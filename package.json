@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node dist/indexer/stall.test.js",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts"
   },
