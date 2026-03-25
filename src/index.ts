@@ -1,8 +1,8 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { streamsRouter } from './routes/streams.js';
 import { healthRouter } from './routes/health.js';
 
-const app = express();
+export const app = express();
 const PORT = process.env.PORT ?? 3000;
 
 app.use(express.json());
@@ -10,7 +10,7 @@ app.use(express.json());
 app.use('/health', healthRouter);
 app.use('/api/streams', streamsRouter);
 
-app.get('/', (_req, res) => {
+app.get('/', (_req: Request, res: Response) => {
   res.json({
     name: 'Fluxora API',
     version: '0.1.0',
@@ -18,6 +18,8 @@ app.get('/', (_req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Fluxora API listening on http://localhost:${PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`Fluxora API listening on http://localhost:${PORT}`);
+  });
+}
