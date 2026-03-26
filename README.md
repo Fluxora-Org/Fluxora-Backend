@@ -2,7 +2,88 @@
 
 Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. For Issue 54, the service now defines a concrete indexer-stall health classification plus an inline incident runbook so operators can reason about stale chain-derived state without relying on tribal knowledge.
 
-## Current status
+## Decimal String Serialization Policy
+
+All amounts crossing the chain/API boundary are serialized as **decimal strings** to prevent precision loss in JSON.
+
+### Amount Fields
+
+- `depositAmount` - Total deposit as decimal string (e.g., "1000000.0000000")
+- `ratePerSecond` - Streaming rate as decimal string (e.g., "0.0000116")
+
+### Validation Rules
+
+- Amounts MUST be strings in decimal notation (e.g., "100", "-50", "0.0000001")
+- Native JSON numbers are rejected to prevent floating-point precision issues
+- Values exceeding safe integer ranges are rejected with `DECIMAL_OUT_OF_RANGE` error
+
+### Error Codes
+
+| Code                     | Description                               |
+| ------------------------ | ----------------------------------------- |
+| `DECIMAL_INVALID_TYPE`   | Amount was not a string                   |
+| `DECIMAL_INVALID_FORMAT` | String did not match decimal pattern      |
+| `DECIMAL_OUT_OF_RANGE`   | Value exceeds maximum supported precision |
+| `DECIMAL_EMPTY_VALUE`    | Amount was empty or null                  |
+
+### Trust Boundaries
+
+| Actor                  | Capabilities                               |
+| ---------------------- | ------------------------------------------ |
+| Public Clients         | Read streams, submit valid decimal strings |
+| Authenticated Partners | Create streams with validated amounts      |
+| Administrators         | Full access, diagnostic logging            |
+| Internal Workers       | Database operations, chain interactions    |
+
+### Failure Modes
+
+| Scenario                 | Behavior                          |
+| ------------------------ | --------------------------------- |
+| Invalid decimal type     | 400 with `DECIMAL_INVALID_TYPE`   |
+| Malformed decimal string | 400 with `DECIMAL_INVALID_FORMAT` |
+| Precision overflow       | 400 with `DECIMAL_OUT_OF_RANGE`   |
+| Missing required field   | 400 with `VALIDATION_ERROR`       |
+| Stream not found         | 404 with `NOT_FOUND`              |
+
+### Operational Notes
+
+#### Diagnostic Logging
+
+Serialization events are logged with context for debugging:
+
+```
+Decimal validation failed {"field":"depositAmount","errorCode":"DECIMAL_INVALID_TYPE","requestId":"..."}
+```
+
+#### Health Observability
+
+- `GET /health` - Returns service health status
+- Request IDs enable correlation across logs
+- Structured JSON logs for log aggregation systems
+
+#### Verification Commands
+
+```bash
+# Run all tests
+npm test
+
+# Run with coverage
+npm test -- --coverage
+
+# Build TypeScript
+npm run build
+
+# Start server
+npm start
+```
+
+### Known Limitations
+
+- In-memory stream storage (production requires database integration)
+- No Stellar RPC integration (placeholder for chain interactions)
+- Rate limiting not implemented (future enhancement)
+
+## What's in this repo
 
 - Implemented today:
   - API info endpoint
@@ -45,149 +126,48 @@ API runs at [http://localhost:3000](http://localhost:3000).
 
 - `npm run dev` - run with tsx watch
 - `npm run build` - compile to `dist/`
-- `npm test` - run indexer freshness tests
+- `npm test` - run the HTTP error-handling tests
 - `npm start` - run compiled `dist/index.js`
 
 ## API overview
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/` | API info |
-| GET | `/health` | Health check with indexer freshness |
-| GET | `/api/streams` | List streams |
-| GET | `/api/streams/:id` | Get one stream |
-| POST | `/api/streams` | Create stream with `sender`, `recipient`, `depositAmount`, `ratePerSecond`, `startTime` |
+| Method | Path               | Description                                                                      |
+| ------ | ------------------ | -------------------------------------------------------------------------------- |
+| GET    | `/`                | API info                                                                         |
+| GET    | `/health`          | Health check                                                                     |
+| GET    | `/api/streams`     | List streams                                                                     |
+| GET    | `/api/streams/:id` | Get one stream                                                                   |
+| POST   | `/api/streams`     | Create stream (body: sender, recipient, depositAmount, ratePerSecond, startTime) |
 
-All responses are JSON. Stream data is in-memory until a durable store is added.
+Contract guarantees for this area:
 
-## Incident runbook: indexer stalled
+## Operational Guidelines
 
-### Service-level outcome
+### Trust Boundaries
+- **Public API**: The `/api/streams/lookup` endpoint is accessible to any client with stream IDs. Currently, no authentication is enforced.
+- **Failures**: Invalid JSON or missing `ids` array returns `400 Bad Request`. Non-existent IDs are silently omitted from the response to prevent information leakage and ensure robustness for partial matches.
 
-The single responsibility area for this issue is operator handling of a stalled indexer. The service-level outcomes are:
+### Health and Observability
+- **Success Metrics**: Monitor `200 OK` responses for the lookup endpoint.
+- **Error Monitoring**: Track `400` errors for client integration issues.
+- **Diagnostics**: If streams are not found, verify the stream creation logs or ensure the in-memory state hasn't been reset by a restart.
 
-- health reporting must tell operators whether the indexer is `healthy`, `starting`, `stalled`, or `not_configured`
-- a stalled indexer must be treated as a stale-chain-state incident, not a silent success
-- public clients must not be told that chain-derived views are current when the indexer is stalled
-- operators must have a written path to classify, diagnose, and respond to the stall
+## Project structure
+...
 
-### Health contract
-
-`GET /health` now includes an `indexer` object:
-
-```json
-{
-  "status": "degraded",
-  "service": "fluxora-backend",
-  "timestamp": "2026-03-25T21:00:00.000Z",
-  "indexer": {
-    "status": "stalled",
-    "stalled": true,
-    "thresholdMs": 300000,
-    "lastSuccessfulSyncAt": "2026-03-25T20:50:00.000Z",
-    "lagMs": 600000,
-    "summary": "Indexer checkpoint is older than the allowed freshness threshold",
-    "clientImpact": "stale_chain_state",
-    "operatorAction": "page"
-  }
-}
-```
-
-Environment variables used by the health route:
-
-- `INDEXER_ENABLED` - set to `true` when an indexer is expected to be running
-- `INDEXER_LAST_SUCCESS_AT` - ISO timestamp of the last successful sync checkpoint
-- `INDEXER_STALL_THRESHOLD_MS` - optional freshness threshold, defaults to `300000`
-
-### Meaning of each indexer status
-
-| Status | Meaning | Overall `/health` status |
-|--------|---------|--------------------------|
-| `not_configured` | No indexer is expected in this environment | `ok` |
-| `starting` | Indexer is enabled but no readable successful checkpoint exists yet | `degraded` |
-| `healthy` | Last checkpoint is within the freshness threshold | `ok` |
-| `stalled` | Last checkpoint is older than the freshness threshold | `degraded` |
-
-### Trust boundaries
-
-| Actor | Trusted for | Not trusted for |
-|-------|-------------|-----------------|
-| Public internet clients | Reading public health information | Deciding whether stale chain state is acceptable for operators or auditors |
-| Authenticated partners | Consuming health output and handling stale data conservatively | Overriding freshness thresholds or masking stalls |
-| Administrators / operators | Interpreting `indexer.status`, paging, restart decisions, incident notes | Assuming data freshness without checking checkpoint age |
-| Internal workers / future indexer jobs | Updating the last successful checkpoint accurately | Silently rewriting or suppressing stale-state signals |
-
-### Failure modes and expected client-visible behavior
-
-| Scenario | Expected behavior |
-|----------|-------------------|
-| Indexer disabled in this environment | `/health` returns `status: "ok"` and `indexer.status: "not_configured"` |
-| Indexer enabled but no checkpoint yet | `/health` returns `status: "degraded"` and `indexer.status: "starting"` |
-| Indexer checkpoint stale | `/health` returns `status: "degraded"` and `indexer.status: "stalled"` |
-| Invalid or unreadable checkpoint value | Treat as `starting`, because the service cannot prove freshness |
-| Public HTTP reads while indexer is stalled | Current repo keeps serving its existing responses; operators must treat any future chain-derived views as stale until the checkpoint recovers |
-| Dependency outage in a future real indexer | The checkpoint should stop advancing, causing `indexer.status: "stalled"` once the threshold is exceeded |
-| Duplicate delivery / duplicated chain event processing | Deferred: no durable indexer or dedupe pipeline exists in this repo version |
-| Invalid input to the freshness classifier | The classifier falls back to `starting` rather than pretending the system is healthy |
-
-### Operator runbook
-
-When `indexer.status` becomes `stalled`:
-
-1. Confirm the symptom
-   - call `GET /health`
-   - record `indexer.lastSuccessfulSyncAt`, `indexer.lagMs`, and `indexer.thresholdMs`
-2. Classify customer impact
-   - treat chain-derived views as stale
-   - do not claim balances, identities, or stream states are current until checkpoint freshness recovers
-3. Check the obvious dependency path
-   - is the indexer worker enabled
-   - is the last successful checkpoint advancing
-   - are Stellar RPC, database, or worker logs showing failures
-4. Recover
-   - restart or unstick the indexer worker if it is wedged
-   - restore blocked dependencies
-   - confirm `/health` returns `indexer.status: "healthy"` again
-5. Close out
-   - record the request/incident time window
-   - record the stale interval from the last good checkpoint to recovery
-   - document follow-up work if recovery required manual intervention
-
-### Abuse and reliability notes
-
-- Invalid checkpoint data must not be treated as healthy.
-- Partial data must be called stale rather than silently accepted.
-- Duplicate event handling is explicitly deferred until a real indexer exists.
-- Excessive request rates are also deferred in this repo version; the runbook documents the stall signal, not rate limiting.
-
-### Operator observability and diagnosis
-
-Operators should be able to answer the following without tribal knowledge:
-
-- whether the indexer is enabled at all
-- the exact last successful checkpoint timestamp
-- how far the checkpoint lags behind the current wall clock
-- whether the service currently considers that lag acceptable
-- whether the operator should observe or page immediately
-
-Current operator signals:
-
-- `/health` exposes `indexer.status`
-- `/health` exposes `indexer.lastSuccessfulSyncAt`
-- `/health` exposes `indexer.lagMs`
-- `/health` exposes `indexer.operatorAction`
-
-This is sufficient for a written runbook now. Once a real indexer exists, logs, metrics, and checkpoint persistence should be added to the same contract rather than inventing a second health vocabulary.
+This is sufficient for local diagnosis now. If Redis, PostgreSQL, Horizon RPC, or workers are added later, their outage classifications should be folded into the same logging pattern.
 
 ### Verification evidence
 
-Automated tests in `src/indexer/stall.test.ts` cover:
+Automated tests in `src/app.test.ts` cover:
 
-- `not_configured` when the indexer is disabled
-- `healthy` when the checkpoint is fresh
-- `stalled` when the checkpoint breaches the threshold
+- normalized `404` for unknown routes
+- normalized `400` for invalid JSON
+- normalized `413` for oversized payloads
+- normalized `400` for route validation failures
+- normalized `500` for unexpected exceptions
 
-Build and test verification:
+Build verification:
 
 ```bash
 npm test
@@ -198,36 +178,149 @@ npm run build
 
 Intentionally deferred in this issue:
 
-- a real indexer implementation
-- persistent checkpoint storage
-- restart automation
-- alerting integrations
-- duplicate-event protection
+- rate limiting implementation
+- duplicate-submission detection
+- persistence-backed failure classification
+- OpenAPI generation for error schemas
 
 Recommended follow-up issues:
 
-- implement a real indexer worker and persist its checkpoints
-- add health tests around the `/health` route itself once the worker exists
-- publish alert thresholds for `indexer.status = "stalled"`
-- add rate limiting and duplicate-event handling for the real indexing pipeline
+- add rate limiting that returns normalized `429` errors
+- add idempotency / duplicate-submission protection
+- publish OpenAPI schemas for the normalized error envelope
+- extend dependency-outage classification once real database / indexing integrations land
 
 ## Project structure
 
 ```text
 src/
-  indexer/        # indexer freshness classification
-  routes/         # health and streams routes
-  index.ts        # server bootstrap
+  routes/     # health, streams
+  index.ts    # Express app and server
+k6/
+  main.js     # k6 entrypoint — composes all scenarios
+  config.js   # Thresholds, stage profiles, base URL
+  helpers.js  # Shared metrics, check utilities, payload generators
+  scenarios/
+    health.js          # GET /health
+    streams-list.js    # GET /api/streams
+    streams-get.js     # GET /api/streams/:id (200 + 404 paths)
+    streams-create.js  # POST /api/streams (valid + edge cases)
 ```
+
+## Load testing (k6)
+
+The `k6/` directory contains a [k6](https://k6.io/) load-testing harness for all critical endpoints.
+
+### Prerequisites
+
+Install k6 ([docs](https://grafana.com/docs/k6/latest/set-up/install-k6/)):
+
+```bash
+# macOS
+brew install k6
+
+# Windows (winget)
+winget install k6 --source winget
+
+# Windows (choco)
+choco install k6
+
+# Docker
+docker pull grafana/k6
+```
+
+### Running
+
+Start the API in one terminal:
+
+```bash
+npm run dev
+```
+
+Run a load test profile in another:
+
+```bash
+# Smoke (default — 5 VUs, 1 min, good for CI)
+npm run k6:smoke
+
+# Load (50 VUs, 5 min)
+npm run k6:load
+
+# Stress (ramp to 200 VUs)
+npm run k6:stress
+
+# Soak (30 VUs, 24 min — memory leak detection)
+npm run k6:soak
+```
+
+Override the target URL for staging/production:
+
+```bash
+k6 run -e PROFILE=load -e K6_BASE_URL=https://staging.fluxora.io k6/main.js
+```
+
+### Profiles
+
+| Profile | VUs   | Duration | Purpose                          |
+|---------|-------|----------|----------------------------------|
+| smoke   | 5     | 1 min    | CI gate / sanity check           |
+| load    | 50    | 5 min    | Pre-release regression           |
+| stress  | → 200 | 6 min    | Capacity ceiling / breaking point|
+| soak    | 30    | 24 min   | Memory leaks / drift detection   |
+
+### SLO thresholds
+
+| Metric                 | Target         |
+|------------------------|----------------|
+| p(95) response time    | < 500 ms       |
+| p(99) response time    | < 1 000 ms     |
+| Error rate             | < 1 %          |
+| Health p(99) latency   | < 200 ms       |
+
+If any threshold is breached, k6 exits with a non-zero code — suitable for CI gates.
+
+### Scenarios covered
+
+- **health** — `GET /health` readiness probe; must never fail.
+- **streams_list** — `GET /api/streams`; validates JSON array response.
+- **streams_get** — `GET /api/streams/:id`; exercises both 200 (existing) and 404 (missing) paths.
+- **streams_create** — `POST /api/streams`; valid payloads (201) and empty-body edge case.
+
+### Trust boundaries modelled
+
+| Boundary           | Endpoints                            | Notes |
+|--------------------|--------------------------------------|-------|
+| Public internet    | GET /health, GET /api/streams[/:id]  | Read-only, unauthenticated |
+| Partner (future)   | POST /api/streams                    | Auth not yet enforced — tracked as follow-up |
+
+### Failure modes tested
+
+| Mode                    | Expected client behavior           | Covered by        |
+|-------------------------|------------------------------------|--------------------|
+| Missing stream ID       | 404 `{ error: "Stream not found" }`| streams-get        |
+| Empty POST body         | Service defaults fields (201)      | streams-create     |
+| Latency degradation     | Thresholds catch p95/p99 drift     | All scenarios      |
+
+### Intentional non-goals (follow-up)
+
+- **Auth header injection**: No JWT layer yet; will add when auth middleware lands.
+- **Database failure injection**: In-memory store only; re-run after PostgreSQL migration.
+- **Stellar RPC dependency simulation**: Requires contract integration work.
+- **Rate-limiting verification**: Rate limiter not yet implemented.
+
+### Observability / incident diagnosis
+
+Operators can diagnose load-test runs via:
+
+1. **k6 terminal summary** — real-time VU count, latency percentiles, error rate.
+2. **k6 JSON output** — `k6 run --out json=results.json k6/main.js` for post-hoc analysis.
+3. **Grafana Cloud k6** — `k6 cloud k6/main.js` streams results to a dashboard (requires account).
 
 ## Environment
 
 Optional:
 
 - `PORT` - server port, default `3000`
-- `INDEXER_ENABLED` - whether an indexer is expected in this environment
-- `INDEXER_LAST_SUCCESS_AT` - last successful sync checkpoint timestamp
-- `INDEXER_STALL_THRESHOLD_MS` - freshness threshold in milliseconds
 
 Likely future additions:
 
