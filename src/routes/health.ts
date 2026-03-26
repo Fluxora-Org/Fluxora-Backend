@@ -1,12 +1,20 @@
 import { Router, Request, Response } from 'express';
 
+import {
+  DEFAULT_INDEXER_STALL_THRESHOLD_MS,
+  assessIndexerHealth,
+} from '../indexer/stall.js';
+
 export const healthRouter = Router();
 
 healthRouter.get('/', (_req: Request, res: Response) => {
   res.json({
-    status: 'ok',
+    status: indexer.status === 'stalled' || indexer.status === 'starting'
+      ? 'degraded'
+      : 'ok',
     service: 'fluxora-backend',
     timestamp: new Date().toISOString(),
+    indexer,
   });
 });
 

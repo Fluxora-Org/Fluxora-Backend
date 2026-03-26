@@ -1,6 +1,6 @@
 # Fluxora Backend
 
-Express + TypeScript API for the Fluxora treasury streaming protocol. Provides REST endpoints for streams, health checks, and (later) Horizon sync and analytics.
+Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. For Issue 54, the service now defines a concrete indexer-stall health classification plus an inline incident runbook so operators can reason about stale chain-derived state without relying on tribal knowledge.
 
 ## Decimal String Serialization Policy
 
@@ -85,9 +85,20 @@ npm start
 
 ## What's in this repo
 
-- **API Gateway** — REST API for stream CRUD and health
-- **Streams API** — List, get, and create stream records (in-memory placeholder; will be replaced by PostgreSQL + Horizon listener)
-- Ready to extend with JWT, RBAC, rate limiting, and streaming engine
+- Implemented today:
+  - API info endpoint
+  - health endpoint
+  - in-memory stream CRUD placeholder
+  - indexer freshness classification for `healthy`, `starting`, `stalled`, and `not_configured`
+  - health-route reporting for indexer freshness
+- Explicitly not implemented yet:
+  - a real indexer worker
+  - durable checkpoint persistence
+  - database-backed chain state
+  - automated restart orchestration
+  - rate limiting or duplicate-delivery protection
+
+If the health route reports `indexer.status = "stalled"`, treat that as an operational signal that chain-derived views would be stale if the real indexer were enabled in this service.
 
 ## Tech stack
 
