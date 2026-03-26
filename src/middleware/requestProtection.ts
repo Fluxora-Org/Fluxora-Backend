@@ -1,20 +1,23 @@
 /**
  * Request protection middleware for Fluxora Backend
- * 
+ *
  * Provides:
- * - Request size limit enforcement
+ * - Request size limit enforcement (Content-Length header + raw stream byte counting)
  * - JSON depth validation
  * - Request timeout protection
- * 
+ *
  * Failure modes and client-visible behavior:
- * - Oversized request (413 Payload Too Large): Request exceeds size limit
+ * - Oversized request (413 Payload Too Large): Content-Length or streamed bytes exceed limit
  * - Excessive JSON depth (400 Bad Request): Nested objects exceed depth limit
  * - Request timeout (408 Request Timeout): Request processing exceeds timeout
+ *
+ * All error responses use the standard { success, error, code, details } envelope.
  */
 
 import { Request, Response, NextFunction } from 'express';
 import { Logger } from '../config/logger';
 import { validateJsonDepth, ValidationError } from '../config/validation';
+import { errorResponse } from '../utils/response';
 
 /**
  * Custom error class for request protection violations
@@ -31,38 +34,71 @@ export class RequestProtectionError extends Error {
 }
 
 /**
- * Middleware to enforce request size limits
- * Must be applied before express.json() to intercept raw request
+ * Middleware to enforce request size limits.
+ *
+ * Two-layer enforcement:
+ * 1. Content-Length header check (fast path — rejects before reading body)
+ * 2. Raw stream byte counting (catches chunked/streaming requests without Content-Length)
+ *
+ * Must be applied BEFORE express.json() so the raw stream is still available.
  */
 export function createRequestSizeLimitMiddleware(maxSizeBytes: number) {
     return (req: Request, res: Response, next: NextFunction) => {
         const logger = req.app.locals.logger as Logger;
-        const contentLength = req.get('content-length');
 
+        // Fast path: reject via Content-Length header
+        const contentLength = req.get('content-length');
         if (contentLength) {
             const size = parseInt(contentLength, 10);
             if (size > maxSizeBytes) {
-                logger.warn('Request rejected: payload too large', {
+                logger.warn('Request rejected: payload too large (Content-Length)', {
                     contentLength: size,
                     maxSizeBytes,
                     path: req.path,
                     method: req.method,
                 });
-                return res.status(413).json({
-                    error: 'Payload too large',
-                    code: 'PAYLOAD_TOO_LARGE',
-                    details: `Request size (${size} bytes) exceeds maximum allowed (${maxSizeBytes} bytes)`,
-                });
+                return res.status(413).json(
+                    errorResponse(
+                        'Payload too large',
+                        'PAYLOAD_TOO_LARGE',
+                        `Request size (${size} bytes) exceeds maximum allowed (${maxSizeBytes} bytes)`
+                    )
+                );
             }
         }
+
+        // Slow path: count raw stream bytes for chunked / no Content-Length requests
+        let receivedBytes = 0;
+        let aborted = false;
+
+        req.on('data', (chunk: Buffer) => {
+            receivedBytes += chunk.length;
+            if (!aborted && receivedBytes > maxSizeBytes) {
+                aborted = true;
+                logger.warn('Request rejected: payload too large (stream)', {
+                    receivedBytes,
+                    maxSizeBytes,
+                    path: req.path,
+                    method: req.method,
+                });
+                res.status(413).json(
+                    errorResponse(
+                        'Payload too large',
+                        'PAYLOAD_TOO_LARGE',
+                        `Streamed bytes (${receivedBytes}) exceed maximum allowed (${maxSizeBytes} bytes)`
+                    )
+                );
+                req.socket.destroy();
+            }
+        });
 
         next();
     };
 }
 
 /**
- * Middleware to validate JSON depth after parsing
- * Must be applied after express.json()
+ * Middleware to validate JSON depth after parsing.
+ * Must be applied AFTER express.json().
  */
 export function createJsonDepthValidationMiddleware(maxDepth: number) {
     return (req: Request, res: Response, next: NextFunction) => {
@@ -80,11 +116,9 @@ export function createJsonDepthValidationMiddleware(maxDepth: number) {
                         method: req.method,
                         error: err.message,
                     });
-                    return res.status(400).json({
-                        error: 'Invalid request',
-                        code: 'JSON_DEPTH_EXCEEDED',
-                        details: err.message,
-                    });
+                    return res.status(400).json(
+                        errorResponse('Invalid request', 'JSON_DEPTH_EXCEEDED', err.message)
+                    );
                 }
                 throw err;
             }
@@ -95,14 +129,13 @@ export function createJsonDepthValidationMiddleware(maxDepth: number) {
 }
 
 /**
- * Middleware to enforce request timeout
- * Aborts request processing if it exceeds timeout
+ * Middleware to enforce request timeout.
+ * Aborts request processing if it exceeds timeout.
  */
 export function createRequestTimeoutMiddleware(timeoutMs: number) {
     return (req: Request, res: Response, next: NextFunction) => {
         const logger = req.app.locals.logger as Logger;
 
-        // Set timeout on the socket
         req.socket.setTimeout(timeoutMs, () => {
             logger.warn('Request timeout', {
                 timeoutMs,
@@ -112,11 +145,13 @@ export function createRequestTimeoutMiddleware(timeoutMs: number) {
             });
 
             if (!res.headersSent) {
-                res.status(408).json({
-                    error: 'Request timeout',
-                    code: 'REQUEST_TIMEOUT',
-                    details: `Request processing exceeded ${timeoutMs}ms timeout`,
-                });
+                res.status(408).json(
+                    errorResponse(
+                        'Request timeout',
+                        'REQUEST_TIMEOUT',
+                        `Request processing exceeded ${timeoutMs}ms timeout`
+                    )
+                );
             }
 
             req.socket.destroy();
@@ -131,8 +166,8 @@ export function createRequestTimeoutMiddleware(timeoutMs: number) {
 }
 
 /**
- * Error handler for request protection errors
- * Should be registered after all other middleware
+ * Error handler for RequestProtectionError instances.
+ * Should be registered after all other middleware.
  */
 export function requestProtectionErrorHandler(
     err: any,
@@ -141,10 +176,9 @@ export function requestProtectionErrorHandler(
     next: NextFunction
 ) {
     if (err instanceof RequestProtectionError) {
-        return res.status(err.statusCode).json({
-            error: err.message,
-            code: err.code,
-        });
+        return res.status(err.statusCode).json(
+            errorResponse(err.message, err.code)
+        );
     }
 
     next(err);

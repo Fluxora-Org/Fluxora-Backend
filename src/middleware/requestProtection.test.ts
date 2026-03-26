@@ -7,6 +7,7 @@ import {
     createJsonDepthValidationMiddleware,
     createRequestTimeoutMiddleware,
     requestProtectionErrorHandler,
+    RequestProtectionError,
 } from './requestProtection';
 
 describe('Request Protection Middleware', () => {
@@ -34,7 +35,7 @@ describe('Request Protection Middleware', () => {
             expect(response.body.ok).toBe(true);
         });
 
-        it('should reject requests exceeding size limit', async () => {
+        it('should reject requests exceeding size limit via Content-Length', async () => {
             const maxSize = 100;
             app.use(createRequestSizeLimitMiddleware(maxSize));
             app.post('/test', (req, res) => res.json({ ok: true }));
@@ -46,6 +47,7 @@ describe('Request Protection Middleware', () => {
                 .send({ data: largePayload });
 
             expect(response.status).toBe(413);
+            expect(response.body.success).toBe(false);
             expect(response.body.code).toBe('PAYLOAD_TOO_LARGE');
         });
 
@@ -63,10 +65,8 @@ describe('Request Protection Middleware', () => {
                 .send({ data: largePayload });
 
             expect(warnSpy).toHaveBeenCalledWith(
-                'Request rejected: payload too large',
-                expect.objectContaining({
-                    maxSizeBytes: maxSize,
-                })
+                expect.stringContaining('payload too large'),
+                expect.objectContaining({ maxSizeBytes: maxSize })
             );
 
             warnSpy.mockRestore();
@@ -83,6 +83,21 @@ describe('Request Protection Middleware', () => {
                 .send({ data: 'test' });
 
             expect(response.status).toBe(200);
+        });
+
+        it('error response should include success:false and code', async () => {
+            const maxSize = 100;
+            app.use(createRequestSizeLimitMiddleware(maxSize));
+            app.post('/test', (req, res) => res.json({ ok: true }));
+
+            const response = await request(app)
+                .post('/test')
+                .set('Content-Type', 'application/json')
+                .send({ data: 'x'.repeat(200) });
+
+            expect(response.body.success).toBe(false);
+            expect(response.body.code).toBe('PAYLOAD_TOO_LARGE');
+            expect(typeof response.body.error).toBe('string');
         });
     });
 
@@ -121,6 +136,7 @@ describe('Request Protection Middleware', () => {
                 .send({ a: { b: { c: { d: 1 } } } });
 
             expect(response.status).toBe(400);
+            expect(response.body.success).toBe(false);
             expect(response.body.code).toBe('JSON_DEPTH_EXCEEDED');
         });
 
@@ -137,9 +153,7 @@ describe('Request Protection Middleware', () => {
 
             expect(warnSpy).toHaveBeenCalledWith(
                 'Request rejected: JSON depth exceeded',
-                expect.objectContaining({
-                    maxDepth: 2,
-                })
+                expect.objectContaining({ maxDepth: 2 })
             );
 
             warnSpy.mockRestore();
@@ -177,7 +191,22 @@ describe('Request Protection Middleware', () => {
                 .send({ a: [[[[1]]]] });
 
             expect(response.status).toBe(400);
+            expect(response.body.success).toBe(false);
             expect(response.body.code).toBe('JSON_DEPTH_EXCEEDED');
+        });
+
+        it('error response should include success:false and code', async () => {
+            app.use(express.json());
+            app.use(createJsonDepthValidationMiddleware(1));
+            app.post('/test', (req, res) => res.json({ ok: true }));
+
+            const response = await request(app)
+                .post('/test')
+                .send({ a: { b: 1 } });
+
+            expect(response.body.success).toBe(false);
+            expect(response.body.code).toBe('JSON_DEPTH_EXCEEDED');
+            expect(typeof response.body.error).toBe('string');
         });
     });
 
@@ -203,29 +232,28 @@ describe('Request Protection Middleware', () => {
     });
 
     describe('requestProtectionErrorHandler', () => {
-        it('should handle request protection errors', async () => {
-            app.use((req, res, next) => {
-                const err = new Error('Test error');
-                (err as any).statusCode = 400;
-                (err as any).code = 'TEST_ERROR';
-                next(err);
+        it('should handle RequestProtectionError with envelope', async () => {
+            app.use((_req, _res, next) => {
+                next(new RequestProtectionError('Too large', 413, 'PAYLOAD_TOO_LARGE'));
             });
             app.use(requestProtectionErrorHandler);
-            app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+            app.use((_err: any, _req: Request, res: Response, _next: NextFunction) => {
                 res.status(500).json({ error: 'Internal error' });
             });
 
             const response = await request(app).get('/test');
 
-            expect(response.status).toBe(500);
+            expect(response.status).toBe(413);
+            expect(response.body.success).toBe(false);
+            expect(response.body.code).toBe('PAYLOAD_TOO_LARGE');
         });
 
         it('should pass through non-protection errors', async () => {
-            app.use((req, res, next) => {
+            app.use((_req, _res, next) => {
                 next(new Error('Generic error'));
             });
             app.use(requestProtectionErrorHandler);
-            app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+            app.use((_err: any, _req: Request, res: Response, _next: NextFunction) => {
                 res.status(500).json({ error: 'Internal error' });
             });
 
@@ -259,12 +287,30 @@ describe('Request Protection Middleware', () => {
                 .post('/test')
                 .send({ data: largePayload });
             expect(sizeResponse.status).toBe(413);
+            expect(sizeResponse.body.success).toBe(false);
 
             // Deep nesting
             const deepResponse = await request(app)
                 .post('/test')
                 .send({ a: { b: { c: { d: { e: { f: 1 } } } } } });
             expect(deepResponse.status).toBe(400);
+            expect(deepResponse.body.success).toBe(false);
+        });
+
+        it('all success responses should have success:true and meta.timestamp', async () => {
+            app.use(express.json());
+            app.use(createJsonDepthValidationMiddleware(10));
+            app.post('/test', (_req, res) => {
+                const { successResponse } = require('../utils/response');
+                res.json(successResponse({ ok: true }));
+            });
+
+            const response = await request(app).post('/test').send({ x: 1 });
+
+            expect(response.status).toBe(200);
+            expect(response.body.success).toBe(true);
+            expect(response.body.meta).toBeDefined();
+            expect(typeof response.body.meta.timestamp).toBe('string');
         });
     });
 });
