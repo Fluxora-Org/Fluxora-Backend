@@ -3,6 +3,7 @@ import {
   validateDecimalString,
   validateAmountFields,
 } from '../serialization/decimal.js';
+
 import {
   ApiError,
   ApiErrorCode,
@@ -645,7 +646,7 @@ streamsRouter.get(
     const { id } = req.params;
     const requestId = (req as { id?: string }).id;
 
-    debug('Fetching stream', { id, requestId });
+    debug('Fetching stream', { id });
 
     const stream = streams.find((s) => s.id === id);
 
@@ -653,13 +654,13 @@ streamsRouter.get(
       throw notFound('Stream', id);
     }
 
-    res.json(stream);
+    res.json(successResponse({ stream }));
   })
 );
 
 /**
  * POST /api/streams
- * Create a new stream with decimal string validation
+ * Create a new stream
  */
 streamsRouter.post(
   '/',
@@ -732,6 +733,7 @@ streamsRouter.post(
     }
 
     const id = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
     const stream = {
       id,
       sender: normalizedInput.sender,
@@ -762,10 +764,6 @@ streamsRouter.post(
 /**
  * DELETE /api/streams/:id
  * Cancel a stream
- * 
- * Failure modes:
- * - Stream not found: Returns 404
- * - Stream already cancelled: Returns 409 Conflict
  */
 streamsRouter.delete(
   '/:id',
@@ -774,7 +772,7 @@ streamsRouter.delete(
     const { id } = req.params;
     const requestId = (req as { id?: string }).id;
 
-    debug('Deleting stream', { id, requestId });
+    debug('Deleting stream', { id });
 
     const index = streams.findIndex((s) => s.id === id);
 
@@ -804,7 +802,7 @@ streamsRouter.delete(
 
     streams[index] = { ...stream, status: 'cancelled' };
 
-    info('Stream cancelled', { id, requestId });
+    info('Stream cancelled', { id });
 
     recordAuditEvent('STREAM_CANCELLED', 'stream', id, req.correlationId);
 
