@@ -1,0 +1,51 @@
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:16.761Z","level":"info","message":"request received","correlationId":"caa165ca-117c-4b8d-9fc5-ab320b7d45d0"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":8,"timestamp":"2026-03-27T10:44:16.769Z","level":"info","message":"request completed","correlationId":"caa165ca-117c-4b8d-9fc5-ab320b7d45d0"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:16.785Z","level":"info","message":"request received","correlationId":"09caa0aa-12cc-477f-9b55-d0e784536d62"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":3,"timestamp":"2026-03-27T10:44:16.788Z","level":"info","message":"request completed","correlationId":"09caa0aa-12cc-477f-9b55-d0e784536d62"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:16.834Z","level":"info","message":"request received","correlationId":"70f822b4-7a8f-494a-89cf-781b3da31682"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":1,"timestamp":"2026-03-27T10:44:16.835Z","level":"info","message":"request completed","correlationId":"70f822b4-7a8f-494a-89cf-781b3da31682"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:16.845Z","level":"info","message":"request received","correlationId":"2582763e-36bf-46f0-a6e2-b96d0694781c"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":1,"timestamp":"2026-03-27T10:44:16.846Z","level":"info","message":"request completed","correlationId":"2582763e-36bf-46f0-a6e2-b96d0694781c"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:16.857Z","level":"info","message":"request received","correlationId":"f2a2b2fd-16eb-4f21-80c2-8d1b21ec0dfd"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":4,"timestamp":"2026-03-27T10:44:16.861Z","level":"info","message":"request completed","correlationId":"f2a2b2fd-16eb-4f21-80c2-8d1b21ec0dfd"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:16.877Z","level":"info","message":"request received","correlationId":"53947a17-4308-41a6-a107-7f34c282ea1b"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":1,"timestamp":"2026-03-27T10:44:16.878Z","level":"info","message":"request completed","correlationId":"53947a17-4308-41a6-a107-7f34c282ea1b"}
+{"ip":"::ffff:127.0.0.1","count":2,"max":1,"timestamp":"2026-03-27T10:44:21.033Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"idempotencyKey":"key-dup-001","cachedStatus":201,"timestamp":"2026-03-27T10:44:21.037Z","level":"info","message":"Idempotent replay","correlationId":"test"}
+{"ip":"::ffff:127.0.0.1","count":2,"max":1,"timestamp":"2026-03-27T10:44:21.053Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"ip":"::ffff:127.0.0.1","count":2,"max":1,"timestamp":"2026-03-27T10:44:21.073Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"error":"cache error","timestamp":"2026-03-27T10:44:21.102Z","level":"warn","message":"Rate limiter cache error — allowing request","correlationId":"test"}
+{"error":"cache error","timestamp":"2026-03-27T10:44:21.134Z","level":"warn","message":"Idempotency cache read error — proceeding","correlationId":"test"}
+{"ip":"1.2.3.4","count":2,"max":1,"timestamp":"2026-03-27T10:44:21.157Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"method":"GET","path":"/does-not-exist","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:21.489Z","level":"info","message":"request received","correlationId":"5115cd28-196d-4572-a11a-2c5e2a27f30c"}
+{"method":"GET","path":"/does-not-exist","statusCode":404,"durationMs":10,"timestamp":"2026-03-27T10:44:21.498Z","level":"info","message":"request completed","correlationId":"5115cd28-196d-4572-a11a-2c5e2a27f30c"}
+{"method":"POST","path":"/api/streams","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:21.582Z","level":"info","message":"request received","correlationId":"65dec740-012c-4fdf-8227-f5bbfd42003f"}
+{"method":"POST","path":"/api/streams","statusCode":400,"durationMs":11,"timestamp":"2026-03-27T10:44:21.593Z","level":"info","message":"request completed","correlationId":"65dec740-012c-4fdf-8227-f5bbfd42003f"}
+{"method":"GET","path":"/__test/error","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T10:44:21.598Z","level":"info","message":"request received","correlationId":"8daf6b63-b2ab-4a80-bbc0-f5c39c2801b8"}
+{"method":"GET","path":"/__test/error","statusCode":500,"durationMs":3,"timestamp":"2026-03-27T10:44:21.601Z","level":"info","message":"request completed","correlationId":"8daf6b63-b2ab-4a80-bbc0-f5c39c2801b8"}
+-------------------|---------|----------|---------|---------|-------------------
+File               | % Stmts | % Branch | % Funcs | % Lines | Uncovered Line #s 
+-------------------|---------|----------|---------|---------|-------------------
+All files          |   96.25 |    80.48 |   94.73 |   97.19 |                   
+ src               |   95.65 |     87.5 |    87.5 |   95.55 |                   
+  app.ts           |   93.75 |      100 |   66.66 |   93.75 | 32                
+  errors.ts        |   96.66 |    85.71 |     100 |   96.55 | 88                
+ src/config        |   95.23 |    82.45 |   93.87 |   95.65 |                   
+  env.ts           |   97.67 |    94.59 |     100 |   97.56 | 136               
+  health.ts        |   91.37 |    46.66 |   93.75 |   92.72 | 128,181,210,221   
+  logger.ts        |   93.33 |     82.6 |   88.23 |   93.33 | 136,144           
+  validation.ts    |   98.27 |    84.61 |     100 |   98.27 | 90                
+ src/indexer       |   86.36 |    52.94 |     100 |      95 |                   
+  stall.ts         |   86.36 |    52.94 |     100 |      95 | 71                
+ src/lib           |     100 |      100 |     100 |     100 |                   
+  logger.ts        |     100 |      100 |     100 |     100 |                   
+ src/middleware    |   99.04 |     75.6 |   95.23 |   99.02 |                   
+  correlationId.ts |     100 |      100 |     100 |     100 |                   
+  errorHandler.ts  |     100 |    81.81 |     100 |     100 | 23,34             
+  idempotency.ts   |   96.66 |    71.42 |      80 |   96.66 | 105               
+  rateLimit.ts     |     100 |    66.66 |     100 |     100 | 49-76,111         
+  requestLogger.ts |     100 |      100 |     100 |     100 |                   
+ src/routes        |   97.24 |    85.18 |     100 |   99.01 |                   
+  health.ts        |     100 |    83.33 |     100 |     100 | 26                
+  streams.ts       |      97 |    85.41 |     100 |   98.92 | 158               
+-------------------|---------|----------|---------|---------|-------------------

@@ -87,16 +87,23 @@ npm start
 
 - Implemented today:
   - API info endpoint
-  - health endpoint
+  - health endpoint with Redis dependency status
   - in-memory stream CRUD placeholder
   - indexer freshness classification for `healthy`, `starting`, `stalled`, and `not_configured`
   - health-route reporting for indexer freshness
+  - **Caching layer for hot reads (Redis)**
+    - `InMemoryCacheClient` for tests, `NullCacheClient` for graceful degradation, `RedisCacheClient` for production
+    - `GET /api/streams` and `GET /api/streams/:id` served from cache with `X-Cache: HIT/MISS` header
+    - Cache invalidated on `POST` (create) and `DELETE` (cancel)
+    - Newly created streams are pre-populated in cache immediately after write
+  - **Rate limiting** — sliding-window counter per IP, configurable `max`/`windowSeconds`, `X-RateLimit-*` headers, `429` with `Retry-After` on breach, fail-open when cache is unavailable
+  - **Idempotency** — `Idempotency-Key` header on `POST /api/streams` replays cached response for duplicate submissions, `Idempotent-Replayed: true` header on replay, fail-open when cache is unavailable
 - Explicitly not implemented yet:
   - a real indexer worker
   - durable checkpoint persistence
   - database-backed chain state
   - automated restart orchestration
-  - rate limiting or duplicate-delivery protection
+  - authentication / JWT enforcement
 
 If the health route reports `indexer.status = "stalled"`, treat that as an operational signal that chain-derived views would be stale if the real indexer were enabled in this service.
 
@@ -134,10 +141,39 @@ API runs at [http://localhost:3000](http://localhost:3000).
 | Method | Path               | Description                                                                      |
 | ------ | ------------------ | -------------------------------------------------------------------------------- |
 | GET    | `/`                | API info                                                                         |
-| GET    | `/health`          | Health check                                                                     |
-| GET    | `/api/streams`     | List streams                                                                     |
-| GET    | `/api/streams/:id` | Get one stream                                                                   |
-| POST   | `/api/streams`     | Create stream (body: sender, recipient, depositAmount, ratePerSecond, startTime) |
+| GET    | `/health`          | Health check (includes Redis dependency status)                                  |
+| GET    | `/api/streams`     | List streams (cached, `X-Cache` header)                                          |
+| GET    | `/api/streams/:id` | Get one stream (cached, `X-Cache` header)                                        |
+| POST   | `/api/streams`     | Create stream — supports `Idempotency-Key` header; rate-limited                  |
+| DELETE | `/api/streams/:id` | Cancel stream; invalidates cache                                                 |
+
+### Cache behaviour
+
+| Operation              | Cache effect                                      |
+| ---------------------- | ------------------------------------------------- |
+| GET /api/streams       | Read from cache (TTL 60 s); MISS populates cache  |
+| GET /api/streams/:id   | Read from cache (TTL 30 s); MISS populates cache  |
+| POST /api/streams      | Pre-populates stream cache; invalidates list cache |
+| DELETE /api/streams/:id| Invalidates stream + list cache                   |
+
+Response header `X-Cache: HIT` or `X-Cache: MISS` is set on all read endpoints.
+
+### Rate limiting
+
+All `/api/streams` routes are rate-limited at **100 requests per 60-second window per IP**.
+
+| Header                | Meaning                                  |
+| --------------------- | ---------------------------------------- |
+| `X-RateLimit-Limit`   | Configured maximum                       |
+| `X-RateLimit-Remaining` | Requests left in current window        |
+| `X-RateLimit-Reset`   | Unix timestamp when window resets        |
+| `Retry-After`         | Seconds to wait (only on 429 responses)  |
+
+When Redis is unavailable the limiter fails open — requests are allowed through.
+
+### Idempotency
+
+`POST /api/streams` accepts an optional `Idempotency-Key` header (8–128 printable ASCII characters). If the same key is seen within 24 hours, the original response is replayed with `Idempotent-Replayed: true` header set. When Redis is unavailable the check is skipped and the request proceeds normally.
 
 Contract guarantees for this area:
 
@@ -321,13 +357,23 @@ Operators can diagnose load-test runs via:
 Optional:
 
 - `PORT` - server port, default `3000`
+- `REDIS_URL` - Redis connection URL, default `redis://localhost:6379`
+- `REDIS_ENABLED` - enable/disable Redis caching, default `true`
+- `LOG_LEVEL` - log verbosity (`debug`/`info`/`warn`/`error`), default `info`
 
 Likely future additions:
 
 - `DATABASE_URL`
-- `REDIS_URL`
 - `HORIZON_URL`
 - `JWT_SECRET`
+
+### Running without Redis
+
+Set `REDIS_ENABLED=false` or simply don't run Redis. The service degrades gracefully:
+- Cache reads return null (every request is a cache miss)
+- Rate limiting is disabled (fail-open)
+- Idempotency checks are skipped (fail-open)
+- All functional endpoints continue to work normally
 
 ## Related repos
 

@@ -166,13 +166,23 @@ export function createDatabaseHealthChecker(): HealthChecker {
 /**
  * Create a health checker for Redis
  */
-export function createRedisHealthChecker(): HealthChecker {
+export function createRedisHealthChecker(pingFn?: () => Promise<boolean>): HealthChecker {
     return {
         name: 'redis',
         async check() {
-            // TODO: Implement actual Redis connection check
-            // For now, return healthy (will be implemented with actual Redis)
-            return { latency: 2 };
+            const startTime = Date.now();
+            try {
+                const ping = pingFn ?? (async () => false);
+                const ok = await ping();
+                return ok
+                    ? { latency: Date.now() - startTime }
+                    : { latency: Date.now() - startTime, error: 'Redis ping failed' };
+            } catch (err) {
+                return {
+                    latency: Date.now() - startTime,
+                    error: err instanceof Error ? err.message : 'Unknown error',
+                };
+            }
         },
     };
 }

@@ -4,6 +4,8 @@ import { streamsRouter } from './routes/streams.js';
 import { healthRouter } from './routes/health.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
+import { createRateLimiter } from './middleware/rateLimit.js';
+import { idempotencyMiddleware } from './middleware/idempotency.js';
 import {
   requestIdMiddleware,
   notFoundHandler,
@@ -24,7 +26,7 @@ export function createApp(options: AppOptions = {}): express.Express {
   application.use(requestLoggerMiddleware);
 
   application.use('/health', healthRouter);
-  application.use('/api/streams', streamsRouter);
+  application.use('/api/streams', createRateLimiter({ max: 100, windowSeconds: 60 }), idempotencyMiddleware, streamsRouter);
 
   application.get('/', (_req: Request, res: Response) => {
     res.json({
