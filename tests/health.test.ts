@@ -13,6 +13,7 @@ describe('GET /health', () => {
     const res = await request(app).get('/health');
     expect(res.body.service).toBe('fluxora-backend');
     expect(typeof res.body.timestamp).toBe('string');
+    expect(res.body.dependencies.indexer).toBeDefined();
   });
 
   it('response includes x-correlation-id header', async () => {
