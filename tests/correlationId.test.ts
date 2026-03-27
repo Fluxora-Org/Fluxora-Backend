@@ -75,6 +75,7 @@ describe('correlationId middleware', () => {
     it('sets correlation ID on POST /api/streams', async () => {
       const res = await request(app)
         .post('/api/streams')
+        .set('Idempotency-Key', 'correlation-id-post-test')
         .send({ sender: 'A', recipient: 'B', depositAmount: '100', ratePerSecond: '1', startTime: 0 });
       expect(res.headers[CORRELATION_ID_HEADER]).toBeDefined();
     });

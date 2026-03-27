@@ -5,32 +5,28 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "start:tsx": "node --import tsx src/index.ts",
-    "dev": "tsx watch src/index.ts",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs",
-    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --coverage",
-<<<<<<< Updated upstream
-    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --watch",
-    "docker:build": "docker build -t fluxora-backend:local .",
-    "docker:run": "docker run --rm -p 3000:3000 --name fluxora-backend fluxora-backend:local",
-    "docker:smoke": "docker run --rm -d --name fluxora-backend-smoke -p 3000:3000 fluxora-backend:local && sleep 3 && curl -fsS http://127.0.0.1:3000/health && docker stop fluxora-backend-smoke"
-=======
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --watch"
->>>>>>> Stashed changes
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js && node --import tsx --test src/webhooks/signature.test.ts",
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.3",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@jest/globals": "^29.7.0",
     "@types/express": "^4.17.21",
     "@types/jest": "^29.5.12",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.11.16",
     "@types/supertest": "^6.0.2",
     "jest": "^29.7.0",
-    "supertest": "^6.3.4",
-    "ts-jest": "^29.1.2",
+    "supertest": "^6.3.3",
+    "ts-jest": "^29.1.1",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"
   }

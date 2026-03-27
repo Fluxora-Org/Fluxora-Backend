@@ -13,10 +13,9 @@
  * `req.correlationId` is already populated.
  */
 
-import type { Request, Response, NextFunction } from 'express';
 import { logger } from '../lib/logger.js';
 
-export function requestLoggerMiddleware(req: Request, res: Response, next: NextFunction): void {
+export function requestLoggerMiddleware(req: any, res: any, next: any): void {
   const { correlationId } = req;
   const startMs = Date.now();
 

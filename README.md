@@ -1,6 +1,22 @@
 # Fluxora Backend
 
-Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. For Issue 54, the service now defines a concrete indexer-stall health classification plus an inline incident runbook so operators can reason about stale chain-derived state without relying on tribal knowledge.
+Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. It now documents both the decimal-string serialization policy for chain/API amounts and the consumer-facing webhook signature verification contract the team intends to keep stable when delivery is enabled.
+
+## Current status
+
+- Implemented today:
+  - REST endpoints for API info, health, and in-memory stream CRUD
+  - decimal-string validation for amount fields
+  - indexer freshness classification for `healthy`, `starting`, `stalled`, and `not_configured`
+  - consumer-side webhook signing and verification helpers in `src/webhooks/signature.ts`
+- Explicitly not implemented yet:
+  - live webhook delivery endpoints
+  - durable delivery logs or replay store
+  - persistent database-backed stream/indexer state
+  - automated restart orchestration
+  - request rate limiting middleware
+
+If a feature in this README is described as a webhook contract, treat it as the documented integration target for consumers and operators, not as proof that the live service already emits webhooks from this repository.
 
 ## Decimal String Serialization Policy
 
@@ -8,169 +24,113 @@ All amounts crossing the chain/API boundary are serialized as **decimal strings*
 
 ### Amount Fields
 
-- `depositAmount` - Total deposit as decimal string (e.g., "1000000.0000000")
-- `ratePerSecond` - Streaming rate as decimal string (e.g., "0.0000116")
+- `depositAmount` - Total deposit as decimal string (for example `"1000000.0000000"`)
+- `ratePerSecond` - Streaming rate as decimal string (for example `"0.0000116"`)
 
 ### Validation Rules
 
-- Amounts MUST be strings in decimal notation (e.g., "100", "-50", "0.0000001")
+- Amounts must be strings in decimal notation
 - Native JSON numbers are rejected to prevent floating-point precision issues
-- Values exceeding safe integer ranges are rejected with `DECIMAL_OUT_OF_RANGE` error
+- Values exceeding safe integer ranges are rejected with `DECIMAL_OUT_OF_RANGE`
 
 ### Error Codes
 
-| Code                     | Description                               |
-| ------------------------ | ----------------------------------------- |
-| `DECIMAL_INVALID_TYPE`   | Amount was not a string                   |
-| `DECIMAL_INVALID_FORMAT` | String did not match decimal pattern      |
-| `DECIMAL_OUT_OF_RANGE`   | Value exceeds maximum supported precision |
-| `DECIMAL_EMPTY_VALUE`    | Amount was empty or null                  |
+| Code | Description |
+|------|-------------|
+| `DECIMAL_INVALID_TYPE` | Amount was not a string |
+| `DECIMAL_INVALID_FORMAT` | String did not match decimal pattern |
+| `DECIMAL_OUT_OF_RANGE` | Value exceeds maximum supported precision |
+| `DECIMAL_EMPTY_VALUE` | Amount was empty or null |
 
-### Trust Boundaries
+## Webhook signature verification for consumers
 
-| Actor                  | Capabilities                               |
-| ---------------------- | ------------------------------------------ |
-| Public Clients         | Read streams, submit valid decimal strings |
-| Authenticated Partners | Create streams with validated amounts      |
-| Administrators         | Full access, diagnostic logging            |
-| Internal Workers       | Database operations, chain interactions    |
+### Scope and guarantee
 
-### Failure Modes
+For consumer-side verification of Fluxora webhook deliveries, Fluxora aims to guarantee:
 
-| Scenario                 | Behavior                          |
-| ------------------------ | --------------------------------- |
-| Invalid decimal type     | 400 with `DECIMAL_INVALID_TYPE`   |
-| Malformed decimal string | 400 with `DECIMAL_INVALID_FORMAT` |
-| Precision overflow       | 400 with `DECIMAL_OUT_OF_RANGE`   |
-| Missing required field   | 400 with `VALIDATION_ERROR`       |
-| Stream not found         | 404 with `NOT_FOUND`              |
+- each delivery carries a stable set of verification headers
+- the signature is computed over the exact raw request body, not parsed JSON
+- consumers can reject stale, oversized, tampered, or duplicate deliveries with predictable outcomes
+- operators have a written checklist for diagnosing delivery failures without relying on tribal knowledge
 
-### Operational Notes
+This repository currently provides the canonical algorithm and the expected outcomes. It does not yet provide a live webhook sending service.
 
-#### Diagnostic Logging
+### Verification contract
 
-Serialization events are logged with context for debugging:
+Fluxora webhook deliveries are expected to use these headers:
 
-```
-Decimal validation failed {"field":"depositAmount","errorCode":"DECIMAL_INVALID_TYPE","requestId":"..."}
-```
+| Header | Meaning |
+|--------|---------|
+| `x-fluxora-delivery-id` | Stable id for a single delivery attempt chain; use it for deduplication |
+| `x-fluxora-timestamp` | Unix timestamp in seconds |
+| `x-fluxora-signature` | Hex-encoded `HMAC-SHA256(secret, timestamp + "." + rawBody)` |
+| `x-fluxora-event` | Event name such as `stream.created` or `stream.updated` |
 
-#### Health Observability
+Canonical signing payload:
 
-- `GET /health` - Returns service health status
-- Request IDs enable correlation across logs
-- Structured JSON logs for log aggregation systems
-
-#### Verification Commands
-
-```bash
-# Run all tests
-npm test
-
-# Run with coverage
-npm test -- --coverage
-
-# Build TypeScript
-npm run build
-
-# Start server
-npm start
+```text
+${timestamp}.${rawRequestBody}
 ```
 
-### Known Limitations
+Canonical verification rules:
 
-- In-memory stream storage (production requires database integration)
-- No Stellar RPC integration (placeholder for chain interactions)
-- Rate limiting not implemented (future enhancement)
+- use the raw request bytes exactly as received
+- reject payloads larger than `256 KiB`
+- reject timestamps outside a `300` second tolerance window
+- compare signatures with a constant-time equality check
+- deduplicate on `x-fluxora-delivery-id`
 
-## CORS Policy (Issue #26)
+Reference implementation lives in `src/webhooks/signature.ts`.
 
-Service-level outcome for this scope:
+### Consumer verification example
 
-- Production CORS behavior is explicit and predictable via a configured allowlist.
-- Non-production environments remain permissive to keep local and staging workflows simple.
+```ts
+import { verifyWebhookSignature } from './src/webhooks/signature.js';
 
-### Policy definition
+const verification = verifyWebhookSignature({
+  secret: process.env.FLUXORA_WEBHOOK_SECRET,
+  deliveryId: req.header('x-fluxora-delivery-id') ?? undefined,
+  timestamp: req.header('x-fluxora-timestamp') ?? undefined,
+  signature: req.header('x-fluxora-signature') ?? undefined,
+  rawBody,
+  isDuplicateDelivery: (deliveryId) => seenDeliveryIds.has(deliveryId),
+});
 
-- Environment variable: `CORS_ALLOWED_ORIGINS`
-- Format: comma-separated origins, for example:
-  - `CORS_ALLOWED_ORIGINS=https://app.fluxora.io,https://ops.fluxora.io`
-- Production (`NODE_ENV=production`):
-  - Cross-origin requests are only allowed for origins present in `CORS_ALLOWED_ORIGINS`.
-  - Allowed preflight (`OPTIONS`) requests return `204` and include `Access-Control-Allow-*` headers.
-  - Non-allowlisted preflight requests return `403` with `CORS_ORIGIN_DENIED`.
-  - Requests from non-allowlisted origins do not receive `Access-Control-Allow-Origin`.
-- Non-production (`development`, `test`, `staging`):
-  - Incoming `Origin` is reflected to keep integration and QA flows frictionless.
+if (!verification.ok) {
+  return res.status(verification.status).json({
+    error: verification.code,
+    message: verification.message,
+  });
+}
+```
 
-### Trust boundaries for CORS
+### Trust boundaries
 
-- Public internet clients:
-  - May read public endpoints.
-  - Browser access is limited by allowlist in production.
-- Authenticated partners:
-  - Must originate from registered partner domains in production.
-  - Must still pass application-level auth once auth middleware is enabled.
-- Administrators:
-  - Maintain and rotate `CORS_ALLOWED_ORIGINS` per deployment.
-  - Validate allowlist changes in staging before production rollout.
-- Internal workers:
-  - Not browser-originated and unaffected by CORS when calling internal services directly.
+| Actor | Trusted for | Not trusted for |
+|-------|-------------|-----------------|
+| Public clients | Valid request shape only | Payload integrity, replay prevention |
+| Authenticated partners / webhook consumers | Possession of shared webhook secret and endpoint ownership | Skipping signature checks, bypassing replay controls |
+| Administrators / operators | Secret rotation, incident response, delivery diagnostics | Reading secrets from logs or bypassing audit trails |
+| Internal workers | Constructing signed payloads, retry scheduling, durable delivery state once implemented | Silently mutating or dropping verified deliveries |
 
 ### Failure modes and expected behavior
 
-- Invalid allowlist format (extra spaces, empty entries): empty entries are ignored; exact origin match is required.
-- Allowlist missing in production: no cross-origin origin is allowed (safe default).
-- Dependency outage (DB, Stellar RPC, worker): CORS policy is still evaluated first; health/error semantics remain unchanged.
-- Partial data / duplicate delivery: outside CORS scope; existing endpoint behavior and error envelopes remain authoritative.
+| Condition | Expected result | Suggested HTTP outcome |
+|-----------|-----------------|------------------------|
+| Missing secret in consumer config | Treat as configuration failure; do not trust the payload | `500` internally, do not acknowledge |
+| Missing delivery id / timestamp / signature | Reject as unauthenticated | `401 Unauthorized` |
+| Non-numeric or stale timestamp | Reject as replay-risk / invalid input | `400` for malformed timestamp, `401` for stale timestamp |
+| Signature mismatch | Reject as unauthenticated | `401 Unauthorized` |
+| Payload larger than `256 KiB` | Reject before parsing JSON | `413 Payload Too Large` |
+| Duplicate delivery id | Do not process the business action twice | `200 OK` after safe dedupe or `409 Conflict` |
+| Consumer overloaded | Ask sender to retry later | `429 Too Many Requests` |
 
-### Observability and incident diagnosis
+## Health and observability
 
-- Health endpoint: `GET /health` confirms service liveness.
-- Request correlation: `x-correlation-id` supports tracing denied preflight and API calls.
-- Logs: request logger captures method/path/status to inspect spikes in `OPTIONS` or `403` responses.
-- Operator runbook:
-  - Confirm `NODE_ENV` and deployed `CORS_ALLOWED_ORIGINS`.
-  - Reproduce with preflight:
-    - `curl -i -X OPTIONS "$BASE_URL/api/streams" -H "Origin: https://candidate.example" -H "Access-Control-Request-Method: POST"`
-  - If denied unexpectedly, compare exact origin (scheme + host + port) against allowlist.
-
-### Verification evidence
-
-- Automated regression tests in `tests/cors.test.ts` cover:
-  - non-production permissive behavior
-  - production allowlisted preflight success
-  - production denied preflight behavior (`403` + `CORS_ORIGIN_DENIED`)
-  - production safe default when allowlist is unset
-
-### Intentional non-goals for this issue
-
-- Dynamic allowlist management API.
-- Wildcard or pattern-based origin matching.
-- CORS-based authentication (CORS is not auth).
-
-## What's in this repo
-
-- Implemented today:
-  - API info endpoint
-  - health endpoint
-  - in-memory stream CRUD placeholder
-  - indexer freshness classification for `healthy`, `starting`, `stalled`, and `not_configured`
-  - health-route reporting for indexer freshness
-- Explicitly not implemented yet:
-  - a real indexer worker
-  - durable checkpoint persistence
-  - database-backed chain state
-  - automated restart orchestration
-  - rate limiting or duplicate-delivery protection
-
-If the health route reports `indexer.status = "stalled"`, treat that as an operational signal that chain-derived views would be stale if the real indexer were enabled in this service.
-
-## Tech stack
-
-- Node.js 18+
-- TypeScript
-- Express
+- `GET /health` returns service status and indexer freshness classification
+- request IDs enable correlation across logs
+- structured JSON logs are expected for diagnostics
+- if `indexer.status = "stalled"`, treat that as an operational signal that chain-derived views would be stale if the real indexer were enabled in this service
 
 ## Local setup
 
@@ -192,7 +152,7 @@ API runs at [http://localhost:3000](http://localhost:3000).
 
 - `npm run dev` - run with tsx watch
 - `npm run build` - compile to `dist/`
-- `npm test` - run the HTTP error-handling tests
+- `npm test` - run the backend test suite plus webhook signature verification tests
 - `npm start` - run compiled `dist/index.js`
 - `npm run docker:build` - build a production container image
 - `npm run docker:run` - run the production container locally
@@ -255,198 +215,167 @@ curl -sS http://127.0.0.1:3000/health
 - This issue does not resolve all pre-existing TypeScript compilation debt across unrelated modules.
 - Follow-up recommendation: add CI job that builds the image and runs `/health` smoke checks on every PR.
 
-## API overview
+## Local setup with Stellar testnet
 
-| Method | Path               | Description                                                                      |
-| ------ | ------------------ | -------------------------------------------------------------------------------- |
-| GET    | `/`                | API info                                                                         |
-| GET    | `/health`          | Health check                                                                     |
-| GET    | `/api/streams`     | List streams                                                                     |
-| GET    | `/api/streams/:id` | Get one stream                                                                   |
-| POST   | `/api/streams`     | Create stream (body: sender, recipient, depositAmount, ratePerSecond, startTime) |
+This section covers everything needed to run Fluxora locally against the Stellar testnet.
 
-Contract guarantees for this area:
+### What is the Stellar testnet?
 
-## Operational Guidelines
+The Stellar testnet is a public test network that mirrors mainnet behaviour but uses test XLM with no real value. It resets periodically (roughly every 3 months). Horizon testnet endpoint: `https://horizon-testnet.stellar.org`.
 
-### Trust Boundaries
-- **Public API**: The `/api/streams/lookup` endpoint is accessible to any client with stream IDs. Currently, no authentication is enforced.
-- **Failures**: Invalid JSON or missing `ids` array returns `400 Bad Request`. Non-existent IDs are silently omitted from the response to prevent information leakage and ensure robustness for partial matches.
+### Additional prerequisites
 
-### Health and Observability
-- **Success Metrics**: Monitor `200 OK` responses for the lookup endpoint.
-- **Error Monitoring**: Track `400` errors for client integration issues.
-- **Diagnostics**: If streams are not found, verify the stream creation logs or ensure the in-memory state hasn't been reset by a restart.
+- [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) — optional, useful for account inspection
+- A Stellar testnet keypair (see below)
 
-## Project structure
-...
-
-This is sufficient for local diagnosis now. If Redis, PostgreSQL, Horizon RPC, or workers are added later, their outage classifications should be folded into the same logging pattern.
-
-### Verification evidence
-
-Automated tests in `src/app.test.ts` cover:
-
-- normalized `404` for unknown routes
-- normalized `400` for invalid JSON
-- normalized `413` for oversized payloads
-- normalized `400` for route validation failures
-- normalized `500` for unexpected exceptions
-
-Build verification:
+### 1. Copy environment file
 
 ```bash
-npm test
-npm run build
+cp .env.example .env
 ```
 
-### Non-goals and follow-up work
+`.env.example` ships with the testnet defaults already set:
 
-Intentionally deferred in this issue:
+| Variable             | Default value                              | Required |
+|----------------------|--------------------------------------------|----------|
+| `PORT`               | `3000`                                     | No       |
+| `HORIZON_URL`        | `https://horizon-testnet.stellar.org`      | Yes      |
+| `NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015`        | Yes      |
 
-- rate limiting implementation
-- duplicate-submission detection
-- persistence-backed failure classification
-- OpenAPI generation for error schemas
+Do **not** commit `.env` — it is listed in `.gitignore`.
 
-Recommended follow-up issues:
+### 2. Generate a testnet keypair
 
-- add rate limiting that returns normalized `429` errors
-- add idempotency / duplicate-submission protection
-- publish OpenAPI schemas for the normalized error envelope
-- extend dependency-outage classification once real database / indexing integrations land
+You can generate a keypair and fund it with Friendbot in one step:
+
+```bash
+# Using Stellar CLI
+stellar keys generate --network testnet dev-account
+
+# Or using curl (replace with any new keypair)
+curl "https://friendbot.stellar.org?addr=<YOUR_PUBLIC_KEY>"
+```
+
+Alternatively, generate a keypair at [Stellar Laboratory](https://laboratory.stellar.org/#account-creator?network=test) — click **Generate Keypair**, then fund it via the Friendbot button.
+
+> Keep the secret key out of version control. Store it only in `.env` or your local secrets manager.
+
+### 3. Verify the testnet account
+
+```bash
+curl "https://horizon-testnet.stellar.org/accounts/<YOUR_PUBLIC_KEY>" | jq .
+```
+
+A successful response includes `"id"`, `"balances"`, and `"sequence"`. An HTTP 404 means the account is not yet funded — run Friendbot first.
+
+### 4. Install and start the API
+
+```bash
+npm install
+npm run dev
+```
+
+Confirm the server is running:
+
+```bash
+curl http://localhost:3000/health
+# {"status":"ok","service":"fluxora-backend","timestamp":"..."}
+```
+
+### 5. Create a test stream
+
+Sender and recipient must be valid Stellar public keys (G…).
+
+```bash
+curl -X POST http://localhost:3000/api/streams \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    "recipient": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN",
+    "depositAmount": "100",
+    "ratePerSecond": "0.001",
+    "startTime": 1700000000
+  }'
+```
+
+### 6. Query streams
+
+```bash
+# List all streams
+curl http://localhost:3000/api/streams
+
+# Get a specific stream
+curl http://localhost:3000/api/streams/<stream-id>
+```
+
+### Trust boundaries
+
+| Client type         | Allowed                                      | Not allowed                        |
+|---------------------|----------------------------------------------|------------------------------------|
+| Public internet     | Read health, list/get/create streams         | Admin operations, raw DB access    |
+| Authenticated partner | Future: write operations with JWT          | —                                  |
+| Internal workers    | Future: Horizon sync, event processing       | Direct DB writes bypassing API     |
+
+### Failure modes
+
+| Condition                    | Expected behaviour                                        |
+|------------------------------|-----------------------------------------------------------|
+| Missing required body fields | `400` with a descriptive error message                   |
+| Stream ID not found          | `404 { "error": "Stream not found" }`                    |
+| Horizon unreachable          | Future: health check returns `503`; streams degrade gracefully |
+| Invalid Stellar address      | Future: `400` once address validation is added           |
+| Server crash / restart       | In-memory streams are lost (expected until DB is added)  |
+
+### Observability
+
+- `GET /health` — returns `{ status, service, timestamp }`; use this as the liveness probe in any deployment
+- Console logs via `tsx watch` show all request activity in development
+- Future: structured JSON logging and a `/metrics` endpoint
+
+## API overview
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | API info |
+| GET | `/health` | Health check |
+| GET | `/api/streams` | List streams |
+| GET | `/api/streams/:id` | Get one stream |
+| POST | `/api/streams` | Create stream |
 
 ## Project structure
 
 ```text
 src/
-  routes/     # health, streams
-  index.ts    # Express app and server
+  routes/          # health, streams
+  webhooks/        # canonical webhook signing and verification contract
+  index.ts         # Express app and server
 k6/
-  main.js     # k6 entrypoint — composes all scenarios
-  config.js   # Thresholds, stage profiles, base URL
-  helpers.js  # Shared metrics, check utilities, payload generators
-  scenarios/
-    health.js          # GET /health
-    streams-list.js    # GET /api/streams
-    streams-get.js     # GET /api/streams/:id (200 + 404 paths)
-    streams-create.js  # POST /api/streams (valid + edge cases)
+  main.js          # k6 entrypoint — composes scenarios
+  config.js        # thresholds, stage profiles, base URL
+  helpers.js       # shared metrics and payload helpers
+  scenarios/       # per-endpoint load scenarios
 ```
 
 ## Load testing (k6)
 
-The `k6/` directory contains a [k6](https://k6.io/) load-testing harness for all critical endpoints.
+The `k6/` directory contains a load-testing harness for critical endpoints.
 
-### Prerequisites
-
-Install k6 ([docs](https://grafana.com/docs/k6/latest/set-up/install-k6/)):
-
-```bash
-# macOS
-brew install k6
-
-# Windows (winget)
-winget install k6 --source winget
-
-# Windows (choco)
-choco install k6
-
-# Docker
-docker pull grafana/k6
-```
-
-### Running
-
-Start the API in one terminal:
+Common commands:
 
 ```bash
 npm run dev
-```
-
-Run a load test profile in another:
-
-```bash
-# Smoke (default — 5 VUs, 1 min, good for CI)
 npm run k6:smoke
-
-# Load (50 VUs, 5 min)
 npm run k6:load
-
-# Stress (ramp to 200 VUs)
 npm run k6:stress
-
-# Soak (30 VUs, 24 min — memory leak detection)
 npm run k6:soak
 ```
-
-Override the target URL for staging/production:
-
-```bash
-k6 run -e PROFILE=load -e K6_BASE_URL=https://staging.fluxora.io k6/main.js
-```
-
-### Profiles
-
-| Profile | VUs   | Duration | Purpose                          |
-|---------|-------|----------|----------------------------------|
-| smoke   | 5     | 1 min    | CI gate / sanity check           |
-| load    | 50    | 5 min    | Pre-release regression           |
-| stress  | → 200 | 6 min    | Capacity ceiling / breaking point|
-| soak    | 30    | 24 min   | Memory leaks / drift detection   |
-
-### SLO thresholds
-
-| Metric                 | Target         |
-|------------------------|----------------|
-| p(95) response time    | < 500 ms       |
-| p(99) response time    | < 1 000 ms     |
-| Error rate             | < 1 %          |
-| Health p(99) latency   | < 200 ms       |
-
-If any threshold is breached, k6 exits with a non-zero code — suitable for CI gates.
-
-### Scenarios covered
-
-- **health** — `GET /health` readiness probe; must never fail.
-- **streams_list** — `GET /api/streams`; validates JSON array response.
-- **streams_get** — `GET /api/streams/:id`; exercises both 200 (existing) and 404 (missing) paths.
-- **streams_create** — `POST /api/streams`; valid payloads (201) and empty-body edge case.
-
-### Trust boundaries modelled
-
-| Boundary           | Endpoints                            | Notes |
-|--------------------|--------------------------------------|-------|
-| Public internet    | GET /health, GET /api/streams[/:id]  | Read-only, unauthenticated |
-| Partner (future)   | POST /api/streams                    | Auth not yet enforced — tracked as follow-up |
-
-### Failure modes tested
-
-| Mode                    | Expected client behavior           | Covered by        |
-|-------------------------|------------------------------------|--------------------|
-| Missing stream ID       | 404 `{ error: "Stream not found" }`| streams-get        |
-| Empty POST body         | Service defaults fields (201)      | streams-create     |
-| Latency degradation     | Thresholds catch p95/p99 drift     | All scenarios      |
-
-### Intentional non-goals (follow-up)
-
-- **Auth header injection**: No JWT layer yet; will add when auth middleware lands.
-- **Database failure injection**: In-memory store only; re-run after PostgreSQL migration.
-- **Stellar RPC dependency simulation**: Requires contract integration work.
-- **Rate-limiting verification**: Rate limiter not yet implemented.
-
-### Observability / incident diagnosis
-
-Operators can diagnose load-test runs via:
-
-1. **k6 terminal summary** — real-time VU count, latency percentiles, error rate.
-2. **k6 JSON output** — `k6 run --out json=results.json k6/main.js` for post-hoc analysis.
-3. **Grafana Cloud k6** — `k6 cloud k6/main.js` streams results to a dashboard (requires account).
 
 ## Environment
 
 Optional:
 
 - `PORT` - server port, default `3000`
+- `FLUXORA_WEBHOOK_SECRET` - shared secret for webhook signature verification once delivery is enabled
 
 Likely future additions:
 

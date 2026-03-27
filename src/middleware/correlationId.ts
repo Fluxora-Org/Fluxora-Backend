@@ -20,12 +20,11 @@
  */
 
 import { randomUUID } from 'crypto';
-import type { Request, Response, NextFunction } from 'express';
 
 /** Canonical header name used for correlation IDs throughout the service. */
 export const CORRELATION_ID_HEADER = 'x-correlation-id';
 
-export function correlationIdMiddleware(req: Request, res: Response, next: NextFunction): void {
+export function correlationIdMiddleware(req: any, res: any, next: any): void {
   const incoming = req.headers[CORRELATION_ID_HEADER];
   const correlationId =
     typeof incoming === 'string' && incoming.trim().length > 0

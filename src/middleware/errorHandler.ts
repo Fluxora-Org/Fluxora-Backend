@@ -38,7 +38,12 @@ export enum ApiErrorCode {
   DECIMAL_ERROR = 'DECIMAL_ERROR',
   NOT_FOUND = 'NOT_FOUND',
   CONFLICT = 'CONFLICT',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
+  TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  FORBIDDEN = 'FORBIDDEN',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
 }
@@ -91,9 +96,9 @@ function getDecimalErrorApiCode(code: DecimalErrorCode): ApiErrorCode {
  */
 export function errorHandler(
   err: Error,
-  req: Request,
-  res: Response,
-  _next: NextFunction
+  req: any,
+  res: any,
+  _next: any
 ): void {
   const requestId = (req as Request & { id?: string }).id;
 
@@ -144,6 +149,19 @@ export function errorHandler(
     return;
   }
 
+  if ((err as { type?: string }).type === 'entity.too.large') {
+    const response: ApiErrorResponse = {
+      error: {
+        code: ApiErrorCode.PAYLOAD_TOO_LARGE,
+        message: 'Request payload exceeds the configured size limit',
+        requestId,
+      },
+    };
+
+    res.status(413).json(response);
+    return;
+  }
+
   // Handle unknown errors (500)
   logError('Unexpected error occurred', {
     errorName: err.name,
@@ -167,10 +185,10 @@ export function errorHandler(
  * Async handler wrapper to catch errors in async route handlers
  */
 export function asyncHandler(
-  fn: (req: Request, res: Response, next: NextFunction) => Promise<void>
+  fn: (req: any, res: any, next: any) => Promise<void>
 ) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    Promise.resolve(fn(req, res, next)).catch(next);
+  return (req: any, res: any, next: any): void => {
+    Promise.resolve(fn(req, res, next)).catch((error) => next(error));
   };
 }
 
@@ -201,4 +219,16 @@ export function conflictError(message: string, details?: unknown): ApiError {
  */
 export function serviceUnavailable(message: string): ApiError {
   return new ApiError(ApiErrorCode.SERVICE_UNAVAILABLE, message, 503);
+}
+
+export function unauthorized(message: string, details?: unknown): ApiError {
+  return new ApiError(ApiErrorCode.UNAUTHORIZED, message, 401, details);
+}
+
+export function payloadTooLarge(message: string, details?: unknown): ApiError {
+  return new ApiError(ApiErrorCode.PAYLOAD_TOO_LARGE, message, 413, details);
+}
+
+export function tooManyRequests(message: string, details?: unknown): ApiError {
+  return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
 }
