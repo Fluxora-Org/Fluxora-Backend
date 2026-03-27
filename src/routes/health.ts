@@ -1,73 +1,54 @@
-import { Router, Request, Response } from 'express';
+import express from 'express';
+import { ApiError, ApiErrorCode } from '../middleware/errorHandler.js';
 
-import {
-  DEFAULT_INDEXER_STALL_THRESHOLD_MS,
-  assessIndexerHealth,
-} from '../indexer/stall.js';
+export const healthRouter = express.Router();
 
-export const healthRouter = Router();
-
-healthRouter.get('/', (_req: Request, res: Response) => {
+/**
+ * @openapi
+ * /v1/health:
+ *   get:
+ *     summary: Basic health check
+ *     description: Returns the current status of the service and timestamp.
+ *     tags: [Health]
+ *     responses:
+ *       200:
+ *         description: Service is healthy
+ */
+healthRouter.get('/', (req: express.Request, res: express.Response) => {
   res.json({
-    status: indexer.status === 'stalled' || indexer.status === 'starting'
-      ? 'degraded'
-      : 'ok',
+    status: 'ok',
     service: 'fluxora-backend',
     timestamp: new Date().toISOString(),
-    indexer,
   });
 });
 
 /**
- * GET /health/ready - Readiness probe
- * Returns 200 only if all dependencies are healthy
+ * GET /v1/health/ready - Readiness probe
  */
-healthRouter.get('/ready', async (req: Request, res: Response) => {
-  const healthManager = req.app.locals.healthManager as HealthCheckManager;
-  const logger = req.app.locals.logger as Logger;
-  const config = req.app.locals.config as Config;
-
-  try {
-    const report = await healthManager.checkAll();
-
-    if (report.status === 'unhealthy') {
-      logger.warn('Readiness check failed', {
-        dependencies: report.dependencies.map(d => ({
-          name: d.name,
-          status: d.status,
-          error: d.error,
-        })),
-      });
-      return res.status(503).json(report);
-    }
-
-    res.json(report);
-  } catch (err) {
-    logger.error('Readiness check error', err as Error);
-    res.status(503).json({
-      status: 'unhealthy',
-      timestamp: new Date().toISOString(),
-      error: 'Health check failed',
-    });
-  }
+healthRouter.get('/ready', (req: express.Request, res: express.Response) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+  });
 });
 
 /**
- * GET /health/live - Detailed health report
- * Returns current health status and dependency details
+ * GET /v1/health/live - Liveness probe
  */
-healthRouter.get('/live', async (req: Request, res: Response) => {
-  const healthManager = req.app.locals.healthManager as HealthCheckManager;
-  const config = req.app.locals.config as Config;
+healthRouter.get('/live', (req: express.Request, res: express.Response) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+  });
+});
 
-  try {
-    const report = healthManager.getLastReport(config.apiVersion);
-    res.json(report);
-  } catch (err) {
-    res.status(500).json({
-      status: 'unhealthy',
-      timestamp: new Date().toISOString(),
-      error: 'Failed to get health report',
-    });
-  }
+/**
+ * Fallback for unsupported methods on health routes
+ */
+healthRouter.all('*', (req: express.Request, res: express.Response) => {
+  throw new ApiError(
+    ApiErrorCode.METHOD_NOT_ALLOWED,
+    `Method ${req.method} not allowed on ${req.originalUrl}`,
+    405
+  );
 });

@@ -1,4 +1,5 @@
-import { Router, Request, Response } from 'express';
+import express from 'express';
+import { CorrelationIdRequest } from '../middleware/correlationId.js';
 import {
   validateDecimalString,
   validateAmountFields,
@@ -15,17 +16,30 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
 
 /**
  * @openapi
- * /api/streams:
+ * /v1/streams:
  *   get:
- *     summary: List all streams
+ *     summary: List streams (paginated)
  *     description: |
- *       Returns all active streaming payment streams.
+ *       Returns a paginated list of active streaming payment streams.
  *       All amount fields are serialized as decimal strings for precision.
  *     tags:
  *       - streams
+ *     parameters:
+ *       - name: limit
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *         description: Maximum number of streams to return (max 100)
+ *       - name: offset
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *         description: Number of streams to skip
  *     responses:
  *       200:
- *         description: List of streams
+ *         description: Paginated list of streams
  *         content:
  *           application/json:
  *             schema:
@@ -35,8 +49,14 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *                   type: array
  *                   items:
  *                     $ref: '#/components/schemas/Stream'
- *       500:
- *         description: Internal server error
+ *                 total:
+ *                   type: integer
+ *                 limit:
+ *                   type: integer
+ *                 offset:
+ *                   type: integer
+ *       5xx:
+ *         description: Server error
  *         content:
  *           application/json:
  *             schema:
@@ -50,7 +70,7 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *       
  *       **Trust Boundary Note**: Amount fields are validated to ensure no precision
  *       loss when crossing the chain/API boundary. Invalid inputs receive explicit
- *       error responses.
+ *       standardized error responses.
  *     tags:
  *       - streams
  *     requestBody:
@@ -67,13 +87,13 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *             schema:
  *               $ref: '#/components/schemas/Stream'
  *       400:
- *         description: Invalid input
+ *         description: Invalid input (Validation Error)
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
  * 
- * /api/streams/{id}:
+ * /v1/streams/{id}:
  *   get:
  *     summary: Get a stream by ID
  *     description: |
@@ -87,7 +107,7 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *         required: true
  *         schema:
  *           type: string
- *         description: Stream identifier
+ *         description: Stream identifier (starts with 'stream-')
  *     responses:
  *       200:
  *         description: Stream details
@@ -214,9 +234,9 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *               description: Request identifier for tracing
  */
 
-import { ApiError } from '../errors.js';
+// Already imported from errorHandler.ts
 
-export const streamsRouter = Router();
+export const streamsRouter = express.Router();
 
 // Amount fields that must be decimal strings per serialization policy
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
@@ -239,13 +259,20 @@ const streams: Array<{
  */
 streamsRouter.get(
   '/',
-  asyncHandler(async (_req: Request, res: Response) => {
-    info('Listing all streams', { count: streams.length });
-    debug('Streams retrieved', { streams: streams.length });
+  asyncHandler(async (req: CorrelationIdRequest, res: express.Response) => {
+    const requestId = req.id;
+    const limit = Math.min(parseInt(String(req.query.limit ?? '50'), 10), 100);
+    const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10), 0);
+
+    info('Listing streams', { count: streams.length, limit, offset, requestId });
+
+    const paginatedStreams = streams.slice(offset, offset + limit);
 
     res.json({
-      streams,
+      streams: paginatedStreams,
       total: streams.length,
+      limit,
+      offset,
     });
   })
 );
@@ -256,9 +283,9 @@ streamsRouter.get(
  */
 streamsRouter.get(
   '/:id',
-  asyncHandler(async (req: Request, res: Response) => {
+  asyncHandler(async (req: CorrelationIdRequest, res: express.Response) => {
     const { id } = req.params;
-    const requestId = (req as Request & { id?: string }).id;
+    const requestId = req.id;
 
     debug('Fetching stream', { id, requestId });
 
@@ -278,19 +305,19 @@ streamsRouter.get(
  */
 streamsRouter.post(
   '/',
-  asyncHandler(async (req: Request, res: Response) => {
+  asyncHandler(async (req: CorrelationIdRequest, res: express.Response) => {
     const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = req.body ?? {};
-    const requestId = (req as Request & { id?: string }).id;
+    const requestId = req.id;
 
     info('Creating new stream', { requestId });
 
     // Validate required string fields
     if (typeof sender !== 'string' || sender.trim() === '') {
-      throw validationError('sender must be a non-empty string');
+      throw validationError('sender must be a non-empty string', { field: 'sender', requestId });
     }
 
     if (typeof recipient !== 'string' || recipient.trim() === '') {
-      throw validationError('recipient must be a non-empty string');
+      throw validationError('recipient must be a non-empty string', { field: 'recipient', requestId });
     }
 
     // Validate amount fields against decimal string policy
@@ -320,42 +347,57 @@ streamsRouter.post(
             code: e.code,
             message: e.message,
           })),
+          requestId,
         }
       );
     }
 
     // Additional semantic validation
-    const depositResult = validateDecimalString(depositAmount, 'depositAmount');
-    const validatedDepositAmount = depositResult.valid && depositResult.value
-      ? depositResult.value
-      : '0'; // Default to '0' for missing values
-    
-    // Only validate semantic constraints for provided values
-    if (depositAmount !== undefined && depositAmount !== null) {
-      const depositNum = parseFloat(validatedDepositAmount);
-      if (depositNum <= 0) {
-        throw validationError('depositAmount must be greater than zero');
+    let validatedDepositAmount: string;
+    try {
+      const depositResult = validateDecimalString(depositAmount, 'depositAmount');
+      validatedDepositAmount = depositResult.valid && depositResult.value
+        ? depositResult.value
+        : '0';
+      
+      if (depositAmount !== undefined && depositAmount !== null) {
+        const depositNum = parseFloat(validatedDepositAmount);
+        if (depositNum <= 0) {
+          throw validationError('depositAmount must be greater than zero', { field: 'depositAmount', requestId });
+        }
       }
+    } catch (e) {
+      if (e instanceof DecimalSerializationError) {
+        throw validationError(e.message, { field: e.field, requestId });
+      }
+      throw e;
     }
 
-    const rateResult = validateDecimalString(ratePerSecond, 'ratePerSecond');
-    const validatedRatePerSecond = rateResult.valid && rateResult.value
-      ? rateResult.value
-      : '0'; // Default to '0' for missing values
-    
-    // Only validate semantic constraints for provided values
-    if (ratePerSecond !== undefined && ratePerSecond !== null) {
-      const rateNum = parseFloat(validatedRatePerSecond);
-      if (rateNum < 0) {
-        throw validationError('ratePerSecond cannot be negative');
+    let validatedRatePerSecond: string;
+    try {
+      const rateResult = validateDecimalString(ratePerSecond, 'ratePerSecond');
+      validatedRatePerSecond = rateResult.valid && rateResult.value
+        ? rateResult.value
+        : '0';
+      
+      if (ratePerSecond !== undefined && ratePerSecond !== null) {
+        const rateNum = parseFloat(validatedRatePerSecond);
+        if (rateNum < 0) {
+          throw validationError('ratePerSecond cannot be negative', { field: 'ratePerSecond', requestId });
+        }
       }
+    } catch (e) {
+      if (e instanceof DecimalSerializationError) {
+        throw validationError(e.message, { field: e.field, requestId });
+      }
+      throw e;
     }
 
     // Validate startTime if provided
     let validatedStartTime = Math.floor(Date.now() / 1000);
     if (startTime !== undefined) {
       if (typeof startTime !== 'number' || !Number.isInteger(startTime) || startTime < 0) {
-        throw validationError('startTime must be a non-negative integer');
+        throw validationError('startTime must be a non-negative integer', { field: 'startTime', requestId });
       }
       validatedStartTime = startTime;
     }
@@ -364,7 +406,7 @@ streamsRouter.post(
     let validatedEndTime = 0;
     if (endTime !== undefined) {
       if (typeof endTime !== 'number' || !Number.isInteger(endTime) || endTime < 0) {
-        throw validationError('endTime must be a non-negative integer');
+        throw validationError('endTime must be a non-negative integer', { field: 'endTime', requestId });
       }
       validatedEndTime = endTime;
     }
@@ -401,11 +443,14 @@ streamsRouter.post(
  */
 streamsRouter.delete(
   '/:id',
-  asyncHandler(async (req: Request, res: Response) => {
+  asyncHandler(async (req: CorrelationIdRequest, res: express.Response) => {
     const { id } = req.params;
-    const requestId = (req as Request & { id?: string }).id;
+    const requestId = req.id;
 
     debug('Deleting stream', { id, requestId });
+
+    // In a real implementation, we would cancel the stream on-chain
+    // or mark it as cancelled in the database.
 
     const index = streams.findIndex((s) => s.id === id);
 
