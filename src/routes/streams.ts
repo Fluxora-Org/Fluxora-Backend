@@ -11,7 +11,8 @@ import {
   serviceUnavailable,
   asyncHandler,
 } from '../middleware/errorHandler.js';
-import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
+import { requireAuth } from '../middleware/auth.js';
+import { SerializationLogger, info, debug } from '../utils/logger.js';
 
 /**
  * @openapi
@@ -294,6 +295,8 @@ import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
  *               type: string
  *               description: Request identifier for tracing
  */
+
+import { ApiError } from '../errors.js';
 
 export const streamsRouter = Router();
 
@@ -617,7 +620,9 @@ streamsRouter.get(
  */
 streamsRouter.post(
   '/',
-  asyncHandler(async (req: any, res: any) => {
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = req.body ?? {};
     const requestId = (req as { id?: string }).id;
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
 
@@ -721,7 +726,8 @@ streamsRouter.post(
  */
 streamsRouter.delete(
   '/:id',
-  asyncHandler(async (req: any, res: any) => {
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
     const requestId = (req as { id?: string }).id;
 
