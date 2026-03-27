@@ -5,12 +5,15 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "node --import tsx --test src/**/*.test.ts",
     "start": "node dist/index.js",
+    "start:tsx": "node --import tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
-    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
-    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs",
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --coverage",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --watch",
+    "docker:build": "docker build -t fluxora-backend:local .",
+    "docker:run": "docker run --rm -p 3000:3000 --name fluxora-backend fluxora-backend:local",
+    "docker:smoke": "docker run --rm -d --name fluxora-backend-smoke -p 3000:3000 fluxora-backend:local && sleep 3 && curl -fsS http://127.0.0.1:3000/health && docker stop fluxora-backend-smoke"
   },
   "dependencies": {
     "express": "^4.18.2"

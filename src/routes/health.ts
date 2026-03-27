@@ -8,6 +8,14 @@ import {
 export const healthRouter = Router();
 
 healthRouter.get('/', (_req: Request, res: Response) => {
+  const indexer = assessIndexerHealth({
+    enabled: process.env.INDEXER_ENABLED === 'true',
+    lastSuccessfulSyncAt: process.env.INDEXER_LAST_SYNC_AT,
+    stallThresholdMs: process.env.INDEXER_STALL_THRESHOLD_MS
+      ? Number(process.env.INDEXER_STALL_THRESHOLD_MS)
+      : DEFAULT_INDEXER_STALL_THRESHOLD_MS,
+  });
+
   res.json({
     status: indexer.status === 'stalled' || indexer.status === 'starting'
       ? 'degraded'

@@ -128,6 +128,66 @@ API runs at [http://localhost:3000](http://localhost:3000).
 - `npm run build` - compile to `dist/`
 - `npm test` - run the HTTP error-handling tests
 - `npm start` - run compiled `dist/index.js`
+- `npm run docker:build` - build a production container image
+- `npm run docker:run` - run the production container locally
+- `npm run docker:smoke` - run a quick container health smoke check
+
+## Production Docker Image (Issue #30)
+
+### Service-level outcomes
+
+- The backend can be packaged and started in a reproducible production image with a single command.
+- The container runs as a non-root user and exposes only one HTTP port (`3000` by default).
+- Operators get a built-in container health signal via Docker `HEALTHCHECK` against `GET /health`.
+- Startup behavior is explicit: the process fails fast if the app cannot boot.
+
+### Trust boundaries for containerized runtime
+
+- Public internet clients: may call read/write API routes (`/`, `/health`, `/api/streams/**`) and receive normalized JSON responses.
+- Authenticated partners: currently same HTTP capabilities as public clients (authentication is intentionally deferred and documented).
+- Administrators/operators: may configure runtime through environment variables (`PORT`, `LOG_LEVEL`, `INDEXER_*`) and observe health/log output.
+- Internal workers: represented by indexer health classification in `/health`; workers are not container-exposed endpoints.
+
+### Failure modes and client-visible behavior
+
+- Invalid input: returns `400` error envelopes from validation middleware.
+- Dependency outage or stale worker checkpoint: `/health` reports `degraded` when indexer is `starting` or `stalled`.
+- Partial data / missing stream: stream lookups return `404` (`NOT_FOUND`) when absent.
+- Duplicate delivery/conflicting transitions: stream cancel path returns `409` (`CONFLICT`) for already-cancelled/completed streams.
+- Process-level failure (boot error/panic): container exits non-zero so orchestrators can restart or alert.
+
+### Operator observability and diagnostics
+
+- Health endpoint: `GET /health` for liveness/degraded state, includes indexer freshness summary.
+- Container health: Docker health status reflects HTTP health response.
+- Logs: structured console logs include request metadata and request/correlation IDs for incident correlation.
+- Triage flow:
+  - Check `docker ps` health status.
+  - Query `/health` and confirm `indexer.status`, `lagMs`, and `summary`.
+  - Inspect container logs for request/error context.
+
+### Verification evidence for this issue
+
+Run the following commands:
+
+```bash
+npm run docker:build
+npm run docker:smoke
+```
+
+Optional manual verification:
+
+```bash
+docker run --rm -p 3000:3000 fluxora-backend:local
+curl -sS http://127.0.0.1:3000/health
+```
+
+### Non-goals and follow-up tracking
+
+- This issue does not introduce authentication/authorization for containerized endpoints.
+- This issue does not add database/Redis/Stellar readiness gating to container startup.
+- This issue does not resolve all pre-existing TypeScript compilation debt across unrelated modules.
+- Follow-up recommendation: add CI job that builds the image and runs `/health` smoke checks on every PR.
 
 ## API overview
 
