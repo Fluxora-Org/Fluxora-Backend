@@ -6,11 +6,12 @@
  * which TypeScript 5.x drops when the interface is declared as an empty
  * extension of core.NextFunction.
  */
-import * as core from 'express-serve-static-core';
+import { UserPayload } from '../lib/auth.js';
 
 declare module 'express-serve-static-core' {
   interface Request {
     correlationId: string;
+    user?: UserPayload;
   }
 }
 

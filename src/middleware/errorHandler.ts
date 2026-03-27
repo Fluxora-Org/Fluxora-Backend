@@ -11,7 +11,12 @@ export enum ApiErrorCode {
   DECIMAL_ERROR = 'DECIMAL_ERROR',
   NOT_FOUND = 'NOT_FOUND',
   CONFLICT = 'CONFLICT',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
+  TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  FORBIDDEN = 'FORBIDDEN',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
 }
@@ -28,8 +33,46 @@ export class ApiError extends Error {
   }
 }
 
-export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction): void {
-  const requestId: string | undefined = req.correlationId;
+/**
+ * Get HTTP status code for decimal error codes
+ */
+function getDecimalErrorStatus(code: DecimalErrorCode): number {
+  switch (code) {
+    case DecimalErrorCode.INVALID_TYPE:
+    case DecimalErrorCode.INVALID_FORMAT:
+    case DecimalErrorCode.EMPTY_VALUE:
+      return 400; // Bad Request
+    case DecimalErrorCode.OUT_OF_RANGE:
+      return 400; // Bad Request
+    case DecimalErrorCode.PRECISION_LOSS:
+      return 400; // Bad Request
+    default:
+      return 400;
+  }
+}
+
+/**
+ * Get API error code for decimal error codes
+ */
+function getDecimalErrorApiCode(code: DecimalErrorCode): ApiErrorCode {
+  return ApiErrorCode.DECIMAL_ERROR;
+}
+
+/**
+ * Express error handler middleware
+ * 
+ * Catches all errors and returns a consistent JSON response.
+ * All errors are logged with sufficient context for diagnosis.
+ */
+export function errorHandler(
+  err: Error,
+  req: any,
+  res: any,
+  _next: any
+): void {
+  const requestId = (req as Request & { id?: string }).id;
+
+  // Handle DecimalSerializationError
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
     res.status(400).json({ error: { code: ApiErrorCode.DECIMAL_ERROR, message: err.message, details: { decimalErrorCode: err.code, field: err.field }, requestId } });
@@ -40,13 +83,48 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     res.status(err.statusCode).json({ error: { code: err.code, message: err.message, details: err.details, requestId } });
     return;
   }
-  const e = err instanceof Error ? err : new Error(String(err));
-  logError('Unexpected error', { errorName: e.name, errorMessage: e.message, stack: e.stack, requestId });
-  res.status(500).json({ error: { code: ApiErrorCode.INTERNAL_ERROR, message: 'An unexpected error occurred.', requestId } });
+
+  if ((err as { type?: string }).type === 'entity.too.large') {
+    const response: ApiErrorResponse = {
+      error: {
+        code: ApiErrorCode.PAYLOAD_TOO_LARGE,
+        message: 'Request payload exceeds the configured size limit',
+        requestId,
+      },
+    };
+
+    res.status(413).json(response);
+    return;
+  }
+
+  // Handle unknown errors (500)
+  logError('Unexpected error occurred', {
+    errorName: err.name,
+    errorMessage: err.message,
+    stack: err.stack,
+    requestId,
+  });
+
+  const response: ApiErrorResponse = {
+    error: {
+      code: ApiErrorCode.INTERNAL_ERROR,
+      message: 'An unexpected error occurred. Please try again later.',
+      requestId,
+    },
+  };
+
+  res.status(500).json(response);
 }
 
-export function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<void>): (req: Request, res: Response, next: NextFunction) => void {
-  return (req, res, next) => { fn(req, res, next).catch(next); };
+/**
+ * Async handler wrapper to catch errors in async route handlers
+ */
+export function asyncHandler(
+  fn: (req: any, res: any, next: any) => Promise<void>
+) {
+  return (req: any, res: any, next: any): void => {
+    Promise.resolve(fn(req, res, next)).catch((error) => next(error));
+  };
 }
 
 export function notFound(resource: string, id?: string): ApiError {
@@ -63,4 +141,16 @@ export function conflictError(message: string, details?: unknown): ApiError {
 
 export function serviceUnavailable(message: string): ApiError {
   return new ApiError(ApiErrorCode.SERVICE_UNAVAILABLE, message, 503);
+}
+
+export function unauthorized(message: string, details?: unknown): ApiError {
+  return new ApiError(ApiErrorCode.UNAUTHORIZED, message, 401, details);
+}
+
+export function payloadTooLarge(message: string, details?: unknown): ApiError {
+  return new ApiError(ApiErrorCode.PAYLOAD_TOO_LARGE, message, 413, details);
+}
+
+export function tooManyRequests(message: string, details?: unknown): ApiError {
+  return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
 }
