@@ -242,12 +242,18 @@ streamsRouter.get(
   '/',
   asyncHandler(async (req: CorrelationIdRequest, res: express.Response) => {
     const requestId = req.id;
-    info('Listing all streams', { count: streams.length, requestId });
-    debug('Streams retrieved', { streams: streams.length, requestId });
+    const limit = Math.min(parseInt(String(req.query.limit ?? '50'), 10), 100);
+    const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10), 0);
+
+    info('Listing streams', { count: streams.length, limit, offset, requestId });
+
+    const paginatedStreams = streams.slice(offset, offset + limit);
 
     res.json({
-      streams,
+      streams: paginatedStreams,
       total: streams.length,
+      limit,
+      offset,
     });
   })
 );
