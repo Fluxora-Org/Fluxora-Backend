@@ -59,7 +59,45 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *       content:
  *         application/json:
  *           schema:
- *             $ref: '#/components/schemas/StreamCreateRequest'
+ *             type: object
+ *             required:
+ *               - transactionHash
+ *               - sender
+ *               - recipient
+ *               - depositAmount
+ *               - ratePerSecond
+ *             properties:
+ *               transactionHash:
+ *                 type: string
+ *                 description: Stellar transaction hash for the stream creation
+ *                 example: "a1b2c3d4..."
+ *               sender:
+ *                 type: string
+ *                 description: Stellar account address of the sender
+ *                 example: "GCSX2..."
+ *               recipient:
+ *                 type: string
+ *                 description: Stellar account address of the recipient
+ *                 example: "GDRX2..."
+ *               depositAmount:
+ *                 type: string
+ *                 description: |
+ *                   Total deposit amount. Must be a decimal string.
+ *                   Example: "1000000.0000000" for 1 million XLM with 7 decimal places.
+ *                 pattern: '^[+-]?\d+(\.\d+)?$'
+ *                 example: "1000000.0000000"
+ *               ratePerSecond:
+ *                 type: string
+ *                 description: |
+ *                   Streaming rate per second as a decimal string.
+ *                   For 1 XLM/day, use "0.0000116" (with 7 decimal precision).
+ *                 pattern: '^[+-]?\d+(\.\d+)?$'
+ *                 example: "0.0000116"
+ *               startTime:
+ *                 type: integer
+ *                 format: int64
+ *                 description: Unix timestamp when the stream should start (optional, defaults to now)
+ *                 example: 1709123456
  *     responses:
  *       201:
  *         description: Stream created successfully
@@ -215,7 +253,7 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *               description: Request identifier for tracing
  */
 
-import { ApiError } from '../errors.js';
+import { verifyStreamOnChain } from '../lib/stellar.js';
 
 export const streamsRouter = Router();
 
@@ -275,120 +313,42 @@ streamsRouter.get(
 
 /**
  * POST /api/streams
- * Create a new stream with decimal string validation
+ * Create a new stream from a verified on-chain transaction
  */
 streamsRouter.post(
   '/',
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = req.body ?? {};
+    const { transactionHash } = req.body ?? {};
     const requestId = (req as Request & { id?: string }).id;
 
-    info('Creating new stream', { requestId });
-
-    // Validate required string fields
-    if (typeof sender !== 'string' || sender.trim() === '') {
-      throw validationError('sender must be a non-empty string');
+    if (!transactionHash) {
+      throw validationError('transactionHash is required');
     }
 
-    if (typeof recipient !== 'string' || recipient.trim() === '') {
-      throw validationError('recipient must be a non-empty string');
-    }
+    info('Verifying on-chain stream', { transactionHash, requestId });
 
-    // Validate amount fields against decimal string policy
-    const amountValidation = validateAmountFields(
-      { depositAmount, ratePerSecond } as Record<string, unknown>,
-      AMOUNT_FIELDS as unknown as string[]
-    );
+    // Trust boundary: Verify the transaction on Stellar
+    const verifiedStream = await verifyStreamOnChain(transactionHash);
 
-    if (!amountValidation.valid) {
-      // Log validation failures for diagnostics
-      for (const err of amountValidation.errors) {
-        SerializationLogger.validationFailed(
-          err.field || 'unknown',
-          err.rawValue,
-          err.code,
-          requestId
-        );
-      }
-
-      throw new ApiError(
-        ApiErrorCode.VALIDATION_ERROR,
-        'Invalid decimal string format for amount fields',
-        400,
-        {
-          errors: amountValidation.errors.map((e) => ({
-            field: e.field,
-            code: e.code,
-            message: e.message,
-          })),
-        }
-      );
-    }
-
-    // Additional semantic validation
-    const depositResult = validateDecimalString(depositAmount, 'depositAmount');
-    const validatedDepositAmount = depositResult.valid && depositResult.value
-      ? depositResult.value
-      : '0'; // Default to '0' for missing values
-    
-    // Only validate semantic constraints for provided values
-    if (depositAmount !== undefined && depositAmount !== null) {
-      const depositNum = parseFloat(validatedDepositAmount);
-      if (depositNum <= 0) {
-        throw validationError('depositAmount must be greater than zero');
-      }
-    }
-
-    const rateResult = validateDecimalString(ratePerSecond, 'ratePerSecond');
-    const validatedRatePerSecond = rateResult.valid && rateResult.value
-      ? rateResult.value
-      : '0'; // Default to '0' for missing values
-    
-    // Only validate semantic constraints for provided values
-    if (ratePerSecond !== undefined && ratePerSecond !== null) {
-      const rateNum = parseFloat(validatedRatePerSecond);
-      if (rateNum < 0) {
-        throw validationError('ratePerSecond cannot be negative');
-      }
-    }
-
-    // Validate startTime if provided
-    let validatedStartTime = Math.floor(Date.now() / 1000);
-    if (startTime !== undefined) {
-      if (typeof startTime !== 'number' || !Number.isInteger(startTime) || startTime < 0) {
-        throw validationError('startTime must be a non-negative integer');
-      }
-      validatedStartTime = startTime;
-    }
-
-    // Validate endTime if provided
-    let validatedEndTime = 0;
-    if (endTime !== undefined) {
-      if (typeof endTime !== 'number' || !Number.isInteger(endTime) || endTime < 0) {
-        throw validationError('endTime must be a non-negative integer');
-      }
-      validatedEndTime = endTime;
-    }
-
-    // Create the stream with validated decimal strings
-    const id = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    // Create the internal record from on-chain evidence
+    const id = `stream-${transactionHash.slice(0, 8)}`;
     const stream = {
       id,
-      sender: sender.trim(),
-      recipient: recipient.trim(),
-      depositAmount: validatedDepositAmount,
-      ratePerSecond: validatedRatePerSecond,
-      startTime: validatedStartTime,
-      endTime: validatedEndTime,
+      ...verifiedStream,
       status: 'active',
     };
 
+    // Check for duplicate (idempotency)
+    const existing = streams.find(s => s.id === id);
+    if (existing) {
+      res.status(200).json(existing);
+      return;
+    }
+
     streams.push(stream);
 
-    SerializationLogger.amountSerialized(2, requestId);
-    info('Stream created', { id, requestId });
-
+    info('Stream verified and indexed', { id, transactionHash, requestId });
     res.status(201).json(stream);
   })
 );

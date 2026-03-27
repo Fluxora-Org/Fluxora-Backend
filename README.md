@@ -58,9 +58,17 @@ Serialization events are logged with context for debugging:
 Decimal validation failed {"field":"depositAmount","errorCode":"DECIMAL_INVALID_TYPE","requestId":"..."}
 ```
 
+#### Chain-First Model
+
+Fluxora-Backend follows a "chain-first" model. The Stellar blockchain is the authoritative source of truth for all stream data.
+
+- `POST /api/streams` requires a valid `transactionHash`.
+- The backend verifies the transaction on-chain before indexing the stream.
+- In-memory state (and future DB state) is a faithful reflection of verified on-chain events.
+
 #### Health Observability
 
-- `GET /health` - Returns service health status
+- `GET /health` - Returns service health status including Horizon (Stellar) connectivity
 - Request IDs enable correlation across logs
 - Structured JSON logs for log aggregation systems
 
@@ -321,20 +329,19 @@ Operators can diagnose load-test runs via:
 2. **k6 JSON output** — `k6 run --out json=results.json k6/main.js` for post-hoc analysis.
 3. **Grafana Cloud k6** — `k6 cloud k6/main.js` streams results to a dashboard (requires account).
 
+## Chain-First Model
+
 ## Environment
 
 Optional:
 
-- `PORT` - server port, default `3000`
-
-Likely future additions:
-
-- `DATABASE_URL`
-- `REDIS_URL`
-- `HORIZON_URL`
-- `JWT_SECRET`
+- `PORT` — Server port (default: 3000)
+- `HORIZON_URL` — Stellar Horizon RPC URL (default: `https://horizon-testnet.stellar.org`)
+- `JWT_SECRET` — Secret for signing session tokens (Required for production)
+- `LOG_LEVEL` — Logging verbosity (`ERROR`, `WARN`, `INFO`, `DEBUG`)
 
 ## Related repos
 
 - `fluxora-frontend` - dashboard and recipient UI
 - `fluxora-contracts` - Soroban smart contracts
+```

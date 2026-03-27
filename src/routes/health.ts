@@ -1,4 +1,8 @@
 import { Router, Request, Response } from 'express';
+import { checkHorizonHealth } from '../lib/stellar.js';
+import { HealthCheckManager } from '../config/health.js';
+import { Config } from '../config/env.js';
+import { Logger } from '../config/logger.js';
 
 import {
   DEFAULT_INDEXER_STALL_THRESHOLD_MS,
@@ -7,14 +11,25 @@ import {
 
 export const healthRouter = Router();
 
-healthRouter.get('/', (_req: Request, res: Response) => {
+healthRouter.get('/', async (_req: Request, res: Response) => {
+  const jwtSecretConfigured = !!process.env.JWT_SECRET;
+  const horizonHealthy = await checkHorizonHealth();
+  
   res.json({
-    status: indexer.status === 'stalled' || indexer.status === 'starting'
-      ? 'degraded'
-      : 'ok',
+    status: horizonHealthy ? 'ok' : 'degraded',
     service: 'fluxora-backend',
     timestamp: new Date().toISOString(),
-    indexer,
+    subsystems: {
+      auth: {
+        status: jwtSecretConfigured ? 'ok' : 'degraded',
+        configured: jwtSecretConfigured,
+        message: jwtSecretConfigured ? 'JWT initialized' : 'Using default development secret',
+      },
+      horizon: {
+        status: horizonHealthy ? 'ok' : 'error',
+        url: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
+      }
+    }
   });
 });
 
@@ -32,7 +47,7 @@ healthRouter.get('/ready', async (req: Request, res: Response) => {
 
     if (report.status === 'unhealthy') {
       logger.warn('Readiness check failed', {
-        dependencies: report.dependencies.map(d => ({
+        dependencies: report.dependencies.map((d: any) => ({
           name: d.name,
           status: d.status,
           error: d.error,
