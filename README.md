@@ -1,6 +1,4 @@
-# Fluxora Backend
-
-Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. For Issue 54, the service now defines a concrete indexer-stall health classification plus an inline incident runbook so operators can reason about stale chain-derived state without relying on tribal knowledge.
+Express + TypeScript API for the Fluxora treasury streaming protocol. This service implements **API Versioning (/v1)** and a formal **Deprecation Policy** to ensure operator-grade reliability and predictable client transitions.
 
 ## Decimal String Serialization Policy
 
@@ -57,9 +55,37 @@ Decimal validation failed {"field":"depositAmount","errorCode":"DECIMAL_INVALID_
 
 #### Health Observability
 
-- `GET /health` - Returns service health status
-- Request IDs enable correlation across logs
+- `GET /v1/health` - Basic health check
+- `GET /v1/health/ready` - Readiness probe (for Kubernetes/Load Balancers)
+- `GET /v1/health/live` - Liveness probe
+- Request IDs (`x-correlation-id`) enable correlation across logs
 - Structured JSON logs for log aggregation systems
+
+## API Versioning & Deprecation Policy
+
+### Versioning Scheme
+The API follows a URL-based versioning scheme: `/v[N]`.
+- Existing production version: `/v1`
+- All new features and breaking changes are introduced in a new version increment.
+
+### Deprecation Policy
+- **Support Window**: `vN` is supported until `vN+2` is released or for 12 months, whichever is later.
+- **Headers**: Deprecated endpoints return a `Deprecation: true` header and a `Link` header pointing to the successor.
+- **Transitions**: The `/api` legacy namespace is aliased to `/v1` but marked as deprecated.
+
+### Error Envelope Standards
+All errors (4xx/5xx) return a consistent JSON payload:
+```json
+{
+  "error": {
+    "code": "API_ERROR_CODE",
+    "message": "Human readable message",
+    "status": 400,
+    "requestId": "uuid-v4",
+    "details": { "..." }
+  }
+}
+```
 
 #### Verification Commands
 
@@ -131,13 +157,16 @@ API runs at [http://localhost:3000](http://localhost:3000).
 
 ## API overview
 
-| Method | Path               | Description                                                                      |
-| ------ | ------------------ | -------------------------------------------------------------------------------- |
-| GET    | `/`                | API info                                                                         |
-| GET    | `/health`          | Health check                                                                     |
-| GET    | `/api/streams`     | List streams                                                                     |
-| GET    | `/api/streams/:id` | Get one stream                                                                   |
-| POST   | `/api/streams`     | Create stream (body: sender, recipient, depositAmount, ratePerSecond, startTime) |
+| Method | Path             | Description                                                                    |
+| ------ | ---------------- | ------------------------------------------------------------------------------ |
+| GET    | `/`              | API Discovery & Discovery                                                      |
+| GET    | `/v1/health`     | Health check                                                                   |
+| GET    | `/v1/streams`    | List streams                                                                   |
+| GET    | `/v1/streams/:id`| Get one stream                                                                 |
+| POST   | `/v1/streams`    | Create stream (body: sender, recipient, depositAmount, ratePerSecond, startTime) |
+
+> [!NOTE]
+> Legacy paths like `/api/streams` are deprecated and will be removed in a future release. Please migrate to `/v1/streams`.
 
 Contract guarantees for this area:
 
