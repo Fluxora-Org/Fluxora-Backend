@@ -332,6 +332,48 @@ curl http://localhost:3000/api/streams/<stream-id>
 - Console logs via `tsx watch` show all request activity in development
 - Future: structured JSON logging and a `/metrics` endpoint
 
+## Database Backups and Restore Runbook (Issue #52)
+
+### Service-level outcomes
+- The backend guarantees a durable, restorable view of chain-derived state using PostgreSQL custom-format dumps.
+- Backup operations execute without halting read/write API availability.
+- Restore operations execute with a `--clean` flag, guaranteeing the database state exactly matches the backup snapshot, avoiding partial data overlaps.
+
+### Trust boundaries
+| Actor | Allowed | Not allowed |
+|-------|---------|-------------|
+| Public internet clients | No access | Cannot trigger, view, or detect backup/restore operations. |
+| Authenticated partners | No access | Cannot trigger or download backups. |
+| Internal workers (Cron) | Execute `backupDatabase` routine securely using local FS | Cannot execute restores or drop tables directly. |
+| Administrators / operators | Execute `restoreDatabase` during incident response, download dumps from cold storage | Leaving unencrypted dumps on public web servers. |
+
+### Failure modes and expected behavior
+
+| Condition | Expected result | System Behavior |
+|-----------|-----------------|-----------------|
+| `DATABASE_URL` missing or malformed | Immediate failure before subprocess spawns | `success: false` returned, no partial files created. |
+| DB credentials invalid/revoked | Subprocess fails with authentication error | Returns `Backup failed` with `stderr` detail for logs. |
+| Disk out of space during backup | `pg_dump` panics mid-stream | Incomplete file remains; operation returns error. Operators must monitor FS capacity. |
+| Corrupted or invalid dump file provided to restore | `pg_restore` rejects the archive format | Returns `Restore failed`. Database state remains unchanged (clean drop does not execute). |
+
+### Operator observability and diagnostics
+Operators can diagnose backup/restore health without relying on tribal knowledge:
+- **Routine Backups:** The backup routine outputs structured JSON containing `{ success: boolean, message: string, error?: string }`.
+- **Triage Flow (Backup Failure):**
+  1. Check disk space on the volume mapped to the output path.
+  2. Verify `DATABASE_URL` validity using `psql`.
+  3. Check the `error` string in the logs for `pg_dump` specific stderr (e.g., `FATAL: connection limit exceeded`).
+- **Triage Flow (Restore Failure):**
+  1. Ensure the target DB has active connections terminated before running a `--clean` restore.
+  2. Verify the input file was generated using custom format (`-F c`), as plain SQL dumps will fail `pg_restore`.
+
+### Verification evidence
+Automated unit tests (`tests/db-ops.test.ts`) assert the boundaries of the `pg_dump` and `pg_restore` wrappers, including credential failures and missing configurations. 
+
+### Non-goals and follow-up tracking
+- **Intentionally deferred:** Automated scheduling (e.g., node-cron) is deferred until persistent volume claims (PVCs) or S3 streaming targets are provisioned in the deployment orchestration.
+- **Follow-up:** Add an S3 upload stream integration so dumps don't remain local to the container filesystem.
+
 ## API overview
 
 | Method | Path | Description |
