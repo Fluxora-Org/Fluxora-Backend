@@ -6,17 +6,13 @@
  *
  * Behaviour:
  * - If the incoming request carries an `x-correlation-id` header with a
- *   non-empty string value, that value is reused (allows clients and upstream
- *   proxies to propagate their own IDs).
+ *   non-empty string value, that value is reused.
  * - Otherwise a new UUID v4 is generated via `crypto.randomUUID()`.
  *
- * The resolved ID is:
- * - Written to `req.correlationId` for downstream handlers and middleware.
- * - Echoed back in the `x-correlation-id` response header so clients can
- *   reference it in support or audit requests.
+ * The resolved ID is written to `req.correlationId` and echoed back in the
+ * `x-correlation-id` response header.
  *
- * Trust boundary: the header value from public-internet clients is accepted
- * as-is for tracing but is never used for authentication or authorisation.
+ * Trust boundary: accepted as-is for tracing only — never used for auth.
  */
 
 import { randomUUID } from 'crypto';

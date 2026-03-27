@@ -13,6 +13,10 @@ import {
 
 describe('Validation Module', () => {
     describe('validateStellarAddress', () => {
+        // Valid Stellar public key: G + exactly 55 chars from [A-Z2-7]
+        const VALID_ADDR_A = 'G' + 'A'.repeat(55);
+        const VALID_ADDR_B = 'G' + 'B'.repeat(55);
+
         it('should accept valid Stellar address', () => {
             const address = 'GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX';
             expect(validateStellarAddress(address)).toBe(address);
@@ -85,6 +89,8 @@ describe('Validation Module', () => {
     });
 
     describe('validateCreateStreamRequest', () => {
+        const VALID_ADDR_A = 'G' + 'A'.repeat(55);
+        const VALID_ADDR_B = 'G' + 'B'.repeat(55);
         const validRequest = {
             sender: 'GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX',
             recipient: 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX',

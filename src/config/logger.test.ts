@@ -6,7 +6,7 @@ import {
     getLogger,
     resetLogger,
     LogLevel,
-} from './logger';
+} from './logger.js';
 
 describe('Logger Module', () => {
     let originalLog: any;

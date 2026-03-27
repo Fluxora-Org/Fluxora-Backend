@@ -1,8 +1,6 @@
-import { Router, Request, Response } from 'express';
-import { checkHorizonHealth } from '../lib/stellar.js';
-import { HealthCheckManager } from '../config/health.js';
-import { Config } from '../config/env.js';
-import { Logger } from '../config/logger.js';
+import express from 'express';
+import type { Request, Response } from 'express';
+import { assessIndexerHealth } from '../indexer/stall.js';
 
 import { HealthCheckManager } from '../config/health.js';
 import { Logger } from '../config/logger.js';

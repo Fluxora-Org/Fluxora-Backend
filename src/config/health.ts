@@ -17,7 +17,7 @@ export interface DependencyHealth {
     name: string;
     status: HealthStatus;
     latency?: number; // milliseconds
-    error?: string;
+    error?: string | undefined;
     lastChecked: string; // ISO timestamp
 }
 

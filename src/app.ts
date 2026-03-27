@@ -8,7 +8,10 @@ import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { isShuttingDown } from './shutdown.js';
 
-export const app = express();
+export interface AppOptions {
+  /** When true, mounts a /__test/error route that throws unconditionally. */
+  includeTestRoutes?: boolean;
+}
 
 app.use(express.json({ limit: '256kb' }));
 // Correlation ID must be first so all subsequent middleware and routes have req.correlationId.

@@ -300,6 +300,7 @@ export function formatDecimalForDisplay(value: string, decimals: number = 7): st
   }
 
   const [intPart, decPart] = validated.value!.split('.');
+  if (intPart === undefined) return value;
   const sign = intPart.startsWith('-') ? '-' : '';
   const absIntPart = intPart.replace(/^[+-]/, '');
   

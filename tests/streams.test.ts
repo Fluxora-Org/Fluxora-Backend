@@ -19,12 +19,14 @@ import {
   resetStreamIdempotencyStore,
 } from '../src/routes/streams.js';
 import { errorHandler } from '../src/middleware/errorHandler.js';
-import { requestIdMiddleware } from '../src/utils/logger.js';
+import { requestIdMiddleware } from '../src/errors.js';
+import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
 
 // Create a minimal test app
 function createTestApp() {
   const app = express();
   app.use(requestIdMiddleware);
+  app.use(correlationIdMiddleware);
   app.use(express.json());
   app.use('/api/streams', streamsRouter);
   app.use(errorHandler);

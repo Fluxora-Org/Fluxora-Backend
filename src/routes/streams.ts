@@ -17,6 +17,33 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 
 /**
+ * Streams API routes.
+ *
+ * All amount fields (depositAmount, ratePerSecond) are validated as decimal
+ * strings before storage and returned as decimal strings in every response.
+ * This prevents floating-point precision loss when amounts cross the
+ * chain/API boundary.
+ *
+ * Trust boundaries
+ * ----------------
+ * - Public internet clients: may list, read, create, and cancel streams.
+ *   Authentication/authorisation is a planned follow-up (see non-goals below).
+ * - Internal workers: same surface; no elevated privileges yet.
+ *
+ * Failure modes
+ * -------------
+ * - Invalid decimal string  → 400 VALIDATION_ERROR with per-field details
+ * - Missing required field  → 400 VALIDATION_ERROR
+ * - Stream not found        → 404 NOT_FOUND
+ * - Duplicate cancel        → 409 CONFLICT
+ *
+ * Non-goals (intentionally deferred)
+ * -----------------------------------
+ * - Persistent storage (in-memory only; PostgreSQL integration is follow-up)
+ * - Authentication / JWT enforcement
+ * - Rate limiting
+ * - Duplicate-delivery protection
+ *
  * @openapi
  * /api/streams:
  *   get:
@@ -203,151 +230,38 @@ import { recordAuditEvent } from '../lib/auditLog.js';
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       400:
- *         description: Invalid input
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- * 
+ *         description: Validation error
  * /api/streams/{id}:
  *   get:
  *     summary: Get a stream by ID
- *     description: |
- *       Returns a single stream by its identifier.
- *       All amount fields are serialized as decimal strings for precision.
- *     tags:
- *       - streams
+ *     tags: [streams]
  *     parameters:
  *       - name: id
  *         in: path
  *         required: true
  *         schema:
  *           type: string
- *         description: Stream identifier
  *     responses:
  *       200:
  *         description: Stream details
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Stream'
  *       404:
- *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- * 
- * components:
- *   schemas:
- *     Stream:
- *       type: object
- *       description: Streaming payment stream details
- *       properties:
- *         id:
+ *         description: Not found
+ *   delete:
+ *     summary: Cancel a stream
+ *     tags: [streams]
+ *     parameters:
+ *       - name: id
+ *         in: path
+ *         required: true
+ *         schema:
  *           type: string
- *           description: Unique stream identifier
- *           example: "stream-1709123456789"
- *         sender:
- *           type: string
- *           description: Stellar account address of the sender
- *           example: "GCSX2..."
- *         recipient:
- *           type: string
- *           description: Stellar account address of the recipient
- *           example: "GDRX2..."
- *         depositAmount:
- *           type: string
- *           description: |
- *             Total deposit amount as a decimal string.
- *             Never serialized as a floating point number to prevent precision loss.
- *           pattern: '^[+-]?\d+(\.\d+)?$'
- *           example: "1000000.0000000"
- *         ratePerSecond:
- *           type: string
- *           description: |
- *             Streaming rate per second as a decimal string.
- *             Precision is critical for accurate time-based payments.
- *           pattern: '^[+-]?\d+(\.\d+)?$'
- *           example: "0.0000116"
- *         startTime:
- *           type: integer
- *           format: int64
- *           description: Unix timestamp when the stream started
- *           example: 1709123456
- *         endTime:
- *           type: integer
- *           format: int64
- *           description: Unix timestamp when the stream ends (0 if indefinite)
- *           example: 1711719456
- *         status:
- *           type: string
- *           enum: [active, paused, cancelled, completed]
- *           description: Current status of the stream
- *           example: "active"
- * 
- *     StreamCreateRequest:
- *       type: object
- *       required:
- *         - sender
- *         - recipient
- *         - depositAmount
- *         - ratePerSecond
- *       properties:
- *         sender:
- *           type: string
- *           description: Stellar account address of the sender
- *           example: "GCSX2..."
- *         recipient:
- *           type: string
- *           description: Stellar account address of the recipient
- *           example: "GDRX2..."
- *         depositAmount:
- *           type: string
- *           description: |
- *             Total deposit amount. Must be a decimal string.
- *             Example: "1000000.0000000" for 1 million XLM with 7 decimal places.
- *           pattern: '^[+-]?\d+(\.\d+)?$'
- *           example: "1000000.0000000"
- *         ratePerSecond:
- *           type: string
- *           description: |
- *             Streaming rate per second as a decimal string.
- *             For 1 XLM/day, use "0.0000116" (with 7 decimal precision).
- *           pattern: '^[+-]?\d+(\.\d+)?$'
- *           example: "0.0000116"
- *         startTime:
- *           type: integer
- *           format: int64
- *           description: Unix timestamp when the stream should start (optional, defaults to now)
- *           example: 1709123456
- * 
- *     Error:
- *       type: object
- *       properties:
- *         error:
- *           type: object
- *           properties:
- *             code:
- *               type: string
- *               description: Machine-readable error code
- *               enum:
- *                 - VALIDATION_ERROR
- *                 - DECIMAL_ERROR
- *                 - NOT_FOUND
- *                 - CONFLICT
- *                 - METHOD_NOT_ALLOWED
- *                 - INTERNAL_ERROR
- *                 - SERVICE_UNAVAILABLE
- *             message:
- *               type: string
- *               description: Human-readable error message
- *             details:
- *               type: object
- *               description: Additional error context (varies by error type)
- *             requestId:
- *               type: string
- *               description: Request identifier for tracing
+ *     responses:
+ *       200:
+ *         description: Stream cancelled
+ *       404:
+ *         description: Not found
+ *       409:
+ *         description: Already cancelled or completed
  */
 
 export const streamsRouter = Router();
@@ -365,7 +279,10 @@ export const streams: Array<{
   startTime: number;
   endTime: number;
   status: string;
-}> = [];
+}
+
+// In-memory stream store — placeholder until PostgreSQL integration lands
+const streams: Stream[] = [];
 
 type StreamsCursor = {
   v: 1;
@@ -674,7 +591,7 @@ streamsRouter.get(
 
 /**
  * GET /api/streams/:id
- * Get a single stream by ID
+ * Get a single stream by ID.
  */
 streamsRouter.get(
   '/:id',
@@ -685,10 +602,7 @@ streamsRouter.get(
     debug('Fetching stream', { id });
 
     const stream = streams.find((s) => s.id === id);
-
-    if (!stream) {
-      throw notFound('Stream', id);
-    }
+    if (!stream) throw notFound('Stream', id);
 
     res.json(successResponse({ stream }));
   })
@@ -794,7 +708,7 @@ streamsRouter.post(
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
     res.status(201).json(stream);
-  })
+  }),
 );
 
 /**
@@ -811,29 +725,21 @@ streamsRouter.delete(
     debug('Deleting stream', { id });
 
     const index = streams.findIndex((s) => s.id === id);
-
-    if (index === -1) {
-      throw notFound('Stream', id);
-    }
+    if (index === -1) throw notFound('Stream', id);
 
     const stream = streams[index];
+    // noUncheckedIndexedAccess: stream is guaranteed non-null because findIndex returned >= 0
+    if (stream === undefined) throw notFound('Stream', id);
 
     if (stream.status === 'cancelled') {
-      throw new ApiError(
-        ApiErrorCode.CONFLICT,
-        'Stream is already cancelled',
-        409,
-        { streamId: id }
-      );
+      throw new ApiError(ApiErrorCode.CONFLICT, 'Stream is already cancelled', 409, {
+        streamId: id,
+      });
     }
-
     if (stream.status === 'completed') {
-      throw new ApiError(
-        ApiErrorCode.CONFLICT,
-        'Cannot cancel a completed stream',
-        409,
-        { streamId: id }
-      );
+      throw new ApiError(ApiErrorCode.CONFLICT, 'Cannot cancel a completed stream', 409, {
+        streamId: id,
+      });
     }
 
     streams[index] = { ...stream, status: 'cancelled' };

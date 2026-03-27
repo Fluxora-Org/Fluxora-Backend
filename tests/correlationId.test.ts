@@ -6,14 +6,15 @@ describe('correlationId middleware', () => {
   describe('ID generation', () => {
     it('generates a correlation ID when none is provided', async () => {
       const res = await request(app).get('/health');
-      expect(res.headers[CORRELATION_ID_HEADER]).toBeDefined();
-      expect(typeof res.headers[CORRELATION_ID_HEADER]).toBe('string');
-      expect(res.headers[CORRELATION_ID_HEADER].length).toBeGreaterThan(0);
+      const id = res.headers[CORRELATION_ID_HEADER];
+      expect(id).toBeDefined();
+      expect(typeof id).toBe('string');
+      expect((id as string).length).toBeGreaterThan(0);
     });
 
     it('generated ID looks like a UUID v4', async () => {
       const res = await request(app).get('/health');
-      const id: string = res.headers[CORRELATION_ID_HEADER];
+      const id = res.headers[CORRELATION_ID_HEADER] as string;
       expect(id).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
       );
@@ -43,13 +44,13 @@ describe('correlationId middleware', () => {
 
     it('generates a new ID when incoming header is an empty string', async () => {
       const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, '');
-      const id: string = res.headers[CORRELATION_ID_HEADER];
+      const id = res.headers[CORRELATION_ID_HEADER] as string;
       expect(id.length).toBeGreaterThan(0);
     });
 
     it('generates a new ID when incoming header is only whitespace', async () => {
       const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, '   ');
-      const id: string = res.headers[CORRELATION_ID_HEADER];
+      const id = res.headers[CORRELATION_ID_HEADER] as string;
       expect(id).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
       );
