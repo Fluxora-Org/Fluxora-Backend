@@ -1,6 +1,22 @@
 # Fluxora Backend
 
-Express + TypeScript API for the Fluxora treasury streaming protocol. Provides REST endpoints for streams, health checks, and (later) Horizon sync and analytics.
+Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. It now documents both the decimal-string serialization policy for chain/API amounts and the consumer-facing webhook signature verification contract the team intends to keep stable when delivery is enabled.
+
+## Current status
+
+- Implemented today:
+  - REST endpoints for API info, health, and in-memory stream CRUD
+  - decimal-string validation for amount fields
+  - indexer freshness classification for `healthy`, `starting`, `stalled`, and `not_configured`
+  - consumer-side webhook signing and verification helpers in `src/webhooks/signature.ts`
+- Explicitly not implemented yet:
+  - live webhook delivery endpoints
+  - durable delivery logs or replay store
+  - persistent database-backed stream/indexer state
+  - automated restart orchestration
+  - request rate limiting middleware
+
+If a feature in this README is described as a webhook contract, treat it as the documented integration target for consumers and operators, not as proof that the live service already emits webhooks from this repository.
 
 ## Decimal String Serialization Policy
 
@@ -8,214 +24,113 @@ All amounts crossing the chain/API boundary are serialized as **decimal strings*
 
 ### Amount Fields
 
-- `depositAmount` - Total deposit as decimal string (e.g., "1000000.0000000")
-- `ratePerSecond` - Streaming rate as decimal string (e.g., "0.0000116")
+- `depositAmount` - Total deposit as decimal string (for example `"1000000.0000000"`)
+- `ratePerSecond` - Streaming rate as decimal string (for example `"0.0000116"`)
 
 ### Validation Rules
 
-- Amounts MUST be strings in decimal notation (e.g., "100", "-50", "0.0000001")
+- Amounts must be strings in decimal notation
 - Native JSON numbers are rejected to prevent floating-point precision issues
-- Values exceeding safe integer ranges are rejected with `DECIMAL_OUT_OF_RANGE` error
+- Values exceeding safe integer ranges are rejected with `DECIMAL_OUT_OF_RANGE`
 
 ### Error Codes
 
-| Code                     | Description                               |
-| ------------------------ | ----------------------------------------- |
-| `DECIMAL_INVALID_TYPE`   | Amount was not a string                   |
-| `DECIMAL_INVALID_FORMAT` | String did not match decimal pattern      |
-| `DECIMAL_OUT_OF_RANGE`   | Value exceeds maximum supported precision |
-| `DECIMAL_EMPTY_VALUE`    | Amount was empty or null                  |
+| Code | Description |
+|------|-------------|
+| `DECIMAL_INVALID_TYPE` | Amount was not a string |
+| `DECIMAL_INVALID_FORMAT` | String did not match decimal pattern |
+| `DECIMAL_OUT_OF_RANGE` | Value exceeds maximum supported precision |
+| `DECIMAL_EMPTY_VALUE` | Amount was empty or null |
 
-### Trust Boundaries
+## Webhook signature verification for consumers
 
-| Actor                  | Capabilities                               |
-| ---------------------- | ------------------------------------------ |
-| Public Clients         | Read streams, submit valid decimal strings |
-| Authenticated Partners | Create streams with validated amounts      |
-| Administrators         | Full access, diagnostic logging            |
-| Internal Workers       | Database operations, chain interactions    |
+### Scope and guarantee
 
-### Failure Modes
+For consumer-side verification of Fluxora webhook deliveries, Fluxora aims to guarantee:
 
-| Scenario                 | Behavior                          |
-| ------------------------ | --------------------------------- |
-| Invalid decimal type     | 400 with `DECIMAL_INVALID_TYPE`   |
-| Malformed decimal string | 400 with `DECIMAL_INVALID_FORMAT` |
-| Precision overflow       | 400 with `DECIMAL_OUT_OF_RANGE`   |
-| Missing required field   | 400 with `VALIDATION_ERROR`       |
-| Stream not found         | 404 with `NOT_FOUND`              |
+- each delivery carries a stable set of verification headers
+- the signature is computed over the exact raw request body, not parsed JSON
+- consumers can reject stale, oversized, tampered, or duplicate deliveries with predictable outcomes
+- operators have a written checklist for diagnosing delivery failures without relying on tribal knowledge
 
-### Operational Notes
+This repository currently provides the canonical algorithm and the expected outcomes. It does not yet provide a live webhook sending service.
 
-#### Diagnostic Logging
+### Verification contract
 
-Serialization events are logged with context for debugging:
+Fluxora webhook deliveries are expected to use these headers:
 
-```
-Decimal validation failed {"field":"depositAmount","errorCode":"DECIMAL_INVALID_TYPE","requestId":"..."}
-```
+| Header | Meaning |
+|--------|---------|
+| `x-fluxora-delivery-id` | Stable id for a single delivery attempt chain; use it for deduplication |
+| `x-fluxora-timestamp` | Unix timestamp in seconds |
+| `x-fluxora-signature` | Hex-encoded `HMAC-SHA256(secret, timestamp + "." + rawBody)` |
+| `x-fluxora-event` | Event name such as `stream.created` or `stream.updated` |
 
-#### Health Observability
+Canonical signing payload:
 
-- `GET /health` - Returns service health status
-- Request IDs enable correlation across logs
-- Structured JSON logs for log aggregation systems
-
-### `/api/streams` Cursor Pagination Contract
-
-`GET /api/streams` now uses opaque forward-only cursors returned as `next_cursor`. Clients must treat the cursor as an opaque token, not a stream ID or sortable value. Pages are ordered by ascending `id`, return at most `limit` items, and always expose `has_more` as the authoritative traversal signal. `total` is now opt-in via `include_total=true` and represents response-time metadata only, not a cursor snapshot guarantee.
-
-Service outcomes for this endpoint:
-
-- A successful page is read from the current in-process stream view and never duplicates an item within that page.
-- Reusing a valid cursor is safe and resumes strictly after the encoded sort key.
-- Cursor traversal correctness is determined by `next_cursor` and `has_more`, not by `total`.
-- If `include_total=true`, `total` reflects the number of matching streams visible when that specific response was generated and may change between cursor requests.
-- If the last-seen stream is deleted between requests, the cursor still resumes after that key instead of failing stale.
-- If the listing dependency is unavailable, the service returns `503 SERVICE_UNAVAILABLE` with a request ID for tracing.
-
-Trust boundaries for this area:
-
-- Public clients may read paginated stream listings only.
-- Authenticated partners consume the same read contract and must not infer internal state from cursors.
-- Administrators diagnose failures through structured logs, request IDs, and `/health`; they do not receive privileged response bodies from this endpoint.
-- Internal workers may refresh the backing view, but duplicate deliveries are absorbed by deterministic ordering plus opaque cursor progression.
-
-Failure modes and client-visible behavior:
-
-- Invalid `limit`, malformed `cursor`, or invalid `include_total`: `400 VALIDATION_ERROR`
-- Missing stream on `GET /api/streams/:id`: `404 NOT_FOUND`
-- Conflicting cancellation on `DELETE /api/streams/:id`: `409 CONFLICT`
-- Listing dependency degraded or unavailable: `503 SERVICE_UNAVAILABLE`
-- Unexpected process error: `500 INTERNAL_ERROR`
-
-Operator notes:
-
-- Use the response `requestId` to correlate client failures with stream pagination logs.
-- `/health` only confirms process liveness today; pagination dependency health is surfaced by request logs and 503 responses.
-- Logs distinguish whether `total` was requested so operators can diagnose expensive or confused client pagination patterns.
-- Representative regression coverage lives in `tests/streams.test.ts`, including malformed cursor handling, deleted-cursor recovery, changing response-time totals, and dependency-unavailable behavior.
-
-### `/api/streams` POST Idempotency Contract
-
-`POST /api/streams` now requires an `Idempotency-Key` header for unsafe creation requests. The key is scoped to the normalized request payload: trimmed identities, validated decimal strings, and normalized time fields.
-
-Service outcomes for this endpoint:
-
-- The first successful request for a key creates exactly one stream and returns `201`.
-- Retrying the same key with the same normalized payload replays the original `201` response body and sets `Idempotency-Replayed: true`.
-- Reusing a key with a different payload returns `409 CONFLICT` and creates no new stream.
-- Invalid requests are rejected with `400` and do not reserve the key for future valid retries.
-- If the idempotency dependency is degraded, the service returns `503 SERVICE_UNAVAILABLE` rather than risking duplicate side effects.
-
-Trust boundaries for this area:
-
-- Public clients may submit create requests only when they provide a syntactically valid idempotency key.
-- Authenticated partners may safely retry after network uncertainty but may not reuse a key for a semantically different operation.
-- Administrators diagnose duplicate-delivery reports through request IDs, idempotency keys, and structured logs.
-- Internal workers may reconcile downstream effects, but they do not bypass the HTTP idempotency contract.
-
-Failure modes and client-visible behavior:
-
-- Missing or malformed `Idempotency-Key`: `400 VALIDATION_ERROR`
-- Invalid stream payload: `400 VALIDATION_ERROR`
-- Same key, different payload: `409 CONFLICT`
-- Idempotency dependency unavailable: `503 SERVICE_UNAVAILABLE`
-- Unexpected process error before a successful write is stored: `500 INTERNAL_ERROR`
-
-Operator notes:
-
-- Correlate retries using the request `requestId`, `Idempotency-Key`, and the `Idempotency-Replayed` response header.
-- Representative automated coverage lives in `tests/streams.test.ts` for first-write, replay, conflict, and dependency-unavailable paths.
-- The current implementation uses in-memory storage only, so idempotency guarantees last for the life of the process and not across restarts.
-
-Intentional non-goals in this issue:
-
-- Replacing the in-memory store with a durable database view
-- Adding authentication or role-based authorization to `/api/streams`
-- Exposing page tokens in any format other than the opaque cursor contract
-- Providing cross-process or post-restart idempotency durability
-
-### `/internal/indexer/contract-events` Durable Ingest Contract
-
-`POST /internal/indexer/contract-events` is the internal worker endpoint for persisting chain-derived contract events into the backend's durable event view. The endpoint is protected by `x-indexer-worker-token` and is intended for internal workers only.
-
-Service outcomes for this endpoint:
-
-- A `200` response means the submitted batch was durably persisted to the configured contract-event store before acknowledgement.
-- Duplicate deliveries are absorbed by `eventId` uniqueness; the response returns `duplicateCount` and `duplicateEventIds` instead of failing the retry.
-- Invalid batches fail atomically and write nothing.
-- If the durable store is degraded or unavailable, the service fails closed with `503 SERVICE_UNAVAILABLE` instead of acknowledging a non-durable write.
-
-Trust boundaries for this area:
-
-- Public internet clients may not ingest contract events.
-- Authenticated internal workers may submit contract-event batches only; they do not receive privileged database internals in responses.
-- Administrators observe dependency health, accepted and duplicate counts, and last failure details through `/health` and structured logs.
-- Authenticated partners and public clients may consume derived read models but may not bypass the worker trust boundary.
-
-Failure modes and client-visible behavior:
-
-- Missing or invalid `x-indexer-worker-token`: `401 UNAUTHORIZED`
-- Oversized payload (`>256 KiB`): `413 PAYLOAD_TOO_LARGE`
-- Too many events in one batch (`>100`) or invalid event schema: `400 VALIDATION_ERROR`
-- Duplicate `eventId` values within a single submitted batch: `409 CONFLICT`
-- Excessive ingest rate from one actor (`>30` requests per minute): `429 TOO_MANY_REQUESTS`
-- Durable store degraded or unavailable: `503 SERVICE_UNAVAILABLE`
-
-Operator notes:
-
-- `/health` reports the indexer dependency state, backing store kind, last successful ingest, last failure reason, and accepted and duplicate counters.
-- Correlate incidents with the response request or correlation ID plus the worker's event IDs.
-- Structured logs emit one line for batch persistence success and one for failure, including batch size, inserted count, duplicate count, and store kind.
-- The default runtime store in this repository is in-memory for local development and tests. Production should inject a Postgres-backed `ContractEventStore` so acknowledgements remain durable across restarts.
-
-Verification coverage:
-
-- `tests/indexer.test.ts` covers successful persistence, duplicate delivery, authentication failures, oversized payload rejection, malformed batches, dependency outage behavior, and rate limiting.
-- `tests/health.test.ts` verifies the indexer health block is exposed to operators.
-
-Intentional non-goals in this issue slice:
-
-- Running chain polling inside the HTTP process; the worker submits already-fetched events to this service
-- Secret rotation, mTLS, or multi-worker tenant auth beyond the shared internal worker token
-- Historical backfill orchestration and replay tooling
-- Automatic Postgres migrations or schema management
-
-#### Verification Commands
-
-```bash
-# Run all tests
-npm test
-
-# Run with coverage
-npm test -- --coverage
-
-# Build TypeScript
-npm run build
-
-# Start server
-npm start
+```text
+${timestamp}.${rawRequestBody}
 ```
 
-### Known Limitations
+Canonical verification rules:
 
-- In-memory stream storage (production requires database integration)
-- No Stellar RPC integration (placeholder for chain interactions)
-- Stream idempotency remains process-local and is not durable across restarts
-- Indexer ingest uses an in-memory store in this repository unless a Postgres-backed store is injected at runtime
+- use the raw request bytes exactly as received
+- reject payloads larger than `256 KiB`
+- reject timestamps outside a `300` second tolerance window
+- compare signatures with a constant-time equality check
+- deduplicate on `x-fluxora-delivery-id`
 
-## What's in this repo
+Reference implementation lives in `src/webhooks/signature.ts`.
 
-- **API Gateway** — REST API for stream CRUD and health
-- **Streams API** — List, get, and create stream records (in-memory placeholder; will be replaced by PostgreSQL + Horizon listener)
-- Ready to extend with JWT, RBAC, rate limiting, and streaming engine
+### Consumer verification example
 
-## Tech stack
+```ts
+import { verifyWebhookSignature } from './src/webhooks/signature.js';
 
-- Node.js 18+
-- TypeScript
-- Express
+const verification = verifyWebhookSignature({
+  secret: process.env.FLUXORA_WEBHOOK_SECRET,
+  deliveryId: req.header('x-fluxora-delivery-id') ?? undefined,
+  timestamp: req.header('x-fluxora-timestamp') ?? undefined,
+  signature: req.header('x-fluxora-signature') ?? undefined,
+  rawBody,
+  isDuplicateDelivery: (deliveryId) => seenDeliveryIds.has(deliveryId),
+});
+
+if (!verification.ok) {
+  return res.status(verification.status).json({
+    error: verification.code,
+    message: verification.message,
+  });
+}
+```
+
+### Trust boundaries
+
+| Actor | Trusted for | Not trusted for |
+|-------|-------------|-----------------|
+| Public clients | Valid request shape only | Payload integrity, replay prevention |
+| Authenticated partners / webhook consumers | Possession of shared webhook secret and endpoint ownership | Skipping signature checks, bypassing replay controls |
+| Administrators / operators | Secret rotation, incident response, delivery diagnostics | Reading secrets from logs or bypassing audit trails |
+| Internal workers | Constructing signed payloads, retry scheduling, durable delivery state once implemented | Silently mutating or dropping verified deliveries |
+
+### Failure modes and expected behavior
+
+| Condition | Expected result | Suggested HTTP outcome |
+|-----------|-----------------|------------------------|
+| Missing secret in consumer config | Treat as configuration failure; do not trust the payload | `500` internally, do not acknowledge |
+| Missing delivery id / timestamp / signature | Reject as unauthenticated | `401 Unauthorized` |
+| Non-numeric or stale timestamp | Reject as replay-risk / invalid input | `400` for malformed timestamp, `401` for stale timestamp |
+| Signature mismatch | Reject as unauthenticated | `401 Unauthorized` |
+| Payload larger than `256 KiB` | Reject before parsing JSON | `413 Payload Too Large` |
+| Duplicate delivery id | Do not process the business action twice | `200 OK` after safe dedupe or `409 Conflict` |
+| Consumer overloaded | Ask sender to retry later | `429 Too Many Requests` |
+
+## Health and observability
+
+- `GET /health` returns service status and indexer freshness classification
+- request IDs enable correlation across logs
+- structured JSON logs are expected for diagnostics
+- if `indexer.status = "stalled"`, treat that as an operational signal that chain-derived views would be stale if the real indexer were enabled in this service
 
 ## Local setup
 
@@ -235,42 +150,64 @@ API runs at [http://localhost:3000](http://localhost:3000).
 
 ### Scripts
 
-- `npm run dev` — Run with tsx watch (no build)
-- `npm run build` — Compile to `dist/`
-- `npm start` — Run compiled `dist/index.js`
+- `npm run dev` - run with tsx watch
+- `npm run build` - compile to `dist/`
+- `npm test` - run the backend test suite plus webhook signature verification tests
+- `npm start` - run compiled `dist/index.js`
 
 ## API overview
 
-| Method | Path               | Description                                                                      |
-| ------ | ------------------ | -------------------------------------------------------------------------------- |
-| GET    | `/`                | API info                                                                         |
-| GET    | `/health`          | Health check                                                                     |
-| GET    | `/api/streams`     | List streams                                                                     |
-| GET    | `/api/streams/:id` | Get one stream                                                                   |
-| POST   | `/api/streams`     | Create stream (body: sender, recipient, depositAmount, ratePerSecond, startTime) |
-| POST   | `/internal/indexer/contract-events` | Internal worker batch ingest for durable contract-event persistence |
-
-All responses are JSON. Stream data is in-memory until you add PostgreSQL.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | API info |
+| GET | `/health` | Health check |
+| GET | `/api/streams` | List streams |
+| GET | `/api/streams/:id` | Get one stream |
+| POST | `/api/streams` | Create stream |
 
 ## Project structure
 
-```
+```text
 src/
-  routes/     # health, streams
-  index.ts    # Express app and server
+  routes/          # health, streams
+  webhooks/        # canonical webhook signing and verification contract
+  index.ts         # Express app and server
+k6/
+  main.js          # k6 entrypoint — composes scenarios
+  config.js        # thresholds, stage profiles, base URL
+  helpers.js       # shared metrics and payload helpers
+  scenarios/       # per-endpoint load scenarios
+```
+
+## Load testing (k6)
+
+The `k6/` directory contains a load-testing harness for critical endpoints.
+
+Common commands:
+
+```bash
+npm run dev
+npm run k6:smoke
+npm run k6:load
+npm run k6:stress
+npm run k6:soak
 ```
 
 ## Environment
 
 Optional:
 
-- `PORT` — Server port (default: 3000)
+- `PORT` - server port, default `3000`
+- `FLUXORA_WEBHOOK_SECRET` - shared secret for webhook signature verification once delivery is enabled
 
-Later you can add `DATABASE_URL`, `REDIS_URL`, `HORIZON_URL`, `JWT_SECRET`, etc.
+Likely future additions:
+
+- `DATABASE_URL`
+- `REDIS_URL`
+- `HORIZON_URL`
+- `JWT_SECRET`
 
 ## Related repos
 
-- **fluxora-frontend** — Dashboard and recipient UI
-- **fluxora-contracts** — Soroban smart contracts
-
-Each is a separate Git repository.
+- `fluxora-frontend` - dashboard and recipient UI
+- `fluxora-contracts` - Soroban smart contracts
