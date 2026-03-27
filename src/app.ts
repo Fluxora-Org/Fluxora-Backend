@@ -6,7 +6,10 @@ import { indexerRouter } from './routes/indexer.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
+import { errorHandler } from './middleware/errorHandler.js';
 import { isShuttingDown } from './shutdown.js';
+
+export const app = express();
 
 export interface AppOptions {
   /** When true, mounts a /__test/error route that throws unconditionally. */
@@ -50,3 +53,5 @@ app.use((_req: any, res: any) => {
 });
 
 app.use(errorHandler);
+
+export default app;

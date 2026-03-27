@@ -40,8 +40,15 @@ export enum DecimalErrorCode {
   INVALID_FORMAT = 'DECIMAL_INVALID_FORMAT',
   OUT_OF_RANGE = 'DECIMAL_OUT_OF_RANGE',
   PRECISION_LOSS = 'DECIMAL_PRECISION_LOSS',
+  PRECISION_EXCEEDED = 'DECIMAL_PRECISION_EXCEEDED',
   EMPTY_VALUE = 'DECIMAL_EMPTY_VALUE',
 }
+
+/**
+ * Stellar precision (7 decimal places)
+ */
+export const STELLAR_DECIMALS = 7;
+export const STROOPS_PER_UNIT = 10_000_000n;
 
 /**
  * Custom error class for decimal serialization errors
@@ -399,4 +406,65 @@ export function validateAmountFields<T extends Record<string, unknown>>(
     valid: errors.length === 0,
     errors,
   };
+}
+
+/**
+ * Parse a decimal string to a BigInt representing stroops (7-decimal precision)
+ * 
+ * @param value - The decimal string to parse
+ * @returns BigInt value in stroops
+ * @throws DecimalSerializationError if the string has more than 7 decimals
+ */
+export function parseToStroops(value: string): bigint {
+  const validated = validateDecimalString(value);
+  if (!validated.valid || !validated.value) {
+    throw validated.error!;
+  }
+
+  const parts = validated.value.split('.');
+  const integerPart = parts[0] || '0';
+  let decimalPart = parts[1] || '';
+
+  if (decimalPart.length > STELLAR_DECIMALS) {
+    throw new DecimalSerializationError(
+      DecimalErrorCode.PRECISION_EXCEEDED,
+      `Value exceeds maximum Stellar precision of ${STELLAR_DECIMALS} decimal places`,
+      undefined,
+      value
+    );
+  }
+
+  // Pad decimal part to exactly 7 places
+  decimalPart = decimalPart.padEnd(STELLAR_DECIMALS, '0');
+
+  // Combine and convert to BigInt
+  const sign = integerPart.startsWith('-') ? -1n : 1n;
+  const absIntegerPart = integerPart.replace(/^[+-]/, '');
+  
+  return sign * (BigInt(absIntegerPart) * STROOPS_PER_UNIT + BigInt(decimalPart));
+}
+
+/**
+ * Format stroops (BigInt) back to a decimal string with 7-decimal precision
+ * 
+ * @param stroops - The BigInt value in stroops
+ * @returns Standard decimal string
+ */
+export function formatFromStroops(stroops: bigint): string {
+  const sign = stroops < 0n ? '-' : '';
+  const absStroops = stroops < 0n ? -stroops : stroops;
+
+  const integerPart = absStroops / STROOPS_PER_UNIT;
+  const decimalPart = absStroops % STROOPS_PER_UNIT;
+
+  const decimalStr = decimalPart.toString().padStart(STELLAR_DECIMALS, '0');
+  
+  // Remove trailing zeros for a cleaner string
+  const trimmedDecimalStr = decimalStr.replace(/0+$/, '');
+  
+  if (trimmedDecimalStr === '') {
+    return `${sign}${integerPart}`;
+  }
+  
+  return `${sign}${integerPart}.${trimmedDecimalStr}`;
 }

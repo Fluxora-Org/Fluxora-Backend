@@ -1,7 +1,8 @@
 import request from 'supertest';
-import { app } from '../src/app.js';
+import  app  from '../src/app.js';
 import * as StellarService from '../src/lib/stellar.js';
 import { jest } from '@jest/globals';
+import { parseToStroops } from '../src/serialization/decimal.js';
 
 // Mock the Stellar service to avoid real network calls
 jest.spyOn(StellarService, 'verifyStreamOnChain');
@@ -18,8 +19,8 @@ describe('POST /api/streams (Chain-First)', () => {
     const mockVerifiedStream = {
       sender: 'GCSX2...',
       recipient: 'GDRX2...',
-      depositAmount: '100.0000000',
-      ratePerSecond: '0.0000116',
+      depositAmount: parseToStroops('100.0000000'),
+      ratePerSecond: parseToStroops('0.0000116'),
       startTime: 1700000000,
       endTime: 0,
     };
@@ -77,8 +78,8 @@ describe('POST /api/streams (Chain-First)', () => {
     const mockVerifiedStream = {
       sender: 'GCSX2...',
       recipient: 'GDRX2...',
-      depositAmount: '100.0000000',
-      ratePerSecond: '0.0000116',
+      depositAmount: parseToStroops('100.0000000'),
+      ratePerSecond: parseToStroops('0.0000116'),
       startTime: 1700000000,
       endTime: 0,
     };

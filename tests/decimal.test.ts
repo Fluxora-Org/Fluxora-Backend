@@ -16,6 +16,8 @@ import {
   formatDecimalForDisplay,
   serializeAmountFields,
   validateAmountFields,
+  parseToStroops,
+  formatFromStroops,
   DecimalSerializationError,
   DecimalErrorCode,
   DECIMAL_STRING_PATTERN,
@@ -279,6 +281,44 @@ describe('Decimal String Serialization Policy', () => {
     it('should return null for precision loss', () => {
       const result = tryDeserializeToNumber('99999999999999999999');
       expect(result).toBeNull();
+    });
+  });
+
+  describe('parseToStroops', () => {
+    it('should parse integer to stroops', () => {
+      expect(parseToStroops('100')).toBe(1_000_000_000n);
+    });
+
+    it('should parse decimal to stroops', () => {
+      expect(parseToStroops('1.5')).toBe(15_000_000n);
+      expect(parseToStroops('0.0000001')).toBe(1n);
+    });
+
+    it('should parse negative decimal to stroops', () => {
+      expect(parseToStroops('-1.5')).toBe(-15_000_000n);
+    });
+
+    it('should throw if precision exceeded', () => {
+      expect(() => parseToStroops('1.00000001')).toThrow(DecimalSerializationError);
+    });
+  });
+
+  describe('formatFromStroops', () => {
+    it('should format stroops to integer string', () => {
+      expect(formatFromStroops(1_000_000_000n)).toBe('100');
+    });
+
+    it('should format stroops to decimal string', () => {
+      expect(formatFromStroops(15_000_000n)).toBe('1.5');
+      expect(formatFromStroops(1n)).toBe('0.0000001');
+    });
+
+    it('should format negative stroops', () => {
+      expect(formatFromStroops(-15_000_000n)).toBe('-1.5');
+    });
+
+    it('should format zero', () => {
+      expect(formatFromStroops(0n)).toBe('0');
     });
   });
 
