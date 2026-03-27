@@ -1,0 +1,1677 @@
+node : (node:8164) ExperimentalWarning: VM Modules is an 
+experimental feature and might change at any time
+At line:1 char:1
++ node --experimental-vm-modules 
+node_modules/jest/bin/jest.js --config ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ((node:8164) Ex 
+   p...nge at any time:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+(Use `node --trace-warnings ...` to show where the warning 
+was created)
+(node:11636) ExperimentalWarning: VM Modules is an 
+experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning 
+was created)
+PASS src/middleware/errorHandler.test.ts (10.671 s)
+  ??? Console
+
+    console.error
+      [2026-03-27T11:32:47.758Z] ERROR: fluxora-backend - 
+API error: not found {"code":"NOT_FOUND","statusCode":404,"r
+equestId":"b862a763-1da3-4b26-8e2b-3ead8bb8fc4f"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.error
+      [2026-03-27T11:32:47.818Z] ERROR: fluxora-backend - 
+Decimal validation failed {"field":"depositAmount","received
+Type":"number","receivedValue":"100","errorCode":"DECIMAL_IN
+VALID_TYPE","requestId":"bf2b10c6-c2de-4ff8-a3c0-5a3ca98a0f2
+6"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at Object.validationFailed (src/utils/logger.ts:130:5)
+      at errorHandler (src/middleware/errorHandler.ts:34:25)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.error
+      [2026-03-27T11:32:47.850Z] ERROR: fluxora-backend - 
+Unexpected error 
+{"errorName":"Error","errorMessage":"boom","stack":"Error: 
+boom\n    at C:\\Users\\USER\\Desktop\\Github\\Fluxora-Backe
+nd\\src\\middleware\\errorHandler.test.ts:90:40\n    at C:\\
+Users\\USER\\Desktop\\Github\\Fluxora-Backend\\src\\middlewa
+re\\errorHandler.test.ts:21:50\n    at C:\\Users\\USER\\Desk
+top\\Github\\Fluxora-Backend\\src\\middleware\\errorHandler.
+ts:49:32\n    at Layer.handle [as handle_request] (C:\\Users
+\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\expr
+ess\\lib\\router\\layer.js:95:5)\n    at next (C:\\Users\\US
+ER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\express\
+\lib\\router\\route.js:149:13)\n    at Route.dispatch (C:\\U
+sers\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\
+express\\lib\\router\\route.js:119:3)\n    at Layer.handle 
+[as handle_request] (C:\\Users\\USER\\Desktop\\Github\\Fluxo
+ra-Backend\\node_modules\\express\\lib\\router\\layer.js:95:
+5)\n    at C:\\Users\\USER\\Desktop\\Github\\Fluxora-Backend
+\\node_modules\\express\\lib\\router\\index.js:284:15\n    
+at router.process_params (C:\\Users\\USER\\Desktop\\Github\\
+Fluxora-Backend\\node_modules\\express\\lib\\router\\index.j
+s:346:12)\n    at next (C:\\Users\\USER\\Desktop\\Github\\Fl
+uxora-Backend\\node_modules\\express\\lib\\router\\index.js:
+280:10)\n    at correlationIdMiddleware (C:\\Users\\USER\\De
+sktop\\Github\\Fluxora-Backend\\src\\middleware\\correlation
+Id.ts:33:3)\n    at Layer.handle [as handle_request] (C:\\Us
+ers\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\e
+xpress\\lib\\router\\layer.js:95:5)\n    at trim_prefix (C:\
+\Users\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules
+\\express\\lib\\router\\index.js:328:13)\n    at C:\\Users\\
+USER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\expres
+s\\lib\\router\\index.js:286:9\n    at 
+router.process_params (C:\\Users\\USER\\Desktop\\Github\\Flu
+xora-Backend\\node_modules\\express\\lib\\router\\index.js:3
+46:12)\n    at next (C:\\Users\\USER\\Desktop\\Github\\Fluxo
+ra-Backend\\node_modules\\express\\lib\\router\\index.js:280
+:10)\n    at jsonParser (C:\\Users\\USER\\Desktop\\Github\\F
+luxora-Backend\\node_modules\\body-parser\\lib\\types\\json.
+js:113:7)\n    at Layer.handle [as handle_request] (C:\\User
+s\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\exp
+ress\\lib\\router\\layer.js:95:5)\n    at trim_prefix (C:\\U
+sers\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\
+express\\lib\\router\\index.js:328:13)\n    at C:\\Users\\US
+ER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\express\
+\lib\\router\\index.js:286:9\n    at router.process_params (
+C:\\Users\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modu
+les\\express\\lib\\router\\index.js:346:12)\n    at next (C:
+\\Users\\USER\\Desktop\\Github\\Fluxora-Backend\\node_module
+s\\express\\lib\\router\\index.js:280:10)\n    at 
+expressInit (C:\\Users\\USER\\Desktop\\Github\\Fluxora-Backe
+nd\\node_modules\\express\\lib\\middleware\\init.js:40:5)\n 
+   at Layer.handle [as handle_request] (C:\\Users\\USER\\Des
+ktop\\Github\\Fluxora-Backend\\node_modules\\express\\lib\\r
+outer\\layer.js:95:5)\n    at trim_prefix (C:\\Users\\USER\\
+Desktop\\Github\\Fluxora-Backend\\node_modules\\express\\lib
+\\router\\index.js:328:13)\n    at C:\\Users\\USER\\Desktop\
+\Github\\Fluxora-Backend\\node_modules\\express\\lib\\router
+\\index.js:286:9\n    at router.process_params (C:\\Users\\U
+SER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\express
+\\lib\\router\\index.js:346:12)\n    at next (C:\\Users\\USE
+R\\Desktop\\Github\\Fluxora-Backend\\node_modules\\express\\
+lib\\router\\index.js:280:10)\n    at query (C:\\Users\\USER
+\\Desktop\\Github\\Fluxora-Backend\\node_modules\\express\\l
+ib\\middleware\\query.js:45:5)\n    at Layer.handle [as 
+handle_request] (C:\\Users\\USER\\Desktop\\Github\\Fluxora-B
+ackend\\node_modules\\express\\lib\\router\\layer.js:95:5)\n
+    at trim_prefix (C:\\Users\\USER\\Desktop\\Github\\Fluxor
+a-Backend\\node_modules\\express\\lib\\router\\index.js:328:
+13)\n    at C:\\Users\\USER\\Desktop\\Github\\Fluxora-Backen
+d\\node_modules\\express\\lib\\router\\index.js:286:9\n    
+at router.process_params (C:\\Users\\USER\\Desktop\\Github\\
+Fluxora-Backend\\node_modules\\express\\lib\\router\\index.j
+s:346:12)\n    at next (C:\\Users\\USER\\Desktop\\Github\\Fl
+uxora-Backend\\node_modules\\express\\lib\\router\\index.js:
+280:10)\n    at router.handle (C:\\Users\\USER\\Desktop\\Git
+hub\\Fluxora-Backend\\node_modules\\express\\lib\\router\\in
+dex.js:175:3)\n    at app.handle (C:\\Users\\USER\\Desktop\\
+Github\\Fluxora-Backend\\node_modules\\express\\lib\\applica
+tion.js:181:10)\n    at Server.app (C:\\Users\\USER\\Desktop
+\\Github\\Fluxora-Backend\\node_modules\\express\\lib\\expre
+ss.js:39:9)\n    at Server.emit (node:events:508:20)\n    
+at parserOnIncoming (node:_http_server:1216:12)\n    at 
+HTTPParser.parserOnHeadersComplete (node:_http_common:125:17
+)","requestId":"0ab6a9ad-9bab-431b-96ac-5ee00c9ddec5"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:44:3)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.error
+      [2026-03-27T11:32:47.866Z] ERROR: fluxora-backend - 
+Unexpected error 
+{"errorName":"Error","errorMessage":"string 
+error","stack":"Error: string error\n    at errorHandler (C:
+\\Users\\USER\\Desktop\\Github\\Fluxora-Backend\\src\\middle
+ware\\errorHandler.ts:43:42)\n    at Layer.handle_error (C:\
+\Users\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules
+\\express\\lib\\router\\layer.js:71:5)\n    at trim_prefix (
+C:\\Users\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modu
+les\\express\\lib\\router\\index.js:326:13)\n    at C:\\User
+s\\USER\\Desktop\\Github\\Fluxora-Backend\\node_modules\\exp
+ress\\lib\\router\\index.js:286:9\n    at 
+router.process_params (C:\\Users\\USER\\Desktop\\Github\\Flu
+xora-Backend\\node_modules\\express\\lib\\router\\index.js:3
+46:12)\n    at next (C:\\Users\\USER\\Desktop\\Github\\Fluxo
+ra-Backend\\node_modules\\express\\lib\\router\\index.js:280
+:10)\n    at next (C:\\Users\\USER\\Desktop\\Github\\Fluxora
+-Backend\\node_modules\\express\\lib\\router\\route.js:141:1
+4)\n    at processTicksAndRejections (node:internal/process/
+task_queues:104:5)","requestId":"36768ba0-5042-463b-a080-8b2
+b3db02485"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:44:3)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.error
+      [2026-03-27T11:32:47.885Z] ERROR: fluxora-backend - 
+API error: nope 
+{"code":"NOT_FOUND","statusCode":404,"requestId":"req-abc"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.error
+      [2026-03-27T11:32:47.909Z] ERROR: fluxora-backend - 
+API error: conflict {"code":"CONFLICT","statusCode":409,"req
+uestId":"179c5a27-70bf-485e-829f-d6856a969aa1"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.error
+      [2026-03-27T11:32:47.925Z] ERROR: fluxora-backend - 
+Decimal validation failed {"field":"unknown","receivedType":
+"undefined","receivedValue":"undefined","errorCode":"DECIMAL
+_INVALID_FORMAT","requestId":"b5f1f30d-ddec-4713-bf12-ba7604
+d4da49"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at Object.validationFailed (src/utils/logger.ts:130:5)
+      at errorHandler (src/middleware/errorHandler.ts:34:25)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+(node:5244) ExperimentalWarning: VM Modules is an 
+experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning 
+was created)
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:48.037Z","level":"info","message":"request received","correlationId":"30f7c391-7230-4b04-ad41-25f73ed38879"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":17,"timestamp":"2026-03-27T11:32:48.054Z","level":"info","message":"request completed","correlationId":"30f7c391-7230-4b04-ad41-25f73ed38879"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:48.111Z","level":"info","message":"request received","correlationId":"97715621-fa4d-4723-8cad-a0318122a5c7"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":1,"timestamp":"2026-03-27T11:32:48.112Z","level":"info","message":"request completed","correlationId":"97715621-fa4d-4723-8cad-a0318122a5c7"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:48.146Z","level":"info","message":"request received","correlationId":"b1fe3265-8df5-4185-8c05-b5379eb51831"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":2,"timestamp":"2026-03-27T11:32:48.148Z","level":"info","message":"request completed","correlationId":"b1fe3265-8df5-4185-8c05-b5379eb51831"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:48.158Z","level":"info","message":"request received","correlationId":"4e852f3a-34b4-4346-8c5f-99a4fc90e117"}
+PASS src/routes/health.test.ts (10.951 s)
+{"method":"GET","path":"/","statusCode":200,"durationMs":40,"timestamp":"2026-03-27T11:32:48.198Z","level":"info","message":"request completed","correlationId":"4e852f3a-34b4-4346-8c5f-99a4fc90e117"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:48.208Z","level":"info","message":"request received","correlationId":"8d72047b-6307-4c0a-8a10-6063db47f2db"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":2,"timestamp":"2026-03-27T11:32:48.210Z","level":"info","message":"request completed","correlationId":"8d72047b-6307-4c0a-8a10-6063db47f2db"}
+{"method":"GET","path":"/health","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:48.220Z","level":"info","message":"request received","correlationId":"acef2b93-7035-40b7-81ca-62d5872af6e8"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":2,"timestamp":"2026-03-27T11:32:48.222Z","level":"info","message":"request completed","correlationId":"acef2b93-7035-40b7-81ca-62d5872af6e8"}
+PASS src/routes/streams.test.ts (11.154 s)
+  ??? Console
+
+    console.log
+      [2026-03-27T11:32:47.764Z] INFO: fluxora-backend - 
+Listing all streams {"count":0}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:47.845Z] INFO: fluxora-backend - 
+Listing all streams {"count":0}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:47.898Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"940c26f2-9219-4c70-9249-bdd88187c52d"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:47.912Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611167911-yqlws","correlati
+onId":"940c26f2-9219-4c70-9249-bdd88187c52d"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:47.940Z] INFO: fluxora-backend - 
+Listing all streams {"count":1}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:47.955Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"ec1783c4-2637-4e0d-b50f-e77cba283567"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:47.956Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611167956-rnpvv","correlati
+onId":"ec1783c4-2637-4e0d-b50f-e77cba283567"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.025Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"cbae6779-0e83-4344-aa1a-8da49a11401d"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.026Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611168026-edqg9","correlati
+onId":"cbae6779-0e83-4344-aa1a-8da49a11401d"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.106Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"d171488d-a762-4fa7-922a-08eba0a3b520"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.108Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611168108-ntv5d","correlati
+onId":"d171488d-a762-4fa7-922a-08eba0a3b520"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.166Z] INFO: fluxora-backend - 
+Stream cancelled {"id":"stream-1774611168108-ntv5d","correla
+tionId":"16e4a97f-ae76-4946-a99f-6f116dd443ea"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.199Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"55b40ef3-e798-4c4b-a672-29a986286d8b"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.200Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611168200-92n26","correlati
+onId":"55b40ef3-e798-4c4b-a672-29a986286d8b"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.218Z] INFO: fluxora-backend - 
+Stream cancelled {"id":"stream-1774611168200-92n26","correla
+tionId":"d6720c69-0310-4620-8d06-21ae9548a52e"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.228Z] ERROR: fluxora-backend - 
+API error: Stream is already cancelled {"code":"CONFLICT","s
+tatusCode":409,"details":{"streamId":"stream-1774611168200-9
+2n26"},"requestId":"4921c42c-1bdd-4c8d-afc3-4534e21670fd"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at Immediate.next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Immediate._onImmediate 
+(node_modules/express/lib/router/index.js:646:15)
+
+    console.error
+      [2026-03-27T11:32:48.242Z] ERROR: fluxora-backend - 
+API error: Stream 'nonexistent' not found {"code":"NOT_FOUND
+","statusCode":404,"requestId":"8166c588-fa75-40f4-a7f2-1da9
+68b35618"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.254Z] INFO: fluxora-backend - 
+Listing all streams {"count":5}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.272Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"a3ec972a-0ffc-470c-9c97-ca110c921f8e"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.274Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611168274-dlsx2","correlati
+onId":"a3ec972a-0ffc-470c-9c97-ca110c921f8e"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.286Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"5f883435-befa-4509-8b12-81af3ff0deb2"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.289Z] ERROR: fluxora-backend - 
+API error: sender must be a non-empty string {"code":"VALIDA
+TION_ERROR","statusCode":400,"requestId":"5f883435-befa-4509
+-8b12-81af3ff0deb2"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.298Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"d6f1b7d3-d045-430d-b665-071c69908082"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.299Z] ERROR: fluxora-backend - 
+API error: recipient must be a non-empty string {"code":"VAL
+IDATION_ERROR","statusCode":400,"requestId":"d6f1b7d3-d045-4
+30d-b665-071c69908082"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.314Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"d05e7975-12f6-4552-9d17-a054ce655152"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.315Z] ERROR: fluxora-backend - 
+Decimal validation failed {"field":"depositAmount","received
+Type":"number","receivedValue":"100","errorCode":"DECIMAL_IN
+VALID_TYPE","requestId":"d05e7975-12f6-4552-9d17-a054ce65515
+2"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at Object.validationFailed (src/utils/logger.ts:130:5)
+      at src/routes/streams.ts:97:29
+      at src/middleware/errorHandler.ts:49:32
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at next 
+(node_modules/express/lib/router/route.js:149:13)
+      at Route.dispatch 
+(node_modules/express/lib/router/route.js:119:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at node_modules/express/lib/router/index.js:284:15
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at router.handle 
+(node_modules/express/lib/router/index.js:175:3)
+      at router 
+(node_modules/express/lib/router/index.js:47:12)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/body-parser/lib/read.js:137:5
+      at invokeCallback 
+(node_modules/raw-body/index.js:238:16)
+      at done (node_modules/raw-body/index.js:227:7)
+      at IncomingMessage.onEnd 
+(node_modules/raw-body/index.js:287:7)
+
+    console.error
+      [2026-03-27T11:32:48.317Z] ERROR: fluxora-backend - 
+API error: Invalid decimal string format for amount fields {
+"code":"VALIDATION_ERROR","statusCode":400,"details":{"error
+s":[{"field":"depositAmount","code":"DECIMAL_INVALID_TYPE","
+message":"Field 'depositAmount' must be a string, received n
+umber"}]},"requestId":"d05e7975-12f6-4552-9d17-a054ce655152"
+}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.328Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"2ee17ca7-9409-40c1-ae9c-928160957934"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.331Z] ERROR: fluxora-backend - 
+API error: depositAmount must be greater than zero {"code":"
+VALIDATION_ERROR","statusCode":400,"requestId":"2ee17ca7-940
+9-40c1-ae9c-928160957934"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.347Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"0f128625-f29e-4b66-8eab-d399d961159f"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.348Z] ERROR: fluxora-backend - 
+API error: ratePerSecond cannot be negative {"code":"VALIDAT
+ION_ERROR","statusCode":400,"requestId":"0f128625-f29e-4b66-
+8eab-d399d961159f"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.357Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"bbf87e77-b060-4779-b08c-6a9cdd9b9a63"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.358Z] ERROR: fluxora-backend - 
+API error: startTime must be a non-negative integer {"code":
+"VALIDATION_ERROR","statusCode":400,"requestId":"bbf87e77-b0
+60-4779-b08c-6a9cdd9b9a63"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.367Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"dfaf3869-2f4f-41df-a5dd-a3b5172bd6d1"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.error
+      [2026-03-27T11:32:48.368Z] ERROR: fluxora-backend - 
+API error: endTime must be a non-negative integer {"code":"V
+ALIDATION_ERROR","statusCode":400,"requestId":"dfaf3869-2f4f
+-41df-a5dd-a3b5172bd6d1"}
+
+    [0m [90m  97 |[39m
+     [90m  98 |[39m   [36mif[39m (level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mERROR[39m) {
+    [31m[1m>[22m[39m[90m  99 |[39m     
+console[33m.[39merror(formatted)[33m;[39m
+     [90m     |[39m             [31m[1m^[22m[39m
+     [90m 100 |[39m   } [36melse[39m [36mif[39m 
+(level [33m===[39m 
+[33mLogLevel[39m[33m.[39m[33mWARN[39m) {
+     [90m 101 |[39m     
+console[33m.[39mwarn(formatted)[33m;[39m
+     [90m 102 |[39m   } [36melse[39m {[0m
+
+      at log (src/utils/logger.ts:99:13)
+      at error (src/utils/logger.ts:108:3)
+      at errorHandler (src/middleware/errorHandler.ts:39:5)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.log
+      [2026-03-27T11:32:48.378Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"dbf87c16-8a76-452a-bd77-ae047205993b"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.379Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611168379-i1pem","correlati
+onId":"dbf87c16-8a76-452a-bd77-ae047205993b"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.389Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"c1733115-d25a-46bf-b4fc-1277e179b53f"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.392Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611168392-0xyut","correlati
+onId":"c1733115-d25a-46bf-b4fc-1277e179b53f"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.403Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"d8e2e101-0953-4f42-ba21-9ac9d968d1b8"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.log
+      [2026-03-27T11:32:48.405Z] INFO: fluxora-backend - 
+Stream created {"id":"stream-1774611168404-j40uw","correlati
+onId":"d8e2e101-0953-4f42-ba21-9ac9d968d1b8"}
+
+      at log (src/utils/logger.ts:103:13)
+
+PASS src/middleware/idempotency.test.ts
+{"idempotencyKey":"key-dup-001","cachedStatus":201,"timestamp":"2026-03-27T11:32:48.929Z","level":"info","message":"Idempotent replay","correlationId":"test"}
+{"error":"cache error","timestamp":"2026-03-27T11:32:48.977Z","level":"warn","message":"Idempotency cache read error ??? proceeding","correlationId":"test"}
+{"error":"write error","timestamp":"2026-03-27T11:32:48.998Z","level":"warn","message":"Idempotency cache write error","correlationId":"test"}
+PASS src/middleware/rateLimit.test.ts
+{"ip":"::ffff:127.0.0.1","count":2,"max":1,"timestamp":"2026-03-27T11:32:49.128Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"ip":"::ffff:127.0.0.1","count":2,"max":1,"timestamp":"2026-03-27T11:32:49.141Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"ip":"::ffff:127.0.0.1","count":2,"max":1,"timestamp":"2026-03-27T11:32:49.154Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"error":"cache error","timestamp":"2026-03-27T11:32:49.162Z","level":"warn","message":"Rate limiter cache error ??? allowing request","correlationId":"test"}
+{"ip":"1.2.3.4","count":2,"max":1,"timestamp":"2026-03-27T11:32:49.190Z","level":"warn","message":"Rate limit exceeded","correlationId":"test"}
+{"method":"GET","path":"/does-not-exist","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:49.437Z","level":"info","message":"request received","correlationId":"1a126403-efb5-43f5-a9c9-6fc45df81d41"}
+{"method":"GET","path":"/does-not-exist","statusCode":404,"durationMs":29,"timestamp":"2026-03-27T11:32:49.465Z","level":"info","message":"request completed","correlationId":"1a126403-efb5-43f5-a9c9-6fc45df81d41"}
+PASS src/config/logger.test.ts
+PASS src/app.test.ts
+  ??? Console
+
+    console.warn
+      API error {
+        requestId: '051fcf5a-7f62-4eb1-9793-6902d6f7f96e',
+        status: 404,
+        code: 'not_found',
+        method: 'GET',
+        path: '/does-not-exist',
+        message: 'No route matches GET /does-not-exist',
+        details: undefined
+      }
+
+    [0m [90m 76 |[39m     
+console[33m.[39merror([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m 77 |[39m   } [36melse[39m {
+    [31m[1m>[22m[39m[90m 78 |[39m     
+console[33m.[39mwarn([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 79 |[39m   }
+     [90m 80 |[39m
+     [90m 81 |[39m   [36mconst[39m errorBody[33m:[39m 
+[33mRecord[39m[33m<[39m[33mstring[39m[33m,[39m 
+unknown[33m>[39m [33m=[39m {[0m
+
+      at errorHandler (src/errors.ts:78:13)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at notFoundHandler (src/errors.ts:34:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at requestLoggerMiddleware 
+(src/middleware/requestLogger.ts:33:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at correlationIdMiddleware 
+(src/middleware/correlationId.ts:33:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at requestIdMiddleware (src/errors.ts:30:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at jsonParser 
+(node_modules/body-parser/lib/types/json.js:113:7)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at src/app.ts:30:5
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at expressInit 
+(node_modules/express/lib/middleware/init.js:40:5)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at query 
+(node_modules/express/lib/middleware/query.js:45:5)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at router.handle 
+(node_modules/express/lib/router/index.js:175:3)
+      at app.handle 
+(node_modules/express/lib/application.js:181:10)
+      at Server.app 
+(node_modules/express/lib/express.js:39:9)
+
+    console.warn
+      API error {
+        requestId: undefined,
+        status: 400,
+        code: 'invalid_json',
+        method: 'POST',
+        path: '/api/streams',
+        message: 'Unexpected end of JSON input',
+        details: undefined
+      }
+
+    [0m [90m 76 |[39m     
+console[33m.[39merror([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m 77 |[39m   } [36melse[39m {
+    [31m[1m>[22m[39m[90m 78 |[39m     
+console[33m.[39mwarn([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 79 |[39m   }
+     [90m 80 |[39m
+     [90m 81 |[39m   [36mconst[39m errorBody[33m:[39m 
+[33mRecord[39m[33m<[39m[33mstring[39m[33m,[39m 
+unknown[33m>[39m [33m=[39m {[0m
+
+      at errorHandler (src/errors.ts:78:13)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/body-parser/lib/read.js:130:7
+      at invokeCallback 
+(node_modules/raw-body/index.js:238:16)
+      at done (node_modules/raw-body/index.js:227:7)
+      at IncomingMessage.onEnd 
+(node_modules/raw-body/index.js:287:7)
+
+    console.warn
+      API error {
+        requestId: undefined,
+        status: 413,
+        code: 'payload_too_large',
+        method: 'POST',
+        path: '/api/streams',
+        message: 'request entity too large',
+        details: undefined
+      }
+
+    [0m [90m 76 |[39m     
+console[33m.[39merror([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m 77 |[39m   } [36melse[39m {
+    [31m[1m>[22m[39m[90m 78 |[39m     
+console[33m.[39mwarn([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 79 |[39m   }
+     [90m 80 |[39m
+     [90m 81 |[39m   [36mconst[39m errorBody[33m:[39m 
+[33mRecord[39m[33m<[39m[33mstring[39m[33m,[39m 
+unknown[33m>[39m [33m=[39m {[0m
+
+      at errorHandler (src/errors.ts:78:13)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at onfinished 
+(node_modules/body-parser/lib/read.js:102:9)
+      at listener (node_modules/on-finished/index.js:170:15)
+      at onFinish (node_modules/on-finished/index.js:101:5)
+      at callback (node_modules/ee-first/index.js:55:10)
+      at IncomingMessage.onevent 
+(node_modules/ee-first/index.js:93:5)
+
+    console.log
+      [2026-03-27T11:32:49.611Z] INFO: fluxora-backend - 
+Creating new stream 
+{"correlationId":"28589c53-9050-4a3e-975d-ccf2100d6959"}
+
+      at log (src/utils/logger.ts:103:13)
+
+    console.warn
+      API error {
+        requestId: '7ccaaa8e-8c2b-42d2-850d-bb9261fc4a05',
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        method: 'POST',
+        path: '/api/streams',
+        message: 'recipient must be a non-empty string',
+        details: undefined
+      }
+
+    [0m [90m 76 |[39m     
+console[33m.[39merror([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m 77 |[39m   } [36melse[39m {
+    [31m[1m>[22m[39m[90m 78 |[39m     
+console[33m.[39mwarn([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 79 |[39m   }
+     [90m 80 |[39m
+     [90m 81 |[39m   [36mconst[39m errorBody[33m:[39m 
+[33mRecord[39m[33m<[39m[33mstring[39m[33m,[39m 
+unknown[33m>[39m [33m=[39m {[0m
+
+      at errorHandler (src/errors.ts:78:13)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at node_modules/express/lib/router/index.js:646:15
+      at next 
+(node_modules/express/lib/router/index.js:265:14)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+
+    console.error
+      API error {
+        requestId: '5d8e633f-6041-4221-a5a2-11eba4fa43c7',
+        status: 500,
+        code: 'internal_error',
+        method: 'GET',
+        path: '/__test/error',
+        message: 'forced test error',
+        details: undefined
+      }
+
+    [0m [90m 74 |[39m
+     [90m 75 |[39m   [36mif[39m 
+(normalized[33m.[39mstatus [33m>=[39m [35m500[39m) {
+    [31m[1m>[22m[39m[90m 76 |[39m     
+console[33m.[39merror([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 77 |[39m   } [36melse[39m {
+     [90m 78 |[39m     console[33m.[39mwarn([32m'API 
+error'[39m[33m,[39m log)[33m;[39m
+     [90m 79 |[39m   }[0m
+
+      at errorHandler (src/errors.ts:76:13)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at next 
+(node_modules/express/lib/router/route.js:141:14)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:97:5)
+      at next 
+(node_modules/express/lib/router/route.js:149:13)
+      at Route.dispatch 
+(node_modules/express/lib/router/route.js:119:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at node_modules/express/lib/router/index.js:284:15
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at requestLoggerMiddleware 
+(src/middleware/requestLogger.ts:33:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+{"method":"POST","path":"/api/streams","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:49.606Z","level":"info","message":"request received","correlationId":"28589c53-9050-4a3e-975d-ccf2100d6959"}
+{"method":"POST","path":"/api/streams","statusCode":400,"durationMs":21,"timestamp":"2026-03-27T11:32:49.627Z","level":"info","message":"request completed","correlationId":"28589c53-9050-4a3e-975d-ccf2100d6959"}
+{"method":"GET","path":"/__test/error","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:49.631Z","level":"info","message":"request received","correlationId":"d1cf3f42-d1ad-4606-bd19-776a2ecf2b00"}
+{"method":"GET","path":"/__test/error","statusCode":500,"durationMs":4,"timestamp":"2026-03-27T11:32:49.635Z","level":"info","message":"request completed","correlationId":"d1cf3f42-d1ad-4606-bd19-776a2ecf2b00"}
+{"method":"GET","path":"/","ip":"::ffff:127.0.0.1","timestamp":"2026-03-27T11:32:49.653Z","level":"info","message":"request received","correlationId":"fe420b29-2486-4666-b8d1-089f9ea1f5ec"}
+{"method":"GET","path":"/","statusCode":200,"durationMs":2,"timestamp":"2026-03-27T11:32:49.655Z","level":"info","message":"request completed","correlationId":"fe420b29-2486-4666-b8d1-089f9ea1f5ec"}
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at correlationIdMiddleware 
+(src/middleware/correlationId.ts:33:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at requestIdMiddleware (src/errors.ts:30:3)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at jsonParser 
+(node_modules/body-parser/lib/types/json.js:113:7)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at src/app.ts:30:5
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at expressInit 
+(node_modules/express/lib/middleware/init.js:40:5)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at query 
+(node_modules/express/lib/middleware/query.js:45:5)
+      at Layer.handle [as handle_request] 
+(node_modules/express/lib/router/layer.js:95:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:328:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at router.handle 
+(node_modules/express/lib/router/index.js:175:3)
+      at app.handle 
+(node_modules/express/lib/application.js:181:10)
+      at Server.app 
+(node_modules/express/lib/express.js:39:9)
+
+    console.warn
+      API error {
+        requestId: undefined,
+        status: 413,
+        code: 'payload_too_large',
+        method: 'POST',
+        path: '/api/streams',
+        message: 'request entity too large',
+        details: undefined
+      }
+
+    [0m [90m 76 |[39m     
+console[33m.[39merror([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m 77 |[39m   } [36melse[39m {
+    [31m[1m>[22m[39m[90m 78 |[39m     
+console[33m.[39mwarn([32m'API error'[39m[33m,[39m 
+log)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 79 |[39m   }
+     [90m 80 |[39m
+     [90m 81 |[39m   [36mconst[39m errorBody[33m:[39m 
+[33mRecord[39m[33m<[39m[33mstring[39m[33m,[39m 
+unknown[33m>[39m [33m=[39m {[0m
+
+      at errorHandler (src/errors.ts:78:13)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:71:5)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at Layer.handle_error 
+(node_modules/express/lib/router/layer.js:67:12)
+      at trim_prefix 
+(node_modules/express/lib/router/index.js:326:13)
+      at node_modules/express/lib/router/index.js:286:9
+      at router.process_params 
+(node_modules/express/lib/router/index.js:346:12)
+      at next 
+(node_modules/express/lib/router/index.js:280:10)
+      at onfinished 
+(node_modules/body-parser/lib/read.js:102:9)
+      at listener (node_modules/on-finished/index.js:170:15)
+      at onFinish (node_modules/on-finished/index.js:101:5)
+      at callback (node_modules/ee-first/index.js:55:10)
+      at IncomingMessage.onevent 
+(node_modules/ee-first/index.js:93:5)
+
+PASS src/config/health.test.ts
+PASS src/config/env.test.ts
+  ??? Console
+
+    console.warn
+      [fluxora] WARNING: JWT_SECRET is shorter than 32 
+characters ??? use a strong secret in production
+
+    [0m [90m 145 |[39m         }
+     [90m 146 |[39m         [90m// Warn in 
+non-production so developers notice without hard-failing 
+CI[39m
+    [31m[1m>[22m[39m[90m 147 |[39m         
+console[33m.[39mwarn([32m'[fluxora] WARNING: JWT_SECRET 
+is shorter than 32 characters ??? use a strong secret in 
+production'[39m)[33m;[39m
+     [90m     |[39m                 [31m[1m^[22m[39m
+     [90m 148 |[39m     }
+     [90m 149 |[39m
+     [90m 150 |[39m     [90m// Reject the placeholder 
+value from .env.example in all environments[39m[0m
+
+      at loadConfig (src/config/env.ts:147:17)
+      at Object.<anonymous> (src/config/env.test.ts:146:28)
+
+PASS src/config/validation.test.ts
+PASS src/cache/redis.test.ts
+PASS src/lib/logger.test.ts
+PASS src/indexer/stall.test.ts
+
+Test Suites: 13 passed, 13 total
+Tests:       220 passed, 220 total
+Snapshots:   0 total
+Time:        15.243 s, estimated 20 s
+Ran all test suites.

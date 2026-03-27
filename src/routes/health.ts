@@ -1,6 +1,7 @@
 import express from 'express';
 import type { Request, Response } from 'express';
 import { assessIndexerHealth } from '../indexer/stall.js';
+import { getCacheClient } from '../cache/redis.js';
 
 import { HealthCheckManager } from '../config/health.js';
 import { Logger } from '../config/logger.js';

@@ -11,6 +11,8 @@ import { isShuttingDown } from './shutdown.js';
 export interface AppOptions {
   /** When true, mounts a /__test/error route that throws unconditionally. */
   includeTestRoutes?: boolean;
+  /** Override payload limit in bytes (default 256 KiB). */
+  payloadLimitBytes?: number;
 }
 
 app.use(express.json({ limit: '256kb' }));

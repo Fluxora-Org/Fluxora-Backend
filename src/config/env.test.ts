@@ -110,8 +110,14 @@ describe('Environment Configuration', () => {
 
         it('should require DATABASE_URL in production', () => {
             process.env.NODE_ENV = 'production';
+            process.env.JWT_SECRET = 'a'.repeat(32);
             delete process.env.DATABASE_URL;
 
+            expect(() => loadConfig()).toThrow(ConfigError);
+        });
+
+        it('should require JWT_SECRET in all environments', () => {
+            delete process.env.JWT_SECRET;
             expect(() => loadConfig()).toThrow(ConfigError);
         });
 
@@ -252,3 +258,4 @@ describe('Environment Configuration', () => {
         });
     });
 });
+

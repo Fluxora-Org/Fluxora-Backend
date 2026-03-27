@@ -228,7 +228,6 @@ import { recordAuditEvent } from '../lib/auditLog.js';
 
 export const streamsRouter = Router();
 
-// Amount fields that must be decimal strings per serialization policy
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 
 // In-memory stream store (placeholder for DB integration)
@@ -243,7 +242,6 @@ export const streams: Array<{
   status: string;
 }
 
-// In-memory stream store — placeholder until PostgreSQL integration lands
 const streams: Stream[] = [];
 
 type StreamsCursor = {
@@ -551,10 +549,6 @@ streamsRouter.get(
   })
 );
 
-/**
- * GET /api/streams/:id
- * Get a single stream by ID.
- */
 streamsRouter.get(
   '/:id',
   asyncHandler(async (req: any, res: any) => {
@@ -643,7 +637,6 @@ streamsRouter.post(
       res.status(existingResponse.statusCode).json(existingResponse.body);
       return;
     }
-
     const id = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
     const stream = {
@@ -656,7 +649,6 @@ streamsRouter.post(
       endTime: normalizedInput.endTime,
       status: 'active',
     };
-
     streams.push(stream);
     idempotencyStore.set(idempotencyKey, {
       requestFingerprint,
@@ -688,22 +680,14 @@ streamsRouter.delete(
 
     const index = streams.findIndex((s) => s.id === id);
     if (index === -1) throw notFound('Stream', id);
-
     const stream = streams[index];
-    // noUncheckedIndexedAccess: stream is guaranteed non-null because findIndex returned >= 0
     if (stream === undefined) throw notFound('Stream', id);
-
     if (stream.status === 'cancelled') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Stream is already cancelled', 409, {
-        streamId: id,
-      });
+      throw new ApiError(ApiErrorCode.CONFLICT, 'Stream is already cancelled', 409, { streamId: id });
     }
     if (stream.status === 'completed') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Cannot cancel a completed stream', 409, {
-        streamId: id,
-      });
+      throw new ApiError(ApiErrorCode.CONFLICT, 'Cannot cancel a completed stream', 409, { streamId: id });
     }
-
     streams[index] = { ...stream, status: 'cancelled' };
 
     info('Stream cancelled', { id });

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  ci:
+    name: Typecheck · Test · Coverage
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── Secrets guard ────────────────────────────────────────────────────
+      # Fail fast if any file tracked by git contains a raw secret pattern.
+      # This catches accidental commits of .env files or hardcoded credentials.
+      - name: Check for secrets in repo
+        run: |
+          # Reject any file that looks like a real .env (not .env.example)
+          if git ls-files | grep -E '^\.env$|^\.env\.' ; then
+            echo "ERROR: .env file is tracked by git — remove it immediately"
+            exit 1
+          fi
+          # Reject placeholder JWT_SECRET if it somehow ends up in source
+          if git grep -l 'dev-secret-key-change-in-production' -- '*.ts' '*.js' '*.json' 2>/dev/null; then
+            echo "ERROR: hardcoded dev secret found in source files"
+            exit 1
+          fi
+          echo "Secrets check passed"
+
+      # ── Type safety ──────────────────────────────────────────────────────
+      - name: Typecheck
+        run: npm run build
+
+      # ── Tests (integration suite — tests/) ───────────────────────────────
+      - name: Test (tests/ suite)
+        run: npm test
+        env:
+          JWT_SECRET: ci-test-secret-at-least-32-chars-long
+          NODE_ENV: test
+
+      # ── Tests (unit suite — src/) ─────────────────────────────────────────
+      - name: Test (src/ suite)
+        run: npm run test:src
+        env:
+          JWT_SECRET: ci-test-secret-at-least-32-chars-long
+          NODE_ENV: test
+
+      # ── Coverage (integration suite with threshold enforcement) ───────────
+      - name: Coverage check (tests/ suite)
+        run: npm run test:coverage
+        env:
+          JWT_SECRET: ci-test-secret-at-least-32-chars-long
+          NODE_ENV: test
+
+      # ── Coverage (unit suite — src/ — ≥95% on changed modules) ───────────
+      - name: Coverage check (src/ suite)
+        run: npm run test:coverage:src
+        env:
+          JWT_SECRET: ci-test-secret-at-least-32-chars-long
+          NODE_ENV: test

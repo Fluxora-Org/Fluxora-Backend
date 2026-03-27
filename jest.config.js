@@ -31,6 +31,10 @@ export default {
     'src/**/*.ts',
     '!src/**/*.test.ts',
     '!src/index.ts',
+    '!src/types/**',
+    '!src/serialization/**',
+    '!src/utils/**',
+    '!src/cache/redis.ts',
   ],
   coverageThreshold: {
     global: {

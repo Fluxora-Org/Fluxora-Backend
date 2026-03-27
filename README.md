@@ -380,9 +380,16 @@ Optional:
 Likely future additions:
 
 - `DATABASE_URL`
-- `REDIS_URL`
 - `HORIZON_URL`
 - `JWT_SECRET`
+
+### Running without Redis
+
+Set `REDIS_ENABLED=false` or simply don't run Redis. The service degrades gracefully:
+- Cache reads return null (every request is a cache miss)
+- Rate limiting is disabled (fail-open)
+- Idempotency checks are skipped (fail-open)
+- All functional endpoints continue to work normally
 
 ## Related repos
 
