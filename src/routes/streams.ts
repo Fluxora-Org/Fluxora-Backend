@@ -101,12 +101,28 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *     description: |
  *       Creates a new streaming payment stream with the specified parameters.
  *       All amount fields must be provided as decimal strings.
+ *       Unsafe POST semantics are protected by an `Idempotency-Key` header.
+ *       
+ *       Service-level outcomes:
+ *       - The first successful request for a given idempotency key creates exactly one stream.
+ *       - Retrying the same key with the same normalized payload replays the original 201 body.
+ *       - Reusing a key for a different payload fails with 409 to avoid ambiguous side effects.
+ *       - If the idempotency store is unavailable, the service fails closed with 503.
  *       
  *       **Trust Boundary Note**: Amount fields are validated to ensure no precision
  *       loss when crossing the chain/API boundary. Invalid inputs receive explicit
  *       error responses.
  *     tags:
  *       - streams
+ *     parameters:
+ *       - name: Idempotency-Key
+ *         in: header
+ *         required: true
+ *         schema:
+ *           type: string
+ *           minLength: 1
+ *           maxLength: 128
+ *         description: Client-supplied key used to deduplicate unsafe POST retries
  *     requestBody:
  *       required: true
  *       content:
@@ -120,6 +136,18 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Stream'
+ *       409:
+ *         description: Idempotency key reused with a different request payload
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       503:
+ *         description: Idempotency dependency unavailable
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       400:
  *         description: Invalid input
  *         content:
@@ -293,13 +321,52 @@ type StreamsCursor = {
 };
 
 type StreamListingDependencyState = 'healthy' | 'unavailable';
+type IdempotencyDependencyState = 'healthy' | 'unavailable';
+
+type NormalizedCreateStreamInput = {
+  sender: string;
+  recipient: string;
+  depositAmount: string;
+  ratePerSecond: string;
+  startTime: number;
+  endTime: number;
+};
+
+type StoredIdempotentResponse = {
+  requestFingerprint: string;
+  statusCode: number;
+  body: {
+    id: string;
+    sender: string;
+    recipient: string;
+    depositAmount: string;
+    ratePerSecond: string;
+    startTime: number;
+    endTime: number;
+    status: string;
+  };
+};
 
 const streamListingDependency = {
   state: 'healthy' as StreamListingDependencyState,
 };
 
+const idempotencyDependency = {
+  state: 'healthy' as IdempotencyDependencyState,
+};
+
+const idempotencyStore = new Map<string, StoredIdempotentResponse>();
+
 export function setStreamListingDependencyState(state: StreamListingDependencyState): void {
   streamListingDependency.state = state;
+}
+
+export function setIdempotencyDependencyState(state: IdempotencyDependencyState): void {
+  idempotencyDependency.state = state;
+}
+
+export function resetStreamIdempotencyStore(): void {
+  idempotencyStore.clear();
 }
 
 function encodeCursor(lastId: string): string {
@@ -358,6 +425,108 @@ function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
   }
 
   return decodeCursor(cursorParam);
+}
+
+function parseIdempotencyKey(headerValue: unknown): string {
+  if (Array.isArray(headerValue) || typeof headerValue !== 'string') {
+    throw validationError('Idempotency-Key header is required for unsafe POST operations');
+  }
+
+  const trimmed = headerValue.trim();
+  if (trimmed.length < 1 || trimmed.length > 128) {
+    throw validationError('Idempotency-Key header must be between 1 and 128 characters');
+  }
+
+  if (!/^[A-Za-z0-9:_-]+$/.test(trimmed)) {
+    throw validationError('Idempotency-Key header must use only letters, numbers, colon, underscore, or hyphen');
+  }
+
+  return trimmed;
+}
+
+function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCreateStreamInput {
+  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = body;
+
+  if (typeof sender !== 'string' || sender.trim() === '') {
+    throw validationError('sender must be a non-empty string');
+  }
+
+  if (typeof recipient !== 'string' || recipient.trim() === '') {
+    throw validationError('recipient must be a non-empty string');
+  }
+
+  const amountValidation = validateAmountFields(
+    { depositAmount, ratePerSecond } as Record<string, unknown>,
+    AMOUNT_FIELDS as unknown as string[]
+  );
+
+  if (!amountValidation.valid) {
+    throw new ApiError(
+      ApiErrorCode.VALIDATION_ERROR,
+      'Invalid decimal string format for amount fields',
+      400,
+      {
+        errors: amountValidation.errors.map((e) => ({
+          field: e.field,
+          code: e.code,
+          message: e.message,
+        })),
+      }
+    );
+  }
+
+  const depositResult = validateDecimalString(depositAmount, 'depositAmount');
+  const validatedDepositAmount = depositResult.valid && depositResult.value
+    ? depositResult.value
+    : '0';
+
+  if (depositAmount !== undefined && depositAmount !== null) {
+    const depositNum = parseFloat(validatedDepositAmount);
+    if (depositNum <= 0) {
+      throw validationError('depositAmount must be greater than zero');
+    }
+  }
+
+  const rateResult = validateDecimalString(ratePerSecond, 'ratePerSecond');
+  const validatedRatePerSecond = rateResult.valid && rateResult.value
+    ? rateResult.value
+    : '0';
+
+  if (ratePerSecond !== undefined && ratePerSecond !== null) {
+    const rateNum = parseFloat(validatedRatePerSecond);
+    if (rateNum < 0) {
+      throw validationError('ratePerSecond cannot be negative');
+    }
+  }
+
+  let validatedStartTime = Math.floor(Date.now() / 1000);
+  if (startTime !== undefined) {
+    if (typeof startTime !== 'number' || !Number.isInteger(startTime) || startTime < 0) {
+      throw validationError('startTime must be a non-negative integer');
+    }
+    validatedStartTime = startTime;
+  }
+
+  let validatedEndTime = 0;
+  if (endTime !== undefined) {
+    if (typeof endTime !== 'number' || !Number.isInteger(endTime) || endTime < 0) {
+      throw validationError('endTime must be a non-negative integer');
+    }
+    validatedEndTime = endTime;
+  }
+
+  return {
+    sender: sender.trim(),
+    recipient: recipient.trim(),
+    depositAmount: validatedDepositAmount,
+    ratePerSecond: validatedRatePerSecond,
+    startTime: validatedStartTime,
+    endTime: validatedEndTime,
+  };
+}
+
+function fingerprintCreateStreamInput(input: NormalizedCreateStreamInput): string {
+  return JSON.stringify(input);
 }
 
 /**
@@ -455,112 +624,94 @@ streamsRouter.post(
   asyncHandler(async (req: Request, res: Response) => {
     const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = req.body ?? {};
     const requestId = (req as { id?: string }).id;
+    const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
 
-    info('Creating new stream', { requestId });
-
-    // Validate required string fields
-    if (typeof sender !== 'string' || sender.trim() === '') {
-      throw validationError('sender must be a non-empty string');
+    if (idempotencyDependency.state !== 'healthy') {
+      warn('Idempotency dependency unavailable', {
+        dependency: 'idempotency-store',
+        requestId,
+        idempotencyKey,
+      });
+      throw serviceUnavailable('Idempotency processing is temporarily unavailable. Retry after dependency health is restored.');
     }
 
-    if (typeof recipient !== 'string' || recipient.trim() === '') {
-      throw validationError('recipient must be a non-empty string');
+    info('Creating new stream', { requestId, idempotencyKey });
+
+    let normalizedInput: NormalizedCreateStreamInput;
+    try {
+      normalizedInput = normalizeCreateStreamInput(req.body ?? {});
+    } catch (error) {
+      const amountValidation = validateAmountFields(
+        {
+          depositAmount: req.body?.depositAmount,
+          ratePerSecond: req.body?.ratePerSecond,
+        } as Record<string, unknown>,
+        AMOUNT_FIELDS as unknown as string[]
+      );
+
+      if (!amountValidation.valid) {
+        for (const err of amountValidation.errors) {
+          SerializationLogger.validationFailed(
+            err.field || 'unknown',
+            err.rawValue,
+            err.code,
+            requestId
+          );
+        }
+      }
+
+      throw error;
     }
 
-    // Validate amount fields against decimal string policy
-    const amountValidation = validateAmountFields(
-      { depositAmount, ratePerSecond } as Record<string, unknown>,
-      AMOUNT_FIELDS as unknown as string[]
-    );
+    const requestFingerprint = fingerprintCreateStreamInput(normalizedInput);
+    const existingResponse = idempotencyStore.get(idempotencyKey);
 
-    if (!amountValidation.valid) {
-      // Log validation failures for diagnostics
-      for (const err of amountValidation.errors) {
-        SerializationLogger.validationFailed(
-          err.field || 'unknown',
-          err.rawValue,
-          err.code,
-          requestId
+    if (existingResponse) {
+      if (existingResponse.requestFingerprint !== requestFingerprint) {
+        throw new ApiError(
+          ApiErrorCode.CONFLICT,
+          'Idempotency-Key has already been used for a different request payload',
+          409,
+          { idempotencyKey }
         );
       }
 
-      throw new ApiError(
-        ApiErrorCode.VALIDATION_ERROR,
-        'Invalid decimal string format for amount fields',
-        400,
-        {
-          errors: amountValidation.errors.map((e) => ({
-            field: e.field,
-            code: e.code,
-            message: e.message,
-          })),
-        }
-      );
+      info('Replaying idempotent stream creation response', {
+        requestId,
+        idempotencyKey,
+        streamId: existingResponse.body.id,
+      });
+
+      res.set('Idempotency-Key', idempotencyKey);
+      res.set('Idempotency-Replayed', 'true');
+      res.status(existingResponse.statusCode).json(existingResponse.body);
+      return;
     }
 
-    // Additional semantic validation
-    const depositResult = validateDecimalString(depositAmount, 'depositAmount');
-    const validatedDepositAmount = depositResult.valid && depositResult.value
-      ? depositResult.value
-      : '0'; // Default to '0' for missing values
-    
-    // Only validate semantic constraints for provided values
-    if (depositAmount !== undefined && depositAmount !== null) {
-      const depositNum = parseFloat(validatedDepositAmount);
-      if (depositNum <= 0) {
-        throw validationError('depositAmount must be greater than zero');
-      }
-    }
-
-    const rateResult = validateDecimalString(ratePerSecond, 'ratePerSecond');
-    const validatedRatePerSecond = rateResult.valid && rateResult.value
-      ? rateResult.value
-      : '0'; // Default to '0' for missing values
-    
-    // Only validate semantic constraints for provided values
-    if (ratePerSecond !== undefined && ratePerSecond !== null) {
-      const rateNum = parseFloat(validatedRatePerSecond);
-      if (rateNum < 0) {
-        throw validationError('ratePerSecond cannot be negative');
-      }
-    }
-
-    // Validate startTime if provided
-    let validatedStartTime = Math.floor(Date.now() / 1000);
-    if (startTime !== undefined) {
-      if (typeof startTime !== 'number' || !Number.isInteger(startTime) || startTime < 0) {
-        throw validationError('startTime must be a non-negative integer');
-      }
-      validatedStartTime = startTime;
-    }
-
-    // Validate endTime if provided
-    let validatedEndTime = 0;
-    if (endTime !== undefined) {
-      if (typeof endTime !== 'number' || !Number.isInteger(endTime) || endTime < 0) {
-        throw validationError('endTime must be a non-negative integer');
-      }
-      validatedEndTime = endTime;
-    }
-
-    // Create the stream with validated decimal strings
     const id = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const stream = {
       id,
-      sender: sender.trim(),
-      recipient: recipient.trim(),
-      depositAmount: validatedDepositAmount,
-      ratePerSecond: validatedRatePerSecond,
-      startTime: validatedStartTime,
-      endTime: validatedEndTime,
+      sender: normalizedInput.sender,
+      recipient: normalizedInput.recipient,
+      depositAmount: normalizedInput.depositAmount,
+      ratePerSecond: normalizedInput.ratePerSecond,
+      startTime: normalizedInput.startTime,
+      endTime: normalizedInput.endTime,
       status: 'active',
     };
 
     streams.push(stream);
+    idempotencyStore.set(idempotencyKey, {
+      requestFingerprint,
+      statusCode: 201,
+      body: stream,
+    });
 
     SerializationLogger.amountSerialized(2, requestId);
-    info('Stream created', { id, requestId });
+    info('Stream created', { id, requestId, idempotencyKey });
 
+    res.set('Idempotency-Key', idempotencyKey);
+    res.set('Idempotency-Replayed', 'false');
     res.status(201).json(stream);
   })
 );
