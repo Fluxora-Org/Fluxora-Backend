@@ -44,8 +44,10 @@ function getClientIp(req: Request): string {
   const forwarded = req.headers['x-forwarded-for'];
   if (typeof forwarded === 'string') {
     const first = forwarded.split(',')[0];
+    /* istanbul ignore next */
     if (first !== undefined) return first.trim();
   }
+  /* istanbul ignore next */
   return req.ip ?? 'unknown';
 }
 

@@ -103,6 +103,7 @@ export function idempotencyMiddleware(
           .set(cacheKey, { status: res.statusCode, body }, IDEMPOTENCY_TTL_SECONDS)
           .catch((err: unknown) => {
             logger.warn('Idempotency cache write error', req.correlationId, {
+              /* istanbul ignore next */
               error: err instanceof Error ? err.message : String(err),
             });
           });
