@@ -17,12 +17,12 @@ export interface LogEntry {
     timestamp: string;
     level: LogLevel;
     message: string;
-    context?: Record<string, unknown>;
+    context?: Record<string, unknown> | undefined;
     error?: {
         name: string;
         message: string;
-        stack?: string;
-    };
+        stack?: string | undefined;
+    } | undefined;
 }
 
 /**
@@ -70,32 +70,32 @@ export class Logger {
      * Log debug message
      */
     debug(message: string, context?: Record<string, unknown>): void {
-        this.emit({ timestamp: '', level: 'debug', message, context });
+        this.emit({ timestamp: '', level: 'debug', message, ...(context !== undefined ? { context } : {}) });
     }
 
     /**
      * Log info message
      */
     info(message: string, context?: Record<string, unknown>): void {
-        this.emit({ timestamp: '', level: 'info', message, context });
+        this.emit({ timestamp: '', level: 'info', message, ...(context !== undefined ? { context } : {}) });
     }
 
     /**
      * Log warning message
      */
     warn(message: string, context?: Record<string, unknown>): void {
-        this.emit({ timestamp: '', level: 'warn', message, context });
+        this.emit({ timestamp: '', level: 'warn', message, ...(context !== undefined ? { context } : {}) });
     }
 
     /**
      * Log error message
      */
     error(message: string, error?: Error, context?: Record<string, unknown>): void {
-        const errorInfo = error
+        const errorInfo: LogEntry['error'] = error
             ? {
                 name: error.name,
                 message: error.message,
-                stack: error.stack,
+                ...(error.stack !== undefined ? { stack: error.stack } : {}),
             }
             : undefined;
 
@@ -103,8 +103,8 @@ export class Logger {
             timestamp: '',
             level: 'error',
             message,
-            context,
-            error: errorInfo,
+            ...(context !== undefined ? { context } : {}),
+            ...(errorInfo !== undefined ? { error: errorInfo } : {}),
         });
     }
 

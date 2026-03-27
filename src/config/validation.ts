@@ -198,3 +198,51 @@ export function validateStreamId(id: string, fieldName: string = 'id'): string {
 
     return id;
 }
+
+/**
+ * Validate JSON depth to prevent deeply nested payload attacks
+ * Recursively traverses the object tree and counts nesting levels
+ */
+export function validateJsonDepth(data: unknown, maxDepth: number, fieldName: string = 'request body'): void {
+    function checkDepth(obj: unknown, currentDepth: number): void {
+        if (currentDepth > maxDepth) {
+            throw new ValidationError(
+                `${fieldName} exceeds maximum JSON depth of ${maxDepth}`,
+                'depth',
+                currentDepth
+            );
+        }
+
+        if (obj === null || obj === undefined) {
+            return;
+        }
+
+        if (typeof obj === 'object') {
+            if (Array.isArray(obj)) {
+                for (const item of obj) {
+                    checkDepth(item, currentDepth + 1);
+                }
+            } else {
+                for (const value of Object.values(obj)) {
+                    checkDepth(value, currentDepth + 1);
+                }
+            }
+        }
+    }
+
+    checkDepth(data, 0);
+}
+
+/**
+ * Validate request size (in bytes)
+ * Note: This is typically enforced at middleware level, but provided for explicit validation
+ */
+export function validateRequestSize(sizeBytes: number, maxSizeBytes: number, fieldName: string = 'request'): void {
+    if (sizeBytes > maxSizeBytes) {
+        throw new ValidationError(
+            `${fieldName} size (${sizeBytes} bytes) exceeds maximum allowed (${maxSizeBytes} bytes)`,
+            'size',
+            sizeBytes
+        );
+    }
+}
