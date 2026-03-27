@@ -40,7 +40,35 @@ export function createApp(options: AppOptions = {}) {
   }, streamsRouter);
 
   // Root endpoint: API discovery and deprecation policy
-  app.get('/', (_req: express.Request, res: express.Response) => {
+  /**
+ * @openapi
+ * /:
+ *   get:
+ *     summary: API Discovery and Deprecation Policy
+ *     description: |
+ *       Returns metadata about the Fluxora API, including currently supported versions,
+ *       the deprecation policy for legacy endpoints, and information about the 
+ *       standardized error envelope and tracing (requestId).
+ *     responses:
+ *       200:
+ *         description: API discovery metadata
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 service:
+ *                   type: string
+ *                 versions:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                 errorPolicy:
+ *                   type: object
+ *                 deprecationPolicy:
+ *                   type: object
+ */
+app.get('/', (_req: express.Request, res: express.Response) => {
     res.json({
       name: 'Fluxora API',
       version: '1.0.0',

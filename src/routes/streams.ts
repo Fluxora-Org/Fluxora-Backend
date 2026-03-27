@@ -16,17 +16,30 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
 
 /**
  * @openapi
- * /api/streams:
+ * /v1/streams:
  *   get:
- *     summary: List all streams
+ *     summary: List streams (paginated)
  *     description: |
- *       Returns all active streaming payment streams.
+ *       Returns a paginated list of active streaming payment streams.
  *       All amount fields are serialized as decimal strings for precision.
  *     tags:
  *       - streams
+ *     parameters:
+ *       - name: limit
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *         description: Maximum number of streams to return (max 100)
+ *       - name: offset
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *         description: Number of streams to skip
  *     responses:
  *       200:
- *         description: List of streams
+ *         description: Paginated list of streams
  *         content:
  *           application/json:
  *             schema:
@@ -36,8 +49,14 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *                   type: array
  *                   items:
  *                     $ref: '#/components/schemas/Stream'
- *       500:
- *         description: Internal server error
+ *                 total:
+ *                   type: integer
+ *                 limit:
+ *                   type: integer
+ *                 offset:
+ *                   type: integer
+ *       5xx:
+ *         description: Server error
  *         content:
  *           application/json:
  *             schema:
@@ -51,7 +70,7 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *       
  *       **Trust Boundary Note**: Amount fields are validated to ensure no precision
  *       loss when crossing the chain/API boundary. Invalid inputs receive explicit
- *       error responses.
+ *       standardized error responses.
  *     tags:
  *       - streams
  *     requestBody:
@@ -68,13 +87,13 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *             schema:
  *               $ref: '#/components/schemas/Stream'
  *       400:
- *         description: Invalid input
+ *         description: Invalid input (Validation Error)
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
  * 
- * /api/streams/{id}:
+ * /v1/streams/{id}:
  *   get:
  *     summary: Get a stream by ID
  *     description: |
@@ -88,7 +107,7 @@ import { SerializationLogger, info, debug } from '../utils/logger.js';
  *         required: true
  *         schema:
  *           type: string
- *         description: Stream identifier
+ *         description: Stream identifier (starts with 'stream-')
  *     responses:
  *       200:
  *         description: Stream details
