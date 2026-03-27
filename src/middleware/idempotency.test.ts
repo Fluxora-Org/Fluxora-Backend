@@ -96,6 +96,24 @@ describe('idempotencyMiddleware', () => {
     expect(res.body.created).toBe(true);
   });
 
+  it('handles cache write error gracefully (fail-open on set)', async () => {
+    // Cache that succeeds on get (returns null = no cached response) but throws on set
+    let getCallCount = 0;
+    const partialFailCache = {
+      get: async () => { getCallCount++; return null; },
+      set: async () => { throw new Error('write error'); },
+      del: async () => { /* no-op */ },
+      delPattern: async () => { /* no-op */ },
+      ping: async () => false,
+      quit: async () => { /* no-op */ },
+    };
+    setCacheClient(partialFailCache as never);
+    // Should still return 201 even though caching the response fails
+    const res = await request(app).post('/resource').set('Idempotency-Key', 'key-write-fail').send({}).expect(201);
+    expect(res.body.created).toBe(true);
+    expect(getCallCount).toBeGreaterThan(0);
+  });
+
   it('fails open when cache unavailable', async () => {
     resetCacheClient();
     const res = await request(app).post('/resource').set('Idempotency-Key', 'key-no-cache').send({}).expect(201);

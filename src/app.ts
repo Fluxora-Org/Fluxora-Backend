@@ -15,12 +15,23 @@ import {
 export interface AppOptions {
   /** When true, mounts a /__test/error route that throws unconditionally. */
   includeTestRoutes?: boolean;
+  /** Override payload limit in bytes (default 256 KiB). */
+  payloadLimitBytes?: number;
 }
 
 export function createApp(options: AppOptions = {}): express.Express {
   const application = express();
 
-  application.use(express.json({ limit: '256kb' }));
+  // Security headers — applied before any route handler
+  application.use((_req: Request, res: Response, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '0'); // modern browsers ignore this; CSP is the right control
+    next();
+  });
+
+  const payloadLimit = options.payloadLimitBytes ?? 256 * 1024;
+  application.use(express.json({ limit: payloadLimit }));
   application.use(requestIdMiddleware);
   application.use(correlationIdMiddleware);
   application.use(requestLoggerMiddleware);

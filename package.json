@@ -11,7 +11,8 @@
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs",
     "test:src": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.js",
     "test:all": "npm run test && npm run test:src",
-    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --coverage"
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --coverage",
+    "test:coverage:src": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.js --coverage"
   },
   "dependencies": {
     "express": "^4.18.2",

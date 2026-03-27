@@ -76,4 +76,31 @@ describe('app error envelopes', () => {
     expect(data.error['status']).toBe(500);
     expect(data.error['message']).toBe('Internal server error');
   });
+
+  it('sets security headers on every response', async () => {
+    const res = await fetch(`${baseUrl}/`);
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+  });
+});
+
+describe('app payload limit', () => {
+  it('respects a custom payloadLimitBytes option', async () => {
+    // Create an app with a very small limit (1 KiB) to verify the option is wired
+    const tinyApp = (await import('./app.js')).createApp({ payloadLimitBytes: 1024 });
+    const tinyServer = tinyApp.listen(0);
+    await once(tinyServer, 'listening');
+    const { port } = tinyServer.address() as AddressInfo;
+    const url = `http://127.0.0.1:${port}`;
+
+    const res = await fetch(`${url}/api/streams`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ blob: 'x'.repeat(2000) }),
+    });
+    expect(res.status).toBe(413);
+
+    tinyServer.close();
+    await once(tinyServer, 'close');
+  });
 });

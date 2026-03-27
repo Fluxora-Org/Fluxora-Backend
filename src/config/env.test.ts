@@ -15,12 +15,13 @@ describe('Environment Configuration', () => {
         savedEnv = { ...process.env };
         resetConfig();
         process.env['NODE_ENV'] = 'development';
+        // Provide a valid JWT_SECRET by default so tests that don't care about it pass
+        process.env['JWT_SECRET'] = 'dev-secret-at-least-32-chars-long!!';
         // Clear test-sensitive vars so defaults apply
         delete process.env['PORT'];
         delete process.env['DATABASE_URL'];
         delete process.env['REDIS_URL'];
         delete process.env['HORIZON_URL'];
-        delete process.env['JWT_SECRET'];
         delete process.env['DATABASE_POOL_SIZE'];
         delete process.env['DATABASE_CONNECTION_TIMEOUT'];
         delete process.env['LOG_LEVEL'];
@@ -104,7 +105,13 @@ describe('Environment Configuration', () => {
 
         it('should require DATABASE_URL in production', () => {
             process.env.NODE_ENV = 'production';
+            process.env.JWT_SECRET = 'a'.repeat(32);
             delete process.env.DATABASE_URL;
+            expect(() => loadConfig()).toThrow(ConfigError);
+        });
+
+        it('should require JWT_SECRET in all environments', () => {
+            delete process.env.JWT_SECRET;
             expect(() => loadConfig()).toThrow(ConfigError);
         });
 
@@ -116,15 +123,28 @@ describe('Environment Configuration', () => {
 
         it('should enforce JWT_SECRET minimum length in production', () => {
             process.env.NODE_ENV = 'production';
+            process.env.DATABASE_URL = 'postgresql://localhost/fluxora';
             process.env.JWT_SECRET = 'short';
             expect(() => loadConfig()).toThrow(ConfigError);
         });
 
-        it('should allow short JWT_SECRET in development', () => {
+        it('should reject placeholder JWT_SECRET value', () => {
+            process.env.JWT_SECRET = 'CHANGE_ME_generate_a_real_secret_before_deploying';
+            expect(() => loadConfig()).toThrow(ConfigError);
+        });
+
+        it('should reject placeholder JWT_SECRET in production too', () => {
+            process.env.NODE_ENV = 'production';
+            process.env.DATABASE_URL = 'postgresql://localhost/fluxora';
+            process.env.JWT_SECRET = 'CHANGE_ME_anything';
+            expect(() => loadConfig()).toThrow(ConfigError);
+        });
+
+        it('should allow short JWT_SECRET in development with a warning', () => {
             process.env.NODE_ENV = 'development';
-            process.env.JWT_SECRET = 'short';
+            process.env.JWT_SECRET = 'short-but-set';
             const config = loadConfig();
-            expect(config.jwtSecret).toBe('short');
+            expect(config.jwtSecret).toBe('short-but-set');
         });
 
         it('should parse CONNECTION_TIMEOUT', () => {
@@ -147,6 +167,18 @@ describe('Environment Configuration', () => {
             process.env.HORIZON_NETWORK_PASSPHRASE = 'Public Global Stellar Network ; September 2015';
             const config = loadConfig();
             expect(config.horizonNetworkPassphrase).toBe('Public Global Stellar Network ; September 2015');
+        });
+
+        it('should parse PAYLOAD_LIMIT_BYTES', () => {
+            process.env['PAYLOAD_LIMIT_BYTES'] = '65536';
+            const config = loadConfig();
+            expect(config.payloadLimitBytes).toBe(65536);
+        });
+
+        it('should default PAYLOAD_LIMIT_BYTES to 256 KiB', () => {
+            delete process.env['PAYLOAD_LIMIT_BYTES'];
+            const config = loadConfig();
+            expect(config.payloadLimitBytes).toBe(256 * 1024);
         });
     });
 
@@ -199,6 +231,7 @@ describe('Environment Configuration', () => {
             expect(config).toHaveProperty('metricsEnabled');
             expect(config).toHaveProperty('enableStreamValidation');
             expect(config).toHaveProperty('enableRateLimit');
+            expect(config).toHaveProperty('payloadLimitBytes');
         });
     });
 
@@ -221,3 +254,4 @@ describe('Environment Configuration', () => {
         });
     });
 });
+

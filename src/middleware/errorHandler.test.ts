@@ -118,3 +118,25 @@ describe('asyncHandler', () => {
     expect(res.body.error.code).toBe(ApiErrorCode.CONFLICT);
   });
 });
+
+describe('error factory helpers — details branch', () => {
+  it('conflictError with details', () => {
+    const e = conflictError('dup', { id: '123' });
+    expect(e.details).toEqual({ id: '123' });
+    expect(e.statusCode).toBe(409);
+  });
+
+  it('validationError without details', () => {
+    const e = validationError('bad');
+    expect(e.details).toBeUndefined();
+  });
+
+  it('DecimalSerializationError without field', async () => {
+    const app = buildApp(() => {
+      throw new DecimalSerializationError(DecimalErrorCode.INVALID_FORMAT, 'bad format');
+    });
+    const res = await request(app).get('/test').expect(400);
+    expect(res.body.error.code).toBe(ApiErrorCode.DECIMAL_ERROR);
+    expect(res.body.error.details.field).toBeUndefined();
+  });
+});

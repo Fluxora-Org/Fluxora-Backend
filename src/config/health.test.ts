@@ -187,5 +187,58 @@ describe('Health Check Manager', () => {
             const report = await manager.checkAll();
             expect(report.status).toBe('unhealthy');
         });
+
+        it('should return healthy with no checkers registered', async () => {
+            const report = await manager.checkAll();
+            expect(report.status).toBe('healthy');
+            expect(report.dependencies).toHaveLength(0);
+        });
+    });
+
+    describe('checkOne — non-Error thrown', () => {
+        it('handles non-Error thrown values (string)', async () => {
+            const checker: HealthChecker = {
+                name: 'string-throw',
+                // eslint-disable-next-line @typescript-eslint/only-throw-error
+                async check() { throw 'plain string error'; },
+            };
+            manager.registerChecker(checker);
+            const report = await manager.checkAll();
+            expect(report.dependencies[0]!.error).toBe('plain string error');
+        });
+    });
+
+    describe('Built-in checkers — branch coverage', () => {
+        it('redis checker returns error when ping returns false', async () => {
+            const checker = createRedisHealthChecker(async () => false);
+            const result = await checker.check();
+            expect(result.error).toBe('Redis ping failed');
+        });
+
+        it('redis checker returns healthy when ping returns true', async () => {
+            const checker = createRedisHealthChecker(async () => true);
+            const result = await checker.check();
+            expect(result.error).toBeUndefined();
+        });
+
+        it('redis checker handles ping throwing', async () => {
+            const checker = createRedisHealthChecker(async () => { throw new Error('conn refused'); });
+            const result = await checker.check();
+            expect(result.error).toBe('conn refused');
+        });
+
+        it('redis checker handles non-Error ping throw', async () => {
+            // eslint-disable-next-line @typescript-eslint/only-throw-error
+            const checker = createRedisHealthChecker(async () => { throw 'oops'; });
+            const result = await checker.check();
+            expect(result.error).toBe('Unknown error');
+        });
+
+        it('horizon checker handles non-ok HTTP response', async () => {
+            // Use a URL that will fail to connect — the catch branch handles it
+            const checker = createHorizonHealthChecker('http://127.0.0.1:1');
+            const result = await checker.check();
+            expect(result.error).toBeDefined();
+        });
     });
 });

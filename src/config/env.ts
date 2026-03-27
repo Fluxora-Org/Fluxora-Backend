@@ -43,6 +43,10 @@ export interface Config {
     // Feature flags
     enableStreamValidation: boolean;
     enableRateLimit: boolean;
+
+    // Request limits
+    /** Maximum request body size in bytes (default 256 KiB). */
+    payloadLimitBytes: number;
 }
 
 /**
@@ -128,12 +132,22 @@ export function loadConfig(): Config {
         'HORIZON_URL'
     );
 
-    const jwtSecret = isProduction
-        ? requireEnv('JWT_SECRET')
-        : process.env.JWT_SECRET ?? 'dev-secret-key-change-in-production';
+    // JWT_SECRET must always be explicitly set — no hardcoded fallback.
+    // In development a short/weak value is tolerated but warned about.
+    // In production the variable is required and must be ≥32 chars.
+    const jwtSecret = requireEnv('JWT_SECRET');
 
-    if (jwtSecret.length < 32 && isProduction) {
-        throw new ConfigError('JWT_SECRET must be at least 32 characters in production');
+    if (jwtSecret.length < 32) {
+        if (isProduction) {
+            throw new ConfigError('JWT_SECRET must be at least 32 characters in production');
+        }
+        // Warn in non-production so developers notice without hard-failing CI
+        console.warn('[fluxora] WARNING: JWT_SECRET is shorter than 32 characters — use a strong secret in production');
+    }
+
+    // Reject the placeholder value from .env.example in all environments
+    if (jwtSecret.startsWith('CHANGE_ME')) {
+        throw new ConfigError('JWT_SECRET is still set to the placeholder value — replace it with a real secret');
     }
 
     const horizonNetworkPassphrase = process.env.HORIZON_NETWORK_PASSPHRASE ?? 'Test SDF Network ; September 2015';
@@ -161,6 +175,8 @@ export function loadConfig(): Config {
 
         enableStreamValidation: parseBoolEnv(process.env.ENABLE_STREAM_VALIDATION, true),
         enableRateLimit: parseBoolEnv(process.env.ENABLE_RATE_LIMIT, !isProduction),
+
+        payloadLimitBytes: parseIntEnv(process.env.PAYLOAD_LIMIT_BYTES, 256 * 1024, 1024, 10 * 1024 * 1024),
     };
 
     return config;
