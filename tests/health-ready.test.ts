@@ -1,5 +1,5 @@
 import request from 'supertest';
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, beforeEach } from 'vitest';
 import express from 'express';
 import { healthRouter } from '../src/routes/health';
 import { HealthCheckManager } from '../src/config/health';

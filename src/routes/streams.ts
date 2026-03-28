@@ -12,14 +12,20 @@ import {
   notFound,
   validationError,
   conflictError,
+  serviceUnavailable,
   asyncHandler,
 } from '../middleware/errorHandler.js';
 import { requireAuth } from '../middleware/auth.js';
-import { info, debug, warn } from '../utils/logger.js';
+import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { verifyStreamOnChain } from '../lib/stellar.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
+import { successResponse } from '../utils/response.js';
 
 /**
  * Streams API routes (BigInt-Safe Implementation)
+ *
+ * All amount fields (depositAmount, ratePerSecond) are stored internally as BigInt (stroops)
+ * and serialized as decimal strings for precision in API responses.
  */
 export const streamsRouter = Router();
 
@@ -43,6 +49,10 @@ export interface Stream {
 // In-memory stream store
 export const streams: Stream[] = [];
 
+// Dependency states
+const streamListingDependency = { state: 'healthy' as 'healthy' | 'unavailable' };
+const idempotencyDependency = { state: 'healthy' as 'healthy' | 'unavailable' };
+
 // Idempotency store
 const idempotencyStore = new Map<string, {
   fingerprint: string;
@@ -50,49 +60,99 @@ const idempotencyStore = new Map<string, {
   body: any;
 }>();
 
+// Pagination helpers
+type StreamsCursor = { v: 1; lastId: string };
+
+function encodeCursor(lastId: string): string {
+  const payload: StreamsCursor = { v: 1, lastId };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function decodeCursor(cursor: string): StreamsCursor {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    if (parsed?.v === 1 && typeof parsed?.lastId === 'string') return parsed;
+  } catch {}
+  throw validationError('cursor must be a valid opaque pagination token');
+}
+
+function parseLimit(limitParam: any): number {
+  const limit = parseInt(String(limitParam || 50), 10);
+  if (isNaN(limit) || limit < 1 || limit > 100) {
+    throw validationError('limit must be an integer between 1 and 100');
+  }
+  return limit;
+}
+
 function parseIdempotencyKey(headerValue: unknown): string {
   if (typeof headerValue !== 'string' || headerValue.trim() === '') {
     throw validationError('Idempotency-Key header is required');
   }
-  return headerValue.trim();
+  const trimmed = headerValue.trim();
+  if (trimmed.length > 128 || !/^[A-Za-z0-9:_-]+$/.test(trimmed)) {
+    throw validationError('Invalid Idempotency-Key format');
+  }
+  return trimmed;
 }
 
 /**
- * GET /api/streams
- * List all streams, formatting BigInt to string
+ * GET /api/streams - List streams with pagination
  */
 streamsRouter.get(
   '/',
-  asyncHandler(async (_req: Request, res: Response) => {
-    info('Listing all streams', { count: streams.length });
+  asyncHandler(async (req: Request, res: Response) => {
+    const limit = parseLimit(req.query.limit);
+    const cursorStr = req.query.cursor as string | undefined;
+    const includeTotal = req.query.include_total === 'true';
 
-    const serializedStreams = streams.map(s => ({
+    if (streamListingDependency.state !== 'healthy') {
+      throw serviceUnavailable('Stream list is temporarily unavailable.');
+    }
+
+    const sortedStreams = [...streams].sort((a, b) => a.id.localeCompare(b.id));
+    let startIndex = 0;
+
+    if (cursorStr) {
+      const cursor = decodeCursor(cursorStr);
+      startIndex = sortedStreams.findIndex((s) => s.id > cursor.lastId);
+      if (startIndex === -1) startIndex = sortedStreams.length;
+    }
+
+    const pageStreams = sortedStreams.slice(startIndex, startIndex + limit);
+    const hasMore = startIndex + pageStreams.length < sortedStreams.length;
+    const nextCursor = hasMore && pageStreams.length > 0
+      ? encodeCursor(pageStreams[pageStreams.length - 1].id)
+      : undefined;
+
+    const serializedStreams = pageStreams.map(s => ({
       ...s,
       depositAmount: formatFromStroops(s.depositAmount),
       ratePerSecond: formatFromStroops(s.ratePerSecond),
     }));
 
-    res.json({
+    const response: any = {
       streams: serializedStreams,
-      total: streams.length,
-    });
+      has_more: hasMore,
+    };
+
+    if (includeTotal) response.total = streams.length;
+    if (nextCursor) response.next_cursor = nextCursor;
+
+    info('Listing streams', { count: pageStreams.length, total: streams.length });
+    res.json(response);
   })
 );
 
 /**
- * GET /api/streams/:id
- * Get a single stream, formatting BigInt to string
+ * GET /api/streams/:id - Get a single stream
  */
 streamsRouter.get(
   '/:id',
   asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
-    debug('Fetching stream', { id });
-
     const stream = streams.find((s) => s.id === id);
-    if (!stream) {
-      throw notFound('Stream', id);
-    }
+
+    if (!stream) throw notFound('Stream', id);
 
     res.json({
       ...stream,
@@ -103,17 +163,18 @@ streamsRouter.get(
 );
 
 /**
- * POST /api/streams
- * Create a new stream via on-chain verification
+ * POST /api/streams - Create/Verify a new stream
  */
 streamsRouter.post(
   '/',
-  authenticate,
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const { transactionHash } = req.body ?? {};
-    const requestId = (req as any).id;
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
+
+    if (idempotencyDependency.state !== 'healthy') {
+      throw serviceUnavailable('Idempotency processing is temporarily unavailable.');
+    }
 
     if (!transactionHash) {
       throw validationError('transactionHash is required');
@@ -127,11 +188,10 @@ streamsRouter.post(
         throw conflictError('Idempotency key reused with different payload');
       }
       res.set('Idempotency-Replayed', 'true');
-      res.status(cached.statusCode).json(cached.body);
-      return;
+      return res.status(cached.statusCode).json(cached.body);
     }
 
-    info('Verifying on-chain stream', { transactionHash, requestId });
+    info('Verifying on-chain stream', { transactionHash });
 
     // Trust boundary: Verify the transaction on Stellar
     const verified = await verifyStreamOnChain(transactionHash);
@@ -143,19 +203,7 @@ streamsRouter.post(
       status: 'active',
     };
 
-    // Store in-memory
-    const existingStream = streams.find(s => s.id === id);
-    if (existingStream) {
-      const responseBody = {
-        ...existingStream,
-        depositAmount: formatFromStroops(existingStream.depositAmount),
-        ratePerSecond: formatFromStroops(existingStream.ratePerSecond),
-      };
-      idempotencyStore.set(idempotencyKey, { fingerprint, statusCode: 200, body: responseBody });
-      res.status(200).json(responseBody);
-      return;
-    }
-
+    // Store in-memory (using BigInt)
     streams.push(stream);
 
     const responseBody = {
@@ -164,51 +212,43 @@ streamsRouter.post(
       ratePerSecond: formatFromStroops(stream.ratePerSecond),
     };
 
-    idempotencyStore.set(idempotencyKey, { fingerprint, statusCode: 201, body: responseBody });
+    idempotencyStore.set(idempotencyKey, {
+      fingerprint,
+      statusCode: 201,
+      body: responseBody,
+    });
 
-    info('Stream verified and indexed', { id, transactionHash, requestId });
+    info('Stream verified and indexed', { id, transactionHash });
     res.status(201).json(responseBody);
   })
 );
 
 /**
- * DELETE /api/streams/:id
- * Cancel a stream
+ * DELETE /api/streams/:id - Cancel a stream
  */
 streamsRouter.delete(
   '/:id',
-  authenticate,
   requireAuth,
-  asyncHandler(async (req: any, res: any) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
-    const requestId = (req as any).id;
-
-    debug('Cancelling stream', { id, requestId });
-
     const index = streams.findIndex((s) => s.id === id);
-    const stream = streams[index];
 
-    if (index === -1 || !stream) {
-      throw notFound('Stream', id);
-    }
+    if (index === -1) throw notFound('Stream', id);
+    const stream = streams[index]!;
 
     if (stream.status === 'cancelled') {
-      throw conflictError('Stream already cancelled');
+      throw conflictError('Stream is already cancelled');
+    }
+
+    if (stream.status === 'completed') {
+      throw conflictError('Cannot cancel a completed stream');
     }
 
     streams[index] = { ...stream, status: 'cancelled' };
 
-    info('Stream cancelled', { id, requestId });
-    res.json({ message: 'Stream cancelled', id });
+    recordAuditEvent('STREAM_CANCELLED', 'stream', id, (req as any).correlationId);
+    info('Stream cancelled', { id });
 
-    const config = getConfig();
-    if (config.webhookUrl && config.webhookSecret) {
-      dispatchWebhook({
-        url: config.webhookUrl,
-        secret: config.webhookSecret,
-        event: 'stream.deleted',
-        payload: streams[index],
-      }).catch((err) => error('Failed to dispatch deletion webhook', { streamId: id }, err as Error));
-    }
+    res.json({ message: 'Stream cancelled', id });
   })
 );
