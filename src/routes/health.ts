@@ -4,14 +4,10 @@ import { successResponse, errorResponse } from '../utils/response.js';
 import { HealthCheckManager } from '../config/health.js';
 import { Logger } from '../config/logger.js';
 import { Config } from '../config/env.js';
-
 import { isShuttingDown } from '../shutdown.js';
 
 export const healthRouter = Router();
 
-/**
- * GET /health - Liveness + basic system status
- */
 healthRouter.get('/', (req: Request, res: Response) => {
   const config = req.app.locals.config as Config | undefined;
 
@@ -24,7 +20,6 @@ healthRouter.get('/', (req: Request, res: Response) => {
   }
 
   const indexer = getIndexerHealth();
-
   const status =
     indexer.dependency === 'unavailable' || indexer.dependency === 'degraded'
       ? 'degraded'
@@ -41,93 +36,64 @@ healthRouter.get('/', (req: Request, res: Response) => {
   });
 });
 
-/**
- * Health check route for the Fluxora API.
- * 
- * Returns a 200 OK with common health metrics and dependencies.
- */
 healthRouter.get('/ready', async (req: Request, res: Response) => {
-  const healthManager = req.app.locals.healthManager as HealthCheckManager;
-  const logger = req.app.locals.logger as Logger;
+  const healthManager = req.app.locals.healthManager as HealthCheckManager | undefined;
+  const logger = req.app.locals.logger as Logger | undefined;
+
+  if (!healthManager) {
+    logger?.warn('Health manager missing for readiness check');
+    return res.status(503).json(
+      errorResponse('Health manager not configured', 'SERVICE_UNAVAILABLE')
+    );
+  }
 
   try {
     const report = await healthManager.checkAll();
+    const dependencies = Object.fromEntries(
+      report.dependencies.map((dependency) => [dependency.name, dependency.status])
+    ) as Record<string, string>;
+
+    const payload = {
+      status: report.status,
+      version: report.version,
+      timestamp: report.timestamp,
+      uptime: report.uptime,
+      dependencies,
+    };
 
     if (report.status === 'unhealthy') {
-      logger.warn('Readiness check failed', {
-        dependencies: report.dependencies.map((d: any) => ({
-          name: d.name,
-          status: d.status,
-          error: d.error,
-        })),
-      });
-
-      return res.status(503).json(
-        errorResponse(
-          'Service not ready',
-          'SERVICE_UNAVAILABLE',
-          JSON.stringify(report)
-        )
-      );
+      logger?.warn('Readiness check failed', { dependencies });
+      return res.status(503).json(payload);
     }
 
-    return res.json(successResponse({ report }));
+    return res.json(payload);
   } catch (err) {
-    logger.error('Readiness check error', err as Error);
-
+    logger?.error('Readiness check error', err as Error);
     return res.status(503).json(
       errorResponse('Health check failed', 'HEALTH_CHECK_ERROR')
     );
   }
 });
 
-/**
- * GET /health/live - Detailed health report
- */
 healthRouter.get('/live', async (req: Request, res: Response) => {
-  const healthManager = req.app.locals.healthManager as HealthCheckManager;
-  const config = req.app.locals.config as Config;
-  const logger = req.app.locals.logger as Logger;
+  const healthManager = req.app.locals.healthManager as HealthCheckManager | undefined;
+  const config = req.app.locals.config as Config | undefined;
+  const logger = req.app.locals.logger as Logger | undefined;
+
+  if (!healthManager) {
+    logger?.warn('Health manager missing for live health report');
+    return res.status(503).json(
+      errorResponse('Health manager not configured', 'SERVICE_UNAVAILABLE')
+    );
+  }
 
   try {
-    const report = healthManager.getLastReport(config.apiVersion);
+    const report = healthManager.getLastReport(config?.apiVersion ?? '0.1.0');
     return res.json(successResponse({ report }));
   } catch (err) {
-    logger.error('Failed to get health report', err as Error);
-
+    logger?.error('Failed to get health report', err as Error);
     return res.status(500).json(
       errorResponse('Failed to get health report', 'HEALTH_CHECK_ERROR')
     );
   }
-});
-
-/**
- * Readiness check - service can handle requests
- */
-healthRouter.get("/ready", (_req: Request, res: Response) => {
-  const dbHealth = checkDatabaseHealth();
-  const health = getHealthMetrics();
-
-  const isReady = dbHealth.healthy && health.healthy;
-
-  res.status(isReady ? 200 : 503).json({
-    status: isReady ? "ready" : "not_ready",
-    timestamp: new Date().toISOString(),
-    checks: {
-      database: dbHealth,
-      metrics: health.checks,
-    },
-  });
-});
-
-/**
- * Metrics endpoint for monitoring
- */
-healthRouter.get("/metrics", (_req: Request, res: Response) => {
-  const health = getHealthMetrics();
-
-  res.json({
-    timestamp: new Date().toISOString(),
-    ...health,
-  });
 });

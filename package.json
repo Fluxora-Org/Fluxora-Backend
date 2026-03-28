@@ -5,14 +5,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --watch",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --runInBand && node --import tsx --test src/webhooks/signature.test.ts",
-    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --runInBand --coverage",
-    "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.8.0",
@@ -30,6 +28,8 @@
     "@types/node": "^20.11.16",
     "@types/pg": "^8.20.0",
     "@types/supertest": "^6.0.2",
+    "@typescript-eslint/eslint-plugin": "^8.57.2",
+    "@typescript-eslint/parser": "^8.57.2",
     "eslint": "^10.1.0",
     "eslint-config-prettier": "^10.1.8",
     "jest": "^29.7.0",
