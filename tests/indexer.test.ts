@@ -12,9 +12,10 @@ const INDEXER_TOKEN = 'test-indexer-token';
 const ENDPOINT = '/internal/indexer/contract-events';
 
 function buildEvent(eventId: string) {
+  const ledger = 512345;
   return {
     eventId,
-    ledger: 512345,
+    ledger,
     contractId: 'CCONTRACT123',
     topic: 'stream.created',
     txHash: `tx-${eventId}`,
@@ -29,6 +30,7 @@ function buildEvent(eventId: string) {
       recipient: 'GBBB',
     },
     happenedAt: '2026-03-26T12:00:00.000Z',
+    ledgerHash: `hash-${ledger}`,
   };
 }
 

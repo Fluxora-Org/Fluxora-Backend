@@ -41,7 +41,11 @@ export interface AuditEntry {
 }
 
 let seq = 0;
-const entries: AuditEntry[] = [];
+const AUDIT_LOG_KEY = '__FLUXORA_AUDIT_LOG__';
+if (!(globalThis as any)[AUDIT_LOG_KEY]) {
+  (globalThis as any)[AUDIT_LOG_KEY] = [];
+}
+const auditLog: AuditEntry[] = (globalThis as any)[AUDIT_LOG_KEY];
 
 /**
  * Append an audit entry. Never throws.
@@ -63,7 +67,7 @@ export function recordAuditEvent(
       ...(correlationId !== undefined ? { correlationId } : {}),
       ...(meta !== undefined ? { meta } : {}),
     };
-    entries.push(entry);
+    auditLog.push(entry);
     logger.info('Audit event recorded', correlationId, { action, resourceType, resourceId });
   } catch (err) {
     // Audit must never block the primary operation.
@@ -78,11 +82,11 @@ export function recordAuditEvent(
 
 /** Return a shallow copy of all entries (oldest first). */
 export function getAuditEntries(): AuditEntry[] {
-  return entries.slice();
+  return [...((globalThis as any)[AUDIT_LOG_KEY] || [])];
 }
 
 /** Reset store — test use only. */
 export function _resetAuditLog(): void {
-  entries.length = 0;
+  (globalThis as any)[AUDIT_LOG_KEY] = [];
   seq = 0;
 }

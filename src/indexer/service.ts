@@ -38,6 +38,9 @@ type IndexerState = {
   acceptedBatchCount: number;
   acceptedEventCount: number;
   duplicateEventCount: number;
+  lastSafeLedger: number;
+  reorgDetected: boolean;
+  reorgHeight?: number | undefined;
 };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -96,6 +99,7 @@ function validateEvent(rawEvent: unknown): ContractEventRecord {
     eventIndex: assertNonNegativeInteger(rawEvent.eventIndex, 'eventIndex'),
     payload,
     happenedAt: assertIsoTimestamp(rawEvent.happenedAt, 'happenedAt'),
+    ledgerHash: assertNonEmptyString(rawEvent.ledgerHash, 'ledgerHash', MAX_TX_HASH_LENGTH),
   };
 }
 
@@ -145,6 +149,9 @@ export class IndexerIngestionService {
       acceptedBatchCount: 0,
       acceptedEventCount: 0,
       duplicateEventCount: 0,
+      lastSafeLedger: 0,
+      reorgDetected: false,
+      reorgHeight: undefined,
     };
   }
 
@@ -171,6 +178,9 @@ export class IndexerIngestionService {
     this.state.acceptedBatchCount = 0;
     this.state.acceptedEventCount = 0;
     this.state.duplicateEventCount = 0;
+    this.state.lastSafeLedger = 0;
+    this.state.reorgDetected = false;
+    this.state.reorgHeight = undefined;
   }
 
   getHealthSnapshot(): IndexerHealthSnapshot {
@@ -183,6 +193,8 @@ export class IndexerIngestionService {
       acceptedBatchCount: this.state.acceptedBatchCount,
       acceptedEventCount: this.state.acceptedEventCount,
       duplicateEventCount: this.state.duplicateEventCount,
+      lastSafeLedger: this.state.lastSafeLedger,
+      reorgDetected: this.state.reorgDetected,
     };
   }
 
@@ -220,15 +232,57 @@ export class IndexerIngestionService {
     this.enforceRateLimit(context.actor);
 
     const request = validateBatch(body);
+    const events = request.events;
+    
+    // Group events by ledger to handle reorgs per ledger
+    const ledgersInBatch = new Set(events.map(e => e.ledger));
+    
+    for (const ledger of ledgersInBatch) {
+      const incomingHash = events.find(e => e.ledger === ledger)!.ledgerHash;
+      const existingHash = await this.store.getLedgerHash(ledger);
+      
+      if (existingHash && existingHash !== incomingHash) {
+        warn('Indexer detected chain reorg', {
+          ledger,
+          existingHash,
+          incomingHash,
+          actor: context.actor,
+          requestId: context.requestId,
+        });
+        
+        this.state.reorgDetected = true;
+        this.state.reorgHeight = ledger;
+        info('Indexer reorgDetected flag set to true', { ledger, requestId: context.requestId });
+        await this.store.rollbackBeforeLedger(ledger);
+        this.state.lastFailureAt = new Date().toISOString();
+        this.state.lastFailureReason = `Reorg detected at ledger ${ledger}`;
+      }
+    }
 
     try {
       const result = await this.store.insertMany(request.events);
       const now = new Date().toISOString();
 
+      const maxLedgerInBatch = Math.max(...events.map(e => e.ledger));
+      // In Stellar, 1-ledger finality is typical. We consider (max - 1) as safe.
+      const reportedSafeLedger = Math.max(this.state.lastSafeLedger, maxLedgerInBatch - 1);
+
       this.state.lastSuccessfulIngestAt = now;
       this.state.acceptedBatchCount += 1;
       this.state.acceptedEventCount += result.insertedEventIds.length;
       this.state.duplicateEventCount += result.duplicateEventIds.length;
+      this.state.lastSafeLedger = reportedSafeLedger;
+
+      // Reset reorg detected flag once we are significantly past the reorg height
+      if (this.state.reorgDetected && this.state.reorgHeight !== undefined && maxLedgerInBatch > this.state.reorgHeight + 5) {
+          info('Indexer reorgDetected flag reset to false', { 
+            maxLedgerInBatch, 
+            reorgHeight: this.state.reorgHeight,
+            requestId: context.requestId 
+          });
+          this.state.reorgDetected = false;
+          this.state.reorgHeight = undefined;
+      }
 
       info('Indexer contract event batch persisted', {
         actor: context.actor,
@@ -237,6 +291,7 @@ export class IndexerIngestionService {
         batchSize: request.events.length,
         insertedCount: result.insertedEventIds.length,
         duplicateCount: result.duplicateEventIds.length,
+        lastSafeLedger: this.state.lastSafeLedger,
       });
 
       debug('Indexer contract event ids processed', {

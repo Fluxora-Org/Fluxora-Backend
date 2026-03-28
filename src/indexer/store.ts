@@ -8,6 +8,8 @@ export type InsertContractEventsResult = {
 export interface ContractEventStore {
   readonly kind: IndexerStoreKind;
   insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult>;
+  rollbackBeforeLedger(ledger: number): Promise<void>;
+  getLedgerHash(ledger: number): Promise<string | null>;
 }
 
 export interface PgClientLike {
@@ -43,6 +45,23 @@ export class InMemoryContractEventStore implements ContractEventStore {
       insertedEventIds,
       duplicateEventIds,
     };
+  }
+
+  async rollbackBeforeLedger(ledger: number): Promise<void> {
+    for (const [eventId, record] of this.records) {
+      if (record.ledger >= ledger) {
+        this.records.delete(eventId);
+      }
+    }
+  }
+
+  async getLedgerHash(ledger: number): Promise<string | null> {
+    for (const record of this.records.values()) {
+      if (record.ledger === ledger) {
+        return record.ledgerHash;
+      }
+    }
+    return null;
   }
 
   reset(): void {
@@ -83,10 +102,11 @@ export class PostgresContractEventStore implements ContractEventStore {
         event.operationIndex,
         event.eventIndex,
         JSON.stringify(event.payload),
-        event.happenedAt
+        event.happenedAt,
+        event.ledgerHash
       );
 
-      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}::jsonb, $${offset + 10}::timestamptz)`;
+      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}::jsonb, $${offset + 10}::timestamptz, $${offset + 11})`;
     });
 
     const sql = `
@@ -100,7 +120,8 @@ export class PostgresContractEventStore implements ContractEventStore {
         operation_index,
         event_index,
         payload,
-        happened_at
+        happened_at,
+        ledger_hash
       )
       VALUES ${placeholders.join(', ')}
       ON CONFLICT (event_id) DO NOTHING
@@ -118,5 +139,20 @@ export class PostgresContractEventStore implements ContractEventStore {
       insertedEventIds,
       duplicateEventIds,
     };
+  }
+
+  async rollbackBeforeLedger(ledger: number): Promise<void> {
+    const sql = `DELETE FROM ${this.tableName} WHERE ledger >= $1`;
+    await this.client.query(sql, [ledger]);
+  }
+
+  async getLedgerHash(ledger: number): Promise<string | null> {
+    const sql = `SELECT ledger_hash FROM ${this.tableName} WHERE ledger = $1 LIMIT 1`;
+    const result = await this.client.query<{ ledger_hash: string }>(sql, [ledger]);
+    if (result.rows.length === 0) {
+      return null;
+    }
+    const row = result.rows[0];
+    return row ? row.ledger_hash : null;
   }
 }

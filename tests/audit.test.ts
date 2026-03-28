@@ -16,6 +16,7 @@ import { auditRouter } from '../src/routes/audit.js';
 import { streamsRouter } from '../src/routes/streams.js';
 import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
 import { errorHandler } from '../src/middleware/errorHandler.js';
+import { generateToken } from '../src/lib/auth.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type SupertestApp = any;
@@ -44,26 +45,26 @@ describe('recordAuditEvent', () => {
     const entries = getAuditEntries();
     expect(entries).toHaveLength(1);
     const e = entries[0];
-    expect(e.seq).toBe(1);
-    expect(e.action).toBe('STREAM_CREATED');
-    expect(e.resourceType).toBe('stream');
-    expect(e.resourceId).toBe('stream-1');
-    expect(typeof e.timestamp).toBe('string');
+    expect(e!.seq).toBe(1);
+    expect(e!.action).toBe('STREAM_CREATED');
+    expect(e!.resourceType).toBe('stream');
+    expect(e!.resourceId).toBe('stream-1');
+    expect(typeof e!.timestamp).toBe('string');
   });
 
   it('increments seq monotonically', () => {
     recordAuditEvent('STREAM_CREATED', 'stream', 'a');
     recordAuditEvent('STREAM_CANCELLED', 'stream', 'b');
     const entries = getAuditEntries();
-    expect(entries[0].seq).toBe(1);
-    expect(entries[1].seq).toBe(2);
+    expect(entries[0]!.seq).toBe(1);
+    expect(entries[1]!.seq).toBe(2);
   });
 
   it('stores correlationId and meta when provided', () => {
     recordAuditEvent('STREAM_CREATED', 'stream', 'x', 'corr-123', { depositAmount: '100' });
     const [e] = getAuditEntries();
-    expect(e.correlationId).toBe('corr-123');
-    expect(e.meta?.depositAmount).toBe('100');
+    expect(e!.correlationId).toBe('corr-123');
+    expect(e!.meta?.depositAmount).toBe('100');
   });
 
   it('omits correlationId key when not provided', () => {
@@ -128,9 +129,11 @@ describe('GET /api/audit', () => {
 
 describe('Audit entries via streams API', () => {
   let app: SupertestApp;
+  let token: string;
 
   beforeEach(() => {
     app = createTestApp();
+    token = generateToken({ address: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX', role: 'operator' });
   });
 
   const validStream = {
@@ -141,19 +144,32 @@ describe('Audit entries via streams API', () => {
   };
 
   it('records STREAM_CREATED when a stream is created', async () => {
-    await request(app).post('/api/streams').send(validStream).expect(201);
+    await request(app)
+      .post('/api/streams')
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'audit-create-1')
+      .send(validStream)
+      .expect(201);
     const entries = getAuditEntries();
     expect(entries).toHaveLength(1);
-    expect(entries[0].action).toBe('STREAM_CREATED');
-    expect(entries[0].resourceType).toBe('stream');
-    expect(entries[0].meta?.depositAmount).toBe('1000.0000000');
+    expect(entries[0]!.action).toBe('STREAM_CREATED');
+    expect(entries[0]!.resourceType).toBe('stream');
+    expect(entries[0]!.meta?.depositAmount).toBe('1000.0000000');
   });
 
   it('records STREAM_CANCELLED when a stream is cancelled', async () => {
-    const createRes = await request(app).post('/api/streams').send(validStream).expect(201);
+    const createRes = await request(app)
+      .post('/api/streams')
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'audit-cancel-1')
+      .send(validStream)
+      .expect(201);
     const { id } = createRes.body;
 
-    await request(app).delete(`/api/streams/${id}`).expect(200);
+    await request(app)
+      .delete(`/api/streams/${id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
 
     const entries = getAuditEntries();
     const cancelEntry = entries.find((e) => e.action === 'STREAM_CANCELLED');
@@ -164,17 +180,20 @@ describe('Audit entries via streams API', () => {
   it('propagates correlationId from request into audit entry', async () => {
     await request(app)
       .post('/api/streams')
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'audit-corr-1')
       .set('x-correlation-id', 'test-corr-999')
       .send(validStream)
       .expect(201);
 
     const [entry] = getAuditEntries();
-    expect(entry.correlationId).toBe('test-corr-999');
+    expect(entry!.correlationId).toBe('test-corr-999');
   });
 
   it('does not record an audit entry when stream creation fails validation', async () => {
     await request(app)
       .post('/api/streams')
+      .set('Authorization', `Bearer ${token}`)
       .send({ ...validStream, depositAmount: 9999 }) // number, not string
       .expect(400);
 
@@ -182,7 +201,10 @@ describe('Audit entries via streams API', () => {
   });
 
   it('does not record an audit entry when cancelling a non-existent stream', async () => {
-    await request(app).delete('/api/streams/does-not-exist').expect(404);
+    await request(app)
+      .delete('/api/streams/does-not-exist')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(404);
     expect(getAuditEntries()).toHaveLength(0);
   });
 });

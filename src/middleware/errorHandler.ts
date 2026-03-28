@@ -15,7 +15,6 @@ export enum ApiErrorCode {
   PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
   TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
-  UNAUTHORIZED = 'UNAUTHORIZED',
   FORBIDDEN = 'FORBIDDEN',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
@@ -70,7 +69,7 @@ export function errorHandler(
   res: any,
   _next: any
 ): void {
-  const requestId = (req as Request & { id?: string }).id;
+  const requestId = res.locals?.requestId || (req as Request & { id?: string }).id;
 
   // Handle DecimalSerializationError
   if (err instanceof DecimalSerializationError) {
@@ -85,15 +84,13 @@ export function errorHandler(
   }
 
   if ((err as { type?: string }).type === 'entity.too.large') {
-    const response: ApiErrorResponse = {
+    res.status(413).json({
       error: {
         code: ApiErrorCode.PAYLOAD_TOO_LARGE,
         message: 'Request payload exceeds the configured size limit',
-        requestId,
+        ...(requestId !== undefined ? { requestId } : {}),
       },
-    };
-
-    res.status(413).json(response);
+    });
     return;
   }
 
@@ -105,15 +102,13 @@ export function errorHandler(
     requestId,
   });
 
-  const response: ApiErrorResponse = {
+  res.status(500).json({
     error: {
       code: ApiErrorCode.INTERNAL_ERROR,
       message: 'An unexpected error occurred. Please try again later.',
-      requestId,
+      ...(requestId !== undefined ? { requestId } : {}),
     },
-  };
-
-  res.status(500).json(response);
+  });
 }
 
 /**

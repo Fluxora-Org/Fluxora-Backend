@@ -211,9 +211,47 @@ curl -sS http://127.0.0.1:3000/health
 ### Non-goals and follow-up tracking
 
 - This issue does not introduce authentication/authorization for containerized endpoints.
-- This issue does not add database/Redis/Stellar readiness gating to container startup.
-- This issue does not resolve all pre-existing TypeScript compilation debt across unrelated modules.
 - Follow-up recommendation: add CI job that builds the image and runs `/health` smoke checks on every PR.
+
+## Reorg handling: chain tip safety for indexer
+
+The Fluxora indexer implements strict chain tip safety and reorg handling to ensure the durability and accuracy of chain-derived state.
+
+### Service-level outcomes
+
+- **Chain Tip Safety**: The indexer reports a `lastSafeLedger` which lags the current ingested tip by a safety margin (default 1 ledger for Stellar finality).
+- **Reorg Detection**: If an incoming batch contains a ledger number that has already been indexed but with a different `ledgerHash`, the service detects a chain reorg.
+- **Automatic Rollback**: Upon reorg detection, the service automatically rolls back its internal state to the ledger before the reorg point and re-indexes the new chain branch.
+- **Operator Observability**: Reorgs and safety metrics are exposed via `GET /health` and high-visibility logs.
+
+### Trust boundaries
+
+| Actor | Trusted for | Not trusted for |
+|-------|-------------|-----------------|
+| Public internet clients | Reading safe ledger state | Determining chain finality |
+| Authenticated partners / Indexers | Providing valid ledger hashes | Forcing rollbacks on final ledgers |
+| Administrators / Operators | Manual state resets | Mutating individual event records |
+| Internal Workers | Detecting reorgs via RPC | Suppressing reorg alerts |
+
+### Failure modes and client-visible behavior
+
+| Condition | Indexer Behavior | Client-visible outcome |
+|-----------|------------------|------------------------|
+| Chain Reorg detected | Trigger rollback and set `reorgDetected: true` | `GET /health` reports `degraded` during rollback |
+| Duplicate delivery | `ON CONFLICT (event_id) DO NOTHING` | `200 OK` (idempotent) |
+| Invalid input (missing hash) | Reject batch with `400 Bad Request` | Error envelope with validation details |
+| Database outage | Return `503 Service Unavailable` | API reports temporary unavailability |
+
+### Indexer operator observability
+
+- **Health Snapshot**: `GET /health` includes `lastSafeLedger` and `reorgDetected`.
+- **Logs**: Reorgs are logged as `WARN` with `existingHash` and `incomingHash` for triage.
+- **Triage**: If `reorgDetected` is true, operators should monitor the `lastSafeLedger` to ensure the indexer is making forward progress on the new chain branch.
+
+### Verification evidence
+
+- **Unit Tests**: `src/indexer/reorg.test.ts` simulates reorg scenarios and verifies rollback logic.
+- **Manual Check**: Observe `lastSafeLedger` in `/health` increases during ingestion.
 
 ## Local setup with Stellar testnet
 

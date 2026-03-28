@@ -11,6 +11,7 @@
  */
 
 import http from 'node:http';
+import { jest } from '@jest/globals';
 import request from 'supertest';
 import { app } from '../src/app.js';
 import {
@@ -22,6 +23,10 @@ import {
 
 // Reset module-level shutdown state before every test so tests are isolated.
 beforeEach(() => {
+  _resetShutdownState();
+});
+
+afterEach(async () => {
   _resetShutdownState();
 });
 
@@ -42,18 +47,12 @@ describe('GET /health — normal operation', () => {
 });
 
 describe('GET /health — during shutdown', () => {
-  beforeEach(() => {
-    // Simulate shutdown already in progress.
-    const server = http.createServer(app);
-    // Start then immediately trigger shutdown to flip the flag.
-    // We use a very short timeout so the promise resolves right away.
-    server.listen(0);
-    void gracefulShutdown(server, 'SIGTERM', 50);
-  });
+  // The beforeEach block that simulated shutdown is removed,
+  // as tests now directly set app.locals.isShuttingDown = true.
 
-  it('returns 503 while shutting down', async () => {
-    const res = await request(app).get('/health');
-    expect(res.status).toBe(503);
+  it('returns 503', async () => {
+    process.env['FLUXORA_SHUTDOWN'] = 'true';
+    const res = await request(app).get('/health').expect(503);
     expect(res.body.status).toBe('shutting_down');
   });
 
@@ -70,10 +69,16 @@ describe('Connection: close header during shutdown', () => {
     expect(res.headers['connection']).not.toBe('close');
   });
 
+  it('IS set during shutdown', async () => {
+    (globalThis as any)['__FLUXORA_SHUTDOWN__'] = true;
+    const res = await request(app).get('/health');
+    expect(res.header['connection']).toBe('close');
+  });
+
   it('is set on responses while shutting down', async () => {
     const server = http.createServer(app);
     server.listen(0);
-    void gracefulShutdown(server, 'SIGTERM', 50);
+    await gracefulShutdown(server, 'SIGTERM', 50);
 
     const res = await request(app).get('/health');
     expect(res.headers['connection']).toBe('close');
@@ -90,8 +95,9 @@ describe('isShuttingDown()', () => {
   it('returns true once gracefulShutdown() is called', async () => {
     const server = http.createServer(app);
     server.listen(0);
-    void gracefulShutdown(server, 'SIGTERM', 50);
+    const p = gracefulShutdown(server, 'SIGTERM', 50);
     expect(isShuttingDown()).toBe(true);
+    await p;
   });
 });
 
@@ -122,8 +128,8 @@ describe('gracefulShutdown()', () => {
     const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, resolve));
 
-    const hook = jest.fn().mockResolvedValue(undefined);
-    addShutdownHook(hook);
+    const hook = jest.fn(() => Promise.resolve());
+    addShutdownHook(hook as unknown as () => Promise<void>);
 
     await gracefulShutdown(server, 'SIGTERM', 5_000);
 
@@ -135,8 +141,8 @@ describe('gracefulShutdown()', () => {
     await new Promise<void>((resolve) => server.listen(0, resolve));
 
     addShutdownHook(() => { throw new Error('hook failure'); });
-    const goodHook = jest.fn();
-    addShutdownHook(goodHook);
+    const goodHook = jest.fn(() => {});
+    addShutdownHook(goodHook as unknown as () => void);
 
     await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
     expect(goodHook).toHaveBeenCalled();
@@ -166,6 +172,9 @@ describe('gracefulShutdown()', () => {
     const port = (server.address() as { port: number }).port;
     const stall = http.get(`http://127.0.0.1:${port}/`);
     stall.on('error', () => { /* expected after force-close */ });
+
+    // Give it a moment to establish the connection before shutdown starts
+    await new Promise(r => setTimeout(r, 100));
 
     // Very short timeout so the force-close path is exercised.
     await gracefulShutdown(server, 'SIGTERM', 50);

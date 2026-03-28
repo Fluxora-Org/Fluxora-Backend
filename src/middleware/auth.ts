@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyToken, UserPayload } from '../lib/auth.js';
 import { ApiError, ApiErrorCode } from './errorHandler.js';
-import { warn, info } from '../utils/logger.js';
+import { warn, info, debug } from '../utils/logger.js';
 
 /**
  * Middleware to optionally authenticate a request via JWT.
@@ -11,7 +11,9 @@ import { warn, info } from '../utils/logger.js';
  */
 export function authenticate(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
-  const requestId = (req as any).id || req.correlationId;
+  const requestId = (req as any).id || (req as any).correlationId;
+
+  debug('Authentication middleware triggered', { hasAuthHeader: !!authHeader, requestId });
 
   if (!authHeader) {
     next();

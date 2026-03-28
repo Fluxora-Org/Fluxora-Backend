@@ -1,10 +1,13 @@
 import request from 'supertest';
-import { app } from '../src/index.js';
+import { app } from '../src/app.js';
 import { generateToken } from '../src/lib/auth.js';
 
 describe('Auth Protected Routes', () => {
   let token: string;
   const address = 'GCSX2...';
+
+  let idempotencyCounter = 0;
+  const nextKey = () => `auth-protected-key-${++idempotencyCounter}`;
 
   beforeAll(() => {
     token = generateToken({ address, role: 'operator' });
@@ -70,6 +73,7 @@ describe('Auth Protected Routes', () => {
       const res = await request(app)
         .post('/api/streams')
         .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', nextKey())
         .send({
           sender: 'G1',
           recipient: 'G2',
@@ -86,6 +90,7 @@ describe('Auth Protected Routes', () => {
       const createRes = await request(app)
         .post('/api/streams')
         .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', nextKey())
         .send({
           sender: 'G1',
           recipient: 'G2',

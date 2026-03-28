@@ -17,7 +17,8 @@
     /* module hygiene */
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "downlevelIteration": true
   },
   "include": ["src/**/*"]
 }

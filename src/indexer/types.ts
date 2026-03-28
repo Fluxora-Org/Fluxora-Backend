@@ -9,6 +9,7 @@ export type ContractEventRecord = {
   eventIndex: number;
   payload: Record<string, unknown>;
   happenedAt: string;
+  ledgerHash: string;
   ingestedAt?: string;
 };
 
@@ -36,4 +37,7 @@ export type IndexerHealthSnapshot = {
   acceptedBatchCount: number;
   acceptedEventCount: number;
   duplicateEventCount: number;
+  lastSafeLedger: number;
+  reorgDetected: boolean;
+  reorgHeight?: number | undefined;
 };
