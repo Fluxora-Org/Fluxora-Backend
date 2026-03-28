@@ -1,34 +1,27 @@
 import jwt from 'jsonwebtoken';
-import { info, warn } from '../utils/logger.js';
-
-const DEFAULT_JWT_SECRET = 'fluxora-dev-secret-change-me';
-const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
-const JWT_EXPIRES_IN = '24h';
-
-if (JWT_SECRET === DEFAULT_JWT_SECRET && process.env.NODE_ENV === 'production') {
-  warn('Using default JWT secret in production! This is insecure.');
-}
+import { getConfig } from '../config/env.js';
+import { warn } from '../utils/logger.js';
 
 export interface UserPayload {
   address: string;
-  role: 'operator' | 'viewer';
+  role: string;
 }
 
 /**
- * Generate a JWT for a user payload.
+ * Generates a signed JWT for testing or initial administrative access.
  */
 export function generateToken(payload: UserPayload): string {
-  info('Generating JWT', { address: payload.address });
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+  const { jwtSecret, jwtExpiresIn } = getConfig();
+  return jwt.sign(payload, jwtSecret, { expiresIn: jwtExpiresIn });
 }
 
 /**
- * Verify a JWT and return the payload.
- * Throws if the token is invalid or expired.
+ * Verifies a JWT and returns the decoded payload.
  */
 export function verifyToken(token: string): UserPayload {
+  const { jwtSecret } = getConfig();
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as UserPayload;
+    const payload = jwt.verify(token, jwtSecret) as UserPayload;
     return payload;
   } catch (error) {
     warn('JWT verification failed', { error: error instanceof Error ? error.message : String(error) });

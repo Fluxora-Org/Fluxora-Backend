@@ -1,32 +1,35 @@
-/**
- * Fluxora Backend — server entry point.
- *
- * Responsibilities:
- *  - Bind the Express app to a TCP port.
- *  - Register OS signal handlers for graceful shutdown.
- *
- * Everything else (routes, middleware, app config) lives in app.ts.
- * Shutdown logic (drain + hooks) lives in shutdown.ts.
- */
-
-import http from 'node:http';
 import { app } from './app.js';
+import { initializeConfig, getConfig, resetConfig } from './config/env.js';
+import { info, error } from './utils/logger.js';
 import { gracefulShutdown } from './shutdown.js';
-import { logger } from './lib/logger.js';
 
-const PORT = Number(process.env.PORT ?? 3000);
-const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000);
+async function start() {
+    try {
+        // Load and validate environment configuration
+        const config = initializeConfig();
+        const { port, nodeEnv, apiVersion } = config;
 
-const server = http.createServer(app);
+        const server = app.listen(port, () => {
+            info(`Fluxora API v${apiVersion} started`, {
+                port,
+                env: nodeEnv,
+                pid: process.pid,
+            });
+        });
 
-server.listen(PORT, () => {
-  logger.info('Fluxora API listening', undefined, { port: PORT });
-});
+        // Initialize graceful shutdown handler
+        gracefulShutdown(server);
 
-async function shutdown(signal: string): Promise<void> {
-  await gracefulShutdown(server, signal, SHUTDOWN_TIMEOUT_MS);
-  process.exit(0);
+    } catch (err) {
+        error('Failed to start application', {}, err as Error);
+        process.exit(1);
+    }
 }
 
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('SIGINT',  () => void shutdown('SIGINT'));
+// Global unhandled rejection handler
+process.on('unhandledRejection', (reason) => {
+    error('Unhandled Promise Rejection', { reason: String(reason) });
+    // In production, we might want to exit here to allow a clean restart
+});
+
+start();
