@@ -10,18 +10,34 @@
  */
 
 import http from 'node:http';
-import { app } from './app.js';
+import { createApp } from './app.js';
 import { gracefulShutdown } from './shutdown.js';
 import { logger } from './lib/logger.js';
+import { initializeMigrations } from './db/migrate.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000);
 
+const app = createApp();
 const server = http.createServer(app);
 
-server.listen(PORT, () => {
-  logger.info('Fluxora API listening', undefined, { port: PORT });
-});
+async function startServer() {
+  try {
+    // Run migrations before starting the server
+    await initializeMigrations();
+
+    server.listen(PORT, () => {
+      logger.info('Fluxora API listening', undefined, { port: PORT });
+    });
+  } catch (err) {
+    logger.error('Failed to start Fluxora API', undefined, {
+      error: err instanceof Error ? err.message : 'Unknown error',
+    });
+    process.exit(1);
+  }
+}
+
+void startServer();
 
 async function shutdown(signal: string): Promise<void> {
   await gracefulShutdown(server, signal, SHUTDOWN_TIMEOUT_MS);

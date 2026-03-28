@@ -1,54 +1,23 @@
 import { Router, Request, Response } from 'express';
 import {
-  validateDecimalString,
-  validateAmountFields,
   formatFromStroops,
-  parseToStroops,
 } from '../serialization/decimal.js';
 
 import {
-  ApiError,
-  ApiErrorCode,
   notFound,
   validationError,
   conflictError,
   asyncHandler,
 } from '../middleware/errorHandler.js';
 import { requireAuth } from '../middleware/auth.js';
-import { info, debug, warn } from '../utils/logger.js';
+import { info, debug } from '../utils/logger.js';
 import { verifyStreamOnChain } from '../lib/stellar.js';
+import { getPool, query, DuplicateEntryError } from '../db/pool.js';
 
 /**
- * Streams API routes (BigInt-Safe Implementation)
+ * Streams API routes (PostgreSQL Implementation)
  */
 export const streamsRouter = Router();
-
-// Amount fields that must be decimal strings per serialization policy
-const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
-
-/**
- * Internal Stream type using BigInt for stroops
- */
-export interface Stream {
-  id: string;
-  sender: string;
-  recipient: string;
-  depositAmount: bigint;
-  ratePerSecond: bigint;
-  startTime: number;
-  endTime: number;
-  status: string;
-}
-
-// In-memory stream store
-export const streams: Stream[] = [];
-
-// Idempotency store
-const idempotencyStore = new Map<string, {
-  fingerprint: string;
-  statusCode: number;
-  body: any;
-}>();
 
 function parseIdempotencyKey(headerValue: unknown): string {
   if (typeof headerValue !== 'string' || headerValue.trim() === '') {
@@ -59,29 +28,39 @@ function parseIdempotencyKey(headerValue: unknown): string {
 
 /**
  * GET /api/streams
- * List all streams, formatting BigInt to string
+ * List all streams from PostgreSQL
  */
 streamsRouter.get(
   '/',
   asyncHandler(async (_req: Request, res: Response) => {
-    info('Listing all streams', { count: streams.length });
+    const pool = getPool();
+    const result = await query(pool, 'SELECT * FROM streams ORDER BY created_at DESC');
+    
+    info('Listing all streams', { count: result.rows.length });
 
-    const serializedStreams = streams.map(s => ({
-      ...s,
-      depositAmount: formatFromStroops(s.depositAmount),
-      ratePerSecond: formatFromStroops(s.ratePerSecond),
+    const serializedStreams = result.rows.map(s => ({
+      id: s.id,
+      sender: s.sender_address,
+      recipient: s.recipient_address,
+      depositAmount: s.amount,
+      ratePerSecond: s.rate_per_second,
+      startTime: Number(s.start_time),
+      endTime: Number(s.end_time),
+      status: s.status,
+      contractId: s.contract_id,
+      transactionHash: s.transaction_hash,
     }));
 
     res.json({
       streams: serializedStreams,
-      total: streams.length,
+      total: serializedStreams.length,
     });
   })
 );
 
 /**
  * GET /api/streams/:id
- * Get a single stream, formatting BigInt to string
+ * Get a single stream from PostgreSQL
  */
 streamsRouter.get(
   '/:id',
@@ -89,28 +68,42 @@ streamsRouter.get(
     const { id } = req.params;
     debug('Fetching stream', { id });
 
-    const stream = streams.find((s) => s.id === id);
-    if (!stream) {
+    const pool = getPool();
+    const result = await query(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
+    
+    if (result.rows.length === 0) {
+      throw notFound('Stream', id);
+    }
+
+    const s = result.rows[0];
+    if (!s) {
       throw notFound('Stream', id);
     }
 
     res.json({
-      ...stream,
-      depositAmount: formatFromStroops(stream.depositAmount),
-      ratePerSecond: formatFromStroops(stream.ratePerSecond),
+      id: s.id,
+      sender: s.sender_address,
+      recipient: s.recipient_address,
+      depositAmount: s.amount,
+      ratePerSecond: s.rate_per_second,
+      startTime: Number(s.start_time),
+      endTime: Number(s.end_time),
+      status: s.status,
+      contractId: s.contract_id,
+      transactionHash: s.transaction_hash,
     });
   })
 );
 
 /**
  * POST /api/streams
- * Create a new stream via on-chain verification
+ * Create a new stream via on-chain verification and PG persistence
  */
 streamsRouter.post(
   '/',
   authenticate,
   requireAuth,
-  asyncHandler(async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const { transactionHash } = req.body ?? {};
     const requestId = (req as any).id;
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
@@ -119,61 +112,76 @@ streamsRouter.post(
       throw validationError('transactionHash is required');
     }
 
-    // Check idempotency
-    const fingerprint = JSON.stringify({ transactionHash });
-    const cached = idempotencyStore.get(idempotencyKey);
-    if (cached) {
-      if (cached.fingerprint !== fingerprint) {
-        throw conflictError('Idempotency key reused with different payload');
-      }
-      res.set('Idempotency-Replayed', 'true');
-      res.status(cached.statusCode).json(cached.body);
-      return;
-    }
+    info('Verifying on-chain stream', { transactionHash, requestId, idempotencyKey });
 
-    info('Verifying on-chain stream', { transactionHash, requestId });
-
-    // Trust boundary: Verify the transaction on Stellar
     const verified = await verifyStreamOnChain(transactionHash);
 
+    const pool = getPool();
     const id = `stream-${transactionHash.slice(0, 8)}`;
-    const stream: Stream = {
-      id,
-      ...verified,
-      status: 'active',
-    };
 
-    // Store in-memory
-    const existingStream = streams.find(s => s.id === id);
-    if (existingStream) {
-      const responseBody = {
-        ...existingStream,
-        depositAmount: formatFromStroops(existingStream.depositAmount),
-        ratePerSecond: formatFromStroops(existingStream.ratePerSecond),
-      };
-      idempotencyStore.set(idempotencyKey, { fingerprint, statusCode: 200, body: responseBody });
-      res.status(200).json(responseBody);
-      return;
+    try {
+      await query(
+        pool,
+        `INSERT INTO streams (
+          id, sender_address, recipient_address, amount, 
+          rate_per_second, start_time, end_time, status, 
+          contract_id, transaction_hash, event_index
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          id,
+          verified.sender,
+          verified.recipient,
+          formatFromStroops(verified.depositAmount),
+          formatFromStroops(verified.ratePerSecond),
+          verified.startTime,
+          verified.endTime,
+          'active',
+          verified.contractId || 'unknown',
+          transactionHash,
+          0
+        ]
+      );
+
+      info('Stream verified and indexed in PG', { id, transactionHash, requestId });
+      res.status(201).json({
+        id,
+        sender: verified.sender,
+        recipient: verified.recipient,
+        depositAmount: formatFromStroops(verified.depositAmount),
+        ratePerSecond: formatFromStroops(verified.ratePerSecond),
+        startTime: verified.startTime,
+        endTime: verified.endTime,
+        status: 'active',
+      });
+    } catch (err) {
+      if (err instanceof DuplicateEntryError) {
+        const existing = await query(pool, 'SELECT * FROM streams WHERE transaction_hash = $1', [transactionHash]);
+        if (existing.rows.length > 0) {
+        const s = existing.rows[0];
+        if (s) {
+          res.set('Idempotency-Replayed', 'true');
+          res.status(200).json({
+            id: s.id,
+            sender: s.sender_address,
+            recipient: s.recipient_address,
+            depositAmount: s.amount,
+            ratePerSecond: s.rate_per_second,
+            startTime: Number(s.start_time),
+            endTime: Number(s.end_time),
+            status: s.status,
+          });
+          return;
+        }
+        }
+      }
+      throw err;
     }
-
-    streams.push(stream);
-
-    const responseBody = {
-      ...stream,
-      depositAmount: formatFromStroops(stream.depositAmount),
-      ratePerSecond: formatFromStroops(stream.ratePerSecond),
-    };
-
-    idempotencyStore.set(idempotencyKey, { fingerprint, statusCode: 201, body: responseBody });
-
-    info('Stream verified and indexed', { id, transactionHash, requestId });
-    res.status(201).json(responseBody);
   })
 );
 
 /**
  * DELETE /api/streams/:id
- * Cancel a stream
+ * Cancel a stream in PostgreSQL
  */
 streamsRouter.delete(
   '/:id',
@@ -185,20 +193,25 @@ streamsRouter.delete(
 
     debug('Cancelling stream', { id, requestId });
 
-    const index = streams.findIndex((s) => s.id === id);
-    const stream = streams[index];
-
-    if (index === -1 || !stream) {
+    const pool = getPool();
+    const result = await query(pool, 'SELECT status FROM streams WHERE id = $1', [id]);
+    
+    if (result.rows.length === 0) {
       throw notFound('Stream', id);
     }
 
-    if (stream.status === 'cancelled') {
+    const s = result.rows[0];
+    if (!s) {
+       throw notFound('Stream', id);
+    }
+
+    if (s.status === 'cancelled') {
       throw conflictError('Stream already cancelled');
     }
 
-    streams[index] = { ...stream, status: 'cancelled' };
+    await query(pool, "UPDATE streams SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [id]);
 
-    info('Stream cancelled', { id, requestId });
+    info('Stream cancelled in PG', { id, requestId });
     res.json({ message: 'Stream cancelled', id });
   })
 );
