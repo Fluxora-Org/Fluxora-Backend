@@ -2,6 +2,83 @@
 
 Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. It now documents both the decimal-string serialization policy for chain/API amounts and the consumer-facing webhook signature verification contract the team intends to keep stable when delivery is enabled.
 
+## Quick Start with Docker Compose
+
+The fastest way to run Fluxora Backend with all dependencies:
+
+```bash
+# 1. Clone and navigate to the repository
+git clone <repository-url>
+cd Fluxora-Backend
+
+# 2. Copy and configure environment variables
+cp .env.example .env
+# Edit .env with your secrets (JWT_SECRET, API_KEYS, etc.)
+
+# 3. Start with PostgreSQL only
+docker-compose up -d
+
+# 4. Or start with PostgreSQL + Redis (full stack)
+docker-compose --profile redis up -d
+
+# 5. Check service health
+curl http://localhost:3000/health
+
+# 6. View logs
+docker-compose logs -f app
+```
+
+### Docker Compose Services
+
+| Service | Description | Default URL |
+|---------|-------------|-------------|
+| `app` | Fluxora Backend API | http://localhost:3000 |
+| `postgres` | PostgreSQL 16 database | localhost:5432 |
+| `redis` | Redis 7 cache (optional) | localhost:6379 |
+
+### Configuration Profiles
+
+- **Default** (`docker-compose up`): App + PostgreSQL
+- **With Redis** (`--profile redis`): App + PostgreSQL + Redis
+- **Full Stack** (`--profile full`): All services
+
+### Health Checks
+
+All services include health checks:
+- **PostgreSQL**: `pg_isready` every 10s
+- **Redis**: `redis-cli ping` every 10s
+- **App**: HTTP health endpoint every 30s
+
+The app waits for PostgreSQL to be healthy before starting.
+
+### Database Initialization
+
+PostgreSQL automatically initializes on first run using scripts in `init-db/`:
+- `01-schema.sql`: Creates tables, indexes, and initial data
+- Streams table for treasury protocol state
+- Indexer state tracking
+- Audit logs for chain-derived changes
+- Webhook delivery tracking (future)
+
+### Troubleshooting
+
+```bash
+# Reset everything (destroys data)
+docker-compose down -v
+
+# Rebuild after code changes
+docker-compose up -d --build
+
+# Check database logs
+docker-compose logs postgres
+
+# Connect to database
+docker-compose exec postgres psql -U fluxora -d fluxora
+
+# Scale app instances (with external load balancer)
+docker-compose up -d --scale app=3
+```
+
 ## Current status
 
 - Implemented today:
