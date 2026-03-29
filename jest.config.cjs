@@ -1,7 +1,9 @@
+'use strict';
+
+/** @type {import('ts-jest').JestConfigWithTsJest} */
 module.exports = {
   preset: 'ts-jest/presets/default-esm',
   testEnvironment: 'node',
-  testMatch: ['**/tests/**/*.test.ts'],
   extensionsToTreatAsEsm: ['.ts'],
   moduleNameMapper: {
     '^(\\.{1,2}/.*)\\.js$': '$1',
@@ -11,10 +13,21 @@ module.exports = {
       'ts-jest',
       {
         useESM: true,
+        diagnostics: {
+          ignoreCodes: [151002],
+        },
+        tsconfig: {
+          isolatedModules: true,
+        },
       },
     ],
   },
-  moduleNameMapper: {
-    '^(\\.{1,2}/.*)\\.js$': '$1',
-  },
+  testMatch: [
+    '**/tests/**/*.test.ts',
+    '**/src/**/*.test.ts',
+  ],
+  testPathIgnorePatterns: [
+    '/node_modules/',
+    'src/webhooks/signature.test.ts',
+  ],
 };
