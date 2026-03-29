@@ -1,5 +1,9 @@
+import type { Request, Response, NextFunction } from 'express';
+import { DecimalSerializationError, DecimalErrorCode } from '../serialization/decimal.js';
+import { SerializationLogger, error as logError } from '../utils/logger.js';
+
 export interface ApiErrorResponse {
-  error: { code: string; message: string; details?: unknown; requestId?: string | undefined };
+  error: { code: string; message: string; details?: unknown; requestId?: string };
 }
 
 export enum ApiErrorCode {
@@ -8,10 +12,10 @@ export enum ApiErrorCode {
   NOT_FOUND = 'NOT_FOUND',
   CONFLICT = 'CONFLICT',
   UNAUTHORIZED = 'UNAUTHORIZED',
+  FORBIDDEN = 'FORBIDDEN',
   PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
   TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
-  FORBIDDEN = 'FORBIDDEN',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
 }
@@ -29,35 +33,7 @@ export class ApiError extends Error {
 }
 
 /**
- * Get HTTP status code for decimal error codes
- */
-function getDecimalErrorStatus(code: DecimalErrorCode): number {
-  switch (code) {
-    case DecimalErrorCode.INVALID_TYPE:
-    case DecimalErrorCode.INVALID_FORMAT:
-    case DecimalErrorCode.EMPTY_VALUE:
-      return 400; // Bad Request
-    case DecimalErrorCode.OUT_OF_RANGE:
-      return 400; // Bad Request
-    case DecimalErrorCode.PRECISION_LOSS:
-      return 400; // Bad Request
-    default:
-      return 400;
-  }
-}
-
-/**
- * Get API error code for decimal error codes
- */
-function getDecimalErrorApiCode(code: DecimalErrorCode): ApiErrorCode {
-  return ApiErrorCode.DECIMAL_ERROR;
-}
-
-/**
  * Express error handler middleware
- * 
- * Catches all errors and returns a consistent JSON response.
- * All errors are logged with sufficient context for diagnosis.
  */
 export function errorHandler(
   err: Error,
@@ -65,14 +41,21 @@ export function errorHandler(
   res: any,
   _next: any
 ): void {
-  const requestId = res.locals?.requestId || (req as Request & { id?: string }).id;
+  const requestId = (req as Request & { id?: string }).id ?? (res.locals['requestId'] as string | undefined);
 
-  // Handle DecimalSerializationError
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
-    res.status(400).json({ error: { code: ApiErrorCode.DECIMAL_ERROR, message: err.message, details: { decimalErrorCode: err.code, field: err.field }, requestId } });
+    res.status(400).json({
+      error: {
+        code: ApiErrorCode.DECIMAL_ERROR,
+        message: err.message,
+        details: { decimalErrorCode: err.code, field: err.field },
+        requestId,
+      },
+    });
     return;
   }
+
   if (err instanceof ApiError) {
     logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
     res.status(err.statusCode).json({ error: { code: err.code, message: err.message, details: err.details, requestId } });
@@ -81,16 +64,11 @@ export function errorHandler(
 
   if ((err as { type?: string }).type === 'entity.too.large') {
     res.status(413).json({
-      error: {
-        code: ApiErrorCode.PAYLOAD_TOO_LARGE,
-        message: 'Request payload exceeds the configured size limit',
-        ...(requestId !== undefined ? { requestId } : {}),
-      },
+      error: { code: ApiErrorCode.PAYLOAD_TOO_LARGE, message: 'Request payload exceeds the configured size limit', requestId },
     });
     return;
   }
 
-  // Handle unknown errors (500)
   logError('Unexpected error occurred', {
     errorName: err.name,
     errorMessage: err.message,
@@ -99,20 +77,12 @@ export function errorHandler(
   });
 
   res.status(500).json({
-    error: {
-      code: ApiErrorCode.INTERNAL_ERROR,
-      message: 'An unexpected error occurred. Please try again later.',
-      ...(requestId !== undefined ? { requestId } : {}),
-    },
+    error: { code: ApiErrorCode.INTERNAL_ERROR, message: 'An unexpected error occurred. Please try again later.', requestId },
   });
 }
 
-/**
- * Async handler wrapper to catch errors in async route handlers
- */
-export function asyncHandler(
-  fn: (req: any, res: any, next: any) => Promise<void>
-) {
+/** Async handler wrapper */
+export function asyncHandler(fn: (req: any, res: any, next: any) => Promise<void>) {
   return (req: any, res: any, next: any): void => {
     Promise.resolve(fn(req, res, next)).catch((error) => next(error));
   };
@@ -136,6 +106,10 @@ export function serviceUnavailable(message: string): ApiError {
 
 export function unauthorized(message: string, details?: unknown): ApiError {
   return new ApiError(ApiErrorCode.UNAUTHORIZED, message, 401, details);
+}
+
+export function forbidden(message: string, details?: unknown): ApiError {
+  return new ApiError(ApiErrorCode.FORBIDDEN, message, 403, details);
 }
 
 export function payloadTooLarge(message: string, details?: unknown): ApiError {
