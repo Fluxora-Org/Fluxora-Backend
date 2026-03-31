@@ -11,6 +11,7 @@
 import { streamRepository } from "../db/repositories/streamRepository.js";
 import { CreateStreamInput, StreamStatus } from "../db/types.js";
 import { info, warn, error as logError, debug } from "../utils/logger.js";
+import { broadcast } from "../websockets/streamChannel.js";
 
 /**
  * Raw event types from Stellar Soroban RPC
@@ -119,9 +120,11 @@ export const streamEventService = {
 
       if (result.created) {
         info("Stream created from event", { streamId, eventId, correlationId });
+        broadcast({ event: 'stream.created', streamId, payload: input as unknown as Record<string, unknown>, timestamp: new Date().toISOString() });
         return { eventId, streamId, action: "created", success: true };
       } else if (result.updated) {
         info("Stream updated from event", { streamId, eventId, correlationId });
+        broadcast({ event: 'stream.updated', streamId, payload: input as unknown as Record<string, unknown>, timestamp: new Date().toISOString() });
         return { eventId, streamId, action: "updated", success: true };
       } else {
         debug("Stream already exists (idempotent)", {
@@ -203,6 +206,7 @@ export const streamEventService = {
           eventId,
           correlationId,
         });
+        broadcast({ event: 'stream.updated', streamId: event.streamId, payload: update as Record<string, unknown>, timestamp: new Date().toISOString() });
         return {
           eventId,
           streamId: event.streamId,
@@ -263,6 +267,7 @@ export const streamEventService = {
         eventId,
         correlationId,
       });
+      broadcast({ event: 'stream.cancelled', streamId: event.streamId, payload: { status: 'cancelled' }, timestamp: new Date().toISOString() });
       return {
         eventId,
         streamId: event.streamId,

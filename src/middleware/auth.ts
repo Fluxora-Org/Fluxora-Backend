@@ -13,6 +13,7 @@ import { warn, info, debug } from '../utils/logger.js';
 export function authenticate(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
   const requestId = (req as any).id || (req as any).correlationId;
+  const apiKey = getApiKeyFromRequest(req.headers as Record<string, string | string[] | undefined>);
 
   debug('Authentication middleware triggered', { hasAuthHeader: !!authHeader, requestId });
 

@@ -2,6 +2,83 @@
 
 Express + TypeScript API for the Fluxora treasury streaming protocol. Today this repository exposes a minimal HTTP surface for stream CRUD and health checks. It now documents both the decimal-string serialization policy for chain/API amounts and the consumer-facing webhook signature verification contract the team intends to keep stable when delivery is enabled.
 
+## Quick Start with Docker Compose
+
+The fastest way to run Fluxora Backend with all dependencies:
+
+```bash
+# 1. Clone and navigate to the repository
+git clone <repository-url>
+cd Fluxora-Backend
+
+# 2. Copy and configure environment variables
+cp .env.example .env
+# Edit .env with your secrets (JWT_SECRET, API_KEYS, etc.)
+
+# 3. Start with PostgreSQL only
+docker-compose up -d
+
+# 4. Or start with PostgreSQL + Redis (full stack)
+docker-compose --profile redis up -d
+
+# 5. Check service health
+curl http://localhost:3000/health
+
+# 6. View logs
+docker-compose logs -f app
+```
+
+### Docker Compose Services
+
+| Service | Description | Default URL |
+|---------|-------------|-------------|
+| `app` | Fluxora Backend API | http://localhost:3000 |
+| `postgres` | PostgreSQL 16 database | localhost:5432 |
+| `redis` | Redis 7 cache (optional) | localhost:6379 |
+
+### Configuration Profiles
+
+- **Default** (`docker-compose up`): App + PostgreSQL
+- **With Redis** (`--profile redis`): App + PostgreSQL + Redis
+- **Full Stack** (`--profile full`): All services
+
+### Health Checks
+
+All services include health checks:
+- **PostgreSQL**: `pg_isready` every 10s
+- **Redis**: `redis-cli ping` every 10s
+- **App**: HTTP health endpoint every 30s
+
+The app waits for PostgreSQL to be healthy before starting.
+
+### Database Initialization
+
+PostgreSQL automatically initializes on first run using scripts in `init-db/`:
+- `01-schema.sql`: Creates tables, indexes, and initial data
+- Streams table for treasury protocol state
+- Indexer state tracking
+- Audit logs for chain-derived changes
+- Webhook delivery tracking (future)
+
+### Troubleshooting
+
+```bash
+# Reset everything (destroys data)
+docker-compose down -v
+
+# Rebuild after code changes
+docker-compose up -d --build
+
+# Check database logs
+docker-compose logs postgres
+
+# Connect to database
+docker-compose exec postgres psql -U fluxora -d fluxora
+
+# Scale app instances (with external load balancer)
+docker-compose up -d --scale app=3
+```
+
 ## Current status
 
 - Implemented today:
@@ -9,6 +86,7 @@ Express + TypeScript API for the Fluxora treasury streaming protocol. Today this
   - decimal-string validation for amount fields
   - indexer freshness classification for `healthy`, `starting`, `stalled`, and `not_configured`
   - consumer-side webhook signing and verification helpers in `src/webhooks/signature.ts`
+  - WebSocket channel for real-time stream updates at `ws://<host>/ws/streams`
 - Explicitly not implemented yet:
   - live webhook delivery endpoints
   - durable delivery logs or replay store
@@ -125,12 +203,119 @@ if (!verification.ok) {
 | Duplicate delivery id | Do not process the business action twice | `200 OK` after safe dedupe or `409 Conflict` |
 | Consumer overloaded | Ask sender to retry later | `429 Too Many Requests` |
 
+## WebSocket API
+
+### Endpoint
+
+```
+ws://<host>/ws/streams
+```
+
+No authentication is required to connect (auth is a documented non-goal for this release — see follow-up below).
+
+### Message schema
+
+All messages are JSON. The server only sends; clients may send subscription messages (currently ignored beyond abuse checks).
+
+**Stream event:**
+
+```json
+{
+  "event": "stream.created" | "stream.updated" | "stream.cancelled",
+  "streamId": "stream-abc123",
+  "payload": { ... },
+  "timestamp": "2026-01-01T00:00:00.000Z"
+}
+```
+
+**Degraded state notification:**
+
+```json
+{
+  "event": "service.degraded",
+  "reason": "Stellar RPC unreachable",
+  "timestamp": "2026-01-01T00:00:00.000Z"
+}
+```
+
+### Abuse prevention
+
+| Control | Limit | Client-visible outcome |
+|---------|-------|------------------------|
+| Max client message size | 4 KiB | Connection closed with code `1009` |
+| Per-connection rate limit | 10 messages / 10 s | Connection closed with code `1008` |
+| Heartbeat (ping/pong) | Every 30 s | Unresponsive clients are terminated |
+
+### Operator observability
+
+- `GET /health` includes `wsConnections` — the count of currently connected clients.
+- Connect/disconnect events are logged as structured JSON with `connectionId` and `total`.
+
+### Manual verification
+
+```bash
+# Install wscat if needed
+npm install -g wscat
+
+# Connect and watch events
+wscat -c ws://localhost:3000/ws/streams
+```
+
+### Non-goals and follow-up
+
+- **Authentication / authorization** on the WebSocket endpoint is intentionally deferred. Follow-up: add JWT or API-key validation on upgrade.
+- **Message replay / durable event log** — events are fire-and-forget; clients that disconnect miss events. Follow-up: add a replay store.
+- **Per-stream subscription filtering** — all clients receive all events. Follow-up: add a subscription message protocol.
+
 ## Health and observability
 
 - `GET /health` returns service status and indexer freshness classification
 - request IDs enable correlation across logs
 - structured JSON logs are expected for diagnostics
 - if `indexer.status = "stalled"`, treat that as an operational signal that chain-derived views would be stale if the real indexer were enabled in this service
+
+## Security headers: helmet middleware
+
+### Service-level outcomes
+
+- every HTTP response carries a predictable baseline of browser-facing security headers
+- the service does not advertise Express internals through the `X-Powered-By` header
+- operators can verify the header policy with a simple `GET /health` or `GET /` check during rollout and incident response
+- failures in downstream dependencies do not disable the security-header baseline because the middleware is applied before route handling
+
+### Trust boundaries
+
+| Actor | May do | May not do |
+|-------|--------|------------|
+| Public internet clients | Call public routes and observe the documented response headers | Weaken or negotiate a lower security-header policy |
+| Authenticated partners | Use partner/admin routes once enabled and receive the same baseline headers | Bypass the default browser-hardening behavior |
+| Administrators / operators | Verify header presence through health checks, logs, and smoke tests | Treat the presence of headers as a substitute for auth, input validation, or TLS termination controls |
+| Internal workers | Reach internal HTTP surfaces through the same Express stack when applicable | Disable header emission on a per-worker basis |
+
+### Failure modes and expected behavior
+
+| Condition | Expected behavior |
+|-----------|-------------------|
+| Invalid input or route error | Return the normal error status/body and still emit the security headers |
+| Dependency outage | `/health` may report degraded or unavailable state, but the header baseline remains present on the HTTP response |
+| Partial data or missing resources | Client receives the documented `404`/`409`/`5xx` behavior with the same header policy intact |
+| Duplicate delivery or replayed request | Business logic decides `200`/`409` behavior; the security headers are unchanged because they are orthogonal to idempotency |
+
+### Operator observability and diagnostics
+
+- smoke check with `curl -I http://127.0.0.1:3000/health` and confirm `content-security-policy`, `strict-transport-security`, `x-content-type-options`, and `x-frame-options`
+- use structured request logs and request IDs to correlate header checks with the request path under investigation
+- if a proxy or CDN strips headers, compare direct-app responses with edge responses to identify where the policy is being altered
+
+### Verification evidence
+
+- automated regression coverage lives in `tests/helmet.test.ts`
+- manual verification: `curl -I http://127.0.0.1:3000/` and `curl -I http://127.0.0.1:3000/health`
+
+### Non-goals and audit notes
+
+- this issue adds baseline browser-facing security headers only; it does not replace TLS, authentication, authorization, rate limiting, or CSP tuning for a future browser UI
+- residual risk: intermediaries can still overwrite or strip headers, so production verification should include at least one edge-facing probe
 
 ## Local setup
 
@@ -370,6 +555,94 @@ curl http://localhost:3000/api/streams/<stream-id>
 - Console logs via `tsx watch` show all request activity in development
 - Future: structured JSON logging and a `/metrics` endpoint
 
+## Database Backups and Restore Runbook (Issue #52)
+
+### Service-level outcomes
+- The backend guarantees a durable, restorable view of chain-derived state using PostgreSQL custom-format dumps.
+- Backup operations execute without halting read/write API availability.
+- Restore operations execute with a `--clean` flag, guaranteeing the database state exactly matches the backup snapshot, avoiding partial data overlaps.
+
+### Trust boundaries
+| Actor | Allowed | Not allowed |
+|-------|---------|-------------|
+| Public internet clients | No access | Cannot trigger, view, or detect backup/restore operations. |
+| Authenticated partners | No access | Cannot trigger or download backups. |
+| Internal workers (Cron) | Execute `backupDatabase` routine securely using local FS | Cannot execute restores or drop tables directly. |
+| Administrators / operators | Execute `restoreDatabase` during incident response, download dumps from cold storage | Leaving unencrypted dumps on public web servers. |
+
+### Failure modes and expected behavior
+
+| Condition | Expected result | System Behavior |
+|-----------|-----------------|-----------------|
+| `DATABASE_URL` missing or malformed | Immediate failure before subprocess spawns | `success: false` returned, no partial files created. |
+| DB credentials invalid/revoked | Subprocess fails with authentication error | Returns `Backup failed` with `stderr` detail for logs. |
+| Disk out of space during backup | `pg_dump` panics mid-stream | Incomplete file remains; operation returns error. Operators must monitor FS capacity. |
+| Corrupted or invalid dump file provided to restore | `pg_restore` rejects the archive format | Returns `Restore failed`. Database state remains unchanged (clean drop does not execute). |
+
+### Operator observability and diagnostics
+Operators can diagnose backup/restore health without relying on tribal knowledge:
+- **Routine Backups:** The backup routine outputs structured JSON containing `{ success: boolean, message: string, error?: string }`.
+- **Triage Flow (Backup Failure):**
+  1. Check disk space on the volume mapped to the output path.
+  2. Verify `DATABASE_URL` validity using `psql`.
+  3. Check the `error` string in the logs for `pg_dump` specific stderr (e.g., `FATAL: connection limit exceeded`).
+- **Triage Flow (Restore Failure):**
+  1. Ensure the target DB has active connections terminated before running a `--clean` restore.
+  2. Verify the input file was generated using custom format (`-F c`), as plain SQL dumps will fail `pg_restore`.
+
+### Verification evidence
+Automated unit tests (`tests/db-ops.test.ts`) assert the boundaries of the `pg_dump` and `pg_restore` wrappers, including credential failures and missing configurations. 
+
+### Non-goals and follow-up tracking
+- **Intentionally deferred:** Automated scheduling (e.g., node-cron) is deferred until persistent volume claims (PVCs) or S3 streaming targets are provisioned in the deployment orchestration.
+- **Follow-up:** Add an S3 upload stream integration so dumps don't remain local to the container filesystem.
+
+## GET /api/streams/:id backed by database (Issue #15)
+
+### Service-level outcomes
+- The `/api/streams/:id` endpoint provides a durable, highly available read path for chain-derived stream state.
+- Values returned respect the Decimal String Serialization Policy to prevent precision loss.
+
+### Trust boundaries
+| Actor | Allowed | Not allowed |
+|-------|---------|-------------|
+| Public internet clients | Can query any known stream ID and receive normalized JSON. | Cannot modify stream state or execute unbounded DB queries (e.g., table scans). |
+| Internal workers / Indexer | Trusted to write accurate chain-derived data to the underlying `streams` table. | — |
+| Administrators / Operators | Monitor DB latency and connection pool health. | — |
+
+### Failure modes and client-visible behavior
+| Condition | Expected result | System Behavior |
+|-----------|-----------------|-----------------|
+| Valid stream ID exists | `200 OK` | Returns JSON payload with decimal strings. |
+| Stream ID does not exist | `404 Not Found` | Returns `{"error": "NOT_FOUND"}`. No DB locks held. |
+| Database connection drops | `503 Service Unavailable` | Returns `{"error": "SERVICE_UNAVAILABLE"}`. Logs the underlying `pg` error for operator triage. |
+
+### Operator observability and diagnostics
+- **Health Checks:** A `503` from this endpoint indicates pool exhaustion, network partition, or DB credentials failure. Cross-reference with `GET /health`.
+- **Diagnostics:** Look for `[GET /api/streams/:id] Database error:` in standard out. This will contain the raw `pg` driver stack trace.
+
+## GET /api/streams filters: status, recipient, sender (Issue #14)
+
+### Service-level outcomes
+- Integrators and finance reviewers can deterministically filter the stream index by `status`, `sender`, and `recipient` addresses.
+- Filtering is applied prior to cursor-based pagination to guarantee consistent, traversable result sets.
+
+### Trust boundaries
+| Actor | Allowed | Not allowed |
+|-------|---------|-------------|
+| Public internet clients | Can filter public streams by valid addresses and statuses. | Cannot bypass pagination limits or execute wildcard/regex searches. |
+| Internal workers / Operators | Full access to filter across all streams for reconciliation. | — |
+
+### Failure modes and client-visible behavior
+| Condition | Expected result | System Behavior |
+|-----------|-----------------|-----------------|
+| Invalid Stellar Address Format | `400 Bad Request` | Fails fast with `VALIDATION_ERROR` indicating exactly which field failed the Regex check. |
+| Invalid Status Enum | `400 Bad Request` | Rejects unknown statuses (e.g., `pending`) to prevent cache poisoning or DB errors. |
+| Valid filters match no records | `200 OK` | Returns an empty `streams: []` array, not a 404, preserving API list semantics. |
+
+### Operator observability and diagnostics
+- Filter parameters are logged alongside `requestId` to help diagnose user reports of "missing streams" (usually caused by a typo in the recipient query).
+
 ## API overview
 
 | Method | Path | Description |
@@ -423,6 +696,166 @@ Likely future additions:
 - `REDIS_URL`
 - `HORIZON_URL`
 - `JWT_SECRET`
+
+## WebSocket API — Stream Updates (#49)
+
+The backend exposes a WebSocket endpoint for real-time stream update notifications.
+Clients subscribe to individual streams and receive push events as the indexer
+processes on-chain activity.
+
+### Endpoint
+
+```
+ws://<host>/ws/streams
+```
+
+### Protocol
+
+All messages are JSON text frames. Binary frames are rejected.
+
+#### Client → Server
+
+| Message | Description |
+|---|---|
+| `{ "type": "subscribe",   "streamId": "<id>" }` | Subscribe to updates for a stream |
+| `{ "type": "unsubscribe", "streamId": "<id>" }` | Stop receiving updates for a stream |
+
+#### Server → Client
+
+| Message | Description |
+|---|---|
+| `{ "type": "stream_update", "streamId": "<id>", "eventId": "<id>", "payload": {...} }` | Stream state change event |
+| `{ "type": "error", "code": "<CODE>", "message": "<text>" }` | Protocol or policy error |
+
+### Error codes
+
+| Code | Cause |
+|---|---|
+| `PAYLOAD_TOO_LARGE` | Inbound message exceeds 4 096 bytes |
+| `RATE_LIMIT_EXCEEDED` | More than 30 messages in a 10-second window |
+| `BINARY_NOT_SUPPORTED` | Binary frame received |
+| `INVALID_JSON` | Message is not valid JSON |
+| `INVALID_MESSAGE` | Missing or invalid `streamId` field |
+| `UNKNOWN_TYPE` | Unrecognised `type` field |
+
+### Operational notes
+
+- **Rate limiting**: 30 inbound messages per 10-second window per connection.
+  Excess messages receive a `RATE_LIMIT_EXCEEDED` error; the connection stays open.
+- **Duplicate delivery prevention**: Each event is identified by `(streamId, eventId)`.
+  If the indexer or RPC layer replays an event, the hub delivers it exactly once.
+  The dedup cache holds up to 10 000 entries (LRU eviction).
+- **Oversized payload rejection**: Inbound messages larger than 4 096 bytes are
+  rejected with `PAYLOAD_TOO_LARGE`. The connection stays open.
+- **RPC failure isolation**: The WS hub operates independently of the Stellar RPC
+  circuit breaker. Clients remain connected during RPC outages; events resume
+  automatically when the indexer recovers.
+- **Graceful shutdown**: `StreamHub.close()` is called during server shutdown to
+  drain connections cleanly.
+
+### Example (browser)
+
+```js
+const ws = new WebSocket('ws://localhost:3000/ws/streams');
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: 'subscribe', streamId: 'stream-abc123' }));
+};
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === 'stream_update') {
+    console.log('Update for', msg.streamId, msg.payload);
+  }
+};
+```
+
+### Implementation
+
+| File | Description |
+|---|---|
+| `src/ws/hub.ts` | `StreamHub` class: connection tracking, rate limiting, dedup, broadcast |
+| `tests/ws.test.ts` | Integration tests: lifecycle, dedup, rate limiting, RPC failure modes |
+
+## WebSocket API — Stream Updates (#49)
+
+The backend exposes a WebSocket endpoint for real-time stream update notifications.
+Clients subscribe to individual streams and receive push events as the indexer
+processes on-chain activity.
+
+### Endpoint
+
+```
+ws://<host>/ws/streams
+```
+
+### Protocol
+
+All messages are JSON text frames. Binary frames are rejected.
+
+#### Client → Server
+
+| Message | Description |
+|---|---|
+| `{ "type": "subscribe",   "streamId": "<id>" }` | Subscribe to updates for a stream |
+| `{ "type": "unsubscribe", "streamId": "<id>" }` | Stop receiving updates for a stream |
+
+#### Server → Client
+
+| Message | Description |
+|---|---|
+| `{ "type": "stream_update", "streamId": "<id>", "eventId": "<id>", "payload": {...} }` | Stream state change event |
+| `{ "type": "error", "code": "<CODE>", "message": "<text>" }` | Protocol or policy error |
+
+### Error codes
+
+| Code | Cause |
+|---|---|
+| `PAYLOAD_TOO_LARGE` | Inbound message exceeds 4 096 bytes |
+| `RATE_LIMIT_EXCEEDED` | More than 30 messages in a 10-second window |
+| `BINARY_NOT_SUPPORTED` | Binary frame received |
+| `INVALID_JSON` | Message is not valid JSON |
+| `INVALID_MESSAGE` | Missing or invalid `streamId` field |
+| `UNKNOWN_TYPE` | Unrecognised `type` field |
+
+### Operational notes
+
+- **Rate limiting**: 30 inbound messages per 10-second window per connection.
+  Excess messages receive a `RATE_LIMIT_EXCEEDED` error; the connection stays open.
+- **Duplicate delivery prevention**: Each event is identified by `(streamId, eventId)`.
+  If the indexer or RPC layer replays an event, the hub delivers it exactly once.
+  The dedup cache holds up to 10 000 entries (LRU eviction).
+- **Oversized payload rejection**: Inbound messages larger than 4 096 bytes are
+  rejected with `PAYLOAD_TOO_LARGE`. The connection stays open.
+- **RPC failure isolation**: The WS hub operates independently of the Stellar RPC
+  circuit breaker. Clients remain connected during RPC outages; events resume
+  automatically when the indexer recovers.
+- **Graceful shutdown**: `StreamHub.close()` is called during server shutdown to
+  drain connections cleanly.
+
+### Example (browser)
+
+```js
+const ws = new WebSocket('ws://localhost:3000/ws/streams');
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: 'subscribe', streamId: 'stream-abc123' }));
+};
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === 'stream_update') {
+    console.log('Update for', msg.streamId, msg.payload);
+  }
+};
+```
+
+### Implementation
+
+| File | Description |
+|---|---|
+| `src/ws/hub.ts` | `StreamHub` class: connection tracking, rate limiting, dedup, broadcast |
+| `tests/ws.test.ts` | Integration tests: lifecycle, dedup, rate limiting, RPC failure modes |
 
 ## Related repos
 

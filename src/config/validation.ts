@@ -45,7 +45,7 @@ export function validateStellarAddress(address: string, fieldName: string = 'add
  * Validate amount as a positive integer string (stroops)
  */
 export function validateAmount(amount: string | number, fieldName: string = 'amount'): string {
-    const amountStr = String(amount).trim();
+    const amountStr = String(amount);
 
     if (!amountStr) {
         throw new ValidationError(`${fieldName} is required`, fieldName, amount);

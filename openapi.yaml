@@ -7,6 +7,16 @@ info:
     
     Presents operator-grade reliability with predictable HTTP semantics, durable views of chain-derived data,
     and explicit failure behavior when dependencies are unhealthy.
+
+    ## Security Header Baseline
+    Fluxora applies Helmet at the Express boundary so every HTTP response carries a consistent
+    browser-facing security-header baseline, including `Content-Security-Policy`,
+    `Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`, and
+    `Referrer-Policy`. The service also suppresses the `X-Powered-By` header.
+
+    These headers are transport invariants for public clients, authenticated partners,
+    administrators, and internal workers that traverse the HTTP surface. They do not replace
+    authentication, authorization, TLS termination, or proxy hardening.
     
     ## Trust Boundaries
     - **Public Internet Clients**: Read-only access to stream listings and health checks

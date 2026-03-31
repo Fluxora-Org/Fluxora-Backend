@@ -1,22 +1,16 @@
-/**
- * Stellar network configuration
- *
- * Defines network-specific settings for Stellar integration
- */
-
 export type StellarNetwork = 'testnet' | 'mainnet';
 
 export interface ContractAddresses {
   streaming: string;
 }
 
-export interface NetworkConfig {
+interface StellarNetworkDefaults {
   horizonUrl: string;
   passphrase: string;
   streamingContractAddress: string;
 }
 
-export const STELLAR_NETWORKS: Record<StellarNetwork, NetworkConfig> = {
+export const STELLAR_NETWORKS: Record<StellarNetwork, StellarNetworkDefaults> = {
   testnet: {
     horizonUrl: 'https://horizon-testnet.stellar.org',
     passphrase: 'Test SDF Network ; September 2015',
