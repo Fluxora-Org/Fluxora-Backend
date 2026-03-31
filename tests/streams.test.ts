@@ -1,5 +1,6 @@
 import express from 'express';
 import request from 'supertest';
+import { getStreamById } from '../src/db/client.js';
 
 // Import the streams router directly - we'll need to export the streams array for testing
 import {
@@ -18,6 +19,11 @@ import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
 import { errorHandler } from '../src/middleware/errorHandler.js';
 import { initializeConfig, resetConfig } from '../src/config/env.js';
 
+jest.mock('../src/db/client.js', () => ({
+  getStreamById: jest.fn(),
+}))
+
+// Create a minimal test app
 function createTestApp() {
   const app = express();
   // Custom requestId middleware for tests to ensure consistent requestId for idempotent replays
@@ -494,8 +500,10 @@ describe('Streams API - Decimal String Serialization', () => {
         .get('/api/streams?limit=2')
         .expect(200);
 
-      const deletedId = firstPage.body.streams[1]!.id;
-      const deletedIndex = streams.findIndex((stream) => stream.id === deletedId);
+      const deletedId = firstPage.body.streams[1].id;
+      const deletedIndex = streams.findIndex(
+        (stream: any) => stream.id === deletedId
+      )
       streams.splice(deletedIndex, 1);
 
       const secondPage = await request(app)
@@ -586,17 +594,147 @@ describe('Streams API - Decimal String Serialization', () => {
         .set('Authorization', `Bearer ${testToken}`)
         .expect(200);
     });
+
+    describe('filtering', () => {
+      beforeEach(async () => {
+        // Clear and re-seed specific streams for filtering
+        streams.length = 0
+        streams.push(
+          {
+            id: '1',
+            status: 'active',
+            sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXA',
+            recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXB',
+            depositAmount: '100',
+            ratePerSecond: '1',
+            startTime: 0,
+            endTime: 0,
+          },
+          {
+            id: '2',
+            status: 'completed',
+            sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXA',
+            recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXC',
+            depositAmount: '200',
+            ratePerSecond: '2',
+            startTime: 0,
+            endTime: 0,
+          },
+          {
+            id: '3',
+            status: 'active',
+            sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXD',
+            recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXB',
+            depositAmount: '300',
+            ratePerSecond: '3',
+            startTime: 0,
+            endTime: 0,
+          }
+        )
+      })
+
+      it('should filter by status', async () => {
+        const response = await request(app)
+          .get('/api/streams?status=active')
+          .expect(200)
+        expect(response.body.streams).toHaveLength(2)
+        expect(
+          response.body.streams.every((s: any) => s.status === 'active')
+        ).toBe(true)
+      })
+
+      it('should filter by sender', async () => {
+        const response = await request(app)
+          .get('/api/streams?sender=GCSX2XXXXXXXXXXXXXXXXXXXXXXA')
+          .expect(200)
+        expect(response.body.streams).toHaveLength(2)
+      })
+
+      it('should filter by recipient', async () => {
+        const response = await request(app)
+          .get('/api/streams?recipient=GDRX2XXXXXXXXXXXXXXXXXXXXXXC')
+          .expect(200)
+        expect(response.body.streams).toHaveLength(1)
+        expect(response.body.streams[0].id).toBe('2')
+      })
+
+      it('should combine filters correctly', async () => {
+        const response = await request(app)
+          .get(
+            '/api/streams?status=active&recipient=GDRX2XXXXXXXXXXXXXXXXXXXXXXB'
+          )
+          .expect(200)
+        expect(response.body.streams).toHaveLength(2)
+      })
+
+      it('should return 400 for invalid status', async () => {
+        const response = await request(app)
+          .get('/api/streams?status=invalid_state')
+          .expect(400)
+        expect(response.body.error.code).toBe('VALIDATION_ERROR')
+      })
+
+      it('should return 400 for invalid sender address', async () => {
+        const response = await request(app)
+          .get('/api/streams?sender=invalid-address')
+          .expect(400)
+        expect(response.body.error.code).toBe('VALIDATION_ERROR')
+      })
+    })
   });
 
   describe('GET /api/streams/:id', () => {
+    beforeEach(() => {
+      jest.clearAllMocks()
+    })
+
+    it('should return 200 and the stream data if found in the database', async () => {
+      const mockStream = {
+        id: 'stream-123',
+        sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
+        recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
+        depositAmount: '100.0000000',
+        ratePerSecond: '0.0010000',
+        startTime: 1700000000,
+        endTime: 0,
+        status: 'active',
+      }
+
+      // Tell our mock DB to return the stream
+      ;(getStreamById as jest.Mock).mockResolvedValueOnce(mockStream)
+
+      const response = await request(app)
+        .get('/api/streams/stream-123')
+        .expect(200)
+
+      expect(response.body).toEqual(mockStream)
+      expect(getStreamById).toHaveBeenCalledWith('stream-123')
+    })
+
     it('should return 404 for non-existent stream', async () => {
+      // Tell our mock DB to return null (not found)
+      ;(getStreamById as jest.Mock).mockResolvedValueOnce(null)
+
       const response = await request(app)
         .get('/api/streams/non-existent-id')
-        .expect(404);
+        .expect(404)
 
-      expect(response.body.error.code).toBe('NOT_FOUND');
-    });
-  });
+      expect(response.body.error.code).toBe('NOT_FOUND')
+    })
+
+    it('should return 503 if the database query fails', async () => {
+      // Tell our mock DB to throw an error
+      ;(getStreamById as jest.Mock).mockRejectedValueOnce(
+        new Error('Connection timeout')
+      )
+
+      const response = await request(app)
+        .get('/api/streams/stream-123')
+        .expect(503)
+
+      expect(response.body.error.code).toBe('SERVICE_UNAVAILABLE')
+    })
+  })
 
   describe('DELETE /api/streams/:id', () => {
     it('should return 404 for non-existent stream', async () => {

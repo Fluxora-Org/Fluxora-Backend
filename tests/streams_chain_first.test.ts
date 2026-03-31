@@ -1,7 +1,7 @@
 import request from 'supertest';
 import  app  from '../src/app.js';
 import * as StellarService from '../src/lib/stellar.js';
-import { jest } from '@jest/globals';
+import { vi as jest } from 'vitest';
 import { parseToStroops } from '../src/serialization/decimal.js';
 
 // Mock the Stellar service to avoid real network calls

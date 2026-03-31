@@ -12,6 +12,7 @@ export interface VerifiedStream {
   ratePerSecond: bigint;
   startTime: number;
   endTime: number;
+  contractId?: string;
 }
 
 /**

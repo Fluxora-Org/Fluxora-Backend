@@ -12,7 +12,7 @@
  * and malicious input conditions.
  */
 
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect } from 'vitest';
 import {
     ValidationError,
     validateStellarAddress,

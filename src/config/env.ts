@@ -1,4 +1,5 @@
-import { StellarNetwork, STELLAR_NETWORKS, ContractAddresses } from './stellar.js';
+import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
+export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
 
 /**
  * Global configuration interface for the Fluxora API.
@@ -39,6 +40,12 @@ export interface Config {
     logLevel: 'debug' | 'info' | 'warn' | 'error';
     metricsEnabled: boolean;
 
+    // Distributed Tracing (OpenTelemetry optional)
+    tracingEnabled: boolean;
+    tracingSampleRate: number; // 0.0 to 1.0
+    tracingOtelEnabled: boolean; // OpenTelemetry integration
+    tracingLogEvents: boolean; // Log span events
+
     // Webhooks
     webhookUrl?: string | undefined;
     webhookSecret?: string | undefined;
@@ -46,6 +53,15 @@ export interface Config {
     // Feature flags
     enableStreamValidation: boolean;
     enableRateLimit: boolean;
+    requirePartnerAuth: boolean;
+    partnerApiToken?: string | undefined;
+    requireAdminAuth: boolean;
+    adminApiToken?: string | undefined;
+    indexerEnabled: boolean;
+    workerEnabled: boolean;
+    indexerStallThresholdMs: number;
+    indexerLastSuccessfulSyncAt?: string | undefined;
+    deploymentChecklistVersion: string;
 }
 
 /**
@@ -242,11 +258,26 @@ export function loadConfig(): Config {
         logLevel: (process.env.LOG_LEVEL ?? 'info') as 'debug' | 'info' | 'warn' | 'error',
         metricsEnabled: parseBoolEnv(process.env.METRICS_ENABLED, true),
 
+        // Distributed Tracing (optional, disabled by default for zero overhead)
+        tracingEnabled: parseBoolEnv(process.env.TRACING_ENABLED, false),
+        tracingSampleRate: Math.min(1.0, Math.max(0.0, parseFloat(process.env.TRACING_SAMPLE_RATE ?? '1.0'))),
+        tracingOtelEnabled: parseBoolEnv(process.env.TRACING_OTEL_ENABLED, false),
+        tracingLogEvents: parseBoolEnv(process.env.TRACING_LOG_EVENTS, false),
+
         webhookUrl: process.env.WEBHOOK_URL,
         webhookSecret: process.env.WEBHOOK_SECRET,
 
         enableStreamValidation: parseBoolEnv(process.env.ENABLE_STREAM_VALIDATION, true),
         enableRateLimit: parseBoolEnv(process.env.ENABLE_RATE_LIMIT, !isProduction),
+        requirePartnerAuth: parseBoolEnv(process.env.REQUIRE_PARTNER_AUTH, false),
+        partnerApiToken: process.env.PARTNER_API_TOKEN,
+        requireAdminAuth: parseBoolEnv(process.env.REQUIRE_ADMIN_AUTH, false),
+        adminApiToken: process.env.ADMIN_API_TOKEN,
+        indexerEnabled: parseBoolEnv(process.env.INDEXER_ENABLED, false),
+        workerEnabled: parseBoolEnv(process.env.WORKER_ENABLED, false),
+        indexerStallThresholdMs: parseIntEnv(process.env.INDEXER_STALL_THRESHOLD_MS, 5 * 60 * 1000, 1000),
+        indexerLastSuccessfulSyncAt: process.env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
+        deploymentChecklistVersion: process.env.DEPLOYMENT_CHECKLIST_VERSION ?? '2026-03-27',
     };
 
     return config;

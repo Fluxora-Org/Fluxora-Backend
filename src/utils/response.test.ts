@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { successResponse, errorResponse } from './response';
+import { successResponse, errorResponse } from './response.js';
 
 describe('Response envelope helpers', () => {
     describe('successResponse', () => {

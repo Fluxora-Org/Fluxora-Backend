@@ -10,7 +10,7 @@
  * - Health checker reports stellar_rpc as unhealthy when circuit is OPEN
  */
 
-import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import express from 'express';
 import {
