@@ -4,8 +4,10 @@ import prettierConfig from 'eslint-config-prettier';
 
 export default [
   {
+    ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'migrations/**', 'k6/**'],
+  },
+  {
     files: ['**/*.ts', '**/*.js'],
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'migrations/**'],
     languageOptions: {
       parser,
       parserOptions: {
