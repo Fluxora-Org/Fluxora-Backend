@@ -14,7 +14,7 @@ import {
   conflictError,
   asyncHandler,
 } from '../middleware/errorHandler.js';
-import { requireAuth } from '../middleware/auth.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
 import { info, debug, warn } from '../utils/logger.js';
 import { verifyStreamOnChain } from '../lib/stellar.js';
 

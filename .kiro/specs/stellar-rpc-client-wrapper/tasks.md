@@ -128,7 +128,7 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
     - Test metrics recording
     - _Requirements: 2.1, 2.2, 2.3, 3.1, 4.1, 5.3, 11.1, 11.2, 11.3_
 
-- [-] 8. Implement logging integration
+- [x] 8. Implement logging integration
   - [x] 8.1 Add structured logging to StellarRpcClient
     - Log request initiation with correlation ID, method, endpoint (INFO level)
     - Log successful requests with correlation ID, duration, status code (INFO level)
@@ -149,7 +149,7 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
     - Test log levels are correct for each event type
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.9, 7.10, 7.11, 7.12_
 
-- [~] 9. Implement Stellar-specific RPC methods
+- [ ] 9. Implement Stellar-specific RPC methods
   - [x] 9.1 Implement getAccount method
     - Accept accountId parameter and optional RequestOptions
     - Validate accountId format (Stellar address)
@@ -191,7 +191,8 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
   - [x] 9.5 Implement getEvents method
     - Accept EventFilters parameter and optional RequestOptions
     - Validate filter parameters (startLedger <= endLedger if both provided)
-    - Build RPC request payload
+    - Build RPC request pa
+    - yload
     - Call executeRequest with timeout and retry policies
     - Parse response JSON into EventsResponse type
     - Validate response contains required fields (events, latestLedger)
@@ -212,7 +213,7 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
 - [x] 10. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [~] 11. Implement health check functionality
+- [ ] 11. Implement health check functionality
   - [x] 11.1 Implement healthCheck method
     - Send lightweight RPC request (e.g., getLedger with latest sequence)
     - Measure response time in milliseconds
@@ -232,7 +233,7 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
     - Test health check logging
     - _Requirements: 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8_
 
-- [~] 12. Implement metrics exposure
+- [ ] 12. Implement metrics exposure
   - [x] 12.1 Implement getMetrics and resetMetrics methods
     - Implement getMetrics that returns MetricsSnapshot from MetricsCollector
     - Include circuit breaker state in snapshot
@@ -247,7 +248,7 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
     - Test resetMetrics clears counters
     - _Requirements: 8.6, 8.7, 8.8, 8.9_
 
-- [~] 13. Integrate with error handling middleware
+- [ ] 13. Integrate with error handling middleware
   - [x] 13.1 Extend error handler middleware for RPC errors
     - Add RPC error type detection in errorHandler
     - Map RpcTimeoutError to 504 Gateway Timeout
@@ -268,7 +269,7 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
     - Test error details included in response
     - _Requirements: 10.6, 10.7, 10.9_
 
-- [~] 14. Implement response validation
+- [ ] 14. Implement response validation
   - [x] 14.1 Add response validation logic
     - Validate response contains expected fields for each RPC method
     - Throw RpcValidationError when required fields are missing
@@ -288,7 +289,7 @@ This implementation plan breaks down the Stellar RPC Client Wrapper into discret
     - Test validation logging
     - _Requirements: 12.1, 12.2, 12.4, 12.5, 12.6, 12.7, 12.8_
 
-- [~] 15. Create example usage and integration
+- [ ] 15. Create example usage and integration
   - [x] 15.1 Create example route using StellarRpcClient
     - Create example route in src/routes/ that demonstrates client usage
     - Initialize StellarRpcClient with configuration from environment variables

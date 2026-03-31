@@ -21,6 +21,7 @@ const migrations: { up: string; down: string }[] = [];
 async function loadMigrations(): Promise<void> {
   const migrationFiles = await Promise.all([
     import("./migrations/001_create_streams_table.js"),
+    import("./migrations/002_create_jobs_tables.js"),
   ]);
 
   for (const mod of migrationFiles) {
@@ -58,9 +59,10 @@ export function migrate(
     .all() as { name: string }[];
   const appliedNames = new Set(appliedMigrations.map((m) => m.name));
 
-  const migrationNames = migrations.map(
-    (_, i) => `00${i + 1}_create_streams_table`,
-  );
+  const migrationNames = [
+    "001_create_streams_table",
+    "002_create_jobs_tables",
+  ];
 
   if (direction === "up") {
     // Apply pending migrations
@@ -124,6 +126,15 @@ export function getMigrationStatus(db: Database.Database): {
   pending: number;
 } {
   const total = migrations.length;
+
+  // Ensure migrations table exists
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
 
   const appliedCount = db
     .prepare("SELECT COUNT(*) as count FROM _migrations")
