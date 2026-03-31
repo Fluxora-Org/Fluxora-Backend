@@ -1,158 +1,56 @@
 /**
  * Database migration runner
  *
- * Applies migrations in order, tracking which have been applied.
- * Uses SQLite's built-in journaling for atomic commits.
+ * Uses node-pg-migrate to apply migrations to PostgreSQL.
  *
  * @module db/migrate
  */
 
-import Database from "better-sqlite3";
-import { info, warn, error as logError } from "../utils/logger.js";
-import path from "path";
-import { fileURLToPath } from "url";
+import { runner } from 'node-pg-migrate';
+import { info, error as logError } from '../utils/logger.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Import migrations - they will be executed in order by filename
-const migrations: { up: string; down: string }[] = [];
-
-async function loadMigrations(): Promise<void> {
-  const migrationFiles = await Promise.all([
-    import("./migrations/001_create_streams_table.js"),
-  ]);
-
-  for (const mod of migrationFiles) {
-    migrations.push({ up: mod.up, down: mod.down });
-  }
-}
-
-export interface MigrationResult {
-  applied: string[];
-  failed: string[];
-}
-
 /**
  * Run all pending migrations
  */
-export function migrate(
-  db: Database.Database,
-  direction: "up" | "down" = "up",
-): MigrationResult {
-  const applied: string[] = [];
-  const failed: string[] = [];
+export async function migrate(): Promise<void> {
+  const databaseUrl = process.env.DATABASE_URL;
 
-  // Ensure migrations table exists
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS _migrations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-  `);
-
-  // Get already applied migrations
-  const appliedMigrations = db
-    .prepare("SELECT name FROM _migrations ORDER BY id")
-    .all() as { name: string }[];
-  const appliedNames = new Set(appliedMigrations.map((m) => m.name));
-
-  const migrationNames = migrations.map(
-    (_, i) => `00${i + 1}_create_streams_table`,
-  );
-
-  if (direction === "up") {
-    // Apply pending migrations
-    for (let i = 0; i < migrations.length; i++) {
-      const name = migrationNames[i];
-
-      if (appliedNames.has(name)) {
-        info(`Migration ${name} already applied, skipping`);
-        continue;
-      }
-
-      try {
-        info(`Applying migration: ${name}`);
-        db.exec(migrations[i].up);
-
-        // Record successful migration
-        db.prepare("INSERT INTO _migrations (name) VALUES (?)").run(name);
-        applied.push(name);
-        info(`Successfully applied: ${name}`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        logError(`Failed to apply migration ${name}: ${message}`);
-        failed.push(name);
-        break;
-      }
-    }
-  } else {
-    // Rollback in reverse order
-    for (let i = migrations.length - 1; i >= 0; i--) {
-      const name = migrationNames[i];
-
-      if (!appliedNames.has(name)) {
-        warn(`Migration ${name} not applied, skipping rollback`);
-        continue;
-      }
-
-      try {
-        info(`Rolling back migration: ${name}`);
-        db.exec(migrations[i].down);
-        db.prepare("DELETE FROM _migrations WHERE name = ?").run(name);
-        applied.push(name);
-        info(`Successfully rolled back: ${name}`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        logError(`Failed to rollback migration ${name}: ${message}`);
-        failed.push(name);
-        break;
-      }
-    }
+  if (!databaseUrl) {
+    throw new Error('DATABASE_URL environment variable is required for migrations');
   }
 
-  return { applied, failed };
+  try {
+    info('Running database migrations...');
+
+    await runner({
+      databaseUrl,
+      dir: path.join(__dirname, '../../migrations'),
+      direction: 'up',
+      migrationsTable: 'pgmigrations',
+      count: Infinity,
+      logger: {
+        info: (msg: string) => info(msg),
+        warn: (msg: string) => info(msg), // Mapping warn to info for cleaner logs
+        error: (msg: string) => logError(msg),
+      },
+    });
+
+    info('Migrations completed successfully');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    logError(`Migration failure: ${message}`);
+    throw err;
+  }
 }
 
 /**
- * Get current migration status
+ * Initialize migrations as part of setup
  */
-export function getMigrationStatus(db: Database.Database): {
-  total: number;
-  applied: number;
-  pending: number;
-} {
-  const total = migrations.length;
-
-  const appliedCount = db
-    .prepare("SELECT COUNT(*) as count FROM _migrations")
-    .get() as { count: number };
-
-  return {
-    total,
-    applied: appliedCount.count,
-    pending: total - appliedCount.count,
-  };
-}
-
-// Auto-run migrations when module is imported
-export async function initializeMigrations(
-  db: Database.Database,
-): Promise<void> {
-  await loadMigrations();
-
-  const status = getMigrationStatus(db);
-  info("Migration status", {
-    total: status.total,
-    applied: status.applied,
-    pending: status.pending,
-  });
-
-  if (status.pending > 0) {
-    const result = migrate(db, "up");
-    if (result.failed.length > 0) {
-      throw new Error(`Migration failed: ${result.failed.join(", ")}`);
-    }
-  }
+export async function initializeMigrations(): Promise<void> {
+  await migrate();
 }

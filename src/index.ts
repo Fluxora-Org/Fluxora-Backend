@@ -1,7 +1,19 @@
-import { app } from './app.js';
-import { initializeConfig, getConfig, resetConfig } from './config/env.js';
-import { info, error } from './utils/logger.js';
+/**
+ * Fluxora Backend — server entry point.
+ *
+ * Responsibilities:
+ *  - Bind the Express app to a TCP port.
+ *  - Register OS signal handlers for graceful shutdown.
+ *
+ * Everything else (routes, middleware, app config) lives in app.ts.
+ * Shutdown logic (drain + hooks) lives in shutdown.ts.
+ */
+
+import http from 'node:http';
+import { createApp } from './app.js';
 import { gracefulShutdown } from './shutdown.js';
+import { logger } from './lib/logger.js';
+import { initializeMigrations } from './db/migrate.js';
 
 async function start() {
     try {
@@ -9,16 +21,26 @@ async function start() {
         const config = initializeConfig();
         const { port, nodeEnv, apiVersion } = config;
 
-        const server = app.listen(port, () => {
-            info(`Fluxora API v${apiVersion} started`, {
-                port,
-                env: nodeEnv,
-                pid: process.pid,
-            });
-        });
+const app = createApp();
+const server = http.createServer(app);
 
-        // Initialize graceful shutdown handler
-        gracefulShutdown(server);
+async function startServer() {
+  try {
+    // Run migrations before starting the server
+    await initializeMigrations();
+
+    server.listen(PORT, () => {
+      logger.info('Fluxora API listening', undefined, { port: PORT });
+    });
+  } catch (err) {
+    logger.error('Failed to start Fluxora API', undefined, {
+      error: err instanceof Error ? err.message : 'Unknown error',
+    });
+    process.exit(1);
+  }
+}
+
+void startServer();
 
     } catch (err) {
         error('Failed to start application', {}, err as Error);

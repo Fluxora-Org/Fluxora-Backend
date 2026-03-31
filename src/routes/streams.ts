@@ -1,15 +1,10 @@
 import { Router, Request, Response } from 'express';
 import { getStreamById } from '../db/client.js';
 import {
-  validateDecimalString,
-  validateAmountFields,
   formatFromStroops,
-  parseToStroops,
 } from '../serialization/decimal.js';
 
 import {
-  ApiError,
-  ApiErrorCode,
   notFound,
   validationError,
   conflictError,
@@ -193,7 +188,7 @@ streamsRouter.get(
 streamsRouter.post(
   '/',
   requireAuth,
-  asyncHandler(async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const { transactionHash } = req.body ?? {};
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
 
@@ -218,9 +213,9 @@ streamsRouter.post(
 
     info('Verifying on-chain stream', { transactionHash });
 
-    // Trust boundary: Verify the transaction on Stellar
     const verified = await verifyStreamOnChain(transactionHash);
 
+    const pool = getPool();
     const id = `stream-${transactionHash.slice(0, 8)}`;
     const stream: Stream = {
       id,
@@ -269,7 +264,7 @@ streamsRouter.delete(
       throw conflictError('Cannot cancel a completed stream');
     }
 
-    streams[index] = { ...stream, status: 'cancelled' };
+    await query(pool, "UPDATE streams SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [id]);
 
     recordAuditEvent('STREAM_CANCELLED', 'stream', id, (req as any).correlationId);
     info('Stream cancelled', { id });
