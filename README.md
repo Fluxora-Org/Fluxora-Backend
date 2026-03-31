@@ -370,6 +370,94 @@ curl http://localhost:3000/api/streams/<stream-id>
 - Console logs via `tsx watch` show all request activity in development
 - Future: structured JSON logging and a `/metrics` endpoint
 
+## Database Backups and Restore Runbook (Issue #52)
+
+### Service-level outcomes
+- The backend guarantees a durable, restorable view of chain-derived state using PostgreSQL custom-format dumps.
+- Backup operations execute without halting read/write API availability.
+- Restore operations execute with a `--clean` flag, guaranteeing the database state exactly matches the backup snapshot, avoiding partial data overlaps.
+
+### Trust boundaries
+| Actor | Allowed | Not allowed |
+|-------|---------|-------------|
+| Public internet clients | No access | Cannot trigger, view, or detect backup/restore operations. |
+| Authenticated partners | No access | Cannot trigger or download backups. |
+| Internal workers (Cron) | Execute `backupDatabase` routine securely using local FS | Cannot execute restores or drop tables directly. |
+| Administrators / operators | Execute `restoreDatabase` during incident response, download dumps from cold storage | Leaving unencrypted dumps on public web servers. |
+
+### Failure modes and expected behavior
+
+| Condition | Expected result | System Behavior |
+|-----------|-----------------|-----------------|
+| `DATABASE_URL` missing or malformed | Immediate failure before subprocess spawns | `success: false` returned, no partial files created. |
+| DB credentials invalid/revoked | Subprocess fails with authentication error | Returns `Backup failed` with `stderr` detail for logs. |
+| Disk out of space during backup | `pg_dump` panics mid-stream | Incomplete file remains; operation returns error. Operators must monitor FS capacity. |
+| Corrupted or invalid dump file provided to restore | `pg_restore` rejects the archive format | Returns `Restore failed`. Database state remains unchanged (clean drop does not execute). |
+
+### Operator observability and diagnostics
+Operators can diagnose backup/restore health without relying on tribal knowledge:
+- **Routine Backups:** The backup routine outputs structured JSON containing `{ success: boolean, message: string, error?: string }`.
+- **Triage Flow (Backup Failure):**
+  1. Check disk space on the volume mapped to the output path.
+  2. Verify `DATABASE_URL` validity using `psql`.
+  3. Check the `error` string in the logs for `pg_dump` specific stderr (e.g., `FATAL: connection limit exceeded`).
+- **Triage Flow (Restore Failure):**
+  1. Ensure the target DB has active connections terminated before running a `--clean` restore.
+  2. Verify the input file was generated using custom format (`-F c`), as plain SQL dumps will fail `pg_restore`.
+
+### Verification evidence
+Automated unit tests (`tests/db-ops.test.ts`) assert the boundaries of the `pg_dump` and `pg_restore` wrappers, including credential failures and missing configurations. 
+
+### Non-goals and follow-up tracking
+- **Intentionally deferred:** Automated scheduling (e.g., node-cron) is deferred until persistent volume claims (PVCs) or S3 streaming targets are provisioned in the deployment orchestration.
+- **Follow-up:** Add an S3 upload stream integration so dumps don't remain local to the container filesystem.
+
+## GET /api/streams/:id backed by database (Issue #15)
+
+### Service-level outcomes
+- The `/api/streams/:id` endpoint provides a durable, highly available read path for chain-derived stream state.
+- Values returned respect the Decimal String Serialization Policy to prevent precision loss.
+
+### Trust boundaries
+| Actor | Allowed | Not allowed |
+|-------|---------|-------------|
+| Public internet clients | Can query any known stream ID and receive normalized JSON. | Cannot modify stream state or execute unbounded DB queries (e.g., table scans). |
+| Internal workers / Indexer | Trusted to write accurate chain-derived data to the underlying `streams` table. | — |
+| Administrators / Operators | Monitor DB latency and connection pool health. | — |
+
+### Failure modes and client-visible behavior
+| Condition | Expected result | System Behavior |
+|-----------|-----------------|-----------------|
+| Valid stream ID exists | `200 OK` | Returns JSON payload with decimal strings. |
+| Stream ID does not exist | `404 Not Found` | Returns `{"error": "NOT_FOUND"}`. No DB locks held. |
+| Database connection drops | `503 Service Unavailable` | Returns `{"error": "SERVICE_UNAVAILABLE"}`. Logs the underlying `pg` error for operator triage. |
+
+### Operator observability and diagnostics
+- **Health Checks:** A `503` from this endpoint indicates pool exhaustion, network partition, or DB credentials failure. Cross-reference with `GET /health`.
+- **Diagnostics:** Look for `[GET /api/streams/:id] Database error:` in standard out. This will contain the raw `pg` driver stack trace.
+
+## GET /api/streams filters: status, recipient, sender (Issue #14)
+
+### Service-level outcomes
+- Integrators and finance reviewers can deterministically filter the stream index by `status`, `sender`, and `recipient` addresses.
+- Filtering is applied prior to cursor-based pagination to guarantee consistent, traversable result sets.
+
+### Trust boundaries
+| Actor | Allowed | Not allowed |
+|-------|---------|-------------|
+| Public internet clients | Can filter public streams by valid addresses and statuses. | Cannot bypass pagination limits or execute wildcard/regex searches. |
+| Internal workers / Operators | Full access to filter across all streams for reconciliation. | — |
+
+### Failure modes and client-visible behavior
+| Condition | Expected result | System Behavior |
+|-----------|-----------------|-----------------|
+| Invalid Stellar Address Format | `400 Bad Request` | Fails fast with `VALIDATION_ERROR` indicating exactly which field failed the Regex check. |
+| Invalid Status Enum | `400 Bad Request` | Rejects unknown statuses (e.g., `pending`) to prevent cache poisoning or DB errors. |
+| Valid filters match no records | `200 OK` | Returns an empty `streams: []` array, not a 404, preserving API list semantics. |
+
+### Operator observability and diagnostics
+- Filter parameters are logged alongside `requestId` to help diagnose user reports of "missing streams" (usually caused by a typo in the recipient query).
+
 ## API overview
 
 | Method | Path | Description |
