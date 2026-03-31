@@ -12,7 +12,7 @@
  * and edge cases in the HTTP API.
  */
 
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, beforeEach } from 'vitest';
 
 // Mock implementations of helpers from streams.ts
 // In real scenario, these would be imported from src/routes/streams.ts

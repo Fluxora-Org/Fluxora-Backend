@@ -1,6 +1,6 @@
 export interface LogContext {
-  requestId?: string;
-  correlationId?: string;
+  requestId?: string | undefined;
+  correlationId?: string | undefined;
   [key: string]: unknown;
 }
 

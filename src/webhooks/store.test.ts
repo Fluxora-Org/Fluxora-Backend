@@ -110,7 +110,7 @@ test('WebhookDeliveryStore: gets pending retries', () => {
   const retries = store.getPendingRetries(now);
 
   assert.equal(retries.length, 1);
-  assert.equal(retries[0].id, 'delivery_1');
+  assert.equal(retries[0]?.id, 'delivery_1');
 });
 
 test('WebhookDeliveryStore: gets deliveries by event ID', () => {

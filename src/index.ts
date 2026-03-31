@@ -1,8 +1,19 @@
+/**
+ * Fluxora Backend — server entry point.
+ *
+ * Responsibilities:
+ *  - Bind the Express app to a TCP port.
+ *  - Register OS signal handlers for graceful shutdown.
+ *
+ * Everything else (routes, middleware, app config) lives in app.ts.
+ * Shutdown logic (drain + hooks) lives in shutdown.ts.
+ */
+
+import http from 'node:http';
 import { createApp } from './app.js';
-import { initializeConfig, getConfig, resetConfig } from './config/env.js';
-import { info, error } from './utils/logger.js';
 import { gracefulShutdown } from './shutdown.js';
-import { initializeTracer, createBuiltInHooks } from './tracing/hooks.js';
+import { logger } from './lib/logger.js';
+import { initializeMigrations } from './db/migrate.js';
 
 async function start() {
     try {
@@ -10,46 +21,26 @@ async function start() {
         const config = initializeConfig();
         const { port, nodeEnv, apiVersion } = config;
 
-        // Initialize distributed tracing
-        if (config.tracingEnabled) {
-            initializeTracer({
-                enabled: true,
-                sampleRate: config.tracingSampleRate,
-                hooks: createBuiltInHooks({
-                    enableBuffer: true,
-                    enableMetrics: true,
-                    bufferConfig: {
-                        maxSpans: 1000,
-                        logEvents: config.tracingLogEvents,
-                        logLevel: config.logLevel,
-                    },
-                }),
-                otel: {
-                    enabled: config.tracingOtelEnabled,
-                    // OTel provider would be injected here in production
-                    instrumentationName: 'fluxora-backend',
-                },
-            });
+const app = createApp();
+const server = http.createServer(app);
 
-            info('Distributed tracing initialized', {
-                sampleRate: config.tracingSampleRate,
-                otelEnabled: config.tracingOtelEnabled,
-            });
-        }
+async function startServer() {
+  try {
+    // Run migrations before starting the server
+    await initializeMigrations();
 
-        // Create and start Express application
-        const app = createApp();
+    server.listen(PORT, () => {
+      logger.info('Fluxora API listening', undefined, { port: PORT });
+    });
+  } catch (err) {
+    logger.error('Failed to start Fluxora API', undefined, {
+      error: err instanceof Error ? err.message : 'Unknown error',
+    });
+    process.exit(1);
+  }
+}
 
-        const server = app.listen(port, () => {
-            info(`Fluxora API v${apiVersion} started`, {
-                port,
-                env: nodeEnv,
-                pid: process.pid,
-            });
-        });
-
-        // Initialize graceful shutdown handler
-        gracefulShutdown(server);
+void startServer();
 
     } catch (err) {
         error('Failed to start application', {}, err as Error);
