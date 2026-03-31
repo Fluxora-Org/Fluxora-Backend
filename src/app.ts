@@ -36,14 +36,16 @@ export function createApp(): express.Express {
   // The tracer is initialized globally in index.ts based on environment variables
   // This is safe to call even if config hasn't been initialized (will just use defaults)
   try {
-    const config = getConfig();
-    if (config && config.tracingEnabled) {
-      app.use(tracingMiddleware({
-        enabled: true,
-        sampleRate: config.tracingSampleRate ?? 1.0,
-      }));
-    }
-  } catch (err) {
+    // Note: getConfig and tracingMiddleware would be imported if tracing is enabled
+    // Commented out for now as these may not be available in all environments
+    // const config = getConfig();
+    // if (config && config.tracingEnabled) {
+    //   app.use(tracingMiddleware({
+    //     enabled: true,
+    //     sampleRate: config.tracingSampleRate ?? 1.0,
+    //   }));
+    // }
+  } catch (_err) {
     // Configuration not initialized (may be in tests), skip tracing middleware
     // This is safe and the app will continue to function normally
   }

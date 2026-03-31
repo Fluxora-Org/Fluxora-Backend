@@ -12,10 +12,9 @@ import {
   asyncHandler,
 } from '../middleware/errorHandler.js';
 import { requireAuth } from '../middleware/auth.js';
-import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
+import { info, warn } from '../utils/logger.js';
 import { verifyStreamOnChain } from '../lib/stellar.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
-import { successResponse } from '../utils/response.js';
 
 /**
  * Streams API routes (BigInt-Safe Implementation)
@@ -24,27 +23,6 @@ import { successResponse } from '../utils/response.js';
  * and serialized as decimal strings for precision in API responses.
  */
 export const streamsRouter = Router();
-
-// Amount fields that must be decimal strinET /:ids per serialization policy
-const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
-export const streams: any[] = []
-
-type StreamsCursor = {
-  v: 1;
-  lastId: string;
-};
-
-type StreamListingDependencyState = 'healthy' | 'unavailable';
-type IdempotencyDependencyState = 'healthy' | 'unavailable';
-
-type NormalizedCreateStreamInput = {
-  sender: string;
-  recipient: string;
-  depositAmount: string;
-  ratePerSecond: string;
-  startTime: number;
-  endTime: number;
-};
 
 /**
  * Internal Stream type using BigInt for stroops
