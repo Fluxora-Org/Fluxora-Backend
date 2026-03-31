@@ -209,6 +209,49 @@ if (!verification.ok) {
 - structured JSON logs are expected for diagnostics
 - if `indexer.status = "stalled"`, treat that as an operational signal that chain-derived views would be stale if the real indexer were enabled in this service
 
+## Security headers: helmet middleware
+
+### Service-level outcomes
+
+- every HTTP response carries a predictable baseline of browser-facing security headers
+- the service does not advertise Express internals through the `X-Powered-By` header
+- operators can verify the header policy with a simple `GET /health` or `GET /` check during rollout and incident response
+- failures in downstream dependencies do not disable the security-header baseline because the middleware is applied before route handling
+
+### Trust boundaries
+
+| Actor | May do | May not do |
+|-------|--------|------------|
+| Public internet clients | Call public routes and observe the documented response headers | Weaken or negotiate a lower security-header policy |
+| Authenticated partners | Use partner/admin routes once enabled and receive the same baseline headers | Bypass the default browser-hardening behavior |
+| Administrators / operators | Verify header presence through health checks, logs, and smoke tests | Treat the presence of headers as a substitute for auth, input validation, or TLS termination controls |
+| Internal workers | Reach internal HTTP surfaces through the same Express stack when applicable | Disable header emission on a per-worker basis |
+
+### Failure modes and expected behavior
+
+| Condition | Expected behavior |
+|-----------|-------------------|
+| Invalid input or route error | Return the normal error status/body and still emit the security headers |
+| Dependency outage | `/health` may report degraded or unavailable state, but the header baseline remains present on the HTTP response |
+| Partial data or missing resources | Client receives the documented `404`/`409`/`5xx` behavior with the same header policy intact |
+| Duplicate delivery or replayed request | Business logic decides `200`/`409` behavior; the security headers are unchanged because they are orthogonal to idempotency |
+
+### Operator observability and diagnostics
+
+- smoke check with `curl -I http://127.0.0.1:3000/health` and confirm `content-security-policy`, `strict-transport-security`, `x-content-type-options`, and `x-frame-options`
+- use structured request logs and request IDs to correlate header checks with the request path under investigation
+- if a proxy or CDN strips headers, compare direct-app responses with edge responses to identify where the policy is being altered
+
+### Verification evidence
+
+- automated regression coverage lives in `tests/helmet.test.ts`
+- manual verification: `curl -I http://127.0.0.1:3000/` and `curl -I http://127.0.0.1:3000/health`
+
+### Non-goals and audit notes
+
+- this issue adds baseline browser-facing security headers only; it does not replace TLS, authentication, authorization, rate limiting, or CSP tuning for a future browser UI
+- residual risk: intermediaries can still overwrite or strip headers, so production verification should include at least one edge-facing probe
+
 ## Local setup
 
 ### Prerequisites
