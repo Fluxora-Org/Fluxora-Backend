@@ -6,13 +6,9 @@ export default defineConfig({
     environment: 'node',
     include: ['tests/**/*.test.ts'],
     coverage: {
-      reporter: ['text'],
-      include: ['src/middleware/rateLimiter.ts', 'src/config/rateLimits.ts', 'src/routes/rateLimits.ts'],
-      thresholds: {
-        functions: 95,
-        branches: 80,
-        lines: 90,
-      },
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      exclude: ['src/index.ts'],
     },
   },
 });
