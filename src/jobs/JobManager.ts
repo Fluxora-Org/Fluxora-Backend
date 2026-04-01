@@ -571,7 +571,7 @@ export class JobManager {
       // Transition to PENDING state
       this.updateJobState(
         jobId,
-        { state: "PENDING", error_message: null, error_code: null },
+        { state: "PENDING", error_message: undefined, error_code: undefined },
         "Job queued for retry",
       );
     });

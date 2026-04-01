@@ -185,7 +185,7 @@ export class RetryEngine {
 
     // Check for HTTP status codes in error message
     const statusCodeMatch = errorMessage.match(/\b(4\d{2}|5\d{2})\b/);
-    if (statusCodeMatch) {
+    if (statusCodeMatch && statusCodeMatch[1]) {
       const statusCode = parseInt(statusCodeMatch[1], 10);
 
       // Transient HTTP status codes

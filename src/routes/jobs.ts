@@ -62,12 +62,12 @@ function isValidPriority(priority: string): priority is JobPriority {
  */
 jobsRouter.post(
   "/",
-  asyncHandler(async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const correlationId = req.correlationId;
     const user = req.user!; // requireAuth ensures user is present
 
     info("Job submission request received", {
-      userId: user.address,
+      userId: user.address!,
       ...(correlationId && { correlationId }),
     });
 
@@ -128,11 +128,11 @@ jobsRouter.post(
 
     try {
       // Check rate limits before creating job
-      const rateLimitResult = rateLimiter.checkRateLimit(user.address, jobType);
+      const rateLimitResult = rateLimiter.checkRateLimit(user.address!, jobType);
 
       if (!rateLimitResult.allowed) {
         warn("Rate limit exceeded", {
-          userId: user.address,
+          userId: user.address!,
           jobType,
           reason: rateLimitResult.reason,
           retryAfter: rateLimitResult.retryAfter,
@@ -185,7 +185,7 @@ jobsRouter.post(
 
       // Create job input
       const jobInput: CreateJobInput = {
-        user_id: user.address,
+        user_id: user.address!,
         job_type: jobType,
         priority: priority,
         payload: payload,
@@ -275,12 +275,12 @@ jobsRouter.get(
 
       // Authorization check: users can only see their own jobs, admins can see all
       const isAdmin = user.role === "admin";
-      const isOwner = job.user_id === user.address;
+      const isOwner = job.user_id === user.address!;
 
       if (!isAdmin && !isOwner) {
         warn("Unauthorized job access attempt", {
           jobId,
-          userId: user.address,
+          userId: user.address!,
           jobOwnerId: job.user_id,
           ...(correlationId && { correlationId }),
         });
@@ -568,7 +568,7 @@ jobsRouter.delete(
 
     info("Job cancellation request received", {
       jobId,
-      userId: user.address,
+      userId: user.address!,
       ...(correlationId && { correlationId }),
     });
 
@@ -587,12 +587,12 @@ jobsRouter.delete(
 
       // Authorization check: users can only cancel their own jobs, admins can cancel all
       const isAdmin = user.role === "admin";
-      const isOwner = job.user_id === user.address;
+      const isOwner = job.user_id === user.address!;
 
       if (!isAdmin && !isOwner) {
         warn("Unauthorized job cancellation attempt", {
           jobId,
-          userId: user.address,
+          userId: user.address!,
           jobOwnerId: job.user_id,
           ...(correlationId && { correlationId }),
         });
@@ -609,7 +609,7 @@ jobsRouter.delete(
 
       info("Job cancelled successfully", {
         jobId,
-        userId: user.address,
+        userId: user.address!,
         ...(correlationId && { correlationId }),
       });
 
@@ -667,7 +667,7 @@ jobsRouter.post(
 
     info("Job retry request received", {
       jobId,
-      userId: user.address,
+      userId: user.address!,
       ...(correlationId && { correlationId }),
     });
 
@@ -707,12 +707,12 @@ jobsRouter.post(
 
       // Authorization check: users can only retry their own jobs, admins can retry all
       const isAdmin = user.role === "admin";
-      const isOwner = job.user_id === user.address;
+      const isOwner = job.user_id === user.address!;
 
       if (!isAdmin && !isOwner) {
         warn("Unauthorized job retry attempt", {
           jobId,
-          userId: user.address,
+          userId: user.address!,
           jobOwnerId: job.user_id,
           ...(correlationId && { correlationId }),
         });
