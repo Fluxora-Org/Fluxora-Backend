@@ -11,25 +11,14 @@ import express from 'express';
 import request from 'supertest';
 
 // Import the streams router directly - we'll need to export the streams array for testing
-import {
-  streamsRouter,
-  streams,
-  setStreamListingDependencyState,
-  setIdempotencyDependencyState,
-  resetStreamIdempotencyStore,
-} from '../src/routes/streams.js';
+import { streamsRouter } from '../src/routes/streams.js';
 import { errorHandler } from '../src/middleware/errorHandler.js';
 import { requestIdMiddleware } from '../src/errors.js';
 import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
 import { generateToken } from '../src/lib/auth.js';
 import { authenticate } from '../src/middleware/auth.js';
 import { initializeConfig } from '../src/config/env.js';
-
-// Initialize config before any test module code runs (upstream requirement)
-initializeConfig();
-import { generateToken } from '../src/lib/auth.js';
-import { authenticate } from '../src/middleware/auth.js';
-import { initializeConfig } from '../src/config/env.js';
+import { streams, setStreamListingDependencyState, setIdempotencyDependencyState, resetStreamIdempotencyStore } from '../src/routes/streams.js';
 
 // Initialize config before any test module code runs (upstream requirement)
 initializeConfig();
@@ -37,10 +26,9 @@ initializeConfig();
 // Create a minimal test app
 function createTestApp() {
   const app = express();
-  app.use(requestIdMiddleware);
   app.use(correlationIdMiddleware);
+  app.use(requestIdMiddleware);
   app.use(express.json());
-  app.use(authenticate);
   app.use(authenticate);
   app.use('/api/streams', streamsRouter);
   app.use(errorHandler);
@@ -90,10 +78,11 @@ describe('Streams API - Decimal String Serialization', () => {
       expect(response.body.error.code).toBe('VALIDATION_ERROR');
       expect(response.body.error.message).toContain('Idempotency-Key');
     });
-
     describe('valid decimal string inputs', () => {
       it('should create stream with valid decimal strings', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '1000000.0000000',
@@ -108,7 +97,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should create stream with integer amounts', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '100',
@@ -169,9 +160,10 @@ describe('Streams API - Decimal String Serialization', () => {
 
         expect(response.body.error.code).toBe('SERVICE_UNAVAILABLE');
       });
-
       it('should create stream with negative rate rejected', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '100',
@@ -183,7 +175,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should create stream with zero deposit rejected', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '0',
@@ -197,7 +191,9 @@ describe('Streams API - Decimal String Serialization', () => {
 
     describe('invalid decimal string inputs', () => {
       it('should reject numeric depositAmount', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: 1000000,
@@ -210,7 +206,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should reject numeric ratePerSecond', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '1000000',
@@ -222,7 +220,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should reject empty depositAmount', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '',
@@ -234,7 +234,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should reject invalid format depositAmount', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: 'invalid',
@@ -247,7 +249,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should reject scientific notation', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '1e10',
@@ -259,7 +263,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should reject NaN', async () => {
-        await postStream(app, {
+        await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: 'NaN',
@@ -271,7 +277,9 @@ describe('Streams API - Decimal String Serialization', () => {
 
     describe('missing required fields', () => {
       it('should reject missing sender', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '100',
             ratePerSecond: '1',
@@ -282,7 +290,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should reject missing recipient', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '100',
             ratePerSecond: '1',
@@ -293,7 +303,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should accept missing depositAmount (uses default)', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             ratePerSecond: '1',
@@ -305,7 +317,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should accept missing ratePerSecond (uses default)', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '100',
@@ -319,7 +333,9 @@ describe('Streams API - Decimal String Serialization', () => {
 
     describe('invalid startTime', () => {
       it('should reject non-integer startTime', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '100',
@@ -332,7 +348,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should reject negative startTime', async () => {
-        await postStream(app, {
+        await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: '100',
@@ -359,7 +377,9 @@ describe('Streams API - Decimal String Serialization', () => {
       });
 
       it('should include error details for validation errors', async () => {
-        const response = await postStream(app, {
+        const response = await request(app)
+          .post('/api/streams')
+          .send({
             sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
             recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
             depositAmount: 'invalid',
@@ -401,8 +421,7 @@ describe('Streams API - Decimal String Serialization', () => {
         await postStream(app, stream).expect(201);
       }
     });
-
-    it('should return streams array with pagination metadata', async () => {
+    it('should return streams array with count', async () => {
       const response = await request(app)
         .get('/api/streams')
         .expect(200);
@@ -586,7 +605,7 @@ describe('Streams API - Decimal String Serialization', () => {
 });
 
 describe('Error Handler Integration', () => {
-  let app: any;
+  let app: ReturnType<typeof express>;
 
   beforeEach(() => {
     app = createTestApp();

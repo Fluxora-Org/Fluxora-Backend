@@ -17,6 +17,24 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
 
   debug('Authentication middleware triggered', { hasAuthHeader: !!authHeader, requestId });
 
+  if (apiKey) {
+    if (isValidApiKey(apiKey)) {
+      req.user = { address: 'system', role: 'service' } as any;
+      info('Service authenticated via API Key', { requestId });
+      return next();
+    }
+    
+    warn('Invalid API Key provided', { requestId });
+    res.status(401).json({
+      error: {
+        code: ApiErrorCode.UNAUTHORIZED,
+        message: 'Invalid API Key',
+        requestId,
+      },
+    });
+    return;
+  }
+
   if (!authHeader) {
     // No credentials — proceed as anonymous
     return next();

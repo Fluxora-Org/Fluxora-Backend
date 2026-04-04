@@ -3,6 +3,8 @@ import type { Express, Request, Response, NextFunction } from 'express';
 import { streamsRouter } from './routes/streams.js';
 import { healthRouter } from './routes/health.js';
 import { indexerRouter } from './routes/indexer.js';
+import { jobsRouter } from './routes/jobs.js';
+import { privacyHeaders, requestLogger, safeErrorHandler } from './middleware/pii.js';
 import { auditRouter } from './routes/audit.js';
 import { dlqRouter } from './routes/dlq.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
@@ -23,6 +25,27 @@ export function createApp(options: AppOptions = {}): Express {
   // Correlation ID must be first so all subsequent middleware/routes have req.correlationId.
   app.use(correlationIdMiddleware);
   app.use(corsAllowlistMiddleware);
+  app.use(privacyHeaders);
+
+  // Distributed tracing middleware (optional, enabled via env config)
+  // The tracer is initialized globally in index.ts based on environment variables
+  // This is safe to call even if config hasn't been initialized (will just use defaults)
+  try {
+    // Note: getConfig and tracingMiddleware would be imported if tracing is enabled
+    // Commented out for now as these may not be available in all environments
+    // const config = getConfig();
+    // if (config && config.tracingEnabled) {
+    //   app.use(tracingMiddleware({
+    //     enabled: true,
+    //     sampleRate: config.tracingSampleRate ?? 1.0,
+    //   }));
+    // }
+  } catch (_err) {
+    // Configuration not initialized (may be in tests), skip tracing middleware
+    // This is safe and the app will continue to function normally
+  }
+
+  app.use(requestLogger);
   app.use(requestLoggerMiddleware);
 
   // During shutdown, tell clients to close the connection so keep-alive
@@ -43,6 +66,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/health', healthRouter);
   app.use('/api/streams', streamsRouter);
   app.use('/internal/indexer', indexerRouter);
+  app.use('/api/jobs', jobsRouter);
   app.use('/api/audit', auditRouter);
   app.use('/admin/dlq', dlqRouter);
 

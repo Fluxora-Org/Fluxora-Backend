@@ -107,13 +107,18 @@ import {
   serviceUnavailable,
   asyncHandler,
 } from '../middleware/errorHandler.js';
+import { requireAuth } from '../middleware/auth.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
+import { verifyStreamOnChain } from '../lib/stellar.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 
 export const streamsRouter = Router();
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+/**
+ * Internal Stream type using BigInt for stroops
+ */
 export interface Stream {
   id: string;
   sender: string;
