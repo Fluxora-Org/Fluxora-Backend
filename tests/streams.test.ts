@@ -13,7 +13,7 @@ import request from 'supertest';
 // Import the streams router directly - we'll need to export the streams array for testing
 import { streamsRouter } from '../src/routes/streams.js';
 import { errorHandler } from '../src/middleware/errorHandler.js';
-import { requestIdMiddleware } from '../src/utils/logger.js';
+import { requestIdMiddleware } from '../src/errors.js';
 import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
 import { generateToken } from '../src/lib/auth.js';
 import { authenticate } from '../src/middleware/auth.js';
@@ -394,6 +394,33 @@ describe('Streams API - Decimal String Serialization', () => {
   });
 
   describe('GET /api/streams', () => {
+    beforeEach(async () => {
+      // Create some test streams for pagination testing
+      const testStreams = [
+        {
+          sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
+          recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
+          depositAmount: '1000.0000000',
+          ratePerSecond: '0.0000116',
+        },
+        {
+          sender: 'GCSX3XXXXXXXXXXXXXXXXXXXXXXX',
+          recipient: 'GDRX3XXXXXXXXXXXXXXXXXXXXXXX',
+          depositAmount: '2000.0000000',
+          ratePerSecond: '0.0000232',
+        },
+        {
+          sender: 'GCSX4XXXXXXXXXXXXXXXXXXXXXXX',
+          recipient: 'GDRX4XXXXXXXXXXXXXXXXXXXXXXX',
+          depositAmount: '3000.0000000',
+          ratePerSecond: '0.0000348',
+        },
+      ];
+
+      for (const stream of testStreams) {
+        await postStream(app, stream).expect(201);
+      }
+    });
     it('should return streams array with count', async () => {
       const response = await request(app)
         .get('/api/streams')

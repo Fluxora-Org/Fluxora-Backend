@@ -5,9 +5,6 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs",
-    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --coverage",
-    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.cjs --watch",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "lint": "eslint . --ext .ts,.js",
