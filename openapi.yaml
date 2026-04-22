@@ -93,6 +93,98 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/auth/session:
+    post:
+      summary: Create authentication session
+      operationId: createSession
+      tags:
+        - Auth
+      description: |
+        Issues a JWT token for authenticated access to privileged endpoints.
+        In this iteration, any valid Stellar address can obtain a session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - address
+              properties:
+                address:
+                  type: string
+                  description: Stellar public key
+                  pattern: '^G[A-Z2-7]{55}$'
+                  example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
+                role:
+                  type: string
+                  enum: [operator, viewer]
+                  default: viewer
+                  description: User role for authorization
+      responses:
+        '200':
+          description: Session created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: JWT token for authentication
+                    example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  user:
+                    type: object
+                    properties:
+                      address:
+                        type: string
+                        example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
+                      role:
+                        type: string
+                        example: operator
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/status:
+    get:
+      summary: Get admin status
+      operationId: getAdminStatus
+      tags:
+        - Admin
+      security:
+        - AdminAuth: []
+      description: |
+        Returns current pause flags and reindex state.
+        Requires admin authentication via ADMIN_API_KEY.
+      responses:
+        '200':
+          description: Admin status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pauseFlags:
+                    type: object
+                  reindex:
+                    type: object
+        '401':
+          description: Missing or invalid admin credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Admin API not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/streams:
     post:
       summary: Create a new stream
@@ -253,6 +345,54 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      summary: Cancel a stream
+      operationId: cancelStream
+      tags:
+        - Streams
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: streamId
+          in: path
+          required: true
+          description: Stream identifier
+          schema:
+            type: string
+            pattern: '^stream-\d+$'
+      responses:
+        '200':
+          description: Stream cancelled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Stream cancelled
+                  id:
+                    type: string
+                    example: stream-1704067200
+        '401':
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Stream already cancelled or completed
           content:
             application/json:
               schema:
@@ -499,11 +639,22 @@ components:
       description: |
         JWT token for authentication. Include in Authorization header:
         Authorization: Bearer <token>
+    AdminAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Admin API key for privileged operations. Include in Authorization header:
+        Authorization: Bearer <ADMIN_API_KEY>
+        Set via ADMIN_API_KEY environment variable.
 
 tags:
   - name: System
     description: System health and metadata endpoints
+  - name: Auth
+    description: Authentication and session management
   - name: Streams
     description: Stream creation, retrieval, and listing
+  - name: Admin
+    description: Administrative endpoints for operators
   - name: Internal
     description: Internal endpoints for workers and administrators
