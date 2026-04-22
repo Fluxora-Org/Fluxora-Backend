@@ -109,6 +109,8 @@ import {
 } from '../middleware/errorHandler.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
+import { assertValidApiTransition } from '../streams/status.js';
+import type { ApiStreamStatus } from '../streams/status.js';
 
 export const streamsRouter = Router();
 
@@ -448,11 +450,9 @@ streamsRouter.delete(
     const stream = streams[index];
     if (stream === undefined) throw notFound('Stream', id);
 
-    if (stream.status === 'cancelled') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Stream is already cancelled', 409, { streamId: id });
-    }
-    if (stream.status === 'completed') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Cannot cancel a completed stream', 409, { streamId: id });
+    const guard = assertValidApiTransition(stream.status as ApiStreamStatus, 'cancelled');
+    if (!guard.ok) {
+      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, { streamId: id, currentStatus: stream.status });
     }
 
     streams[index] = { ...stream, status: 'cancelled' };
@@ -460,5 +460,45 @@ streamsRouter.delete(
     recordAuditEvent('STREAM_CANCELLED', 'stream', id as string, (req as any).correlationId);
 
     res.json({ message: 'Stream cancelled', id });
+  }),
+);
+
+/**
+ * PATCH /api/streams/:id/status
+ * Transition a stream to a new status.
+ *
+ * Body: { "status": "paused" | "active" | "completed" | "cancelled" }
+ *
+ * Returns 409 CONFLICT when the transition is not permitted by the state machine.
+ */
+streamsRouter.patch(
+  '/:id/status',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { id }    = req.params;
+    const requestId = (req as any).id as string | undefined;
+    const { status: newStatus } = req.body ?? {};
+
+    if (typeof newStatus !== 'string' || !['scheduled', 'active', 'paused', 'completed', 'cancelled'].includes(newStatus)) {
+      throw validationError('status must be one of: scheduled, active, paused, completed, cancelled');
+    }
+
+    const index = streams.findIndex((s) => s.id === id);
+    if (index === -1) throw notFound('Stream', id);
+
+    const stream = streams[index]!;
+    const guard = assertValidApiTransition(stream.status as ApiStreamStatus, newStatus as ApiStreamStatus);
+    if (!guard.ok) {
+      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+        streamId: id,
+        currentStatus: stream.status,
+        requestedStatus: newStatus,
+      });
+    }
+
+    streams[index] = { ...stream, status: newStatus };
+    info('Stream status updated', { id, from: stream.status, to: newStatus, requestId });
+    recordAuditEvent('STREAM_STATUS_UPDATED', 'stream', id as string, (req as any).correlationId);
+
+    res.json({ ...streams[index] });
   }),
 );
