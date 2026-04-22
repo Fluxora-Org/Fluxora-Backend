@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { info, error } from '../utils/logger.js';
+import { isLedgerRolledBack } from '../indexer/service.js';
 
 export interface WebhookOptions {
   url: string;
@@ -7,14 +8,25 @@ export interface WebhookOptions {
   event: string;
   payload: any;
   retryCount?: number;
+  /** Ledger this event originated from — used to suppress rolled-back events. */
+  ledger?: number;
 }
 
 /**
  * Dispatches a webhook notification with HMAC-SHA256 signature.
+ * Skips dispatch if the originating ledger was rolled back due to a reorg.
  * Implements exponential backoff for 5xx errors.
  */
 export async function dispatchWebhook(options: WebhookOptions): Promise<void> {
-  const { url, secret, event, payload, retryCount = 0 } = options;
+  const { url, secret, event, payload, retryCount = 0, ledger } = options;
+
+  // Suppress events from rolled-back ledgers to prevent duplicate delivery
+  // after a chain reorg.
+  if (ledger !== undefined && isLedgerRolledBack(ledger)) {
+    info('Webhook suppressed: ledger was rolled back', { url, event, ledger });
+    return;
+  }
+
   const timestamp = Math.floor(Date.now() / 1000);
   const signaturePayload = `${timestamp}.${event}.${JSON.stringify(payload)}`;
   const signature = crypto.createHmac('sha256', secret).update(signaturePayload).digest('hex');
@@ -32,7 +44,7 @@ export async function dispatchWebhook(options: WebhookOptions): Promise<void> {
       method: 'POST',
       headers,
       body: JSON.stringify({ event, timestamp, payload }),
-      signal: AbortSignal.timeout(10000), // 10s timeout
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) {

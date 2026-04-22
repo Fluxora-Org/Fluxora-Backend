@@ -19,6 +19,7 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage } from 'http';
 import type { Server } from 'http';
+import { isLedgerRolledBack } from '../indexer/service.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -41,6 +42,8 @@ export interface StreamUpdateEvent {
   /** Unique event identifier used for deduplication. */
   eventId: string;
   payload: unknown;
+  /** Ledger this event originated from — used to suppress rolled-back events. */
+  ledger?: number;
 }
 
 interface ClientState {
@@ -224,7 +227,13 @@ export class StreamHub {
    * the RPC layer replays events.
    */
   broadcast(event: StreamUpdateEvent): void {
-    const { streamId, eventId, payload } = event;
+    const { streamId, eventId, payload, ledger } = event;
+
+    // Suppress events from rolled-back ledgers to prevent duplicate WS delivery
+    // after a chain reorg.
+    if (ledger !== undefined && isLedgerRolledBack(ledger)) {
+      return;
+    }
 
     if (this.dedup.has(streamId, eventId)) {
       return; // already delivered
