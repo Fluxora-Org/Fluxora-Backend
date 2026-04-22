@@ -15,37 +15,32 @@
  * - 200 DELETE (acknowledge) entry
  * - 400 for invalid pagination params
  */
-import express from 'express';
-import request from 'supertest';
-import { dlqRouter, enqueueDeadLetter, _resetDlq } from '../src/routes/dlq.js';
-import { errorHandler } from '../src/middleware/errorHandler.js';
-import { requestIdMiddleware } from '../src/errors.js';
-import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
-import { generateToken } from '../src/lib/auth.js';
-import { initializeConfig } from '../src/config/env.js';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { webhookDeliveryStore } from '../src/webhooks/store.js';
+import { webhookService } from '../src/webhooks/service.js';
+import type { WebhookDelivery, WebhookEvent } from '../src/webhooks/types.js';
 
-// Initialize config before any test module code runs (upstream requirement)
-initializeConfig();
+// Mock fetch for testing
+const originalFetch = global.fetch;
+let mockFetchResponses: Map<string, Response> = new Map();
 
-function createTestApp() {
-  const app = express();
-  app.use(requestIdMiddleware);
-  app.use(correlationIdMiddleware);
-  app.use(express.json());
-  app.use('/admin/dlq', dlqRouter);
-  app.use(errorHandler);
-  return app;
+function mockFetch(url: string, options?: RequestInit): Promise<Response> {
+  const response = mockFetchResponses.get(url);
+  if (response) {
+    return Promise.resolve(response.clone());
+  }
+  return Promise.reject(new Error(`No mock response for ${url}`));
 }
 
-const operatorToken = generateToken({ address: 'GADMIN', role: 'operator' });
-const viewerToken   = generateToken({ address: 'GVIEWER', role: 'viewer' });
-
-describe('DLQ Admin API', () => {
-  let app: any;
-
+describe('Webhook Dead-Letter Queue', () => {
   beforeEach(() => {
-    app = createTestApp();
-    _resetDlq();
+    global.fetch = mockFetch as any;
+    webhookDeliveryStore.clear();
+    mockFetchResponses.clear();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
   });
 
   // ── Auth guard tests ──────────────────────────────────────────────────────

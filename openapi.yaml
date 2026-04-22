@@ -305,6 +305,363 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+/api/webhooks/queue:
+    post:
+      summary: Queue a webhook delivery
+      operationId: queueWebhook
+      tags:
+        - Webhooks
+      description: |
+        Queue a webhook delivery for reliable processing using the outbox pattern.
+        Returns immediately with acceptance confirmation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueueWebhookRequest'
+      responses:
+        '202':
+          description: Webhook queued for delivery
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueWebhookResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/webhooks/deliveries/{deliveryId}:
+    get:
+      summary: Get webhook delivery status
+      operationId: getWebhookDelivery
+      tags:
+        - Webhooks
+      parameters:
+        - name: deliveryId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique delivery identifier
+      responses:
+        '200':
+          description: Delivery details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDelivery'
+        '404':
+          description: Delivery not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/webhooks/deliveries:
+    get:
+      summary: List webhook deliveries
+      operationId: listWebhookDeliveries
+      tags:
+        - Webhooks
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, delivered, failed, permanent_failure]
+          description: Filter by delivery status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+          description: Maximum number of deliveries to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Number of deliveries to skip
+      responses:
+        '200':
+          description: List of deliveries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDeliveryList'
+
+  /api/webhooks/outbox:
+    get:
+      summary: List outbox items
+      operationId: listOutboxItems
+      tags:
+        - Webhooks
+      parameters:
+        - name: priority
+          in: query
+          schema:
+            type: string
+            enum: [high, normal, low]
+          description: Filter by priority level
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [ready, pending, failed]
+            default: ready
+          description: Filter by status
+      responses:
+        '200':
+          description: List of outbox items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboxItemList'
+
+  /api/webhooks/dlq:
+    get:
+      summary: List dead-letter queue items
+      operationId: listDeadLetterQueue
+      tags:
+        - Webhooks
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: Maximum number of DLQ items to return
+      responses:
+        '200':
+          description: List of DLQ items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeadLetterQueueList'
+
+  /api/webhooks/dlq/{dlqId}/retry:
+    post:
+      summary: Retry a dead-letter queue item
+      operationId: retryDeadLetterItem
+      tags:
+        - Webhooks
+      parameters:
+        - name: dlqId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: DLQ item identifier
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - secret
+              properties:
+                secret:
+                  type: string
+                  description: Webhook secret for retry
+      responses:
+        '200':
+          description: DLQ item queued for retry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetryDLQResponse'
+        '404':
+          description: DLQ item not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Missing secret
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/webhooks/circuit-breakers:
+    get:
+      summary: List circuit breaker states
+      operationId: listCircuitBreakers
+      tags:
+        - Webhooks
+      responses:
+        '200':
+          description: List of circuit breaker states
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CircuitBreakerList'
+
+  /api/webhooks/metrics:
+    get:
+      summary: Get webhook delivery metrics
+      operationId: getWebhookMetrics
+      tags:
+        - Webhooks
+      responses:
+        '200':
+          description: Webhook delivery metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookMetrics'
+
+  /api/webhooks/verify:
+    post:
+      summary: Verify webhook signature
+      operationId: verifyWebhookSignature
+      tags:
+        - Webhooks
+      description: |
+        Verify a webhook signature for testing and debugging purposes.
+        Consumers can use this endpoint to validate their signature verification logic.
+      parameters:
+        - name: secret
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Webhook secret
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw webhook payload
+      responses:
+        '200':
+          description: Signature verified successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifySignatureResponse'
+        '401':
+          description: Signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/webhooks/process-outbox:
+    post:
+      summary: Process outbox items
+      operationId: processOutbox
+      tags:
+        - Internal
+      description: |
+        Internal endpoint for background workers to process ready outbox items.
+        Requires webhook secret for authentication.
+      parameters:
+        - name: secret
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Webhook secret
+      responses:
+        '200':
+          description: Outbox processing completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessOutboxResponse'
+        '400':
+          description: Missing secret
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/webhooks/retry:
+    post:
+      summary: Process pending webhook retries
+      operationId: processWebhookRetries
+      tags:
+        - Internal
+      description: |
+        Internal endpoint for background workers to process pending webhook retries.
+        Requires webhook secret for authentication.
+      parameters:
+        - name: secret
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Webhook secret
+      responses:
+        '200':
+          description: Retry processing completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Pending webhook retries processed
+        '400':
+          description: Missing secret
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/webhooks/cleanup:
+    post:
+      summary: Clean up old webhook data
+      operationId: cleanupWebhookData
+      tags:
+        - Internal
+      description: |
+        Internal endpoint for maintenance to clean up old webhook data.
+        Requires admin authentication.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                olderThanDays:
+                  type: integer
+                  default: 7
+                  description: Clean up data older than this many days
+      responses:
+        '200':
+          description: Cleanup completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CleanupResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   schemas:
     CreateStreamRequest:
@@ -491,6 +848,409 @@ components:
                 field: sender
                 value: invalid
 
+    # Webhook-related schemas
+    QueueWebhookRequest:
+      type: object
+      required:
+        - event
+        - endpointUrl
+        - secret
+      properties:
+        event:
+          type: object
+          required:
+            - id
+            - type
+            - timestamp
+            - data
+          properties:
+            id:
+              type: string
+              description: Unique event identifier
+              example: event_123
+            type:
+              type: string
+              enum: [stream.created, stream.updated, stream.cancelled]
+              description: Event type
+              example: stream.created
+            timestamp:
+              type: integer
+              description: Event timestamp (Unix milliseconds)
+              example: 1710000000000
+            data:
+              type: object
+              description: Event payload data
+              example:
+                streamId: stream_123
+        endpointUrl:
+          type: string
+          format: uri
+          description: Webhook endpoint URL
+          example: https://consumer.example.com/webhook
+        secret:
+          type: string
+          description: Webhook secret for signature verification
+          example: webhook_secret_123
+        priority:
+          type: string
+          enum: [high, normal, low]
+          default: normal
+          description: Delivery priority
+          example: normal
+
+    QueueWebhookResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        outboxId:
+          type: string
+          description: Outbox item identifier
+          example: outbox_123
+        message:
+          type: string
+          example: Webhook queued for delivery
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Internal delivery ID
+          example: delivery_123
+        deliveryId:
+          type: string
+          description: Public delivery identifier
+          example: deliv_123
+        eventId:
+          type: string
+          description: Associated event ID
+          example: event_123
+        eventType:
+          type: string
+          description: Event type
+          example: stream.created
+        status:
+          type: string
+          enum: [pending, delivered, failed, permanent_failure]
+          description: Delivery status
+          example: pending
+        attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookDeliveryAttempt'
+        createdAt:
+          type: string
+          format: date-time
+          description: When delivery was created
+          example: '2024-03-10T12:00:00Z'
+        updatedAt:
+          type: string
+          format: date-time
+          description: When delivery was last updated
+          example: '2024-03-10T12:00:00Z'
+
+    WebhookDeliveryAttempt:
+      type: object
+      properties:
+        attemptNumber:
+          type: integer
+          description: Attempt number (1-based)
+          example: 1
+        timestamp:
+          type: string
+          format: date-time
+          description: When attempt was made
+          example: '2024-03-10T12:00:00Z'
+        statusCode:
+          type: integer
+          nullable: true
+          description: HTTP status code (null for network errors)
+          example: 503
+        error:
+          type: string
+          nullable: true
+          description: Error message if attempt failed
+          example: Connection timeout
+        nextRetryAt:
+          type: string
+          nullable: true
+          format: date-time
+          description: When next retry is scheduled
+          example: '2024-03-10T12:00:05Z'
+
+    WebhookDeliveryList:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Total number of deliveries
+          example: 42
+        deliveries:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookDelivery'
+
+    OutboxItemList:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Total number of outbox items
+          example: 15
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OutboxItem'
+
+    OutboxItem:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Outbox item identifier
+          example: outbox_123
+        deliveryId:
+          type: string
+          description: Associated delivery ID
+          example: deliv_123
+        eventId:
+          type: string
+          description: Associated event ID
+          example: event_123
+        eventType:
+          type: string
+          description: Event type
+          example: stream.created
+        endpointUrl:
+          type: string
+          description: Webhook endpoint URL
+          example: https://consumer.example.com/webhook
+        priority:
+          type: string
+          enum: [high, normal, low]
+          description: Delivery priority
+          example: high
+        attempts:
+          type: integer
+          description: Number of attempts made
+          example: 0
+        maxAttempts:
+          type: integer
+          description: Maximum allowed attempts
+          example: 5
+        scheduledFor:
+          type: string
+          format: date-time
+          description: When item is scheduled for processing
+          example: '2024-03-10T12:00:00Z'
+        createdAt:
+          type: string
+          format: date-time
+          description: When item was created
+          example: '2024-03-10T12:00:00Z'
+
+    DeadLetterQueueList:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Total number of DLQ items
+          example: 3
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeadLetterQueueItem'
+
+    DeadLetterQueueItem:
+      type: object
+      properties:
+        id:
+          type: string
+          description: DLQ item identifier
+          example: dlq_123
+        deliveryId:
+          type: string
+          description: Original delivery ID
+          example: deliv_123
+        eventId:
+          type: string
+          description: Associated event ID
+          example: event_123
+        eventType:
+          type: string
+          description: Event type
+          example: stream.created
+        endpointUrl:
+          type: string
+          description: Webhook endpoint URL
+          example: https://consumer.example.com/webhook
+        failureReason:
+          type: string
+          description: Reason for failure
+          example: Max attempts exceeded
+        attemptCount:
+          type: integer
+          description: Number of attempts made
+          example: 5
+        createdAt:
+          type: string
+          format: date-time
+          description: When item was created
+          example: '2024-03-10T12:00:00Z'
+        processedAt:
+          type: string
+          nullable: true
+          format: date-time
+          description: When item was processed (null if unprocessed)
+          example: null
+
+    RetryDLQResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        outboxId:
+          type: string
+          description: New outbox item ID for retry
+          example: outbox_456
+        message:
+          type: string
+          example: DLQ item queued for retry
+
+    CircuitBreakerList:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Total number of circuit breakers
+          example: 2
+        states:
+          type: array
+          items:
+            $ref: '#/components/schemas/CircuitBreakerState'
+
+    CircuitBreakerState:
+      type: object
+      properties:
+        endpointUrl:
+          type: string
+          description: Endpoint URL
+          example: https://consumer.example.com/webhook
+        state:
+          type: string
+          enum: [closed, open, half-open]
+          description: Circuit breaker state
+          example: open
+        failureCount:
+          type: integer
+          description: Number of consecutive failures
+          example: 15
+        lastFailureTime:
+          type: string
+          nullable: true
+          format: date-time
+          description: Time of last failure
+          example: '2024-03-10T12:00:00Z'
+        nextAttemptTime:
+          type: string
+          nullable: true
+          format: date-time
+          description: When next attempt will be allowed
+          example: '2024-03-10T12:05:00Z'
+
+    WebhookMetrics:
+      type: object
+      properties:
+        totalDeliveries:
+          type: integer
+          description: Total number of deliveries
+          example: 1000
+        successfulDeliveries:
+          type: integer
+          description: Number of successful deliveries
+          example: 950
+        failedDeliveries:
+          type: integer
+          description: Number of failed deliveries
+          example: 30
+        dlqItems:
+          type: integer
+          description: Number of items in dead-letter queue
+          example: 20
+        outboxItems:
+          type: integer
+          description: Number of items in outbox
+          example: 5
+        successRate:
+          type: number
+          format: float
+          description: Success rate percentage
+          example: 95.0
+        failureRate:
+          type: number
+          format: float
+          description: Failure rate percentage
+          example: 5.0
+
+    VerifySignatureResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        code:
+          type: string
+          example: ok
+        message:
+          type: string
+          example: Webhook signature verified
+
+    ProcessOutboxResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        processed:
+          type: integer
+          description: Number of items processed
+          example: 10
+        errors:
+          type: integer
+          description: Number of processing errors
+          example: 0
+        total:
+          type: integer
+          description: Total items ready for processing
+          example: 10
+        message:
+          type: string
+          example: Outbox processing completed
+
+    CleanupResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        cleaned:
+          type: integer
+          description: Number of items cleaned up
+          example: 150
+        errors:
+          type: array
+          items:
+            type: string
+          description: List of cleanup errors
+          example: []
+        olderThanDays:
+          type: integer
+          description: Age threshold for cleanup
+          example: 7
+
   securitySchemes:
     BearerAuth:
       type: http
@@ -505,5 +1265,7 @@ tags:
     description: System health and metadata endpoints
   - name: Streams
     description: Stream creation, retrieval, and listing
+  - name: Webhooks
+    description: Webhook delivery and management endpoints
   - name: Internal
     description: Internal endpoints for workers and administrators
