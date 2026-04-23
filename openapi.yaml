@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   description: |
     Fluxora Backend: Off-chain companion to the streaming contract.
-    
+
     Presents operator-grade reliability with predictable HTTP semantics, durable views of chain-derived data,
     and explicit failure behavior when dependencies are unhealthy.
 
@@ -17,23 +17,22 @@ info:
     These headers are transport invariants for public clients, authenticated partners,
     administrators, and internal workers that traverse the HTTP surface. They do not replace
     authentication, authorization, TLS termination, or proxy hardening.
-    
+
     ## Trust Boundaries
     - **Public Internet Clients**: Read-only access to stream listings and health checks
     - **Authenticated Partners**: Create and manage streams with idempotency guarantees
     - **Administrators**: Full access including internal indexer endpoints
     - **Internal Workers**: Indexer endpoints for chain state synchronization
-    
+
     ## Failure Modes & Client-Visible Behavior
     - **Invalid Input (400)**: Malformed addresses, negative amounts, oversized payloads
     - **Unauthorized (401)**: Missing or invalid authentication token
     - **Forbidden (403)**: Insufficient permissions for the requested operation
     - **Conflict (409)**: Duplicate submission detected (idempotency key collision)
     - **Payload Too Large (413)**: Request exceeds 256 KiB limit
-    - **Unprocessable Entity (422)**: Validation failed (e.g., insufficient deposit)
     - **Service Unavailable (503)**: Dependency outage (database, Stellar RPC, workers)
     - **Internal Server Error (500)**: Unexpected error; check logs with requestId
-    
+
   contact:
     name: Fluxora Team
   license:
@@ -58,17 +57,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: Fluxora API
-                  version:
-                    type: string
-                    example: 0.1.0
-                  docs:
-                    type: string
-                    example: Programmable treasury streaming on Stellar.
+                $ref: '#/components/schemas/RootResponse'
 
   /health:
     get:
@@ -79,15 +68,61 @@ paths:
       description: |
         Returns the health status of the service and its dependencies.
         Used by load balancers and monitoring systems.
+        Returns 503 during graceful shutdown.
       responses:
         '200':
-          description: Service is healthy
+          description: Service is healthy or degraded
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthReport'
+                $ref: '#/components/schemas/HealthResponse'
         '503':
-          description: Service or dependency is unhealthy
+          description: Service is shutting down
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /health/ready:
+    get:
+      summary: Readiness probe
+      operationId: getHealthReady
+      tags:
+        - System
+      description: |
+        Returns 200 if all dependencies are healthy and service is ready to accept traffic.
+        Returns 503 if any dependency is unhealthy or service is shutting down.
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+        '503':
+          description: Service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health/live:
+    get:
+      summary: Liveness probe
+      operationId: getHealthLive
+      tags:
+        - System
+      description: |
+        Returns detailed health report for all dependencies.
+      responses:
+        '200':
+          description: Detailed health report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessResponse'
+        '500':
+          description: Failed to get health report
           content:
             application/json:
               schema:
@@ -127,59 +162,9 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  token:
-                    type: string
-                    description: JWT token for authentication
-                    example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
-                  user:
-                    type: object
-                    properties:
-                      address:
-                        type: string
-                        example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
-                      role:
-                        type: string
-                        example: operator
+                $ref: '#/components/schemas/SessionResponse'
         '400':
           description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/admin/status:
-    get:
-      summary: Get admin status
-      operationId: getAdminStatus
-      tags:
-        - Admin
-      security:
-        - AdminAuth: []
-      description: |
-        Returns current pause flags and reindex state.
-        Requires admin authentication via ADMIN_API_KEY.
-      responses:
-        '200':
-          description: Admin status
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  pauseFlags:
-                    type: object
-                  reindex:
-                    type: object
-        '401':
-          description: Missing or invalid admin credentials
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '503':
-          description: Admin API not configured
           content:
             application/json:
               schema:
@@ -203,7 +188,8 @@ paths:
             will return the same response (idempotent).
           schema:
             type: string
-            format: uuid
+            minLength: 1
+            maxLength: 128
       requestBody:
         required: true
         content:
@@ -216,7 +202,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Stream'
+                $ref: '#/components/schemas/StreamResponse'
         '400':
           description: Invalid request (malformed JSON, invalid address format, etc.)
           content:
@@ -243,16 +229,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Validation failed. Common causes:
-            - sender and recipient are the same
-            - depositAmount < ratePerSecond (insufficient for 1 second)
-            - startTime is in the past (>1 hour ago)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Service unavailable (database, Stellar RPC, or workers down)
           content:
@@ -269,12 +245,12 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Number of streams to return (1-100, default 20)
+          description: Number of streams to return (1-100, default 50)
           schema:
             type: integer
             minimum: 1
             maximum: 100
-            default: 20
+            default: 50
         - name: cursor
           in: query
           required: false
@@ -283,7 +259,7 @@ paths:
             Omit for first page.
           schema:
             type: string
-        - name: includeTotal
+        - name: include_total
           in: query
           required: false
           description: Include total count in response (may be expensive for large datasets)
@@ -296,7 +272,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StreamList'
+                $ref: '#/components/schemas/StreamListResponse'
         '400':
           description: Invalid query parameters
           content:
@@ -320,23 +296,16 @@ paths:
         - name: streamId
           in: path
           required: true
-          description: Stream identifier (format: stream-{timestamp})
+          description: Stream identifier (format: stream-{timestamp}-{random})
           schema:
             type: string
-            pattern: '^stream-\d+$'
       responses:
         '200':
           description: Stream details
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Stream'
-        '400':
-          description: Invalid stream ID format
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/StreamResponse'
         '404':
           description: Stream not found
           content:
@@ -345,49 +314,6 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Service unavailable
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-    delete:
-      summary: Cancel a stream
-      operationId: cancelStream
-      tags:
-        - Streams
-      parameters:
-        - name: streamId
-          in: path
-          required: true
-          description: Stream identifier
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Stream cancelled
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: Stream cancelled
-                  id:
-                    type: string
-        '404':
-          description: Stream not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
-          description: Stream already cancelled or completed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '413':
-          description: Request body exceeds 256 KiB limit
           content:
             application/json:
               schema:
@@ -407,21 +333,13 @@ paths:
           description: Stream identifier
           schema:
             type: string
-            pattern: '^stream-\d+$'
       responses:
         '200':
           description: Stream cancelled successfully
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: Stream cancelled
-                  id:
-                    type: string
-                    example: stream-1704067200
+                $ref: '#/components/schemas/CancelStreamResponse'
         '401':
           description: Missing or invalid authentication token
           content:
@@ -470,11 +388,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: queued
+                $ref: '#/components/schemas/AcceptedResponse'
         '401':
           description: Unauthorized
           content:
@@ -494,627 +408,157 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
-/api/webhooks/queue:
-    post:
-      summary: Queue a webhook delivery
-      operationId: queueWebhook
-      tags:
-        - Webhooks
-      description: |
-        Queue a webhook delivery for reliable processing using the outbox pattern.
-        Returns immediately with acceptance confirmation.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/QueueWebhookRequest'
-      responses:
-        '202':
-          description: Webhook queued for delivery
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/QueueWebhookResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/webhooks/deliveries/{deliveryId}:
-    get:
-      summary: Get webhook delivery status
-      operationId: getWebhookDelivery
-      tags:
-        - Webhooks
-      parameters:
-        - name: deliveryId
-          in: path
-          required: true
-          schema:
-            type: string
-          description: Unique delivery identifier
-      responses:
-        '200':
-          description: Delivery details
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WebhookDelivery'
-        '404':
-          description: Delivery not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/webhooks/deliveries:
-    get:
-      summary: List webhook deliveries
-      operationId: listWebhookDeliveries
-      tags:
-        - Webhooks
-      parameters:
-        - name: status
-          in: query
-          schema:
-            type: string
-            enum: [pending, delivered, failed, permanent_failure]
-          description: Filter by delivery status
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-          description: Maximum number of deliveries to return
-        - name: offset
-          in: query
-          schema:
-            type: integer
-            default: 0
-          description: Number of deliveries to skip
-      responses:
-        '200':
-          description: List of deliveries
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WebhookDeliveryList'
-
-  /api/webhooks/outbox:
-    get:
-      summary: List outbox items
-      operationId: listOutboxItems
-      tags:
-        - Webhooks
-      parameters:
-        - name: priority
-          in: query
-          schema:
-            type: string
-            enum: [high, normal, low]
-          description: Filter by priority level
-        - name: status
-          in: query
-          schema:
-            type: string
-            enum: [ready, pending, failed]
-            default: ready
-          description: Filter by status
-      responses:
-        '200':
-          description: List of outbox items
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OutboxItemList'
-
-  /api/webhooks/dlq:
-    get:
-      summary: List dead-letter queue items
-      operationId: listDeadLetterQueue
-      tags:
-        - Webhooks
-      parameters:
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 50
-          description: Maximum number of DLQ items to return
-      responses:
-        '200':
-          description: List of DLQ items
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DeadLetterQueueList'
-
-  /api/webhooks/dlq/{dlqId}/retry:
-    post:
-      summary: Retry a dead-letter queue item
-      operationId: retryDeadLetterItem
-      tags:
-        - Webhooks
-      parameters:
-        - name: dlqId
-          in: path
-          required: true
-          schema:
-            type: string
-          description: DLQ item identifier
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-                - secret
-              properties:
-                secret:
-                  type: string
-                  description: Webhook secret for retry
-      responses:
-        '200':
-          description: DLQ item queued for retry
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/RetryDLQResponse'
-        '404':
-          description: DLQ item not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '400':
-          description: Missing secret
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/webhooks/circuit-breakers:
-    get:
-      summary: List circuit breaker states
-      operationId: listCircuitBreakers
-      tags:
-        - Webhooks
-      responses:
-        '200':
-          description: List of circuit breaker states
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/CircuitBreakerList'
-
-  /api/webhooks/metrics:
-    get:
-      summary: Get webhook delivery metrics
-      operationId: getWebhookMetrics
-      tags:
-        - Webhooks
-      responses:
-        '200':
-          description: Webhook delivery metrics
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WebhookMetrics'
-
-  /api/webhooks/verify:
-    post:
-      summary: Verify webhook signature
-      operationId: verifyWebhookSignature
-      tags:
-        - Webhooks
-      description: |
-        Verify a webhook signature for testing and debugging purposes.
-        Consumers can use this endpoint to validate their signature verification logic.
-      parameters:
-        - name: secret
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Webhook secret
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              description: Raw webhook payload
-      responses:
-        '200':
-          description: Signature verified successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/VerifySignatureResponse'
-        '401':
-          description: Signature verification failed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /internal/webhooks/process-outbox:
-    post:
-      summary: Process outbox items
-      operationId: processOutbox
-      tags:
-        - Internal
-      description: |
-        Internal endpoint for background workers to process ready outbox items.
-        Requires webhook secret for authentication.
-      parameters:
-        - name: secret
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Webhook secret
-      responses:
-        '200':
-          description: Outbox processing completed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ProcessOutboxResponse'
-        '400':
-          description: Missing secret
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /internal/webhooks/retry:
-    post:
-      summary: Process pending webhook retries
-      operationId: processWebhookRetries
-      tags:
-        - Internal
-      description: |
-        Internal endpoint for background workers to process pending webhook retries.
-        Requires webhook secret for authentication.
-      parameters:
-        - name: secret
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Webhook secret
-      responses:
-        '200':
-          description: Retry processing completed
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok:
-                    type: boolean
-                    example: true
-                  message:
-                    type: string
-                    example: Pending webhook retries processed
-        '400':
-          description: Missing secret
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /internal/webhooks/cleanup:
-    post:
-      summary: Clean up old webhook data
-      operationId: cleanupWebhookData
-      tags:
-        - Internal
-      description: |
-        Internal endpoint for maintenance to clean up old webhook data.
-        Requires admin authentication.
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                olderThanDays:
-                  type: integer
-                  default: 7
-                  description: Clean up data older than this many days
-      responses:
-        '200':
-          description: Cleanup completed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/CleanupResponse'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-/admin/dlq:
-    get:
-      summary: List dead-letter queue entries (admin only)
-      operationId: listDlqEntries
-      tags:
-        - Admin
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 50
-          description: Maximum number of entries to return
-        - name: offset
-          in: query
-          schema:
-            type: integer
-            minimum: 0
-            default: 0
-          description: Number of entries to skip
-        - name: topic
-          in: query
-          schema:
-            type: string
-          description: Filter by topic name
-      responses:
-        '200':
-          description: Paginated DLQ entries
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  entries:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/DlqEntry'
-                  total:
-                    type: integer
-                    description: Total number of entries
-                  limit:
-                    type: integer
-                    description: Page size limit
-                  offset:
-                    type: integer
-                    description: Number of entries skipped
-                  has_more:
-                    type: boolean
-                    description: Whether more entries are available
-        '400':
-          description: Invalid pagination parameters
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Missing or invalid authentication
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: Operator role required
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-    delete:
-      summary: Purge all DLQ entries (admin only)
-      operationId: purgeDlqEntries
-      tags:
-        - Admin
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: topic
-          in: query
-          schema:
-            type: string
-          description: Filter by topic name (optional, purges all if not specified)
-      responses:
-        '200':
-          description: DLQ entries purged
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: DLQ entries purged
-                  purged:
-                    type: integer
-                    description: Number of entries purged
-                  topicFilter:
-                    type: string
-                    description: Topic filter applied (or 'all')
-                  removedIds:
-                    type: array
-                    items:
-                      type: string
-                    description: IDs of removed entries
-        '401':
-          description: Missing or invalid authentication
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: Operator role required
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /admin/dlq/{id}:
-    get:
-      summary: Get a single DLQ entry (admin only)
-      operationId: getDlqEntry
-      tags:
-        - Admin
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: DLQ entry ID
-      responses:
-        '200':
-          description: DLQ entry
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  entry:
-                    $ref: '#/components/schemas/DlqEntry'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: Forbidden
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-    delete:
-      summary: Remove (acknowledge) a DLQ entry (admin only)
-      operationId: deleteDlqEntry
-      tags:
-        - Admin
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: DLQ entry ID
-      responses:
-        '200':
-          description: Entry removed
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: DLQ entry removed
-                  id:
-                    type: string
-                    description: ID of removed entry
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: Forbidden
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /admin/dlq/{id}/replay:
-    post:
-      summary: Replay a DLQ entry (admin only)
-      operationId: replayDlqEntry
-      tags:
-        - Admin
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: DLQ entry ID
-      responses:
-        '200':
-          description: DLQ entry replayed
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: DLQ entry replayed
-                  id:
-                    type: string
-                    description: ID of replayed entry
-                  topic:
-                    type: string
-                    description: Topic of replayed entry
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: Forbidden
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
 components:
   schemas:
+    ResponseMeta:
+      type: object
+      required:
+        - timestamp
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp of the response
+          example: '2024-01-01T12:00:00.000Z'
+        requestId:
+          type: string
+          description: Opaque request identifier for log correlation
+          example: 550e8400-e29b-41d4-a716-446655440000
+
+    RootResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            name:
+              type: string
+              example: Fluxora API
+            version:
+              type: string
+              example: 0.1.0
+            docs:
+              type: string
+              example: Programmable treasury streaming on Stellar.
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    HealthResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: [ok, degraded, shutting_down]
+              description: Overall service health
+              example: ok
+            service:
+              type: string
+              example: fluxora-backend
+            network:
+              type: string
+              description: Stellar network (testnet, public, etc.)
+              example: testnet
+            contractAddresses:
+              type: object
+              description: Deployed contract addresses
+              example: {}
+            timestamp:
+              type: string
+              format: date-time
+              example: '2024-01-01T12:00:00.000Z'
+            indexer:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [ok, stalled, starting, unknown]
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    ReadinessResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            report:
+              type: object
+              description: Detailed readiness report
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    LivenessResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            report:
+              type: object
+              description: Detailed liveness report
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    SessionResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            token:
+              type: string
+              description: JWT token for authentication
+              example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            user:
+              type: object
+              properties:
+                address:
+                  type: string
+                  example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
+                role:
+                  type: string
+                  example: operator
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
     CreateStreamRequest:
       type: object
       required:
@@ -1144,17 +588,17 @@ components:
           type: string
           description: |
             Total amount to deposit in stroops (1 XLM = 10,000,000 stroops).
-            Must be a non-negative integer string.
+            Must be a non-negative decimal string.
             Must be >= ratePerSecond (minimum 1 second of streaming).
             Max: 9223372036854775807 stroops (~922 million XLM).
-          pattern: '^\d+$'
+          pattern: '^\d+(\.\d+)?$'
           example: '1000000000'
         ratePerSecond:
           type: string
           description: |
             Streaming rate in stroops per second.
-            Must be a positive integer string.
-          pattern: '^\d+$'
+            Must be a positive decimal string.
+          pattern: '^\d+(\.\d+)?$'
           example: '100000'
         startTime:
           type: integer
@@ -1165,117 +609,91 @@ components:
 
     Stream:
       type: object
+      description: |
+        A durable, PostgreSQL-backed stream record.
+        All monetary amounts are decimal strings - never numbers.
+      required:
+        - id
+        - sender
+        - recipient
+        - depositAmount
+        - ratePerSecond
+        - startTime
+        - endTime
+        - status
       properties:
         id:
           type: string
-          description: Unique stream identifier
-          pattern: '^stream-\d+$'
-          example: stream-1704067200
+          description: |
+            Unique stream identifier derived from SHA-256 of request content.
+            Format: stream-{64-char-hex}-{eventIndex}
+          example: stream-a3f1c2d...0c-0
         sender:
           type: string
           description: |
-            Sender's Stellar public key.
-            Format: G followed by 55 base32 characters [A-Z2-7].
+            Sender Stellar public key (G + 55 base32 chars).
           pattern: '^G[A-Z2-7]{55}$'
           example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
         recipient:
           type: string
           description: |
-            Recipient's Stellar public key.
-            Format: G followed by 55 base32 characters [A-Z2-7].
+            Recipient Stellar public key (G + 55 base32 chars).
           pattern: '^G[A-Z2-7]{55}$'
           example: GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX
         depositAmount:
           type: string
-          description: Total deposit in stroops
-          example: '1000000000'
+          description: Total deposit as a decimal string (never a number).
+          pattern: '^[+-]?[0-9]+(\.[0-9]+)?$'
+          example: '1000'
         ratePerSecond:
           type: string
-          description: Streaming rate in stroops/second
-          example: '100000'
+          description: Streaming rate per second as a decimal string.
+          pattern: '^[+-]?[0-9]+(\.[0-9]+)?$'
+          example: '10'
         startTime:
           type: integer
-          description: Stream start time (Unix timestamp)
-          example: 1704067200
-        createdAt:
-          type: string
-          format: date-time
-          description: When the stream was created
-          example: '2024-01-01T12:00:00Z'
+          description: Stream start time (Unix epoch seconds).
+          example: 1700000000
+        endTime:
+          type: integer
+          description: Stream end time (Unix epoch seconds). 0 = indefinite.
+          example: 0
         status:
           type: string
           enum:
-            - pending
             - active
+            - paused
             - completed
             - cancelled
-          description: Current stream status
+          description: Current stream status.
           example: active
 
-    StreamList:
+    StreamResponse:
       type: object
+      required:
+        - streams
+        - has_more
       properties:
         streams:
           type: array
           items:
             $ref: '#/components/schemas/Stream'
-        cursor:
+        has_more:
+          type: boolean
+          description: Whether more pages are available.
+          example: true
+        next_cursor:
           type: string
           nullable: true
-          description: Pagination cursor for next page (null if no more pages)
-          example: c3RyZWFtLTE3MDQwNjcyMDA=
+          description: Opaque cursor for the next page (absent when has_more=false).
+          example: eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjLTAifQ
         total:
           type: integer
           nullable: true
-          description: Total number of streams (only if includeTotal=true)
+          description: Total count (only present when include_total=true).
           example: 42
 
-    HealthReport:
-      type: object
-      properties:
-        status:
-          type: string
-          enum:
-            - healthy
-            - degraded
-            - unhealthy
-          description: Overall service health
-          example: healthy
-        timestamp:
-          type: string
-          format: date-time
-          description: Health check timestamp
-          example: '2024-01-01T12:00:00Z'
-        dependencies:
-          type: object
-          properties:
-            database:
-              $ref: '#/components/schemas/DependencyHealth'
-            stellarRpc:
-              $ref: '#/components/schemas/DependencyHealth'
-            workers:
-              $ref: '#/components/schemas/DependencyHealth'
-
-    DependencyHealth:
-      type: object
-      properties:
-        status:
-          type: string
-          enum:
-            - healthy
-            - unhealthy
-          example: healthy
-        latency:
-          type: integer
-          description: Response time in milliseconds
-          example: 45
-        error:
-          type: string
-          nullable: true
-          description: Error message if unhealthy
-          example: null
-
-    SuccessResponse:
+    StreamListResponse:
       type: object
       required:
         - success
@@ -1285,25 +703,70 @@ components:
         success:
           type: boolean
           enum: [true]
-          description: Always true for successful responses
-          example: true
         data:
           type: object
-          description: Response payload
-        meta:
-          type: object
-          required:
-            - timestamp
           properties:
-            timestamp:
+            streams:
+              type: array
+              items:
+                $ref: '#/components/schemas/Stream'
+            has_more:
+              type: boolean
+              description: Whether more streams are available
+              example: false
+            next_cursor:
               type: string
-              format: date-time
-              description: ISO-8601 timestamp of the response
-              example: '2024-01-01T12:00:00.000Z'
-            requestId:
+              nullable: true
+              description: Pagination cursor for next page (null if no more pages)
+              example: null
+            total:
+              type: integer
+              nullable: true
+              description: Total number of streams (only if include_total=true)
+              example: null
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    CancelStreamResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            message:
               type: string
-              description: Opaque request identifier for log correlation
-              example: 550e8400-e29b-41d4-a716-446655440000
+              example: Stream cancelled
+            id:
+              type: string
+              example: stream-1704067200-abc12
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    AcceptedResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+              example: queued
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
 
     ErrorResponse:
       type: object
@@ -1335,11 +798,12 @@ components:
                 - TOO_MANY_REQUESTS
                 - SERVICE_UNAVAILABLE
                 - INTERNAL_ERROR
-              example: PAYLOAD_TOO_LARGE
+                - DECIMAL_ERROR
+              example: VALIDATION_ERROR
             message:
               type: string
               description: Human-readable error message
-              example: Request body exceeds the 262144-byte limit
+              example: Validation failed
             requestId:
               type: string
               description: Correlation ID for log triage
@@ -1347,450 +811,6 @@ components:
             details:
               description: Additional error context (field-level validation errors, etc.)
               nullable: true
-
-    # Webhook-related schemas
-    QueueWebhookRequest:
-      type: object
-      required:
-        - event
-        - endpointUrl
-        - secret
-      properties:
-        event:
-          type: object
-          required:
-            - id
-            - type
-            - timestamp
-            - data
-          properties:
-            id:
-              type: string
-              description: Unique event identifier
-              example: event_123
-            type:
-              type: string
-              enum: [stream.created, stream.updated, stream.cancelled]
-              description: Event type
-              example: stream.created
-            timestamp:
-              type: integer
-              description: Event timestamp (Unix milliseconds)
-              example: 1710000000000
-            data:
-              type: object
-              description: Event payload data
-              example:
-                streamId: stream_123
-        endpointUrl:
-          type: string
-          format: uri
-          description: Webhook endpoint URL
-          example: https://consumer.example.com/webhook
-        secret:
-          type: string
-          description: Webhook secret for signature verification
-          example: webhook_secret_123
-        priority:
-          type: string
-          enum: [high, normal, low]
-          default: normal
-          description: Delivery priority
-          example: normal
-
-    QueueWebhookResponse:
-      type: object
-      properties:
-        ok:
-          type: boolean
-          example: true
-        outboxId:
-          type: string
-          description: Outbox item identifier
-          example: outbox_123
-        message:
-          type: string
-          example: Webhook queued for delivery
-
-    WebhookDelivery:
-      type: object
-      properties:
-        id:
-          type: string
-          description: Internal delivery ID
-          example: delivery_123
-        deliveryId:
-          type: string
-          description: Public delivery identifier
-          example: deliv_123
-        eventId:
-          type: string
-          description: Associated event ID
-          example: event_123
-        eventType:
-          type: string
-          description: Event type
-          example: stream.created
-        status:
-          type: string
-          enum: [pending, delivered, failed, permanent_failure]
-          description: Delivery status
-          example: pending
-        attempts:
-          type: array
-          items:
-            $ref: '#/components/schemas/WebhookDeliveryAttempt'
-        createdAt:
-          type: string
-          format: date-time
-          description: When delivery was created
-          example: '2024-03-10T12:00:00Z'
-        updatedAt:
-          type: string
-          format: date-time
-          description: When delivery was last updated
-          example: '2024-03-10T12:00:00Z'
-
-    WebhookDeliveryAttempt:
-      type: object
-      properties:
-        attemptNumber:
-          type: integer
-          description: Attempt number (1-based)
-          example: 1
-        timestamp:
-          type: string
-          format: date-time
-          description: When attempt was made
-          example: '2024-03-10T12:00:00Z'
-        statusCode:
-          type: integer
-          nullable: true
-          description: HTTP status code (null for network errors)
-          example: 503
-        error:
-          type: string
-          nullable: true
-          description: Error message if attempt failed
-          example: Connection timeout
-        nextRetryAt:
-          type: string
-          nullable: true
-          format: date-time
-          description: When next retry is scheduled
-          example: '2024-03-10T12:00:05Z'
-
-    WebhookDeliveryList:
-      type: object
-      properties:
-        total:
-          type: integer
-          description: Total number of deliveries
-          example: 42
-        deliveries:
-          type: array
-          items:
-            $ref: '#/components/schemas/WebhookDelivery'
-
-    OutboxItemList:
-      type: object
-      properties:
-        total:
-          type: integer
-          description: Total number of outbox items
-          example: 15
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/OutboxItem'
-
-    OutboxItem:
-      type: object
-      properties:
-        id:
-          type: string
-          description: Outbox item identifier
-          example: outbox_123
-        deliveryId:
-          type: string
-          description: Associated delivery ID
-          example: deliv_123
-        eventId:
-          type: string
-          description: Associated event ID
-          example: event_123
-        eventType:
-          type: string
-          description: Event type
-          example: stream.created
-        endpointUrl:
-          type: string
-          description: Webhook endpoint URL
-          example: https://consumer.example.com/webhook
-        priority:
-          type: string
-          enum: [high, normal, low]
-          description: Delivery priority
-          example: high
-        attempts:
-          type: integer
-          description: Number of attempts made
-          example: 0
-        maxAttempts:
-          type: integer
-          description: Maximum allowed attempts
-          example: 5
-        scheduledFor:
-          type: string
-          format: date-time
-          description: When item is scheduled for processing
-          example: '2024-03-10T12:00:00Z'
-        createdAt:
-          type: string
-          format: date-time
-          description: When item was created
-          example: '2024-03-10T12:00:00Z'
-
-    DeadLetterQueueList:
-      type: object
-      properties:
-        total:
-          type: integer
-          description: Total number of DLQ items
-          example: 3
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/DeadLetterQueueItem'
-
-    DeadLetterQueueItem:
-      type: object
-      properties:
-        id:
-          type: string
-          description: DLQ item identifier
-          example: dlq_123
-        deliveryId:
-          type: string
-          description: Original delivery ID
-          example: deliv_123
-        eventId:
-          type: string
-          description: Associated event ID
-          example: event_123
-        eventType:
-          type: string
-          description: Event type
-          example: stream.created
-        endpointUrl:
-          type: string
-          description: Webhook endpoint URL
-          example: https://consumer.example.com/webhook
-        failureReason:
-          type: string
-          description: Reason for failure
-          example: Max attempts exceeded
-        attemptCount:
-          type: integer
-          description: Number of attempts made
-          example: 5
-        createdAt:
-          type: string
-          format: date-time
-          description: When item was created
-          example: '2024-03-10T12:00:00Z'
-        processedAt:
-          type: string
-          nullable: true
-          format: date-time
-          description: When item was processed (null if unprocessed)
-          example: null
-
-    RetryDLQResponse:
-      type: object
-      properties:
-        ok:
-          type: boolean
-          example: true
-        outboxId:
-          type: string
-          description: New outbox item ID for retry
-          example: outbox_456
-        message:
-          type: string
-          example: DLQ item queued for retry
-
-    CircuitBreakerList:
-      type: object
-      properties:
-        total:
-          type: integer
-          description: Total number of circuit breakers
-          example: 2
-        states:
-          type: array
-          items:
-            $ref: '#/components/schemas/CircuitBreakerState'
-
-    CircuitBreakerState:
-      type: object
-      properties:
-        endpointUrl:
-          type: string
-          description: Endpoint URL
-          example: https://consumer.example.com/webhook
-        state:
-          type: string
-          enum: [closed, open, half-open]
-          description: Circuit breaker state
-          example: open
-        failureCount:
-          type: integer
-          description: Number of consecutive failures
-          example: 15
-        lastFailureTime:
-          type: string
-          nullable: true
-          format: date-time
-          description: Time of last failure
-          example: '2024-03-10T12:00:00Z'
-        nextAttemptTime:
-          type: string
-          nullable: true
-          format: date-time
-          description: When next attempt will be allowed
-          example: '2024-03-10T12:05:00Z'
-
-    WebhookMetrics:
-      type: object
-      properties:
-        totalDeliveries:
-          type: integer
-          description: Total number of deliveries
-          example: 1000
-        successfulDeliveries:
-          type: integer
-          description: Number of successful deliveries
-          example: 950
-        failedDeliveries:
-          type: integer
-          description: Number of failed deliveries
-          example: 30
-        dlqItems:
-          type: integer
-          description: Number of items in dead-letter queue
-          example: 20
-        outboxItems:
-          type: integer
-          description: Number of items in outbox
-          example: 5
-        successRate:
-          type: number
-          format: float
-          description: Success rate percentage
-          example: 95.0
-        failureRate:
-          type: number
-          format: float
-          description: Failure rate percentage
-          example: 5.0
-
-    VerifySignatureResponse:
-      type: object
-      properties:
-        ok:
-          type: boolean
-          example: true
-        code:
-          type: string
-          example: ok
-        message:
-          type: string
-          example: Webhook signature verified
-
-    ProcessOutboxResponse:
-      type: object
-      properties:
-        ok:
-          type: boolean
-          example: true
-        processed:
-          type: integer
-          description: Number of items processed
-          example: 10
-        errors:
-          type: integer
-          description: Number of processing errors
-          example: 0
-        total:
-          type: integer
-          description: Total items ready for processing
-          example: 10
-        message:
-          type: string
-          example: Outbox processing completed
-
-    CleanupResponse:
-      type: object
-      properties:
-        ok:
-          type: boolean
-          example: true
-        cleaned:
-          type: integer
-          description: Number of items cleaned up
-          example: 150
-        errors:
-          type: array
-          items:
-            type: string
-          description: List of cleanup errors
-          example: []
-        olderThanDays:
-          type: integer
-          description: Age threshold for cleanup
-          example: 7
-
-    DlqEntry:
-      type: object
-      properties:
-        id:
-          type: string
-          description: DLQ entry identifier
-          example: dlq-1646992800000-abc123
-        topic:
-          type: string
-          description: Event topic
-          example: stream.created
-        payload:
-          type: object
-          description: Event payload
-          example:
-            streamId: stream_123
-            amount: "1000000000"
-        error:
-          type: string
-          description: Error message
-          example: Connection timeout
-        attempts:
-          type: integer
-          description: Number of retry attempts
-          example: 3
-        firstFailedAt:
-          type: string
-          format: date-time
-          description: When the entry first failed
-          example: '2024-03-10T12:00:00Z'
-        lastFailedAt:
-          type: string
-          format: date-time
-          description: When the entry last failed
-          example: '2024-03-10T12:05:00Z'
-        correlationId:
-          type: string
-          nullable: true
-          description: Optional correlation ID
-          example: corr-123
 
   securitySchemes:
     BearerAuth:
@@ -1815,7 +835,5 @@ tags:
     description: Authentication and session management
   - name: Streams
     description: Stream creation, retrieval, and listing
-  - name: Webhooks
-    description: Webhook delivery and management endpoints
   - name: Internal
     description: Internal endpoints for workers and administrators
