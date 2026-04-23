@@ -12,6 +12,8 @@ import {
   revokeApiKey,
   listApiKeys,
 } from '../lib/apiKey.js';
+import { calculateSweepable, validateSweepRequest } from '../lib/sweep.js';
+import { streams } from './streams.js';
 
 export const adminRouter = Router();
 
@@ -183,4 +185,60 @@ adminRouter.delete('/api-keys/:id', (req, res) => {
     const status = msg.includes('not found') ? 404 : 400;
     res.status(status).json({ error: msg });
   }
+});
+
+// ─── Safe Sweep ───────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/admin/sweep
+ *
+ * Calculates the sweepable amount (contract balance minus outstanding
+ * liabilities) and validates that the requested transfer does not steal
+ * funds owed to recipients.
+ *
+ * Invariant: sweepable = contractBalance - outstandingLiabilities
+ *
+ * Body:
+ *   {
+ *     "contractBalance": "1000.0000000",  // reported on-chain balance
+ *     "requestedAmount": "50.0000000"     // amount the operator wants to sweep
+ *   }
+ *
+ * Responses:
+ *   200 — sweep is safe; returns sweepableAmount, totalLiabilities, contractBalance
+ *   400 — invalid input or requested amount exceeds sweepable
+ *   401/403 — missing or invalid admin credentials
+ */
+adminRouter.post('/sweep', (req, res) => {
+  const { contractBalance, requestedAmount } = req.body ?? {};
+
+  if (typeof contractBalance !== 'string' || contractBalance.trim() === '') {
+    res.status(400).json({ error: 'contractBalance (decimal string) is required.' });
+    return;
+  }
+  if (typeof requestedAmount !== 'string' || requestedAmount.trim() === '') {
+    res.status(400).json({ error: 'requestedAmount (decimal string) is required.' });
+    return;
+  }
+
+  let sweepResult;
+  try {
+    sweepResult = calculateSweepable({ contractBalance, streams });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+
+  const validation = validateSweepRequest(requestedAmount, sweepResult);
+  if (!validation.ok) {
+    const status = validation.error.code === 'INVALID_INPUT' ? 400 : 400;
+    res.status(status).json({ error: validation.error.message, code: validation.error.code });
+    return;
+  }
+
+  res.json({
+    message: 'Sweep is safe to execute.',
+    requestedAmount,
+    ...sweepResult,
+  });
 });
