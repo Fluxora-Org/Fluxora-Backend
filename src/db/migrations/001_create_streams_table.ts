@@ -69,6 +69,51 @@ CREATE INDEX IF NOT EXISTS idx_streams_start_time ON streams(start_time);
 CREATE INDEX IF NOT EXISTS idx_streams_end_time ON streams(end_time);
 `;
 
+/**
+ * Audit log table — stores immutable records of privileged state changes.
+ * Written atomically with stream operations via transactionalUpsertStream /
+ * transactionalUpdateStream so audit rows are always in sync with stream rows.
+ */
+export const upAuditLogs = `
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  seq            INTEGER NOT NULL,
+  timestamp      TEXT    NOT NULL,
+  action         TEXT    NOT NULL,
+  resource_type  TEXT    NOT NULL,
+  resource_id    TEXT    NOT NULL,
+  correlation_id TEXT,
+  meta           TEXT    -- JSON string or NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource_id  ON audit_logs(resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action       ON audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp    ON audit_logs(timestamp);
+`;
+
+/**
+ * Webhook outbox table — transactional outbox pattern.
+ * A row is inserted here atomically with the stream write so the webhook
+ * dispatcher can pick it up without risk of the stream being written but
+ * the webhook being lost (or vice-versa).
+ */
+export const upWebhookOutbox = `
+CREATE TABLE IF NOT EXISTS webhook_outbox (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  stream_id  TEXT    NOT NULL,
+  event_type TEXT    NOT NULL,
+  payload    TEXT    NOT NULL, -- JSON string; amounts are decimal strings
+  created_at TEXT    NOT NULL,
+  processed  INTEGER NOT NULL DEFAULT 0 -- 0 = pending, 1 = dispatched
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_outbox_stream_id  ON webhook_outbox(stream_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_outbox_processed  ON webhook_outbox(processed);
+CREATE INDEX IF NOT EXISTS idx_webhook_outbox_created_at ON webhook_outbox(created_at);
+`;
+
 export const down = `
+DROP TABLE IF EXISTS webhook_outbox;
+DROP TABLE IF EXISTS audit_logs;
 DROP TABLE IF EXISTS streams;
 `;
