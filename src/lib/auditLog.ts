@@ -22,11 +22,7 @@
 
 import { logger } from './logger.js';
 
-export type AuditAction =
-  | 'STREAM_CREATED'
-  | 'STREAM_CANCELLED'
-  | 'PAUSE_FLAGS_UPDATED'
-  | 'REINDEX_TRIGGERED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED';
 
 export interface AuditEntry {
   /** Monotonically increasing sequence number within this process lifetime. */

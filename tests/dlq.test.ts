@@ -15,37 +15,44 @@
  * - 200 DELETE (acknowledge) entry
  * - 400 for invalid pagination params
  */
-import express from 'express';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
-import { dlqRouter, enqueueDeadLetter, _resetDlq } from '../src/routes/dlq.js';
-import { errorHandler } from '../src/middleware/errorHandler.js';
-import { requestIdMiddleware } from '../src/errors.js';
-import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
-import { generateToken } from '../src/lib/auth.js';
-import { initializeConfig } from '../src/config/env.js';
+import app from '../src/index.js';
+import { webhookDeliveryStore } from '../src/webhooks/store.js';
+import { webhookService } from '../src/webhooks/service.js';
+import type { WebhookDelivery, WebhookEvent } from '../src/webhooks/types.js';
+import { enqueueDeadLetter, _resetDlq } from '../src/routes/dlq.js';
+import { getAuditEntries, _resetAuditLog } from '../src/lib/auditLog.js';
 
-// Initialize config before any test module code runs (upstream requirement)
-initializeConfig();
+// Test tokens (these should match your test setup)
+const operatorToken = 'operator-test-token';
+const viewerToken = 'viewer-test-token';
 
-function createTestApp() {
-  const app = express();
-  app.use(requestIdMiddleware);
-  app.use(correlationIdMiddleware);
-  app.use(express.json());
-  app.use('/admin/dlq', dlqRouter);
-  app.use(errorHandler);
-  return app;
+// Mock fetch for testing
+const originalFetch = global.fetch;
+let mockFetchResponses: Map<string, Response> = new Map();
+
+function mockFetch(url: string, options?: RequestInit): Promise<Response> {
+  const response = mockFetchResponses.get(url);
+  if (response) {
+    return Promise.resolve(response.clone());
+  }
+  return Promise.reject(new Error(`No mock response for ${url}`));
 }
 
-const operatorToken = generateToken({ address: 'GADMIN', role: 'operator' });
-const viewerToken   = generateToken({ address: 'GVIEWER', role: 'viewer' });
-
-describe('DLQ Admin API', () => {
-  let app: any;
-
+describe('Webhook Dead-Letter Queue', () => {
   beforeEach(() => {
-    app = createTestApp();
+    global.fetch = mockFetch as any;
+    webhookDeliveryStore.clear();
+    mockFetchResponses.clear();
     _resetDlq();
+    _resetAuditLog();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    _resetDlq();
+    _resetAuditLog();
   });
 
   // ── Auth guard tests ──────────────────────────────────────────────────────
@@ -233,5 +240,166 @@ describe('DLQ Admin API', () => {
     expect(entry.firstFailedAt).toBeTruthy();
     expect(entry.lastFailedAt).toBeTruthy();
     expect(entry.correlationId).toBe('corr-123');
+  });
+
+  // Additional tests for audit logging
+  it('GET /admin/dlq records audit event', async () => {
+    enqueueDeadLetter({ topic: 'test.topic', payload: {}, error: 'err', attempts: 1 });
+
+    const res = await request(app)
+      .get('/admin/dlq')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    const auditEntries = getAuditEntries();
+    const dlqAuditEntry = auditEntries.find(e => e.action === 'DLQ_LISTED');
+    expect(dlqAuditEntry).toBeDefined();
+    expect(dlqAuditEntry?.resourceType).toBe('dlq');
+    expect(dlqAuditEntry?.resourceId).toBe('list');
+    expect(dlqAuditEntry?.meta?.total).toBe(1);
+  });
+
+  // Replay endpoint tests
+  it('POST /admin/dlq/:id/replay replays entry with audit logging', async () => {
+    const entry = enqueueDeadLetter({ 
+      topic: 'stream.created', 
+      payload: { streamId: 'test' }, 
+      error: 'timeout', 
+      attempts: 3 
+    });
+
+    const res = await request(app)
+      .post(`/admin/dlq/${entry.id}/replay`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.message).toBe('DLQ entry replayed');
+    expect(res.body.id).toBe(entry.id);
+    expect(res.body.topic).toBe('stream.created');
+
+    // Verify audit logging
+    const auditEntries = getAuditEntries();
+    const replayAuditEntry = auditEntries.find(e => e.action === 'DLQ_REPLAYED');
+    expect(replayAuditEntry).toBeDefined();
+    expect(replayAuditEntry?.resourceType).toBe('dlq');
+    expect(replayAuditEntry?.resourceId).toBe(entry.id);
+    expect(replayAuditEntry?.meta?.topic).toBe('stream.created');
+  });
+
+  it('POST /admin/dlq/:id/replay resets attempts count', async () => {
+    const entry = enqueueDeadLetter({ 
+      topic: 'stream.created', 
+      payload: {}, 
+      error: 'timeout', 
+      attempts: 5 
+    });
+
+    await request(app)
+      .post(`/admin/dlq/${entry.id}/replay`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    // Verify attempts were reset
+    const getRes = await request(app)
+      .get(`/admin/dlq/${entry.id}`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(getRes.body.entry.attempts).toBe(0);
+  });
+
+  it('POST /admin/dlq/:id/replay requires operator role', async () => {
+    const entry = enqueueDeadLetter({ topic: 'test', payload: {}, error: 'err', attempts: 1 });
+
+    const res = await request(app)
+      .post(`/admin/dlq/${entry.id}/replay`)
+      .set('Authorization', `Bearer ${viewerToken}`)
+      .expect(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  it('POST /admin/dlq/:id/replay returns 404 for unknown entry', async () => {
+    const res = await request(app)
+      .post('/admin/dlq/unknown-id/replay')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(404);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+  });
+
+  // Purge endpoint tests
+  it('DELETE /admin/dlq purges all entries with audit logging', async () => {
+    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err1', attempts: 1 });
+    enqueueDeadLetter({ topic: 'stream.cancelled', payload: {}, error: 'err2', attempts: 1 });
+
+    const res = await request(app)
+      .delete('/admin/dlq')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.message).toBe('DLQ entries purged');
+    expect(res.body.purged).toBe(2);
+    expect(res.body.topicFilter).toBe('all');
+    expect(res.body.removedIds).toHaveLength(2);
+
+    // Verify audit logging
+    const auditEntries = getAuditEntries();
+    const purgeAuditEntry = auditEntries.find(e => e.action === 'DLQ_PURGED');
+    expect(purgeAuditEntry).toBeDefined();
+    expect(purgeAuditEntry?.resourceType).toBe('dlq');
+    expect(purgeAuditEntry?.resourceId).toBe('bulk');
+    expect(purgeAuditEntry?.meta?.purgedCount).toBe(2);
+  });
+
+  it('DELETE /admin/dlq?topic=filter purges filtered entries', async () => {
+    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err1', attempts: 1 });
+    enqueueDeadLetter({ topic: 'stream.cancelled', payload: {}, error: 'err2', attempts: 1 });
+    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err3', attempts: 1 });
+
+    const res = await request(app)
+      .delete('/admin/dlq?topic=stream.created')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.purged).toBe(2);
+    expect(res.body.topicFilter).toBe('stream.created');
+
+    // Verify remaining entries
+    const listRes = await request(app)
+      .get('/admin/dlq')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(listRes.body.total).toBe(1);
+    expect(listRes.body.entries[0].topic).toBe('stream.cancelled');
+  });
+
+  it('DELETE /admin/dlq handles empty DLQ gracefully', async () => {
+    const res = await request(app)
+      .delete('/admin/dlq')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.message).toBe('No DLQ entries to purge');
+    expect(res.body.purged).toBe(0);
+  });
+
+  it('DELETE /admin/dlq requires operator role', async () => {
+    const res = await request(app)
+      .delete('/admin/dlq')
+      .set('Authorization', `Bearer ${viewerToken}`)
+      .expect(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  it('DELETE /admin/dlq handles no matching entries', async () => {
+    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err', attempts: 1 });
+
+    const res = await request(app)
+      .delete('/admin/dlq?topic=nonexistent')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.message).toBe('No DLQ entries to purge');
+    expect(res.body.purged).toBe(0);
   });
 });
