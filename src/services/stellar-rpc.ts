@@ -107,6 +107,15 @@ export class CircuitBreaker {
 
   getState(): CircuitState { return this.state; }
 
+  /** Number of failures currently in the rolling window. */
+  getFailureCount(): number {
+    this.evictOldFailures();
+    return this.failures.length;
+  }
+
+  /** Epoch ms when the breaker last tripped to OPEN, or 0 if never. */
+  getOpenedAt(): number { return this.openedAt; }
+
   /** Execute fn through the breaker. Throws CircuitOpenError if OPEN. */
   async call<T>(fn: () => Promise<T>): Promise<T> {
     this.evictOldFailures();

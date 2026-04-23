@@ -490,6 +490,98 @@ All error responses follow this standardized structure:
 
 ---
 
+## RPC Degradation Middleware
+
+When the Stellar RPC provider becomes unreachable the backend activates a **degradation policy** enforced by the `rpcDegradation` middleware. The policy is observable, deterministic, and documented here so that clients and operators can reason about behavior during an outage without guessing.
+
+### Circuit Breaker States
+
+| State | Meaning |
+|-------|---------|
+| `CLOSED` | Normal operation — all requests pass through |
+| `OPEN` | Tripped after repeated RPC failures — writes blocked, reads carry staleness warning |
+| `HALF_OPEN` | One probe call is allowed to test recovery — treated as degraded until the probe succeeds |
+
+The breaker trips when `failureThreshold` failures occur within the rolling `windowMs` window. It stays `OPEN` for `resetTimeoutMs` before transitioning to `HALF_OPEN`.
+
+### Client-Visible Outcomes
+
+| Condition | HTTP Method | Status | Response Headers | Body |
+|-----------|-------------|--------|------------------|------|
+| Circuit CLOSED | Any | Normal route response | `X-Degradation-State: CLOSED` | Normal response body |
+| Circuit OPEN / HALF_OPEN | GET, HEAD, OPTIONS | 200 (stale data) | `Warning: 199 fluxora-backend "Stellar RPC unavailable - data may be stale"`, `X-Degradation-State: OPEN` | Cached / database-backed response |
+| Circuit OPEN / HALF_OPEN | POST, PUT, PATCH, DELETE | 503 | `X-Degradation-State: OPEN` | `{"error":{"code":"SERVICE_UNAVAILABLE","message":"...","degradation":{...}}}` |
+| Circuit recovers → CLOSED | Any | Normal route response | `X-Degradation-State: CLOSED` | Normal response body |
+
+### Response Headers
+
+| Header | Present | Description |
+|--------|---------|-------------|
+| `X-Degradation-State` | Always | Current circuit state: `CLOSED`, `OPEN`, or `HALF_OPEN` |
+| `Warning` | Only when degraded + read request | RFC 7234 warning indicating the response data may be stale |
+
+### Error Response Shape (503)
+
+```json
+{
+  "error": {
+    "code": "SERVICE_UNAVAILABLE",
+    "message": "Stellar RPC is currently unavailable — mutating operations are temporarily suspended",
+    "degradation": {
+      "circuitState": "OPEN",
+      "failureCount": 5,
+      "openedAt": "2026-04-22T22:30:00.000Z"
+    }
+  }
+}
+```
+
+### Trust Boundaries
+
+| Actor | May do | May not do |
+|-------|--------|------------|
+| Public internet clients | Observe `X-Degradation-State` header, read stale data during degradation | Force the circuit open or closed, bypass the write block |
+| Authenticated partners | Same as public clients; additionally retry writes after recovery | Skip the staleness signal or ignore `Warning` headers |
+| Administrators / operators | Monitor state via `/health` and `X-Degradation-State`, manually reset the circuit | Disable the degradation middleware at runtime without a deploy |
+| Internal workers | Continue read-only operations during degradation | Write to chain-derived state while the circuit is tripped |
+
+### Failure Modes
+
+| Condition | Expected Behavior |
+|-----------|-------------------|
+| Single RPC failure | `RpcProviderError` thrown; circuit stays `CLOSED` until threshold reached |
+| Threshold reached | Circuit trips to `OPEN`; subsequent writes return 503 immediately |
+| `OPEN` + read request | 200 with `Warning` header; data served from database/cache |
+| `OPEN` + write request | 503 with error body including degradation diagnostics |
+| Reset timeout expires | Circuit transitions to `HALF_OPEN`; one probe call is allowed |
+| Probe succeeds | Circuit returns to `CLOSED`; normal operation resumes |
+| Probe fails | Circuit returns to `OPEN`; degradation continues |
+| Manual `resetCircuit()` | Circuit forced to `CLOSED`; use for operator recovery |
+
+### Operator Observability
+
+- **`X-Degradation-State` header**: present on every HTTP response; monitor with edge probes or log analysis
+- **`GET /health`**: reports overall service status as `degraded` when the RPC circuit is not `CLOSED`
+- **Structured logs**: state transitions emit `rpc_degradation_transition` events; blocked writes emit `rpc_degradation_write_blocked` events
+- **Triage flow**:
+  1. Check `X-Degradation-State` header on any response or query `/health`
+  2. If `OPEN`: inspect structured logs for `rpc_failure` events to identify the RPC provider issue
+  3. If sustained: consider manual `resetCircuit()` after verifying RPC provider recovery
+  4. If resolved: confirm `X-Degradation-State: CLOSED` on subsequent requests
+
+### Decimal String Serialization Guarantee
+
+The degradation middleware does **not** modify response bodies. All amount fields (`depositAmount`, `ratePerSecond`, etc.) continue to be serialized as decimal strings per the project-wide serialization policy, regardless of degradation state.
+
+### Verification Evidence
+
+- Automated tests: `tests/incidents/rpc_outage.test.ts`
+- Manual check: trip the circuit via repeated RPC failures and verify:
+  - `GET /api/streams` returns 200 with `Warning` and `X-Degradation-State: OPEN`
+  - `POST /api/streams` returns 503 with degradation diagnostics
+
+---
+
 ## Non-Goals & Deferred Work
 
 ### Out of Scope (v0.1.0)
