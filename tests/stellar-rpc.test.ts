@@ -1,83 +1,166 @@
-import { vi as jest } from 'vitest';
-import { StellarRpcClient } from '../src/lib/stellar-rpc.js';
+import { vi as jest, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  StellarRpcService,
+  CircuitBreaker,
+  RpcProviderError,
+  CircuitOpenError,
+  setStellarRpcService,
+  type RawRpcClient,
+} from '../src/services/stellar-rpc.js';
 
-describe('StellarRpcClient', () => {
-  let client: StellarRpcClient;
-  let mockServerInstance: any;
+// ── StellarRpcService — failure classification ────────────────────────────────
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-    
-    // Explicitly create mock methods
-    mockServerInstance = {
-      getLatestLedger: jest.fn(),
-      getHealth: jest.fn(),
-    };
+function makeService(
+  mockFn: () => Promise<{ sequence: number }>,
+  opts: { timeoutMs?: number; failureThreshold?: number } = {},
+): StellarRpcService {
+  const client: RawRpcClient = { getLatestLedger: mockFn };
+  return new StellarRpcService(() => client, { timeoutMs: 50, failureThreshold: 3, ...opts });
+}
 
-    // Use Dependency Injection (passing the mock server to the constructor)
-    client = new StellarRpcClient(mockServerInstance);
+describe('StellarRpcService — failure classification', () => {
+  afterEach(() => setStellarRpcService(null));
+
+  it('classifies a timeout as TIMEOUT kind', async () => {
+    const svc = makeService(() => new Promise(() => {}), { timeoutMs: 20 });
+    const err = await svc.getLatestLedger().catch((e) => e);
+    expect(err).toBeInstanceOf(RpcProviderError);
+    expect((err as RpcProviderError).kind).toBe('TIMEOUT');
   });
 
-  describe('withTimeout', () => {
-    it('should resolve if function completes within timeout', async () => {
-      const fn = jest.fn<() => Promise<string>>().mockResolvedValue('success');
-      const result = await client.withTimeout(fn, 1000);
-      expect(result).toBe('success');
-    });
-
-    it('should reject if function exceeds timeout', async () => {
-      // Use a function that never resolves to test timeout
-      const fn = () => new Promise<string>(() => {});
-      const promise = client.withTimeout(fn, 10);
-      await expect(promise).rejects.toThrow('Operation timed out after 10ms');
-    });
+  it('classifies a network error (ECONNREFUSED) as NETWORK kind', async () => {
+    const netErr = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    const svc = makeService(() => Promise.reject(netErr));
+    const err = await svc.getLatestLedger().catch((e) => e);
+    expect(err).toBeInstanceOf(RpcProviderError);
+    expect((err as RpcProviderError).kind).toBe('NETWORK');
   });
 
-  describe('withRetry', () => {
-    it('should resolve on first attempt if successful', async () => {
-      const fn = jest.fn<() => Promise<string>>().mockResolvedValue('success');
-      const result = await client.withRetry(fn, 3, 1);
-      expect(result).toBe('success');
-      expect(fn).toHaveBeenCalledTimes(1);
-    });
-
-    it('should retry on failure and resolve if subsequent attempt succeeds', async () => {
-      const fn = jest.fn<() => Promise<string>>()
-        .mockRejectedValueOnce(new Error('fail 1'))
-        .mockRejectedValueOnce(new Error('fail 2'))
-        .mockResolvedValue('success');
-
-      const result = await client.withRetry(fn, 3, 1);
-      expect(result).toBe('success');
-      expect(fn).toHaveBeenCalledTimes(3);
-    });
-
-    it('should throw after max retries', async () => {
-      const fn = jest.fn<() => Promise<string>>().mockRejectedValue(new Error('constant fail'));
-      await expect(client.withRetry(fn, 2, 1)).rejects.toThrow('constant fail');
-      expect(fn).toHaveBeenCalledTimes(3); // Initial + 2 retries
-    });
+  it('classifies an HTTP 500 response as PROVIDER kind', async () => {
+    const providerErr = Object.assign(new Error('Internal Server Error'), { statusCode: 500 });
+    const svc = makeService(() => Promise.reject(providerErr));
+    const err = await svc.getLatestLedger().catch((e) => e);
+    expect(err).toBeInstanceOf(RpcProviderError);
+    expect((err as RpcProviderError).kind).toBe('PROVIDER');
+    expect((err as RpcProviderError).statusCode).toBe(500);
   });
 
-  describe('getLatestLedger', () => {
-    it('should call getLatestLedger and return result', async () => {
-      const mockResult = { id: 'ledger-mock-id' };
-      mockServerInstance.getLatestLedger.mockResolvedValue(mockResult);
-
-      const result = await client.getLatestLedger();
-      expect(result).toEqual(mockResult);
-      expect(mockServerInstance.getLatestLedger).toHaveBeenCalled();
-    });
+  it('classifies a generic error as PROVIDER kind', async () => {
+    const svc = makeService(() => Promise.reject(new Error('something went wrong')));
+    const err = await svc.getLatestLedger().catch((e) => e);
+    expect(err).toBeInstanceOf(RpcProviderError);
+    expect((err as RpcProviderError).kind).toBe('PROVIDER');
   });
 
-  describe('getHealth', () => {
-    it('should call getHealth and return result', async () => {
-      const mockResult = { status: 'healthy' };
-      mockServerInstance.getHealth.mockResolvedValue(mockResult);
+  it('includes durationMs in the error', async () => {
+    const svc = makeService(() => new Promise(() => {}), { timeoutMs: 20 });
+    const err = await svc.getLatestLedger().catch((e) => e) as RpcProviderError;
+    expect(typeof err.durationMs).toBe('number');
+    expect(err.durationMs).toBeGreaterThanOrEqual(0);
+  });
+});
 
-      const result = await client.getHealth();
-      expect(result).toEqual(mockResult);
-      expect(mockServerInstance.getHealth).toHaveBeenCalled();
-    });
+// ── StellarRpcService — AbortController cancellation ─────────────────────────
+
+describe('StellarRpcService — AbortController cancellation', () => {
+  afterEach(() => setStellarRpcService(null));
+
+  it('rejects with CANCELLED kind when signal is aborted before call', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const svc = makeService(() => new Promise(() => {}));
+    const err = await svc.getLatestLedger({ signal: controller.signal }).catch((e) => e);
+    expect(err).toBeInstanceOf(RpcProviderError);
+    expect((err as RpcProviderError).kind).toBe('CANCELLED');
+  });
+
+  it('rejects with CANCELLED kind when signal is aborted mid-flight', async () => {
+    const controller = new AbortController();
+    const svc = makeService(() => new Promise(() => {}), { timeoutMs: 5000 });
+    const promise = svc.getLatestLedger({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 10);
+    const err = await promise.catch((e) => e);
+    expect(err).toBeInstanceOf(RpcProviderError);
+    expect((err as RpcProviderError).kind).toBe('CANCELLED');
+  });
+
+  it('resolves normally when signal is not aborted', async () => {
+    const controller = new AbortController();
+    const svc = makeService(() => Promise.resolve({ sequence: 42 }));
+    const result = await svc.getLatestLedger({ signal: controller.signal });
+    expect(result).toEqual({ sequence: 42 });
+  });
+});
+
+// ── StellarRpcService — circuit breaker integration ──────────────────────────
+
+describe('StellarRpcService — circuit breaker integration', () => {
+  afterEach(() => setStellarRpcService(null));
+
+  it('trips the circuit after failureThreshold failures', async () => {
+    const svc = makeService(() => Promise.reject(new Error('fail')), { failureThreshold: 3 });
+    for (let i = 0; i < 3; i++) {
+      await svc.getLatestLedger().catch(() => {});
+    }
+    expect(svc.getCircuitState()).toBe('OPEN');
+  });
+
+  it('throws CircuitOpenError when circuit is OPEN', async () => {
+    const svc = makeService(() => Promise.reject(new Error('fail')), { failureThreshold: 3 });
+    for (let i = 0; i < 3; i++) {
+      await svc.getLatestLedger().catch(() => {});
+    }
+    const err = await svc.getLatestLedger().catch((e) => e);
+    expect(err).toBeInstanceOf(CircuitOpenError);
+    expect((err as CircuitOpenError).kind).toBe('CIRCUIT_OPEN');
+  });
+
+  it('resets to CLOSED after resetCircuit()', async () => {
+    const svc = makeService(() => Promise.reject(new Error('fail')), { failureThreshold: 3 });
+    for (let i = 0; i < 3; i++) {
+      await svc.getLatestLedger().catch(() => {});
+    }
+    svc.resetCircuit();
+    expect(svc.getCircuitState()).toBe('CLOSED');
+  });
+
+  it('returns result when circuit is CLOSED and call succeeds', async () => {
+    const svc = makeService(() => Promise.resolve({ sequence: 100 }));
+    const result = await svc.getLatestLedger();
+    expect(result).toEqual({ sequence: 100 });
+    expect(svc.getCircuitState()).toBe('CLOSED');
+  });
+});
+
+// ── CircuitBreaker unit tests ─────────────────────────────────────────────────
+
+describe('CircuitBreaker', () => {
+  it('starts in CLOSED state', () => {
+    const cb = new CircuitBreaker();
+    expect(cb.getState()).toBe('CLOSED');
+  });
+
+  it('transitions to OPEN after threshold failures', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 2 });
+    const fail = () => Promise.reject(new Error('x'));
+    await cb.call(fail).catch(() => {});
+    await cb.call(fail).catch(() => {});
+    expect(cb.getState()).toBe('OPEN');
+  });
+
+  it('resets to CLOSED on reset()', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 1 });
+    await cb.call(() => Promise.reject(new Error('x'))).catch(() => {});
+    cb.reset();
+    expect(cb.getState()).toBe('CLOSED');
+  });
+
+  it('transitions to HALF_OPEN after resetTimeoutMs', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 10 });
+    await cb.call(() => Promise.reject(new Error('x'))).catch(() => {});
+    expect(cb.getState()).toBe('OPEN');
+    await new Promise((r) => setTimeout(r, 20));
+    await cb.call(() => Promise.resolve('ok')).catch(() => {});
+    expect(cb.getState()).toBe('CLOSED');
   });
 });

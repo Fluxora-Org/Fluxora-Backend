@@ -1,8 +1,10 @@
 import type { Request, Response, NextFunction } from 'express';
 import { DecimalSerializationError, DecimalErrorCode } from '../serialization/decimal.js';
 import { SerializationLogger, error as logError } from '../utils/logger.js';
+import { errorResponse } from '../utils/response.js';
 
 export interface ApiErrorResponse {
+  success: false;
   error: { code: string; message: string; details?: unknown; requestId?: string };
 }
 
@@ -45,27 +47,34 @@ export function errorHandler(
 
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
-    res.status(400).json({
-      error: {
-        code: ApiErrorCode.DECIMAL_ERROR,
-        message: err.message,
-        details: { decimalErrorCode: err.code, field: err.field },
-        requestId,
-      },
-    });
+    res.status(400).json(
+      errorResponse(
+        ApiErrorCode.DECIMAL_ERROR,
+        err.message,
+        { decimalErrorCode: err.code, field: err.field },
+        requestId
+      )
+    );
     return;
   }
 
   if (err instanceof ApiError) {
     logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
-    res.status(err.statusCode).json({ error: { code: err.code, message: err.message, details: err.details, requestId } });
+    res.status(err.statusCode).json(
+      errorResponse(err.code, err.message, err.details, requestId)
+    );
     return;
   }
 
   if ((err as { type?: string }).type === 'entity.too.large') {
-    res.status(413).json({
-      error: { code: ApiErrorCode.PAYLOAD_TOO_LARGE, message: 'Request payload exceeds the configured size limit', requestId },
-    });
+    res.status(413).json(
+      errorResponse(
+        ApiErrorCode.PAYLOAD_TOO_LARGE,
+        'Request payload exceeds the configured size limit',
+        undefined,
+        requestId
+      )
+    );
     return;
   }
 
@@ -76,9 +85,14 @@ export function errorHandler(
     requestId,
   });
 
-  res.status(500).json({
-    error: { code: ApiErrorCode.INTERNAL_ERROR, message: 'An unexpected error occurred. Please try again later.', requestId },
-  });
+  res.status(500).json(
+    errorResponse(
+      ApiErrorCode.INTERNAL_ERROR,
+      'An unexpected error occurred. Please try again later.',
+      undefined,
+      requestId
+    )
+  );
 }
 
 /** Async handler wrapper */

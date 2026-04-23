@@ -27,10 +27,14 @@ export type WebhookVerificationResult = {
   status: 200 | 400 | 401 | 409 | 413;
   code: WebhookVerificationCode;
   message: string;
+  /** True when the previous (rotating-out) secret matched instead of the current one. */
+  usedPreviousSecret?: boolean;
 };
 
 export type VerifyWebhookSignatureInput = {
   secret?: string;
+  /** Previous secret kept valid during rotation window. */
+  secretPrevious?: string;
   deliveryId?: string;
   timestamp?: string;
   signature?: string;
@@ -72,6 +76,7 @@ export function verifyWebhookSignature(
 ): WebhookVerificationResult {
   const {
     secret,
+    secretPrevious,
     deliveryId,
     timestamp,
     signature,
@@ -148,16 +153,30 @@ export function verifyWebhookSignature(
     };
   }
 
-  const expectedSignature = computeWebhookSignature(secret, timestamp, body);
   const actualSignature = signature.trim().toLowerCase();
 
-  const matches = actualSignature.length === expectedSignature.length &&
-    timingSafeEqual(
-      Buffer.from(actualSignature, 'utf8'),
-      Buffer.from(expectedSignature, 'utf8'),
-    );
+  // Try current secret first, then fall back to previous secret (rotation window).
+  const secrets: Array<{ value: string; isPrevious: boolean }> = [
+    { value: secret, isPrevious: false },
+    ...(secretPrevious ? [{ value: secretPrevious, isPrevious: true }] : []),
+  ];
 
-  if (!matches) {
+  let matched = false;
+  let usedPreviousSecret = false;
+
+  for (const { value, isPrevious } of secrets) {
+    const expected = computeWebhookSignature(value, timestamp, body);
+    if (
+      actualSignature.length === expected.length &&
+      timingSafeEqual(Buffer.from(actualSignature, 'utf8'), Buffer.from(expected, 'utf8'))
+    ) {
+      matched = true;
+      usedPreviousSecret = isPrevious;
+      break;
+    }
+  }
+
+  if (!matched) {
     return {
       ok: false,
       status: 401,
@@ -180,5 +199,6 @@ export function verifyWebhookSignature(
     status: 200,
     code: 'ok',
     message: 'Webhook signature verified',
+    ...(usedPreviousSecret ? { usedPreviousSecret: true } : {}),
   };
 }

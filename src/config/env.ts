@@ -49,6 +49,8 @@ export interface Config {
     // Webhooks
     webhookUrl?: string | undefined;
     webhookSecret?: string | undefined;
+    /** Previous secret kept valid during rotation window */
+    webhookSecretPrevious?: string | undefined;
 
     // Feature flags
     enableStreamValidation: boolean;
@@ -266,6 +268,7 @@ export function loadConfig(): Config {
 
         webhookUrl: process.env.WEBHOOK_URL,
         webhookSecret: process.env.WEBHOOK_SECRET,
+        webhookSecretPrevious: process.env.WEBHOOK_SECRET_PREVIOUS,
 
         enableStreamValidation: parseBoolEnv(process.env.ENABLE_STREAM_VALIDATION, true),
         enableRateLimit: parseBoolEnv(process.env.ENABLE_RATE_LIMIT, !isProduction),

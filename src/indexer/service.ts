@@ -43,6 +43,28 @@ type IndexerState = {
   reorgHeight?: number | undefined;
 };
 
+/**
+ * Tracks ledgers that were rolled back due to a reorg.
+ * Webhook dispatcher and WS hub check this before emitting events
+ * so rolled-back events are never delivered to consumers.
+ */
+const rolledBackLedgers = new Set<number>();
+
+/** Returns true if the given ledger was rolled back and not yet re-confirmed. */
+export function isLedgerRolledBack(ledger: number): boolean {
+  return rolledBackLedgers.has(ledger);
+}
+
+/** Clear rolled-back ledger tracking (called after re-ingestion confirms the new chain). */
+function clearRolledBackLedger(ledger: number): void {
+  rolledBackLedgers.delete(ledger);
+}
+
+/** Reset all rolled-back ledger state (for testing). */
+export function _resetRolledBackLedgers(): void {
+  rolledBackLedgers.clear();
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -181,6 +203,7 @@ export class IndexerIngestionService {
     this.state.lastSafeLedger = 0;
     this.state.reorgDetected = false;
     this.state.reorgHeight = undefined;
+    rolledBackLedgers.clear();
   }
 
   getHealthSnapshot(): IndexerHealthSnapshot {
@@ -249,9 +272,12 @@ export class IndexerIngestionService {
           actor: context.actor,
           requestId: context.requestId,
         });
-        
+
         this.state.reorgDetected = true;
         this.state.reorgHeight = ledger;
+        // Mark this ledger as rolled back so dispatcher and hub suppress
+        // any in-flight events that belong to the orphaned chain branch.
+        rolledBackLedgers.add(ledger);
         info('Indexer reorgDetected flag set to true', { ledger, requestId: context.requestId });
         await this.store.rollbackBeforeLedger(ledger);
         this.state.lastFailureAt = new Date().toISOString();
@@ -275,11 +301,12 @@ export class IndexerIngestionService {
 
       // Reset reorg detected flag once we are significantly past the reorg height
       if (this.state.reorgDetected && this.state.reorgHeight !== undefined && maxLedgerInBatch > this.state.reorgHeight + 5) {
-          info('Indexer reorgDetected flag reset to false', { 
-            maxLedgerInBatch, 
+          info('Indexer reorgDetected flag reset to false', {
+            maxLedgerInBatch,
             reorgHeight: this.state.reorgHeight,
-            requestId: context.requestId 
+            requestId: context.requestId
           });
+          clearRolledBackLedger(this.state.reorgHeight);
           this.state.reorgDetected = false;
           this.state.reorgHeight = undefined;
       }

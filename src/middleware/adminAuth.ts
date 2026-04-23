@@ -30,6 +30,10 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   }
 
   const token = parts[1];
+  if (!token) {
+    res.status(401).json({ error: 'Bearer token is missing.' });
+    return;
+  }
 
   // Constant-time-ish comparison to reduce timing side-channels.
   if (token.length !== adminKey.length || !timingSafeEqual(token, adminKey)) {
