@@ -73,3 +73,38 @@ export function mapChainStatusToApiStatus(
     ...CHAIN_TO_API_STATUS[chainStatus],
   };
 }
+
+/**
+ * Valid API-layer status transitions.
+ * Terminal statuses (completed, cancelled) have no outgoing edges.
+ */
+const VALID_API_TRANSITIONS: Partial<Record<ApiStreamStatus, readonly ApiStreamStatus[]>> = {
+  scheduled: ['active', 'cancelled'],
+  active:    ['paused', 'completed', 'cancelled'],
+  paused:    ['active', 'cancelled'],
+  completed: [],
+  cancelled: [],
+};
+
+/**
+ * Returns true when moving from `from` → `to` is a permitted transition.
+ */
+export function isValidApiTransition(from: ApiStreamStatus, to: ApiStreamStatus): boolean {
+  return (VALID_API_TRANSITIONS[from] ?? []).includes(to);
+}
+
+/**
+ * Asserts the transition is valid and returns a descriptive error message when
+ * it is not, so callers can surface a 409 without duplicating the logic.
+ */
+export function assertValidApiTransition(
+  from: ApiStreamStatus,
+  to: ApiStreamStatus,
+): { ok: true } | { ok: false; message: string } {
+  if (isValidApiTransition(from, to)) return { ok: true };
+  const terminal = VALID_API_TRANSITIONS[from]?.length === 0;
+  const message = terminal
+    ? `Stream is already ${from} and cannot be transitioned`
+    : `Cannot transition stream from '${from}' to '${to}'`;
+  return { ok: false, message };
+}

@@ -44,8 +44,41 @@ This document describes the streams database table that maps on-chain streaming 
 
 1. **ID Uniqueness**: Each stream has a unique ID derived deterministically from `stream-{txHash}-{eventIndex}`
 2. **Amount Precision**: All monetary amounts are stored as decimal strings (never floating point)
-3. **Status Transitions**: Valid state machine: `active` → `paused/completed/cancelled`, `paused` → `active/cancelled`
+3. **Status Transitions**: Valid state machine enforced at the API layer — invalid transitions return `409 CONFLICT`
 4. **Audit Trail**: `created_at` and `updated_at` are always populated
+
+### API-Layer Status State Machine
+
+```
+scheduled ──► active ──► paused ──► active
+    │            │           │
+    ▼            ▼           ▼
+cancelled    completed   cancelled
+             (terminal)  (terminal)
+```
+
+| From \ To   | scheduled | active | paused | completed | cancelled |
+|-------------|-----------|--------|--------|-----------|-----------|
+| scheduled   | ✗         | ✓      | ✗      | ✗         | ✓         |
+| active      | ✗         | ✗      | ✓      | ✓         | ✓         |
+| paused      | ✗         | ✓      | ✗      | ✗         | ✓         |
+| completed   | ✗         | ✗      | ✗      | ✗         | ✗         |
+| cancelled   | ✗         | ✗      | ✗      | ✗         | ✗         |
+
+`completed` and `cancelled` are **terminal** — no further transitions are permitted.
+
+Any attempt to transition to an invalid target status returns:
+
+```json
+HTTP 409 Conflict
+{
+  "error": {
+    "code": "CONFLICT",
+    "message": "Stream is already completed and cannot be transitioned",
+    "details": { "streamId": "...", "currentStatus": "completed", "requestedStatus": "active" }
+  }
+}
+```
 
 ### Data Finality
 
@@ -108,6 +141,22 @@ List all streams with filtering and pagination.
 ### GET /api/streams/:id
 
 Get a single stream by ID.
+
+### PATCH /api/streams/:id/status
+
+Transition a stream to a new status. Returns `409 CONFLICT` when the transition
+is not permitted by the state machine (see table above).
+
+**Request body:**
+```json
+{ "status": "paused" }
+```
+
+**Responses:**
+- `200` — stream updated, full stream object returned
+- `400` — unknown status value
+- `404` — stream not found
+- `409` — invalid transition (terminal status or disallowed edge)
 
 ---
 

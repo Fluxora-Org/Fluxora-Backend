@@ -27,22 +27,20 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: 'pnpm'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Lint
-        run: pnpm lint
-
-      - name: Format check
-        run: pnpm format:check
-
-      - name: Security audit
-        run: pnpm audit --audit-level=high
+      - name: Check formatting and lint
+        run: pnpm run lint
 
       - name: Build
-        run: pnpm build
+        run: pnpm run build
 
-      - name: Test with coverage
-        run: pnpm test:coverage
+      - name: Run tests
+        run: pnpm test

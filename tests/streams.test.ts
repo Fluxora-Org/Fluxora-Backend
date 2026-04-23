@@ -27,12 +27,6 @@ import { initializeConfig } from '../src/config/env.js';
 
 // Initialize config before any test module code runs (upstream requirement)
 initializeConfig();
-import { generateToken } from '../src/lib/auth.js';
-import { authenticate } from '../src/middleware/auth.js';
-import { initializeConfig } from '../src/config/env.js';
-
-// Initialize config before any test module code runs (upstream requirement)
-initializeConfig();
 
 // Create a minimal test app
 function createTestApp() {
@@ -40,7 +34,6 @@ function createTestApp() {
   app.use(requestIdMiddleware);
   app.use(correlationIdMiddleware);
   app.use(express.json());
-  app.use(authenticate);
   app.use(authenticate);
   app.use('/api/streams', streamsRouter);
   app.use(errorHandler);
@@ -615,5 +608,178 @@ describe('Error Handler Integration', () => {
     // But in this test setup, it might return 500
     expect(response.status).toBeGreaterThanOrEqual(400);
     expect(response.status).toBeLessThanOrEqual(500);
+  });
+});
+
+// ─── Status Transition Tests ──────────────────────────────────────────────────
+
+describe('Stream Status Transitions', () => {
+  let app: any;
+
+  const BASE_STREAM = {
+    sender: 'GCSX2XXXXXXXXXXXXXXXXXXXXXXX',
+    recipient: 'GDRX2XXXXXXXXXXXXXXXXXXXXXXX',
+    depositAmount: '100',
+    ratePerSecond: '1',
+  };
+
+  beforeEach(() => {
+    app = createTestApp();
+    streams.length = 0;
+    setStreamListingDependencyState('healthy');
+    setIdempotencyDependencyState('healthy');
+    resetStreamIdempotencyStore();
+  });
+
+  async function createStream() {
+    const res = await postStream(app, BASE_STREAM);
+    expect(res.status).toBe(201);
+    return res.body as { id: string; status: string };
+  }
+
+  // ── PATCH /:id/status ────────────────────────────────────────────────────
+
+  describe('PATCH /api/streams/:id/status', () => {
+    it('transitions active → paused', async () => {
+      const { id } = await createStream();
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'paused' });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('paused');
+    });
+
+    it('transitions active → cancelled', async () => {
+      const { id } = await createStream();
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'cancelled' });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('cancelled');
+    });
+
+    it('transitions active → completed', async () => {
+      const { id } = await createStream();
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'completed' });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('completed');
+    });
+
+    it('transitions paused → active', async () => {
+      const { id } = await createStream();
+      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'paused' });
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'active' });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('active');
+    });
+
+    it('returns 409 for active → active (no-op invalid)', async () => {
+      const { id } = await createStream();
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'active' });
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+    });
+
+    it('returns 409 when transitioning from a terminal status (completed)', async () => {
+      const { id } = await createStream();
+      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'completed' });
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'active' });
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+      expect(res.body.error.message).toMatch(/completed/);
+    });
+
+    it('returns 409 when transitioning from a terminal status (cancelled)', async () => {
+      const { id } = await createStream();
+      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'cancelled' });
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'active' });
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+    });
+
+    it('returns 400 for an unknown status value', async () => {
+      const { id } = await createStream();
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'unknown' });
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('returns 400 when status field is missing', async () => {
+      const { id } = await createStream();
+      const res = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({});
+      expect(res.status).toBe(400);
+    });
+
+    it('returns 404 for unknown stream id', async () => {
+      const res = await request(app)
+        .patch('/api/streams/nonexistent/status')
+        .send({ status: 'paused' });
+      expect(res.status).toBe(404);
+    });
+
+    it('preserves decimal-string amount fields after transition', async () => {
+      const res1 = await postStream(app, {
+        ...BASE_STREAM,
+        depositAmount: '1000000.0000000',
+        ratePerSecond: '0.0000116',
+      });
+      const { id } = res1.body;
+      const res2 = await request(app)
+        .patch(`/api/streams/${id}/status`)
+        .send({ status: 'paused' });
+      expect(res2.status).toBe(200);
+      expect(res2.body.depositAmount).toBe('1000000.0000000');
+      expect(res2.body.ratePerSecond).toBe('0.0000116');
+    });
+  });
+
+  // ── DELETE (cancel guard) ────────────────────────────────────────────────
+
+  describe('DELETE /api/streams/:id (cancel guard)', () => {
+    it('returns 409 when cancelling an already-cancelled stream', async () => {
+      const { id } = await createStream();
+      await request(app).delete(`/api/streams/${id}`).expect(200);
+      const res = await request(app).delete(`/api/streams/${id}`);
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+      expect(res.body.error.message).toMatch(/cancelled/);
+    });
+
+    it('returns 409 when cancelling a completed stream', async () => {
+      const { id } = await createStream();
+      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'completed' });
+      const res = await request(app).delete(`/api/streams/${id}`);
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+      expect(res.body.error.message).toMatch(/completed/);
+    });
+
+    it('cancels an active stream successfully', async () => {
+      const { id } = await createStream();
+      const res = await request(app).delete(`/api/streams/${id}`);
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(id);
+    });
+
+    it('cancels a paused stream successfully', async () => {
+      const { id } = await createStream();
+      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'paused' });
+      const res = await request(app).delete(`/api/streams/${id}`);
+      expect(res.status).toBe(200);
+    });
   });
 });

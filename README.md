@@ -137,12 +137,12 @@ This repository currently provides the canonical algorithm and the expected outc
 
 Fluxora webhook deliveries are expected to use these headers:
 
-| Header | Meaning |
-|--------|---------|
-| `x-fluxora-delivery-id` | Stable id for a single delivery attempt chain; use it for deduplication |
-| `x-fluxora-timestamp` | Unix timestamp in seconds |
-| `x-fluxora-signature` | Hex-encoded `HMAC-SHA256(secret, timestamp + "." + rawBody)` |
-| `x-fluxora-event` | Event name such as `stream.created` or `stream.updated` |
+| Header | Meaning | Validation |
+|--------|---------|------------|
+| `x-fluxora-delivery-id` | Stable id for a single delivery attempt chain; use it for deduplication | Required; non-empty string |
+| `x-fluxora-timestamp` | Unix timestamp in seconds | Required; positive integer string |
+| `x-fluxora-signature` | Hex-encoded `HMAC-SHA256(secret, timestamp + "." + rawBody)` | Required; 64-char hex (case-insensitive, whitespace trimmed) |
+| `x-fluxora-event` | Event name such as `stream.created` or `stream.updated` | Informational |
 
 Canonical signing payload:
 
@@ -249,7 +249,12 @@ All messages are JSON. The server only sends; clients may send subscription mess
 ### Operator observability
 
 - `GET /health` includes `wsConnections` — the count of currently connected clients.
-- Connect/disconnect events are logged as structured JSON with `connectionId` and `total`.
+- Connect/disconnect events are logged natively to standard output as structured JSON.
+- **Connection Lifecycle Logs:** - On connection, a `ws_connect` event is emitted containing the assigned `connectionId` and the client's `ip`.
+  - On termination, a `ws_disconnect` event is emitted containing the `connectionId`, connection `durationMs`, closure `code`, closure `reason`, and a `metrics` payload.
+- **Per-Connection Metrics:** Included in the `ws_disconnect` log, the `metrics` object tracks:
+  - `messagesReceived` / `messagesSent`
+  - `bytesReceived` / `bytesSent` (measured purely as utf-8 string buffers to preserve decimal-string serialization guarantees).
 
 ### Manual verification
 
