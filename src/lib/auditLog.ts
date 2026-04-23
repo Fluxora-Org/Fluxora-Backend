@@ -26,25 +26,7 @@
 
 import { logger } from './logger.js';
 
-/**
- * Minimal interface for the DB connection passed to writeAuditEntryToDb.
- * Avoids a hard dependency on better-sqlite3 types while remaining
- * compatible with both the real Database instance and test doubles.
- */
-export interface AuditDbConnection {
-  prepare(sql: string): { run(...args: unknown[]): unknown };
-}
-
-export type AuditAction =
-  | 'STREAM_CREATED'
-  | 'STREAM_CANCELLED'
-  | 'STREAM_UPDATED'
-  | 'STREAM_STATUS_UPDATED'
-  | 'DLQ_LISTED'
-  | 'DLQ_REPLAYED'
-  | 'DLQ_PURGED'
-  | 'PAUSE_FLAGS_UPDATED'
-  | 'REINDEX_TRIGGERED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED';
 
 export interface AuditEntry {
   /** Monotonically increasing sequence number within this process lifetime. */

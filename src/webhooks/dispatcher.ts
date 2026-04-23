@@ -40,7 +40,7 @@ export class WebhookDispatcher {
     const { url, secret, payload, deliveryId, eventType, attemptNumber = 1 } = options;
     const timestamp = Math.floor(Date.now() / 1000).toString();
 
-    logger.info('Dispatching webhook', {
+    logger.info('Dispatching webhook', undefined, {
       deliveryId,
       eventType,
       attemptNumber,
@@ -59,7 +59,7 @@ export class WebhookDispatcher {
       };
 
       if (response.ok) {
-        logger.info('Webhook delivered successfully', {
+        logger.info('Webhook delivered successfully', undefined, {
           deliveryId,
           statusCode: response.status,
           attemptNumber,
@@ -81,7 +81,7 @@ export class WebhookDispatcher {
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
         
-        logger.warn('Webhook delivery failed, will retry', {
+        logger.warn('Webhook delivery failed, will retry', undefined, {
           deliveryId,
           statusCode: response.status,
           attemptNumber,
@@ -98,7 +98,7 @@ export class WebhookDispatcher {
         };
       }
 
-      logger.error('Webhook delivery failed permanently', {
+      logger.error('Webhook delivery failed permanently', undefined, {
         deliveryId,
         statusCode: response.status,
         attemptNumber,
@@ -125,7 +125,7 @@ export class WebhookDispatcher {
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
         
-        logger.warn('Webhook delivery failed with error, will retry', {
+        logger.warn('Webhook delivery failed with error, will retry', undefined, {
           deliveryId,
           attemptNumber,
           error: errorMessage,
@@ -140,7 +140,7 @@ export class WebhookDispatcher {
         };
       }
 
-      logger.error('Webhook delivery failed permanently with error', {
+      logger.error('Webhook delivery failed permanently with error', undefined, {
         deliveryId,
         attemptNumber,
         error: errorMessage,
@@ -206,7 +206,7 @@ export class WebhookDispatcher {
       clearTimeout(timeoutId);
       return response.status < 500; // Accept any non-server-error status
     } catch (error) {
-      logger.warn('Webhook endpoint validation failed', { url, error: error instanceof Error ? error.message : String(error) });
+      logger.warn('Webhook endpoint validation failed', undefined, { url, error: error instanceof Error ? error.message : String(error) });
       return false;
     }
   }

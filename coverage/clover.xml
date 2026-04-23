@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<coverage generated="1776948280123" clover="3.2.0">
+  <project timestamp="1776948280124" name="All files">
+    <metrics statements="89" coveredstatements="89" conditionals="46" coveredconditionals="46" methods="15" coveredmethods="15" elements="150" coveredelements="150" complexity="0" loc="89" ncloc="89" packages="1" files="2" classes="2"/>
+    <file name="store.ts" path="C:\Users\machintosh\Documents\Fouth Wave\Fluxora-Backend\src\indexer\store.ts">
+      <metrics statements="83" coveredstatements="83" conditionals="43" coveredconditionals="43" methods="14" coveredmethods="14"/>
+      <line num="16" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="17" count="50" type="stmt"/>
+      <line num="18" count="50" type="stmt"/>
+      <line num="19" count="50" type="stmt"/>
+      <line num="21" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="22" count="126" type="stmt"/>
+      <line num="23" count="126" type="stmt"/>
+      <line num="24" count="126" type="stmt"/>
+      <line num="25" count="126" type="cond" truecount="1" falsecount="0"/>
+      <line num="26" count="138" type="cond" truecount="2" falsecount="0"/>
+      <line num="27" count="4" type="stmt"/>
+      <line num="28" count="4" type="stmt"/>
+      <line num="29" count="4" type="cond" truecount="1" falsecount="0"/>
+      <line num="30" count="134" type="stmt"/>
+      <line num="31" count="134" type="stmt"/>
+      <line num="32" count="134" type="stmt"/>
+      <line num="33" count="126" type="cond" truecount="1" falsecount="0"/>
+      <line num="34" count="126" type="stmt"/>
+      <line num="35" count="126" type="stmt"/>
+      <line num="37" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="38" count="14" type="stmt"/>
+      <line num="39" count="14" type="stmt"/>
+      <line num="40" count="14" type="cond" truecount="1" falsecount="0"/>
+      <line num="41" count="29" type="cond" truecount="1" falsecount="0"/>
+      <line num="42" count="29" type="stmt"/>
+      <line num="43" count="14" type="cond" truecount="1" falsecount="0"/>
+      <line num="44" count="51" type="cond" truecount="1" falsecount="0"/>
+      <line num="45" count="51" type="stmt"/>
+      <line num="46" count="14" type="cond" truecount="2" falsecount="0"/>
+      <line num="47" count="13" type="stmt"/>
+      <line num="48" count="13" type="stmt"/>
+      <line num="49" count="14" type="stmt"/>
+      <line num="51" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="52" count="115" type="cond" truecount="1" falsecount="0"/>
+      <line num="53" count="481" type="cond" truecount="1" falsecount="0"/>
+      <line num="54" count="481" type="cond" truecount="1" falsecount="0"/>
+      <line num="55" count="72" type="stmt"/>
+      <line num="56" count="115" type="stmt"/>
+      <line num="58" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="60" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="61" count="13" type="cond" truecount="1" falsecount="0"/>
+      <line num="62" count="13" type="stmt"/>
+      <line num="64" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="65" count="5" type="cond" truecount="2" falsecount="0"/>
+      <line num="66" count="5" type="stmt"/>
+      <line num="68" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="70" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="71" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="72" count="1" type="stmt"/>
+      <line num="74" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="75" count="3" type="stmt"/>
+      <line num="76" count="3" type="cond" truecount="1" falsecount="0"/>
+      <line num="77" count="13" type="cond" truecount="2" falsecount="0"/>
+      <line num="78" count="13" type="stmt"/>
+      <line num="79" count="3" type="stmt"/>
+      <line num="80" count="3" type="stmt"/>
+      <line num="81" count="1" type="stmt"/>
+      <line num="83" count="1" type="stmt"/>
+      <line num="84" count="1" type="stmt"/>
+      <line num="85" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="87" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="88" count="3" type="cond" truecount="2" falsecount="0"/>
+      <line num="89" count="2" type="stmt"/>
+      <line num="90" count="2" type="cond" truecount="1" falsecount="0"/>
+      <line num="91" count="4" type="stmt"/>
+      <line num="92" count="4" type="stmt"/>
+      <line num="93" count="4" type="stmt"/>
+      <line num="94" count="2" type="stmt"/>
+      <line num="95" count="2" type="stmt"/>
+      <line num="96" count="2" type="stmt"/>
+      <line num="97" count="2" type="cond" truecount="1" falsecount="0"/>
+      <line num="98" count="2" type="stmt"/>
+      <line num="99" count="2" type="cond" truecount="2" falsecount="0"/>
+      <line num="100" count="2" type="stmt"/>
+      <line num="101" count="3" type="stmt"/>
+      <line num="103" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="104" count="1" type="stmt"/>
+      <line num="105" count="1" type="stmt"/>
+      <line num="107" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="108" count="2" type="stmt"/>
+      <line num="109" count="2" type="cond" truecount="2" falsecount="0"/>
+      <line num="110" count="2" type="stmt"/>
+      <line num="111" count="1" type="stmt"/>
+    </file>
+    <file name="types.ts" path="C:\Users\machintosh\Documents\Fouth Wave\Fluxora-Backend\src\indexer\types.ts">
+      <metrics statements="6" coveredstatements="6" conditionals="3" coveredconditionals="3" methods="1" coveredmethods="1"/>
+      <line num="31" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="32" count="7" type="cond" truecount="1" falsecount="0"/>
+      <line num="33" count="3" type="stmt"/>
+      <line num="34" count="3" type="cond" truecount="1" falsecount="0"/>
+      <line num="35" count="4" type="stmt"/>
+      <line num="36" count="4" type="stmt"/>
+    </file>
+  </project>
+</coverage>

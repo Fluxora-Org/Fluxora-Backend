@@ -1,114 +1,111 @@
-# Fluxora Backend - Streams Feature Documentation
+# Streams — Feature Documentation
 
 ## Overview
 
-This document describes the streams database table that maps on-chain streaming events from the Stellar Soroban blockchain to the backend database.
+Streams are durable, PostgreSQL-backed records that represent on-chain payment streams from the
+Stellar Soroban contract.  All list / get / create / cancel operations go through
+`src/db/repositories/streamRepository.ts` — there is no in-memory fallback.
 
 ---
 
-## 1. Schema Design
+## 1. Database Schema
 
-### Database Table: `streams`
+### Table: `streams`
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | TEXT | PRIMARY KEY | Unique identifier derived from `transaction_hash` + `event_index` |
-| `sender_address` | TEXT | NOT NULL | Stellar address of the sender |
-| `recipient_address` | TEXT | NOT NULL | Stellar address of the recipient |
-| `amount` | TEXT | NOT NULL | Total streaming amount (decimal string) |
-| `streamed_amount` | TEXT | NOT NULL DEFAULT '0' | Amount streamed so far |
-| `remaining_amount` | TEXT | NOT NULL | Remaining amount to stream |
-| `rate_per_second` | TEXT | NOT NULL | Streaming rate per second |
-| `start_time` | INTEGER | NOT NULL | Unix timestamp when stream starts |
-| `end_time` | INTEGER | NOT NULL DEFAULT 0 | Unix timestamp when stream ends (0 = indefinite) |
-| `status` | TEXT | NOT NULL DEFAULT 'active' | Stream status (active/paused/completed/cancelled) |
-| `contract_id` | TEXT | NOT NULL | Soroban contract ID |
-| `transaction_hash` | TEXT | NOT NULL | Transaction hash that created the stream |
-| `event_index` | INTEGER | NOT NULL | Event index within the transaction |
-| `created_at` | TEXT | NOT NULL | When the record was created |
-| `updated_at` | TEXT | NOT NULL | When the record was last updated |
+| Column             | Type        | Constraints                                      | Description                                      |
+|--------------------|-------------|--------------------------------------------------|--------------------------------------------------|
+| `id`               | TEXT        | PRIMARY KEY                                      | Derived from `stream-{txHash}-{eventIndex}`      |
+| `sender_address`   | TEXT        | NOT NULL                                         | Stellar address of the sender                    |
+| `recipient_address`| TEXT        | NOT NULL                                         | Stellar address of the recipient                 |
+| `amount`           | TEXT        | NOT NULL, CHECK decimal-string                   | Total deposit amount (decimal string)            |
+| `streamed_amount`  | TEXT        | NOT NULL DEFAULT '0', CHECK decimal-string       | Amount streamed so far                           |
+| `remaining_amount` | TEXT        | NOT NULL, CHECK decimal-string                   | Remaining amount                                 |
+| `rate_per_second`  | TEXT        | NOT NULL, CHECK decimal-string                   | Streaming rate per second                        |
+| `start_time`       | BIGINT      | NOT NULL, CHECK >= 0                             | Unix epoch seconds                               |
+| `end_time`         | BIGINT      | NOT NULL DEFAULT 0, CHECK >= 0                   | Unix epoch seconds (0 = indefinite)              |
+| `status`           | TEXT        | NOT NULL DEFAULT 'active', CHECK enum            | active / paused / completed / cancelled          |
+| `contract_id`      | TEXT        | NOT NULL                                         | Soroban contract ID                              |
+| `transaction_hash` | TEXT        | NOT NULL                                         | Transaction hash that created the stream         |
+| `event_index`      | INTEGER     | NOT NULL                                         | Event index within the transaction               |
+| `created_at`       | TIMESTAMPTZ | NOT NULL DEFAULT NOW()                           | Record creation timestamp                        |
+| `updated_at`       | TIMESTAMPTZ | NOT NULL DEFAULT NOW()                           | Last update timestamp                            |
+
+**Unique constraint:** `(transaction_hash, event_index)` — guarantees idempotent event ingestion.
 
 ### Indexes
 
-- `idx_streams_status` - For filtering by status
-- `idx_streams_sender` - For sender lookups
-- `idx_streams_recipient` - For recipient lookups
-- `idx_streams_contract` - For contract-scoped queries
-- `idx_streams_created_at` - For time-based queries
+| Index                    | Column(s)          | Purpose                        |
+|--------------------------|--------------------|--------------------------------|
+| `idx_streams_status`     | `status`           | Filter by status               |
+| `idx_streams_sender`     | `sender_address`   | Sender lookups                 |
+| `idx_streams_recipient`  | `recipient_address`| Recipient lookups              |
+| `idx_streams_contract`   | `contract_id`      | Contract-scoped queries        |
+| `idx_streams_created_at` | `created_at`       | Time-based ordering            |
+| `idx_streams_start_time` | `start_time`       | Time-range filtering           |
+| `idx_streams_end_time`   | `end_time`         | Time-range filtering           |
 
 ---
 
-## 2. Service-Level Guarantees
+## 2. Decimal-String Invariant
 
-### Invariants (What "Correct" Data Means)
+All monetary amounts cross the chain/API boundary as **decimal strings** (e.g. `"1000"`,
+`"0.0000116"`).  This prevents JSON floating-point precision loss.
 
-1. **ID Uniqueness**: Each stream has a unique ID derived deterministically from `stream-{txHash}-{eventIndex}`
-2. **Amount Precision**: All monetary amounts are stored as decimal strings (never floating point)
-3. **Status Transitions**: Valid state machine enforced at the API layer — invalid transitions return `409 CONFLICT`
-4. **Audit Trail**: `created_at` and `updated_at` are always populated
+- DB CHECK constraints enforce the format at the storage layer.
+- Zod schemas (`src/validation/schemas.ts`) enforce it at the HTTP boundary.
+- `src/serialization/decimal.ts` provides helpers for validation and display.
+- Numeric types in request bodies are **rejected with 400**.
 
-### API-Layer Status State Machine
+---
+
+## 3. API ↔ DB Field Mapping
+
+The HTTP API uses camelCase; the database uses snake_case.  The `toApiStream()` function in
+`src/routes/streams.ts` performs the mapping:
+
+| API field       | DB column          |
+|-----------------|--------------------|
+| `id`            | `id`               |
+| `sender`        | `sender_address`   |
+| `recipient`     | `recipient_address`|
+| `depositAmount` | `amount`           |
+| `ratePerSecond` | `rate_per_second`  |
+| `startTime`     | `start_time`       |
+| `endTime`       | `end_time`         |
+| `status`        | `status`           |
+
+---
+
+## 4. Status State Machine
 
 ```
-scheduled ──► active ──► paused ──► active
-    │            │           │
-    ▼            ▼           ▼
-cancelled    completed   cancelled
-             (terminal)  (terminal)
+active ──► paused ──► active
+  │           │
+  ▼           ▼
+completed  cancelled  (terminal)
 ```
 
-| From \ To   | scheduled | active | paused | completed | cancelled |
-|-------------|-----------|--------|--------|-----------|-----------|
-| scheduled   | ✗         | ✓      | ✗      | ✗         | ✓         |
-| active      | ✗         | ✗      | ✓      | ✓         | ✓         |
-| paused      | ✗         | ✓      | ✗      | ✗         | ✓         |
-| completed   | ✗         | ✗      | ✗      | ✗         | ✗         |
-| cancelled   | ✗         | ✗      | ✗      | ✗         | ✗         |
+| From \ To   | active | paused | completed | cancelled |
+|-------------|--------|--------|-----------|-----------|
+| active      | ✗      | ✓      | ✓         | ✓         |
+| paused      | ✓      | ✗      | ✗         | ✓         |
+| completed   | ✗      | ✗      | ✗         | ✗         |
+| cancelled   | ✗      | ✗      | ✗         | ✗         |
 
 `completed` and `cancelled` are **terminal** — no further transitions are permitted.
 
-Any attempt to transition to an invalid target status returns:
+Invalid transitions return `409 CONFLICT`:
 
 ```json
-HTTP 409 Conflict
 {
+  "success": false,
   "error": {
     "code": "CONFLICT",
     "message": "Stream is already completed and cannot be transitioned",
-    "details": { "streamId": "...", "currentStatus": "completed", "requestedStatus": "active" }
+    "details": { "streamId": "...", "currentStatus": "completed" }
   }
 }
 ```
-
-### Data Finality
-
-- **Final**: Data is considered final once the transaction is confirmed on Stellar (typically 3-5 seconds)
-- **Pending**: Events that haven't been confirmed are not stored
-- **Stale Data**: No automatic staleness handling - events are reprocessed on chain reorgs
-
----
-
-## 3. Trust Boundaries
-
-| Client Type | Access | Authorization |
-|-------------|--------|---------------|
-| Public users | Read-only (`GET /api/streams`, `GET /api/streams/:id`) | None required |
-| Authenticated users | Limited scoped access | Token-based |
-| Admins | Full access | Role-based |
-| Internal workers | Ingestion + status updates | Service account |
-
----
-
-## 4. Failure Modes & Behavior
-
-| Scenario | Expected Behavior |
-|----------|-------------------|
-| Invalid input | 400 with clear error message |
-| Duplicate event | Ignored (idempotent upsert) |
-| DB outage | 503 + retry-safe response |
-| RPC failure | Partial ingestion + retry queue |
-| Oversized payload | 413 with limit error |
-| High request rate | 429 with rate limit |
 
 ---
 
@@ -116,131 +113,142 @@ HTTP 409 Conflict
 
 ### GET /api/streams
 
-List all streams with filtering and pagination.
+List streams with cursor-based pagination.
 
-**Query Parameters:**
-- `status` - Filter by status (active/paused/completed/cancelled)
-- `sender` - Filter by sender address
-- `recipient` - Filter by recipient address
-- `limit` - Max results (default: 20, max: 100)
-- `offset` - Pagination offset (default: 0)
+**Query parameters:**
+
+| Parameter       | Type    | Default | Description                                  |
+|-----------------|---------|---------|----------------------------------------------|
+| `limit`         | integer | 50      | Results per page (1–100)                     |
+| `cursor`        | string  | —       | Opaque pagination token from previous response|
+| `include_total` | boolean | false   | Include total count (may be expensive)       |
 
 **Response:**
 ```json
 {
-  "streams": [...],
-  "pagination": {
-    "total": 100,
-    "limit": 20,
-    "offset": 0,
-    "hasMore": true
-  }
+  "success": true,
+  "data": {
+    "streams": [...],
+    "has_more": true,
+    "next_cursor": "<opaque>",
+    "total": 100
+  },
+  "meta": { "timestamp": "..." }
 }
 ```
+
+- `total` is only present when `include_total=true`. It reflects the current count at response time and is not a snapshot guarantee.
+- `next_cursor` is only present when `has_more` is `true`.
+
+**Indexed filters:**
+
+The `status`, `sender`, and `recipient` filters map directly to database indexes (`idx_streams_status`, `idx_streams_sender`, `idx_streams_recipient`). Combining filters with cursor pagination is safe — the cursor position is relative to the filtered result set.
 
 ### GET /api/streams/:id
 
 Get a single stream by ID.
 
-### PATCH /api/streams/:id/status
+**Responses:** `200 OK` | `404 NOT_FOUND` | `503 SERVICE_UNAVAILABLE`
 
-Transition a stream to a new status. Returns `409 CONFLICT` when the transition
-is not permitted by the state machine (see table above).
+### POST /api/streams
+
+Create a new stream.  Requires `Authorization: Bearer <token>` and `Idempotency-Key` header.
 
 **Request body:**
 ```json
-{ "status": "paused" }
+{
+  "sender":        "G...",
+  "recipient":     "G...",
+  "depositAmount": "1000",
+  "ratePerSecond": "10",
+  "startTime":     1700000000,
+  "endTime":       0
+}
 ```
 
-**Responses:**
-- `200` — stream updated, full stream object returned
-- `400` — unknown status value
-- `404` — stream not found
-- `409` — invalid transition (terminal status or disallowed edge)
+**Responses:** `201 Created` | `400 VALIDATION_ERROR` | `401 UNAUTHORIZED` | `409 CONFLICT` | `503 SERVICE_UNAVAILABLE`
+
+### DELETE /api/streams/:id
+
+Cancel a stream.  Requires authentication.
+
+**Responses:** `200 OK` | `404 NOT_FOUND` | `409 CONFLICT` | `503 SERVICE_UNAVAILABLE`
+
+### PATCH /api/streams/:id/status
+
+Transition a stream to a new status.
+
+**Request body:** `{ "status": "paused" | "active" | "completed" | "cancelled" }`
+
+**Responses:** `200 OK` | `400 VALIDATION_ERROR` | `404 NOT_FOUND` | `409 CONFLICT` | `503 SERVICE_UNAVAILABLE`
 
 ---
 
-## 6. Event Mapping (Blockchain → DB)
+## 6. Idempotency
 
-### Event Types
+`POST /api/streams` requires an `Idempotency-Key` header (1–128 chars, `[A-Za-z0-9:_-]`).
 
-1. **StreamCreated** - New stream created on chain
-2. **StreamUpdated** - Stream state updated (amounts, status)
-3. **StreamCancelled** - Stream cancelled
+- First request: creates the stream, returns `201`, sets `Idempotency-Replayed: false`.
+- Repeat with same key + same body: returns cached `201`, sets `Idempotency-Replayed: true`.
+- Same key + different body: returns `409 CONFLICT`.
 
-### Idempotency
+The idempotency store is currently in-memory (Redis-backed in production).
 
-- Each event is identified by `transaction_hash` + `event_index`
-- Same event processed twice results in no change (safe retry)
-- Out-of-order events are handled via upsert logic
-
----
-
-## 7. Observability
-
-### Metrics
-
-- `eventsIngested` - Total events successfully ingested
-- `eventsFailed` - Total events that failed
-- `eventsIgnored` - Duplicate events ignored
-- `ingestionRate` - Events per second
-- `failureRate` - Failures per second
-- `avgDbLatency` - Average database operation latency
-- `chainLagMs` - Lag between blockchain and database
-
-### Health Endpoints
-
-- `GET /health` - Basic liveness
-- `GET /health/ready` - Readiness with DB and metrics checks
-- `GET /health/metrics` - Current metrics snapshot
+At the DB layer, `upsertStream` uses `INSERT … ON CONFLICT DO NOTHING` on
+`(transaction_hash, event_index)` for safe blockchain event replay.
 
 ---
 
-## 8. Runbook
+## 7. Trust Boundaries
 
-### How to Detect Ingestion Lag
-
-1. Check `/health/metrics` for `chainLagMs`
-2. If lag > 5 minutes, investigate RPC connectivity
-3. Check logs for ingestion failures
-
-### How to Replay Events
-
-1. Events are stored with `transaction_hash` + `event_index`
-2. To replay, call the event processor with the same event data
-3. Idempotency ensures no duplicates
-
-### Known Limitations
-
-- SQLite database (not production-grade for high concurrency)
-- No real-time event subscription (polling-based)
-- Single-node deployment only
+| Client Type        | Access                                    | Auth required |
+|--------------------|-------------------------------------------|---------------|
+| Public users       | `GET /api/streams`, `GET /api/streams/:id`| No            |
+| Authenticated users| `POST`, `DELETE`, `PATCH /status`         | JWT Bearer    |
+| Internal workers   | Indexer ingestion via `upsertStream`      | Service account|
 
 ---
 
-## 9. Testing
+## 8. Failure Modes
 
-Run tests with:
+| Scenario              | HTTP Status | Error Code           |
+|-----------------------|-------------|----------------------|
+| Invalid input         | 400         | `VALIDATION_ERROR`   |
+| Missing auth          | 401         | `UNAUTHORIZED`       |
+| Stream not found      | 404         | `NOT_FOUND`          |
+| Invalid transition    | 409         | `CONFLICT`           |
+| Idempotency conflict  | 409         | `CONFLICT`           |
+| DB pool exhausted     | 503         | `SERVICE_UNAVAILABLE`|
+| Dependency down       | 503         | `SERVICE_UNAVAILABLE`|
+
+---
+
+## 9. Running Tests
+
 ```bash
-npm test
-```
+# All tests
+pnpm test
 
-Run with coverage:
-```bash
-npm run test:coverage
-```
+# With coverage (target ≥ 95%)
+pnpm test:coverage
 
-Target: ≥95% coverage on new modules.
+# Specific suites
+pnpm test tests/routes/streams.test.ts
+pnpm test tests/streamsRepository.test.ts
+```
 
 ---
 
 ## 10. Files
 
-- `src/db/types.ts` - Database types and invariants
-- `src/db/connection.ts` - Database connection management
-- `src/db/migrate.ts` - Migration runner
-- `src/db/migrations/001_create_streams_table.ts` - Schema migration
-- `src/db/repositories/streamRepository.ts` - Stream CRUD operations
-- `src/services/streamEventService.ts` - Event processing service
-- `src/metrics/index.ts` - Metrics tracking
-- `src/routes/streams.ts` - API endpoints
+| File                                              | Purpose                                      |
+|---------------------------------------------------|----------------------------------------------|
+| `src/db/types.ts`                                 | TypeScript types for DB records              |
+| `src/db/pool.ts`                                  | PostgreSQL connection pool + query helper    |
+| `src/db/migrations/001_create_streams_table.ts`   | PostgreSQL DDL migration                     |
+| `src/db/repositories/streamRepository.ts`         | All DB operations for streams                |
+| `src/routes/streams.ts`                           | HTTP route handlers                          |
+| `src/validation/schemas.ts`                       | Zod input validation schemas                 |
+| `src/serialization/decimal.ts`                    | Decimal-string helpers                       |
+| `tests/routes/streams.test.ts`                    | Route integration tests (mocked DB)          |
+| `tests/streamsRepository.test.ts`                 | Repository unit tests (mocked pool)          |

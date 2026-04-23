@@ -17,6 +17,9 @@ import { initializeMigrations } from './db/migrate.js';
 import { getPool } from './db/pool.js';
 import { createStreamHub, getStreamHub } from './ws/hub.js';
 
+// Export a pre-built app instance for use in tests and other consumers.
+export { app } from './app.js';
+
 // Configuration
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const NODE_ENV = process.env.NODE_ENV || 'development';

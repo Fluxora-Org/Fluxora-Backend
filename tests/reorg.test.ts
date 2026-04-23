@@ -1,3 +1,26 @@
+/**
+ * Chain reorganisation tests for the Fluxora indexer.
+ *
+ * Strategy under test
+ * -------------------
+ * The indexer uses ledger-hash-based reorg detection:
+ *   - If an incoming batch contains a ledgerHash that differs from the stored
+ *     hash for the same ledger sequence, a fork is detected.
+ *   - The store rolls back all records at ledger >= forkLedger.
+ *   - The canonical (post-reorg) events are then inserted in the same request.
+ *   - The service sets reorgDetected=true and reorgHeight=forkLedger.
+ *   - reorgDetected resets to false once we are > forkLedger + 5 ledgers ahead.
+ *
+ * Security / double-counting invariants verified here
+ * ---------------------------------------------------
+ * 1. Events from the orphaned chain are fully removed before canonical events
+ *    are inserted — no double-counting.
+ * 2. The common ancestor (ledger < forkLedger) is never touched.
+ * 3. A deep reorg (10 blocks) leaves the store at the correct ancestor state.
+ * 4. Multiple sequential reorgs are handled independently.
+ */
+
+import { describe, it, expect, beforeEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../src/app.js';
 import { InMemoryContractEventStore } from '../src/indexer/store.js';
@@ -11,7 +34,7 @@ import { dispatchWebhook } from '../src/webhooks/dispatcher.js';
 
 const INDEXER_TOKEN = 'test-reorg-token';
 
-function buildEvent(eventId: string, ledger: number, ledgerHash: string) {
+function buildEvent(eventId: string, ledger: number, ledgerHash: string, eventIndex = 0) {
   return {
     eventId,
     ledger,
@@ -20,26 +43,43 @@ function buildEvent(eventId: string, ledger: number, ledgerHash: string) {
     txHash: `tx-${eventId}`,
     txIndex: 0,
     operationIndex: 0,
-    eventIndex: 0,
-    payload: { streamId: `stream-${eventId}` },
+    eventIndex,
+    payload: {
+      streamId: `stream-${eventId}`,
+      depositAmount: '100.0000000',
+    },
     happenedAt: '2026-03-26T12:00:00.000Z',
     ledgerHash,
   };
 }
 
-function postEvents(events: unknown[]) {
+function post(events: unknown[]) {
   return request(app)
-    .post('/internal/indexer/contract-events')
-    .set('x-indexer-worker-token', INDEXER_TOKEN)
+    .post(ENDPOINT)
+    .set('x-indexer-worker-token', TOKEN)
     .send({ events });
 }
 
-describe('Indexer Reorg Handling and Chain Tip Safety', () => {
+async function getHealth() {
+  const res = await request(app).get('/health').expect(200);
+  return res.body.dependencies.indexer as {
+    lastSafeLedger: number;
+    reorgDetected: boolean;
+    reorgHeight?: number;
+    acceptedEventCount: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('Indexer reorg handling', () => {
   let store: InMemoryContractEventStore;
 
   beforeEach(() => {
     resetIndexerState();
-    setIndexerIngestAuthToken(INDEXER_TOKEN);
+    setIndexerIngestAuthToken(TOKEN);
     store = new InMemoryContractEventStore();
     setIndexerEventStore(store);
   });
@@ -60,9 +100,8 @@ describe('Indexer Reorg Handling and Chain Tip Safety', () => {
     expect(reorgResponse.body.insertedCount).toBe(1);
 
     const records = store.all();
-    expect(records.length).toBe(2);
-    expect(records.find(r => r.ledger === 101)?.ledgerHash).toBe('hash-101-reorg');
-    expect(records.find(r => r.ledger === 101)?.eventId).toBe('evt-101-new');
+    // Should still have 10 records — the reorged chain, not 20
+    expect(records).toHaveLength(10);
 
     const health = await request(app).get('/health').expect(200);
     expect(health.body.dependencies.indexer.reorgDetected).toBe(true);

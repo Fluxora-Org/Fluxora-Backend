@@ -748,3 +748,148 @@ describe('WebSocket hub — observability and metrics', () => {
     consoleSpy.mockRestore();
   });
 });
+
+// ── JWT auth tests ────────────────────────────────────────────────────────────
+
+import jwt from 'jsonwebtoken';
+
+const TEST_JWT_SECRET = 'test-ws-jwt-secret';
+
+function makeToken(payload: object = { sub: 'user-1' }, secret = TEST_JWT_SECRET): string {
+  return jwt.sign(payload, secret);
+}
+
+async function setupWithAuth(opts: { wsAuthRequired: boolean; jwtSecret?: string } = { wsAuthRequired: true }): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  const server = http.createServer();
+  const hub = new StreamHub(server, {
+    wsAuthRequired: opts.wsAuthRequired,
+    jwtSecret: opts.jwtSecret ?? TEST_JWT_SECRET,
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address() as { port: number };
+      resolve({ server, hub, port: addr.port });
+    });
+  });
+}
+
+function connectWithToken(port: number, token: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/streams`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    ws.once('open', () => resolve(ws));
+    ws.once('error', reject);
+    ws.once('unexpected-response', (_req, res) => {
+      reject(new Error(`HTTP ${res.statusCode}`));
+    });
+  });
+}
+
+function connectWithQueryToken(port: number, token: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/streams?token=${encodeURIComponent(token)}`);
+    ws.once('open', () => resolve(ws));
+    ws.once('error', reject);
+    ws.once('unexpected-response', (_req, res) => {
+      reject(new Error(`HTTP ${res.statusCode}`));
+    });
+  });
+}
+
+function connectExpect401(port: number, headers?: Record<string, string>): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/streams`, { headers });
+    ws.once('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0));
+    ws.once('open', () => { ws.close(); reject(new Error('Expected 401 but connection opened')); });
+    ws.once('error', reject);
+  });
+}
+
+describe('WebSocket hub — JWT authentication', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+
+  afterEach(async () => {
+    await teardown(server, hub);
+  });
+
+  it('accepts a valid JWT in Authorization header when auth is required', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: true }));
+    const token = makeToken();
+    const ws = await connectWithToken(port, token);
+    expect(hub.clientCount).toBe(1);
+    ws.close();
+    await sleep(50);
+  });
+
+  it('accepts a valid JWT in ?token= query string when auth is required', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: true }));
+    const token = makeToken();
+    const ws = await connectWithQueryToken(port, token);
+    expect(hub.clientCount).toBe(1);
+    ws.close();
+    await sleep(50);
+  });
+
+  it('rejects with 401 when no token is provided and auth is required', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: true }));
+    const status = await connectExpect401(port);
+    expect(status).toBe(401);
+    expect(hub.clientCount).toBe(0);
+  });
+
+  it('rejects with 401 when token is signed with wrong secret', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: true }));
+    const badToken = makeToken({ sub: 'attacker' }, 'wrong-secret');
+    const status = await connectExpect401(port, { Authorization: `Bearer ${badToken}` });
+    expect(status).toBe(401);
+  });
+
+  it('rejects with 401 when token is malformed', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: true }));
+    const status = await connectExpect401(port, { Authorization: 'Bearer not.a.jwt' });
+    expect(status).toBe(401);
+  });
+
+  it('rejects with 401 when token is expired', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: true }));
+    const expiredToken = jwt.sign({ sub: 'user-1', exp: Math.floor(Date.now() / 1000) - 10 }, TEST_JWT_SECRET);
+    const status = await connectExpect401(port, { Authorization: `Bearer ${expiredToken}` });
+    expect(status).toBe(401);
+  });
+
+  it('allows all connections when auth is disabled (backward-compatible default)', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: false }));
+    // No token at all — should connect fine.
+    const ws = await connect(port);
+    expect(hub.clientCount).toBe(1);
+    ws.close();
+    await sleep(50);
+  });
+
+  it('allows connections with a valid token even when auth is disabled', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: false }));
+    const token = makeToken();
+    const ws = await connectWithToken(port, token);
+    expect(hub.clientCount).toBe(1);
+    ws.close();
+    await sleep(50);
+  });
+
+  it('authenticated client can subscribe and receive broadcasts', async () => {
+    ({ server, hub, port } = await setupWithAuth({ wsAuthRequired: true }));
+    const ws = await connectWithToken(port, makeToken());
+    send(ws, { type: 'subscribe', streamId: 'auth-stream' });
+    await sleep(30);
+
+    const msgPromise = nextMessage(ws);
+    await hub.broadcast({ streamId: 'auth-stream', eventId: 'auth-evt-1', payload: { depositAmount: '100.0000000' } });
+    const msg = (await msgPromise) as any;
+
+    expect(msg.type).toBe('stream_update');
+    expect(typeof msg.payload.depositAmount).toBe('string');
+    ws.close();
+  });
+});

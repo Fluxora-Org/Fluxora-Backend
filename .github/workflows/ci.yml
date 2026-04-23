@@ -2,23 +2,28 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop, 'feature/**' ]
+    branches: [main, develop, 'feature/**']
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
 
 jobs:
-  build:
-    name: Build, Lint, and Test
+  ci:
+    name: Lint, Format, Test
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        node-version: [18.x, 20.x]
+        node-version: [20.x]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js ${{ matrix.node-version }}
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
