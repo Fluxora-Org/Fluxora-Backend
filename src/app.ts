@@ -5,6 +5,8 @@ import { healthRouter } from './routes/health.js';
 import { indexerRouter } from './routes/indexer.js';
 import { auditRouter } from './routes/audit.js';
 import { dlqRouter } from './routes/dlq.js';
+import { authRouter } from './routes/auth.js';
+import { adminRouter } from './routes/admin.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
@@ -43,7 +45,9 @@ export function createApp(options: AppOptions = {}): Express {
   }
 
   app.use('/health', healthRouter);
+  app.use('/api/auth', authRouter);
   app.use('/api/streams', streamsRouter);
+  app.use('/api/admin', adminRouter);
   app.use('/internal/indexer', indexerRouter);
   app.use('/api/audit', auditRouter);
   app.use('/admin/dlq', dlqRouter);

@@ -1,4 +1,3 @@
-/** @type {import('jest').Config} */
 module.exports = {
   preset: 'ts-jest/presets/default-esm',
   testEnvironment: 'node',
@@ -7,21 +6,13 @@ module.exports = {
     '^(\\.{1,2}/.*)\\.js$': '$1',
   },
   transform: {
-    '^.+\\.tsx?$': [
+    '^.+\\.ts$': [
       'ts-jest',
       {
         useESM: true,
-        tsconfig: {
-          module: 'ESNext',
-          moduleResolution: 'bundler',
-        },
       },
     ],
   },
   testMatch: ['**/tests/**/*.test.ts'],
-  // Exclude test files that import from vitest (not installed)
-  testPathIgnorePatterns: [
-    '/node_modules/',
-  ],
-  globals: {},
+  collectCoverageFrom: ['src/**/*.ts', '!src/index.ts'],
 };

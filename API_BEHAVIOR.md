@@ -221,6 +221,86 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 - **Behavior**: Stream creation may fail; listing may return stale data
 - **Recovery**: Automatic; retry after 30 seconds
 
+---
+
+## Stellar RPC: Timeout, Cancellation, and Failure Classification
+
+### Overview
+
+All Stellar RPC calls go through `StellarRpcService` in `src/services/stellar-rpc.ts`, which enforces:
+
+- **Per-call timeout** — configurable via `RPC_TIMEOUT_MS` (default 5 000 ms)
+- **AbortController cancellation** — callers may pass an `AbortSignal` to cancel in-flight calls
+- **Structured failure classification** — every failure is tagged with a `kind` field
+- **Circuit breaker** — trips after repeated failures to prevent cascade
+
+### Failure Kinds (`RpcFailureKind`)
+
+| Kind | Cause | Operator action |
+|------|-------|-----------------|
+| `TIMEOUT` | Call did not complete within `timeoutMs` | Check RPC endpoint latency; increase `RPC_TIMEOUT_MS` if needed |
+| `NETWORK` | Connection-level error (`ECONNREFUSED`, `ENOTFOUND`, etc.) | Verify network path to RPC endpoint; check DNS |
+| `PROVIDER` | RPC returned an error response (4xx / 5xx) | Inspect `statusCode` in log; check RPC provider status |
+| `CIRCUIT_OPEN` | Circuit breaker is OPEN; call was not attempted | Wait for `RPC_CB_RESET_TIMEOUT_MS`; check upstream health |
+| `CANCELLED` | Caller aborted via `AbortSignal` | Expected; no action required |
+
+### Structured Log Fields
+
+Every failure emits a `warn` log with these fields:
+
+```json
+{
+  "event": "rpc_failure",
+  "operation": "getLatestLedger",
+  "kind": "TIMEOUT",
+  "statusCode": null,
+  "durationMs": 5001,
+  "error": "getLatestLedger timed out after 5000ms"
+}
+```
+
+### AbortController Usage
+
+Pass an `AbortSignal` to cancel a call externally:
+
+```ts
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 3000); // cancel after 3 s
+
+try {
+  const ledger = await rpcService.getLatestLedger({ signal: controller.signal });
+} catch (err) {
+  if (err instanceof RpcProviderError && err.kind === 'CANCELLED') {
+    // call was cancelled — safe to ignore or retry
+  }
+}
+```
+
+### Circuit Breaker Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `RPC_TIMEOUT_MS` | `5000` | Per-call timeout in ms |
+| `RPC_CB_FAILURE_THRESHOLD` | `5` | Failures within window before tripping |
+| `RPC_CB_WINDOW_MS` | `30000` | Rolling failure-counting window in ms |
+| `RPC_CB_RESET_TIMEOUT_MS` | `60000` | Time OPEN before allowing a probe in ms |
+
+### Failure Modes and Expected Behavior
+
+| Condition | `kind` | Circuit breaker | Client-visible outcome |
+|-----------|--------|-----------------|------------------------|
+| RPC unreachable | `NETWORK` | Counts toward threshold | `503 Service Unavailable` |
+| RPC slow / hung | `TIMEOUT` | Counts toward threshold | `503 Service Unavailable` |
+| RPC 5xx response | `PROVIDER` | Counts toward threshold | `503 Service Unavailable` |
+| Breaker OPEN | `CIRCUIT_OPEN` | Already OPEN | `503 Service Unavailable` (fast-fail) |
+| Caller cancelled | `CANCELLED` | Does **not** count | Request aborted; no response sent |
+
+### Security Notes
+
+- Timeout values are read from environment variables at startup; they are not user-controllable at runtime.
+- `AbortSignal` cancellation does not suppress circuit-breaker accounting — only `CANCELLED` failures are excluded from the failure count.
+- No RPC credentials or internal error details are forwarded to HTTP clients; only `503` with a generic message is returned.
+
 #### Worker Queue Full
 - **Trigger**: Indexer worker queue exceeds capacity
 - **Status**: 503

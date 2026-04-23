@@ -11,14 +11,16 @@
  *
  * Trust boundaries
  * ----------------
- * - Public internet clients: may list, read, create, and cancel streams.
- *   Authentication/authorisation is a planned follow-up (see non-goals below).
+ * - Public internet clients: may list and read streams without authentication.
+ * - Authenticated partners: may create and cancel streams with valid JWT.
  * - Internal workers: same surface; no elevated privileges yet.
  *
  * Failure modes
  * -------------
  * - Invalid decimal string  → 400 VALIDATION_ERROR with per-field details
  * - Missing required field  → 400 VALIDATION_ERROR
+ * - Missing authentication  → 401 UNAUTHORIZED
+ * - Invalid token           → 401 UNAUTHORIZED
  * - Stream not found        → 404 NOT_FOUND
  * - Duplicate cancel        → 409 CONFLICT
  * - Listing dependency down → 503 SERVICE_UNAVAILABLE
@@ -27,7 +29,6 @@
  * Non-goals (intentionally deferred)
  * -----------------------------------
  * - Persistent storage (in-memory only; PostgreSQL integration is follow-up)
- * - Authentication / JWT enforcement on stream routes
  * - Rate limiting
  *
  * @openapi
@@ -109,6 +110,7 @@ import {
 } from '../middleware/errorHandler.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
 
 export const streamsRouter = Router();
 
@@ -361,10 +363,12 @@ streamsRouter.get(
 
 /**
  * POST /api/streams
- * Create a new stream. Auth intentionally deferred — see non-goals above.
+ * Create a new stream. Requires authentication.
  */
 streamsRouter.post(
   '/',
+  authenticate,
+  requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId      = (req as any).id as string | undefined;
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
@@ -432,10 +436,12 @@ streamsRouter.post(
 
 /**
  * DELETE /api/streams/:id
- * Cancel a stream.
+ * Cancel a stream. Requires authentication.
  */
 streamsRouter.delete(
   '/:id',
+  authenticate,
+  requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const { id }    = req.params;
     const requestId = (req as any).id as string | undefined;

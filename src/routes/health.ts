@@ -5,6 +5,7 @@ import { HealthCheckManager } from '../config/health.js';
 import { Logger } from '../config/logger.js';
 import { Config } from '../config/env.js';
 import { successResponse, errorResponse } from '../utils/response.js';
+import { isShuttingDown } from '../shutdown.js';
 
 export const healthRouter = Router();
 
@@ -12,6 +13,20 @@ export const healthRouter = Router();
  * GET /health - Liveness + basic system status
  */
 healthRouter.get('/', (req: Request, res: Response) => {
+  // Return 503 during graceful shutdown
+  if (isShuttingDown()) {
+    return res.status(503).json(
+      successResponse({
+        status: 'shutting_down',
+        service: 'fluxora-backend',
+        network: req.app.locals.config?.stellarNetwork ?? 'unknown',
+        contractAddresses: (req.app.locals.config as Config | undefined)?.contractAddresses ?? {},
+        timestamp: new Date().toISOString(),
+        message: 'Service is shutting down',
+      })
+    );
+  }
+
   const config = req.app.locals.config as Config | undefined;
   let indexer;
   try {
@@ -37,6 +52,11 @@ healthRouter.get('/', (req: Request, res: Response) => {
  * GET /health/ready - Readiness probe
  */
 healthRouter.get('/ready', async (req: Request, res: Response) => {
+  // Return 503 during graceful shutdown
+  if (isShuttingDown()) {
+    return res.status(503).json(errorResponse('Service is shutting down', 'SERVICE_SHUTTING_DOWN'));
+  }
+
   const healthManager = req.app.locals.healthManager as HealthCheckManager;
   const logger = req.app.locals.logger as Logger;
   try {
