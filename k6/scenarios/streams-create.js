@@ -14,25 +14,32 @@ let counter = 0;
 /**
  * Exercises POST /api/streams.
  *
- * Trust boundary: authenticated partners (auth not yet enforced—recorded
- * as follow-up work).
+ * Trust boundary: public internet clients (auth deferred).
  *
- * Expected behavior:
- *   - Valid payload  → 201 with the created stream (includes generated id).
- *   - Empty body     → the service currently defaults every field; load test
- *     confirms this doesn't crash but flags it as a gap for input validation.
+ * Contract:
+ *   - Requires Idempotency-Key header (1–128 chars, [A-Za-z0-9:_-])
+ *   - depositAmount and ratePerSecond must be decimal strings
+ *   - 201 response body: { id, sender, recipient, depositAmount, ratePerSecond,
+ *                          startTime, endTime, status }
+ *   - Amounts in response are decimal strings (never native JSON numbers)
  *
  * Failure modes tested:
- *   - Completely empty body (no JSON).
- *   - Missing required fields.
+ *   - Missing Idempotency-Key → 400 VALIDATION_ERROR
+ *   - Empty body              → 400 VALIDATION_ERROR
  */
 export default function streamsCreateScenario() {
   counter++;
 
-  // --- Happy path: well-formed payload ---
+  // Unique idempotency key per iteration — prevents replay collisions across VUs.
+  const idempotencyKey = `k6-${__VU}-${__ITER}`;
+
+  // --- Happy path: well-formed payload with required Idempotency-Key ---
   const payload = makeStreamPayload(counter);
   const res = http.post(`${BASE_URL}/api/streams`, payload, {
-    ...JSON_HEADERS,
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': idempotencyKey,
+    },
     tags: { endpoint: 'streams_create' },
   });
 
@@ -40,32 +47,43 @@ export default function streamsCreateScenario() {
   if (passed) {
     check(res, {
       'POST /api/streams — has id': (r) => {
-        try {
-          return !!JSON.parse(r.body).id;
-        } catch (_) {
-          return false;
-        }
+        try { return typeof JSON.parse(r.body).id === 'string'; } catch (_) { return false; }
       },
       'POST /api/streams — status active': (r) => {
-        try {
-          return JSON.parse(r.body).status === 'active';
-        } catch (_) {
-          return false;
-        }
+        try { return JSON.parse(r.body).status === 'active'; } catch (_) { return false; }
+      },
+      // Decimal-string serialization policy: amounts must be strings, not numbers.
+      'POST /api/streams — depositAmount is decimal string': (r) => {
+        try { return typeof JSON.parse(r.body).depositAmount === 'string'; } catch (_) { return false; }
+      },
+      'POST /api/streams — ratePerSecond is decimal string': (r) => {
+        try { return typeof JSON.parse(r.body).ratePerSecond === 'string'; } catch (_) { return false; }
       },
     });
   }
   streamsCreateLatency.add(res.timings.duration);
 
-  // --- Edge case: empty body ---
-  const emptyRes = http.post(`${BASE_URL}/api/streams`, '{}', {
+  // --- Missing Idempotency-Key → 400 ---
+  const noKeyRes = http.post(`${BASE_URL}/api/streams`, payload, {
     ...JSON_HEADERS,
     tags: { endpoint: 'streams_create' },
   });
-  // Current implementation defaults all fields and returns 201.
-  // This check documents current behavior; tighten when validation is added.
+  const noKeyOk = check(noKeyRes, {
+    'POST /api/streams (no idempotency key) — status 400': (r) => r.status === 400,
+  });
+  errorRate.add(!noKeyOk);
+  streamsCreateLatency.add(noKeyRes.timings.duration);
+
+  // --- Empty body → 400 ---
+  const emptyRes = http.post(`${BASE_URL}/api/streams`, '{}', {
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': `${idempotencyKey}-empty`,
+    },
+    tags: { endpoint: 'streams_create' },
+  });
   const emptyOk = check(emptyRes, {
-    'POST /api/streams (empty) — no 5xx': (r) => r.status < 500,
+    'POST /api/streams (empty body) — status 400': (r) => r.status === 400,
   });
   errorRate.add(!emptyOk);
   streamsCreateLatency.add(emptyRes.timings.duration);

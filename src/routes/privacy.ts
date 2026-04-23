@@ -8,6 +8,7 @@
  */
 
 import { Router } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import {
   STREAM_FIELD_POLICIES,
   REQUEST_FIELD_POLICIES,
@@ -18,16 +19,53 @@ import {
 
 export const privacyRouter = Router();
 
+const SERVICE_NAME = 'fluxora-backend';
+const SERVICE_VERSION = '0.1.0';
+
+/**
+ * Middleware: set security and cache headers on every privacy response.
+ *
+ * Policy documents must not be cached by intermediaries — an operator
+ * updating the policy should see the change immediately.
+ */
+function privacyHeaders(_req: Request, res: Response, next: NextFunction): void {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  next();
+}
+
+privacyRouter.use(privacyHeaders);
+
+/**
+ * Reject HTTP methods other than GET and HEAD on all privacy routes.
+ * HEAD is implicitly handled by Express for GET routes.
+ */
+function rejectUnsupportedMethods(req: Request, res: Response, next: NextFunction): void {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.setHeader('Allow', 'GET, HEAD');
+    res.status(405).json({
+      error: {
+        code: 'METHOD_NOT_ALLOWED',
+        message: `${req.method} is not allowed on this resource`,
+      },
+    });
+    return;
+  }
+  next();
+}
+
+privacyRouter.use(rejectUnsupportedMethods);
+
 /**
  * GET /api/privacy/policy
  *
  * Returns the full PII policy document: field classifications,
  * retention schedule, and trust boundaries.
  */
-privacyRouter.get('/policy', (_req, res) => {
+privacyRouter.get('/policy', (_req: Request, res: Response) => {
   res.json({
-    service: 'fluxora-backend',
-    version: '0.1.0',
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
     piiPolicy: {
       summary:
         'Fluxora stores only chain-derived pseudonymous data (Stellar public keys and ' +
@@ -46,6 +84,7 @@ privacyRouter.get('/policy', (_req, res) => {
     },
     _links: {
       self: '/api/privacy/policy',
+      retention: '/api/privacy/retention',
       health: '/health',
       streams: '/api/streams',
     },
@@ -58,12 +97,17 @@ privacyRouter.get('/policy', (_req, res) => {
  * Lightweight view of just the retention schedule for quick
  * compliance checks.
  */
-privacyRouter.get('/retention', (_req, res) => {
+privacyRouter.get('/retention', (_req: Request, res: Response) => {
   res.json({
     retentionSchedule: RETENTION_SCHEDULE,
+    _links: {
+      self: '/api/privacy/retention',
+      fullPolicy: '/api/privacy/policy',
+    },
   });
 });
 
+/** Map a classification enum value to a human-readable description. */
 function classificationDescription(level: DataClassification): string {
   switch (level) {
     case DataClassification.PUBLIC:

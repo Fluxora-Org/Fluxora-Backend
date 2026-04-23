@@ -22,7 +22,7 @@
 
 import { logger } from './logger.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED';
 
 export interface AuditEntry {
   /** Monotonically increasing sequence number within this process lifetime. */
@@ -87,6 +87,9 @@ export function getAuditEntries(): AuditEntry[] {
 
 /** Reset store — test use only. */
 export function _resetAuditLog(): void {
-  (globalThis as any)[AUDIT_LOG_KEY] = [];
+  const log = (globalThis as any)[AUDIT_LOG_KEY];
+  if (Array.isArray(log)) {
+    log.length = 0;
+  }
   seq = 0;
 }

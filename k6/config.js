@@ -9,19 +9,36 @@
 export const BASE_URL = __ENV.K6_BASE_URL || 'http://localhost:3000';
 
 /**
- * Service-level thresholds applied across all scenarios.
- * p(95) latency  < 500 ms
- * p(99) latency  < 1 000 ms
- * Error rate     < 1 %
- * Health checks  always < 200 ms p(99)
+ * Baseline SLOs — published per endpoint so regressions are pinpointed.
+ *
+ * Global
+ *   p(95) < 500 ms, p(99) < 1 000 ms, error rate < 1 %
+ *
+ * Per-endpoint (tagged via { endpoint: '<name>' } on each request):
+ *   health          p(99) < 200 ms  — used as readiness probe; must be fast
+ *   streams_list    p(95) < 500 ms, p(99) < 800 ms
+ *   streams_get     p(95) < 400 ms, p(99) < 700 ms
+ *   streams_create  p(95) < 600 ms, p(99) < 1 000 ms  — write path is slower
+ *
+ * Custom trend metrics (from helpers.js) mirror the tagged thresholds and
+ * appear in the k6 summary as human-readable named series.
  */
 export const THRESHOLDS = {
+  // Global baseline
   http_req_duration: ['p(95)<500', 'p(99)<1000'],
-  http_req_failed: ['rate<0.01'],
-  'http_req_duration{endpoint:health}': ['p(99)<200'],
-  'http_req_duration{endpoint:streams_list}': ['p(95)<500'],
-  'http_req_duration{endpoint:streams_get}': ['p(95)<500'],
-  'http_req_duration{endpoint:streams_create}': ['p(95)<500'],
+  http_req_failed:   ['rate<0.01'],
+
+  // Per-endpoint SLOs (tagged requests)
+  'http_req_duration{endpoint:health}':          ['p(99)<200'],
+  'http_req_duration{endpoint:streams_list}':    ['p(95)<500', 'p(99)<800'],
+  'http_req_duration{endpoint:streams_get}':     ['p(95)<400', 'p(99)<700'],
+  'http_req_duration{endpoint:streams_create}':  ['p(95)<600', 'p(99)<1000'],
+
+  // Named trend metrics (mirrors above; surfaced in k6 end-of-test summary)
+  fluxora_health_latency:          ['p(99)<200'],
+  fluxora_streams_list_latency:    ['p(95)<500', 'p(99)<800'],
+  fluxora_streams_get_latency:     ['p(95)<400', 'p(99)<700'],
+  fluxora_streams_create_latency:  ['p(95)<600', 'p(99)<1000'],
 };
 
 /**
