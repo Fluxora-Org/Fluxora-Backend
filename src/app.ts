@@ -17,7 +17,6 @@ import { isShuttingDown } from './shutdown.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
-import { registry } from './metrics.js';
 import { successResponse, errorResponse } from './utils/response.js';
 
 export interface AppOptions {
@@ -33,9 +32,16 @@ export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
   const rateLimiter = createRateLimiter(env);
-  const { ip, apiKey, admin } = getRateLimitConfig(env);
-  const timeoutMs = options.requestTimeoutMs ?? 30000;
 
+  // Inject config and healthManager into app.locals for route handlers
+  if (options.config) {
+    app.locals.config = options.config;
+  }
+  if (options.healthManager) {
+    app.locals.healthManager = options.healthManager;
+  }
+
+  app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   // Correlation ID must be first so all subsequent middleware/routes have req.correlationId.
@@ -44,9 +50,6 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(requestLoggerMiddleware);
   app.use(httpMetrics);
   app.use(rateLimiter);
-
-  // Attach AbortSignal and enforce timeout limits before hitting complex routes
-  app.use(requestTimeoutMiddleware(timeoutMs));
 
   app.use((_req: Request, res: Response, next: NextFunction) => {
     if (isShuttingDown()) {
@@ -59,28 +62,10 @@ export function createApp(options: AppOptions = {}): Express {
     app.get('/__test/error', () => {
       throw new Error('Intentional test error');
     });
-
-    app.get('/__test/timeout', async (req: Request, res: Response, next: NextFunction) => {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          // Simulate a long running operation
-          const timer = setTimeout(() => resolve(), 5000);
-
-          // Listen to the abort signal to halt operation
-          req.socket.once('timeout', () => {
-            clearTimeout(timer);
-            reject(new Error('Operation aborted by signal'));
-          });
-        });
-
-        if (!res.headersSent) {
-          res.json({ success: true });
-        }
-      } catch (err) {
-        next(err);
-      }
-    });
   }
+
+  // Metrics endpoint - no auth required for Prometheus scraping
+  app.use('/metrics', metricsRouter);
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
@@ -89,25 +74,22 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/internal/indexer', indexerRouter);
   app.use('/api/audit', auditRouter);
   app.use('/admin/dlq', dlqRouter);
-  app.use('/api/rate-limits', createRateLimitsRouter({ ip, apiKey, admin }));
-
-  app.get('/metrics', async (_req: Request, res: Response) => {
-    res.set('Content-Type', registry.contentType);
-    res.end(await registry.metrics());
-  });
+  app.use('/api/rate-limits', createRateLimitsRouter(env));
 
   app.get('/', (_req: Request, res: Response) => {
-    res.json(successResponse({
-      name: 'Fluxora API',
-      version: '0.1.0',
-      docs: 'Programmable treasury streaming on Stellar.',
-    }));
+    res.json(
+      successResponse({
+        name: 'Fluxora API',
+        version: '0.1.0',
+        docs: 'Programmable treasury streaming on Stellar.',
+      }),
+    );
   });
 
   app.use((req: Request, res: Response) => {
     const requestId = (req as any).id as string | undefined;
     res.status(404).json(
-      errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId)
+      errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
     );
   });
 

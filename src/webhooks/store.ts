@@ -76,7 +76,7 @@ export class WebhookDeliveryStore {
     this.deliveryIdIndex.set(delivery.deliveryId, delivery.id);
     this.metrics.totalDeliveries++;
     
-    logger.debug('Webhook delivery stored', {
+    logger.debug('Webhook delivery stored', undefined, {
       deliveryId: delivery.deliveryId,
       status: delivery.status,
     });
@@ -114,7 +114,7 @@ export class WebhookDeliveryStore {
         this.metrics.failedDeliveries++;
       }
 
-      logger.debug('Webhook delivery status updated', {
+      logger.debug('Webhook delivery status updated', undefined, {
         deliveryId: delivery.deliveryId,
         oldStatus,
         newStatus: status,
@@ -140,7 +140,7 @@ export class WebhookDeliveryStore {
     
     this.metrics.outboxItems++;
     
-    logger.info('Item added to webhook outbox', {
+    logger.info('Item added to webhook outbox', undefined, {
       outboxId: id,
       deliveryId: item.deliveryId,
       priority,
@@ -221,7 +221,7 @@ export class WebhookDeliveryStore {
     this.deadLetterQueue.set(id, dlqItem);
     this.metrics.dlqItems++;
     
-    logger.error('Webhook delivery moved to dead-letter queue', {
+    logger.error('Webhook delivery moved to dead-letter queue', undefined, {
       dlqId: id,
       deliveryId: delivery.deliveryId,
       failureReason,
@@ -250,7 +250,7 @@ export class WebhookDeliveryStore {
     this.deadLetterQueue.delete(id);
     this.metrics.dlqItems--;
     
-    logger.info('Dead-letter queue item processed', {
+    logger.info('Dead-letter queue item processed', undefined, {
       dlqId: id,
       deliveryId: item.deliveryId,
       processedAt: new Date(processedAt).toISOString(),
@@ -405,7 +405,7 @@ export class WebhookDeliveryStore {
         }
       }
 
-      logger.info('Webhook store cleanup completed', { cleaned, olderThanMs });
+      logger.info('Webhook store cleanup completed', undefined, { cleaned, olderThanMs });
     } catch (error) {
       errors.push(error instanceof Error ? error.message : String(error));
     }

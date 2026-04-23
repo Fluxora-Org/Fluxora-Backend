@@ -266,9 +266,32 @@ npm install -g wscat
 wscat -c ws://localhost:3000/ws/streams
 ```
 
+### Authentication (optional, backward-compatible)
+
+JWT authentication on the WebSocket upgrade is supported via two environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WS_AUTH_REQUIRED` | `false` | Set to `true` to reject unauthenticated upgrade requests with HTTP 401 |
+| `JWT_SECRET` | — | HS256 secret used to verify tokens |
+
+Token delivery (first match wins):
+1. `Authorization: Bearer <token>` header on the upgrade request
+2. `?token=<jwt>` query-string parameter
+
+When `WS_AUTH_REQUIRED` is absent or `false`, all connections are accepted regardless of whether a token is present. This enables a zero-downtime rollout: deploy first, issue tokens to clients, then flip the flag.
+
+```bash
+# Connect with a token
+wscat -c "ws://localhost:3000/ws/streams" \
+  --header "Authorization: Bearer <your-jwt>"
+
+# Or via query string
+wscat -c "ws://localhost:3000/ws/streams?token=<your-jwt>"
+```
+
 ### Non-goals and follow-up
 
-- **Authentication / authorization** on the WebSocket endpoint is intentionally deferred. Follow-up: add JWT or API-key validation on upgrade.
 - **Message replay / durable event log** — events are fire-and-forget; clients that disconnect miss events. Follow-up: add a replay store.
 - **Per-stream subscription filtering** — all clients receive all events. Follow-up: add a subscription message protocol.
 
@@ -326,27 +349,43 @@ wscat -c ws://localhost:3000/ws/streams
 
 ### Prerequisites
 
-- Node.js 18+
-- npm or pnpm
+- Node.js 20+
+- pnpm 9+
 
 ### Install and run
 
 ```bash
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 API runs at [http://localhost:3000](http://localhost:3000).
 
 ### Scripts
 
-- `npm run dev` - run with tsx watch
-- `npm run build` - compile to `dist/`
-- `npm test` - run the backend test suite plus webhook signature verification tests
-- `npm start` - run compiled `dist/index.js`
-- `npm run docker:build` - build a production container image
-- `npm run docker:run` - run the production container locally
-- `npm run docker:smoke` - run a quick container health smoke check
+- `pnpm dev` - run with tsx watch
+- `pnpm build` - compile to `dist/`
+- `pnpm test` - run the full test suite (vitest, single run)
+- `pnpm test:coverage` - run tests and enforce 95% coverage threshold
+- `pnpm test:watch` - run tests in watch mode during development
+- `pnpm lint` - check for ESLint violations
+- `pnpm lint:fix` - auto-fix ESLint violations where possible
+- `pnpm format` - format all files with Prettier
+- `pnpm format:check` - verify formatting without writing (used in CI)
+- `pnpm start` - run compiled `dist/index.js`
+- `pnpm docker:build` - build a production container image
+- `pnpm docker:run` - run the production container locally
+- `pnpm docker:smoke` - run a quick container health smoke check
+
+### Code quality
+
+ESLint and Prettier are configured to enforce consistent style and prevent common bugs:
+
+- `amount` and `balance` fields must stay as decimal strings — `parseFloat`, `Number()`, and unary `+` on these variables are lint errors.
+- All exported functions and class methods require explicit return types.
+- Prettier settings are locked (`endOfLine: lf`, `singleQuote`, `trailingComma: all`) to avoid format-war diffs in PRs.
+
+The CI pipeline runs `pnpm lint`, `pnpm format:check`, `pnpm audit`, and `pnpm test:coverage` on every push and PR. Coverage below 95% fails the build.
 
 ## Production Docker Image (Issue #30)
 
@@ -566,41 +605,116 @@ curl http://localhost:3000/api/streams/<stream-id>
 - The backend guarantees a durable, restorable view of chain-derived state using PostgreSQL custom-format dumps.
 - Backup operations execute without halting read/write API availability.
 - Restore operations execute with a `--clean` flag, guaranteeing the database state exactly matches the backup snapshot, avoiding partial data overlaps.
+- Dumps can be streamed directly to/from an S3 bucket — no temporary file is written to the container filesystem when an S3 target is configured.
+- All monetary amount fields remain as decimal strings throughout; this module never coerces them to numbers.
+
+### S3 streaming target (optional)
+
+Install the AWS SDK v3 packages to enable S3 streaming:
+
+```bash
+npm install @aws-sdk/client-s3 @aws-sdk/lib-storage
+```
+
+Configure credentials via standard AWS environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `AWS_ACCESS_KEY_ID` | AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Target region (default: `us-east-1`) |
+
+#### Backup to S3
+
+```ts
+import { backupDatabase } from './src/scripts/db-ops.js'
+
+const result = await backupDatabase(
+  process.env.DATABASE_URL!,
+  '',   // outputPath is ignored when s3Target is set
+  { bucket: 'my-backups', key: `fluxora/${new Date().toISOString()}.dump` },
+)
+// { success: true, message: 'Backup successfully streamed to s3://my-backups/fluxora/...' }
+```
+
+#### Restore from S3
+
+```ts
+import { restoreDatabase } from './src/scripts/db-ops.js'
+
+const result = await restoreDatabase(
+  process.env.DATABASE_URL!,
+  '',   // inputPath is ignored when s3Source is set
+  { bucket: 'my-backups', key: 'fluxora/2026-04-23T00:00:00.000Z.dump' },
+)
+// { success: true, message: 'Restore successfully completed from s3://my-backups/...' }
+```
+
+#### Local backup / restore (no S3)
+
+```ts
+// Backup to local file
+await backupDatabase(process.env.DATABASE_URL!, './backup.dump')
+
+// Restore from local file
+await restoreDatabase(process.env.DATABASE_URL!, './backup.dump')
+```
+
+### Security notes
+
+- `DATABASE_URL` is validated before any subprocess is spawned. Empty strings and non-postgres schemes are rejected immediately.
+- All subprocess arguments are passed as an array via `execFile` / `spawn` — never interpolated into a shell string — preventing command injection.
+- Output/input paths are checked for shell metacharacters (`` ` ``, `$`, `|`, `;`, `&`, `<`, `>`) before use.
+- AWS credentials are consumed from environment variables only; they are never logged or included in error messages.
+- The `error` field in `DbOperationResult` contains raw `pg_dump`/`pg_restore` stderr — review before logging to ensure no credentials appear in your log pipeline.
 
 ### Trust boundaries
 | Actor | Allowed | Not allowed |
 |-------|---------|-------------|
 | Public internet clients | No access | Cannot trigger, view, or detect backup/restore operations. |
 | Authenticated partners | No access | Cannot trigger or download backups. |
-| Internal workers (Cron) | Execute `backupDatabase` routine securely using local FS | Cannot execute restores or drop tables directly. |
-| Administrators / operators | Execute `restoreDatabase` during incident response, download dumps from cold storage | Leaving unencrypted dumps on public web servers. |
+| Internal workers (Cron) | Execute `backupDatabase` securely via local FS or S3 stream | Cannot execute restores or drop tables directly. |
+| Administrators / operators | Execute `restoreDatabase` during incident response, download dumps from S3 cold storage | Leaving unencrypted dumps on public web servers. |
 
 ### Failure modes and expected behavior
 
 | Condition | Expected result | System Behavior |
 |-----------|-----------------|-----------------|
 | `DATABASE_URL` missing or malformed | Immediate failure before subprocess spawns | `success: false` returned, no partial files created. |
+| `DATABASE_URL` is not a postgres:// URL | Immediate failure before subprocess spawns | `success: false` with descriptive message. |
+| Output/input path contains shell metacharacters | Immediate failure before subprocess spawns | `success: false` — injection attempt blocked. |
 | DB credentials invalid/revoked | Subprocess fails with authentication error | Returns `Backup failed` with `stderr` detail for logs. |
-| Disk out of space during backup | `pg_dump` panics mid-stream | Incomplete file remains; operation returns error. Operators must monitor FS capacity. |
+| Disk out of space during local backup | `pg_dump` panics mid-stream | Incomplete file remains; operation returns error. Operators must monitor FS capacity. |
+| S3 upload fails mid-stream | Upload promise rejects | Returns `Backup failed` with error detail. |
+| S3 object body is empty on restore | Detected before spawning pg_restore | Returns `Restore failed` with descriptive message. |
 | Corrupted or invalid dump file provided to restore | `pg_restore` rejects the archive format | Returns `Restore failed`. Database state remains unchanged (clean drop does not execute). |
+| AWS SDK v3 not installed | Lazy-load fails with clear message | Returns `Backup/Restore failed` with install instructions. |
 
 ### Operator observability and diagnostics
 Operators can diagnose backup/restore health without relying on tribal knowledge:
 - **Routine Backups:** The backup routine outputs structured JSON containing `{ success: boolean, message: string, error?: string }`.
 - **Triage Flow (Backup Failure):**
-  1. Check disk space on the volume mapped to the output path.
-  2. Verify `DATABASE_URL` validity using `psql`.
+  1. Check disk space on the volume mapped to the output path (local mode) or S3 bucket permissions (S3 mode).
+  2. Verify `DATABASE_URL` validity using `psql "$DATABASE_URL" -c '\l'`.
   3. Check the `error` string in the logs for `pg_dump` specific stderr (e.g., `FATAL: connection limit exceeded`).
+  4. For S3 mode: verify `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and bucket write permissions.
 - **Triage Flow (Restore Failure):**
   1. Ensure the target DB has active connections terminated before running a `--clean` restore.
-  2. Verify the input file was generated using custom format (`-F c`), as plain SQL dumps will fail `pg_restore`.
+  2. Verify the input file was generated using custom format (`pg_dump --format=custom`), as plain SQL dumps will fail `pg_restore`.
+  3. For S3 mode: verify the object key exists and the IAM role has `s3:GetObject` permission.
 
 ### Verification evidence
-Automated unit tests (`tests/db-ops.test.ts`) assert the boundaries of the `pg_dump` and `pg_restore` wrappers, including credential failures and missing configurations. 
+Automated unit tests (`tests/db-ops.test.ts`) assert the boundaries of the `pg_dump` and `pg_restore` wrappers, covering:
+- Local file backup and restore success paths
+- S3 streaming backup and restore success paths
+- Input validation (missing URL, invalid scheme, shell metacharacters in paths)
+- Error propagation from subprocess stderr
+- AWS SDK not installed error path
+- `DbOperationResult` shape guarantees
 
 ### Non-goals and follow-up tracking
-- **Intentionally deferred:** Automated scheduling (e.g., node-cron) is deferred until persistent volume claims (PVCs) or S3 streaming targets are provisioned in the deployment orchestration.
-- **Follow-up:** Add an S3 upload stream integration so dumps don't remain local to the container filesystem.
+- **Intentionally deferred:** Automated scheduling (e.g., node-cron) is deferred until persistent volume claims (PVCs) are provisioned in the deployment orchestration.
+- **Intentionally deferred:** Backup encryption at rest — use S3 server-side encryption (SSE-S3 or SSE-KMS) at the bucket level.
 
 ## GET /api/streams/:id backed by database (Issue #15)
 

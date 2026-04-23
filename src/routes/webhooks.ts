@@ -21,7 +21,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
     const { event, endpointUrl, secret, priority = 'normal' } = req.body;
 
     if (!event || !endpointUrl || !secret) {
-      return res.status(400).json({
+      res.status(400).json({
         error: {
           code: 'INVALID_REQUEST',
           message: 'Missing required fields: event, endpointUrl, secret',
@@ -44,7 +44,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
       maxAttempts: 5,
     });
 
-    logger.info('Webhook queued for delivery', {
+    logger.info('Webhook queued for delivery', undefined, {
       outboxId,
       eventId: event.id,
       eventType: event.type,
@@ -82,9 +82,10 @@ webhooksRouter.get('/deliveries/:deliveryId', (req, res) => {
   const delivery = webhookService.getDeliveryStatus(deliveryId);
 
   if (!delivery) {
-    return res.status(404).json(
+    res.status(404).json(
       errorResponse('DELIVERY_NOT_FOUND', `Webhook delivery ${deliveryId} not found`, undefined, requestId)
     );
+    return;
   }
 
   res.json(successResponse({
@@ -133,7 +134,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
       createdAt: new Date(delivery.createdAt).toISOString(),
       updatedAt: new Date(delivery.updatedAt).toISOString(),
     })),
-  }, requestId));
+  });
 });
 
 /**
@@ -209,7 +210,7 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
   const { secret } = req.body;
 
   if (!secret) {
-    return res.status(400).json({
+    res.status(400).json({
       error: {
         code: 'MISSING_SECRET',
         message: 'Webhook secret is required',
@@ -223,19 +224,20 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
     const dlqItem = dlqItems.find(item => item.id === dlqId);
     
     if (!dlqItem) {
-      return res.status(404).json({
+      res.status(404).json({
         error: {
           code: 'DLQ_ITEM_NOT_FOUND',
           message: `Dead-letter queue item ${dlqId} not found`,
         },
       });
+      return;
     }
 
     // Process the DLQ item (remove from DLQ)
     const processed = webhookDeliveryStore.processDeadLetterQueueItem(dlqId);
     
     if (!processed) {
-      return res.status(500).json({
+      res.status(500).json({
         error: {
           code: 'DLQ_PROCESS_ERROR',
           message: 'Failed to process DLQ item',
@@ -258,7 +260,7 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
       maxAttempts: 3, // Fewer attempts for retries
     });
 
-    logger.info('DLQ item retried', {
+    logger.info('DLQ item retried', undefined, {
       dlqId,
       outboxId,
       deliveryId: dlqItem.deliveryId,
@@ -270,7 +272,8 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
       message: 'DLQ item queued for retry',
     });
   } catch (error) {
-    logger.error('Error retrying DLQ item', { dlqId }, {
+    logger.error('Error retrying DLQ item', undefined, {
+      dlqId,
       error: error instanceof Error ? error.message : String(error),
     });
 
@@ -313,7 +316,7 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', (req, res) => {
   const decodedUrl = decodeURIComponent(endpointUrl);
   
   // This would need to be implemented in the store
-  logger.info('Circuit breaker reset requested', { endpointUrl: decodedUrl });
+  logger.info('Circuit breaker reset requested', undefined, { endpointUrl: decodedUrl });
 
   res.json({
     ok: true,
@@ -354,15 +357,15 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
 
   const result = verifyWebhookSignature({
     secret,
-    deliveryId,
-    timestamp,
-    signature,
+    ...(deliveryId !== undefined ? { deliveryId } : {}),
+    ...(timestamp !== undefined ? { timestamp } : {}),
+    ...(signature !== undefined ? { signature } : {}),
     rawBody: req.body,
     isDuplicateDelivery: (id) => webhookService.isDuplicateDelivery(id),
   });
 
   if (!result.ok) {
-    return res.status(result.status).json(
+    res.status(result.status).json(
       errorResponse(result.code, result.message, undefined, requestId)
     );
   }
@@ -383,7 +386,7 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
 
   if (!secret) {
     logger.warn('Webhook outbox processing endpoint called without secret', undefined);
-    return res.status(400).json({
+    res.status(400).json({
       error: {
         code: 'MISSING_SECRET',
         message: 'Webhook secret is required as query parameter',
@@ -400,7 +403,7 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
       try {
         // This would integrate with the webhook service to process the item
         // For now, we'll just log and remove from outbox
-        logger.info('Processing outbox item', {
+        logger.info('Processing outbox item', undefined, {
           outboxId: item.id,
           deliveryId: item.deliveryId,
         });
@@ -408,7 +411,8 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
         webhookDeliveryStore.removeFromOutbox(item.id);
         processed++;
       } catch (error) {
-        logger.error('Error processing outbox item', { outboxId: item.id }, {
+        logger.error('Error processing outbox item', undefined, {
+          outboxId: item.id,
           error: error instanceof Error ? error.message : String(error),
         });
         errors++;
@@ -446,7 +450,7 @@ webhooksRouter.post('/retry', express.json(), async (req, res) => {
 
   if (!secret) {
     logger.warn('Webhook retry endpoint called without secret', undefined);
-    return res.status(400).json(
+    res.status(400).json(
       errorResponse('MISSING_SECRET', 'Webhook secret is required as query parameter', undefined, requestId)
     );
   }
@@ -479,7 +483,7 @@ webhooksRouter.post('/cleanup', express.json(), (req, res) => {
   try {
     const result = webhookDeliveryStore.cleanup(olderThanMs);
     
-    logger.info('Webhook cleanup completed', {
+    logger.info('Webhook cleanup completed', undefined, {
       olderThanDays,
       cleaned: result.cleaned,
       errors: result.errors.length,

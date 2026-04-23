@@ -20,20 +20,14 @@ export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 /** Reusable decimal-string field schema */
 function decimalStringField(fieldName: string) {
   return z
-    .string({
-      required_error: `${fieldName} is required`,
-      invalid_type_error: `${fieldName} must be a decimal string, not a number`,
-    })
+    .string({ error: `${fieldName} must be a decimal string, not a number` })
     .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
 }
 
 /** Reusable Stellar public key field schema */
 function stellarPublicKeyField(fieldName: string) {
   return z
-    .string({
-      required_error: `${fieldName} is required`,
-      invalid_type_error: `${fieldName} must be a string`,
-    })
+    .string({ error: `${fieldName} must be a string` })
     .min(1, `${fieldName} must be a non-empty string`)
     .regex(STELLAR_PUBLIC_KEY_REGEX, `${fieldName} must be a valid Stellar public key (G...)`);
 }
@@ -60,12 +54,12 @@ export const CreateStreamSchema = z.object({
     })
     .optional(),
   startTime: z
-    .number({ invalid_type_error: 'startTime must be a number' })
+    .number({ error: 'startTime must be a number' })
     .int('startTime must be an integer')
     .nonnegative('startTime must be a non-negative number')
     .optional(),
   endTime: z
-    .number({ invalid_type_error: 'endTime must be a number' })
+    .number({ error: 'endTime must be a number' })
     .int('endTime must be an integer')
     .nonnegative('endTime must be a non-negative integer')
     .optional(),
@@ -83,7 +77,7 @@ export const ListStreamsQuerySchema = z.object({
     .optional(),
   cursor: z.string().optional(),
   include_total: z.enum(['true', 'false'], {
-    errorMap: () => ({ message: 'include_total must be true or false' }),
+    error: 'include_total must be true or false',
   }).optional(),
 });
 

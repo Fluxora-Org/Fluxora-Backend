@@ -12,6 +12,7 @@ import {
   revokeApiKey,
   listApiKeys,
 } from '../lib/apiKey.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
 
 export const adminRouter = Router();
 

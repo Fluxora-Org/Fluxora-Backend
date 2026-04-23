@@ -141,6 +141,74 @@ export function setIndexerEventStore(store: ContractEventStore): void {
   indexerIngestionService.setStore(store);
 }
 
+/**
+ * @openapi
+ * /internal/indexer/events:
+ *   get:
+ *     summary: Replay stored contract events for debugging and audit
+ *     description: |
+ *       Returns an append-only view of ingested contract events.
+ *       Supports filtering by ledger range, contractId, and topic.
+ *       Amounts in event payloads follow the decimal-string serialization policy.
+ *     tags:
+ *       - indexer
+ *     parameters:
+ *       - name: x-indexer-worker-token
+ *         in: header
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: fromLedger
+ *         in: query
+ *         schema: { type: integer }
+ *       - name: toledger
+ *         in: query
+ *         schema: { type: integer }
+ *       - name: contractId
+ *         in: query
+ *         schema: { type: string }
+ *       - name: topic
+ *         in: query
+ *         schema: { type: string }
+ *       - name: limit
+ *         in: query
+ *         schema: { type: integer, maximum: 1000, default: 100 }
+ *       - name: offset
+ *         in: query
+ *         schema: { type: integer, default: 0 }
+ *     responses:
+ *       200:
+ *         description: Paginated event list
+ *       401:
+ *         description: Missing or invalid internal worker credentials
+ */
+indexerRouter.get('/events', async (req: any, res: any, next: any) => {
+  try {
+    requireIndexerToken(req);
+
+    const parseIntParam = (val: unknown): number | undefined => {
+      if (val === undefined || val === '') return undefined;
+      const n = Number(val);
+      return Number.isInteger(n) && n >= 0 ? n : undefined;
+    };
+
+    const filter = {
+      fromLedger: parseIntParam(req.query.fromLedger),
+      toledger: parseIntParam(req.query.toledger),
+      contractId: req.query.contractId as string | undefined,
+      topic: req.query.topic as string | undefined,
+      limit: parseIntParam(req.query.limit),
+      offset: parseIntParam(req.query.offset),
+    };
+
+    const result = await indexerIngestionService.getEvents(filter);
+
+    res.status(200).json(successResponse(result, req.id ?? req.correlationId));
+  } catch (caught) {
+    next(caught);
+  }
+});
+
 export function resetIndexerState(): void {
   if (defaultIndexerEventStore instanceof InMemoryContractEventStore) {
     defaultIndexerEventStore.reset();

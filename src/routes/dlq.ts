@@ -82,6 +82,7 @@ import { authenticate, requireAuth } from '../middleware/auth.js';
 import { asyncHandler, validationError } from '../middleware/errorHandler.js';
 import { info, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
+import { successResponse, errorResponse } from '../utils/response.js';
 
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
@@ -194,7 +195,7 @@ dlqRouter.get(
       limit,
       offset,
       has_more: offset + page.length < filtered.length,
-    }, requestId));
+    });
   }),
 );
 

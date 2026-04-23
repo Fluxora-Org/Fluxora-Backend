@@ -195,3 +195,64 @@ export interface ApiKeyCreated {
   prefix: string;
   createdAt: string;
 }
+
+// ─── Stream Event Store ───────────────────────────────────────────────────────
+
+/**
+ * An append-only record of a contract event as ingested from the chain.
+ * Used for replay and debugging. Amounts in payload must follow the
+ * decimal-string serialization policy.
+ */
+export interface StreamEventRecord {
+  /** Stable unique identifier for this event (chain-derived) */
+  eventId: string;
+  /** Ledger sequence number */
+  ledger: number;
+  /** Ledger hash for reorg detection */
+  ledgerHash: string;
+  /** Soroban contract ID */
+  contractId: string;
+  /** Event topic (e.g. "stream.created") */
+  topic: string;
+  /** Transaction hash */
+  txHash: string;
+  /** Transaction index within the ledger */
+  txIndex: number;
+  /** Operation index within the transaction */
+  operationIndex: number;
+  /** Event index within the operation */
+  eventIndex: number;
+  /**
+   * Arbitrary event payload. Amount fields (depositAmount, ratePerSecond, etc.)
+   * MUST be decimal strings per the serialization policy.
+   */
+  payload: Record<string, unknown>;
+  /** ISO-8601 timestamp when the event occurred on-chain */
+  happenedAt: string;
+  /** ISO-8601 timestamp when the event was ingested into the store */
+  ingestedAt: string;
+}
+
+/** Filter options for replaying events from the store */
+export interface StreamEventReplayFilter {
+  /** Only return events at or after this ledger (inclusive) */
+  fromLedger?: number;
+  /** Only return events at or before this ledger (inclusive) */
+  toledger?: number;
+  /** Only return events for this contract */
+  contractId?: string;
+  /** Only return events with this topic */
+  topic?: string;
+  /** Maximum number of events to return (default 100, max 1000) */
+  limit?: number;
+  /** Offset for pagination */
+  offset?: number;
+}
+
+/** Result of a replay query */
+export interface StreamEventReplayResult {
+  events: StreamEventRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}

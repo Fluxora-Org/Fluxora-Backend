@@ -1,9 +1,11 @@
 /**
- * Streams API routes.
+ * Streams API routes — PostgreSQL-backed.
  *
- * Issue #6  — Input validation layer: all amount fields validated as decimal strings.
- * Issue #34 — Supertest integration tests: routes are designed for full HTTP testability.
+ * All list/get/create/cancel operations delegate to streamRepository.
+ * The in-memory store has been removed; state lives in the `streams` table.
  *
+ * Decimal-string invariant
+ * ------------------------
  * All amount fields (depositAmount, ratePerSecond) are validated as decimal
  * strings before storage and returned as decimal strings in every response.
  * This prevents floating-point precision loss when amounts cross the
@@ -13,89 +15,23 @@
  * ----------------
  * - Public internet clients: may list and read streams without authentication.
  * - Authenticated partners: may create and cancel streams with valid JWT.
- * - Internal workers: same surface; no elevated privileges yet.
  *
  * Failure modes
  * -------------
- * - Invalid decimal string  → 400 VALIDATION_ERROR with per-field details
+ * - Invalid decimal string  → 400 VALIDATION_ERROR
  * - Missing required field  → 400 VALIDATION_ERROR
  * - Missing authentication  → 401 UNAUTHORIZED
  * - Invalid token           → 401 UNAUTHORIZED
  * - Stream not found        → 404 NOT_FOUND
  * - Duplicate cancel        → 409 CONFLICT
- * - Listing dependency down → 503 SERVICE_UNAVAILABLE
+ * - DB unavailable          → 503 SERVICE_UNAVAILABLE
  * - Idempotency store down  → 503 SERVICE_UNAVAILABLE
  *
- * Non-goals (intentionally deferred)
- * -----------------------------------
- * - Persistent storage (in-memory only; PostgreSQL integration is follow-up)
- * - Rate limiting
- *
- * @openapi
- * /api/streams:
- *   get:
- *     summary: List streams with cursor pagination
- *     tags: [streams]
- *     parameters:
- *       - name: cursor
- *         in: query
- *         required: false
- *         schema: { type: string }
- *       - name: limit
- *         in: query
- *         schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
- *       - name: include_total
- *         in: query
- *         schema: { type: boolean, default: false }
- *     responses:
- *       200: { description: Paginated list of streams }
- *       400: { description: Invalid pagination parameters }
- *       503: { description: Listing dependency unavailable }
- *   post:
- *     summary: Create a new stream
- *     tags: [streams]
- *     parameters:
- *       - name: Idempotency-Key
- *         in: header
- *         required: true
- *         schema: { type: string, minLength: 1, maxLength: 128 }
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema: { $ref: '#/components/schemas/StreamCreateRequest' }
- *     responses:
- *       201: { description: Stream created }
- *       400: { description: Validation error }
- *       409: { description: Idempotency key conflict }
- *       503: { description: Idempotency dependency unavailable }
- * /api/streams/{id}:
- *   get:
- *     summary: Get a stream by ID
- *     tags: [streams]
- *     parameters:
- *       - name: id
- *         in: path
- *         required: true
- *         schema: { type: string }
- *     responses:
- *       200: { description: Stream details }
- *       404: { description: Not found }
- *   delete:
- *     summary: Cancel a stream
- *     tags: [streams]
- *     parameters:
- *       - name: id
- *         in: path
- *         required: true
- *         schema: { type: string }
- *     responses:
- *       200: { description: Stream cancelled }
- *       404: { description: Not found }
- *       409: { description: Already cancelled or completed }
+ * @module routes/streams
  */
 import { Router } from 'express';
 import type { Request, Response } from 'express';
+import crypto from 'crypto';
 import {
   validateDecimalString,
   validateAmountFields,
@@ -111,13 +47,21 @@ import {
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth } from '../middleware/auth.js';
-import { parseBody, CreateStreamSchema, formatZodIssues } from '../validation/schemas.js';
-import { assertValidApiTransition, type ApiStreamStatus } from '../streams/status.js';
+import { successResponse } from '../utils/response.js';
+import { streamRepository } from '../db/repositories/streamRepository.js';
+import { PoolExhaustedError } from '../db/pool.js';
+import {
+  CreateStreamSchema,
+  parseBody,
+  formatZodIssues,
+} from '../validation/schemas.js';
+import type { StreamStatus } from '../db/types.js';
 
 export const streamsRouter = Router();
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
+/** Public-facing stream shape (camelCase, decimal strings). */
 export interface Stream {
   id: string;
   sender: string;
@@ -130,10 +74,9 @@ export interface Stream {
 }
 
 type StreamsCursor = { v: 1; lastId: string };
-type StreamListingDependencyState = 'healthy' | 'unavailable';
-type IdempotencyDependencyState  = 'healthy' | 'unavailable';
+type DependencyState = 'healthy' | 'unavailable';
 
-type NormalizedCreateStreamInput = {
+type NormalizedCreateInput = {
   sender: string;
   recipient: string;
   depositAmount: string;
@@ -148,31 +91,45 @@ type StoredIdempotentResponse = {
   body: Stream;
 };
 
-// Amount fields that must be decimal strings per serialization policy
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 
-// ── In-memory store (export for test-level inspection / reset) ────────────────
-export const streams: Stream[] = [];
-
 // ── Dependency state (injectable for tests) ───────────────────────────────────
-const streamListingDependency = { state: 'healthy' as StreamListingDependencyState };
-const idempotencyDependency   = { state: 'healthy' as IdempotencyDependencyState };
-const idempotencyStore        = new Map<string, StoredIdempotentResponse>();
 
-export function setStreamListingDependencyState(state: StreamListingDependencyState): void {
+const streamListingDependency = { state: 'healthy' as DependencyState };
+const idempotencyDependency   = { state: 'healthy' as DependencyState };
+
+// In-memory idempotency store (Redis-backed in production; sufficient for now)
+const idempotencyStore = new Map<string, StoredIdempotentResponse>();
+
+export function setStreamListingDependencyState(state: DependencyState): void {
   streamListingDependency.state = state;
 }
-export function setIdempotencyDependencyState(state: IdempotencyDependencyState): void {
+export function setIdempotencyDependencyState(state: DependencyState): void {
   idempotencyDependency.state = state;
 }
 export function resetStreamIdempotencyStore(): void {
   idempotencyStore.clear();
 }
 
-/** Reset streams array — test use only. */
-export function _resetStreams(): void {
-  streams.length = 0;
-  idempotencyStore.clear();
+// ── DB → API mapper ───────────────────────────────────────────────────────────
+
+/**
+ * Map a StreamRecord (snake_case DB row) to the public Stream shape (camelCase).
+ * Preserves decimal-string amounts exactly as stored.
+ */
+import type { StreamRecord } from '../db/types.js';
+
+function toApiStream(record: StreamRecord): Stream {
+  return {
+    id:            record.id,
+    sender:        record.sender_address,
+    recipient:     record.recipient_address,
+    depositAmount: record.amount,
+    ratePerSecond: record.rate_per_second,
+    startTime:     record.start_time,
+    endTime:       record.end_time,
+    status:        record.status,
+  };
 }
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
@@ -226,7 +183,7 @@ function parseIncludeTotal(includeTotalParam: unknown): boolean {
   if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
     throw validationError('include_total must be true or false');
   }
-  if (includeTotalParam === 'true')  return true;
+  if (includeTotalParam === 'true') return true;
   if (includeTotalParam === 'false') return false;
   throw validationError('include_total must be true or false');
 }
@@ -245,18 +202,18 @@ function parseIdempotencyKey(headerValue: unknown): string {
   return trimmed;
 }
 
-// ── Body normaliser (uses Zod schema validation with Stellar key checks) ──────
+// ── Body normaliser ───────────────────────────────────────────────────────────
 
-function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCreateStreamInput {
+function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateInput {
   const parseResult = parseBody(CreateStreamSchema, body);
 
   if (!parseResult.success) {
-    const formattedErrors = formatZodIssues(parseResult.issues);
+    const formatted = formatZodIssues(parseResult.issues);
     throw new ApiError(
       ApiErrorCode.VALIDATION_ERROR,
       formattedErrors[0]?.message ?? 'Validation failed',
       400,
-      { errors: formattedErrors },
+      formatted.map((e) => e.message).join('; '),
     );
   }
 
@@ -277,22 +234,71 @@ function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCr
 
   const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
+  if (depositAmount !== undefined && parseFloat(validatedDeposit) <= 0) {
+    throw validationError('depositAmount must be greater than zero');
+  }
 
   const rateResult = validateDecimalString(ratePerSecond ?? '0', 'ratePerSecond');
   const validatedRate = rateResult.valid && rateResult.value ? rateResult.value : '0';
+  if (ratePerSecond !== undefined && parseFloat(validatedRate) < 0) {
+    throw validationError('ratePerSecond cannot be negative');
+  }
 
   return {
-    sender: sender.trim(),
-    recipient: recipient.trim(),
+    sender:        sender.trim(),
+    recipient:     recipient.trim(),
     depositAmount: validatedDeposit,
     ratePerSecond: validatedRate,
-    startTime: startTime ?? Math.floor(Date.now() / 1000),
-    endTime: endTime ?? 0,
+    startTime:     startTime ?? Math.floor(Date.now() / 1000),
+    endTime:       endTime   ?? 0,
   };
 }
 
-function fingerprintCreateStreamInput(input: NormalizedCreateStreamInput): string {
+function fingerprintInput(input: NormalizedCreateInput): string {
   return JSON.stringify(input);
+}
+
+/** Wrap DB errors so pool exhaustion surfaces as 503. */
+function wrapDbError(err: unknown): never {
+  if (err instanceof PoolExhaustedError) {
+    throw serviceUnavailable('Database is temporarily unavailable. Please retry shortly.');
+  }
+  throw err;
+}
+
+// ── API status state machine ──────────────────────────────────────────────────
+
+type ApiStreamStatus = 'scheduled' | 'active' | 'paused' | 'completed' | 'cancelled';
+
+const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
+  scheduled:  ['active', 'cancelled'],
+  active:     ['paused', 'completed', 'cancelled'],
+  paused:     ['active', 'cancelled'],
+  completed:  [],
+  cancelled:  [],
+};
+
+function assertValidApiTransition(
+  from: ApiStreamStatus,
+  to: ApiStreamStatus,
+): { ok: true } | { ok: false; message: string } {
+  const allowed = API_TRANSITIONS[from] ?? [];
+  if (allowed.includes(to)) return { ok: true };
+  if (from === to) return { ok: false, message: `Stream is already ${from}` };
+  if (from === 'completed') return { ok: false, message: 'Stream is already completed and cannot be transitioned' };
+  if (from === 'cancelled') return { ok: false, message: 'Stream is already cancelled and cannot be transitioned' };
+  return { ok: false, message: `Cannot transition stream from '${from}' to '${to}'` };
+}
+
+// ── Test helpers (no-op in production) ───────────────────────────────────────
+
+/**
+ * Reset test state.
+ * In the DB-backed model this only clears the in-memory idempotency store.
+ * Tests that need a clean DB should truncate the table directly.
+ */
+export function _resetStreams(): void {
+  idempotencyStore.clear();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -304,9 +310,9 @@ function fingerprintCreateStreamInput(input: NormalizedCreateStreamInput): strin
 streamsRouter.get(
   '/',
   asyncHandler(async (req: any, res: any) => {
-    const requestId    = req.id as string | undefined;
-    const limit        = parseLimit(req.query.limit);
-    const cursor       = parseCursor(req.query.cursor);
+    const requestId = req.id as string | undefined;
+    const limit = parseLimit(req.query.limit);
+    const cursor = parseCursor(req.query.cursor);
     const includeTotal = parseIncludeTotal(req.query.include_total);
 
     // Indexed filters
@@ -319,28 +325,40 @@ streamsRouter.get(
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
-    let filtered = [...streams];
-    if (statusFilter)    filtered = filtered.filter((s) => s.status    === statusFilter);
-    if (senderFilter)    filtered = filtered.filter((s) => s.sender    === senderFilter);
-    if (recipientFilter) filtered = filtered.filter((s) => s.recipient === recipientFilter);
+    let result: { streams: Stream[]; hasMore: boolean; total?: number };
+    try {
+      const dbResult = await streamRepository.findWithCursor(
+        {},
+        limit,
+        cursor?.lastId,
+        includeTotal,
+      );
+      result = {
+        streams: dbResult.streams.map(toApiStream),
+        hasMore: dbResult.hasMore,
+        total:   dbResult.total,
+      };
+    } catch (err) {
+      wrapDbError(err);
+    }
 
-    const sortedStreams = filtered.sort((a, b) => a.id.localeCompare(b.id));
-    const startIndex   = cursor ? sortedStreams.findIndex((s) => s.id > cursor.lastId) : 0;
-    const normStart    = startIndex === -1 ? sortedStreams.length : startIndex;
-    const pageStreams   = sortedStreams.slice(normStart, normStart + limit);
-    const hasMore      = normStart + pageStreams.length < sortedStreams.length;
-    const nextCursor   = hasMore && pageStreams.length > 0
+    const pageStreams = result!.streams;
+    const hasMore     = result!.hasMore;
+    const nextCursor  = hasMore && pageStreams.length > 0
       ? encodeCursor(pageStreams[pageStreams.length - 1]!.id)
       : undefined;
 
     info('Listing streams', { limit, returned: pageStreams.length, hasMore, requestId });
 
-    const response: { streams: typeof pageStreams; has_more: boolean; total?: number; next_cursor?: string } = {
-      streams: pageStreams,
-      has_more: hasMore,
-    };
-    if (includeTotal)  response.total       = sortedStreams.length;
-    if (nextCursor)    response.next_cursor = nextCursor;
+    const response: {
+      streams: Stream[];
+      has_more: boolean;
+      total?: number;
+      next_cursor?: string;
+    } = { streams: pageStreams, has_more: hasMore };
+
+    if (includeTotal && result!.total !== undefined) response.total       = result!.total;
+    if (nextCursor)                                  response.next_cursor = nextCursor;
 
     res.json(response);
   }),
@@ -353,12 +371,19 @@ streamsRouter.get(
 streamsRouter.get(
   '/:id',
   asyncHandler(async (req: any, res: any) => {
-    const { id } = req.params;
+    const { id }    = req.params;
     const requestId = req.id as string | undefined;
     debug('Fetching stream', { id });
-    const stream = streams.find((s) => s.id === id);
-    if (!stream) throw notFound('Stream', id);
-    res.json(stream);
+
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) throw notFound('Stream', id);
+    res.json(successResponse({ stream: toApiStream(record!) }, requestId));
   }),
 );
 
@@ -371,7 +396,7 @@ streamsRouter.post(
   authenticate,
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId      = (req as any).id as string | undefined;
+    const requestId = (req as any).id as string | undefined;
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
 
     if (idempotencyDependency.state !== 'healthy') {
@@ -381,9 +406,9 @@ streamsRouter.post(
 
     info('Creating new stream', { requestId, idempotencyKey });
 
-    let normalizedInput: NormalizedCreateStreamInput;
+    let normalizedInput: NormalizedCreateInput;
     try {
-      normalizedInput = normalizeCreateStreamInput(req.body ?? {});
+      normalizedInput = normalizeCreateInput(req.body ?? {});
     } catch (error) {
       const av = validateAmountFields(
         { depositAmount: req.body?.depositAmount, ratePerSecond: req.body?.ratePerSecond } as Record<string, unknown>,
@@ -397,12 +422,17 @@ streamsRouter.post(
       throw error;
     }
 
-    const requestFingerprint = fingerprintCreateStreamInput(normalizedInput);
+    const requestFingerprint = fingerprintInput(normalizedInput);
     const existingResponse   = idempotencyStore.get(idempotencyKey);
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
-        throw new ApiError(ApiErrorCode.CONFLICT, 'Idempotency-Key has already been used for a different request payload', 409, { idempotencyKey });
+        throw new ApiError(
+          ApiErrorCode.CONFLICT,
+          'Idempotency-Key has already been used for a different request payload',
+          409,
+          { idempotencyKey },
+        );
       }
       info('Replaying idempotent stream creation', { requestId, idempotencyKey, streamId: existingResponse.body.id });
       res.set('Idempotency-Key', idempotencyKey);
@@ -411,28 +441,43 @@ streamsRouter.post(
       return;
     }
 
-    const id     = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const stream: Stream = {
-      id,
-      sender:        normalizedInput.sender,
-      recipient:     normalizedInput.recipient,
-      depositAmount: normalizedInput.depositAmount,
-      ratePerSecond: normalizedInput.ratePerSecond,
-      startTime:     normalizedInput.startTime,
-      endTime:       normalizedInput.endTime,
-      status:        'active',
-    };
+    // Derive a deterministic ID from the request content so replays are safe
+    const idHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(normalizedInput))
+      .digest('hex');
+    const id = `stream-${idHash}-0`;
 
-    streams.push(stream);
+    let upsertResult;
+    try {
+      upsertResult = await streamRepository.upsertStream({
+        id,
+        sender_address:    normalizedInput.sender,
+        recipient_address: normalizedInput.recipient,
+        amount:            normalizedInput.depositAmount,
+        streamed_amount:   '0',
+        remaining_amount:  normalizedInput.depositAmount,
+        rate_per_second:   normalizedInput.ratePerSecond,
+        start_time:        normalizedInput.startTime,
+        end_time:          normalizedInput.endTime,
+        contract_id:       'api-created',
+        transaction_hash:  idHash,
+        event_index:       0,
+      }, requestId);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    const stream = toApiStream(upsertResult!.stream);
     idempotencyStore.set(idempotencyKey, { requestFingerprint, statusCode: 201, body: stream });
 
     SerializationLogger.amountSerialized(2, requestId);
-    info('Stream created', { id, requestId, idempotencyKey });
-    recordAuditEvent('STREAM_CREATED', 'stream', id, (req as any).correlationId, {
+    info('Stream created', { id: stream.id, requestId, idempotencyKey });
+    recordAuditEvent('STREAM_CREATED', 'stream', stream.id, (req as any).correlationId, {
       depositAmount: normalizedInput.depositAmount,
       ratePerSecond: normalizedInput.ratePerSecond,
-      sender: normalizedInput.sender,
-      recipient: normalizedInput.recipient,
+      sender:        normalizedInput.sender,
+      recipient:     normalizedInput.recipient,
     });
 
     res.set('Idempotency-Key', idempotencyKey);
@@ -450,25 +495,35 @@ streamsRouter.delete(
   authenticate,
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const { id }    = req.params;
+    const { id } = req.params;
     const requestId = (req as any).id as string | undefined;
+    debug('Cancelling stream', { id });
 
-    debug('Deleting stream', { id });
-
-    const index = streams.findIndex((s) => s.id === id);
-    if (index === -1) throw notFound('Stream', id);
-
-    const stream = streams[index];
-    if (stream === undefined) throw notFound('Stream', id);
-
-    const guard = assertValidApiTransition(stream.status as ApiStreamStatus, 'cancelled');
-    if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, { streamId: id, currentStatus: stream.status });
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
     }
 
-    streams[index] = { ...stream, status: 'cancelled' };
-    info('Stream cancelled', { id });
-    recordAuditEvent('STREAM_CANCELLED', 'stream', id as string, (req as any).correlationId);
+    if (!record) throw notFound('Stream', id);
+
+    const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
+    if (!guard.ok) {
+      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+        streamId: id,
+        currentStatus: record!.status,
+      });
+    }
+
+    try {
+      await streamRepository.updateStream(id, { status: 'cancelled' }, requestId);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    info('Stream cancelled', { id, requestId });
+    recordAuditEvent('STREAM_CANCELLED', 'stream', id, (req as any).correlationId);
 
     res.json({ message: 'Stream cancelled', id });
   }),
@@ -485,31 +540,45 @@ streamsRouter.delete(
 streamsRouter.patch(
   '/:id/status',
   asyncHandler(async (req: Request, res: Response) => {
-    const { id }    = req.params;
+    const { id } = req.params;
     const requestId = (req as any).id as string | undefined;
     const { status: newStatus } = req.body ?? {};
 
-    if (typeof newStatus !== 'string' || !['scheduled', 'active', 'paused', 'completed', 'cancelled'].includes(newStatus)) {
+    const validStatuses: ApiStreamStatus[] = ['scheduled', 'active', 'paused', 'completed', 'cancelled'];
+    if (typeof newStatus !== 'string' || !validStatuses.includes(newStatus as ApiStreamStatus)) {
       throw validationError('status must be one of: scheduled, active, paused, completed, cancelled');
     }
 
-    const index = streams.findIndex((s) => s.id === id);
-    if (index === -1) throw notFound('Stream', id);
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
 
-    const stream = streams[index]!;
-    const guard = assertValidApiTransition(stream.status as ApiStreamStatus, newStatus as ApiStreamStatus);
+    if (!record) throw notFound('Stream', id);
+
+    const guard = assertValidApiTransition(record!.status as ApiStreamStatus, newStatus as ApiStreamStatus);
     if (!guard.ok) {
       throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
         streamId: id,
-        currentStatus: stream.status,
+        currentStatus: record!.status,
         requestedStatus: newStatus,
       });
     }
 
-    streams[index] = { ...stream, status: newStatus };
-    info('Stream status updated', { id, from: stream.status, to: newStatus, requestId });
-    recordAuditEvent('STREAM_STATUS_UPDATED', 'stream', id as string, (req as any).correlationId);
+    let updated;
+    try {
+      // 'scheduled' is an API-only concept; map to 'active' in DB
+      const dbStatus = newStatus === 'scheduled' ? 'active' : newStatus as StreamStatus;
+      updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId);
+    } catch (err) {
+      wrapDbError(err);
+    }
 
-    res.json({ ...streams[index] });
+    info('Stream status updated', { id, from: record!.status, to: newStatus, requestId });
+    recordAuditEvent('STREAM_STATUS_UPDATED', 'stream', id, (req as any).correlationId);
+
+    res.json(successResponse(toApiStream(updated!), requestId));
   }),
 );
