@@ -244,3 +244,48 @@ Target: ≥95% coverage on new modules.
 - `src/services/streamEventService.ts` - Event processing service
 - `src/metrics/index.ts` - Metrics tracking
 - `src/routes/streams.ts` - API endpoints
+
+---
+
+## 11. Token Assumptions and Accidental Deposit Recovery
+
+### Token Model
+
+The streaming protocol assumes that the contract address holds exactly the
+tokens that are owed to active stream recipients plus any excess that arrived
+via direct transfer (accidental deposits).
+
+```
+contractBalance = outstandingLiabilities + accidentalDeposits
+```
+
+`outstandingLiabilities` is the sum of `depositAmount` across all non-depleted
+streams (see `docs/security.md` for the full liability table).
+
+### Accidental Direct Deposits
+
+Tokens sent directly to the contract address — bypassing the streaming
+protocol — are not tracked by any stream record. They appear as a positive
+difference between `contractBalance` and `outstandingLiabilities`.
+
+These tokens can be recovered safely via the admin sweep endpoint:
+
+```
+POST /api/admin/sweep
+Authorization: Bearer <ADMIN_API_KEY>
+
+{
+  "contractBalance": "<on-chain balance>",
+  "requestedAmount": "<amount to recover>"
+}
+```
+
+The endpoint enforces the invariant before approving any transfer. See
+`docs/security.md` for the full sweep contract.
+
+### Indexer Lag Warning
+
+If the indexer has not yet processed recent stream events, the service's view
+of `outstandingLiabilities` may be stale. Operators should confirm that
+`GET /health` reports `indexer.status = "healthy"` before relying on the sweep
+calculation.
