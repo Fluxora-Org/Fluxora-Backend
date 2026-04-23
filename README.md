@@ -349,27 +349,43 @@ wscat -c "ws://localhost:3000/ws/streams?token=<your-jwt>"
 
 ### Prerequisites
 
-- Node.js 18+
-- npm or pnpm
+- Node.js 20+
+- pnpm 9+
 
 ### Install and run
 
 ```bash
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 API runs at [http://localhost:3000](http://localhost:3000).
 
 ### Scripts
 
-- `npm run dev` - run with tsx watch
-- `npm run build` - compile to `dist/`
-- `npm test` - run the backend test suite plus webhook signature verification tests
-- `npm start` - run compiled `dist/index.js`
-- `npm run docker:build` - build a production container image
-- `npm run docker:run` - run the production container locally
-- `npm run docker:smoke` - run a quick container health smoke check
+- `pnpm dev` - run with tsx watch
+- `pnpm build` - compile to `dist/`
+- `pnpm test` - run the full test suite (vitest, single run)
+- `pnpm test:coverage` - run tests and enforce 95% coverage threshold
+- `pnpm test:watch` - run tests in watch mode during development
+- `pnpm lint` - check for ESLint violations
+- `pnpm lint:fix` - auto-fix ESLint violations where possible
+- `pnpm format` - format all files with Prettier
+- `pnpm format:check` - verify formatting without writing (used in CI)
+- `pnpm start` - run compiled `dist/index.js`
+- `pnpm docker:build` - build a production container image
+- `pnpm docker:run` - run the production container locally
+- `pnpm docker:smoke` - run a quick container health smoke check
+
+### Code quality
+
+ESLint and Prettier are configured to enforce consistent style and prevent common bugs:
+
+- `amount` and `balance` fields must stay as decimal strings — `parseFloat`, `Number()`, and unary `+` on these variables are lint errors.
+- All exported functions and class methods require explicit return types.
+- Prettier settings are locked (`endOfLine: lf`, `singleQuote`, `trailingComma: all`) to avoid format-war diffs in PRs.
+
+The CI pipeline runs `pnpm lint`, `pnpm format:check`, `pnpm audit`, and `pnpm test:coverage` on every push and PR. Coverage below 95% fails the build.
 
 ## Production Docker Image (Issue #30)
 
