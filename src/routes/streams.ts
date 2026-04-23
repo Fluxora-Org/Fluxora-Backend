@@ -183,7 +183,7 @@ function parseIncludeTotal(includeTotalParam: unknown): boolean {
   if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
     throw validationError('include_total must be true or false');
   }
-  if (includeTotalParam === 'true')  return true;
+  if (includeTotalParam === 'true') return true;
   if (includeTotalParam === 'false') return false;
   throw validationError('include_total must be true or false');
 }
@@ -310,9 +310,9 @@ export function _resetStreams(): void {
 streamsRouter.get(
   '/',
   asyncHandler(async (req: any, res: any) => {
-    const requestId    = req.id as string | undefined;
-    const limit        = parseLimit(req.query.limit);
-    const cursor       = parseCursor(req.query.cursor);
+    const requestId = req.id as string | undefined;
+    const limit = parseLimit(req.query.limit);
+    const cursor = parseCursor(req.query.cursor);
     const includeTotal = parseIncludeTotal(req.query.include_total);
 
     if (streamListingDependency.state !== 'healthy') {
@@ -391,7 +391,7 @@ streamsRouter.post(
   authenticate,
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId      = (req as any).id as string | undefined;
+    const requestId = (req as any).id as string | undefined;
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
 
     if (idempotencyDependency.state !== 'healthy') {
@@ -490,7 +490,7 @@ streamsRouter.delete(
   authenticate,
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const { id }    = req.params;
+    const { id } = req.params;
     const requestId = (req as any).id as string | undefined;
     debug('Cancelling stream', { id });
 
@@ -535,7 +535,7 @@ streamsRouter.delete(
 streamsRouter.patch(
   '/:id/status',
   asyncHandler(async (req: Request, res: Response) => {
-    const { id }    = req.params;
+    const { id } = req.params;
     const requestId = (req as any).id as string | undefined;
     const { status: newStatus } = req.body ?? {};
 

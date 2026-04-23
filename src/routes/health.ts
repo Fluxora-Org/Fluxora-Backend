@@ -54,7 +54,7 @@ healthRouter.get('/', (req: Request, res: Response) => {
 healthRouter.get('/ready', async (req: Request, res: Response) => {
   // Return 503 during graceful shutdown
   if (isShuttingDown()) {
-    return res.status(503).json(errorResponse('Service is shutting down', 'SERVICE_SHUTTING_DOWN'));
+    return res.status(503).json(errorResponse('SERVICE_SHUTTING_DOWN', 'Service is shutting down'));
   }
 
   const healthManager = req.app.locals.healthManager as HealthCheckManager;
@@ -69,12 +69,12 @@ healthRouter.get('/ready', async (req: Request, res: Response) => {
           error: d.error,
         })),
       });
-      return res.status(503).json(errorResponse('Service not ready', 'SERVICE_UNAVAILABLE', report));
+      return res.status(503).json(errorResponse('SERVICE_UNAVAILABLE', 'Service not ready', report));
     }
     res.json(successResponse({ report }));
   } catch (err) {
     logger.error('Readiness check error', err as Error);
-    res.status(503).json(errorResponse('Health check failed', 'HEALTH_CHECK_ERROR'));
+    res.status(503).json(errorResponse('HEALTH_CHECK_ERROR', 'Health check failed'));
   }
 });
 
@@ -90,6 +90,6 @@ healthRouter.get('/live', async (req: Request, res: Response) => {
     res.json(successResponse({ report }));
   } catch (err) {
     logger.error('Failed to get health report', err as Error);
-    res.status(500).json(errorResponse('Failed to get health report', 'HEALTH_CHECK_ERROR'));
+    res.status(500).json(errorResponse('HEALTH_CHECK_ERROR', 'Failed to get health report'));
   }
 });
