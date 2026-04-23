@@ -7,7 +7,6 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
-import { adminRouter } from './routes/admin.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
@@ -17,6 +16,7 @@ import { isShuttingDown } from './shutdown.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
+import { successResponse, errorResponse } from './utils/response.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -29,7 +29,6 @@ export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
   const rateLimiter = createRateLimiter(env);
-  const { ip, apiKey, admin } = getRateLimitConfig(env);
 
   app.use(bodySizeLimitMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
@@ -38,9 +37,6 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
   app.use(rateLimiter);
-
-  // Attach AbortSignal and enforce timeout limits before hitting complex routes
-  app.use(createRequestTimeoutMiddleware(timeoutMs));
 
   app.use((_req: Request, res: Response, next: NextFunction) => {
     if (isShuttingDown()) {
@@ -53,27 +49,6 @@ export function createApp(options: AppOptions = {}): Express {
     app.get('/__test/error', () => {
       throw new Error('Intentional test error');
     });
-
-    app.get('/__test/timeout', async (req: Request, res: Response, next: NextFunction) => {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          // Simulate a long running operation
-          const timer = setTimeout(() => resolve(), 5000);
-
-          // Listen to the abort signal to halt operation
-          req.abortSignal.addEventListener('abort', () => {
-            clearTimeout(timer);
-            reject(new Error('Operation aborted by signal'));
-          });
-        });
-
-        if (!res.headersSent) {
-          res.json({ success: true });
-        }
-      } catch (err) {
-        next(err);
-      }
-    });
   }
 
   app.use('/health', healthRouter);
@@ -82,9 +57,8 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/api/admin', adminRouter);
   app.use('/internal/indexer', indexerRouter);
   app.use('/api/audit', auditRouter);
-  app.use('/api/admin', adminRouter);
   app.use('/admin/dlq', dlqRouter);
-  app.use('/api/admin', adminRouter);
+  app.use('/api/rate-limits', createRateLimitsRouter(env));
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(successResponse({
@@ -97,7 +71,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use((req: Request, res: Response) => {
     const requestId = (req as any).id as string | undefined;
     res.status(404).json(
-      errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId)
+      errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
     );
   });
 

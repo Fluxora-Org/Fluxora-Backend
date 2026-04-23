@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   description: |
     Fluxora Backend: Off-chain companion to the streaming contract.
-    
+
     Presents operator-grade reliability with predictable HTTP semantics, durable views of chain-derived data,
     and explicit failure behavior when dependencies are unhealthy.
 
@@ -17,13 +17,13 @@ info:
     These headers are transport invariants for public clients, authenticated partners,
     administrators, and internal workers that traverse the HTTP surface. They do not replace
     authentication, authorization, TLS termination, or proxy hardening.
-    
+
     ## Trust Boundaries
     - **Public Internet Clients**: Read-only access to stream listings and health checks
     - **Authenticated Partners**: Create and manage streams with idempotency guarantees
     - **Administrators**: Full access including internal indexer endpoints
     - **Internal Workers**: Indexer endpoints for chain state synchronization
-    
+
     ## Failure Modes & Client-Visible Behavior
     - **Invalid Input (400)**: Malformed addresses, negative amounts, oversized payloads
     - **Unauthorized (401)**: Missing or invalid authentication token
@@ -33,7 +33,7 @@ info:
     - **Unprocessable Entity (422)**: Validation failed (e.g., insufficient deposit)
     - **Service Unavailable (503)**: Dependency outage (database, Stellar RPC, workers)
     - **Internal Server Error (500)**: Unexpected error; check logs with requestId
-    
+
   contact:
     name: Fluxora Team
   license:
@@ -1165,69 +1165,88 @@ components:
 
     Stream:
       type: object
+      description: |
+        A durable, PostgreSQL-backed stream record.
+        All monetary amounts are decimal strings - never numbers.
+      required:
+        - id
+        - sender
+        - recipient
+        - depositAmount
+        - ratePerSecond
+        - startTime
+        - endTime
+        - status
       properties:
         id:
           type: string
-          description: Unique stream identifier
-          pattern: '^stream-\d+$'
-          example: stream-1704067200
+          description: |
+            Unique stream identifier derived from SHA-256 of request content.
+            Format: stream-{64-char-hex}-{eventIndex}
+          example: stream-a3f1c2d...0c-0
         sender:
           type: string
           description: |
-            Sender's Stellar public key.
-            Format: G followed by 55 base32 characters [A-Z2-7].
+            Sender Stellar public key (G + 55 base32 chars).
           pattern: '^G[A-Z2-7]{55}$'
           example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
         recipient:
           type: string
           description: |
-            Recipient's Stellar public key.
-            Format: G followed by 55 base32 characters [A-Z2-7].
+            Recipient Stellar public key (G + 55 base32 chars).
           pattern: '^G[A-Z2-7]{55}$'
           example: GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX
         depositAmount:
           type: string
-          description: Total deposit in stroops
-          example: '1000000000'
+          description: Total deposit as a decimal string (never a number).
+          pattern: '^[+-]?[0-9]+(\.[0-9]+)?$'
+          example: '1000'
         ratePerSecond:
           type: string
-          description: Streaming rate in stroops/second
-          example: '100000'
+          description: Streaming rate per second as a decimal string.
+          pattern: '^[+-]?[0-9]+(\.[0-9]+)?$'
+          example: '10'
         startTime:
           type: integer
-          description: Stream start time (Unix timestamp)
-          example: 1704067200
-        createdAt:
-          type: string
-          format: date-time
-          description: When the stream was created
-          example: '2024-01-01T12:00:00Z'
+          description: Stream start time (Unix epoch seconds).
+          example: 1700000000
+        endTime:
+          type: integer
+          description: Stream end time (Unix epoch seconds). 0 = indefinite.
+          example: 0
         status:
           type: string
           enum:
-            - pending
             - active
+            - paused
             - completed
             - cancelled
-          description: Current stream status
+          description: Current stream status.
           example: active
 
     StreamList:
       type: object
+      required:
+        - streams
+        - has_more
       properties:
         streams:
           type: array
           items:
             $ref: '#/components/schemas/Stream'
-        cursor:
+        has_more:
+          type: boolean
+          description: Whether more pages are available.
+          example: true
+        next_cursor:
           type: string
           nullable: true
-          description: Pagination cursor for next page (null if no more pages)
-          example: c3RyZWFtLTE3MDQwNjcyMDA=
+          description: Opaque cursor for the next page (absent when has_more=false).
+          example: eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjLTAifQ
         total:
           type: integer
           nullable: true
-          description: Total number of streams (only if includeTotal=true)
+          description: Total count (only present when include_total=true).
           example: 42
 
     HealthReport:

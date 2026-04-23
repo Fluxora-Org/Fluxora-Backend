@@ -1,13 +1,20 @@
 /**
- * Stream Repository - Database operations for streams table
+ * Stream Repository — PostgreSQL-backed CRUD for the streams table.
  *
- * Implements idempotent event ingestion from blockchain events.
- * Handles out-of-order events and ensures data consistency.
+ * All public methods are async and use the shared pg Pool from src/db/pool.ts.
+ *
+ * Idempotency guarantee:
+ *   upsertStream uses INSERT … ON CONFLICT DO NOTHING so the same
+ *   (transaction_hash, event_index) pair is safe to submit multiple times.
+ *
+ * Decimal-string invariant:
+ *   Amount columns are stored and returned as TEXT.  No numeric coercion
+ *   is performed here — callers own that responsibility.
  *
  * @module db/repositories/streamRepository
  */
 
-import { getDatabase } from "../connection.js";
+import { getPool, query, DuplicateEntryError } from '../pool.js';
 import {
   StreamRecord,
   CreateStreamInput,
@@ -17,136 +24,82 @@ import {
   PaginatedStreams,
   STREAM_INVARIANTS,
   StreamStatus,
-} from "../types.js";
-import { info, warn, error as logError, debug } from "../../utils/logger.js";
+} from '../types.js';
+import { info, warn, debug } from '../../utils/logger.js';
 
-/**
- * Result of an upsert operation
- */
+// ── Types ─────────────────────────────────────────────────────────────────────
+
 export interface UpsertResult {
   created: boolean;
-  updated: boolean;
   stream: StreamRecord;
 }
 
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
 /**
- * Stream repository with idempotent event handling
+ * Map a raw pg row to a typed StreamRecord.
+ * pg returns BIGINT columns as strings — coerce start_time / end_time to number.
  */
+function rowToRecord(row: Record<string, unknown>): StreamRecord {
+  return {
+    id:                row['id']                as string,
+    sender_address:    row['sender_address']    as string,
+    recipient_address: row['recipient_address'] as string,
+    amount:            row['amount']            as string,
+    streamed_amount:   row['streamed_amount']   as string,
+    remaining_amount:  row['remaining_amount']  as string,
+    rate_per_second:   row['rate_per_second']   as string,
+    start_time:        Number(row['start_time']),
+    end_time:          Number(row['end_time']),
+    status:            row['status']            as StreamStatus,
+    contract_id:       row['contract_id']       as string,
+    transaction_hash:  row['transaction_hash']  as string,
+    event_index:       row['event_index']       as number,
+    created_at:        (row['created_at'] as Date).toISOString(),
+    updated_at:        (row['updated_at'] as Date).toISOString(),
+  };
+}
+
+function isValidStatusTransition(from: StreamStatus, to: StreamStatus): boolean {
+  const allowed: readonly string[] = STREAM_INVARIANTS.validTransitions[from] ?? [];
+  return allowed.includes(to);
+}
+
+// ── Repository ────────────────────────────────────────────────────────────────
+
 export const streamRepository = {
   /**
-   * Create or update a stream from a blockchain event.
+   * Insert a stream from a blockchain event.
    *
-   * IDEMPOTENCY: Uses transaction_hash + event_index as unique constraint.
-   * If an event with the same transaction hash and event index already exists,
-   * the operation is idempotent - returns the existing record without modification.
-   *
-   * HANDLES OUT-OF-ORDER: If a later event arrives before an earlier one,
-   * both are handled correctly - earlier event creates the record,
-   * later event updates it.
-   *
-   * @param input - Stream data from blockchain event
-   * @param correlationId - Request ID for tracing
-   * @returns UpsertResult with created/updated flag and stream record
+   * Uses INSERT … ON CONFLICT DO NOTHING for idempotency.
+   * If the (transaction_hash, event_index) pair already exists the existing
+   * record is returned with created=false.
    */
-  upsertStream(input: CreateStreamInput, correlationId?: string): UpsertResult {
-    const db = getDatabase();
-    const now = new Date().toISOString();
+  async upsertStream(
+    input: CreateStreamInput,
+    correlationId?: string,
+  ): Promise<UpsertResult> {
+    const pool = getPool();
 
-    // Validate input
-    const validation = validateStreamInput(input);
-    if (!validation.valid) {
-      throw new Error(`Invalid stream input: ${validation.errors.join(", ")}`);
-    }
-
-    // Check if stream already exists (idempotency check)
-    const existing = db
-      .prepare(
-        `
-      SELECT * FROM streams 
-      WHERE transaction_hash = ? AND event_index = ?
-    `,
-      )
-      .get(input.transaction_hash, input.event_index) as
-      | StreamRecord
-      | undefined;
-
-    if (existing) {
-      debug("Stream already exists (idempotent)", {
-        id: existing.id,
-        txHash: input.transaction_hash,
-        correlationId,
-      });
-      return { created: false, updated: false, stream: existing };
-    }
-
-    // Check if stream ID already exists (possible from different event in same tx)
-    const existingById = db
-      .prepare("SELECT * FROM streams WHERE id = ?")
-      .get(input.id) as StreamRecord | undefined;
-
-    if (existingById) {
-      // Update existing record - handle out-of-order events
-      info("Updating existing stream with new event data", {
-        id: input.id,
-        correlationId,
-      });
-
-      const stmt = db.prepare(`
-        UPDATE streams SET
-          sender_address = ?,
-          recipient_address = ?,
-          amount = ?,
-          streamed_amount = ?,
-          remaining_amount = ?,
-          rate_per_second = ?,
-          start_time = ?,
-          end_time = ?,
-          status = ?,
-          contract_id = ?,
-          transaction_hash = ?,
-          event_index = ?,
-          updated_at = ?
-        WHERE id = ?
-      `);
-
-      stmt.run(
-        input.sender_address,
-        input.recipient_address,
-        input.amount,
-        input.streamed_amount,
-        input.remaining_amount,
-        input.rate_per_second,
-        input.start_time,
-        input.end_time,
-        "active",
-        input.contract_id,
-        input.transaction_hash,
-        input.event_index,
-        now,
-        input.id,
-      );
-
-      const updated = db
-        .prepare("SELECT * FROM streams WHERE id = ?")
-        .get(input.id) as StreamRecord;
-      return { created: false, updated: true, stream: updated };
-    }
-
-    // Create new stream record
-    info("Creating new stream from event", {
-      id: input.id,
-      correlationId,
-    });
-
-    const stmt = db.prepare(`
+    const insertSql = `
       INSERT INTO streams (
-        id, sender_address, recipient_address, amount, streamed_amount,
-        remaining_amount, rate_per_second, start_time, end_time, status,
-        contract_id, transaction_hash, event_index, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+        id, sender_address, recipient_address,
+        amount, streamed_amount, remaining_amount, rate_per_second,
+        start_time, end_time, status,
+        contract_id, transaction_hash, event_index,
+        created_at, updated_at
+      ) VALUES (
+        $1, $2, $3,
+        $4, $5, $6, $7,
+        $8, $9, 'active',
+        $10, $11, $12,
+        NOW(), NOW()
+      )
+      ON CONFLICT (transaction_hash, event_index) DO NOTHING
+      RETURNING *
+    `;
 
-    stmt.run(
+    const params = [
       input.id,
       input.sender_address,
       input.recipient_address,
@@ -156,300 +109,269 @@ export const streamRepository = {
       input.rate_per_second,
       input.start_time,
       input.end_time,
-      "active",
       input.contract_id,
       input.transaction_hash,
       input.event_index,
-      now,
-      now,
-    );
+    ];
 
-    const stream = db
-      .prepare("SELECT * FROM streams WHERE id = ?")
-      .get(input.id) as StreamRecord;
-    return { created: true, updated: false, stream };
+    const result = await query<Record<string, unknown>>(pool, insertSql, params);
+
+    if (result.rows.length > 0) {
+      const stream = rowToRecord(result.rows[0]!);
+      info('Stream created from event', { id: stream.id, correlationId });
+      return { created: true, stream };
+    }
+
+    // Row already existed — fetch it
+    const existing = await this.getById(input.id);
+    if (!existing) {
+      // Edge case: conflict on tx_hash+event_index but different id — fetch by event
+      const byEvent = await this.getByEvent(input.transaction_hash, input.event_index);
+      if (!byEvent) throw new Error('Idempotency conflict: stream not found after insert conflict');
+      debug('Stream already exists (idempotent)', { id: byEvent.id, correlationId });
+      return { created: false, stream: byEvent };
+    }
+
+    debug('Stream already exists (idempotent)', { id: existing.id, correlationId });
+    return { created: false, stream: existing };
   },
 
   /**
-   * Update stream status and/or amounts
-   *
-   * Validates status transitions according to state machine
+   * Update stream status and/or amounts.
+   * Validates status transitions against the state machine.
    */
-  updateStream(
+  async updateStream(
     id: string,
     input: UpdateStreamInput,
     correlationId?: string,
-  ): StreamRecord {
-    const db = getDatabase();
-    const now = new Date().toISOString();
+  ): Promise<StreamRecord> {
+    const pool = getPool();
 
-    // Get current stream
-    const current = db.prepare("SELECT * FROM streams WHERE id = ?").get(id) as
-      | StreamRecord
-      | undefined;
+    const current = await this.getById(id);
+    if (!current) throw new Error(`Stream not found: ${id}`);
 
-    if (!current) {
-      throw new Error(`Stream not found: ${id}`);
-    }
-
-    // Validate status transition
-    if (
-      input.status &&
-      !isValidStatusTransition(current.status, input.status)
-    ) {
+    if (input.status && !isValidStatusTransition(current.status, input.status)) {
+      const allowed = STREAM_INVARIANTS.validTransitions[current.status].join(', ');
       throw new Error(
-        `Invalid status transition: ${current.status} -> ${input.status}. ` +
-          `Valid transitions: ${STREAM_INVARIANTS.validTransitions[current.status].join(", ")}`,
+        `Invalid status transition: ${current.status} → ${input.status}. Allowed: ${allowed || 'none'}`,
       );
     }
 
-    // Build update query
-    const updates: string[] = ["updated_at = ?"];
-    const values: (string | number)[] = [now];
+    const setClauses: string[] = ['updated_at = NOW()'];
+    const values: unknown[]    = [];
+    let   idx                  = 1;
 
     if (input.status !== undefined) {
-      updates.push("status = ?");
+      setClauses.push(`status = $${idx++}`);
       values.push(input.status);
     }
-
     if (input.streamed_amount !== undefined) {
-      updates.push("streamed_amount = ?");
+      setClauses.push(`streamed_amount = $${idx++}`);
       values.push(input.streamed_amount);
     }
-
     if (input.remaining_amount !== undefined) {
-      updates.push("remaining_amount = ?");
+      setClauses.push(`remaining_amount = $${idx++}`);
       values.push(input.remaining_amount);
     }
-
     if (input.end_time !== undefined) {
-      updates.push("end_time = ?");
+      setClauses.push(`end_time = $${idx++}`);
       values.push(input.end_time);
     }
 
     values.push(id);
+    const sql = `UPDATE streams SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`;
 
-    const stmt = db.prepare(
-      `UPDATE streams SET ${updates.join(", ")} WHERE id = ?`,
+    const result = await query<Record<string, unknown>>(pool, sql, values);
+    if (result.rows.length === 0) throw new Error(`Stream not found after update: ${id}`);
+
+    info('Stream updated', { id, input, correlationId });
+    return rowToRecord(result.rows[0]!);
+  },
+
+  /** Fetch a single stream by its primary key. */
+  async getById(id: string): Promise<StreamRecord | undefined> {
+    const pool = getPool();
+    const result = await query<Record<string, unknown>>(
+      pool,
+      'SELECT * FROM streams WHERE id = $1',
+      [id],
     );
-    stmt.run(...values);
-
-    info("Stream updated", { id, input, correlationId });
-
-    return db
-      .prepare("SELECT * FROM streams WHERE id = ?")
-      .get(id) as StreamRecord;
+    return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
   },
 
-  /**
-   * Get stream by ID
-   */
-  getById(id: string): StreamRecord | undefined {
-    const db = getDatabase();
-    return db.prepare("SELECT * FROM streams WHERE id = ?").get(id) as
-      | StreamRecord
-      | undefined;
-  },
-
-  /**
-   * Get stream by transaction hash and event index (for idempotency check)
-   */
-  getByEvent(
+  /** Fetch a stream by its blockchain event coordinates (for idempotency). */
+  async getByEvent(
     transactionHash: string,
     eventIndex: number,
-  ): StreamRecord | undefined {
-    const db = getDatabase();
-    return db
-      .prepare(
-        `
-      SELECT * FROM streams 
-      WHERE transaction_hash = ? AND event_index = ?
-    `,
-      )
-      .get(transactionHash, eventIndex) as StreamRecord | undefined;
+  ): Promise<StreamRecord | undefined> {
+    const pool = getPool();
+    const result = await query<Record<string, unknown>>(
+      pool,
+      'SELECT * FROM streams WHERE transaction_hash = $1 AND event_index = $2',
+      [transactionHash, eventIndex],
+    );
+    return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
   },
 
   /**
-   * Query streams with filtering and pagination
+   * Cursor-based paginated list with optional filters.
+   *
+   * Cursor encodes the last seen `id` (lexicographic ordering).
+   * Filters map directly to WHERE clauses — all are optional.
    */
-  find(filter: StreamFilter, pagination: PaginationOptions): PaginatedStreams {
-    const db = getDatabase();
+  async findWithCursor(
+    filter: StreamFilter,
+    limit: number,
+    afterId?: string,
+    includeTotal?: boolean,
+  ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
+    const pool = getPool();
 
-    // Build WHERE clause
     const conditions: string[] = [];
-    const params: (string | number)[] = [];
+    const params: unknown[]    = [];
+    let   idx                  = 1;
 
     if (filter.status) {
-      conditions.push("status = ?");
+      conditions.push(`status = $${idx++}`);
       params.push(filter.status);
     }
-
     if (filter.sender_address) {
-      conditions.push("sender_address = ?");
+      conditions.push(`sender_address = $${idx++}`);
       params.push(filter.sender_address);
     }
-
     if (filter.recipient_address) {
-      conditions.push("recipient_address = ?");
+      conditions.push(`recipient_address = $${idx++}`);
       params.push(filter.recipient_address);
     }
-
     if (filter.contract_id) {
-      conditions.push("contract_id = ?");
+      conditions.push(`contract_id = $${idx++}`);
       params.push(filter.contract_id);
     }
 
+    const whereBase = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // Cursor condition appended separately so total count excludes it
+    const cursorConditions = [...conditions];
+    const cursorParams     = [...params];
+
+    if (afterId) {
+      cursorConditions.push(`id > $${idx++}`);
+      cursorParams.push(afterId);
+    }
+
+    const whereCursor =
+      cursorConditions.length > 0 ? `WHERE ${cursorConditions.join(' AND ')}` : '';
+
+    // Fetch limit+1 to detect hasMore
+    const dataSql = `
+      SELECT * FROM streams
+      ${whereCursor}
+      ORDER BY id ASC
+      LIMIT $${idx}
+    `;
+    cursorParams.push(limit + 1);
+
+    const [dataResult, countResult] = await Promise.all([
+      query<Record<string, unknown>>(pool, dataSql, cursorParams),
+      includeTotal
+        ? query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${whereBase}`, params)
+        : Promise.resolve(null),
+    ]);
+
+    const hasMore = dataResult.rows.length > limit;
+    const rows    = hasMore ? dataResult.rows.slice(0, limit) : dataResult.rows;
+    const streams = rows.map(rowToRecord);
+
+    return {
+      streams,
+      hasMore,
+      total: countResult ? Number(countResult.rows[0]!.count) : undefined,
+    };
+  },
+
+  /**
+   * Offset-based paginated list (used by internal/indexer consumers).
+   */
+  async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
+    const pool = getPool();
+
+    const conditions: string[] = [];
+    const params: unknown[]    = [];
+    let   idx                  = 1;
+
+    if (filter.status) {
+      conditions.push(`status = $${idx++}`);
+      params.push(filter.status);
+    }
+    if (filter.sender_address) {
+      conditions.push(`sender_address = $${idx++}`);
+      params.push(filter.sender_address);
+    }
+    if (filter.recipient_address) {
+      conditions.push(`recipient_address = $${idx++}`);
+      params.push(filter.recipient_address);
+    }
+    if (filter.contract_id) {
+      conditions.push(`contract_id = $${idx++}`);
+      params.push(filter.contract_id);
+    }
     if (filter.start_time_from !== undefined) {
-      conditions.push("start_time >= ?");
+      conditions.push(`start_time >= $${idx++}`);
       params.push(filter.start_time_from);
     }
-
     if (filter.start_time_to !== undefined) {
-      conditions.push("start_time <= ?");
+      conditions.push(`start_time <= $${idx++}`);
       params.push(filter.start_time_to);
     }
-
     if (filter.end_time_from !== undefined) {
-      conditions.push("end_time >= ?");
+      conditions.push(`end_time >= $${idx++}`);
       params.push(filter.end_time_from);
     }
-
     if (filter.end_time_to !== undefined) {
-      conditions.push("end_time <= ?");
+      conditions.push(`end_time <= $${idx++}`);
       params.push(filter.end_time_to);
     }
 
-    const whereClause =
-      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // Get total count
-    const countResult = db
-      .prepare(`SELECT COUNT(*) as total FROM streams ${whereClause}`)
-      .get(...params) as { total: number };
-    const total = countResult.total;
+    const countParams = [...params];
+    const dataParams  = [...params, pagination.limit, pagination.offset];
 
-    // Get paginated results
-    const query = `
-      SELECT * FROM streams 
-      ${whereClause}
-      ORDER BY created_at DESC
-      LIMIT ? OFFSET ?
-    `;
+    const [countResult, dataResult] = await Promise.all([
+      query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
+      query<Record<string, unknown>>(
+        pool,
+        `SELECT * FROM streams ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
+        dataParams,
+      ),
+    ]);
 
-    params.push(pagination.limit, pagination.offset);
-    const streams = db.prepare(query).all(...params) as StreamRecord[];
+    const total   = Number(countResult.rows[0]!.count);
+    const streams = dataResult.rows.map(rowToRecord);
 
     return {
       streams,
       total,
-      limit: pagination.limit,
-      offset: pagination.offset,
+      limit:   pagination.limit,
+      offset:  pagination.offset,
       hasMore: pagination.offset + streams.length < total,
     };
   },
 
-  /**
-   * Get all streams (for backwards compatibility)
-   */
-  getAll(): StreamRecord[] {
-    const db = getDatabase();
-    return db
-      .prepare("SELECT * FROM streams ORDER BY created_at DESC")
-      .all() as StreamRecord[];
-  },
-
-  /**
-   * Count streams by status
-   */
-  countByStatus(): Record<StreamStatus, number> {
-    const db = getDatabase();
-    const results = db
-      .prepare(
-        `
-      SELECT status, COUNT(*) as count FROM streams GROUP BY status
-    `,
-      )
-      .all() as { status: StreamStatus; count: number }[];
+  /** Count streams grouped by status. */
+  async countByStatus(): Promise<Record<StreamStatus, number>> {
+    const pool = getPool();
+    const result = await query<{ status: StreamStatus; count: string }>(
+      pool,
+      'SELECT status, COUNT(*) AS count FROM streams GROUP BY status',
+    );
 
     const counts: Record<StreamStatus, number> = {
-      active: 0,
-      paused: 0,
-      completed: 0,
-      cancelled: 0,
+      active: 0, paused: 0, completed: 0, cancelled: 0,
     };
-
-    for (const row of results) {
-      counts[row.status] = row.count;
+    for (const row of result.rows) {
+      counts[row.status] = Number(row.count);
     }
-
     return counts;
   },
 };
-
-/**
- * Validate stream input data
- */
-function validateStreamInput(input: CreateStreamInput): {
-  valid: boolean;
-  errors: string[];
-} {
-  const errors: string[] = [];
-
-  // Validate ID format
-  if (!STREAM_INVARIANTS.idPattern.test(input.id)) {
-    errors.push(`Invalid ID format: ${input.id}`);
-  }
-
-  // Validate addresses (basic Stellar address format check)
-  if (!input.sender_address || !input.sender_address.startsWith("G")) {
-    errors.push(`Invalid sender address: ${input.sender_address}`);
-  }
-
-  if (!input.recipient_address || !input.recipient_address.startsWith("G")) {
-    errors.push(`Invalid recipient address: ${input.recipient_address}`);
-  }
-
-  // Validate amounts
-  if (!/^\d+(\.\d+)?$/.test(input.amount)) {
-    errors.push(`Invalid amount format: ${input.amount}`);
-  }
-
-  if (!/^\d+(\.\d+)?$/.test(input.rate_per_second)) {
-    errors.push(`Invalid rate_per_second format: ${input.rate_per_second}`);
-  }
-
-  // Validate timestamps
-  if (
-    input.start_time < STREAM_INVARIANTS.timestampConstraints.minTime ||
-    input.start_time > STREAM_INVARIANTS.timestampConstraints.maxTime
-  ) {
-    errors.push(`Invalid start_time: ${input.start_time}`);
-  }
-
-  if (
-    input.end_time < STREAM_INVARIANTS.timestampConstraints.minTime ||
-    input.end_time > STREAM_INVARIANTS.timestampConstraints.maxTime
-  ) {
-    errors.push(`Invalid end_time: ${input.end_time}`);
-  }
-
-  // Validate transaction hash
-  if (!/^[a-f0-9]{64}$/.test(input.transaction_hash)) {
-    errors.push(`Invalid transaction hash: ${input.transaction_hash}`);
-  }
-
-  return { valid: errors.length === 0, errors };
-}
-
-/**
- * Check if status transition is valid
- */
-function isValidStatusTransition(
-  from: StreamStatus,
-  to: StreamStatus,
-): boolean {
-  const transitions: readonly string[] =
-    STREAM_INVARIANTS.validTransitions[from];
-  if (!transitions) return false;
-  return transitions.includes(to);
-}
