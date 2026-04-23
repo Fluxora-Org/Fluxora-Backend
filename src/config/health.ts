@@ -18,7 +18,8 @@ export interface HealthReport {
 
 export interface HealthChecker {
   name: string;
-  check(): Promise<{ latency: number; error?: string }>;
+  /** Return `degraded: true` to signal high-latency / partial availability without a hard error. */
+  check(): Promise<{ latency: number; error?: string; degraded?: boolean }>;
 }
 
 export class HealthCheckManager {
@@ -69,11 +70,21 @@ export class HealthCheckManager {
     try {
       const result = await checker.check();
       const latency = result.latency ?? Date.now() - startTime;
+
+      let status: HealthStatus;
+      if (result.error) {
+        status = 'unhealthy';
+      } else if (result.degraded) {
+        status = 'degraded';
+      } else {
+        status = 'healthy';
+      }
+
       const health: DependencyHealth = {
         name: checker.name,
-        status: result.error ? 'unhealthy' : 'healthy',
+        status,
         latency,
-        error: result.error,
+        ...(result.error !== undefined ? { error: result.error } : {}),
         lastChecked: new Date().toISOString(),
       };
 

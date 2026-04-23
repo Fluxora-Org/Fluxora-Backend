@@ -33,6 +33,14 @@ export function createApp(options: AppOptions = {}): Express {
   const env = options.env ?? (process.env as Record<string, string | undefined>);
   const rateLimiter = createRateLimiter(env);
 
+  // Inject config and healthManager into app.locals for route handlers
+  if (options.config) {
+    app.locals.config = options.config;
+  }
+  if (options.healthManager) {
+    app.locals.healthManager = options.healthManager;
+  }
+
   app.use(bodySizeLimitMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   // Correlation ID must be first so all subsequent middleware/routes have req.correlationId.
