@@ -13,14 +13,22 @@ import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { bodySizeLimitMiddleware, BODY_LIMIT_BYTES } from './middleware/requestProtection.js';
 import { isShuttingDown } from './shutdown.js';
+import { createRateLimiter } from './middleware/rateLimiter.js';
+import { createRateLimitsRouter } from './routes/rateLimits.js';
+import { getRateLimitConfig } from './config/rateLimits.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error route that throws unconditionally. */
   includeTestRoutes?: boolean;
+  /** Environment variables used to seed the rate-limiter (defaults to process.env). */
+  env?: Record<string, string | undefined>;
 }
 
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
+  const env = options.env ?? (process.env as Record<string, string | undefined>);
+  const rateLimiter = createRateLimiter(env);
+  const { ip, apiKey, admin } = getRateLimitConfig(env);
 
   app.use(bodySizeLimitMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
@@ -28,6 +36,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(correlationIdMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(rateLimiter);
 
   // During shutdown, tell clients to close the connection so keep-alive
   // connections are not reused and the server can drain quickly.
