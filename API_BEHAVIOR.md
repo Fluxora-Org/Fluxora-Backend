@@ -36,60 +36,77 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 
 ## HTTP Status Codes & Semantics
 
+### Success Responses
+
+All successful responses follow this standardized structure:
+
+```json
+{
+  "success": true,
+  "data": {
+    // Response payload
+  },
+  "meta": {
+    "timestamp": "2024-01-01T12:00:00.000Z",
+    "requestId": "550e8400-e29b-41d4-a716-446655440000"
+  }
+}
+```
+
 ### 200 OK
 - **When**: Request succeeded; response body contains result
-- **Body**: JSON object with requested data
+- **Body**: JSON object with `success: true`, `data`, and `meta` fields
 - **Idempotent**: Yes (safe to retry)
-- **Example**: GET /api/streams returns stream list
+- **Example**: GET /api/streams returns stream list wrapped in success envelope
 
 ### 201 Created
 - **When**: Resource created successfully
-- **Body**: JSON object with created resource
+- **Body**: JSON object with `success: true`, created resource in `data`, and `meta` fields
 - **Idempotent**: Yes (via Idempotency-Key)
-- **Example**: POST /api/streams returns new stream
+- **Example**: POST /api/streams returns new stream wrapped in success envelope
 
 ### 202 Accepted
 - **When**: Request accepted for async processing
-- **Body**: JSON object with status (e.g., "queued")
+- **Body**: JSON object with `success: true`, status in `data`, and `meta` fields
 - **Idempotent**: Yes
 - **Example**: POST /internal/indexer/sync queues sync job
 
 ### 400 Bad Request
 - **When**: Malformed request (invalid JSON, missing fields, wrong types)
-- **Body**: Error response with code and message
+- **Body**: Error response with standardized envelope
 - **Idempotent**: No (retry may succeed with corrected request)
 - **Examples**:
-  - Invalid JSON: `{"error": {"code": "invalid_json", "message": "Request body must be valid JSON"}}`
-  - Missing field: `{"error": {"code": "validation_error", "message": "sender is required"}}`
+  - Invalid JSON: `{"success": false, "error": {"code": "INVALID_JSON", "message": "Request body must be valid JSON"}}`
+  - Missing field: `{"success": false, "error": {"code": "VALIDATION_ERROR", "message": "sender is required"}}`
 
 ### 401 Unauthorized
 - **When**: Missing or invalid authentication token
-- **Body**: Error response with code "unauthorized"
+- **Body**: Error response with code "UNAUTHORIZED"
 - **Idempotent**: No (retry with valid token may succeed)
 - **Cause**: Missing Authorization header, expired token, invalid signature
 
 ### 403 Forbidden
 - **When**: Authenticated but insufficient permissions
-- **Body**: Error response with code "forbidden"
+- **Body**: Error response with code "FORBIDDEN"
 - **Idempotent**: No (retry with different credentials may succeed)
 - **Example**: Non-admin trying to access /internal/indexer
 
 ### 404 Not Found
 - **When**: Resource does not exist
-- **Body**: Error response with code "not_found"
+- **Body**: Error response with code "NOT_FOUND"
 - **Idempotent**: Yes (resource will not exist on retry)
 - **Example**: GET /api/streams/stream-invalid returns 404
 
 ### 409 Conflict
 - **When**: Duplicate submission detected (Idempotency-Key collision with different body)
-- **Body**: Error response with code "conflict"
+- **Body**: Error response with code "CONFLICT"
 - **Idempotent**: No (retry with same body returns 201; different body returns 409)
 - **Cause**: Same Idempotency-Key used with different request body
 - **Recovery**: Use new Idempotency-Key or retry with original body
 
 ### 413 Payload Too Large
 - **When**: Request body exceeds 256 KiB
-- **Body**: Error response with code "payload_too_large"
+- **Body**: Error response with code "PAYLOAD_TOO_LARGE"
 - **Idempotent**: No (retry with smaller payload may succeed)
 - **Limit**: 256 KiB (262,144 bytes)
 
@@ -104,13 +121,13 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 
 ### 500 Internal Server Error
 - **When**: Unexpected error in service code
-- **Body**: Error response with code "internal_error" and requestId
+- **Body**: Error response with code "INTERNAL_ERROR" and requestId
 - **Idempotent**: Unknown (check logs with requestId)
 - **Action**: Log requestId; contact support
 
 ### 503 Service Unavailable
 - **When**: Dependency is unhealthy (database, Stellar RPC, workers)
-- **Body**: Error response with code "service_unavailable"
+- **Body**: Error response with code "SERVICE_UNAVAILABLE"
 - **Idempotent**: Yes (retry after dependency recovers)
 - **Cause**: Database connection failed, Stellar RPC timeout, worker queue full
 - **Recovery**: Automatic; retry after 30 seconds
@@ -163,21 +180,21 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 #### Sender and Recipient Are the Same
 - **Trigger**: `sender === recipient`
 - **Status**: 422
-- **Code**: `validation_error`
+- **Code**: `VALIDATION_ERROR`
 - **Message**: "sender and recipient must be different addresses"
 - **Recovery**: Use different addresses
 
 #### Insufficient Deposit
 - **Trigger**: `depositAmount < ratePerSecond`
 - **Status**: 422
-- **Code**: `validation_error`
+- **Code**: `VALIDATION_ERROR`
 - **Message**: "depositAmount must be at least equal to ratePerSecond (minimum 1 second of streaming)"
 - **Recovery**: Increase depositAmount or decrease ratePerSecond
 
 #### Invalid Timestamp
 - **Trigger**: `startTime < now - 1 hour` or `startTime` is not a valid Unix timestamp
 - **Status**: 400 or 422
-- **Code**: `validation_error`
+- **Code**: `VALIDATION_ERROR`
 - **Message**: "startTime must be in the future or within the last hour"
 - **Recovery**: Use future timestamp or timestamp within last hour
 
@@ -192,14 +209,14 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 #### Idempotency-Key Collision (Different Body)
 - **Trigger**: Same Idempotency-Key with different request body
 - **Status**: 409
-- **Code**: `conflict`
+- **Code**: `CONFLICT`
 - **Message**: "Duplicate Idempotency-Key with different request body"
 - **Recovery**: Use new Idempotency-Key or retry with original body
 
 #### Missing Idempotency-Key
 - **Trigger**: POST /api/streams without Idempotency-Key header
 - **Status**: 400
-- **Code**: `validation_error`
+- **Code**: `VALIDATION_ERROR`
 - **Message**: "Idempotency-Key header is required"
 - **Recovery**: Add Idempotency-Key header with unique value
 
@@ -208,7 +225,7 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 #### Database Connection Failed
 - **Trigger**: Cannot connect to database
 - **Status**: 503
-- **Code**: `service_unavailable`
+- **Code**: `SERVICE_UNAVAILABLE`
 - **Message**: "Service temporarily unavailable"
 - **Behavior**: All endpoints return 503
 - **Recovery**: Automatic; retry after 30 seconds
@@ -216,15 +233,95 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 #### Stellar RPC Timeout
 - **Trigger**: Stellar RPC endpoint does not respond within timeout
 - **Status**: 503
-- **Code**: `service_unavailable`
+- **Code**: `SERVICE_UNAVAILABLE`
 - **Message**: "Service temporarily unavailable"
 - **Behavior**: Stream creation may fail; listing may return stale data
 - **Recovery**: Automatic; retry after 30 seconds
 
+---
+
+## Stellar RPC: Timeout, Cancellation, and Failure Classification
+
+### Overview
+
+All Stellar RPC calls go through `StellarRpcService` in `src/services/stellar-rpc.ts`, which enforces:
+
+- **Per-call timeout** — configurable via `RPC_TIMEOUT_MS` (default 5 000 ms)
+- **AbortController cancellation** — callers may pass an `AbortSignal` to cancel in-flight calls
+- **Structured failure classification** — every failure is tagged with a `kind` field
+- **Circuit breaker** — trips after repeated failures to prevent cascade
+
+### Failure Kinds (`RpcFailureKind`)
+
+| Kind | Cause | Operator action |
+|------|-------|-----------------|
+| `TIMEOUT` | Call did not complete within `timeoutMs` | Check RPC endpoint latency; increase `RPC_TIMEOUT_MS` if needed |
+| `NETWORK` | Connection-level error (`ECONNREFUSED`, `ENOTFOUND`, etc.) | Verify network path to RPC endpoint; check DNS |
+| `PROVIDER` | RPC returned an error response (4xx / 5xx) | Inspect `statusCode` in log; check RPC provider status |
+| `CIRCUIT_OPEN` | Circuit breaker is OPEN; call was not attempted | Wait for `RPC_CB_RESET_TIMEOUT_MS`; check upstream health |
+| `CANCELLED` | Caller aborted via `AbortSignal` | Expected; no action required |
+
+### Structured Log Fields
+
+Every failure emits a `warn` log with these fields:
+
+```json
+{
+  "event": "rpc_failure",
+  "operation": "getLatestLedger",
+  "kind": "TIMEOUT",
+  "statusCode": null,
+  "durationMs": 5001,
+  "error": "getLatestLedger timed out after 5000ms"
+}
+```
+
+### AbortController Usage
+
+Pass an `AbortSignal` to cancel a call externally:
+
+```ts
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 3000); // cancel after 3 s
+
+try {
+  const ledger = await rpcService.getLatestLedger({ signal: controller.signal });
+} catch (err) {
+  if (err instanceof RpcProviderError && err.kind === 'CANCELLED') {
+    // call was cancelled — safe to ignore or retry
+  }
+}
+```
+
+### Circuit Breaker Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `RPC_TIMEOUT_MS` | `5000` | Per-call timeout in ms |
+| `RPC_CB_FAILURE_THRESHOLD` | `5` | Failures within window before tripping |
+| `RPC_CB_WINDOW_MS` | `30000` | Rolling failure-counting window in ms |
+| `RPC_CB_RESET_TIMEOUT_MS` | `60000` | Time OPEN before allowing a probe in ms |
+
+### Failure Modes and Expected Behavior
+
+| Condition | `kind` | Circuit breaker | Client-visible outcome |
+|-----------|--------|-----------------|------------------------|
+| RPC unreachable | `NETWORK` | Counts toward threshold | `503 Service Unavailable` |
+| RPC slow / hung | `TIMEOUT` | Counts toward threshold | `503 Service Unavailable` |
+| RPC 5xx response | `PROVIDER` | Counts toward threshold | `503 Service Unavailable` |
+| Breaker OPEN | `CIRCUIT_OPEN` | Already OPEN | `503 Service Unavailable` (fast-fail) |
+| Caller cancelled | `CANCELLED` | Does **not** count | Request aborted; no response sent |
+
+### Security Notes
+
+- Timeout values are read from environment variables at startup; they are not user-controllable at runtime.
+- `AbortSignal` cancellation does not suppress circuit-breaker accounting — only `CANCELLED` failures are excluded from the failure count.
+- No RPC credentials or internal error details are forwarded to HTTP clients; only `503` with a generic message is returned.
+
 #### Worker Queue Full
 - **Trigger**: Indexer worker queue exceeds capacity
 - **Status**: 503
-- **Code**: `service_unavailable`
+- **Code**: `SERVICE_UNAVAILABLE`
 - **Message**: "Service temporarily unavailable"
 - **Behavior**: POST /internal/indexer/sync returns 503
 - **Recovery**: Automatic; retry after 60 seconds
@@ -270,42 +367,43 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 
 ## Error Response Format
 
-All error responses follow this structure:
+All error responses follow this standardized structure:
 
 ```json
 {
+  "success": false,
   "error": {
-    "code": "error_code",
+    "code": "ERROR_CODE",
     "message": "Human-readable message",
-    "status": 400,
-    "requestId": "550e8400-e29b-41d4-a716-446655440000",
     "details": {
       "field": "fieldName",
       "value": "fieldValue"
-    }
+    },
+    "requestId": "550e8400-e29b-41d4-a716-446655440000"
   }
 }
 ```
 
 ### Fields
-- **code**: Machine-readable error code (snake_case)
-- **message**: Human-readable description
-- **status**: HTTP status code (for reference)
-- **requestId**: Correlation ID for debugging (always present)
-- **details**: Optional; additional context (field name, value, etc.)
+- **success**: Always `false` for error responses
+- **error.code**: Machine-readable error code (UPPER_SNAKE_CASE)
+- **error.message**: Human-readable description
+- **error.details**: Optional; additional context (field name, value, etc.)
+- **error.requestId**: Correlation ID for debugging (always present when available)
 
 ### Error Codes
-- `invalid_json`: Malformed JSON
-- `validation_error`: Input validation failed
-- `invalid_stellar_address`: Address format invalid
-- `invalid_amount`: Amount validation failed
-- `payload_too_large`: Request exceeds size limit
-- `unauthorized`: Missing or invalid authentication
-- `forbidden`: Insufficient permissions
-- `not_found`: Resource not found
-- `conflict`: Duplicate submission (Idempotency-Key collision)
-- `service_unavailable`: Dependency outage
-- `internal_error`: Unexpected server error
+- `INVALID_JSON`: Malformed JSON
+- `VALIDATION_ERROR`: Input validation failed
+- `INVALID_STELLAR_ADDRESS`: Address format invalid
+- `INVALID_AMOUNT`: Amount validation failed
+- `PAYLOAD_TOO_LARGE`: Request exceeds size limit
+- `UNAUTHORIZED`: Missing or invalid authentication
+- `FORBIDDEN`: Insufficient permissions
+- `NOT_FOUND`: Resource not found
+- `CONFLICT`: Duplicate submission (Idempotency-Key collision)
+- `SERVICE_UNAVAILABLE`: Dependency outage
+- `INTERNAL_ERROR`: Unexpected server error
+- `DECIMAL_ERROR`: Decimal string serialization error
 
 ---
 

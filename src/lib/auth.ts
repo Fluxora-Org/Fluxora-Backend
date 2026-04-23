@@ -12,7 +12,7 @@ export interface UserPayload {
  */
 export function generateToken(payload: UserPayload): string {
   const { jwtSecret, jwtExpiresIn } = getConfig();
-  return jwt.sign(payload, jwtSecret, { expiresIn: jwtExpiresIn });
+  return jwt.sign(payload, jwtSecret, { expiresIn: jwtExpiresIn as string | number });
 }
 
 /**

@@ -11,14 +11,16 @@
  *
  * Trust boundaries
  * ----------------
- * - Public internet clients: may list, read, create, and cancel streams.
- *   Authentication/authorisation is a planned follow-up (see non-goals below).
+ * - Public internet clients: may list and read streams without authentication.
+ * - Authenticated partners: may create and cancel streams with valid JWT.
  * - Internal workers: same surface; no elevated privileges yet.
  *
  * Failure modes
  * -------------
  * - Invalid decimal string  → 400 VALIDATION_ERROR with per-field details
  * - Missing required field  → 400 VALIDATION_ERROR
+ * - Missing authentication  → 401 UNAUTHORIZED
+ * - Invalid token           → 401 UNAUTHORIZED
  * - Stream not found        → 404 NOT_FOUND
  * - Duplicate cancel        → 409 CONFLICT
  * - Listing dependency down → 503 SERVICE_UNAVAILABLE
@@ -27,7 +29,6 @@
  * Non-goals (intentionally deferred)
  * -----------------------------------
  * - Persistent storage (in-memory only; PostgreSQL integration is follow-up)
- * - Authentication / JWT enforcement on stream routes
  * - Rate limiting
  *
  * @openapi
@@ -109,6 +110,7 @@ import {
 } from '../middleware/errorHandler.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
 
 export const streamsRouter = Router();
 
@@ -162,6 +164,12 @@ export function setIdempotencyDependencyState(state: IdempotencyDependencyState)
   idempotencyDependency.state = state;
 }
 export function resetStreamIdempotencyStore(): void {
+  idempotencyStore.clear();
+}
+
+/** Reset streams array — test use only. */
+export function _resetStreams(): void {
+  streams.length = 0;
   idempotencyStore.clear();
 }
 
@@ -235,17 +243,24 @@ function parseIdempotencyKey(headerValue: unknown): string {
   return trimmed;
 }
 
-// ── Body normaliser (uses Zod-compatible path; also calls decimal validator) ──
+// ── Body normaliser (uses Zod schema validation with Stellar key checks) ──────
 
 function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCreateStreamInput {
-  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = body;
+  // First, validate with Zod schema (includes Stellar public key validation)
+  const parseResult = parseBody(CreateStreamSchema, body);
+  
+  if (!parseResult.success) {
+    const formattedErrors = formatZodIssues(parseResult.issues);
+    const errorMessage = formattedErrors.map(e => e.message).join('; ');
+    throw new ApiError(
+      ApiErrorCode.VALIDATION_ERROR,
+      'Validation failed',
+      400,
+      formattedErrors.map(e => e.message).join('; ')
+    );
+  }
 
-  if (typeof sender !== 'string' || sender.trim() === '') {
-    throw validationError('sender must be a non-empty string');
-  }
-  if (typeof recipient !== 'string' || recipient.trim() === '') {
-    throw validationError('recipient must be a non-empty string');
-  }
+  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = parseResult.data;
 
   // Validate decimal fields — also catches number types passed as amounts
   const amountValidation = validateAmountFields(
@@ -275,17 +290,11 @@ function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCr
 
   let validatedStartTime = Math.floor(Date.now() / 1000);
   if (startTime !== undefined) {
-    if (typeof startTime !== 'number' || !Number.isInteger(startTime) || startTime < 0) {
-      throw validationError('startTime must be a non-negative integer');
-    }
     validatedStartTime = startTime;
   }
 
   let validatedEndTime = 0;
   if (endTime !== undefined) {
-    if (typeof endTime !== 'number' || !Number.isInteger(endTime) || endTime < 0) {
-      throw validationError('endTime must be a non-negative integer');
-    }
     validatedEndTime = endTime;
   }
 
@@ -340,7 +349,7 @@ streamsRouter.get(
     if (includeTotal)  response.total       = sortedStreams.length;
     if (nextCursor)    response.next_cursor = nextCursor;
 
-    res.json(response);
+    res.json(successResponse(response, requestId));
   }),
 );
 
@@ -352,19 +361,22 @@ streamsRouter.get(
   '/:id',
   asyncHandler(async (req: any, res: any) => {
     const { id } = req.params;
+    const requestId = req.id as string | undefined;
     debug('Fetching stream', { id });
     const stream = streams.find((s) => s.id === id);
     if (!stream) throw notFound('Stream', id);
-    res.json({ stream });
+    res.json(successResponse({ stream }, requestId));
   }),
 );
 
 /**
  * POST /api/streams
- * Create a new stream. Auth intentionally deferred — see non-goals above.
+ * Create a new stream. Requires authentication.
  */
 streamsRouter.post(
   '/',
+  authenticate,
+  requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId      = (req as any).id as string | undefined;
     const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
@@ -402,7 +414,7 @@ streamsRouter.post(
       info('Replaying idempotent stream creation', { requestId, idempotencyKey, streamId: existingResponse.body.id });
       res.set('Idempotency-Key', idempotencyKey);
       res.set('Idempotency-Replayed', 'true');
-      res.status(existingResponse.statusCode).json(existingResponse.body);
+      res.status(existingResponse.statusCode).json(successResponse(existingResponse.body, requestId));
       return;
     }
 
@@ -426,16 +438,18 @@ streamsRouter.post(
 
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
-    res.status(201).json(stream);
+    res.status(201).json(successResponse(stream, requestId));
   }),
 );
 
 /**
  * DELETE /api/streams/:id
- * Cancel a stream.
+ * Cancel a stream. Requires authentication.
  */
 streamsRouter.delete(
   '/:id',
+  authenticate,
+  requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const { id }    = req.params;
     const requestId = (req as any).id as string | undefined;
@@ -448,17 +462,55 @@ streamsRouter.delete(
     const stream = streams[index];
     if (stream === undefined) throw notFound('Stream', id);
 
-    if (stream.status === 'cancelled') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Stream is already cancelled', 409, { streamId: id });
-    }
-    if (stream.status === 'completed') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Cannot cancel a completed stream', 409, { streamId: id });
+    const guard = assertValidApiTransition(stream.status as ApiStreamStatus, 'cancelled');
+    if (!guard.ok) {
+      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, { streamId: id, currentStatus: stream.status });
     }
 
     streams[index] = { ...stream, status: 'cancelled' };
     info('Stream cancelled', { id });
     recordAuditEvent('STREAM_CANCELLED', 'stream', id as string, (req as any).correlationId);
 
-    res.json({ message: 'Stream cancelled', id });
+    res.json(successResponse({ message: 'Stream cancelled', id }, requestId));
+  }),
+);
+
+/**
+ * PATCH /api/streams/:id/status
+ * Transition a stream to a new status.
+ *
+ * Body: { "status": "paused" | "active" | "completed" | "cancelled" }
+ *
+ * Returns 409 CONFLICT when the transition is not permitted by the state machine.
+ */
+streamsRouter.patch(
+  '/:id/status',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { id }    = req.params;
+    const requestId = (req as any).id as string | undefined;
+    const { status: newStatus } = req.body ?? {};
+
+    if (typeof newStatus !== 'string' || !['scheduled', 'active', 'paused', 'completed', 'cancelled'].includes(newStatus)) {
+      throw validationError('status must be one of: scheduled, active, paused, completed, cancelled');
+    }
+
+    const index = streams.findIndex((s) => s.id === id);
+    if (index === -1) throw notFound('Stream', id);
+
+    const stream = streams[index]!;
+    const guard = assertValidApiTransition(stream.status as ApiStreamStatus, newStatus as ApiStreamStatus);
+    if (!guard.ok) {
+      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+        streamId: id,
+        currentStatus: stream.status,
+        requestedStatus: newStatus,
+      });
+    }
+
+    streams[index] = { ...stream, status: newStatus };
+    info('Stream status updated', { id, from: stream.status, to: newStatus, requestId });
+    recordAuditEvent('STREAM_STATUS_UPDATED', 'stream', id as string, (req as any).correlationId);
+
+    res.json({ ...streams[index] });
   }),
 );

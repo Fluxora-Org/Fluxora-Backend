@@ -12,6 +12,7 @@ import {
   indexerIngestionService,
 } from '../indexer/service.js';
 import { IndexerDependencyState } from '../indexer/types.js';
+import { successResponse } from '../utils/response.js';
 
 export const indexerRouter = Router();
 
@@ -116,13 +117,13 @@ indexerRouter.post('/contract-events', async (req: any, res: any, next: any) => 
       requestId: req.id ?? req.correlationId,
     });
 
-    res.status(200).json({
+    res.status(200).json(successResponse({
       outcome: 'persisted',
       insertedCount: result.insertedCount,
       duplicateCount: result.duplicateCount,
       insertedEventIds: result.insertedEventIds,
       duplicateEventIds: result.duplicateEventIds,
-    });
+    }, req.id ?? req.correlationId));
   } catch (caught) {
     next(caught);
   }

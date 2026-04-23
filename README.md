@@ -137,12 +137,12 @@ This repository currently provides the canonical algorithm and the expected outc
 
 Fluxora webhook deliveries are expected to use these headers:
 
-| Header | Meaning |
-|--------|---------|
-| `x-fluxora-delivery-id` | Stable id for a single delivery attempt chain; use it for deduplication |
-| `x-fluxora-timestamp` | Unix timestamp in seconds |
-| `x-fluxora-signature` | Hex-encoded `HMAC-SHA256(secret, timestamp + "." + rawBody)` |
-| `x-fluxora-event` | Event name such as `stream.created` or `stream.updated` |
+| Header | Meaning | Validation |
+|--------|---------|------------|
+| `x-fluxora-delivery-id` | Stable id for a single delivery attempt chain; use it for deduplication | Required; non-empty string |
+| `x-fluxora-timestamp` | Unix timestamp in seconds | Required; positive integer string |
+| `x-fluxora-signature` | Hex-encoded `HMAC-SHA256(secret, timestamp + "." + rawBody)` | Required; 64-char hex (case-insensitive, whitespace trimmed) |
+| `x-fluxora-event` | Event name such as `stream.created` or `stream.updated` | Informational |
 
 Canonical signing payload:
 

@@ -7,12 +7,149 @@
  * - Request parameter parsing
  * - Input normalization
  * - Fingerprinting for idempotency
+ * - Response envelope structure validation
  * 
  * These tests ensure predictable behavior for critical paths
  * and edge cases in the HTTP API.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
+import { successResponse, errorResponse } from '../src/utils/response.js';
+
+describe('Response Envelope Helpers', () => {
+    describe('successResponse', () => {
+        it('should wrap data in success envelope with timestamp', () => {
+            const data = { id: 'stream-123', amount: '1000' };
+            const result = successResponse(data);
+
+            expect(result.success).toBe(true);
+            expect(result.data).toEqual(data);
+            expect(result.meta.timestamp).toBeTruthy();
+            expect(new Date(result.meta.timestamp).toISOString()).toBe(result.meta.timestamp);
+        });
+
+        it('should include requestId when provided', () => {
+            const data = { id: 'stream-123' };
+            const requestId = 'req-abc-123';
+            const result = successResponse(data, requestId);
+
+            expect(result.success).toBe(true);
+            expect(result.data).toEqual(data);
+            expect(result.meta.requestId).toBe(requestId);
+        });
+
+        it('should not include requestId when not provided', () => {
+            const data = { id: 'stream-123' };
+            const result = successResponse(data);
+
+            expect(result.success).toBe(true);
+            expect(result.meta.requestId).toBeUndefined();
+        });
+
+        it('should handle empty object data', () => {
+            const result = successResponse({});
+
+            expect(result.success).toBe(true);
+            expect(result.data).toEqual({});
+        });
+
+        it('should handle array data', () => {
+            const data = [{ id: 1 }, { id: 2 }];
+            const result = successResponse(data);
+
+            expect(result.success).toBe(true);
+            expect(result.data).toEqual(data);
+        });
+
+        it('should handle primitive data', () => {
+            const result = successResponse('test-string');
+
+            expect(result.success).toBe(true);
+            expect(result.data).toBe('test-string');
+        });
+    });
+
+    describe('errorResponse', () => {
+        it('should wrap error in error envelope', () => {
+            const result = errorResponse('VALIDATION_ERROR', 'Invalid input');
+
+            expect(result.success).toBe(false);
+            expect(result.error.code).toBe('VALIDATION_ERROR');
+            expect(result.error.message).toBe('Invalid input');
+        });
+
+        it('should include details when provided', () => {
+            const details = { field: 'sender', value: 'invalid' };
+            const result = errorResponse('VALIDATION_ERROR', 'Invalid sender', details);
+
+            expect(result.success).toBe(false);
+            expect(result.error.details).toEqual(details);
+        });
+
+        it('should include requestId when provided', () => {
+            const requestId = 'req-xyz-789';
+            const result = errorResponse('NOT_FOUND', 'Resource not found', undefined, requestId);
+
+            expect(result.success).toBe(false);
+            expect(result.error.requestId).toBe(requestId);
+        });
+
+        it('should not include details when not provided', () => {
+            const result = errorResponse('NOT_FOUND', 'Resource not found');
+
+            expect(result.success).toBe(false);
+            expect(result.error.details).toBeUndefined();
+        });
+
+        it('should not include requestId when not provided', () => {
+            const result = errorResponse('NOT_FOUND', 'Resource not found');
+
+            expect(result.success).toBe(false);
+            expect(result.error.requestId).toBeUndefined();
+        });
+
+        it('should handle complex details object', () => {
+            const details = {
+                errors: [
+                    { field: 'sender', message: 'Required' },
+                    { field: 'recipient', message: 'Invalid format' }
+                ]
+            };
+            const result = errorResponse('VALIDATION_ERROR', 'Multiple validation errors', details);
+
+            expect(result.success).toBe(false);
+            expect(result.error.details).toEqual(details);
+        });
+    });
+
+    describe('Envelope Structure Consistency', () => {
+        it('success envelope should have required fields', () => {
+            const result = successResponse({ test: 'data' });
+
+            expect(result).toHaveProperty('success');
+            expect(result).toHaveProperty('data');
+            expect(result).toHaveProperty('meta');
+            expect(result.meta).toHaveProperty('timestamp');
+        });
+
+        it('error envelope should have required fields', () => {
+            const result = errorResponse('ERROR_CODE', 'Error message');
+
+            expect(result).toHaveProperty('success');
+            expect(result).toHaveProperty('error');
+            expect(result.error).toHaveProperty('code');
+            expect(result.error).toHaveProperty('message');
+        });
+
+        it('success and error envelopes should be distinguishable by success field', () => {
+            const success = successResponse({ data: 'test' });
+            const error = errorResponse('ERROR', 'message');
+
+            expect(success.success).toBe(true);
+            expect(error.success).toBe(false);
+        });
+    });
+});
 
 // Mock implementations of helpers from streams.ts
 // In real scenario, these would be imported from src/routes/streams.ts
