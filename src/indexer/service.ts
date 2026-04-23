@@ -8,6 +8,7 @@ import {
   IngestContractEventsRequest,
   IngestContractEventsResult,
 } from './types.js';
+import { StreamEventReplayFilter, StreamEventReplayResult } from '../db/types.js';
 
 const MAX_EVENTS_PER_BATCH = 100;
 const MAX_EVENT_ID_LENGTH = 128;
@@ -239,6 +240,10 @@ export class IndexerIngestionService {
 
     bucket.timestamps.push(now);
     this.rateLimits.set(actor, bucket);
+  }
+
+  async getEvents(filter?: StreamEventReplayFilter): Promise<StreamEventReplayResult> {
+    return this.store.getEvents(filter);
   }
 
   async ingest(body: unknown, context: IngestRequestContext): Promise<IngestContractEventsResult> {
