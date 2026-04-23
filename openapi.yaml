@@ -261,7 +261,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 
     get:
-      summary: List streams with pagination
+      summary: List streams with cursor pagination and indexed filters
       operationId: listStreams
       tags:
         - Streams
@@ -269,34 +269,72 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Number of streams to return (1-100, default 20)
+          description: Number of streams to return (1-100, default 50)
           schema:
             type: integer
             minimum: 1
             maximum: 100
-            default: 20
+            default: 50
         - name: cursor
           in: query
           required: false
           description: |
-            Pagination cursor from previous response. Base64-encoded stream ID.
-            Omit for first page.
+            Opaque pagination cursor returned in `next_cursor` from a previous
+            response. Encodes the last seen stream id (base64url). Omit for
+            the first page.
           schema:
             type: string
-        - name: includeTotal
+        - name: include_total
           in: query
           required: false
-          description: Include total count in response (may be expensive for large datasets)
+          description: |
+            When true, include a `total` field in the response reflecting the
+            current count of matching streams. This is a point-in-time snapshot
+            and is not guaranteed to be consistent with the cursor position.
           schema:
             type: boolean
             default: false
+        - name: status
+          in: query
+          required: false
+          description: Filter by stream status (uses the status index).
+          schema:
+            type: string
+            enum: [scheduled, active, paused, completed, cancelled]
+        - name: sender
+          in: query
+          required: false
+          description: Filter by sender Stellar address (uses the sender_address index).
+          schema:
+            type: string
+        - name: recipient
+          in: query
+          required: false
+          description: Filter by recipient Stellar address (uses the recipient_address index).
+          schema:
+            type: string
       responses:
         '200':
-          description: List of streams
+          description: Cursor-paginated list of streams
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StreamList'
+                type: object
+                required: [streams, has_more]
+                properties:
+                  streams:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Stream'
+                  has_more:
+                    type: boolean
+                    description: True when more results exist beyond this page.
+                  next_cursor:
+                    type: string
+                    description: Opaque cursor to pass as `cursor` on the next request. Absent when `has_more` is false.
+                  total:
+                    type: integer
+                    description: Present only when `include_total=true`.
         '400':
           description: Invalid query parameters
           content:

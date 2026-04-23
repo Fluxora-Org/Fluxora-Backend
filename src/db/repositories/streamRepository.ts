@@ -270,6 +270,67 @@ export const streamRepository = {
   },
 
   /**
+   * Cursor-paginated stream query with stable ordering and indexed filters.
+   *
+   * Ordering: id ASC (lexicographic, stable across pages).
+   * Cursor: opaque base64url token encoding the last seen id.
+   * Filters are applied before pagination so the cursor position is
+   * consistent even when new records are inserted between pages.
+   *
+   * Decimal-string guarantee: amount fields are stored and returned as
+   * TEXT — no numeric coercion occurs in this layer.
+   */
+  findWithCursor(
+    filter: StreamFilter,
+    limit: number,
+    cursor?: string,
+  ): { streams: StreamRecord[]; nextCursor: string | undefined; hasMore: boolean } {
+    const db = getDatabase();
+
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+
+    if (cursor) {
+      conditions.push('id > ?');
+      params.push(cursor);
+    }
+
+    if (filter.status) {
+      conditions.push('status = ?');
+      params.push(filter.status);
+    }
+
+    if (filter.sender_address) {
+      conditions.push('sender_address = ?');
+      params.push(filter.sender_address);
+    }
+
+    if (filter.recipient_address) {
+      conditions.push('recipient_address = ?');
+      params.push(filter.recipient_address);
+    }
+
+    if (filter.contract_id) {
+      conditions.push('contract_id = ?');
+      params.push(filter.contract_id);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // Fetch one extra row to determine hasMore without a separate COUNT query.
+    params.push(limit + 1);
+    const rows = db
+      .prepare(`SELECT * FROM streams ${where} ORDER BY id ASC LIMIT ?`)
+      .all(...params) as StreamRecord[];
+
+    const hasMore = rows.length > limit;
+    const streams = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore ? streams[streams.length - 1]?.id : undefined;
+
+    return { streams, nextCursor, hasMore };
+  },
+
+  /**
    * Query streams with filtering and pagination
    */
   find(filter: StreamFilter, pagination: PaginationOptions): PaginatedStreams {

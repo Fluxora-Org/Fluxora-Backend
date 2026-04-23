@@ -111,6 +111,8 @@ import {
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth } from '../middleware/auth.js';
+import { parseBody, CreateStreamSchema, formatZodIssues } from '../validation/schemas.js';
+import { assertValidApiTransition, type ApiStreamStatus } from '../streams/status.js';
 
 export const streamsRouter = Router();
 
@@ -246,23 +248,20 @@ function parseIdempotencyKey(headerValue: unknown): string {
 // ── Body normaliser (uses Zod schema validation with Stellar key checks) ──────
 
 function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCreateStreamInput {
-  // First, validate with Zod schema (includes Stellar public key validation)
   const parseResult = parseBody(CreateStreamSchema, body);
-  
+
   if (!parseResult.success) {
     const formattedErrors = formatZodIssues(parseResult.issues);
-    const errorMessage = formattedErrors.map(e => e.message).join('; ');
     throw new ApiError(
       ApiErrorCode.VALIDATION_ERROR,
-      'Validation failed',
+      formattedErrors[0]?.message ?? 'Validation failed',
       400,
-      formattedErrors.map(e => e.message).join('; ')
+      { errors: formattedErrors },
     );
   }
 
   const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = parseResult.data;
 
-  // Validate decimal fields — also catches number types passed as amounts
   const amountValidation = validateAmountFields(
     { depositAmount, ratePerSecond } as Record<string, unknown>,
     AMOUNT_FIELDS as unknown as string[],
@@ -276,35 +275,19 @@ function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCr
     );
   }
 
-  const depositResult = validateDecimalString(depositAmount, 'depositAmount');
+  const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && depositAmount !== null) {
-    if (parseFloat(validatedDeposit) <= 0) throw validationError('depositAmount must be greater than zero');
-  }
 
-  const rateResult = validateDecimalString(ratePerSecond, 'ratePerSecond');
+  const rateResult = validateDecimalString(ratePerSecond ?? '0', 'ratePerSecond');
   const validatedRate = rateResult.valid && rateResult.value ? rateResult.value : '0';
-  if (ratePerSecond !== undefined && ratePerSecond !== null) {
-    if (parseFloat(validatedRate) < 0) throw validationError('ratePerSecond cannot be negative');
-  }
-
-  let validatedStartTime = Math.floor(Date.now() / 1000);
-  if (startTime !== undefined) {
-    validatedStartTime = startTime;
-  }
-
-  let validatedEndTime = 0;
-  if (endTime !== undefined) {
-    validatedEndTime = endTime;
-  }
 
   return {
     sender: sender.trim(),
     recipient: recipient.trim(),
     depositAmount: validatedDeposit,
     ratePerSecond: validatedRate,
-    startTime: validatedStartTime,
-    endTime: validatedEndTime,
+    startTime: startTime ?? Math.floor(Date.now() / 1000),
+    endTime: endTime ?? 0,
   };
 }
 
@@ -326,12 +309,22 @@ streamsRouter.get(
     const cursor       = parseCursor(req.query.cursor);
     const includeTotal = parseIncludeTotal(req.query.include_total);
 
+    // Indexed filters
+    const statusFilter    = req.query.status    as string | undefined;
+    const senderFilter    = req.query.sender    as string | undefined;
+    const recipientFilter = req.query.recipient as string | undefined;
+
     if (streamListingDependency.state !== 'healthy') {
       warn('Stream listing dependency unavailable', { dependency: 'stream-list-view', requestId });
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
-    const sortedStreams = [...streams].sort((a, b) => a.id.localeCompare(b.id));
+    let filtered = [...streams];
+    if (statusFilter)    filtered = filtered.filter((s) => s.status    === statusFilter);
+    if (senderFilter)    filtered = filtered.filter((s) => s.sender    === senderFilter);
+    if (recipientFilter) filtered = filtered.filter((s) => s.recipient === recipientFilter);
+
+    const sortedStreams = filtered.sort((a, b) => a.id.localeCompare(b.id));
     const startIndex   = cursor ? sortedStreams.findIndex((s) => s.id > cursor.lastId) : 0;
     const normStart    = startIndex === -1 ? sortedStreams.length : startIndex;
     const pageStreams   = sortedStreams.slice(normStart, normStart + limit);
@@ -349,7 +342,7 @@ streamsRouter.get(
     if (includeTotal)  response.total       = sortedStreams.length;
     if (nextCursor)    response.next_cursor = nextCursor;
 
-    res.json(successResponse(response, requestId));
+    res.json(response);
   }),
 );
 
@@ -365,7 +358,7 @@ streamsRouter.get(
     debug('Fetching stream', { id });
     const stream = streams.find((s) => s.id === id);
     if (!stream) throw notFound('Stream', id);
-    res.json(successResponse({ stream }, requestId));
+    res.json(stream);
   }),
 );
 
@@ -414,7 +407,7 @@ streamsRouter.post(
       info('Replaying idempotent stream creation', { requestId, idempotencyKey, streamId: existingResponse.body.id });
       res.set('Idempotency-Key', idempotencyKey);
       res.set('Idempotency-Replayed', 'true');
-      res.status(existingResponse.statusCode).json(successResponse(existingResponse.body, requestId));
+      res.status(existingResponse.statusCode).json(existingResponse.body);
       return;
     }
 
@@ -444,7 +437,7 @@ streamsRouter.post(
 
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
-    res.status(201).json(successResponse(stream, requestId));
+    res.status(201).json(stream);
   }),
 );
 
@@ -477,7 +470,7 @@ streamsRouter.delete(
     info('Stream cancelled', { id });
     recordAuditEvent('STREAM_CANCELLED', 'stream', id as string, (req as any).correlationId);
 
-    res.json(successResponse({ message: 'Stream cancelled', id }, requestId));
+    res.json({ message: 'Stream cancelled', id });
   }),
 );
 

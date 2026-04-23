@@ -116,27 +116,47 @@ HTTP 409 Conflict
 
 ### GET /api/streams
 
-List all streams with filtering and pagination.
+List streams with cursor-based pagination and indexed filters.
 
 **Query Parameters:**
-- `status` - Filter by status (active/paused/completed/cancelled)
-- `sender` - Filter by sender address
-- `recipient` - Filter by recipient address
-- `limit` - Max results (default: 20, max: 100)
-- `offset` - Pagination offset (default: 0)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer (1–100) | 50 | Max results per page |
+| `cursor` | string | — | Opaque token from `next_cursor` in a previous response |
+| `include_total` | boolean | false | Include a `total` count in the response |
+| `status` | string | — | Filter by status: `scheduled`, `active`, `paused`, `completed`, `cancelled` |
+| `sender` | string | — | Filter by sender Stellar address |
+| `recipient` | string | — | Filter by recipient Stellar address |
+
+**Pagination model:**
+
+Streams are ordered by `id ASC` (stable lexicographic order). The cursor encodes the last seen `id` as a base64url token. Passing it on the next request returns only records with `id > cursor`, so pages are consistent even when new streams are inserted between requests.
+
+```
+GET /api/streams?limit=2
+→ { streams: [...], has_more: true, next_cursor: "eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tMTIzIn0" }
+
+GET /api/streams?limit=2&cursor=eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tMTIzIn0
+→ { streams: [...], has_more: false }
+```
 
 **Response:**
 ```json
 {
   "streams": [...],
-  "pagination": {
-    "total": 100,
-    "limit": 20,
-    "offset": 0,
-    "hasMore": true
-  }
+  "has_more": true,
+  "next_cursor": "<opaque token>",
+  "total": 42
 }
 ```
+
+- `total` is only present when `include_total=true`. It reflects the current count at response time and is not a snapshot guarantee.
+- `next_cursor` is only present when `has_more` is `true`.
+
+**Indexed filters:**
+
+The `status`, `sender`, and `recipient` filters map directly to database indexes (`idx_streams_status`, `idx_streams_sender`, `idx_streams_recipient`). Combining filters with cursor pagination is safe — the cursor position is relative to the filtered result set.
 
 ### GET /api/streams/:id
 
