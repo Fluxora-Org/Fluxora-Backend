@@ -82,6 +82,7 @@ import { authenticate, requireAuth } from '../middleware/auth.js';
 import { asyncHandler, validationError } from '../middleware/errorHandler.js';
 import { info, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
+import { successResponse, errorResponse } from '../utils/response.js';
 
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
@@ -188,7 +189,7 @@ dlqRouter.get(
       { total: filtered.length, returned: page.length, offset, limit, topicFilter }
     );
 
-    res.json({
+    res.json(successResponse({
       entries: page,
       total: filtered.length,
       limit,

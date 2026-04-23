@@ -198,12 +198,26 @@ paths:
           in: header
           required: true
           description: |
-            Unique identifier for this request. Used to prevent duplicate submissions.
-            Must be a UUID or similar unique value. Same key with identical request body
-            will return the same response (idempotent).
+            Unique key that makes this request idempotent. Clients MUST supply a
+            fresh value per logical operation and MUST reuse the same value when
+            retrying after a network failure.
+
+            **Format**: 1–128 characters; allowed charset: `[A-Za-z0-9:_-]`.
+            UUID v4 is recommended but any value matching the charset is accepted.
+
+            **Behaviour**:
+            - Same key + same body → 201 (cached response, `Idempotency-Replayed: true`)
+            - Same key + different body → 409 CONFLICT
+            - Missing or malformed key → 400 VALIDATION_ERROR
+
+            **Security**: The key value is never echoed in error response bodies
+            or server logs to prevent accidental secret leakage.
           schema:
             type: string
-            format: uuid
+            minLength: 1
+            maxLength: 128
+            pattern: '^[A-Za-z0-9:_-]+$'
+            example: '550e8400-e29b-41d4-a716-446655440000'
       requestBody:
         required: true
         content:
@@ -212,13 +226,33 @@ paths:
               $ref: '#/components/schemas/CreateStreamRequest'
       responses:
         '201':
-          description: Stream created successfully
+          description: |
+            Stream created (or replayed from cache).
+            Check `Idempotency-Replayed` response header and `meta.idempotencyReplayed`
+            to distinguish a fresh creation from a cached replay.
+          headers:
+            Idempotency-Key:
+              description: Echoes the key supplied by the client.
+              schema:
+                type: string
+            Idempotency-Replayed:
+              description: |
+                `true` when the response was served from the idempotency cache;
+                `false` on first creation.
+              schema:
+                type: string
+                enum: ['true', 'false']
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Stream'
         '400':
-          description: Invalid request (malformed JSON, invalid address format, etc.)
+          description: |
+            Invalid request. Common causes:
+            - Missing or malformed `Idempotency-Key` header
+            - Invalid JSON body
+            - Invalid Stellar address format
+            - Non-string amount field (must be decimal string)
           content:
             application/json:
               schema:
@@ -231,8 +265,9 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
           description: |
-            Duplicate submission detected. Same Idempotency-Key with different request body.
-            Retry with same body or use new Idempotency-Key.
+            Idempotency-Key collision — the same key was previously used with a
+            different request body. Use a new Idempotency-Key or retry with the
+            original body.
           content:
             application/json:
               schema:
@@ -254,7 +289,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
-          description: Service unavailable (database, Stellar RPC, or workers down)
+          description: Service unavailable (database, Stellar RPC, or idempotency store down)
           content:
             application/json:
               schema:

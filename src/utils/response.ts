@@ -15,6 +15,8 @@ export interface ResponseMeta {
     timestamp: string;
     /** Opaque request identifier for log correlation */
     requestId?: string;
+    /** Present on idempotent replays — true when the response was served from cache */
+    idempotencyReplayed?: boolean;
 }
 
 export interface SuccessEnvelope<T> {
@@ -45,6 +47,25 @@ export function successResponse<T>(data: T, requestId?: string): SuccessEnvelope
         meta: {
             timestamp: new Date().toISOString(),
             ...(requestId ? { requestId } : {}),
+        },
+    };
+}
+
+/**
+ * Build a success envelope for an idempotent replay response.
+ *
+ * Identical to successResponse but stamps `meta.idempotencyReplayed = true`
+ * so clients can distinguish a fresh creation from a cached replay without
+ * inspecting the Idempotency-Replayed response header.
+ */
+export function idempotentReplayResponse<T>(data: T, requestId?: string): SuccessEnvelope<T> {
+    return {
+        success: true,
+        data,
+        meta: {
+            timestamp: new Date().toISOString(),
+            ...(requestId ? { requestId } : {}),
+            idempotencyReplayed: true,
         },
     };
 }

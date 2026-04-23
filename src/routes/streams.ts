@@ -16,16 +16,32 @@
  * - Public internet clients: may list and read streams without authentication.
  * - Authenticated partners: may create and cancel streams with valid JWT.
  *
+ * Idempotency
+ * -----------
+ * POST /api/streams requires an Idempotency-Key header (1–128 chars,
+ * [A-Za-z0-9:_-]).  The key is validated by requireIdempotencyKey middleware
+ * before the handler runs.  A SHA-256 fingerprint of the normalised request
+ * body is stored alongside the cached response so that:
+ *   - Same key + same body  → 201 replay (Idempotency-Replayed: true)
+ *   - Same key + diff body  → 409 CONFLICT
+ *   - Missing / bad key     → 400 VALIDATION_ERROR
+ *
+ * The idempotency store is in-memory (Map) for this iteration.  In production
+ * it should be backed by Redis with a 24-hour TTL.
+ *
  * Failure modes
  * -------------
- * - Invalid decimal string  → 400 VALIDATION_ERROR
- * - Missing required field  → 400 VALIDATION_ERROR
- * - Missing authentication  → 401 UNAUTHORIZED
- * - Invalid token           → 401 UNAUTHORIZED
- * - Stream not found        → 404 NOT_FOUND
- * - Duplicate cancel        → 409 CONFLICT
- * - DB unavailable          → 503 SERVICE_UNAVAILABLE
- * - Idempotency store down  → 503 SERVICE_UNAVAILABLE
+ * - Missing Idempotency-Key  → 400 VALIDATION_ERROR
+ * - Invalid Idempotency-Key  → 400 VALIDATION_ERROR
+ * - Invalid decimal string   → 400 VALIDATION_ERROR
+ * - Missing required field   → 400 VALIDATION_ERROR
+ * - Missing authentication   → 401 UNAUTHORIZED
+ * - Invalid token            → 401 UNAUTHORIZED
+ * - Stream not found         → 404 NOT_FOUND
+ * - Key reuse / diff payload → 409 CONFLICT
+ * - Duplicate cancel         → 409 CONFLICT
+ * - DB unavailable           → 503 SERVICE_UNAVAILABLE
+ * - Idempotency store down   → 503 SERVICE_UNAVAILABLE
  *
  * @module routes/streams
  */
@@ -44,10 +60,11 @@ import {
   serviceUnavailable,
   asyncHandler,
 } from '../middleware/errorHandler.js';
+import { requireIdempotencyKey } from '../middleware/requestProtection.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth } from '../middleware/auth.js';
-import { successResponse } from '../utils/response.js';
+import { successResponse, idempotentReplayResponse } from '../utils/response.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
 import {
@@ -100,6 +117,14 @@ const idempotencyDependency   = { state: 'healthy' as DependencyState };
 
 // In-memory idempotency store (Redis-backed in production; sufficient for now)
 const idempotencyStore = new Map<string, StoredIdempotentResponse>();
+
+/**
+ * Legacy shim — audit.test.ts and streams.test.ts reference this array.
+ * The DB-backed implementation no longer uses it for storage; it is kept
+ * as an empty array so existing test imports do not break.
+ * @deprecated Use streamRepository directly.
+ */
+export const streams: Stream[] = [];
 
 export function setStreamListingDependencyState(state: DependencyState): void {
   streamListingDependency.state = state;
@@ -186,20 +211,6 @@ function parseIncludeTotal(includeTotalParam: unknown): boolean {
   if (includeTotalParam === 'true')  return true;
   if (includeTotalParam === 'false') return false;
   throw validationError('include_total must be true or false');
-}
-
-function parseIdempotencyKey(headerValue: unknown): string {
-  if (Array.isArray(headerValue) || typeof headerValue !== 'string') {
-    throw validationError('Idempotency-Key header is required for unsafe POST operations');
-  }
-  const trimmed = headerValue.trim();
-  if (trimmed.length < 1 || trimmed.length > 128) {
-    throw validationError('Idempotency-Key header must be between 1 and 128 characters');
-  }
-  if (!/^[A-Za-z0-9:_-]+$/.test(trimmed)) {
-    throw validationError('Idempotency-Key header must use only letters, numbers, colon, underscore, or hyphen');
-  }
-  return trimmed;
 }
 
 // ── Body normaliser ───────────────────────────────────────────────────────────
@@ -384,22 +395,33 @@ streamsRouter.get(
 
 /**
  * POST /api/streams
- * Create a new stream. Requires authentication.
+ * Create a new stream. Requires authentication + Idempotency-Key header.
+ *
+ * Idempotency-Key is validated by requireIdempotencyKey before this handler
+ * runs; the validated key is available on res.locals.idempotencyKey.
  */
 streamsRouter.post(
   '/',
   authenticate,
   requireAuth,
+  requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId      = (req as any).id as string | undefined;
-    const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
+    const correlationId  = (req as any).correlationId as string | undefined;
+    // Key already validated and trimmed by requireIdempotencyKey middleware
+    const idempotencyKey = res.locals['idempotencyKey'] as string;
 
     if (idempotencyDependency.state !== 'healthy') {
-      warn('Idempotency dependency unavailable', { dependency: 'idempotency-store', requestId, idempotencyKey });
+      warn('Idempotency dependency unavailable', {
+        dependency: 'idempotency-store',
+        requestId,
+        // Never log the key value at warn/error level — it could be a secret
+        idempotencyKeyLength: idempotencyKey.length,
+      });
       throw serviceUnavailable('Idempotency processing is temporarily unavailable. Retry after dependency health is restored.');
     }
 
-    info('Creating new stream', { requestId, idempotencyKey });
+    info('Creating new stream', { requestId, correlationId });
 
     let normalizedInput: NormalizedCreateInput;
     try {
@@ -422,17 +444,29 @@ streamsRouter.post(
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
+        // Log the decision without leaking the key value itself
+        warn('Idempotency-Key reused with different payload', {
+          requestId,
+          correlationId,
+          idempotencyKeyLength: idempotencyKey.length,
+          action: 'conflict',
+        });
         throw new ApiError(
           ApiErrorCode.CONFLICT,
           'Idempotency-Key has already been used for a different request payload',
           409,
-          { idempotencyKey },
+          { hint: 'Use a new Idempotency-Key or retry with the original request body' },
         );
       }
-      info('Replaying idempotent stream creation', { requestId, idempotencyKey, streamId: existingResponse.body.id });
+      info('Replaying idempotent stream creation', {
+        requestId,
+        correlationId,
+        streamId: existingResponse.body.id,
+        action: 'replay',
+      });
       res.set('Idempotency-Key', idempotencyKey);
       res.set('Idempotency-Replayed', 'true');
-      res.status(existingResponse.statusCode).json(successResponse(existingResponse.body, requestId));
+      res.status(existingResponse.statusCode).json(idempotentReplayResponse(existingResponse.body, requestId));
       return;
     }
 
@@ -467,8 +501,8 @@ streamsRouter.post(
     idempotencyStore.set(idempotencyKey, { requestFingerprint, statusCode: 201, body: stream });
 
     SerializationLogger.amountSerialized(2, requestId);
-    info('Stream created', { id: stream.id, requestId, idempotencyKey });
-    recordAuditEvent('STREAM_CREATED', 'stream', stream.id, (req as any).correlationId, {
+    info('Stream created', { id: stream.id, requestId, correlationId, action: 'created' });
+    recordAuditEvent('STREAM_CREATED', 'stream', stream.id, correlationId, {
       depositAmount: normalizedInput.depositAmount,
       ratePerSecond: normalizedInput.ratePerSecond,
       sender:        normalizedInput.sender,
