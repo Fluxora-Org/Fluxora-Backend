@@ -11,7 +11,8 @@ import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { bodySizeLimitMiddleware, BODY_LIMIT_BYTES } from './middleware/requestProtection.js';
+import { bodySizeLimitMiddleware, requestTimeoutMiddleware, BODY_LIMIT_BYTES } from './middleware/requestProtection.js';
+import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown } from './shutdown.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
@@ -23,6 +24,8 @@ export interface AppOptions {
   includeTestRoutes?: boolean;
   /** Environment variables used to seed the rate-limiter (defaults to process.env). */
   env?: Record<string, string | undefined>;
+  /** Socket-level request timeout in ms (defaults to 30000). */
+  requestTimeoutMs?: number;
 }
 
 export function createApp(options: AppOptions = {}): Express {
@@ -36,6 +39,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(correlationIdMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(httpMetrics);
   app.use(rateLimiter);
 
   app.use((_req: Request, res: Response, next: NextFunction) => {
