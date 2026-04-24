@@ -217,8 +217,14 @@ All successful responses follow this standardized structure:
 - **Trigger**: POST /api/streams without Idempotency-Key header
 - **Status**: 400
 - **Code**: `VALIDATION_ERROR`
-- **Message**: "Idempotency-Key header is required"
-- **Recovery**: Add Idempotency-Key header with unique value
+- **Message**: "Idempotency-Key header is required and must be a single string value"
+- **Recovery**: Add Idempotency-Key header with a unique value matching `[A-Za-z0-9:_-]`, 1–128 chars
+
+#### Malformed Idempotency-Key
+- **Trigger**: Key contains disallowed characters, or exceeds 128 / is under 1 character
+- **Status**: 400
+- **Code**: `VALIDATION_ERROR`
+- **Recovery**: Use a valid key (UUID v4 recommended)
 
 ### Dependency Outages
 
@@ -348,20 +354,42 @@ try {
 
 ### Exactly-Once Semantics
 - **Scope**: POST /api/streams (stream creation)
-- **Mechanism**: Idempotency-Key header + request fingerprint
-- **Duration**: 24 hours (idempotency key stored in cache)
-- **Guarantee**: Same Idempotency-Key + same body = same response
+- **Mechanism**: `Idempotency-Key` request header + SHA-256 fingerprint of normalised body
+- **Duration**: Process lifetime (in-memory store); Redis-backed store recommended for production (24-hour TTL)
+- **Guarantee**: Same `Idempotency-Key` + same body = same response, served from cache
 
 ### Idempotency-Key Format
-- **Required**: Yes (for POST /api/streams)
-- **Format**: UUID or unique string (20+ chars recommended)
-- **Example**: `550e8400-e29b-41d4-a716-446655440000`
-- **Validation**: Must be non-empty string
+- **Required**: Yes — missing or malformed key returns `400 VALIDATION_ERROR`
+- **Length**: 1–128 characters
+- **Charset**: `[A-Za-z0-9:_-]` — letters, digits, colon, underscore, hyphen
+- **Recommended**: UUID v4 (`550e8400-e29b-41d4-a716-446655440000`)
+- **Validation**: Enforced by `requireIdempotencyKey` middleware before the handler runs
+
+### Response Headers
+| Header | Value | Meaning |
+|--------|-------|---------|
+| `Idempotency-Key` | Echoed from request | Confirms which key was processed |
+| `Idempotency-Replayed` | `true` / `false` | `true` = served from cache; `false` = fresh creation |
+
+### Response Body Signal
+The `meta` object in every `201` response carries `idempotencyReplayed`:
+- **Fresh creation**: `meta.idempotencyReplayed` is absent
+- **Replay**: `meta.idempotencyReplayed: true`
+
+### Collision Behaviour (Same Key, Different Body)
+- **Status**: `409 CONFLICT`
+- **Code**: `CONFLICT`
+- **Message**: "Idempotency-Key has already been used for a different request payload"
+- **Details**: `{ hint: "Use a new Idempotency-Key or retry with the original request body" }`
+- **Security**: The raw key value is **never** included in the error response body or server logs
 
 ### Retry Semantics
-- **Safe to Retry**: 201, 400, 409, 413, 422, 503
+- **Safe to Retry**: 201 (with same key+body), 400, 409, 413, 422, 503
 - **Unsafe to Retry**: 401, 403, 500
 - **Recommended Strategy**: Exponential backoff with jitter (1s, 2s, 4s, 8s, 16s)
+
+### Failure Atomicity
+If the database upsert fails (e.g. pool exhausted → 503), the idempotency key is **not** stored. The client may safely retry with the same key and body once the dependency recovers.
 
 ---
 

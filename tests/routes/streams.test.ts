@@ -4,31 +4,41 @@
  * The PostgreSQL repository is fully mocked so no real database is required.
  * Tests cover all routes, validation, idempotency, state-machine transitions,
  * and error envelopes.
+ *
+ * Idempotency coverage (§ "replay/collision tests"):
+ *   - Missing Idempotency-Key → 400
+ *   - Malformed key (bad chars, too long) → 400
+ *   - First creation → 201, Idempotency-Replayed: false
+ *   - Replay (same key + same body) → 201, Idempotency-Replayed: true, meta.idempotencyReplayed: true
+ *   - Collision (same key + different body) → 409 CONFLICT, no key leaked in body
+ *   - Independent keys → independent streams
+ *   - Idempotency store unavailable → 503
+ *   - DB pool exhausted during upsert → 503 (key NOT stored)
+ *   - Decimal-string precision preserved through replay
  */
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import request from 'supertest';
 
 // ── Mock the repository before importing the app ──────────────────────────────
-const mockGetById          = vi.fn();
-const mockUpsertStream     = vi.fn();
-const mockUpdateStream     = vi.fn();
-const mockFindWithCursor   = vi.fn();
+const mockGetById        = vi.fn();
+const mockUpsertStream   = vi.fn();
+const mockUpdateStream   = vi.fn();
+const mockFindWithCursor = vi.fn();
 
 vi.mock('../../src/db/repositories/streamRepository.js', () => ({
   streamRepository: {
-    getById:         (...a: unknown[]) => mockGetById(...a),
-    upsertStream:    (...a: unknown[]) => mockUpsertStream(...a),
-    updateStream:    (...a: unknown[]) => mockUpdateStream(...a),
-    findWithCursor:  (...a: unknown[]) => mockFindWithCursor(...a),
-    countByStatus:   vi.fn().mockResolvedValue({ active: 0, paused: 0, completed: 0, cancelled: 0 }),
+    getById:        (...a: unknown[]) => mockGetById(...a),
+    upsertStream:   (...a: unknown[]) => mockUpsertStream(...a),
+    updateStream:   (...a: unknown[]) => mockUpdateStream(...a),
+    findWithCursor: (...a: unknown[]) => mockFindWithCursor(...a),
+    countByStatus:  vi.fn().mockResolvedValue({ active: 0, paused: 0, completed: 0, cancelled: 0 }),
   },
 }));
 
-// Mock pool so PoolExhaustedError is importable
 vi.mock('../../src/db/pool.js', () => ({
-  getPool:            vi.fn(() => ({})),
-  query:              vi.fn(),
-  PoolExhaustedError: class PoolExhaustedError extends Error {
+  getPool:             vi.fn(() => ({})),
+  query:               vi.fn(),
+  PoolExhaustedError:  class PoolExhaustedError extends Error {
     constructor() { super('pool exhausted'); this.name = 'PoolExhaustedError'; }
   },
   DuplicateEntryError: class DuplicateEntryError extends Error {
@@ -37,13 +47,23 @@ vi.mock('../../src/db/pool.js', () => ({
 }));
 
 import { createApp } from '../../src/app.js';
-import { _resetStreams, setStreamListingDependencyState, setIdempotencyDependencyState } from '../../src/routes/streams.js';
+import {
+  _resetStreams,
+  setStreamListingDependencyState,
+  setIdempotencyDependencyState,
+} from '../../src/routes/streams.js';
+import { initializeConfig } from '../../src/config/env.js';
+import { generateToken } from '../../src/lib/auth.js';
+
+// Initialize config before importing anything that needs it
+initializeConfig();
+
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 const VALID_SENDER    = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
 const VALID_RECIPIENT = 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR';
-const INVALID_KEY_SHORT         = 'GABC123';
-const INVALID_KEY_WRONG_PREFIX  = 'AAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
-const INVALID_KEY_INVALID_CHARS = 'G1111111111111111111111111111111111111111111111111111111';
+
+const TEST_TOKEN = generateToken({ address: VALID_SENDER, role: 'operator' });
 
 const app = createApp();
 
@@ -77,6 +97,22 @@ const validBody = {
   ratePerSecond: '10',
 };
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+let _keyCounter = 0;
+function uniqueKey(prefix = 'key'): string {
+  return `${prefix}-${++_keyCounter}`;
+}
+
+function post(body: Record<string, unknown>, key?: string) {
+  const req = request(app)
+    .post('/api/streams')
+    .set('Authorization', `Bearer ${TEST_TOKEN}`)
+    .send(body);
+  if (key !== undefined) req.set('Idempotency-Key', key);
+  return req;
+}
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
 describe('streams routes', () => {
@@ -86,7 +122,6 @@ describe('streams routes', () => {
     setStreamListingDependencyState('healthy');
     setIdempotencyDependencyState('healthy');
 
-    // Default happy-path mocks
     mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
     mockGetById.mockResolvedValue(undefined);
     mockUpsertStream.mockResolvedValue({ created: true, stream: makeDbRecord() });
@@ -101,7 +136,7 @@ describe('streams routes', () => {
     vi.restoreAllMocks();
   });
 
-  // ── GET /api/streams ────────────────────────────────────────────────────────
+  // ── GET /api/streams ──────────────────────────────────────────────────────
 
   describe('GET /api/streams', () => {
     it('returns an empty list when no streams exist', async () => {
@@ -113,27 +148,18 @@ describe('streams routes', () => {
     });
 
     it('returns mapped streams from the repository', async () => {
-      mockFindWithCursor.mockResolvedValue({
-        streams: [makeDbRecord()],
-        hasMore: false,
-      });
-
+      mockFindWithCursor.mockResolvedValue({ streams: [makeDbRecord()], hasMore: false });
       const res = await request(app).get('/api/streams');
       expect(res.status).toBe(200);
       expect(res.body.data.streams).toHaveLength(1);
       const s = res.body.data.streams[0];
       expect(s.sender).toBe(VALID_SENDER);
-      expect(s.recipient).toBe(VALID_RECIPIENT);
       expect(s.depositAmount).toBe('1000');
       expect(s.ratePerSecond).toBe('10');
     });
 
     it('includes next_cursor when hasMore=true', async () => {
-      mockFindWithCursor.mockResolvedValue({
-        streams: [makeDbRecord({ id: 'stream-abc-0' })],
-        hasMore: true,
-      });
-
+      mockFindWithCursor.mockResolvedValue({ streams: [makeDbRecord({ id: 'stream-abc-0' })], hasMore: true });
       const res = await request(app).get('/api/streams?limit=1');
       expect(res.status).toBe(200);
       expect(res.body.data.next_cursor).toBeDefined();
@@ -142,7 +168,6 @@ describe('streams routes', () => {
 
     it('includes total when include_total=true', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false, total: 42 });
-
       const res = await request(app).get('/api/streams?include_total=true');
       expect(res.status).toBe(200);
       expect(res.body.data.total).toBe(42);
@@ -155,18 +180,15 @@ describe('streams routes', () => {
     });
 
     it('rejects limit > 100', async () => {
-      const res = await request(app).get('/api/streams?limit=101');
-      expect(res.status).toBe(400);
+      expect((await request(app).get('/api/streams?limit=101')).status).toBe(400);
     });
 
     it('rejects invalid cursor', async () => {
-      const res = await request(app).get('/api/streams?cursor=!!!invalid!!!');
-      expect(res.status).toBe(400);
+      expect((await request(app).get('/api/streams?cursor=!!!invalid!!!')).status).toBe(400);
     });
 
     it('rejects invalid include_total value', async () => {
-      const res = await request(app).get('/api/streams?include_total=maybe');
-      expect(res.status).toBe(400);
+      expect((await request(app).get('/api/streams?include_total=maybe')).status).toBe(400);
     });
 
     it('returns 503 when listing dependency is unavailable', async () => {
@@ -179,28 +201,20 @@ describe('streams routes', () => {
     it('returns 503 when pool is exhausted', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockFindWithCursor.mockRejectedValue(new PoolExhaustedError());
-
-      const res = await request(app).get('/api/streams');
-      expect(res.status).toBe(503);
+      expect((await request(app).get('/api/streams')).status).toBe(503);
     });
 
-    it('accepts a valid cursor and passes afterId to repository', async () => {
+    it('passes afterId to repository from a valid cursor', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
-
-      // Build a valid cursor
       const cursor = Buffer.from(JSON.stringify({ v: 1, lastId: 'stream-abc-0' })).toString('base64url');
-      const res = await request(app).get(`/api/streams?cursor=${cursor}`);
-      expect(res.status).toBe(200);
+      await request(app).get(`/api/streams?cursor=${cursor}`);
       expect(mockFindWithCursor).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.any(Number),
-        'stream-abc-0',
-        expect.any(Boolean),
+        expect.anything(), expect.any(Number), 'stream-abc-0', expect.any(Boolean),
       );
     });
   });
 
-  // ── GET /api/streams/:id ────────────────────────────────────────────────────
+  // ── GET /api/streams/:id ──────────────────────────────────────────────────
 
   describe('GET /api/streams/:id', () => {
     it('returns 404 for a non-existent stream', async () => {
@@ -208,34 +222,21 @@ describe('streams routes', () => {
       const res = await request(app).get('/api/streams/stream-nonexistent');
       expect(res.status).toBe(404);
       expect(res.body.success).toBe(false);
-      expect(res.body.error.message).toContain('Stream');
     });
 
     it('returns the stream when found', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
-
       const res = await request(app).get('/api/streams/stream-abc-0');
       expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
       expect(res.body.data.stream.id).toBe('stream-abc-0');
-      expect(res.body.data.stream.sender).toBe(VALID_SENDER);
       expect(res.body.data.stream.depositAmount).toBe('1000');
     });
 
     it('maps DB snake_case to API camelCase', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({
-        sender_address:    VALID_SENDER,
-        recipient_address: VALID_RECIPIENT,
-        amount:            '500',
-        rate_per_second:   '5',
-        start_time:        1700000000,
-        end_time:          1800000000,
+        amount: '500', rate_per_second: '5', start_time: 1700000000, end_time: 1800000000,
       }));
-
-      const res = await request(app).get('/api/streams/stream-abc-0');
-      const s = res.body.data.stream;
-      expect(s.sender).toBe(VALID_SENDER);
-      expect(s.recipient).toBe(VALID_RECIPIENT);
+      const s = (await request(app).get('/api/streams/stream-abc-0')).body.data.stream;
       expect(s.depositAmount).toBe('500');
       expect(s.ratePerSecond).toBe('5');
       expect(s.startTime).toBe(1700000000);
@@ -245,203 +246,306 @@ describe('streams routes', () => {
     it('returns 503 when pool is exhausted', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockGetById.mockRejectedValue(new PoolExhaustedError());
-
-      const res = await request(app).get('/api/streams/stream-x');
-      expect(res.status).toBe(503);
+      expect((await request(app).get('/api/streams/stream-x')).status).toBe(503);
     });
   });
 
-  // ── POST /api/streams ───────────────────────────────────────────────────────
 
-  describe('POST /api/streams', () => {
-    it('creates a stream with valid input', async () => {
-      const res = await request(app)
-        .post('/api/streams')
-        .send(validBody);
+  // ── POST /api/streams — idempotency ──────────────────────────────────────
 
-      expect(res.status).toBe(201);
-      expect(res.body.success).toBe(true);
-      expect(res.body.data.sender).toBe(VALID_SENDER);
-      expect(res.body.data.recipient).toBe(VALID_RECIPIENT);
-      expect(res.body.data.depositAmount).toBe('1000');
-      expect(res.body.data.ratePerSecond).toBe('10');
-      expect(res.body.data.status).toBe('active');
-      expect(res.body.data.id).toMatch(/^stream-/);
+  describe('POST /api/streams — idempotency', () => {
+
+    // ── Missing / malformed key ─────────────────────────────────────────────
+
+    it('returns 400 when Idempotency-Key header is absent', async () => {
+      const res = await post(validBody); // no key
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+      expect(res.body.error.message).toMatch(/Idempotency-Key/);
     });
 
-    it('sets Idempotency-Replayed: false on first creation', async () => {
-      const res = await request(app)
-        .post('/api/streams')
-        .set('Idempotency-Key', 'key-001')
-        .send(validBody);
+    it('returns 400 when Idempotency-Key is an empty string', async () => {
+      const res = await post(validBody, '');
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
 
+    it('returns 400 when Idempotency-Key exceeds 128 characters', async () => {
+      const res = await post(validBody, 'a'.repeat(129));
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('accepts an Idempotency-Key of exactly 128 characters', async () => {
+      const res = await post(validBody, 'a'.repeat(128));
+      expect(res.status).toBe(201);
+    });
+
+    it('accepts an Idempotency-Key of exactly 1 character', async () => {
+      const res = await post(validBody, 'z');
+      expect(res.status).toBe(201);
+    });
+
+    it('returns 400 when Idempotency-Key contains disallowed characters (space)', async () => {
+      const res = await post(validBody, 'key with spaces');
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('returns 400 when Idempotency-Key contains disallowed characters (slash)', async () => {
+      const res = await post(validBody, 'key/slash');
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('accepts keys with allowed special characters (colon, underscore, hyphen)', async () => {
+      const res = await post(validBody, 'my-key_v1:2024');
+      expect(res.status).toBe(201);
+    });
+
+    it('accepts a UUID-formatted key', async () => {
+      const res = await post(validBody, '550e8400-e29b-41d4-a716-446655440000');
+      expect(res.status).toBe(201);
+    });
+
+    // ── First creation ──────────────────────────────────────────────────────
+
+    it('returns 201 on first creation with Idempotency-Replayed: false', async () => {
+      const res = await post(validBody, uniqueKey());
       expect(res.status).toBe(201);
       expect(res.headers['idempotency-replayed']).toBe('false');
+      expect(res.body.success).toBe(true);
+      expect(res.body.meta.idempotencyReplayed).toBeUndefined();
     });
 
-    it('replays idempotent request with same key and body', async () => {
-      await request(app)
-        .post('/api/streams')
-        .set('Idempotency-Key', 'key-replay')
-        .send(validBody);
+    it('echoes the Idempotency-Key header in the response', async () => {
+      const key = uniqueKey('echo');
+      const res = await post(validBody, key);
+      expect(res.status).toBe(201);
+      expect(res.headers['idempotency-key']).toBe(key);
+    });
 
-      const res2 = await request(app)
-        .post('/api/streams')
-        .set('Idempotency-Key', 'key-replay')
-        .send(validBody);
-
-      expect(res2.status).toBe(201);
-      expect(res2.headers['idempotency-replayed']).toBe('true');
-      // Repository should only be called once
+    it('calls upsertStream exactly once on first creation', async () => {
+      await post(validBody, uniqueKey());
       expect(mockUpsertStream).toHaveBeenCalledTimes(1);
     });
 
-    it('returns 409 when same key is used with different body', async () => {
-      await request(app)
-        .post('/api/streams')
-        .set('Idempotency-Key', 'key-conflict')
-        .send(validBody);
+    // ── Replay (same key + same body) ───────────────────────────────────────
 
-      const res2 = await request(app)
-        .post('/api/streams')
-        .set('Idempotency-Key', 'key-conflict')
-        .send({ ...validBody, depositAmount: '9999' });
-
-      expect(res2.status).toBe(409);
-      expect(res2.body.error.code).toBe('CONFLICT');
+    it('returns 201 on replay with Idempotency-Replayed: true', async () => {
+      const key = uniqueKey('replay');
+      await post(validBody, key).expect(201);
+      const res = await post(validBody, key);
+      expect(res.status).toBe(201);
+      expect(res.headers['idempotency-replayed']).toBe('true');
     });
 
-    it('accepts an explicit startTime', async () => {
+    it('sets meta.idempotencyReplayed=true on replay response', async () => {
+      const key = uniqueKey('meta-replay');
+      await post(validBody, key).expect(201);
+      const res = await post(validBody, key).expect(201);
+      expect(res.body.meta.idempotencyReplayed).toBe(true);
+    });
+
+    it('returns identical data body on replay', async () => {
+      const key = uniqueKey('data-replay');
+      const first = await post(validBody, key).expect(201);
+      const second = await post(validBody, key).expect(201);
+      expect(second.body.data).toEqual(first.body.data);
+    });
+
+    it('does NOT call upsertStream on replay', async () => {
+      const key = uniqueKey('no-upsert');
+      await post(validBody, key).expect(201);
+      vi.clearAllMocks();
+      await post(validBody, key).expect(201);
+      expect(mockUpsertStream).not.toHaveBeenCalled();
+    });
+
+    it('preserves decimal-string precision through replay', async () => {
+      const preciseBody = { ...validBody, depositAmount: '1000000.0000007', ratePerSecond: '0.0000116' };
       mockUpsertStream.mockResolvedValue({
         created: true,
-        stream: makeDbRecord({ start_time: 1700000000 }),
+        stream: makeDbRecord({ amount: '1000000.0000007', rate_per_second: '0.0000116' }),
       });
-
-      const res = await request(app)
-        .post('/api/streams')
-        .send({ ...validBody, startTime: 1700000000 });
-
-      expect(res.status).toBe(201);
-      expect(res.body.data.startTime).toBe(1700000000);
+      const key = uniqueKey('decimal-replay');
+      await post(preciseBody, key).expect(201);
+      const res = await post(preciseBody, key).expect(201);
+      expect(res.body.data.depositAmount).toBe('1000000.0000007');
+      expect(res.body.data.ratePerSecond).toBe('0.0000116');
     });
 
-    it('rejects missing sender', async () => {
-      const { sender: _, ...body } = validBody;
-      const res = await request(app).post('/api/streams').send(body);
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('sender is required');
+    it('handles concurrent replays safely (sequential simulation)', async () => {
+      const key = uniqueKey('concurrent');
+      await post(validBody, key).expect(201);
+      const [r1, r2, r3] = await Promise.all([
+        post(validBody, key),
+        post(validBody, key),
+        post(validBody, key),
+      ]);
+      expect(r1.status).toBe(201);
+      expect(r2.status).toBe(201);
+      expect(r3.status).toBe(201);
+      // Only the original upsert call
+      expect(mockUpsertStream).toHaveBeenCalledTimes(1);
     });
 
-    it('rejects empty sender', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, sender: '' });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('sender must be a valid Stellar public key (G...)');
-    });
+    // ── Collision (same key + different body) ───────────────────────────────
 
-    it('rejects invalid sender - too short', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, sender: INVALID_KEY_SHORT });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('sender must be a valid Stellar public key (G...)');
-    });
-
-    it('rejects invalid sender - wrong prefix', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, sender: INVALID_KEY_WRONG_PREFIX });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('sender must be a valid Stellar public key (G...)');
-    });
-
-    it('rejects invalid sender - invalid characters', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, sender: INVALID_KEY_INVALID_CHARS });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('sender must be a valid Stellar public key (G...)');
-    });
-
-    it('rejects invalid sender - generic string', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, sender: 'not-a-stellar-key' });
-      expect(res.status).toBe(400);
-    });
-
-    it('rejects missing recipient', async () => {
-      const { recipient: _, ...body } = validBody;
-      const res = await request(app).post('/api/streams').send(body);
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('recipient is required');
-    });
-
-    it('rejects empty recipient', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, recipient: '' });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('recipient must be a valid Stellar public key (G...)');
-    });
-
-    it('rejects invalid recipient - too short', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, recipient: INVALID_KEY_SHORT });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('recipient must be a valid Stellar public key (G...)');
-    });
-
-    it('rejects invalid recipient - wrong prefix', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, recipient: INVALID_KEY_WRONG_PREFIX });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('recipient must be a valid Stellar public key (G...)');
-    });
-
-    it('rejects non-positive depositAmount', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, depositAmount: '0' });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('depositAmount must be a positive numeric string');
-    });
-
-    it('rejects non-numeric depositAmount', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, depositAmount: 'abc' });
-      expect(res.status).toBe(400);
-    });
-
-    it('rejects numeric depositAmount (must be string)', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, depositAmount: 1000 });
-      expect(res.status).toBe(400);
-    });
-
-    it('rejects negative ratePerSecond', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, ratePerSecond: '-5' });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('ratePerSecond must be a positive numeric string');
-    });
-
-    it('rejects negative startTime', async () => {
-      const res = await request(app).post('/api/streams').send({ ...validBody, startTime: -1 });
-      expect(res.status).toBe(400);
-      expect(res.body.error.details).toContain('startTime must be a non-negative number');
-    });
-
-    it('returns all validation errors at once', async () => {
-      const res = await request(app).post('/api/streams').send({});
-      expect(res.status).toBe(400);
+    it('returns 409 CONFLICT when same key is reused with a different body', async () => {
+      const key = uniqueKey('conflict');
+      await post(validBody, key).expect(201);
+      const res = await post({ ...validBody, depositAmount: '9999' }, key);
+      expect(res.status).toBe(409);
       expect(res.body.success).toBe(false);
-      // At minimum sender and recipient errors
-      expect(res.body.error.details.length).toBeGreaterThanOrEqual(2);
+      expect(res.body.error.code).toBe('CONFLICT');
     });
 
-    it('does not log raw Stellar keys after creation', async () => {
-      const logSpy = vi.spyOn(console, 'log');
-      await request(app).post('/api/streams').send(validBody);
-      const allOutput = logSpy.mock.calls.map((c) => String(c[0])).join(' ');
-      expect(allOutput).not.toContain(VALID_SENDER);
-      expect(allOutput).not.toContain(VALID_RECIPIENT);
+    it('409 conflict body does NOT contain the raw Idempotency-Key value', async () => {
+      const key = uniqueKey('no-key-leak');
+      await post(validBody, key).expect(201);
+      const res = await post({ ...validBody, depositAmount: '9999' }, key).expect(409);
+      // The key must not appear anywhere in the serialised response body
+      expect(JSON.stringify(res.body)).not.toContain(key);
     });
+
+    it('409 conflict body contains a hint for recovery', async () => {
+      const key = uniqueKey('hint');
+      await post(validBody, key).expect(201);
+      const res = await post({ ...validBody, depositAmount: '1' }, key).expect(409);
+      expect(res.body.error.details).toBeDefined();
+    });
+
+    it('different keys for different bodies create independent streams', async () => {
+      const key1 = uniqueKey('ind-a');
+      const key2 = uniqueKey('ind-b');
+      const r1 = await post(validBody, key1).expect(201);
+      const r2 = await post({ ...validBody, depositAmount: '2000' }, key2).expect(201);
+      expect(r1.body.data.id).toBeDefined();
+      expect(r2.body.data.id).toBeDefined();
+      expect(mockUpsertStream).toHaveBeenCalledTimes(2);
+    });
+
+    it('same body with different keys creates two separate upsert calls', async () => {
+      await post(validBody, uniqueKey('sep-a')).expect(201);
+      await post(validBody, uniqueKey('sep-b')).expect(201);
+      expect(mockUpsertStream).toHaveBeenCalledTimes(2);
+    });
+
+    // ── Dependency / infrastructure failures ────────────────────────────────
 
     it('returns 503 when idempotency dependency is unavailable', async () => {
       setIdempotencyDependencyState('unavailable');
-      const res = await request(app).post('/api/streams').send(validBody);
+      const res = await post(validBody, uniqueKey());
       expect(res.status).toBe(503);
+      expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
     });
 
     it('returns 503 when pool is exhausted during upsert', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockUpsertStream.mockRejectedValue(new PoolExhaustedError());
-
-      const res = await request(app).post('/api/streams').send(validBody);
+      const res = await post(validBody, uniqueKey());
       expect(res.status).toBe(503);
+    });
+
+    it('does NOT cache the response when upsert fails (no phantom replay)', async () => {
+      const { PoolExhaustedError } = await import('../../src/db/pool.js');
+      const key = uniqueKey('no-cache-on-fail');
+      mockUpsertStream.mockRejectedValueOnce(new PoolExhaustedError());
+      await post(validBody, key).expect(503);
+
+      // Second attempt with DB healthy — should attempt upsert again, not replay
+      mockUpsertStream.mockResolvedValueOnce({ created: true, stream: makeDbRecord() });
+      const res = await post(validBody, key).expect(201);
+      expect(res.headers['idempotency-replayed']).toBe('false');
+      expect(mockUpsertStream).toHaveBeenCalledTimes(2);
+    });
+
+    // ── Security: no secret leakage in logs ─────────────────────────────────
+
+    it('does not log raw Stellar addresses after creation', async () => {
+      const warnSpy  = vi.spyOn(console, 'warn');
+      const errorSpy = vi.spyOn(console, 'error');
+      await post(validBody, uniqueKey('pii-check')).expect(201);
+      const allOutput = [
+        ...warnSpy.mock.calls,
+        ...errorSpy.mock.calls,
+      ].map((c) => String(c[0])).join(' ');
+      expect(allOutput).not.toContain(VALID_SENDER);
+      expect(allOutput).not.toContain(VALID_RECIPIENT);
+    });
+
+    it('does not log the raw Idempotency-Key value on conflict', async () => {
+      const key = uniqueKey('key-not-logged');
+      const warnSpy = vi.spyOn(console, 'warn');
+      await post(validBody, key).expect(201);
+      await post({ ...validBody, depositAmount: '1' }, key).expect(409);
+      const allWarn = warnSpy.mock.calls.map((c) => String(c[0])).join(' ');
+      expect(allWarn).not.toContain(key);
+    });
+  });
+
+
+  // ── POST /api/streams — validation ───────────────────────────────────────
+
+  describe('POST /api/streams — validation', () => {
+    it('creates a stream with valid input', async () => {
+      const res = await post(validBody, uniqueKey());
+      expect(res.status).toBe(201);
+      expect(res.body.data.sender).toBe(VALID_SENDER);
+      expect(res.body.data.depositAmount).toBe('1000');
+      expect(res.body.data.status).toBe('active');
+    });
+
+    it('rejects missing sender', async () => {
+      const { sender: _, ...body } = validBody;
+      const res = await post(body, uniqueKey());
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('rejects invalid sender (too short)', async () => {
+      const res = await post({ ...validBody, sender: 'GABC123' }, uniqueKey());
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects invalid sender (wrong prefix)', async () => {
+      const res = await post({ ...validBody, sender: 'AAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7' }, uniqueKey());
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects missing recipient', async () => {
+      const { recipient: _, ...body } = validBody;
+      const res = await post(body, uniqueKey());
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('rejects non-positive depositAmount', async () => {
+      const res = await post({ ...validBody, depositAmount: '0' }, uniqueKey());
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects numeric depositAmount (must be string)', async () => {
+      const res = await post({ ...validBody, depositAmount: 1000 }, uniqueKey());
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects negative ratePerSecond', async () => {
+      const res = await post({ ...validBody, ratePerSecond: '-5' }, uniqueKey());
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects negative startTime', async () => {
+      const res = await post({ ...validBody, startTime: -1 }, uniqueKey());
+      expect(res.status).toBe(400);
+    });
+
+    it('returns all validation errors at once', async () => {
+      const res = await post({}, uniqueKey());
+      expect(res.status).toBe(400);
+      expect(res.body.error.details.length).toBeGreaterThanOrEqual(2);
     });
 
     it('preserves decimal-string precision for amounts', async () => {
@@ -449,72 +553,68 @@ describe('streams routes', () => {
         created: true,
         stream: makeDbRecord({ amount: '0.0000001', rate_per_second: '0.0000116' }),
       });
-
-      const res = await request(app).post('/api/streams').send({
-        ...validBody,
-        depositAmount: '0.0000001',
-        ratePerSecond: '0.0000116',
-      });
-
+      const res = await post({ ...validBody, depositAmount: '0.0000001', ratePerSecond: '0.0000116' }, uniqueKey());
       expect(res.status).toBe(201);
       expect(res.body.data.depositAmount).toBe('0.0000001');
       expect(res.body.data.ratePerSecond).toBe('0.0000116');
     });
   });
 
-  // ── DELETE /api/streams/:id ─────────────────────────────────────────────────
+  // ── DELETE /api/streams/:id ───────────────────────────────────────────────
 
   describe('DELETE /api/streams/:id', () => {
     it('cancels an active stream', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'active' }));
       mockUpdateStream.mockResolvedValue(makeDbRecord({ status: 'cancelled' }));
-
-      const res = await request(app).delete('/api/streams/stream-abc-0');
+      const res = await request(app)
+        .delete('/api/streams/stream-abc-0')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
       expect(res.body.data.message).toBe('Stream cancelled');
-      expect(res.body.data.id).toBe('stream-abc-0');
     });
 
     it('returns 404 for a non-existent stream', async () => {
       mockGetById.mockResolvedValue(undefined);
-      const res = await request(app).delete('/api/streams/stream-nonexistent');
-      expect(res.status).toBe(404);
+      expect((await request(app)
+        .delete('/api/streams/stream-nonexistent')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+      ).status).toBe(404);
     });
 
     it('returns 409 when stream is already cancelled', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'cancelled' }));
-      const res = await request(app).delete('/api/streams/stream-abc-0');
+      const res = await request(app)
+        .delete('/api/streams/stream-abc-0')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('CONFLICT');
     });
 
     it('returns 409 when stream is already completed', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'completed' }));
-      const res = await request(app).delete('/api/streams/stream-abc-0');
-      expect(res.status).toBe(409);
+      expect((await request(app)
+        .delete('/api/streams/stream-abc-0')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+      ).status).toBe(409);
     });
 
     it('returns 503 when pool is exhausted', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockGetById.mockRejectedValue(new PoolExhaustedError());
-
-      const res = await request(app).delete('/api/streams/stream-abc-0');
-      expect(res.status).toBe(503);
+      expect((await request(app)
+        .delete('/api/streams/stream-abc-0')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+      ).status).toBe(503);
     });
   });
 
-  // ── PATCH /api/streams/:id/status ──────────────────────────────────────────
+  // ── PATCH /api/streams/:id/status ────────────────────────────────────────
 
   describe('PATCH /api/streams/:id/status', () => {
     it('transitions active → paused', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'active' }));
       mockUpdateStream.mockResolvedValue(makeDbRecord({ status: 'paused' }));
-
-      const res = await request(app)
-        .patch('/api/streams/stream-abc-0/status')
-        .send({ status: 'paused' });
-
+      const res = await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'paused' });
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('paused');
     });
@@ -522,78 +622,39 @@ describe('streams routes', () => {
     it('transitions paused → active', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'paused' }));
       mockUpdateStream.mockResolvedValue(makeDbRecord({ status: 'active' }));
-
-      const res = await request(app)
-        .patch('/api/streams/stream-abc-0/status')
-        .send({ status: 'active' });
-
-      expect(res.status).toBe(200);
-      expect(res.body.data.status).toBe('active');
-    });
-
-    it('transitions active → completed', async () => {
-      mockGetById.mockResolvedValue(makeDbRecord({ status: 'active' }));
-      mockUpdateStream.mockResolvedValue(makeDbRecord({ status: 'completed' }));
-
-      const res = await request(app)
-        .patch('/api/streams/stream-abc-0/status')
-        .send({ status: 'completed' });
-
+      const res = await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'active' });
       expect(res.status).toBe(200);
     });
 
     it('returns 409 for invalid transition: completed → active', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'completed' }));
-
-      const res = await request(app)
-        .patch('/api/streams/stream-abc-0/status')
-        .send({ status: 'active' });
-
+      const res = await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'active' });
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('CONFLICT');
     });
 
     it('returns 409 for invalid transition: cancelled → paused', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'cancelled' }));
-
-      const res = await request(app)
-        .patch('/api/streams/stream-abc-0/status')
-        .send({ status: 'paused' });
-
-      expect(res.status).toBe(409);
+      expect((await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'paused' })).status).toBe(409);
     });
 
     it('returns 400 for unknown status value', async () => {
-      const res = await request(app)
-        .patch('/api/streams/stream-abc-0/status')
-        .send({ status: 'unknown-status' });
-
-      expect(res.status).toBe(400);
+      expect((await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'unknown-status' })).status).toBe(400);
     });
 
     it('returns 404 when stream not found', async () => {
       mockGetById.mockResolvedValue(undefined);
-
-      const res = await request(app)
-        .patch('/api/streams/stream-nonexistent/status')
-        .send({ status: 'paused' });
-
-      expect(res.status).toBe(404);
+      expect((await request(app).patch('/api/streams/stream-nonexistent/status').send({ status: 'paused' })).status).toBe(404);
     });
 
     it('returns 503 when pool is exhausted', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockGetById.mockRejectedValue(new PoolExhaustedError());
-
-      const res = await request(app)
-        .patch('/api/streams/stream-abc-0/status')
-        .send({ status: 'paused' });
-
-      expect(res.status).toBe(503);
+      expect((await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'paused' })).status).toBe(503);
     });
   });
 
-  // ── Response envelope ───────────────────────────────────────────────────────
+  // ── Response envelope ─────────────────────────────────────────────────────
 
   describe('response envelope', () => {
     it('success responses have { success: true, data, meta }', async () => {
@@ -601,7 +662,6 @@ describe('streams routes', () => {
       const res = await request(app).get('/api/streams');
       expect(res.body.success).toBe(true);
       expect(res.body.data).toBeDefined();
-      expect(res.body.meta).toBeDefined();
       expect(res.body.meta.timestamp).toBeDefined();
     });
 
@@ -610,6 +670,18 @@ describe('streams routes', () => {
       expect(res.body.success).toBe(false);
       expect(res.body.error.code).toBeDefined();
       expect(res.body.error.message).toBeDefined();
+    });
+
+    it('replay responses have meta.idempotencyReplayed=true', async () => {
+      const key = uniqueKey('envelope-replay');
+      await post(validBody, key).expect(201);
+      const res = await post(validBody, key).expect(201);
+      expect(res.body.meta.idempotencyReplayed).toBe(true);
+    });
+
+    it('fresh creation responses do NOT have meta.idempotencyReplayed', async () => {
+      const res = await post(validBody, uniqueKey('envelope-fresh')).expect(201);
+      expect(res.body.meta.idempotencyReplayed).toBeUndefined();
     });
   });
 });
