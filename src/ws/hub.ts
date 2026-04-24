@@ -36,6 +36,8 @@ import type { Server } from 'http';
 import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
+import type { ContractEventStore } from '../indexer/store.js';
+import type { StreamEventReplayFilter } from '../db/types.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -92,6 +94,11 @@ export interface StreamHubOptions {
    * Defaults to the JWT_SECRET environment variable.
    */
   jwtSecret?: string;
+  /**
+   * Event store used by replayFromCursor to fetch historical events.
+   * When absent, replayFromCursor sends an empty result.
+   */
+  eventStore?: ContractEventStore;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -104,6 +111,7 @@ export class StreamHub {
   private readonly ownsDedup: boolean;
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
+  private eventStore: ContractEventStore | undefined;
 
   private readonly metrics: BackpressureMetrics = {
     droppedMessages: 0,
@@ -131,15 +139,16 @@ export class StreamHub {
       options?.jwtSecret ??
       process.env.JWT_SECRET;
 
-    this.wss = new WebSocketServer({ server, path: '/ws/streams' });
+    this.eventStore = options?.eventStore;
 
-    // Handle upgrade manually so we can reject before the WS handshake.
-    server.on('upgrade', (req, socket, head) => {
-      // Only intercept our path.
-      const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
-      if (pathname !== '/ws/streams') return;
+    if (this.wsAuthRequired) {
+      // Use noServer mode so we fully control the upgrade handshake.
+      this.wss = new WebSocketServer({ noServer: true });
 
-      if (this.wsAuthRequired) {
+      server.on('upgrade', (req, socket, head) => {
+        const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
+        if (pathname !== '/ws/streams') return;
+
         const result = verifyWsToken(req, this.jwtSecret);
         if (!result.ok) {
           socket.write(
@@ -151,12 +160,15 @@ export class StreamHub {
           socket.destroy();
           return;
         }
-      }
 
-      this.wss.handleUpgrade(req, socket, head, (ws) => {
-        this.wss.emit('connection', ws, req);
+        this.wss.handleUpgrade(req, socket, head, (ws) => {
+          this.wss.emit('connection', ws, req);
+        });
       });
-    });
+    } else {
+      // Let the WebSocketServer handle upgrades automatically.
+      this.wss = new WebSocketServer({ server, path: '/ws/streams' });
+    }
 
     this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       this.onConnect(ws, req);
@@ -276,6 +288,20 @@ export class StreamHub {
 
     const { type, streamId } = msg as Record<string, unknown>;
 
+    if (type === 'replay') {
+      const { afterEventId, fromLedger, toledger, contractId, topic, limit } = msg as Record<string, unknown>;
+      const replayFilter: StreamEventReplayFilter = {
+        ...(typeof afterEventId === 'string' ? { afterEventId } : {}),
+        ...(typeof fromLedger === 'number' ? { fromLedger } : {}),
+        ...(typeof toledger === 'number' ? { toledger } : {}),
+        ...(typeof contractId === 'string' ? { contractId } : {}),
+        ...(typeof topic === 'string' ? { topic } : {}),
+        ...(typeof limit === 'number' ? { limit } : {}),
+      };
+      void this.replayFromCursor(ws, replayFilter);
+      return;
+    }
+
     if (typeof streamId !== 'string' || streamId.trim() === '') {
       this.sendError(ws, 'INVALID_MESSAGE', 'streamId must be a non-empty string');
       return;
@@ -383,6 +409,76 @@ export class StreamHub {
   setBackpressureThresholds(opts: { dropBytes?: number; terminateBytes?: number }): void {
     if (typeof opts.dropBytes === 'number' && opts.dropBytes >= 0) this.dropBytes = opts.dropBytes;
     if (typeof opts.terminateBytes === 'number' && opts.terminateBytes >= 0) this.terminateBytes = opts.terminateBytes;
+  }
+
+  /**
+   * Attach (or replace) the event store used by replayFromCursor.
+   * Called by the indexer route after the store is configured.
+   */
+  setEventStore(store: ContractEventStore): void {
+    this.eventStore = store;
+  }
+
+  /**
+   * Replay stored events to a single connected client starting after the
+   * given cursor eventId.  Events are fetched from the attached event store
+   * in ledger-ascending order and sent as `stream_replay` frames.
+   *
+   * The method is intentionally fire-and-forget from the caller's perspective:
+   * it resolves once all pages have been sent (or the client disconnects).
+   *
+   * @param ws         Target WebSocket connection (must be OPEN).
+   * @param filter     Replay filter forwarded to the event store.
+   *                   `afterEventId` acts as the exclusive cursor.
+   */
+  async replayFromCursor(ws: WebSocket, filter: StreamEventReplayFilter = {}): Promise<void> {
+    if (!this.eventStore) {
+      this.sendError(ws, 'REPLAY_UNAVAILABLE', 'Event store is not configured');
+      return;
+    }
+
+    let cursor = filter.afterEventId;
+    const pageSize = Math.min(filter.limit ?? 100, 1000);
+
+    do {
+      if (ws.readyState !== WebSocket.OPEN) return;
+
+      const pageFilter: StreamEventReplayFilter = {
+        ...filter,
+        ...(cursor !== undefined ? { afterEventId: cursor } : {}),
+        limit: pageSize,
+      };
+      const result = await this.eventStore.getEvents(pageFilter);
+
+      for (const event of result.events) {
+        if (ws.readyState !== WebSocket.OPEN) return;
+
+        const message = JSON.stringify({
+          type: 'stream_replay',
+          eventId: event.eventId,
+          ledger: event.ledger,
+          topic: event.topic,
+          payload: event.payload,
+          happenedAt: event.happenedAt,
+        });
+
+        ws.send(message);
+
+        const state = this.clients.get(ws);
+        if (state) {
+          state.metrics.messagesSent += 1;
+          state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
+        }
+        this.metrics.sentMessages++;
+      }
+
+      cursor = result.nextCursor;
+    } while (cursor !== undefined);
+
+    // Signal end of replay stream
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'stream_replay_complete', cursor: cursor ?? null }));
+    }
   }
 
   async close(cb?: () => void): Promise<void> {

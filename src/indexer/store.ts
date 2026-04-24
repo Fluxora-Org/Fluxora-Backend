@@ -34,6 +34,10 @@ export class InMemoryContractEventStore implements ContractEventStore {
       insertedEventIds.push(event.eventId);
     }
 
+    for (const [id, record] of staged) {
+      this.records.set(id, record);
+    }
+
     return { insertedEventIds, duplicateEventIds };
   }
 
@@ -64,6 +68,21 @@ export class InMemoryContractEventStore implements ContractEventStore {
 
     let results = [...this.records.values()] as StreamEventRecord[];
 
+    // Stable ordering: ledger asc, then eventId asc
+    results.sort((a, b) => a.ledger - b.ledger || a.eventId.localeCompare(b.eventId));
+
+    // Cursor-based: drop everything up to and including the cursor eventId
+    // (applied before other filters so the cursor position is stable)
+    if (filter.afterEventId !== undefined) {
+      const idx = results.findIndex((r) => r.eventId === filter.afterEventId);
+      if (idx === -1) {
+        // Unknown cursor — treat as "past end of store", return empty
+        results = [];
+      } else {
+        results = results.slice(idx + 1);
+      }
+    }
+
     if (filter.fromLedger !== undefined) {
       results = results.filter((r) => r.ledger >= filter.fromLedger!);
     }
@@ -77,16 +96,28 @@ export class InMemoryContractEventStore implements ContractEventStore {
       results = results.filter((r) => r.topic === filter.topic);
     }
 
-    // Stable ordering: ledger asc, then eventId asc
-    results.sort((a, b) => a.ledger - b.ledger || a.eventId.localeCompare(b.eventId));
-
     const total = results.length;
-    const events = results.slice(offset, offset + limit).map((r) => ({
+    const slice = filter.afterEventId !== undefined
+      ? results.slice(0, limit)
+      : results.slice(offset, offset + limit);
+
+    const events = slice.map((r) => ({
       ...r,
       ingestedAt: r.ingestedAt ?? new Date().toISOString(),
     }));
 
-    return { events, total, limit, offset };
+    const lastEvent = events[events.length - 1];
+    const nextCursor = events.length === limit && total > limit && lastEvent
+      ? lastEvent.eventId
+      : undefined;
+
+    return {
+      events,
+      total,
+      limit,
+      offset: filter.afterEventId !== undefined ? 0 : offset,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+    };
   }
 
   reset(): void {
@@ -201,6 +232,26 @@ export class PostgresContractEventStore implements ContractEventStore {
       conditions.push(`topic = $${values.length}`);
     }
 
+    // Cursor: translate afterEventId into a (ledger, event_id) boundary
+    if (filter.afterEventId !== undefined) {
+      // Fetch the cursor row's ledger so we can use a composite key comparison
+      const cursorResult = await this.client.query<{ ledger: number }>(
+        `SELECT ledger FROM ${this.tableName} WHERE event_id = $1 LIMIT 1`,
+        [filter.afterEventId],
+      );
+      if (cursorResult.rows.length > 0) {
+        const cursorRow = cursorResult.rows[0];
+        if (cursorRow) {
+          const cursorLedger = cursorRow.ledger;
+          values.push(cursorLedger, filter.afterEventId);
+          conditions.push(
+            `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
+          );
+        }
+      }
+      // If cursor row not found, return empty (cursor is past the end of the store)
+    }
+
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const countResult = await this.client.query<{ count: string }>(
@@ -209,7 +260,7 @@ export class PostgresContractEventStore implements ContractEventStore {
     );
     const total = parseInt(countResult.rows[0]?.count ?? '0', 10);
 
-    values.push(limit, offset);
+    const pageValues = [...values, limit, filter.afterEventId !== undefined ? 0 : offset];
     const dataResult = await this.client.query<{
       event_id: string; ledger: number; ledger_hash: string; contract_id: string;
       topic: string; tx_hash: string; tx_index: number; operation_index: number;
@@ -220,8 +271,8 @@ export class PostgresContractEventStore implements ContractEventStore {
               tx_index, operation_index, event_index, payload, happened_at, ingested_at
        FROM ${this.tableName} ${where}
        ORDER BY ledger ASC, event_id ASC
-       LIMIT $${values.length - 1} OFFSET $${values.length}`,
-      values
+       LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
+      pageValues
     );
 
     const events: StreamEventRecord[] = dataResult.rows.map((row) => ({
@@ -239,6 +290,17 @@ export class PostgresContractEventStore implements ContractEventStore {
       ingestedAt: row.ingested_at,
     }));
 
-    return { events, total, limit, offset };
+    const lastEvent = events[events.length - 1];
+    const nextCursor = events.length === limit && total > limit && lastEvent
+      ? lastEvent.eventId
+      : undefined;
+
+    return {
+      events,
+      total,
+      limit,
+      offset: filter.afterEventId !== undefined ? 0 : offset,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+    };
   }
 }
