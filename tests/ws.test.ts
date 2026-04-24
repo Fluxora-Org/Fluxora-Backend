@@ -893,3 +893,209 @@ describe('WebSocket hub — JWT authentication', () => {
     ws.close();
   });
 });
+
+// ── replayFromCursor tests ────────────────────────────────────────────────────
+
+import { InMemoryContractEventStore } from '../src/indexer/store.js';
+
+function makeStoreRecord(eventId: string, ledger: number, topic = 'stream.created') {
+  return {
+    eventId,
+    ledger,
+    contractId: 'CCONTRACT',
+    topic,
+    txHash: `tx-${eventId}`,
+    txIndex: 0,
+    operationIndex: 0,
+    eventIndex: 0,
+    payload: { depositAmount: '100.0000000', ratePerSecond: '0.0000001' },
+    happenedAt: '2026-01-01T00:00:00.000Z',
+    ledgerHash: `hash-${ledger}`,
+  };
+}
+
+async function setupWithStore(store: InMemoryContractEventStore): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  const server = http.createServer();
+  const hub = new StreamHub(server, { eventStore: store });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address() as { port: number };
+      resolve({ server, hub, port: addr.port });
+    });
+  });
+}
+
+function collectMessages(ws: WebSocket, count: number, timeoutMs = 2000): Promise<unknown[]> {
+  return new Promise((resolve, reject) => {
+    const msgs: unknown[] = [];
+    const timer = setTimeout(() => resolve(msgs), timeoutMs);
+    ws.on('message', (d) => {
+      msgs.push(JSON.parse(d.toString()));
+      if (msgs.length >= count) {
+        clearTimeout(timer);
+        resolve(msgs);
+      }
+    });
+    ws.once('error', (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
+describe('StreamHub.replayFromCursor — event store replay', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+  let store: InMemoryContractEventStore;
+
+  beforeEach(async () => {
+    store = new InMemoryContractEventStore();
+    ({ server, hub, port } = await setupWithStore(store));
+  });
+
+  afterEach(async () => {
+    await teardown(server, hub);
+  });
+
+  it('sends stream_replay frames for all stored events and a stream_replay_complete frame', async () => {
+    await store.insertMany([
+      makeStoreRecord('e1', 100),
+      makeStoreRecord('e2', 101),
+      makeStoreRecord('e3', 102),
+    ]);
+
+    const ws = await connect(port);
+    // 3 replay frames + 1 complete frame
+    const msgsPromise = collectMessages(ws, 4);
+    send(ws, { type: 'replay' });
+    const msgs = await msgsPromise;
+
+    const replayFrames = msgs.filter((m: any) => m.type === 'stream_replay');
+    const completeFrame = msgs.find((m: any) => m.type === 'stream_replay_complete');
+
+    expect(replayFrames).toHaveLength(3);
+    expect(replayFrames.map((m: any) => m.eventId)).toEqual(['e1', 'e2', 'e3']);
+    expect(completeFrame).toBeDefined();
+
+    ws.close();
+  });
+
+  it('replays only events after the given afterEventId cursor', async () => {
+    await store.insertMany([
+      makeStoreRecord('e1', 100),
+      makeStoreRecord('e2', 101),
+      makeStoreRecord('e3', 102),
+    ]);
+
+    const ws = await connect(port);
+    // 2 replay frames (e2, e3) + 1 complete
+    const msgsPromise = collectMessages(ws, 3);
+    send(ws, { type: 'replay', afterEventId: 'e1' });
+    const msgs = await msgsPromise;
+
+    const replayFrames = msgs.filter((m: any) => m.type === 'stream_replay');
+    expect(replayFrames.map((m: any) => m.eventId)).toEqual(['e2', 'e3']);
+
+    ws.close();
+  });
+
+  it('sends only stream_replay_complete when cursor is at the end of the store', async () => {
+    await store.insertMany([makeStoreRecord('e1', 100)]);
+
+    const ws = await connect(port);
+    const msgsPromise = collectMessages(ws, 1);
+    send(ws, { type: 'replay', afterEventId: 'e1' });
+    const msgs = await msgsPromise;
+
+    expect(msgs).toHaveLength(1);
+    expect((msgs[0] as any).type).toBe('stream_replay_complete');
+
+    ws.close();
+  });
+
+  it('sends stream_replay_complete immediately when store is empty', async () => {
+    const ws = await connect(port);
+    const msgsPromise = collectMessages(ws, 1);
+    send(ws, { type: 'replay' });
+    const msgs = await msgsPromise;
+
+    expect(msgs).toHaveLength(1);
+    expect((msgs[0] as any).type).toBe('stream_replay_complete');
+
+    ws.close();
+  });
+
+  it('sends REPLAY_UNAVAILABLE error when no event store is configured', async () => {
+    // Hub without an event store
+    const plainServer = http.createServer();
+    const plainHub = new StreamHub(plainServer);
+    await new Promise<void>((resolve) => plainServer.listen(0, '127.0.0.1', resolve));
+    const plainPort = (plainServer.address() as { port: number }).port;
+
+    const ws = await connect(plainPort);
+    const msgPromise = nextMessage(ws);
+    send(ws, { type: 'replay' });
+    const msg = await msgPromise;
+
+    expect((msg as any).type).toBe('error');
+    expect((msg as any).code).toBe('REPLAY_UNAVAILABLE');
+
+    ws.close();
+    await new Promise<void>((resolve) => plainHub.close(() => plainServer.close(() => resolve())));
+  });
+
+  it('preserves decimal-string amounts in replayed payload frames', async () => {
+    const preciseAmount = '9999999999999.9999999';
+    await store.insertMany([{
+      ...makeStoreRecord('e-decimal', 100),
+      payload: { depositAmount: preciseAmount, ratePerSecond: '0.0000001' },
+    }]);
+
+    const ws = await connect(port);
+    const msgsPromise = collectMessages(ws, 2);
+    send(ws, { type: 'replay' });
+    const msgs = await msgsPromise;
+
+    const replayFrame = msgs.find((m: any) => m.type === 'stream_replay') as any;
+    expect(typeof replayFrame.payload.depositAmount).toBe('string');
+    expect(replayFrame.payload.depositAmount).toBe(preciseAmount);
+
+    ws.close();
+  });
+
+  it('increments sentMessages metrics for each replayed frame', async () => {
+    await store.insertMany([
+      makeStoreRecord('e1', 100),
+      makeStoreRecord('e2', 101),
+    ]);
+
+    const ws = await connect(port);
+    const before = hub.getMetrics().sentMessages;
+    // 2 replay + 1 complete = 3 messages received by client
+    const msgsPromise = collectMessages(ws, 3);
+    send(ws, { type: 'replay' });
+    await msgsPromise;
+
+    // sentMessages tracks replay frames (2); complete frame is not counted in metrics
+    expect(hub.getMetrics().sentMessages).toBeGreaterThanOrEqual(before + 2);
+
+    ws.close();
+  });
+
+  it('setEventStore replaces the store used by replayFromCursor', async () => {
+    // Hub starts with empty store; replace it with one that has an event
+    const newStore = new InMemoryContractEventStore();
+    await newStore.insertMany([makeStoreRecord('e-new', 200)]);
+    hub.setEventStore(newStore);
+
+    const ws = await connect(port);
+    // 1 replay + 1 complete
+    const msgsPromise = collectMessages(ws, 2);
+    send(ws, { type: 'replay' });
+    const msgs = await msgsPromise;
+
+    const replayFrames = msgs.filter((m: any) => m.type === 'stream_replay');
+    expect(replayFrames).toHaveLength(1);
+    expect((replayFrames[0] as any).eventId).toBe('e-new');
+
+    ws.close();
+  });
+});

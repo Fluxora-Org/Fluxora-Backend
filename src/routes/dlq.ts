@@ -189,7 +189,7 @@ dlqRouter.get(
       { total: filtered.length, returned: page.length, offset, limit, topicFilter }
     );
 
-    res.json({
+    res.json(successResponse({
       entries: page,
       total: filtered.length,
       limit,

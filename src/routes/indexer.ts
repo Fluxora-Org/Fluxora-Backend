@@ -143,6 +143,124 @@ export function setIndexerEventStore(store: ContractEventStore): void {
 
 /**
  * @openapi
+ * /internal/indexer/events/replay:
+ *   get:
+ *     summary: Cursor-based event replay from the event store
+ *     description: |
+ *       Returns a page of stored contract events starting strictly after the
+ *       supplied `afterEventId` cursor, ordered by (ledger ASC, eventId ASC).
+ *
+ *       Consumers use the returned `nextCursor` value as the `afterEventId`
+ *       parameter on the next request to advance the replay window without
+ *       gaps or duplicates.  Omit `afterEventId` to start from the beginning
+ *       of the store.
+ *
+ *       Amount fields in event payloads follow the decimal-string
+ *       serialization policy — they are never coerced to numbers.
+ *
+ *       Trust boundaries:
+ *       - Public internet clients may not call this route.
+ *       - Authenticated internal workers may replay events for audit and
+ *         catch-up purposes only.
+ *       - Administrators observe replay health via `/health` and request IDs.
+ *
+ *       Failure modes:
+ *       - Unknown `afterEventId` is treated as "cursor past end of store" and
+ *         returns an empty event list (not a 404).
+ *       - `limit` is silently capped at 1000.
+ *     tags:
+ *       - indexer
+ *     parameters:
+ *       - name: x-indexer-worker-token
+ *         in: header
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: afterEventId
+ *         in: query
+ *         description: |
+ *           Exclusive cursor. Only events that come strictly after this
+ *           eventId (in ledger-ascending order) are returned.
+ *           Omit to start from the beginning of the store.
+ *         schema:
+ *           type: string
+ *       - name: fromLedger
+ *         in: query
+ *         schema: { type: integer }
+ *       - name: toledger
+ *         in: query
+ *         schema: { type: integer }
+ *       - name: contractId
+ *         in: query
+ *         schema: { type: string }
+ *       - name: topic
+ *         in: query
+ *         schema: { type: string }
+ *       - name: limit
+ *         in: query
+ *         schema: { type: integer, maximum: 1000, default: 100 }
+ *     responses:
+ *       200:
+ *         description: Cursor-paginated event page
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 events:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                 total:
+ *                   type: integer
+ *                 limit:
+ *                   type: integer
+ *                 nextCursor:
+ *                   type: string
+ *                   nullable: true
+ *                   description: Pass as afterEventId on the next request. Absent when no more events.
+ *       401:
+ *         description: Missing or invalid internal worker credentials
+ */
+indexerRouter.get('/events/replay', async (req: any, res: any, next: any) => {
+  try {
+    requireIndexerToken(req);
+
+    const parseIntParam = (val: unknown): number | undefined => {
+      if (val === undefined || val === '') return undefined;
+      const n = Number(val);
+      return Number.isInteger(n) && n >= 0 ? n : undefined;
+    };
+
+    const afterEventId = typeof req.query.afterEventId === 'string' && req.query.afterEventId !== ''
+      ? req.query.afterEventId
+      : undefined;
+
+    const fromLedger = parseIntParam(req.query.fromLedger);
+    const toledger = parseIntParam(req.query.toledger);
+    const contractId = typeof req.query.contractId === 'string' ? req.query.contractId : undefined;
+    const topic = typeof req.query.topic === 'string' ? req.query.topic : undefined;
+    const limit = parseIntParam(req.query.limit);
+
+    const filter: import('../db/types.js').StreamEventReplayFilter = {
+      ...(afterEventId !== undefined ? { afterEventId } : {}),
+      ...(fromLedger !== undefined ? { fromLedger } : {}),
+      ...(toledger !== undefined ? { toledger } : {}),
+      ...(contractId !== undefined ? { contractId } : {}),
+      ...(topic !== undefined ? { topic } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    };
+
+    const result = await indexerIngestionService.getEvents(filter);
+
+    res.status(200).json(successResponse(result, req.id ?? req.correlationId));
+  } catch (caught) {
+    next(caught);
+  }
+});
+
+/**
+ * @openapi
  * /internal/indexer/events:
  *   get:
  *     summary: Replay stored contract events for debugging and audit
@@ -192,13 +310,20 @@ indexerRouter.get('/events', async (req: any, res: any, next: any) => {
       return Number.isInteger(n) && n >= 0 ? n : undefined;
     };
 
-    const filter = {
-      fromLedger: parseIntParam(req.query.fromLedger),
-      toledger: parseIntParam(req.query.toledger),
-      contractId: req.query.contractId as string | undefined,
-      topic: req.query.topic as string | undefined,
-      limit: parseIntParam(req.query.limit),
-      offset: parseIntParam(req.query.offset),
+    const fromLedger = parseIntParam(req.query.fromLedger);
+    const toledger = parseIntParam(req.query.toledger);
+    const contractId = typeof req.query.contractId === 'string' ? req.query.contractId : undefined;
+    const topic = typeof req.query.topic === 'string' ? req.query.topic : undefined;
+    const limit = parseIntParam(req.query.limit);
+    const offset = parseIntParam(req.query.offset);
+
+    const filter: import('../db/types.js').StreamEventReplayFilter = {
+      ...(fromLedger !== undefined ? { fromLedger } : {}),
+      ...(toledger !== undefined ? { toledger } : {}),
+      ...(contractId !== undefined ? { contractId } : {}),
+      ...(topic !== undefined ? { topic } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+      ...(offset !== undefined ? { offset } : {}),
     };
 
     const result = await indexerIngestionService.getEvents(filter);
