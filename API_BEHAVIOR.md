@@ -13,7 +13,7 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 ## Trust Boundaries
 
 ### Public Internet Clients
-- **Access**: Read-only (GET /health, GET /api/streams, GET /api/streams/{id})
+- **Access**: Read-only (GET /health, GET /api/streams, GET /api/streams/{id}, GET /api/admin/status/read-only)
 - **Restrictions**: No authentication required; rate limiting applies
 - **Guarantees**: Best-effort; no SLA
 
@@ -26,6 +26,12 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 - **Access**: Full access including internal endpoints
 - **Authentication**: Bearer token with admin scope
 - **Guarantees**: All partner guarantees plus internal diagnostics
+
+### Admin Feature Flags
+- **Storage**: Admin pause flags are persisted to local state storage and reloaded at startup.
+- **Read-Only Visibility**: `GET /api/admin/status/read-only` exposes only `pauseFlags` without requiring admin credentials.
+- **Protected Mutation**: `PUT /api/admin/pause` still requires admin authentication.
+- **Failure Mode**: If pause-flag persistence fails during mutation, the API returns `503 Service Unavailable` and leaves in-memory flags unchanged.
 
 ### Internal Workers
 - **Access**: Indexer endpoints (POST /internal/indexer/sync)
