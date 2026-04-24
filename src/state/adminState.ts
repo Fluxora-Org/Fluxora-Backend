@@ -1,9 +1,13 @@
 /**
  * Centralized admin state for operator-grade controls.
  *
- * Holds pause flags and reindex tracking in memory.
- * Will be replaced by Redis or PostgreSQL once persistence is wired up.
+ * Holds pause flags and reindex tracking in memory, with file-backed
+ * persistence for pause flags so admin toggles survive process restarts.
  */
+
+import * as fs from 'node:fs';
+import { dirname } from 'node:path';
+import { logger } from '../lib/logger.js';
 
 export interface PauseFlags {
   /** Block new stream creation via the public API. */
@@ -27,6 +31,13 @@ interface AdminState {
   reindex: ReindexState;
 }
 
+interface PersistedAdminStateV1 {
+  version: 1;
+  pauseFlags: PauseFlags;
+}
+
+const DEFAULT_ADMIN_STATE_FILE = '/tmp/fluxora-admin-state.json';
+
 const state: AdminState = {
   pauseFlags: {
     streamCreation: false,
@@ -41,17 +52,122 @@ const state: AdminState = {
   },
 };
 
+hydratePauseFlagsFromPersistence();
+
+export class AdminStatePersistenceError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'AdminStatePersistenceError';
+  }
+}
+
+function resolveAdminStatePath(): string {
+  const configured = process.env.ADMIN_STATE_FILE?.trim();
+  return configured && configured.length > 0 ? configured : DEFAULT_ADMIN_STATE_FILE;
+}
+
+function isPauseFlags(value: unknown): value is PauseFlags {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.streamCreation === 'boolean' && typeof candidate.ingestion === 'boolean';
+}
+
+function readPersistedPauseFlags(): PauseFlags | null {
+  try {
+    const raw = fs.readFileSync(resolveAdminStatePath(), 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+
+    if (isPauseFlags(parsed)) {
+      return { ...parsed };
+    }
+
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      (parsed as Partial<PersistedAdminStateV1>).version === 1 &&
+      isPauseFlags((parsed as Partial<PersistedAdminStateV1>).pauseFlags)
+    ) {
+      return { ...(parsed as PersistedAdminStateV1).pauseFlags };
+    }
+
+    logger.warn('Ignoring invalid persisted admin state payload', undefined, {
+      adminStatePath: resolveAdminStatePath(),
+    });
+    return null;
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException;
+    if (error.code === 'ENOENT') {
+      return null;
+    }
+
+    logger.warn('Failed to read persisted admin state', undefined, {
+      adminStatePath: resolveAdminStatePath(),
+      error: error.message,
+    });
+    return null;
+  }
+}
+
+function writePersistedPauseFlags(flags: PauseFlags): void {
+  const adminStatePath = resolveAdminStatePath();
+  const tempPath = `${adminStatePath}.${process.pid}.tmp`;
+  const payload: PersistedAdminStateV1 = {
+    version: 1,
+    pauseFlags: {
+      streamCreation: flags.streamCreation,
+      ingestion: flags.ingestion,
+    },
+  };
+
+  fs.mkdirSync(dirname(adminStatePath), { recursive: true, mode: 0o700 });
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    fs.renameSync(tempPath, adminStatePath);
+  } catch (err) {
+    // Best effort cleanup for failed atomic writes.
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // no-op
+    }
+    throw err;
+  }
+}
+
+function hydratePauseFlagsFromPersistence(): void {
+  const persisted = readPersistedPauseFlags();
+  if (!persisted) return;
+  state.pauseFlags = persisted;
+}
+
 export function getPauseFlags(): PauseFlags {
   return { ...state.pauseFlags };
 }
 
 export function setPauseFlags(flags: Partial<PauseFlags>): PauseFlags {
-  if (flags.streamCreation !== undefined) {
-    state.pauseFlags.streamCreation = flags.streamCreation;
+  const next: PauseFlags = {
+    streamCreation:
+      flags.streamCreation !== undefined ? flags.streamCreation : state.pauseFlags.streamCreation,
+    ingestion: flags.ingestion !== undefined ? flags.ingestion : state.pauseFlags.ingestion,
+  };
+
+  if (
+    next.streamCreation === state.pauseFlags.streamCreation &&
+    next.ingestion === state.pauseFlags.ingestion
+  ) {
+    return { ...state.pauseFlags };
   }
-  if (flags.ingestion !== undefined) {
-    state.pauseFlags.ingestion = flags.ingestion;
+
+  try {
+    writePersistedPauseFlags(next);
+  } catch (err) {
+    throw new AdminStatePersistenceError('Failed to persist admin pause flags', err);
   }
+
+  state.pauseFlags = next;
   return { ...state.pauseFlags };
 }
 
@@ -111,7 +227,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Reset state — only exposed for tests. */
-export function _resetForTest(): void {
+export function _resetForTest(options: { clearPersistence?: boolean } = {}): void {
   state.pauseFlags.streamCreation = false;
   state.pauseFlags.ingestion = false;
   state.reindex = {
@@ -121,4 +237,24 @@ export function _resetForTest(): void {
     error: null,
     processedItems: 0,
   };
+
+  if (options.clearPersistence !== false) {
+    try {
+      fs.rmSync(resolveAdminStatePath(), { force: true });
+    } catch {
+      // no-op
+    }
+  }
+}
+
+export function _reloadPauseFlagsFromPersistenceForTest(): void {
+  const persisted = readPersistedPauseFlags();
+  if (!persisted) {
+    state.pauseFlags = {
+      streamCreation: false,
+      ingestion: false,
+    };
+    return;
+  }
+  state.pauseFlags = persisted;
 }

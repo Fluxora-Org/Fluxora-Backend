@@ -5,6 +5,7 @@ import {
   setPauseFlags,
   getReindexState,
   triggerReindex,
+  AdminStatePersistenceError,
 } from '../state/adminState.js';
 import {
   createApiKey,
@@ -15,6 +16,15 @@ import {
 import { recordAuditEvent } from '../lib/auditLog.js';
 
 export const adminRouter = Router();
+
+/**
+ * GET /api/admin/status/read-only
+ * Read-only endpoint for pause-flag visibility without admin credentials.
+ * Exposes non-sensitive service posture only.
+ */
+adminRouter.get('/status/read-only', (_req, res) => {
+  res.json({ pauseFlags: getPauseFlags() });
+});
 
 // Every admin route requires a valid Bearer token.
 adminRouter.use(requireAdminAuth);
@@ -69,7 +79,18 @@ adminRouter.put('/pause', (req, res) => {
   }
 
   const previous = getPauseFlags();
-  const updated = setPauseFlags({ streamCreation, ingestion });
+  let updated;
+  try {
+    updated = setPauseFlags({ streamCreation, ingestion });
+  } catch (err) {
+    if (err instanceof AdminStatePersistenceError) {
+      res.status(503).json({
+        error: 'Unable to persist pause flags. Try again later.',
+      });
+      return;
+    }
+    throw err;
+  }
 
   recordAuditEvent(
     'PAUSE_FLAGS_UPDATED',
