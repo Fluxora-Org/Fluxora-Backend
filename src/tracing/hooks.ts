@@ -371,6 +371,43 @@ export class Tracer {
 }
 
 /**
+ * Wrap an async operation in a span.
+ *
+ * Creates a child span under the given correlationId, runs fn, then ends the
+ * span with 'ok' or 'error' depending on whether fn throws.
+ *
+ * Usage:
+ *   const result = await traceSpan('db.query', correlationId, { sql }, async () => {
+ *     return pool.query(sql, params);
+ *   });
+ */
+export async function traceSpan<T>(
+  name: string,
+  correlationId: string,
+  tags: Record<string, unknown>,
+  fn: (span: Span) => Promise<T>,
+  parentSpanId?: string,
+): Promise<T> {
+  const tracer = getTracer();
+  const span = tracer.startSpan({
+    traceId: correlationId,
+    parentSpanId,
+    serviceName: 'fluxora-api',
+    tags: { 'span.name': name, ...tags },
+  });
+
+  try {
+    const result = await fn(span);
+    tracer.endSpan(span, 'ok');
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    tracer.endSpan(span, 'error', message);
+    throw err;
+  }
+}
+
+/**
  * Global tracer instance.
  */
 let globalTracer: Tracer | null = null;

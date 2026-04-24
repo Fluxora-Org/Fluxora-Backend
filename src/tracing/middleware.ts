@@ -7,6 +7,7 @@
  * - Track response status and duration
  * - Handle errors and exceptions
  * - Link request logs to traces via correlation ID
+ * - Propagate correlationId through async boundaries via AsyncLocalStorage
  *
  * Trust boundary: treats all incoming request headers as untrusted
  * (already validated by correlationId middleware). Sanitizes user
@@ -18,9 +19,25 @@
  * - If OpenTelemetry is misconfigured, the app continues without it
  */
 
+import { AsyncLocalStorage } from 'async_hooks';
 import { Request, Response, NextFunction } from 'express';
 import { getTracer } from './hooks.js';
 import { Span } from './hooks.js';
+
+/**
+ * AsyncLocalStorage for propagating correlationId through async boundaries.
+ * Any code that calls `getCorrelationId()` within the same async context
+ * (including callbacks, promises, and timers) will receive the correct ID.
+ */
+export const correlationStore = new AsyncLocalStorage<string>();
+
+/**
+ * Get the correlationId for the current async context.
+ * Returns 'unknown' if called outside a request context.
+ */
+export function getCorrelationId(): string {
+  return correlationStore.getStore() ?? 'unknown';
+}
 
 /**
  * Request-scoped tracer state.
@@ -46,76 +63,73 @@ export function tracingMiddleware(config?: { enabled?: boolean; sampleRate?: num
   const enabled = config?.enabled ?? false;
 
   return (req: any, res: Response, next: NextFunction): void => {
+    const correlationId = req.correlationId || 'unknown';
+
     if (!enabled) {
-      return next();
+      // Still propagate correlationId even when tracing is disabled.
+      return correlationStore.run(correlationId, () => next());
     }
 
-    try {
-      const correlationId = req.correlationId || 'unknown';
-      const startTimeMs = Date.now();
+    correlationStore.run(correlationId, () => {
+      try {
+        const startTimeMs = Date.now();
 
-      // Determine if this request should be sampled
-      const sampleRate = config?.sampleRate ?? 1.0;
-      const shouldSample = Math.random() < sampleRate;
+        // Determine if this request should be sampled
+        const sampleRate = config?.sampleRate ?? 1.0;
+        const shouldSample = Math.random() < sampleRate;
 
-      // Create a span for this request
-      const span = tracer.startSpan({
-        traceId: correlationId,
-        parentSpanId: undefined,
-        userId: extractUserId(req),
-        serviceName: 'fluxora-api',
-        tags: {
-          'http.method': req.method,
-          'http.path': req.path,
-          'http.ip': req.ip,
-          'http.user_agent': req.headers['user-agent'],
-          'otel.enabled': shouldSample,
-        },
-      });
-
-      // Attach span to request locals for access by routes
-      if (!res.locals) {
-        res.locals = {};
-      }
-      res.locals.traceContext = {
-        span,
-        startTimeMs,
-        eventLog: [],
-      } as RequestTraceContext;
-
-      // Record response and finalize span
-      res.on('finish', () => {
-        const durationMs = Date.now() - startTimeMs;
-
-        tracer.recordEvent(span, 'http.response', {
-          statusCode: res.statusCode,
-          durationMs,
-          contentLength: res.getHeader('content-length'),
+        // Create a span for this request
+        const span = tracer.startSpan({
+          traceId: correlationId,
+          parentSpanId: undefined,
+          userId: extractUserId(req),
+          serviceName: 'fluxora-api',
+          tags: {
+            'http.method': req.method,
+            'http.path': req.path,
+            'http.ip': req.ip,
+            'http.user_agent': req.headers['user-agent'],
+            'otel.enabled': shouldSample,
+          },
         });
 
-        // Determine span status based on HTTP status code
-        const status = res.statusCode < 400 ? 'ok' : 'error';
-        const statusMessage =
-          res.statusCode < 400
-            ? `HTTP ${res.statusCode}`
-            : `HTTP ${res.statusCode}`;
-
-        tracer.endSpan(span, status, statusMessage);
-      });
-
-      // Capture any unhandled errors during request processing
-      res.on('close', () => {
-        // If the response wasn't finished (e.g., aborted), end the span
-        if (!res.writableEnded) {
-          tracer.endSpan(span, 'error', 'Request aborted or closed unexpectedly');
+        // Attach span to request locals for access by routes
+        if (!res.locals) {
+          res.locals = {};
         }
-      });
+        res.locals.traceContext = {
+          span,
+          startTimeMs,
+          eventLog: [],
+        } as RequestTraceContext;
 
-      next();
-    } catch (err) {
-      // Tracing initialization error; continue without tracing
-      next();
-    }
+        // Record response and finalize span
+        res.on('finish', () => {
+          const durationMs = Date.now() - startTimeMs;
+
+          tracer.recordEvent(span, 'http.response', {
+            statusCode: res.statusCode,
+            durationMs,
+            contentLength: res.getHeader('content-length'),
+          });
+
+          const status = res.statusCode < 400 ? 'ok' : 'error';
+          tracer.endSpan(span, status, `HTTP ${res.statusCode}`);
+        });
+
+        // Capture any unhandled errors during request processing
+        res.on('close', () => {
+          if (!res.writableEnded) {
+            tracer.endSpan(span, 'error', 'Request aborted or closed unexpectedly');
+          }
+        });
+
+        next();
+      } catch (err) {
+        // Tracing initialization error; continue without tracing
+        next();
+      }
+    });
   };
 }
 

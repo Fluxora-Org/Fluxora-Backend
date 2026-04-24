@@ -13,6 +13,8 @@
  */
 
 import { logger } from '../lib/logger.js';
+import { traceSpan } from '../tracing/hooks.js';
+import { getCorrelationId } from '../tracing/middleware.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -146,10 +148,16 @@ export class StellarRpcService {
   resetCircuit(): void { this.breaker.reset(); }
 
   async getLatestLedger(): Promise<{ sequence: number }> {
-    return this.breaker.call(() => this.callWithTimeout(
-      () => this.getClient().getLatestLedger(),
-      'getLatestLedger',
-    ));
+    const correlationId = getCorrelationId();
+    return traceSpan(
+      'stellar.rpc',
+      correlationId,
+      { 'rpc.operation': 'getLatestLedger' },
+      () => this.breaker.call(() => this.callWithTimeout(
+        () => this.getClient().getLatestLedger(),
+        'getLatestLedger',
+      )),
+    );
   }
 
   private async callWithTimeout<T>(

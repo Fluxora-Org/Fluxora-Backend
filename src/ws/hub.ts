@@ -19,6 +19,7 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage } from 'http';
 import type { Server } from 'http';
+import { getTracer } from '../tracing/hooks.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -235,12 +236,24 @@ export class StreamHub {
     if (!subscribers || subscribers.size === 0) return;
 
     const message = JSON.stringify({ type: 'stream_update', streamId, eventId, payload });
+    let sent = 0;
 
     for (const ws of subscribers) {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(message);
+        sent++;
       }
     }
+
+    // Record a span event for observability (fire-and-forget, no correlationId context here).
+    const tracer = getTracer();
+    const span = tracer.startSpan({
+      traceId: eventId,
+      serviceName: 'fluxora-ws',
+      tags: { 'ws.stream_id': streamId, 'ws.event_id': eventId, 'ws.recipients': sent },
+    });
+    tracer.recordEvent(span, 'ws.broadcast', { streamId, eventId, recipients: sent });
+    tracer.endSpan(span, 'ok');
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
