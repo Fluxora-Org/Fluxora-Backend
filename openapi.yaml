@@ -463,6 +463,97 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /internal/indexer/events/replay:
+    get:
+      summary: Cursor-based event replay from the event store
+      operationId: replayIndexerEvents
+      tags:
+        - Internal
+      description: |
+        Returns a page of stored contract events starting strictly after the
+        supplied `afterEventId` cursor, ordered by `(ledger ASC, eventId ASC)`.
+
+        Consumers advance the replay window by passing the returned `nextCursor`
+        value as `afterEventId` on the next request. Omit `afterEventId` to
+        start from the beginning of the store.
+
+        Amount fields in event payloads follow the decimal-string serialization
+        policy — they are never coerced to numbers.
+
+        ## Trust Boundaries
+        - Public internet clients may not call this route.
+        - Authenticated internal workers may replay events for audit and
+          catch-up purposes only.
+
+        ## Failure Modes
+        - An unknown `afterEventId` is treated as "cursor past end of store"
+          and returns an empty event list (not a 404).
+        - `limit` is silently capped at 1000.
+      parameters:
+        - name: x-indexer-worker-token
+          in: header
+          required: true
+          description: Internal worker authentication token
+          schema:
+            type: string
+        - name: afterEventId
+          in: query
+          required: false
+          description: |
+            Exclusive cursor. Only events that come strictly after this
+            eventId (in ledger-ascending order) are returned.
+            Omit to start from the beginning of the store.
+          schema:
+            type: string
+        - name: fromLedger
+          in: query
+          required: false
+          description: Only return events at or after this ledger (inclusive).
+          schema:
+            type: integer
+            minimum: 0
+        - name: toledger
+          in: query
+          required: false
+          description: Only return events at or before this ledger (inclusive).
+          schema:
+            type: integer
+            minimum: 0
+        - name: contractId
+          in: query
+          required: false
+          description: Filter by Soroban contract ID.
+          schema:
+            type: string
+        - name: topic
+          in: query
+          required: false
+          description: Filter by event topic (e.g. `stream.created`).
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum events per page (default 100, max 1000).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Cursor-paginated event page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventReplayResponse'
+        '401':
+          description: Missing or invalid internal worker credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   schemas:
     ResponseMeta:
@@ -822,6 +913,127 @@ components:
               example: queued
         meta:
           $ref: '#/components/schemas/ResponseMeta'
+
+    EventReplayResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      description: |
+        Response envelope for the cursor-based event replay endpoint.
+        Amount fields inside `events[].payload` are always decimal strings.
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          required:
+            - events
+            - total
+            - limit
+            - offset
+          properties:
+            events:
+              type: array
+              description: Ordered list of contract events for this page.
+              items:
+                $ref: '#/components/schemas/StreamEventRecord'
+            total:
+              type: integer
+              description: Total events matching the filter after the cursor position.
+              example: 42
+            limit:
+              type: integer
+              description: Effective page size (capped at 1000).
+              example: 100
+            offset:
+              type: integer
+              description: Always 0 when cursor-based pagination is used.
+              example: 0
+            nextCursor:
+              type: string
+              nullable: true
+              description: |
+                Pass as `afterEventId` on the next request to advance the
+                replay window. Absent when there are no more events.
+              example: evt-abc123
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    StreamEventRecord:
+      type: object
+      description: |
+        An append-only record of a contract event as ingested from the chain.
+        Amount fields in `payload` follow the decimal-string serialization policy.
+      required:
+        - eventId
+        - ledger
+        - ledgerHash
+        - contractId
+        - topic
+        - txHash
+        - txIndex
+        - operationIndex
+        - eventIndex
+        - payload
+        - happenedAt
+        - ingestedAt
+      properties:
+        eventId:
+          type: string
+          description: Stable unique identifier for this event (chain-derived).
+          example: evt-abc123
+        ledger:
+          type: integer
+          description: Ledger sequence number.
+          example: 512345
+        ledgerHash:
+          type: string
+          description: Ledger hash for reorg detection.
+          example: abc123def456
+        contractId:
+          type: string
+          description: Soroban contract ID.
+          example: CCONTRACT123
+        topic:
+          type: string
+          description: Event topic.
+          example: stream.created
+        txHash:
+          type: string
+          description: Transaction hash.
+          example: tx-abc123
+        txIndex:
+          type: integer
+          example: 0
+        operationIndex:
+          type: integer
+          example: 0
+        eventIndex:
+          type: integer
+          example: 0
+        payload:
+          type: object
+          description: |
+            Arbitrary event payload. Amount fields (depositAmount, ratePerSecond,
+            etc.) are always decimal strings — never numbers.
+          additionalProperties: true
+          example:
+            streamId: stream-abc123
+            depositAmount: "100.0000000"
+            ratePerSecond: "0.0000001"
+        happenedAt:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp when the event occurred on-chain.
+          example: '2026-03-26T12:00:00.000Z'
+        ingestedAt:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp when the event was ingested into the store.
+          example: '2026-03-26T12:00:01.000Z'
 
     ErrorResponse:
       type: object

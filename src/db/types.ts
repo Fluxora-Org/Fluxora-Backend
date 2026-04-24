@@ -247,6 +247,12 @@ export interface StreamEventReplayFilter {
   limit?: number;
   /** Offset for pagination */
   offset?: number;
+  /**
+   * Cursor-based replay: only return events that come strictly after this
+   * eventId in the canonical (ledger ASC, eventId ASC) ordering.
+   * When present, `offset` is ignored.
+   */
+  afterEventId?: string;
 }
 
 /** Result of a replay query */
@@ -255,4 +261,9 @@ export interface StreamEventReplayResult {
   total: number;
   limit: number;
   offset: number;
+  /**
+   * Opaque cursor for the next page. Pass as `afterEventId` in the next
+   * request. Absent when there are no more events.
+   */
+  nextCursor?: string;
 }
