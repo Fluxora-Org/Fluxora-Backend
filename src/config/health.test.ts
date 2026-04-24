@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import {
   HealthCheckManager,
-  HealthChecker,
+  type HealthChecker,
+  type DependencyHealth,
   createDatabaseHealthChecker,
   createRedisHealthChecker,
   createHorizonHealthChecker,
@@ -217,6 +218,40 @@ describe('Health Check Manager', () => {
 
       expect(manager.getLastReport().status).toBe('degraded');
     });
+
+    it('should mark degraded when checker returns degraded: true', async () => {
+      const checker: HealthChecker = {
+        name: 'slow',
+        async check() { return { latency: 1500, degraded: true }; },
+      };
+      manager.registerChecker(checker);
+      const report = await manager.checkAll();
+      expect(report.status).toBe('degraded');
+      expect(report.dependencies[0]!.status).toBe('degraded');
+    });
+
+    it('unhealthy takes precedence over degraded in aggregation', async () => {
+      manager.registerChecker({ name: 'slow', async check() { return { latency: 1, degraded: true }; } });
+      manager.registerChecker({ name: 'broken', async check() { return { latency: 1, error: 'down' }; } });
+      const report = await manager.checkAll();
+      expect(report.status).toBe('unhealthy');
+    });
+
+    it('degraded takes precedence over healthy in aggregation', async () => {
+      manager.registerChecker({ name: 'ok', async check() { return { latency: 1 }; } });
+      manager.registerChecker({ name: 'slow', async check() { return { latency: 1, degraded: true }; } });
+      const report = await manager.checkAll();
+      expect(report.status).toBe('degraded');
+    });
+
+    it('does not include error field when checker returns degraded without error', async () => {
+      const checker: HealthChecker = {
+        name: 'slow',
+        async check() { return { latency: 1, degraded: true }; },
+      };
+      manager.registerChecker(checker);
+      const report = await manager.checkAll();
+      expect(report.dependencies[0]!.error).toBeUndefined();
+    });
   });
 });
-

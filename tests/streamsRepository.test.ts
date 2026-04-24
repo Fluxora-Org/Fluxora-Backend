@@ -1,164 +1,330 @@
 /**
- * Tests for stream repository
+ * Unit tests for streamRepository (PostgreSQL-backed).
  *
- * Tests idempotent event ingestion, filtering, and pagination
+ * All pg pool interactions are mocked — no real database required.
+ * Tests cover: upsert idempotency, getById, getByEvent, findWithCursor,
+ * updateStream (status transitions), countByStatus, and error propagation.
  */
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
-import Database from "better-sqlite3";
-
-// Mock the database module
-jest.mock("../src/db/connection.js", () => ({
-  getDatabase: jest.fn(),
+// ── Mock the pool module before importing the repository ─────────────────────
+const mockQuery = vi.fn();
+vi.mock('../src/db/pool.js', () => ({
+  getPool:           vi.fn(() => ({})),
+  query:             (...args: unknown[]) => mockQuery(...args),
+  PoolExhaustedError: class PoolExhaustedError extends Error {
+    constructor() { super('pool exhausted'); this.name = 'PoolExhaustedError'; }
+  },
+  DuplicateEntryError: class DuplicateEntryError extends Error {
+    constructor(d?: string) { super(d ?? 'duplicate'); this.name = 'DuplicateEntryError'; }
+  },
 }));
 
-import { streamRepository } from "../src/db/repositories/streamRepository.js";
-import { getDatabase } from "../src/db/connection.js";
+import { streamRepository } from '../src/db/repositories/streamRepository.js';
+import type { CreateStreamInput, UpdateStreamInput } from '../src/db/types.js';
 
-const mockDb = {
-  prepare: jest.fn(),
-  exec: jest.fn(),
-} as unknown as Database.Database;
+// ── Fixtures ──────────────────────────────────────────────────────────────────
 
-beforeEach(() => {
-  jest.clearAllMocks();
-  (getDatabase as jest.Mock).mockReturnValue(mockDb);
-});
+const TX_HASH = 'a'.repeat(64);
 
-describe("streamRepository", () => {
-  describe("upsertStream", () => {
-    const validInput = {
-      id: "stream-abc123def456-0",
-      sender_address:
-        "GCSX2QMKB3C7MFD3C4J5ZM3PJG2LX4RHH4R4H2K7RXA4X7ZM5J5Z5Z5Z5Z5",
-      recipient_address:
-        "GDRXE2PFUD66M3H4R44BFM6F4Q4Z3X4Y5Z6M3H4R44BFM6F4Q4Z3X4Y5Z",
-      amount: "1000.0000000",
-      streamed_amount: "0",
-      remaining_amount: "1000.0000000",
-      rate_per_second: "0.0000116",
-      start_time: 1709123456,
-      end_time: 1711719456,
-      contract_id: "C1234567890abcdef",
-      transaction_hash:
-        "abc123def456789012345678901234567890123456789012345678901234",
-      event_index: 0,
-    };
+function makeRow(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    id:                'stream-' + TX_HASH + '-0',
+    sender_address:    'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+    recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+    amount:            '1000',
+    streamed_amount:   '0',
+    remaining_amount:  '1000',
+    rate_per_second:   '10',
+    start_time:        '1700000000',
+    end_time:          '0',
+    status:            'active',
+    contract_id:       'api-created',
+    transaction_hash:  TX_HASH,
+    event_index:       0,
+    created_at:        new Date('2024-01-01T00:00:00Z'),
+    updated_at:        new Date('2024-01-01T00:00:00Z'),
+    ...overrides,
+  };
+}
 
-    it("should create a new stream when it does not exist", () => {
-      // Mock: no existing stream
-      mockDb.prepare
-        .mockReturnValueOnce({ get: jest.fn().mockReturnValue(undefined) }) // Check for existing by tx+event
-        .mockReturnValueOnce({ get: jest.fn().mockReturnValue(undefined) }) // Check for existing by ID
-        .mockReturnValueOnce({ run: jest.fn() }) // Insert
-        .mockReturnValueOnce({ get: jest.fn().mockReturnValue(validInput) }); // Get created
+function makeInput(overrides: Partial<CreateStreamInput> = {}): CreateStreamInput {
+  return {
+    id:                'stream-' + TX_HASH + '-0',
+    sender_address:    'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+    recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+    amount:            '1000',
+    streamed_amount:   '0',
+    remaining_amount:  '1000',
+    rate_per_second:   '10',
+    start_time:        1700000000,
+    end_time:          0,
+    contract_id:       'api-created',
+    transaction_hash:  TX_HASH,
+    event_index:       0,
+    ...overrides,
+  };
+}
 
-      const result = streamRepository.upsertStream(validInput);
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function queryReturnsRows(rows: Record<string, unknown>[]) {
+  mockQuery.mockResolvedValueOnce({ rows });
+}
+
+function queryReturnsEmpty() {
+  mockQuery.mockResolvedValueOnce({ rows: [] });
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe('streamRepository', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // ── upsertStream ────────────────────────────────────────────────────────────
+
+  describe('upsertStream', () => {
+    it('creates a new stream and returns created=true', async () => {
+      const row = makeRow();
+      queryReturnsRows([row]); // INSERT … RETURNING *
+
+      const result = await streamRepository.upsertStream(makeInput());
 
       expect(result.created).toBe(true);
-      expect(result.updated).toBe(false);
+      expect(result.stream.id).toBe(row['id']);
+      expect(result.stream.amount).toBe('1000');
+      expect(result.stream.start_time).toBe(1700000000); // bigint coerced to number
     });
 
-    it("should return existing stream when idempotent (same tx+event)", () => {
-      mockDb.prepare.mockReturnValueOnce({
-        get: jest.fn().mockReturnValue(validInput),
-      }); // Existing found
+    it('returns created=false when event already exists (idempotent)', async () => {
+      queryReturnsEmpty();                // INSERT returns nothing (conflict)
+      queryReturnsRows([makeRow()]);      // getById fallback
 
-      const result = streamRepository.upsertStream(validInput);
+      const result = await streamRepository.upsertStream(makeInput());
 
       expect(result.created).toBe(false);
-      expect(result.updated).toBe(false);
-      expect(result.stream).toEqual(validInput);
+      expect(result.stream.id).toBeTruthy();
     });
 
-    it("should validate input - reject invalid ID format", () => {
-      const invalidInput = {
-        ...validInput,
-        id: "invalid-id",
-      };
+    it('falls back to getByEvent when getById returns nothing', async () => {
+      queryReturnsEmpty();           // INSERT conflict
+      queryReturnsEmpty();           // getById → not found
+      queryReturnsRows([makeRow()]); // getByEvent → found
 
-      expect(() => streamRepository.upsertStream(invalidInput)).toThrow(
-        "Invalid stream input",
+      const result = await streamRepository.upsertStream(makeInput());
+      expect(result.created).toBe(false);
+    });
+
+    it('throws when both getById and getByEvent return nothing after conflict', async () => {
+      queryReturnsEmpty(); // INSERT conflict
+      queryReturnsEmpty(); // getById
+      queryReturnsEmpty(); // getByEvent
+
+      await expect(streamRepository.upsertStream(makeInput())).rejects.toThrow(
+        'Idempotency conflict',
       );
     });
 
-    it("should validate input - reject invalid sender address", () => {
-      const invalidInput = {
-        ...validInput,
-        sender_address: "INVALID",
-      };
+    it('preserves decimal-string amounts exactly', async () => {
+      const row = makeRow({ amount: '0.0000001', rate_per_second: '0.0000116' });
+      queryReturnsRows([row]);
 
-      expect(() => streamRepository.upsertStream(invalidInput)).toThrow(
-        "Invalid stream input",
+      const result = await streamRepository.upsertStream(
+        makeInput({ amount: '0.0000001', rate_per_second: '0.0000116' }),
       );
-    });
 
-    it("should validate input - reject invalid amount format", () => {
-      const invalidInput = {
-        ...validInput,
-        amount: "not-a-number",
-      };
-
-      expect(() => streamRepository.upsertStream(invalidInput)).toThrow(
-        "Invalid stream input",
-      );
+      expect(result.stream.amount).toBe('0.0000001');
+      expect(result.stream.rate_per_second).toBe('0.0000116');
     });
   });
 
-  describe("find", () => {
-    it("should return paginated results with filter", () => {
-      const mockStreams = [
-        { id: "stream-1", status: "active" },
-        { id: "stream-2", status: "active" },
-      ];
+  // ── getById ─────────────────────────────────────────────────────────────────
 
-      // Mock count query
-      mockDb.prepare
-        .mockReturnValueOnce({ get: jest.fn().mockReturnValue({ total: 2 }) }) // Count
-        .mockReturnValueOnce({ all: jest.fn().mockReturnValue(mockStreams) }); // Select
-
-      const result = streamRepository.find(
-        { status: "active" },
-        { limit: 20, offset: 0 },
-      );
-
-      expect(result.streams).toEqual(mockStreams);
-      expect(result.total).toBe(2);
-      expect(result.hasMore).toBe(false);
+  describe('getById', () => {
+    it('returns a stream record when found', async () => {
+      queryReturnsRows([makeRow()]);
+      const record = await streamRepository.getById('stream-' + TX_HASH + '-0');
+      expect(record).toBeDefined();
+      expect(record!.status).toBe('active');
     });
 
-    it("should handle empty results", () => {
-      mockDb.prepare
-        .mockReturnValueOnce({ get: jest.fn().mockReturnValue({ total: 0 }) })
-        .mockReturnValueOnce({ all: jest.fn().mockReturnValue([]) });
+    it('returns undefined when not found', async () => {
+      queryReturnsEmpty();
+      const record = await streamRepository.getById('nonexistent');
+      expect(record).toBeUndefined();
+    });
 
-      const result = streamRepository.find({}, { limit: 20, offset: 0 });
-
-      expect(result.streams).toEqual([]);
-      expect(result.total).toBe(0);
-      expect(result.hasMore).toBe(false);
+    it('coerces bigint start_time / end_time to number', async () => {
+      queryReturnsRows([makeRow({ start_time: '1700000000', end_time: '1800000000' })]);
+      const record = await streamRepository.getById('x');
+      expect(typeof record!.start_time).toBe('number');
+      expect(typeof record!.end_time).toBe('number');
+      expect(record!.start_time).toBe(1700000000);
+      expect(record!.end_time).toBe(1800000000);
     });
   });
 
-  describe("getById", () => {
-    it("should return stream when found", () => {
-      const mockStream = { id: "stream-1", status: "active" };
-      mockDb.prepare.mockReturnValueOnce({
-        get: jest.fn().mockReturnValue(mockStream),
-      });
+  // ── getByEvent ──────────────────────────────────────────────────────────────
 
-      const result = streamRepository.getById("stream-1");
-
-      expect(result).toEqual(mockStream);
+  describe('getByEvent', () => {
+    it('returns a stream when found by tx hash + event index', async () => {
+      queryReturnsRows([makeRow()]);
+      const record = await streamRepository.getByEvent(TX_HASH, 0);
+      expect(record).toBeDefined();
     });
 
-    it("should return undefined when not found", () => {
-      mockDb.prepare.mockReturnValueOnce({
-        get: jest.fn().mockReturnValue(undefined),
+    it('returns undefined when not found', async () => {
+      queryReturnsEmpty();
+      const record = await streamRepository.getByEvent('deadbeef', 99);
+      expect(record).toBeUndefined();
+    });
+  });
+
+  // ── updateStream ────────────────────────────────────────────────────────────
+
+  describe('updateStream', () => {
+    it('updates status from active to cancelled', async () => {
+      queryReturnsRows([makeRow()]);                              // getById
+      queryReturnsRows([makeRow({ status: 'cancelled' })]);      // UPDATE RETURNING
+
+      const updated = await streamRepository.updateStream('stream-x', { status: 'cancelled' });
+      expect(updated.status).toBe('cancelled');
+    });
+
+    it('updates status from active to paused', async () => {
+      queryReturnsRows([makeRow()]);
+      queryReturnsRows([makeRow({ status: 'paused' })]);
+
+      const updated = await streamRepository.updateStream('stream-x', { status: 'paused' });
+      expect(updated.status).toBe('paused');
+    });
+
+    it('rejects invalid transition: completed → active', async () => {
+      queryReturnsRows([makeRow({ status: 'completed' })]);
+
+      await expect(
+        streamRepository.updateStream('stream-x', { status: 'active' }),
+      ).rejects.toThrow('Invalid status transition');
+    });
+
+    it('rejects invalid transition: cancelled → paused', async () => {
+      queryReturnsRows([makeRow({ status: 'cancelled' })]);
+
+      await expect(
+        streamRepository.updateStream('stream-x', { status: 'paused' }),
+      ).rejects.toThrow('Invalid status transition');
+    });
+
+    it('throws when stream not found', async () => {
+      queryReturnsEmpty(); // getById
+
+      await expect(
+        streamRepository.updateStream('nonexistent', { status: 'cancelled' }),
+      ).rejects.toThrow('Stream not found');
+    });
+
+    it('updates streamed_amount and remaining_amount', async () => {
+      queryReturnsRows([makeRow()]);
+      queryReturnsRows([makeRow({ streamed_amount: '500', remaining_amount: '500' })]);
+
+      const updated = await streamRepository.updateStream('stream-x', {
+        streamed_amount:  '500',
+        remaining_amount: '500',
       });
+      expect(updated.streamed_amount).toBe('500');
+      expect(updated.remaining_amount).toBe('500');
+    });
+  });
 
-      const result = streamRepository.getById("nonexistent");
+  // ── findWithCursor ──────────────────────────────────────────────────────────
 
-      expect(result).toBeUndefined();
+  describe('findWithCursor', () => {
+    it('returns empty list when no streams exist', async () => {
+      queryReturnsRows([]); // data query (no total)
+
+      const result = await streamRepository.findWithCursor({}, 50);
+      expect(result.streams).toHaveLength(0);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('returns streams and detects hasMore', async () => {
+      // limit=2, fetch limit+1=3 rows → hasMore=true
+      const rows = [makeRow({ id: 'a' }), makeRow({ id: 'b' }), makeRow({ id: 'c' })];
+      queryReturnsRows(rows);
+
+      const result = await streamRepository.findWithCursor({}, 2);
+      expect(result.streams).toHaveLength(2);
+      expect(result.hasMore).toBe(true);
+    });
+
+    it('includes total when includeTotal=true', async () => {
+      queryReturnsRows([makeRow()]); // data
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '42' }] }); // count
+
+      const result = await streamRepository.findWithCursor({}, 50, undefined, true);
+      expect(result.total).toBe(42);
+    });
+
+    it('does not include total when includeTotal=false', async () => {
+      queryReturnsRows([makeRow()]);
+
+      const result = await streamRepository.findWithCursor({}, 50, undefined, false);
+      expect(result.total).toBeUndefined();
+    });
+
+    it('applies afterId cursor correctly', async () => {
+      queryReturnsRows([makeRow({ id: 'stream-b' })]);
+
+      const result = await streamRepository.findWithCursor({}, 50, 'stream-a');
+      expect(result.streams[0]!.id).toBe('stream-b');
+    });
+  });
+
+  // ── countByStatus ───────────────────────────────────────────────────────────
+
+  describe('countByStatus', () => {
+    it('returns zero counts when table is empty', async () => {
+      queryReturnsRows([]);
+
+      const counts = await streamRepository.countByStatus();
+      expect(counts.active).toBe(0);
+      expect(counts.paused).toBe(0);
+      expect(counts.completed).toBe(0);
+      expect(counts.cancelled).toBe(0);
+    });
+
+    it('aggregates counts by status', async () => {
+      queryReturnsRows([
+        { status: 'active',    count: '5' },
+        { status: 'paused',    count: '2' },
+        { status: 'cancelled', count: '1' },
+      ]);
+
+      const counts = await streamRepository.countByStatus();
+      expect(counts.active).toBe(5);
+      expect(counts.paused).toBe(2);
+      expect(counts.cancelled).toBe(1);
+      expect(counts.completed).toBe(0);
+    });
+  });
+
+  // ── error propagation ───────────────────────────────────────────────────────
+
+  describe('error propagation', () => {
+    it('propagates unexpected DB errors from getById', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('connection refused'));
+      await expect(streamRepository.getById('x')).rejects.toThrow('connection refused');
+    });
+
+    it('propagates unexpected DB errors from upsertStream', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('syntax error'));
+      await expect(streamRepository.upsertStream(makeInput())).rejects.toThrow('syntax error');
     });
   });
 });

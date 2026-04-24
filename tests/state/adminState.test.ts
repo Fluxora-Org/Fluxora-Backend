@@ -1,16 +1,40 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import * as fs from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   getPauseFlags,
   setPauseFlags,
   isStreamCreationPaused,
   getReindexState,
   triggerReindex,
+  AdminStatePersistenceError,
   _resetForTest,
+  _reloadPauseFlagsFromPersistenceForTest,
 } from '../../src/state/adminState.js';
 
 describe('adminState', () => {
+  let originalAdminStateFile: string | undefined;
+  let adminStateFile: string;
+
   beforeEach(() => {
+    originalAdminStateFile = process.env.ADMIN_STATE_FILE;
+    adminStateFile = join(
+      tmpdir(),
+      `fluxora-admin-state-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+    );
+    process.env.ADMIN_STATE_FILE = adminStateFile;
     _resetForTest();
+  });
+
+  afterEach(() => {
+    _resetForTest();
+
+    if (originalAdminStateFile !== undefined) {
+      process.env.ADMIN_STATE_FILE = originalAdminStateFile;
+    } else {
+      delete process.env.ADMIN_STATE_FILE;
+    }
   });
 
   describe('pause flags', () => {
@@ -48,6 +72,34 @@ describe('adminState', () => {
       expect(isStreamCreationPaused()).toBe(false);
       setPauseFlags({ streamCreation: true });
       expect(isStreamCreationPaused()).toBe(true);
+    });
+
+    it('persists pause flags and reloads them from storage', () => {
+      setPauseFlags({ streamCreation: true, ingestion: true });
+
+      _resetForTest({ clearPersistence: false });
+      expect(getPauseFlags()).toEqual({ streamCreation: false, ingestion: false });
+
+      _reloadPauseFlagsFromPersistenceForTest();
+      expect(getPauseFlags()).toEqual({ streamCreation: true, ingestion: true });
+    });
+
+    it('ignores invalid persisted payload and falls back to defaults', () => {
+      fs.writeFileSync(adminStateFile, '{"version":1,"pauseFlags":{"streamCreation":"yes"}}\n', 'utf8');
+
+      _reloadPauseFlagsFromPersistenceForTest();
+      expect(getPauseFlags()).toEqual({ streamCreation: false, ingestion: false });
+    });
+
+    it('throws and keeps prior state when persistence write fails', () => {
+      const writeSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
+        throw new Error('disk full');
+      });
+
+      expect(() => setPauseFlags({ streamCreation: true })).toThrow(AdminStatePersistenceError);
+      expect(getPauseFlags()).toEqual({ streamCreation: false, ingestion: false });
+
+      writeSpy.mockRestore();
     });
   });
 

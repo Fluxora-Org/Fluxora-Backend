@@ -23,6 +23,14 @@ export class ApiError extends Error {
   }
 }
 
+export function serviceUnavailable(message: string, details?: Record<string, unknown>): ApiError {
+  return new ApiError(503, 'service_unavailable', message, details);
+}
+
+export function unauthorizedError(message: string, details?: Record<string, unknown>): ApiError {
+  return new ApiError(401, 'unauthorized', message, details);
+}
+
 export function requestIdMiddleware(req: Request, res: Response, next: NextFunction): void {
   const requestId = req.header('x-request-id') ?? randomUUID();
   res.locals['requestId'] = requestId;

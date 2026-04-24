@@ -14,36 +14,52 @@ import { z } from 'zod';
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
 
+/** Regex for valid Stellar public keys: G followed by 55 base32 characters */
+export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
+
 /** Reusable decimal-string field schema */
 function decimalStringField(fieldName: string) {
   return z
-    .string({
-      required_error: `${fieldName} is required`,
-      invalid_type_error: `${fieldName} must be a decimal string, not a number`,
-    })
+    .string({ error: `${fieldName} must be a decimal string, not a number` })
     .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
+}
+
+/** Reusable Stellar public key field schema */
+function stellarPublicKeyField(fieldName: string) {
+  return z
+    .string({ error: `${fieldName} must be a string` })
+    .min(1, `${fieldName} must be a non-empty string`)
+    .regex(STELLAR_PUBLIC_KEY_REGEX, `${fieldName} must be a valid Stellar public key (G...)`);
 }
 
 /**
  * Schema for POST /api/streams body.
  *
  * Service-level invariants enforced here:
- * - sender / recipient: non-empty strings
+ * - sender / recipient: valid Stellar public keys (G followed by 55 base32 chars)
  * - depositAmount / ratePerSecond: decimal strings only (not numbers)
  * - startTime / endTime: non-negative integers when provided
  */
 export const CreateStreamSchema = z.object({
-  sender: z.string().min(1, 'sender must be a non-empty string'),
-  recipient: z.string().min(1, 'recipient must be a non-empty string'),
-  depositAmount: decimalStringField('depositAmount').optional(),
-  ratePerSecond: decimalStringField('ratePerSecond').optional(),
+  sender: stellarPublicKeyField('sender'),
+  recipient: stellarPublicKeyField('recipient'),
+  depositAmount: decimalStringField('depositAmount')
+    .refine((val) => parseFloat(val) > 0, {
+      message: 'depositAmount must be a positive numeric string',
+    })
+    .optional(),
+  ratePerSecond: decimalStringField('ratePerSecond')
+    .refine((val) => parseFloat(val) > 0, {
+      message: 'ratePerSecond must be a positive numeric string',
+    })
+    .optional(),
   startTime: z
-    .number({ invalid_type_error: 'startTime must be a number' })
+    .number({ error: 'startTime must be a number' })
     .int('startTime must be an integer')
-    .nonnegative('startTime must be a non-negative integer')
+    .nonnegative('startTime must be a non-negative number')
     .optional(),
   endTime: z
-    .number({ invalid_type_error: 'endTime must be a number' })
+    .number({ error: 'endTime must be a number' })
     .int('endTime must be an integer')
     .nonnegative('endTime must be a non-negative integer')
     .optional(),
@@ -61,7 +77,7 @@ export const ListStreamsQuerySchema = z.object({
     .optional(),
   cursor: z.string().optional(),
   include_total: z.enum(['true', 'false'], {
-    errorMap: () => ({ message: 'include_total must be true or false' }),
+    error: 'include_total must be true or false',
   }).optional(),
 });
 

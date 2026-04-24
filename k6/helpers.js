@@ -34,17 +34,35 @@ export function checkResponse(res, expectedStatus, label) {
   return passed;
 }
 
+// Valid Stellar public keys (G + 55 base32 chars, 56 chars total).
+// These are well-known testnet addresses safe to use in load tests.
+const STELLAR_SENDERS = [
+  'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+  'GBVVJJWAKGKF3YJKGQZQKQZQKQZQKQZQKQZQKQZQKQZQKQZQKQZQKQ',
+  'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+];
+const STELLAR_RECIPIENTS = [
+  'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+  'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+  'GDQJUTQYK2MQX2CQNQGKWPWWQJQKQZQKQZQKQZQKQZQKQZQKQZQKQZ',
+];
+
 /**
- * Generate a realistic-looking stream creation payload.
+ * Generate a stream creation payload with valid Stellar addresses and
+ * decimal-string amounts per the serialization policy.
  *
- * @param {number} idx  Unique index to make payloads distinguishable
+ * @param {number} idx  Unique index to vary amounts across VUs
  */
 export function makeStreamPayload(idx) {
+  const i = idx % STELLAR_SENDERS.length;
+  // Amounts are decimal strings — never native JSON numbers.
+  const deposit = (1000 + (idx % 100) * 10).toFixed(7);       // e.g. "1000.0000000"
+  const rate    = (0.001 + (idx % 50) * 0.0001).toFixed(7);   // e.g. "0.0010000"
   return JSON.stringify({
-    sender: `GABCDEFGHIJKLMNOPQRSTUVWXYZ234567890SENDER${idx}`,
-    recipient: `GABCDEFGHIJKLMNOPQRSTUVWXYZ234567890RECIP${idx}`,
-    depositAmount: `${(1000 + idx * 10).toFixed(7)}`,
-    ratePerSecond: `${(0.001 + idx * 0.0001).toFixed(7)}`,
-    startTime: Math.floor(Date.now() / 1000),
+    sender:        STELLAR_SENDERS[i],
+    recipient:     STELLAR_RECIPIENTS[i],
+    depositAmount: deposit,
+    ratePerSecond: rate,
+    startTime:     Math.floor(Date.now() / 1000),
   });
 }

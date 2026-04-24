@@ -5,9 +5,26 @@ import {
   setPauseFlags,
   getReindexState,
   triggerReindex,
+  AdminStatePersistenceError,
 } from '../state/adminState.js';
+import {
+  createApiKey,
+  rotateApiKey,
+  revokeApiKey,
+  listApiKeys,
+} from '../lib/apiKey.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
 
 export const adminRouter = Router();
+
+/**
+ * GET /api/admin/status/read-only
+ * Read-only endpoint for pause-flag visibility without admin credentials.
+ * Exposes non-sensitive service posture only.
+ */
+adminRouter.get('/status/read-only', (_req, res) => {
+  res.json({ pauseFlags: getPauseFlags() });
+});
 
 // Every admin route requires a valid Bearer token.
 adminRouter.use(requireAdminAuth);
@@ -61,7 +78,33 @@ adminRouter.put('/pause', (req, res) => {
     return;
   }
 
-  const updated = setPauseFlags({ streamCreation, ingestion });
+  const previous = getPauseFlags();
+  let updated;
+  try {
+    updated = setPauseFlags({ streamCreation, ingestion });
+  } catch (err) {
+    if (err instanceof AdminStatePersistenceError) {
+      res.status(503).json({
+        error: 'Unable to persist pause flags. Try again later.',
+      });
+      return;
+    }
+    throw err;
+  }
+
+  recordAuditEvent(
+    'PAUSE_FLAGS_UPDATED',
+    'pauseFlags',
+    'system',
+    (req as any).correlationId,
+    {
+      previous,
+      updated,
+      ...(streamCreation !== undefined ? { streamCreation } : {}),
+      ...(ingestion !== undefined ? { ingestion } : {}),
+    },
+  );
+
   res.json({ message: 'Pause flags updated.', pauseFlags: updated });
 });
 
@@ -88,8 +131,78 @@ adminRouter.post('/reindex', async (_req, res) => {
   }
 
   const state = await triggerReindex();
+
+  recordAuditEvent(
+    'REINDEX_TRIGGERED',
+    'reindex',
+    'system',
+    (_req as any).correlationId,
+    { status: state.status, startedAt: state.startedAt },
+  );
+
   res.status(202).json({
     message: 'Reindex started.',
     reindex: state,
   });
+});
+
+// ─── API Key Management ───────────────────────────────────────────────────────
+
+/**
+ * GET /api/admin/api-keys
+ * Lists all API key records (hashes only — raw keys are never returned).
+ */
+adminRouter.get('/api-keys', (_req, res) => {
+  res.json({ apiKeys: listApiKeys() });
+});
+
+/**
+ * POST /api/admin/api-keys
+ * Creates a new API key. The raw key is returned exactly once.
+ *
+ * Body: { "name": "my-service" }
+ */
+adminRouter.post('/api-keys', (req, res) => {
+  const { name } = req.body ?? {};
+  if (!name || typeof name !== 'string') {
+    res.status(400).json({ error: 'name (string) is required.' });
+    return;
+  }
+  try {
+    const created = createApiKey(name);
+    res.status(201).json(created);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+/**
+ * POST /api/admin/api-keys/:id/rotate
+ * Issues a new raw key for an existing key record. The old key is immediately
+ * invalidated. The new raw key is returned exactly once.
+ */
+adminRouter.post('/api-keys/:id/rotate', (req, res) => {
+  try {
+    const rotated = rotateApiKey(req.params.id);
+    res.json(rotated);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const status = msg.includes('not found') ? 404 : 400;
+    res.status(status).json({ error: msg });
+  }
+});
+
+/**
+ * DELETE /api/admin/api-keys/:id
+ * Revokes an API key. Revoked keys cannot authenticate requests.
+ */
+adminRouter.delete('/api-keys/:id', (req, res) => {
+  try {
+    revokeApiKey(req.params.id);
+    res.status(204).send();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const status = msg.includes('not found') ? 404 : 400;
+    res.status(status).json({ error: msg });
+  }
 });

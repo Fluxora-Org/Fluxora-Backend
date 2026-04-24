@@ -5,79 +5,100 @@
  *   - Track connected clients per stream subscription.
  *   - Rate-limit incoming messages per connection.
  *   - Reject oversized inbound payloads.
- *   - Deduplicate outbound events by (streamId, eventId) to prevent
- *     duplicate delivery on reconnect or RPC retry.
+ *   - Deduplicate outbound events by (streamId, eventId).
  *   - Broadcast stream update events to all subscribed clients.
+ *   - Apply backpressure to slow/stalled clients.
+ *   - Optionally enforce JWT authentication on upgrade (WS_AUTH_REQUIRED).
  *
- * Protocol (JSON over WebSocket):
- *   Client → Server:  { type: "subscribe",   streamId: string }
- *   Client → Server:  { type: "unsubscribe", streamId: string }
- *   Server → Client:  { type: "stream_update", streamId: string, eventId: string, payload: unknown }
- *   Server → Client:  { type: "error", code: string, message: string }
+ * ## WebSocket JWT Auth (optional, backward-compatible)
+ *
+ * Controlled by two environment variables:
+ *   WS_AUTH_REQUIRED=true   — reject unauthenticated upgrade requests (401)
+ *   JWT_SECRET=<secret>     — secret used to verify HS256 tokens
+ *
+ * When WS_AUTH_REQUIRED is absent or false, all connections are accepted
+ * regardless of whether a token is present. This allows a zero-downtime
+ * rollout: deploy with auth disabled, issue tokens to clients, then flip
+ * the flag.
+ *
+ * Token delivery (first match wins):
+ *   1. Authorization: Bearer <token>  header on the upgrade request
+ *   2. ?token=<jwt>                   query-string parameter
+ *
+ * On auth failure the server sends HTTP 401 before the WebSocket handshake
+ * completes, so the client never enters the OPEN state.
  */
 
+import { randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage } from 'http';
 import type { Server } from 'http';
-import { getTracer } from '../tracing/hooks.js';
+import type { DedupCache as IDedupCache } from '../redis/dedup.js';
+import { InMemoryDedupCache } from '../redis/dedup.js';
+import { verifyWsToken } from '../middleware/tokenAuth.js';
+import type { ContractEventStore } from '../indexer/store.js';
+import type { StreamEventReplayFilter } from '../db/types.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/** Maximum inbound message size in bytes. Payloads larger than this are rejected. */
 export const MAX_MESSAGE_BYTES = 4_096;
-
-/** Maximum inbound messages per client per rate-limit window. */
 export const RATE_LIMIT_MAX = 30;
-
-/** Rate-limit window duration in milliseconds. */
 export const RATE_LIMIT_WINDOW_MS = 10_000;
 
-/** Maximum number of (streamId, eventId) pairs kept in the dedup cache. */
-const DEDUP_CACHE_MAX = 10_000;
+export const BACKPRESSURE_DROP_BYTES = 1 * 1024 * 1024;
+export const BACKPRESSURE_TERMINATE_BYTES = 4 * 1024 * 1024;
+export const FANOUT_YIELD_BATCH = 256;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface StreamUpdateEvent {
   streamId: string;
-  /** Unique event identifier used for deduplication. */
   eventId: string;
   payload: unknown;
+  ledger?: number;
+}
+
+export interface BackpressureMetrics {
+  droppedMessages: number;
+  terminatedConnections: number;
+  sentMessages: number;
+}
+
+interface ConnectionMetrics {
+  messagesReceived: number;
+  messagesSent: number;
+  bytesReceived: number;
+  bytesSent: number;
 }
 
 interface ClientState {
+  id: string;
+  connectedAt: number;
+  ip: string;
+  metrics: ConnectionMetrics;
   subscriptions: Set<string>;
-  /** Timestamps of recent inbound messages for rate limiting. */
   messageTimestamps: number[];
 }
 
-// ── Dedup cache ───────────────────────────────────────────────────────────────
+// ── Hub options ───────────────────────────────────────────────────────────────
 
-/**
- * LRU-style dedup cache: tracks (streamId:eventId) pairs that have already
- * been broadcast. Evicts oldest entries when the cache exceeds DEDUP_CACHE_MAX.
- */
-class DedupCache {
-  private readonly seen = new Map<string, true>();
-
-  has(streamId: string, eventId: string): boolean {
-    return this.seen.has(`${streamId}:${eventId}`);
-  }
-
-  add(streamId: string, eventId: string): void {
-    const key = `${streamId}:${eventId}`;
-    if (this.seen.has(key)) return;
-    if (this.seen.size >= DEDUP_CACHE_MAX) {
-      // Evict the oldest entry (Map preserves insertion order).
-      const oldest = this.seen.keys().next().value;
-      if (oldest !== undefined) this.seen.delete(oldest);
-    }
-    this.seen.set(key, true);
-  }
-
-  /** Clear all entries (for testing). */
-  clear(): void {
-    this.seen.clear();
-  }
+export interface StreamHubOptions {
+  dedupCache?: IDedupCache;
+  /**
+   * When true, upgrade requests without a valid JWT are rejected with 401.
+   * Defaults to the WS_AUTH_REQUIRED environment variable.
+   */
+  wsAuthRequired?: boolean;
+  /**
+   * JWT secret used to verify tokens on upgrade.
+   * Defaults to the JWT_SECRET environment variable.
+   */
+  jwtSecret?: string;
+  /**
+   * Event store used by replayFromCursor to fetch historical events.
+   * When absent, replayFromCursor sends an empty result.
+   */
+  eventStore?: ContractEventStore;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -85,37 +106,116 @@ class DedupCache {
 export class StreamHub {
   private readonly wss: WebSocketServer;
   private readonly clients = new Map<WebSocket, ClientState>();
-  /** streamId → set of subscribed clients */
   private readonly subscriptions = new Map<string, Set<WebSocket>>();
-  private readonly dedup = new DedupCache();
+  private readonly dedup: IDedupCache;
+  private readonly ownsDedup: boolean;
+  private readonly wsAuthRequired: boolean;
+  private readonly jwtSecret: string | undefined;
+  private eventStore: ContractEventStore | undefined;
 
-  constructor(server: Server) {
-    this.wss = new WebSocketServer({ server, path: '/ws/streams' });
-    this.wss.on('connection', (ws: WebSocket, _req: IncomingMessage) => {
-      this.onConnect(ws);
+  private readonly metrics: BackpressureMetrics = {
+    droppedMessages: 0,
+    terminatedConnections: 0,
+    sentMessages: 0,
+  };
+
+  private dropBytes: number = BACKPRESSURE_DROP_BYTES;
+  private terminateBytes: number = BACKPRESSURE_TERMINATE_BYTES;
+
+  constructor(server: Server, options?: StreamHubOptions) {
+    if (options?.dedupCache) {
+      this.dedup = options.dedupCache;
+      this.ownsDedup = false;
+    } else {
+      this.dedup = new InMemoryDedupCache();
+      this.ownsDedup = true;
+    }
+
+    this.wsAuthRequired =
+      options?.wsAuthRequired ??
+      (process.env.WS_AUTH_REQUIRED === 'true');
+
+    this.jwtSecret =
+      options?.jwtSecret ??
+      process.env.JWT_SECRET;
+
+    this.eventStore = options?.eventStore;
+
+    if (this.wsAuthRequired) {
+      // Use noServer mode so we fully control the upgrade handshake.
+      this.wss = new WebSocketServer({ noServer: true });
+
+      server.on('upgrade', (req, socket, head) => {
+        const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
+        if (pathname !== '/ws/streams') return;
+
+        const result = verifyWsToken(req, this.jwtSecret);
+        if (!result.ok) {
+          socket.write(
+            'HTTP/1.1 401 Unauthorized\r\n' +
+            'Content-Type: text/plain\r\n' +
+            'Connection: close\r\n\r\n' +
+            `Unauthorized: ${result.code}\r\n`,
+          );
+          socket.destroy();
+          return;
+        }
+
+        this.wss.handleUpgrade(req, socket, head, (ws) => {
+          this.wss.emit('connection', ws, req);
+        });
+      });
+    } else {
+      // Let the WebSocketServer handle upgrades automatically.
+      this.wss = new WebSocketServer({ server, path: '/ws/streams' });
+    }
+
+    this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+      this.onConnect(ws, req);
     });
   }
 
   // ── Connection lifecycle ───────────────────────────────────────────────────
 
-  private onConnect(ws: WebSocket): void {
-    this.clients.set(ws, { subscriptions: new Set(), messageTimestamps: [] });
+  private onConnect(ws: WebSocket, req: IncomingMessage): void {
+    const connectionId = randomUUID();
+    const ip = req.socket.remoteAddress ?? 'unknown';
+    const connectedAt = Date.now();
+
+    this.clients.set(ws, {
+      id: connectionId,
+      connectedAt,
+      ip,
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptions: new Set(),
+      messageTimestamps: [],
+    });
+
+    console.info(
+      JSON.stringify({ event: 'ws_connect', connectionId, ip, timestamp: new Date(connectedAt).toISOString() }),
+    );
 
     ws.on('message', (data, isBinary) => {
+      const state = this.clients.get(ws);
+
       if (isBinary) {
         this.sendError(ws, 'BINARY_NOT_SUPPORTED', 'Binary frames are not accepted');
         return;
       }
 
       const raw = data.toString('utf8');
+      const byteLength = Buffer.byteLength(raw, 'utf8');
 
-      // Oversized payload guard.
-      if (Buffer.byteLength(raw, 'utf8') > MAX_MESSAGE_BYTES) {
+      if (state) {
+        state.metrics.messagesReceived += 1;
+        state.metrics.bytesReceived += byteLength;
+      }
+
+      if (byteLength > MAX_MESSAGE_BYTES) {
         this.sendError(ws, 'PAYLOAD_TOO_LARGE', `Message exceeds ${MAX_MESSAGE_BYTES} bytes`);
         return;
       }
 
-      // Rate limit guard.
       if (!this.checkRateLimit(ws)) {
         this.sendError(ws, 'RATE_LIMIT_EXCEEDED', 'Too many messages; slow down');
         return;
@@ -124,11 +224,11 @@ export class StreamHub {
       this.handleMessage(ws, raw);
     });
 
-    ws.on('close', () => this.onDisconnect(ws));
-    ws.on('error', () => this.onDisconnect(ws));
+    ws.on('close', (code, reason) => this.onDisconnect(ws, code, reason));
+    ws.on('error', () => ws.close(1011, 'Internal Error'));
   }
 
-  private onDisconnect(ws: WebSocket): void {
+  private onDisconnect(ws: WebSocket, code?: number, reason?: Buffer): void {
     const state = this.clients.get(ws);
     if (!state) return;
 
@@ -138,6 +238,18 @@ export class StreamHub {
         this.subscriptions.delete(streamId);
       }
     }
+
+    const durationMs = Date.now() - state.connectedAt;
+    console.info(
+      JSON.stringify({
+        event: 'ws_disconnect',
+        connectionId: state.id,
+        durationMs,
+        code: code ?? 0,
+        reason: reason?.toString('utf8') ?? '',
+        metrics: state.metrics,
+      }),
+    );
 
     this.clients.delete(ws);
   }
@@ -152,9 +264,7 @@ export class StreamHub {
     const cutoff = now - RATE_LIMIT_WINDOW_MS;
     state.messageTimestamps = state.messageTimestamps.filter((t) => t >= cutoff);
 
-    if (state.messageTimestamps.length >= RATE_LIMIT_MAX) {
-      return false;
-    }
+    if (state.messageTimestamps.length >= RATE_LIMIT_MAX) return false;
 
     state.messageTimestamps.push(now);
     return true;
@@ -178,6 +288,20 @@ export class StreamHub {
 
     const { type, streamId } = msg as Record<string, unknown>;
 
+    if (type === 'replay') {
+      const { afterEventId, fromLedger, toledger, contractId, topic, limit } = msg as Record<string, unknown>;
+      const replayFilter: StreamEventReplayFilter = {
+        ...(typeof afterEventId === 'string' ? { afterEventId } : {}),
+        ...(typeof fromLedger === 'number' ? { fromLedger } : {}),
+        ...(typeof toledger === 'number' ? { toledger } : {}),
+        ...(typeof contractId === 'string' ? { contractId } : {}),
+        ...(typeof topic === 'string' ? { topic } : {}),
+        ...(typeof limit === 'number' ? { limit } : {}),
+      };
+      void this.replayFromCursor(ws, replayFilter);
+      return;
+    }
+
     if (typeof streamId !== 'string' || streamId.trim() === '') {
       this.sendError(ws, 'INVALID_MESSAGE', 'streamId must be a non-empty string');
       return;
@@ -195,53 +319,75 @@ export class StreamHub {
   private subscribe(ws: WebSocket, streamId: string): void {
     const state = this.clients.get(ws);
     if (!state) return;
-
     state.subscriptions.add(streamId);
-
-    if (!this.subscriptions.has(streamId)) {
-      this.subscriptions.set(streamId, new Set());
-    }
+    if (!this.subscriptions.has(streamId)) this.subscriptions.set(streamId, new Set());
     this.subscriptions.get(streamId)!.add(ws);
   }
 
   private unsubscribe(ws: WebSocket, streamId: string): void {
     const state = this.clients.get(ws);
     if (!state) return;
-
     state.subscriptions.delete(streamId);
     this.subscriptions.get(streamId)?.delete(ws);
-    if (this.subscriptions.get(streamId)?.size === 0) {
-      this.subscriptions.delete(streamId);
-    }
+    if (this.subscriptions.get(streamId)?.size === 0) this.subscriptions.delete(streamId);
   }
 
   // ── Broadcast ──────────────────────────────────────────────────────────────
 
-  /**
-   * Broadcast a stream update to all clients subscribed to `event.streamId`.
-   *
-   * Deduplication: if (streamId, eventId) has already been broadcast, the call
-   * is a no-op. This prevents duplicate delivery when the indexer retries or
-   * the RPC layer replays events.
-   */
-  broadcast(event: StreamUpdateEvent): void {
+  async broadcast(event: StreamUpdateEvent): Promise<void> {
     const { streamId, eventId, payload } = event;
 
-    if (this.dedup.has(streamId, eventId)) {
-      return; // already delivered
-    }
-    this.dedup.add(streamId, eventId);
+    if (await this.dedup.has(streamId, eventId)) return;
+    await this.dedup.add(streamId, eventId);
 
     const subscribers = this.subscriptions.get(streamId);
     if (!subscribers || subscribers.size === 0) return;
 
     const message = JSON.stringify({ type: 'stream_update', streamId, eventId, payload });
-    let sent = 0;
+    const targets = Array.from(subscribers);
 
-    for (const ws of subscribers) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(message);
-        sent++;
+    if (targets.length <= FANOUT_YIELD_BATCH) {
+      this.deliverBatch(targets, message);
+      return;
+    }
+
+    const self = this;
+    let i = 0;
+    function next(): void {
+      const end = Math.min(i + FANOUT_YIELD_BATCH, targets.length);
+      self.deliverBatch(targets.slice(i, end), message);
+      i = end;
+      if (i < targets.length) setImmediate(next);
+    }
+    next();
+  }
+
+  private deliverBatch(batch: WebSocket[], message: string): void {
+    for (const ws of batch) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+
+      const buffered = ws.bufferedAmount;
+
+      if (buffered > this.terminateBytes) {
+        this.metrics.terminatedConnections++;
+        this.metrics.droppedMessages++;
+        try { ws.terminate(); } catch { /* ignore */ }
+        this.onDisconnect(ws);
+        continue;
+      }
+
+      if (buffered > this.dropBytes) {
+        this.metrics.droppedMessages++;
+        continue;
+      }
+
+      ws.send(message);
+      this.metrics.sentMessages++;
+
+      const state = this.clients.get(ws);
+      if (state) {
+        state.metrics.messagesSent += 1;
+        state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
       }
     }
 
@@ -259,24 +405,105 @@ export class StreamHub {
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   private sendError(ws: WebSocket, code: string, message: string): void {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'error', code, message }));
-    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', code, message }));
   }
 
-  /** Number of currently connected clients (for health/metrics). */
   get clientCount(): number {
     return this.clients.size;
   }
 
-  /** Close the underlying WebSocket server (for graceful shutdown). */
-  close(cb?: () => void): void {
+  getMetrics(): Readonly<BackpressureMetrics> {
+    return { ...this.metrics };
+  }
+
+  setBackpressureThresholds(opts: { dropBytes?: number; terminateBytes?: number }): void {
+    if (typeof opts.dropBytes === 'number' && opts.dropBytes >= 0) this.dropBytes = opts.dropBytes;
+    if (typeof opts.terminateBytes === 'number' && opts.terminateBytes >= 0) this.terminateBytes = opts.terminateBytes;
+  }
+
+  /**
+   * Attach (or replace) the event store used by replayFromCursor.
+   * Called by the indexer route after the store is configured.
+   */
+  setEventStore(store: ContractEventStore): void {
+    this.eventStore = store;
+  }
+
+  /**
+   * Replay stored events to a single connected client starting after the
+   * given cursor eventId.  Events are fetched from the attached event store
+   * in ledger-ascending order and sent as `stream_replay` frames.
+   *
+   * The method is intentionally fire-and-forget from the caller's perspective:
+   * it resolves once all pages have been sent (or the client disconnects).
+   *
+   * @param ws         Target WebSocket connection (must be OPEN).
+   * @param filter     Replay filter forwarded to the event store.
+   *                   `afterEventId` acts as the exclusive cursor.
+   */
+  async replayFromCursor(ws: WebSocket, filter: StreamEventReplayFilter = {}): Promise<void> {
+    if (!this.eventStore) {
+      this.sendError(ws, 'REPLAY_UNAVAILABLE', 'Event store is not configured');
+      return;
+    }
+
+    let cursor = filter.afterEventId;
+    const pageSize = Math.min(filter.limit ?? 100, 1000);
+
+    do {
+      if (ws.readyState !== WebSocket.OPEN) return;
+
+      const pageFilter: StreamEventReplayFilter = {
+        ...filter,
+        ...(cursor !== undefined ? { afterEventId: cursor } : {}),
+        limit: pageSize,
+      };
+      const result = await this.eventStore.getEvents(pageFilter);
+
+      for (const event of result.events) {
+        if (ws.readyState !== WebSocket.OPEN) return;
+
+        const message = JSON.stringify({
+          type: 'stream_replay',
+          eventId: event.eventId,
+          ledger: event.ledger,
+          topic: event.topic,
+          payload: event.payload,
+          happenedAt: event.happenedAt,
+        });
+
+        ws.send(message);
+
+        const state = this.clients.get(ws);
+        if (state) {
+          state.metrics.messagesSent += 1;
+          state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
+        }
+        this.metrics.sentMessages++;
+      }
+
+      cursor = result.nextCursor;
+    } while (cursor !== undefined);
+
+    // Signal end of replay stream
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'stream_replay_complete', cursor: cursor ?? null }));
+    }
+  }
+
+  async close(cb?: () => void): Promise<void> {
+    if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
   }
 
-  /** Reset dedup cache (for testing). */
-  _resetDedup(): void {
-    this.dedup.clear();
+  async _resetDedup(): Promise<void> {
+    await this.dedup.clear();
+  }
+
+  _resetMetrics(): void {
+    this.metrics.droppedMessages = 0;
+    this.metrics.terminatedConnections = 0;
+    this.metrics.sentMessages = 0;
   }
 }
 
@@ -284,8 +511,8 @@ export class StreamHub {
 
 let _hub: StreamHub | null = null;
 
-export function createStreamHub(server: Server): StreamHub {
-  _hub = new StreamHub(server);
+export function createStreamHub(server: Server, options?: StreamHubOptions): StreamHub {
+  _hub = new StreamHub(server, options);
   return _hub;
 }
 
@@ -293,7 +520,6 @@ export function getStreamHub(): StreamHub | null {
   return _hub;
 }
 
-/** Reset singleton (for testing). */
 export function resetStreamHub(): void {
   _hub = null;
 }
