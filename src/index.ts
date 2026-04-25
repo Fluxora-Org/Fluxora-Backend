@@ -13,7 +13,7 @@ import http from 'node:http';
 import { createApp } from './app.js';
 import { gracefulShutdown, addShutdownHook } from './shutdown.js';
 import { logger } from './lib/logger.js';
-import { initializeMigrations } from './db/migrate.js';
+import { checkPendingMigrations } from './db/migrate.js';
 import { getPool } from './db/pool.js';
 import { createStreamHub, getStreamHub } from './ws/hub.js';
 
@@ -26,8 +26,9 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 
 async function startServer() {
   try {
-    // Run migrations before starting the server
-    await initializeMigrations();
+    // Guard: fail fast if any migrations are pending.
+    // Migrations must be applied (e.g. via `pnpm migrate`) before starting.
+    await checkPendingMigrations();
 
     const app = createApp();
     const server = http.createServer(app);
