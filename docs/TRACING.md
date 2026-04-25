@@ -479,3 +479,112 @@ app.use(tracingMiddleware({
 - Middleware integration: [src/tracing/middleware.ts](../src/tracing/middleware.ts)
 - Built-in hooks: [src/tracing/builtin.ts](../src/tracing/builtin.ts)
 - Tests: [tests/tracing/](../tests/tracing/)
+
+---
+
+## Instrumented Spans
+
+The following spans are emitted automatically when tracing is enabled.
+
+### HTTP — `http.response` event on every request span
+
+| Tag | Value |
+|-----|-------|
+| `http.method` | `GET`, `POST`, etc. |
+| `http.path` | Request path |
+| `http.ip` | Client IP |
+| `http.user_agent` | User-Agent header |
+| `statusCode` | HTTP response status |
+| `durationMs` | Total request duration |
+
+Span status is `ok` for `< 400`, `error` otherwise.
+
+### Database — `db.query`
+
+Emitted by `src/db/pool.ts` for every `query()` call.
+
+| Tag | Value |
+|-----|-------|
+| `span.name` | `db.query` |
+| `db.sql` | SQL statement |
+| `correlationId` | Propagated from request context |
+
+Span status is `error` if the query throws (including `DuplicateEntryError`).
+
+### Stellar RPC — `stellar.rpc`
+
+Emitted by `src/services/stellar-rpc.ts` for every RPC call.
+
+| Tag | Value |
+|-----|-------|
+| `span.name` | `stellar.rpc` |
+| `rpc.operation` | e.g. `getLatestLedger` |
+| `correlationId` | Propagated from request context |
+
+Span status is `error` if the circuit breaker trips or the call times out.
+
+### Webhook Dispatch — `webhook.dispatch`
+
+Emitted by `src/webhooks/dispatcher.ts` for every `dispatchWebhook()` call.
+
+| Tag | Value |
+|-----|-------|
+| `span.name` | `webhook.dispatch` |
+| `webhook.event` | Event name (e.g. `stream.created`) |
+| `webhook.url` | Destination URL |
+| `webhook.retry` | Retry attempt number (0 = first attempt) |
+| `correlationId` | Propagated from request context |
+
+Span status is `error` if all retries are exhausted and the final attempt throws.
+
+### WebSocket Broadcast — `ws.broadcast`
+
+Emitted by `src/ws/hub.ts` for every `broadcast()` call that delivers at least one message.
+
+| Attribute | Value |
+|-----------|-------|
+| `ws.stream_id` | Stream being broadcast |
+| `ws.event_id` | Unique event identifier |
+| `ws.recipients` | Number of clients that received the message |
+
+This span uses `eventId` as its `traceId` because broadcasts happen outside an HTTP request context.
+
+---
+
+## correlationId Propagation Through Async Boundaries
+
+`src/tracing/middleware.ts` uses Node's `AsyncLocalStorage` to propagate the
+`correlationId` through all async continuations spawned within a request:
+
+```typescript
+import { getCorrelationId } from './tracing/middleware.js';
+
+// Inside any async function called during a request:
+const correlationId = getCorrelationId(); // returns the request's correlationId
+```
+
+This means DB queries, RPC calls, and webhook dispatches triggered by the same
+HTTP request all share the same `correlationId` in their spans — even across
+`await` boundaries, `setTimeout`, and `Promise.all`.
+
+When called outside a request context (e.g., background jobs), `getCorrelationId()`
+returns `'unknown'`.
+
+### `traceSpan` helper
+
+```typescript
+import { traceSpan } from './tracing/hooks.js';
+
+const result = await traceSpan(
+  'my.operation',          // span name
+  correlationId,           // trace ID
+  { 'my.tag': 'value' },  // additional tags
+  async (span) => {
+    // span is available if you need to record extra events
+    return doWork();
+  },
+);
+```
+
+The helper starts a span, runs the async function, ends the span `ok` on
+success or `error` on throw, and always re-throws the original error.

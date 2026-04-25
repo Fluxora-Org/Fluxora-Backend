@@ -390,6 +390,16 @@ export class StreamHub {
         state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
       }
     }
+
+    // Record a span event for observability (fire-and-forget, no correlationId context here).
+    const tracer = getTracer();
+    const span = tracer.startSpan({
+      traceId: eventId,
+      serviceName: 'fluxora-ws',
+      tags: { 'ws.stream_id': streamId, 'ws.event_id': eventId, 'ws.recipients': sent },
+    });
+    tracer.recordEvent(span, 'ws.broadcast', { streamId, eventId, recipients: sent });
+    tracer.endSpan(span, 'ok');
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────

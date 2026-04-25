@@ -19,6 +19,8 @@
  */
 
 import { logger } from '../lib/logger.js';
+import { traceSpan } from '../tracing/hooks.js';
+import { getCorrelationId } from '../tracing/middleware.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

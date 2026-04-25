@@ -14,6 +14,8 @@
 
 import pg from 'pg';
 import { logger } from '../lib/logger.js';
+import { traceSpan } from '../tracing/hooks.js';
+import { getCorrelationId } from '../tracing/middleware.js';
 
 const { Pool } = pg;
 
@@ -112,21 +114,24 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
     throw new PoolExhaustedError();
   }
 
-  const start = Date.now();
-  try {
-    const result = await pool.query<T>(sql, params);
-    const latency = Date.now() - start;
-    if (latency > 1_000) {
-      logger.warn('Slow postgres query', undefined, { sql, latencyMs: latency });
+  const correlationId = getCorrelationId();
+  return traceSpan('db.query', correlationId, { 'db.sql': sql }, async () => {
+    const start = Date.now();
+    try {
+      const result = await pool.query<T>(sql, params);
+      const latency = Date.now() - start;
+      if (latency > 1_000) {
+        logger.warn('Slow postgres query', undefined, { sql, latencyMs: latency });
+      }
+      return result;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException & { code?: string }).code === PG_UNIQUE_VIOLATION) {
+        const detail = (err as { detail?: string }).detail;
+        throw new DuplicateEntryError(detail);
+      }
+      throw err;
     }
-    return result;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException & { code?: string }).code === PG_UNIQUE_VIOLATION) {
-      const detail = (err as { detail?: string }).detail;
-      throw new DuplicateEntryError(detail);
-    }
-    throw err;
-  }
+  });
 }
 
 // ── Pool metrics (for health endpoint) ───────────────────────────────────────
