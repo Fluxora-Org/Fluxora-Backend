@@ -67,6 +67,8 @@ export function redactKeysInString(input: string): string {
  *   undefined) are replaced with `[REDACTED]` — no type coercion occurs.
  * - Non-sensitive string values (including decimal amount strings) are
  *   passed through as-is, preserving full precision.
+ * - Error objects are specially handled to redact sensitive data in
+ *   error messages and stack traces.
  *
  * @param obj - The object to sanitize. Must be a plain object or array.
  * @returns A new deep-cloned object with sensitive fields redacted.
@@ -74,6 +76,32 @@ export function redactKeysInString(input: string): string {
 export function sanitize<T extends Record<string, unknown>>(obj: T): T {
   const fields = redactableFields();
   return sanitizeValue(obj, fields) as T;
+}
+
+/**
+ * Sanitizes an error object, redacting sensitive data from error messages
+ * and stack traces while preserving error structure.
+ */
+export function sanitizeError(error: Error): Record<string, unknown> {
+  const fields = redactableFields();
+  const result: Record<string, unknown> = {
+    name: error.name,
+    message: redactKeysInString(error.message),
+  };
+
+  // Redact sensitive data from stack traces
+  if (error.stack) {
+    result.stack = redactKeysInString(error.stack);
+  }
+
+  // Copy any additional error properties
+  for (const [key, value] of Object.entries(error)) {
+    if (!['name', 'message', 'stack'].includes(key)) {
+      result[key] = sanitizeValue(value, fields);
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -86,6 +114,11 @@ function sanitizeValue(value: unknown, fields: Set<string>): unknown {
   // already decided to redact the field — handled one level up).
   if (value === null || value === undefined) return value;
 
+  // Handle Error objects specially
+  if (value instanceof Error) {
+    return sanitizeError(value);
+  }
+
   if (Array.isArray(value)) {
     return value.map((item) => sanitizeValue(item, fields));
   }
@@ -93,7 +126,8 @@ function sanitizeValue(value: unknown, fields: Set<string>): unknown {
   if (typeof value === 'object') {
     const result: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      if (fields.has(key)) {
+      if (fields.has(key.toLowerCase())) {
+        // Case-insensitive matching for field names
         // Sensitive field: apply masking or full redaction.
         // IMPORTANT: we never call Number() or parseFloat() here —
         // decimal strings must remain strings.
