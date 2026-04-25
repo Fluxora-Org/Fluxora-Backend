@@ -39,10 +39,13 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
   /**
    * GET /api/rate-limits
    * Returns the caller's current rate-limit status.
+   * Optional query parameters: path, method - returns status for specific route
    */
   rateLimitsRouter.get('/', (req: Request, res: Response) => {
     const { identifier, identifierType } = limiter.extractClientIdentifier(req);
-    const status = limiter.getStatus(identifier, identifierType);
+    const path = typeof req.query.path === 'string' ? req.query.path : undefined;
+    const method = typeof req.query.method === 'string' ? req.query.method.toUpperCase() : undefined;
+    const status = limiter.getStatus(identifier, identifierType, path, method);
 
     res.setHeader('X-RateLimit-Limit', String(status.limit));
     res.setHeader('X-RateLimit-Remaining', String(status.remaining));
