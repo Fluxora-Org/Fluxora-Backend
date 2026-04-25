@@ -7,6 +7,8 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
+import { cspNonceMiddleware, createHelmetMiddleware } from './middleware/helmet.js';
+import { metricsRouter } from './routes/metrics.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
@@ -41,6 +43,7 @@ export function createApp(options: AppOptions = {}): Express {
     app.locals.healthManager = options.healthManager;
   }
 
+  app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
