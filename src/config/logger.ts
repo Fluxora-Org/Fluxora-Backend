@@ -11,6 +11,8 @@
  * - error: Failures requiring operator attention
  */
 
+import { sanitize, sanitizeError, redactKeysInString } from '../pii/sanitizer.js';
+
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 export interface LogEntry {
@@ -56,14 +58,30 @@ export class Logger {
             return;
         }
 
-        const output = {
+        // Sanitize the entry
+        const sanitizedEntry: LogEntry = {
             ...entry,
             timestamp: new Date().toISOString(),
+            message: redactKeysInString(entry.message),
         };
 
+        // Sanitize context if present
+        if (sanitizedEntry.context) {
+            sanitizedEntry.context = sanitize(sanitizedEntry.context);
+        }
+
+        // Sanitize error if present
+        if (sanitizedEntry.error) {
+            sanitizedEntry.error = {
+                name: sanitizedEntry.error.name,
+                message: redactKeysInString(sanitizedEntry.error.message),
+                stack: sanitizedEntry.error.stack ? redactKeysInString(sanitizedEntry.error.stack) : undefined,
+            };
+        }
+
         // Use appropriate console method
-        const method = entry.level === 'error' ? 'error' : entry.level === 'warn' ? 'warn' : 'log';
-        console[method](JSON.stringify(output));
+        const method = sanitizedEntry.level === 'error' ? 'error' : sanitizedEntry.level === 'warn' ? 'warn' : 'log';
+        console[method](JSON.stringify(sanitizedEntry));
     }
 
     /**

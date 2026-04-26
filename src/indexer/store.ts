@@ -1,67 +1,123 @@
 import { ContractEventRecord, IndexerStoreKind } from './types.js';
+import { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } from '../db/types.js';
 
-export type InsertContractEventsResult = {
-  insertedEventIds: string[];
-  duplicateEventIds: string[];
-};
+export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
 
 export interface ContractEventStore {
   readonly kind: IndexerStoreKind;
   insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult>;
   rollbackBeforeLedger(ledger: number): Promise<void>;
   getLedgerHash(ledger: number): Promise<string | null>;
+  /** Replay stored events with optional filtering. Append-only — never mutates. */
+  getEvents(filter?: StreamEventReplayFilter): Promise<StreamEventReplayResult>;
 }
 
 export interface PgClientLike {
-  query<T = unknown>(text: string, values?: unknown[]): Promise<{
-    rows: T[];
-    rowCount?: number | null;
-  }>;
+  query<T = unknown>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount?: number | null }>;
 }
 
 export class InMemoryContractEventStore implements ContractEventStore {
   public readonly kind: IndexerStoreKind = 'memory';
-
   private readonly records = new Map<string, ContractEventRecord>();
+  private readonly reorgLog: ReorgRecord[] = [];
 
   async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
     const insertedEventIds: string[] = [];
     const duplicateEventIds: string[] = [];
-
+    const staged = new Map<string, ContractEventRecord>();
     for (const event of events) {
-      if (this.records.has(event.eventId)) {
+      if (this.records.has(event.eventId) || staged.has(event.eventId)) {
         duplicateEventIds.push(event.eventId);
         continue;
       }
-
-      this.records.set(event.eventId, {
-        ...event,
-        ingestedAt: event.ingestedAt ?? new Date().toISOString(),
-      });
+      staged.set(event.eventId, { ...event, ingestedAt: new Date().toISOString() });
       insertedEventIds.push(event.eventId);
     }
 
-    return {
-      insertedEventIds,
-      duplicateEventIds,
-    };
+    for (const [id, record] of staged) {
+      this.records.set(id, record);
+    }
+
+    return { insertedEventIds, duplicateEventIds };
   }
 
-  async rollbackBeforeLedger(ledger: number): Promise<void> {
+  async rollbackBeforeLedger(forkLedger: number): Promise<void> {
+    const removedEventIds: string[] = [];
+    let evictedHash = '';
+    for (const record of this.records.values()) {
+      if (record.ledger === forkLedger) { evictedHash = record.ledgerHash; break; }
+    }
     for (const [eventId, record] of this.records) {
-      if (record.ledger >= ledger) {
-        this.records.delete(eventId);
-      }
+      if (record.ledger >= forkLedger) { removedEventIds.push(eventId); this.records.delete(eventId); }
+    }
+    if (removedEventIds.length > 0 || evictedHash !== '') {
+      this.reorgLog.push({ forkLedger, evictedHash, incomingHash: '', removedEventIds, rolledBackAt: new Date().toISOString() });
     }
   }
 
   async getLedgerHash(ledger: number): Promise<string | null> {
     for (const record of this.records.values()) {
-      if (record.ledger === ledger) {
-        return record.ledgerHash;
-      }
+      if (record.ledger === ledger) return record.ledgerHash;
     }
     return null;
+  }
+
+  async getEvents(filter: StreamEventReplayFilter = {}): Promise<StreamEventReplayResult> {
+    const limit = Math.min(filter.limit ?? 100, 1000);
+    const offset = filter.offset ?? 0;
+
+    let results = [...this.records.values()] as StreamEventRecord[];
+
+    // Stable ordering: ledger asc, then eventId asc
+    results.sort((a, b) => a.ledger - b.ledger || a.eventId.localeCompare(b.eventId));
+
+    // Cursor-based: drop everything up to and including the cursor eventId
+    // (applied before other filters so the cursor position is stable)
+    if (filter.afterEventId !== undefined) {
+      const idx = results.findIndex((r) => r.eventId === filter.afterEventId);
+      if (idx === -1) {
+        // Unknown cursor — treat as "past end of store", return empty
+        results = [];
+      } else {
+        results = results.slice(idx + 1);
+      }
+    }
+
+    if (filter.fromLedger !== undefined) {
+      results = results.filter((r) => r.ledger >= filter.fromLedger!);
+    }
+    if (filter.toledger !== undefined) {
+      results = results.filter((r) => r.ledger <= filter.toledger!);
+    }
+    if (filter.contractId !== undefined) {
+      results = results.filter((r) => r.contractId === filter.contractId);
+    }
+    if (filter.topic !== undefined) {
+      results = results.filter((r) => r.topic === filter.topic);
+    }
+
+    const total = results.length;
+    const slice = filter.afterEventId !== undefined
+      ? results.slice(0, limit)
+      : results.slice(offset, offset + limit);
+
+    const events = slice.map((r) => ({
+      ...r,
+      ingestedAt: r.ingestedAt ?? new Date().toISOString(),
+    }));
+
+    const lastEvent = events[events.length - 1];
+    const nextCursor = events.length === limit && total > limit && lastEvent
+      ? lastEvent.eventId
+      : undefined;
+
+    return {
+      events,
+      total,
+      limit,
+      offset: filter.afterEventId !== undefined ? 0 : offset,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+    };
   }
 
   reset(): void {
@@ -71,27 +127,38 @@ export class InMemoryContractEventStore implements ContractEventStore {
   all(): ContractEventRecord[] {
     return [...this.records.values()].sort((a, b) => a.eventId.localeCompare(b.eventId));
   }
+
+  byLedger(ledger: number): ContractEventRecord[] {
+    return [...this.records.values()].filter((r) => r.ledger === ledger).sort((a, b) => a.eventIndex - b.eventIndex);
+  }
+
+  getReorgLog(): Readonly<ReorgRecord[]> { return this.reorgLog; }
+
+  ledgerCount(): number {
+    return new Set([...this.records.values()].map((r) => r.ledger)).size;
+  }
+
+  tipLedger(): number | null {
+    let tip: number | null = null;
+    for (const record of this.records.values()) {
+      if (tip === null || record.ledger > tip) tip = record.ledger;
+    }
+    return tip;
+  }
 }
 
 export class PostgresContractEventStore implements ContractEventStore {
   public readonly kind: IndexerStoreKind = 'postgres';
-
-  constructor(
-    private readonly client: PgClientLike,
-    private readonly tableName = 'contract_events'
-  ) {}
+  constructor(private readonly client: PgClientLike, private readonly tableName = 'contract_events') {}
 
   async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
     if (events.length === 0) {
-      return {
-        insertedEventIds: [],
-        duplicateEventIds: [],
-      };
+      return { insertedEventIds: [], duplicateEventIds: [] };
     }
 
     const values: unknown[] = [];
     const placeholders = events.map((event, index) => {
-      const offset = index * 10;
+      const offset = index * 11;
       values.push(
         event.eventId,
         event.ledger,
@@ -111,17 +178,8 @@ export class PostgresContractEventStore implements ContractEventStore {
 
     const sql = `
       INSERT INTO ${this.tableName} (
-        event_id,
-        ledger,
-        contract_id,
-        topic,
-        tx_hash,
-        tx_index,
-        operation_index,
-        event_index,
-        payload,
-        happened_at,
-        ledger_hash
+        event_id, ledger, contract_id, topic, tx_hash,
+        tx_index, operation_index, event_index, payload, happened_at, ledger_hash
       )
       VALUES ${placeholders.join(', ')}
       ON CONFLICT (event_id) DO NOTHING
@@ -129,30 +187,120 @@ export class PostgresContractEventStore implements ContractEventStore {
     `;
 
     const result = await this.client.query<{ event_id: string }>(sql, values);
-    const insertedEventIds = result.rows.map((row) => row.event_id);
+    const insertedEventIds = result.rows.map((r) => r.event_id);
     const inserted = new Set(insertedEventIds);
     const duplicateEventIds = events
-      .map((event) => event.eventId)
-      .filter((eventId) => !inserted.has(eventId));
+      .map((e) => e.eventId)
+      .filter((id) => !inserted.has(id));
 
-    return {
-      insertedEventIds,
-      duplicateEventIds,
-    };
+    return { insertedEventIds, duplicateEventIds };
   }
 
   async rollbackBeforeLedger(ledger: number): Promise<void> {
-    const sql = `DELETE FROM ${this.tableName} WHERE ledger >= $1`;
-    await this.client.query(sql, [ledger]);
+    await this.client.query(`DELETE FROM ${this.tableName} WHERE ledger >= $1`, [ledger]);
   }
 
   async getLedgerHash(ledger: number): Promise<string | null> {
-    const sql = `SELECT ledger_hash FROM ${this.tableName} WHERE ledger = $1 LIMIT 1`;
-    const result = await this.client.query<{ ledger_hash: string }>(sql, [ledger]);
-    if (result.rows.length === 0) {
-      return null;
+    const result = await this.client.query<{ ledger_hash: string }>(
+      `SELECT ledger_hash FROM ${this.tableName} WHERE ledger = $1 LIMIT 1`,
+      [ledger]
+    );
+    return result.rows[0]?.ledger_hash ?? null;
+  }
+
+  async getEvents(filter: StreamEventReplayFilter = {}): Promise<StreamEventReplayResult> {
+    const limit = Math.min(filter.limit ?? 100, 1000);
+    const offset = filter.offset ?? 0;
+
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+
+    if (filter.fromLedger !== undefined) {
+      values.push(filter.fromLedger);
+      conditions.push(`ledger >= $${values.length}`);
     }
-    const row = result.rows[0];
-    return row ? row.ledger_hash : null;
+    if (filter.toledger !== undefined) {
+      values.push(filter.toledger);
+      conditions.push(`ledger <= $${values.length}`);
+    }
+    if (filter.contractId !== undefined) {
+      values.push(filter.contractId);
+      conditions.push(`contract_id = $${values.length}`);
+    }
+    if (filter.topic !== undefined) {
+      values.push(filter.topic);
+      conditions.push(`topic = $${values.length}`);
+    }
+
+    // Cursor: translate afterEventId into a (ledger, event_id) boundary
+    if (filter.afterEventId !== undefined) {
+      // Fetch the cursor row's ledger so we can use a composite key comparison
+      const cursorResult = await this.client.query<{ ledger: number }>(
+        `SELECT ledger FROM ${this.tableName} WHERE event_id = $1 LIMIT 1`,
+        [filter.afterEventId],
+      );
+      if (cursorResult.rows.length > 0) {
+        const cursorRow = cursorResult.rows[0];
+        if (cursorRow) {
+          const cursorLedger = cursorRow.ledger;
+          values.push(cursorLedger, filter.afterEventId);
+          conditions.push(
+            `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
+          );
+        }
+      }
+      // If cursor row not found, return empty (cursor is past the end of the store)
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countResult = await this.client.query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM ${this.tableName} ${where}`,
+      values
+    );
+    const total = parseInt(countResult.rows[0]?.count ?? '0', 10);
+
+    const pageValues = [...values, limit, filter.afterEventId !== undefined ? 0 : offset];
+    const dataResult = await this.client.query<{
+      event_id: string; ledger: number; ledger_hash: string; contract_id: string;
+      topic: string; tx_hash: string; tx_index: number; operation_index: number;
+      event_index: number; payload: Record<string, unknown>; happened_at: string;
+      ingested_at: string;
+    }>(
+      `SELECT event_id, ledger, ledger_hash, contract_id, topic, tx_hash,
+              tx_index, operation_index, event_index, payload, happened_at, ingested_at
+       FROM ${this.tableName} ${where}
+       ORDER BY ledger ASC, event_id ASC
+       LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
+      pageValues
+    );
+
+    const events: StreamEventRecord[] = dataResult.rows.map((row) => ({
+      eventId: row.event_id,
+      ledger: row.ledger,
+      ledgerHash: row.ledger_hash,
+      contractId: row.contract_id,
+      topic: row.topic,
+      txHash: row.tx_hash,
+      txIndex: row.tx_index,
+      operationIndex: row.operation_index,
+      eventIndex: row.event_index,
+      payload: row.payload,
+      happenedAt: row.happened_at,
+      ingestedAt: row.ingested_at,
+    }));
+
+    const lastEvent = events[events.length - 1];
+    const nextCursor = events.length === limit && total > limit && lastEvent
+      ? lastEvent.eventId
+      : undefined;
+
+    return {
+      events,
+      total,
+      limit,
+      offset: filter.afterEventId !== undefined ? 0 : offset,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+    };
   }
 }

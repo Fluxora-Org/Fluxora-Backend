@@ -79,8 +79,10 @@
  */
 import { Router } from 'express';
 import { authenticate, requireAuth } from '../middleware/auth.js';
-import { asyncHandler } from '../middleware/errorHandler.js';
+import { asyncHandler, validationError } from '../middleware/errorHandler.js';
 import { info, warn } from '../utils/logger.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
+import { successResponse, errorResponse } from '../utils/response.js';
 
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
@@ -128,9 +130,9 @@ export const dlqRouter = Router();
 function requireOperator(req: any, res: any, next: any): void {
   if (req.user?.role !== 'operator') {
     warn('Non-operator attempted DLQ access', { role: req.user?.role, path: req.path });
-    res.status(403).json({
-      error: { code: 'FORBIDDEN', message: 'Operator role required to access the DLQ', requestId: req.id },
-    });
+    res.status(403).json(
+      errorResponse('FORBIDDEN', 'Operator role required to access the DLQ', undefined, req.id)
+    );
     return;
   }
   next();
@@ -155,8 +157,7 @@ dlqRouter.get(
     if (limitParam !== undefined) {
       const parsed = Number.parseInt(String(limitParam), 10);
       if (Number.isNaN(parsed) || parsed < 1 || parsed > 100) {
-        res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'limit must be an integer between 1 and 100', requestId } });
-        return;
+        throw validationError('limit must be an integer between 1 and 100');
       }
       limit = parsed;
     }
@@ -165,8 +166,7 @@ dlqRouter.get(
     if (offsetParam !== undefined) {
       const parsed = Number.parseInt(String(offsetParam), 10);
       if (Number.isNaN(parsed) || parsed < 0) {
-        res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'offset must be a non-negative integer', requestId } });
-        return;
+        throw validationError('offset must be a non-negative integer');
       }
       offset = parsed;
     }
@@ -180,13 +180,22 @@ dlqRouter.get(
 
     info('DLQ entries listed', { total: filtered.length, returned: page.length, offset, limit, requestId });
 
-    res.json({
+    // Record audit event for DLQ listing
+    recordAuditEvent(
+      'DLQ_LISTED',
+      'dlq',
+      'list',
+      requestId,
+      { total: filtered.length, returned: page.length, offset, limit, topicFilter }
+    );
+
+    res.json(successResponse({
       entries: page,
       total: filtered.length,
       limit,
       offset,
       has_more: offset + page.length < filtered.length,
-    });
+    }));
   }),
 );
 
@@ -199,10 +208,52 @@ dlqRouter.get(
   asyncHandler(async (req: any, res: any) => {
     const entry = dlqEntries.find((e) => e.id === req.params.id);
     if (!entry) {
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
+      return;
+    }
+    res.json(successResponse({ entry }, req.id));
+  }),
+);
+
+/**
+ * POST /admin/dlq/:id/replay
+ * Replay a DLQ entry by re-enqueuing it for processing.
+ */
+dlqRouter.post(
+  '/:id/replay',
+  asyncHandler(async (req: any, res: any) => {
+    const index = dlqEntries.findIndex((e) => e.id === req.params.id);
+    if (index === -1) {
       res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
       return;
     }
-    res.json({ entry });
+
+    const entry = dlqEntries[index];
+    if (!entry) {
+      res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
+      return;
+    }
+    
+    // Reset the entry for replay
+    entry.attempts = 0;
+    entry.lastFailedAt = new Date().toISOString();
+    
+    info('DLQ entry replayed', { id: entry.id, topic: entry.topic, requestId: req.id });
+    
+    // Record audit event for DLQ replay
+    recordAuditEvent(
+      'DLQ_REPLAYED',
+      'dlq',
+      entry.id,
+      req.id,
+      { topic: entry.topic, originalAttempts: entry.attempts }
+    );
+
+    res.json({ 
+      message: 'DLQ entry replayed', 
+      id: entry.id,
+      topic: entry.topic
+    });
   }),
 );
 
@@ -215,11 +266,61 @@ dlqRouter.delete(
   asyncHandler(async (req: any, res: any) => {
     const index = dlqEntries.findIndex((e) => e.id === req.params.id);
     if (index === -1) {
-      res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
       return;
     }
     const [removed] = dlqEntries.splice(index, 1);
     info('DLQ entry acknowledged', { id: removed!.id, requestId: req.id });
-    res.json({ message: 'DLQ entry removed', id: removed!.id });
+    res.json(successResponse({ message: 'DLQ entry removed', id: removed!.id }, req.id));
+  }),
+);
+
+/**
+ * DELETE /admin/dlq
+ * Purge all DLQ entries (bulk delete with optional topic filter).
+ */
+dlqRouter.delete(
+  '/',
+  asyncHandler(async (req: any, res: any) => {
+    const topicFilter = req.query.topic;
+    const requestId = req.id;
+
+    let entriesToRemove = dlqEntries.slice();
+    if (typeof topicFilter === 'string' && topicFilter.trim() !== '') {
+      entriesToRemove = entriesToRemove.filter((e) => e.topic === topicFilter.trim());
+    }
+
+    if (entriesToRemove.length === 0) {
+      res.json({ message: 'No DLQ entries to purge', purged: 0 });
+      return;
+    }
+
+    // Remove entries
+    const removedIds: string[] = [];
+    entriesToRemove.forEach((entry) => {
+      const index = dlqEntries.findIndex((e) => e.id === entry.id);
+      if (index !== -1) {
+        dlqEntries.splice(index, 1);
+        removedIds.push(entry.id);
+      }
+    });
+
+    info('DLQ entries purged', { count: removedIds.length, topicFilter, requestId });
+
+    // Record audit event for DLQ purge
+    recordAuditEvent(
+      'DLQ_PURGED',
+      'dlq',
+      'bulk',
+      requestId,
+      { purgedCount: removedIds.length, topicFilter, removedIds }
+    );
+
+    res.json({ 
+      message: 'DLQ entries purged', 
+      purged: removedIds.length,
+      topicFilter: topicFilter || 'all',
+      removedIds
+    });
   }),
 );

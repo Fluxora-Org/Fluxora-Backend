@@ -87,4 +87,69 @@ describe('helmet security headers', () => {
       expect(res['x-powered-by']).toBeUndefined();
     }
   });
+
+  // --- Strict CSP assertions ---
+
+  it('CSP default-src is self only', async () => {
+    const res = await performRequest('/');
+    const csp = res['content-security-policy'] as string;
+    expect(csp).toMatch(/default-src 'self'/);
+  });
+
+  it('CSP script-src does not contain unsafe-inline or unsafe-eval', async () => {
+    const res = await performRequest('/');
+    const csp = res['content-security-policy'] as string;
+    // Extract the script-src directive
+    const match = csp.match(/script-src ([^;]+)/);
+    expect(match).not.toBeNull();
+    const scriptSrc = match![1];
+    expect(scriptSrc).not.toContain("'unsafe-inline'");
+    expect(scriptSrc).not.toContain("'unsafe-eval'");
+  });
+
+  it('CSP style-src does not contain unsafe-inline', async () => {
+    const res = await performRequest('/');
+    const csp = res['content-security-policy'] as string;
+    const match = csp.match(/style-src ([^;]+)/);
+    expect(match).not.toBeNull();
+    const styleSrc = match![1];
+    expect(styleSrc).not.toContain("'unsafe-inline'");
+  });
+
+  it('CSP script-src and style-src include a per-request nonce', async () => {
+    const res = await performRequest('/');
+    const csp = res['content-security-policy'] as string;
+    // nonce-<base64> pattern
+    expect(csp).toMatch(/nonce-[A-Za-z0-9+/]+=*/);
+  });
+
+  it('CSP nonce is unique per request', async () => {
+    const res1 = await performRequest('/');
+    const res2 = await performRequest('/');
+    const csp1 = res1['content-security-policy'] as string;
+    const csp2 = res2['content-security-policy'] as string;
+    const nonce1 = csp1.match(/nonce-([A-Za-z0-9+/=]+)/)?.[1];
+    const nonce2 = csp2.match(/nonce-([A-Za-z0-9+/=]+)/)?.[1];
+    expect(nonce1).toBeDefined();
+    expect(nonce2).toBeDefined();
+    expect(nonce1).not.toBe(nonce2);
+  });
+
+  it('CSP object-src is none', async () => {
+    const res = await performRequest('/');
+    const csp = res['content-security-policy'] as string;
+    expect(csp).toMatch(/object-src 'none'/);
+  });
+
+  it('CSP frame-src is none', async () => {
+    const res = await performRequest('/');
+    const csp = res['content-security-policy'] as string;
+    expect(csp).toMatch(/frame-src 'none'/);
+  });
+
+  it('CSP includes upgrade-insecure-requests', async () => {
+    const res = await performRequest('/');
+    const csp = res['content-security-policy'] as string;
+    expect(csp).toContain('upgrade-insecure-requests');
+  });
 });
