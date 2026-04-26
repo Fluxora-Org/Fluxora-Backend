@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   description: |
     Fluxora Backend: Off-chain companion to the streaming contract.
-    
+
     Presents operator-grade reliability with predictable HTTP semantics, durable views of chain-derived data,
     and explicit failure behavior when dependencies are unhealthy.
 
@@ -17,23 +17,22 @@ info:
     These headers are transport invariants for public clients, authenticated partners,
     administrators, and internal workers that traverse the HTTP surface. They do not replace
     authentication, authorization, TLS termination, or proxy hardening.
-    
+
     ## Trust Boundaries
     - **Public Internet Clients**: Read-only access to stream listings and health checks
     - **Authenticated Partners**: Create and manage streams with idempotency guarantees
     - **Administrators**: Full access including internal indexer endpoints
     - **Internal Workers**: Indexer endpoints for chain state synchronization
-    
+
     ## Failure Modes & Client-Visible Behavior
     - **Invalid Input (400)**: Malformed addresses, negative amounts, oversized payloads
     - **Unauthorized (401)**: Missing or invalid authentication token
     - **Forbidden (403)**: Insufficient permissions for the requested operation
     - **Conflict (409)**: Duplicate submission detected (idempotency key collision)
     - **Payload Too Large (413)**: Request exceeds 256 KiB limit
-    - **Unprocessable Entity (422)**: Validation failed (e.g., insufficient deposit)
     - **Service Unavailable (503)**: Dependency outage (database, Stellar RPC, workers)
     - **Internal Server Error (500)**: Unexpected error; check logs with requestId
-    
+
   contact:
     name: Fluxora Team
   license:
@@ -58,17 +57,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: Fluxora API
-                  version:
-                    type: string
-                    example: 0.1.0
-                  docs:
-                    type: string
-                    example: Programmable treasury streaming on Stellar.
+                $ref: '#/components/schemas/RootResponse'
 
   /health:
     get:
@@ -79,15 +68,136 @@ paths:
       description: |
         Returns the health status of the service and its dependencies.
         Used by load balancers and monitoring systems.
+        Returns 503 during graceful shutdown.
       responses:
         '200':
-          description: Service is healthy
+          description: Service is healthy or degraded
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthReport'
+                $ref: '#/components/schemas/HealthResponse'
         '503':
-          description: Service or dependency is unhealthy
+          description: Service is shutting down
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /health/ready:
+    get:
+      summary: Readiness probe
+      operationId: getHealthReady
+      tags:
+        - System
+      description: |
+        Returns 200 if all dependencies are healthy and service is ready to accept traffic.
+        Returns 503 if any dependency is unhealthy or service is shutting down.
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+        '503':
+          description: Service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health/live:
+    get:
+      summary: Liveness probe
+      operationId: getHealthLive
+      tags:
+        - System
+      description: |
+        Returns detailed health report for all dependencies.
+      responses:
+        '200':
+          description: Detailed health report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessResponse'
+        '500':
+          description: Failed to get health report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/status/read-only:
+    get:
+      summary: Read-only admin feature-flag status
+      operationId: getAdminStatusReadOnly
+      tags:
+        - Admin
+      description: |
+        Returns non-sensitive operational pause flags without requiring
+        admin credentials. This endpoint is read-only and does not expose
+        reindex internals or mutation capabilities.
+      responses:
+        '200':
+          description: Current pause-flag state
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - pauseFlags
+                properties:
+                  pauseFlags:
+                    type: object
+                    required:
+                      - streamCreation
+                      - ingestion
+                    properties:
+                      streamCreation:
+                        type: boolean
+                        description: Whether creation of new streams is paused.
+                      ingestion:
+                        type: boolean
+                        description: Whether chain ingestion/indexing is paused.
+
+  /api/auth/session:
+    post:
+      summary: Create authentication session
+      operationId: createSession
+      tags:
+        - Auth
+      description: |
+        Issues a JWT token for authenticated access to privileged endpoints.
+        In this iteration, any valid Stellar address can obtain a session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - address
+              properties:
+                address:
+                  type: string
+                  description: Stellar public key
+                  pattern: '^G[A-Z2-7]{55}$'
+                  example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
+                role:
+                  type: string
+                  enum: [operator, viewer]
+                  default: viewer
+                  description: User role for authorization
+      responses:
+        '200':
+          description: Session created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '400':
+          description: Invalid request
           content:
             application/json:
               schema:
@@ -106,12 +216,24 @@ paths:
           in: header
           required: true
           description: |
-            Unique identifier for this request. Used to prevent duplicate submissions.
-            Must be a UUID or similar unique value. Same key with identical request body
-            will return the same response (idempotent).
+            Unique key that makes this request idempotent. Clients MUST supply a
+            fresh value per logical operation and MUST reuse the same value when
+            retrying after a network failure.
+
+            **Format**: 1–128 characters; allowed charset: `[A-Za-z0-9:_-]`.
+            UUID v4 is recommended but any value matching the charset is accepted.
+
+            **Behaviour**:
+            - Same key + same body → 201 (cached response, `Idempotency-Replayed: true`)
+            - Same key + different body → 409 CONFLICT
+            - Missing or malformed key → 400 VALIDATION_ERROR
+
+            **Security**: The key value is never echoed in error response bodies
+            or server logs to prevent accidental secret leakage.
           schema:
             type: string
-            format: uuid
+            minLength: 1
+            maxLength: 128
       requestBody:
         required: true
         content:
@@ -120,13 +242,33 @@ paths:
               $ref: '#/components/schemas/CreateStreamRequest'
       responses:
         '201':
-          description: Stream created successfully
+          description: |
+            Stream created (or replayed from cache).
+            Check `Idempotency-Replayed` response header and `meta.idempotencyReplayed`
+            to distinguish a fresh creation from a cached replay.
+          headers:
+            Idempotency-Key:
+              description: Echoes the key supplied by the client.
+              schema:
+                type: string
+            Idempotency-Replayed:
+              description: |
+                `true` when the response was served from the idempotency cache;
+                `false` on first creation.
+              schema:
+                type: string
+                enum: ['true', 'false']
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Stream'
+                $ref: '#/components/schemas/StreamResponse'
         '400':
-          description: Invalid request (malformed JSON, invalid address format, etc.)
+          description: |
+            Invalid request. Common causes:
+            - Missing or malformed `Idempotency-Key` header
+            - Invalid JSON body
+            - Invalid Stellar address format
+            - Non-string amount field (must be decimal string)
           content:
             application/json:
               schema:
@@ -139,8 +281,9 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
           description: |
-            Duplicate submission detected. Same Idempotency-Key with different request body.
-            Retry with same body or use new Idempotency-Key.
+            Idempotency-Key collision — the same key was previously used with a
+            different request body. Use a new Idempotency-Key or retry with the
+            original body.
           content:
             application/json:
               schema:
@@ -151,25 +294,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Validation failed. Common causes:
-            - sender and recipient are the same
-            - depositAmount < ratePerSecond (insufficient for 1 second)
-            - startTime is in the past (>1 hour ago)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
         '503':
-          description: Service unavailable (database, Stellar RPC, or workers down)
+          description: Service unavailable (database, Stellar RPC, or idempotency store down)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
     get:
-      summary: List streams with pagination
+      summary: List streams with cursor pagination and indexed filters
       operationId: listStreams
       tags:
         - Streams
@@ -177,34 +310,57 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Number of streams to return (1-100, default 20)
+          description: Number of streams to return (1-100, default 50)
           schema:
             type: integer
             minimum: 1
             maximum: 100
-            default: 20
+            default: 50
         - name: cursor
           in: query
           required: false
           description: |
-            Pagination cursor from previous response. Base64-encoded stream ID.
-            Omit for first page.
+            Opaque pagination cursor returned in `next_cursor` from a previous
+            response. Encodes the last seen stream id (base64url). Omit for
+            the first page.
           schema:
             type: string
-        - name: includeTotal
+        - name: include_total
           in: query
           required: false
-          description: Include total count in response (may be expensive for large datasets)
+          description: |
+            When true, include a `total` field in the response reflecting the
+            current count of matching streams. This is a point-in-time snapshot
+            and is not guaranteed to be consistent with the cursor position.
           schema:
             type: boolean
             default: false
+        - name: status
+          in: query
+          required: false
+          description: Filter by stream status (uses the status index).
+          schema:
+            type: string
+            enum: [scheduled, active, paused, completed, cancelled]
+        - name: sender
+          in: query
+          required: false
+          description: Filter by sender Stellar address (uses the sender_address index).
+          schema:
+            type: string
+        - name: recipient
+          in: query
+          required: false
+          description: Filter by recipient Stellar address (uses the recipient_address index).
+          schema:
+            type: string
       responses:
         '200':
-          description: List of streams
+          description: Cursor-paginated list of streams
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StreamList'
+                $ref: '#/components/schemas/StreamListResponse'
         '400':
           description: Invalid query parameters
           content:
@@ -228,19 +384,52 @@ paths:
         - name: streamId
           in: path
           required: true
-          description: Stream identifier (format: stream-{timestamp})
+          description: Stream identifier (format: stream-{timestamp}-{random})
           schema:
             type: string
-            pattern: '^stream-\d+$'
       responses:
         '200':
           description: Stream details
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Stream'
-        '400':
-          description: Invalid stream ID format
+                $ref: '#/components/schemas/StreamResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      summary: Cancel a stream
+      operationId: cancelStream
+      tags:
+        - Streams
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: streamId
+          in: path
+          required: true
+          description: Stream identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Stream cancelled successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelStreamResponse'
+        '401':
+          description: Missing or invalid authentication token
           content:
             application/json:
               schema:
@@ -251,8 +440,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '503':
-          description: Service unavailable
+        '409':
+          description: Stream already cancelled or completed
           content:
             application/json:
               schema:
@@ -287,11 +476,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: queued
+                $ref: '#/components/schemas/AcceptedResponse'
         '401':
           description: Unauthorized
           content:
@@ -304,9 +489,255 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body exceeds 256 KiB limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/indexer/events/replay:
+    get:
+      summary: Cursor-based event replay from the event store
+      operationId: replayIndexerEvents
+      tags:
+        - Internal
+      description: |
+        Returns a page of stored contract events starting strictly after the
+        supplied `afterEventId` cursor, ordered by `(ledger ASC, eventId ASC)`.
+
+        Consumers advance the replay window by passing the returned `nextCursor`
+        value as `afterEventId` on the next request. Omit `afterEventId` to
+        start from the beginning of the store.
+
+        Amount fields in event payloads follow the decimal-string serialization
+        policy — they are never coerced to numbers.
+
+        ## Trust Boundaries
+        - Public internet clients may not call this route.
+        - Authenticated internal workers may replay events for audit and
+          catch-up purposes only.
+
+        ## Failure Modes
+        - An unknown `afterEventId` is treated as "cursor past end of store"
+          and returns an empty event list (not a 404).
+        - `limit` is silently capped at 1000.
+      parameters:
+        - name: x-indexer-worker-token
+          in: header
+          required: true
+          description: Internal worker authentication token
+          schema:
+            type: string
+        - name: afterEventId
+          in: query
+          required: false
+          description: |
+            Exclusive cursor. Only events that come strictly after this
+            eventId (in ledger-ascending order) are returned.
+            Omit to start from the beginning of the store.
+          schema:
+            type: string
+        - name: fromLedger
+          in: query
+          required: false
+          description: Only return events at or after this ledger (inclusive).
+          schema:
+            type: integer
+            minimum: 0
+        - name: toledger
+          in: query
+          required: false
+          description: Only return events at or before this ledger (inclusive).
+          schema:
+            type: integer
+            minimum: 0
+        - name: contractId
+          in: query
+          required: false
+          description: Filter by Soroban contract ID.
+          schema:
+            type: string
+        - name: topic
+          in: query
+          required: false
+          description: Filter by event topic (e.g. `stream.created`).
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum events per page (default 100, max 1000).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Cursor-paginated event page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventReplayResponse'
+        '401':
+          description: Missing or invalid internal worker credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
 components:
   schemas:
+    ResponseMeta:
+      type: object
+      required:
+        - timestamp
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp of the response
+          example: '2024-01-01T12:00:00.000Z'
+        requestId:
+          type: string
+          description: Opaque request identifier for log correlation
+          example: 550e8400-e29b-41d4-a716-446655440000
+
+    RootResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            name:
+              type: string
+              example: Fluxora API
+            version:
+              type: string
+              example: 0.1.0
+            docs:
+              type: string
+              example: Programmable treasury streaming on Stellar.
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    HealthResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: [ok, degraded, shutting_down]
+              description: Overall service health
+              example: ok
+            service:
+              type: string
+              example: fluxora-backend
+            network:
+              type: string
+              description: Stellar network (testnet, public, etc.)
+              example: testnet
+            contractAddresses:
+              type: object
+              description: Deployed contract addresses
+              example: {}
+            timestamp:
+              type: string
+              format: date-time
+              example: '2024-01-01T12:00:00.000Z'
+            indexer:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [ok, stalled, starting, unknown]
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    ReadinessResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            report:
+              type: object
+              description: Detailed readiness report
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    LivenessResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            report:
+              type: object
+              description: Detailed liveness report
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    SessionResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            token:
+              type: string
+              description: JWT token for authentication
+              example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            user:
+              type: object
+              properties:
+                address:
+                  type: string
+                  example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
+                role:
+                  type: string
+                  example: operator
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
     CreateStreamRequest:
       type: object
       required:
@@ -318,29 +749,35 @@ components:
       properties:
         sender:
           type: string
-          description: Stellar public key of the sender (starts with G, 56 chars)
+          description: |
+            Stellar public key of the sender.
+            Must start with 'G' followed by exactly 55 base32 characters [A-Z2-7].
+            Total length: 56 characters.
           pattern: '^G[A-Z2-7]{55}$'
           example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
         recipient:
           type: string
-          description: Stellar public key of the recipient (starts with G, 56 chars)
+          description: |
+            Stellar public key of the recipient.
+            Must start with 'G' followed by exactly 55 base32 characters [A-Z2-7].
+            Total length: 56 characters.
           pattern: '^G[A-Z2-7]{55}$'
           example: GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX
         depositAmount:
           type: string
           description: |
             Total amount to deposit in stroops (1 XLM = 10,000,000 stroops).
-            Must be a non-negative integer string.
+            Must be a non-negative decimal string.
             Must be >= ratePerSecond (minimum 1 second of streaming).
             Max: 9223372036854775807 stroops (~922 million XLM).
-          pattern: '^\d+$'
+          pattern: '^\d+(\.\d+)?$'
           example: '1000000000'
         ratePerSecond:
           type: string
           description: |
             Streaming rate in stroops per second.
-            Must be a positive integer string.
-          pattern: '^\d+$'
+            Must be a positive decimal string.
+          pattern: '^\d+(\.\d+)?$'
           example: '100000'
         startTime:
           type: integer
@@ -351,145 +788,329 @@ components:
 
     Stream:
       type: object
+      description: |
+        A durable, PostgreSQL-backed stream record.
+        All monetary amounts are decimal strings - never numbers.
+      required:
+        - id
+        - sender
+        - recipient
+        - depositAmount
+        - ratePerSecond
+        - startTime
+        - endTime
+        - status
       properties:
         id:
           type: string
-          description: Unique stream identifier
-          pattern: '^stream-\d+$'
-          example: stream-1704067200
+          description: |
+            Unique stream identifier derived from SHA-256 of request content.
+            Format: stream-{64-char-hex}-{eventIndex}
+          example: stream-a3f1c2d...0c-0
         sender:
           type: string
-          description: Sender's Stellar public key
+          description: |
+            Sender Stellar public key (G + 55 base32 chars).
+          pattern: '^G[A-Z2-7]{55}$'
           example: GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX
         recipient:
           type: string
-          description: Recipient's Stellar public key
+          description: |
+            Recipient Stellar public key (G + 55 base32 chars).
+          pattern: '^G[A-Z2-7]{55}$'
           example: GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX
         depositAmount:
           type: string
-          description: Total deposit in stroops
-          example: '1000000000'
+          description: Total deposit as a decimal string (never a number).
+          pattern: '^[+-]?[0-9]+(\.[0-9]+)?$'
+          example: '1000'
         ratePerSecond:
           type: string
-          description: Streaming rate in stroops/second
-          example: '100000'
+          description: Streaming rate per second as a decimal string.
+          pattern: '^[+-]?[0-9]+(\.[0-9]+)?$'
+          example: '10'
         startTime:
           type: integer
-          description: Stream start time (Unix timestamp)
-          example: 1704067200
-        createdAt:
-          type: string
-          format: date-time
-          description: When the stream was created
-          example: '2024-01-01T12:00:00Z'
+          description: Stream start time (Unix epoch seconds).
+          example: 1700000000
+        endTime:
+          type: integer
+          description: Stream end time (Unix epoch seconds). 0 = indefinite.
+          example: 0
         status:
           type: string
           enum:
-            - pending
             - active
+            - paused
             - completed
             - cancelled
-          description: Current stream status
+          description: Current stream status.
           example: active
 
-    StreamList:
+    StreamResponse:
       type: object
+      required:
+        - streams
+        - has_more
       properties:
         streams:
           type: array
           items:
             $ref: '#/components/schemas/Stream'
-        cursor:
+        has_more:
+          type: boolean
+          description: Whether more pages are available.
+          example: true
+        next_cursor:
           type: string
           nullable: true
-          description: Pagination cursor for next page (null if no more pages)
-          example: c3RyZWFtLTE3MDQwNjcyMDA=
+          description: Opaque cursor for the next page (absent when has_more=false).
+          example: eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjLTAifQ
         total:
           type: integer
           nullable: true
-          description: Total number of streams (only if includeTotal=true)
+          description: Total count (only present when include_total=true).
           example: 42
 
-    HealthReport:
+    StreamListResponse:
       type: object
+      required:
+        - success
+        - data
+        - meta
       properties:
-        status:
-          type: string
-          enum:
-            - healthy
-            - degraded
-            - unhealthy
-          description: Overall service health
-          example: healthy
-        timestamp:
-          type: string
-          format: date-time
-          description: Health check timestamp
-          example: '2024-01-01T12:00:00Z'
-        dependencies:
+        success:
+          type: boolean
+          enum: [true]
+        data:
           type: object
           properties:
-            database:
-              $ref: '#/components/schemas/DependencyHealth'
-            stellarRpc:
-              $ref: '#/components/schemas/DependencyHealth'
-            workers:
-              $ref: '#/components/schemas/DependencyHealth'
+            streams:
+              type: array
+              items:
+                $ref: '#/components/schemas/Stream'
+            has_more:
+              type: boolean
+              description: Whether more streams are available
+              example: false
+            next_cursor:
+              type: string
+              nullable: true
+              description: Pagination cursor for next page (null if no more pages)
+              example: null
+            total:
+              type: integer
+              nullable: true
+              description: Total number of streams (only if include_total=true)
+              example: null
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
 
-    DependencyHealth:
+    CancelStreamResponse:
       type: object
+      required:
+        - success
+        - data
+        - meta
       properties:
-        status:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Stream cancelled
+            id:
+              type: string
+              example: stream-1704067200-abc12
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    AcceptedResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+              example: queued
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    EventReplayResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      description: |
+        Response envelope for the cursor-based event replay endpoint.
+        Amount fields inside `events[].payload` are always decimal strings.
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+          required:
+            - events
+            - total
+            - limit
+            - offset
+          properties:
+            events:
+              type: array
+              description: Ordered list of contract events for this page.
+              items:
+                $ref: '#/components/schemas/StreamEventRecord'
+            total:
+              type: integer
+              description: Total events matching the filter after the cursor position.
+              example: 42
+            limit:
+              type: integer
+              description: Effective page size (capped at 1000).
+              example: 100
+            offset:
+              type: integer
+              description: Always 0 when cursor-based pagination is used.
+              example: 0
+            nextCursor:
+              type: string
+              nullable: true
+              description: |
+                Pass as `afterEventId` on the next request to advance the
+                replay window. Absent when there are no more events.
+              example: evt-abc123
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    StreamEventRecord:
+      type: object
+      description: |
+        An append-only record of a contract event as ingested from the chain.
+        Amount fields in `payload` follow the decimal-string serialization policy.
+      required:
+        - eventId
+        - ledger
+        - ledgerHash
+        - contractId
+        - topic
+        - txHash
+        - txIndex
+        - operationIndex
+        - eventIndex
+        - payload
+        - happenedAt
+        - ingestedAt
+      properties:
+        eventId:
           type: string
-          enum:
-            - healthy
-            - unhealthy
-          example: healthy
-        latency:
+          description: Stable unique identifier for this event (chain-derived).
+          example: evt-abc123
+        ledger:
           type: integer
-          description: Response time in milliseconds
-          example: 45
-        error:
+          description: Ledger sequence number.
+          example: 512345
+        ledgerHash:
           type: string
-          nullable: true
-          description: Error message if unhealthy
-          example: null
+          description: Ledger hash for reorg detection.
+          example: abc123def456
+        contractId:
+          type: string
+          description: Soroban contract ID.
+          example: CCONTRACT123
+        topic:
+          type: string
+          description: Event topic.
+          example: stream.created
+        txHash:
+          type: string
+          description: Transaction hash.
+          example: tx-abc123
+        txIndex:
+          type: integer
+          example: 0
+        operationIndex:
+          type: integer
+          example: 0
+        eventIndex:
+          type: integer
+          example: 0
+        payload:
+          type: object
+          description: |
+            Arbitrary event payload. Amount fields (depositAmount, ratePerSecond,
+            etc.) are always decimal strings — never numbers.
+          additionalProperties: true
+          example:
+            streamId: stream-abc123
+            depositAmount: "100.0000000"
+            ratePerSecond: "0.0000001"
+        happenedAt:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp when the event occurred on-chain.
+          example: '2026-03-26T12:00:00.000Z'
+        ingestedAt:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp when the event was ingested into the store.
+          example: '2026-03-26T12:00:01.000Z'
 
     ErrorResponse:
       type: object
       required:
+        - success
         - error
       properties:
+        success:
+          type: boolean
+          enum: [false]
+          description: Always false for error responses
+          example: false
         error:
           type: object
           required:
             - code
             - message
-            - status
           properties:
             code:
               type: string
               description: Machine-readable error code
-              example: invalid_stellar_address
+              enum:
+                - VALIDATION_ERROR
+                - NOT_FOUND
+                - CONFLICT
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - PAYLOAD_TOO_LARGE
+                - TOO_MANY_REQUESTS
+                - SERVICE_UNAVAILABLE
+                - INTERNAL_ERROR
+                - DECIMAL_ERROR
+              example: VALIDATION_ERROR
             message:
               type: string
               description: Human-readable error message
-              example: 'sender must be a valid Stellar public key (starts with G, 56 chars)'
-            status:
-              type: integer
-              description: HTTP status code
-              example: 400
+              example: Validation failed
             requestId:
               type: string
-              description: Correlation ID for debugging
+              description: Correlation ID for log triage
               example: 550e8400-e29b-41d4-a716-446655440000
             details:
-              type: object
+              description: Additional error context (field-level validation errors, etc.)
               nullable: true
-              description: Additional error context
-              example:
-                field: sender
-                value: invalid
 
   securitySchemes:
     BearerAuth:
@@ -499,10 +1120,19 @@ components:
       description: |
         JWT token for authentication. Include in Authorization header:
         Authorization: Bearer <token>
+    AdminAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Admin API key for privileged operations. Include in Authorization header:
+        Authorization: Bearer <ADMIN_API_KEY>
+        Set via ADMIN_API_KEY environment variable.
 
 tags:
   - name: System
     description: System health and metadata endpoints
+  - name: Auth
+    description: Authentication and session management
   - name: Streams
     description: Stream creation, retrieval, and listing
   - name: Internal

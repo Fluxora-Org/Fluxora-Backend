@@ -46,6 +46,23 @@ services:
       - redis
       - full
 
+  # One-shot migration runner — exits 0 on success, non-zero on failure.
+  # The app service depends on this completing successfully.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fluxora-migrate
+    command: ["node", "dist/scripts/run-migrations.js"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fluxora}:${POSTGRES_PASSWORD:-fluxora_password}@postgres:5432/${POSTGRES_DB:-fluxora}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - fluxora-network
+    restart: "no"
+
   # Fluxora Backend Application
   app:
     build:
@@ -83,6 +100,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s

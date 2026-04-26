@@ -15,6 +15,7 @@ type CorsNext = (err?: unknown) => void;
 
 const DEFAULT_ALLOWED_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
 const DEFAULT_ALLOWED_HEADERS = 'Content-Type,Authorization,X-Correlation-ID';
+const PREFLIGHT_MAX_AGE = '86400'; // 24 hours in seconds
 
 function parseAllowedOrigins(raw: string | undefined): Set<string> {
   if (!raw) {
@@ -33,11 +34,17 @@ function isProduction(): boolean {
   return process.env.NODE_ENV === 'production';
 }
 
-function allowOrigin(res: CorsResponse, origin: string): void {
+function allowOrigin(req: CorsRequest, res: CorsResponse, origin: string): void {
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', DEFAULT_ALLOWED_METHODS);
-  res.setHeader('Access-Control-Allow-Headers', DEFAULT_ALLOWED_HEADERS);
+
+  // Echo back the requested headers if present, otherwise use defaults.
+  const requestedHeaders = req.header('Access-Control-Request-Headers');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    requestedHeaders ?? DEFAULT_ALLOWED_HEADERS,
+  );
 }
 
 function isPreflight(req: CorsRequest): boolean {
@@ -58,8 +65,9 @@ export function corsAllowlistMiddleware(req: CorsRequest, res: CorsResponse, nex
   }
 
   if (!isProduction()) {
-    allowOrigin(res, origin);
+    allowOrigin(req, res, origin);
     if (isPreflight(req)) {
+      res.setHeader('Access-Control-Max-Age', PREFLIGHT_MAX_AGE);
       res.sendStatus(204);
       return;
     }
@@ -71,8 +79,9 @@ export function corsAllowlistMiddleware(req: CorsRequest, res: CorsResponse, nex
   const isAllowed = allowedOrigins.has(origin);
 
   if (isAllowed) {
-    allowOrigin(res, origin);
+    allowOrigin(req, res, origin);
     if (isPreflight(req)) {
+      res.setHeader('Access-Control-Max-Age', PREFLIGHT_MAX_AGE);
       res.sendStatus(204);
       return;
     }

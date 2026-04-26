@@ -9,6 +9,8 @@
  * log-shipping agents and shell pipelines can separate severity streams.
  */
 
+import { sanitize, redactKeysInString } from '../pii/sanitizer.js';
+
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 export interface LogRecord {
@@ -20,13 +22,17 @@ export interface LogRecord {
 }
 
 function write(level: LogLevel, message: string, correlationId?: string, meta?: Record<string, unknown>): void {
+  // Sanitize the message and metadata
+  const sanitizedMessage = redactKeysInString(message);
+  const sanitizedMeta = meta ? sanitize(meta) : undefined;
+  
   // meta is spread first so core fields (timestamp, level, message, correlationId)
   // always take precedence and cannot be overwritten by callers.
   const record: LogRecord = {
-    ...meta,
+    ...sanitizedMeta,
     timestamp: new Date().toISOString(),
     level,
-    message,
+    message: sanitizedMessage,
     ...(correlationId !== undefined ? { correlationId } : {}),
   };
   const line = JSON.stringify(record) + '\n';

@@ -9,7 +9,7 @@ import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
 function resolveRoute(req: Request): string {
   const raw = req.route?.path
     ? `${req.baseUrl}${req.route.path}`
-    : req.originalUrl.split('?')[0];
+    : (req.originalUrl.split('?')[0] ?? req.originalUrl);
 
   // Collapse trailing slash to keep label cardinality predictable,
   // but preserve the bare root path "/".
