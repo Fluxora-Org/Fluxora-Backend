@@ -38,6 +38,7 @@ import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import type { ContractEventStore } from '../indexer/store.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
+import { getTracer } from '../tracing/hooks.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -347,7 +348,7 @@ export class StreamHub {
     const targets = Array.from(subscribers);
 
     if (targets.length <= FANOUT_YIELD_BATCH) {
-      this.deliverBatch(targets, message);
+      this.deliverBatch(targets, message, streamId, eventId);
       return;
     }
 
@@ -355,14 +356,16 @@ export class StreamHub {
     let i = 0;
     function next(): void {
       const end = Math.min(i + FANOUT_YIELD_BATCH, targets.length);
-      self.deliverBatch(targets.slice(i, end), message);
+      self.deliverBatch(targets.slice(i, end), message, streamId, eventId);
       i = end;
       if (i < targets.length) setImmediate(next);
     }
     next();
   }
 
-  private deliverBatch(batch: WebSocket[], message: string): void {
+  private deliverBatch(batch: WebSocket[], message: string, streamId: string, eventId: string): number {
+    let sent = 0;
+    
     for (const ws of batch) {
       if (ws.readyState !== WebSocket.OPEN) continue;
 
@@ -383,6 +386,7 @@ export class StreamHub {
 
       ws.send(message);
       this.metrics.sentMessages++;
+      sent++;
 
       const state = this.clients.get(ws);
       if (state) {
@@ -400,6 +404,8 @@ export class StreamHub {
     });
     tracer.recordEvent(span, 'ws.broadcast', { streamId, eventId, recipients: sent });
     tracer.endSpan(span, 'ok');
+    
+    return sent;
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
