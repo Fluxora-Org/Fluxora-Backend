@@ -60,7 +60,7 @@ import {
   serviceUnavailable,
   asyncHandler,
 } from '../middleware/errorHandler.js';
-import { requireIdempotencyKey } from '../middleware/requestProtection.js';
+import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth } from '../middleware/auth.js';
@@ -105,7 +105,7 @@ type NormalizedCreateInput = {
 type StoredIdempotentResponse = {
   requestFingerprint: string;
   statusCode: number;
-  body: Stream;
+  body: ReturnType<typeof successResponse<Stream>>;
 };
 
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
@@ -222,7 +222,7 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
     const formatted = formatZodIssues(parseResult.issues);
     throw new ApiError(
       ApiErrorCode.VALIDATION_ERROR,
-      formattedErrors[0]?.message ?? 'Validation failed',
+      formatted[0]?.message ?? 'Validation failed',
       400,
       formatted.map((e) => e.message).join('; '),
     );
@@ -347,7 +347,7 @@ streamsRouter.get(
       result = {
         streams: dbResult.streams.map(toApiStream),
         hasMore: dbResult.hasMore,
-        total:   dbResult.total,
+        ...(dbResult.total !== undefined ? { total: dbResult.total } : {}),
       };
     } catch (err) {
       wrapDbError(err);
@@ -412,7 +412,8 @@ streamsRouter.post(
   requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = (req as any).id as string | undefined;
-    const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
+    const correlationId = (req as any).correlationId as string | undefined;
+    const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
 
     if (idempotencyDependency.state !== 'healthy') {
       warn('Idempotency dependency unavailable', {
@@ -464,12 +465,14 @@ streamsRouter.post(
       info('Replaying idempotent stream creation', {
         requestId,
         correlationId,
-        streamId: existingResponse.body.id,
+        streamId: existingResponse.body.data.id,
         action: 'replay',
       });
       res.set('Idempotency-Key', idempotencyKey);
       res.set('Idempotency-Replayed', 'true');
-      res.status(existingResponse.statusCode).json(existingResponse.body);
+      res.status(existingResponse.statusCode).json(
+        idempotentReplayResponse(existingResponse.body.data, requestId),
+      );
       return;
     }
 
@@ -501,11 +504,12 @@ streamsRouter.post(
     }
 
     const stream = toApiStream(upsertResult!.stream);
-    idempotencyStore.set(idempotencyKey, { requestFingerprint, statusCode: 201, body: stream });
+    const responseEnvelope = successResponse(stream, requestId);
+    idempotencyStore.set(idempotencyKey, { requestFingerprint, statusCode: 201, body: responseEnvelope });
 
     SerializationLogger.amountSerialized(2, requestId);
     info('Stream created', { id: stream.id, requestId, correlationId, action: 'created' });
-    recordAuditEvent('STREAM_CREATED', 'stream', stream.id, correlationId, {
+    recordAuditEvent('STREAM_CREATED', 'stream', stream.id, correlationId ?? '', {
       depositAmount: normalizedInput.depositAmount,
       ratePerSecond: normalizedInput.ratePerSecond,
       sender:        normalizedInput.sender,
@@ -514,7 +518,7 @@ streamsRouter.post(
 
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
-    res.status(201).json(stream);
+    res.status(201).json(responseEnvelope);
   }),
 );
 
@@ -549,13 +553,13 @@ streamsRouter.delete(
     }
 
     try {
-      await streamRepository.updateStream(id, { status: 'cancelled' }, requestId);
+      await streamRepository.updateStream(id, { status: 'cancelled' }, requestId ?? '');
     } catch (err) {
       wrapDbError(err);
     }
 
     info('Stream cancelled', { id, requestId });
-    recordAuditEvent('STREAM_CANCELLED', 'stream', id, (req as any).correlationId);
+    recordAuditEvent('STREAM_CANCELLED', 'stream', id, (req as any).correlationId ?? '');
 
     res.json({ message: 'Stream cancelled', id });
   }),
@@ -603,13 +607,13 @@ streamsRouter.patch(
     try {
       // 'scheduled' is an API-only concept; map to 'active' in DB
       const dbStatus = newStatus === 'scheduled' ? 'active' : newStatus as StreamStatus;
-      updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId);
+      updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId ?? '');
     } catch (err) {
       wrapDbError(err);
     }
 
     info('Stream status updated', { id, from: record!.status, to: newStatus, requestId });
-    recordAuditEvent('STREAM_STATUS_UPDATED', 'stream', id, (req as any).correlationId);
+    recordAuditEvent('STREAM_STATUS_UPDATED', 'stream', id, (req as any).correlationId ?? '');
 
     res.json(successResponse(toApiStream(updated!), requestId));
   }),
