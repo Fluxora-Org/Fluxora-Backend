@@ -227,6 +227,13 @@ export class WebhookService {
   }
 
   /**
+   * Register an inbound delivery ID for deduplication.
+   */
+  registerDeliveryId(deliveryId: string): void {
+    webhookDeliveryStore.registerDeliveryId(deliveryId);
+  }
+
+  /**
    * Check if a delivery ID has been seen (for deduplication)
    */
   isDuplicateDelivery(deliveryId: string): boolean {

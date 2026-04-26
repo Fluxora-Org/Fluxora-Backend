@@ -5,6 +5,7 @@ import { healthRouter } from './routes/health.js';
 import { indexerRouter } from './routes/indexer.js';
 import { auditRouter } from './routes/audit.js';
 import { dlqRouter } from './routes/dlq.js';
+import { webhooksRouter } from './routes/webhooks.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
@@ -43,6 +44,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/health', healthRouter);
   app.use('/api/streams', streamsRouter);
   app.use('/internal/indexer', indexerRouter);
+  app.use('/internal/webhooks', webhooksRouter);
   app.use('/api/audit', auditRouter);
   app.use('/admin/dlq', dlqRouter);
 
