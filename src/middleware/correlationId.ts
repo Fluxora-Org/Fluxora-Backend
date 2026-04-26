@@ -16,18 +16,34 @@
  */
 
 import { randomUUID } from 'crypto';
+import { correlationStore } from '../tracing/middleware.js';
 
 /** Canonical header name used for correlation IDs throughout the service. */
 export const CORRELATION_ID_HEADER = 'x-correlation-id';
 
-export function correlationIdMiddleware(req: any, res: any, next: any): void {
-  const incoming = req.headers[CORRELATION_ID_HEADER];
-  const correlationId =
-    typeof incoming === 'string' && incoming.trim().length > 0
-      ? incoming.trim()
-      : randomUUID();
+const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-  req.correlationId = correlationId;
-  res.setHeader(CORRELATION_ID_HEADER, correlationId);
-  next();
+export function isValidCorrelationId(value: string): boolean {
+  return UUID_V4_REGEX.test(value);
+}
+
+function resolveCorrelationId(incoming: unknown): string {
+  if (typeof incoming === 'string') {
+    const trimmed = incoming.trim();
+    if (trimmed.length > 0 && isValidCorrelationId(trimmed)) {
+      return trimmed;
+    }
+  }
+
+  return randomUUID();
+}
+
+export function correlationIdMiddleware(req: any, res: any, next: any): void {
+  const correlationId = resolveCorrelationId(req.headers[CORRELATION_ID_HEADER]);
+
+  correlationStore.run(correlationId, () => {
+    req.correlationId = correlationId;
+    res.setHeader(CORRELATION_ID_HEADER, correlationId);
+    next();
+  });
 }

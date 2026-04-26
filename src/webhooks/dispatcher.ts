@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { logger } from '../lib/logger.js';
+import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
+import { getCorrelationId } from '../tracing/middleware.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { computeWebhookSignature } from './signature.js';
@@ -13,6 +15,7 @@ export interface WebhookDispatchOptions {
   eventType: string;
   policy?: WebhookRetryPolicy;
   attemptNumber?: number;
+  correlationId?: string;
 }
 
 export interface WebhookDispatchResult {
@@ -37,10 +40,11 @@ export class WebhookDispatcher {
    * Dispatch a webhook with proper signature and error handling
    */
   async dispatch(options: WebhookDispatchOptions): Promise<WebhookDispatchResult> {
-    const { url, secret, payload, deliveryId, eventType, attemptNumber = 1 } = options;
+    const { url, secret, payload, deliveryId, eventType, attemptNumber = 1, correlationId } = options;
     const timestamp = Math.floor(Date.now() / 1000).toString();
+    const effectiveCorrelationId = correlationId ?? getCorrelationId();
 
-    logger.info('Dispatching webhook', undefined, {
+    logger.info('Dispatching webhook', effectiveCorrelationId !== 'unknown' ? effectiveCorrelationId : undefined, {
       deliveryId,
       eventType,
       attemptNumber,
@@ -50,7 +54,7 @@ export class WebhookDispatcher {
     const signature = computeWebhookSignature(secret, timestamp, payload);
 
     try {
-      const response = await this.sendRequest(url, payload, deliveryId, eventType, timestamp, signature);
+      const response = await this.sendRequest(url, payload, deliveryId, eventType, timestamp, signature, effectiveCorrelationId);
       
       const attempt: WebhookDeliveryAttempt = {
         attemptNumber,
@@ -165,21 +169,28 @@ export class WebhookDispatcher {
     eventType: string,
     timestamp: string,
     signature: string,
+    correlationId?: string,
   ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
 
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'x-fluxora-delivery-id': deliveryId,
+        'x-fluxora-timestamp': timestamp,
+        'x-fluxora-signature': signature,
+        'x-fluxora-event': eventType,
+        'User-Agent': 'Fluxora-Webhook-Dispatcher/2.0',
+      };
+
+      if (correlationId && correlationId !== 'unknown') {
+        headers[CORRELATION_ID_HEADER] = correlationId;
+      }
+
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-fluxora-delivery-id': deliveryId,
-          'x-fluxora-timestamp': timestamp,
-          'x-fluxora-signature': signature,
-          'x-fluxora-event': eventType,
-          'User-Agent': 'Fluxora-Webhook-Dispatcher/2.0',
-        },
+        headers,
         body: payload,
         signal: controller.signal,
       });
