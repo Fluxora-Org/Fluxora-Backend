@@ -77,7 +77,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/internal/indexer', indexerRouter);
   app.use('/api/audit', auditRouter);
   app.use('/admin/dlq', dlqRouter);
-  app.use('/api/rate-limits', createRateLimitsRouter(env));
+  app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(

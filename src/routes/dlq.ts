@@ -195,7 +195,7 @@ dlqRouter.get(
       limit,
       offset,
       has_more: offset + page.length < filtered.length,
-    });
+    }));
   }),
 );
 

@@ -6,6 +6,7 @@ import { Logger } from '../config/logger.js';
 import { Config } from '../config/env.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { isShuttingDown } from '../shutdown.js';
+import { getIndexerHealth } from './indexer.js';
 
 export const healthRouter = Router();
 
@@ -37,7 +38,7 @@ healthRouter.get('/', (req: Request, res: Response) => {
   const config = req.app.locals.config as Config | undefined;
   let indexerStall;
   try {
-    indexer = assessIndexerHealth({ stallThresholdMs: DEFAULT_INDEXER_STALL_THRESHOLD_MS });
+    indexerStall = assessIndexerHealth({ stallThresholdMs: DEFAULT_INDEXER_STALL_THRESHOLD_MS });
   } catch {
     indexerStall = { status: 'unknown' };
   }
