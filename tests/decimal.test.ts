@@ -18,6 +18,7 @@ import {
   validateAmountFields,
   parseToStroops,
   formatFromStroops,
+  normalizeDecimalString,
   DecimalSerializationError,
   DecimalErrorCode,
   DECIMAL_STRING_PATTERN,
@@ -48,6 +49,26 @@ describe('Decimal String Serialization Policy', () => {
     });
   });
 
+  describe('normalizeDecimalString', () => {
+    it('strips trailing fractional zeros', () => {
+      expect(normalizeDecimalString('100.50')).toBe('100.5');
+      expect(normalizeDecimalString('1.0000000')).toBe('1');
+      expect(normalizeDecimalString('100.0')).toBe('100');
+      expect(normalizeDecimalString('0.10')).toBe('0.1');
+    });
+
+    it('leaves values without trailing zeros unchanged', () => {
+      expect(normalizeDecimalString('100')).toBe('100');
+      expect(normalizeDecimalString('0.0000116')).toBe('0.0000116');
+      expect(normalizeDecimalString('0')).toBe('0');
+    });
+
+    it('handles negative values', () => {
+      expect(normalizeDecimalString('-100.50')).toBe('-100.5');
+      expect(normalizeDecimalString('-1.0')).toBe('-1');
+    });
+  });
+
   describe('validateDecimalString', () => {
     describe('valid inputs', () => {
       it('should validate positive integers', () => {
@@ -66,7 +87,7 @@ describe('Decimal String Serialization Policy', () => {
       it('should validate positive decimals', () => {
         const result = validateDecimalString('100.50');
         expect(result.valid).toBe(true);
-        expect(result.value).toBe('100.50');
+        expect(result.value).toBe('100.5'); // trailing zero stripped
       });
 
       it('should validate zero', () => {
@@ -195,13 +216,60 @@ describe('Decimal String Serialization Policy', () => {
         expect(result.valid).toBe(false);
         expect(result.error?.code).toBe(DecimalErrorCode.OUT_OF_RANGE);
       });
+
+      // --- Extreme value boundary tests ---
+
+      it('should accept int64 max (9223372036854775807)', () => {
+        const result = validateDecimalString('9223372036854775807');
+        expect(result.valid).toBe(true);
+        expect(result.value).toBe('9223372036854775807');
+      });
+
+      it('should reject int64 max + 1 (9223372036854775808)', () => {
+        const result = validateDecimalString('9223372036854775808');
+        expect(result.valid).toBe(false);
+        expect(result.error?.code).toBe(DecimalErrorCode.OUT_OF_RANGE);
+      });
+
+      it('should accept int64 max with fractional part', () => {
+        // Integer part equals int64 max — still valid
+        const result = validateDecimalString('9223372036854775807.9999999');
+        expect(result.valid).toBe(true);
+      });
+
+      it('should reject value whose integer part exceeds int64 max', () => {
+        const result = validateDecimalString('9223372036854775808.0');
+        expect(result.valid).toBe(false);
+        expect(result.error?.code).toBe(DecimalErrorCode.OUT_OF_RANGE);
+      });
+
+      // --- Trailing-zero normalization tests ---
+
+      it('should normalize trailing fractional zeros', () => {
+        expect(validateDecimalString('100.50').value).toBe('100.5');
+        expect(validateDecimalString('1.0000000').value).toBe('1');
+        expect(validateDecimalString('100.0').value).toBe('100');
+        expect(validateDecimalString('0.10').value).toBe('0.1');
+      });
+
+      it('should not alter values with no trailing zeros', () => {
+        expect(validateDecimalString('0.0000116').value).toBe('0.0000116');
+        expect(validateDecimalString('100').value).toBe('100');
+        expect(validateDecimalString('0').value).toBe('0');
+      });
     });
   });
 
   describe('serializeToDecimalString', () => {
-    it('should serialize valid string as-is', () => {
-      const result = serializeToDecimalString('100.50');
-      expect(result).toBe('100.50');
+    it('should serialize valid string as-is when already normalized', () => {
+      const result = serializeToDecimalString('100.5');
+      expect(result).toBe('100.5');
+    });
+
+    it('should normalize trailing zeros in string input', () => {
+      expect(serializeToDecimalString('100.50')).toBe('100.5');
+      expect(serializeToDecimalString('1.0000000')).toBe('1');
+      expect(serializeToDecimalString('100.0')).toBe('100');
     });
 
     it('should serialize integer numbers', () => {
