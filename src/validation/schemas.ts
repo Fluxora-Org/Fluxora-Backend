@@ -10,6 +10,7 @@
  * @module validation/schemas
  */
 import { z } from 'zod';
+import { normalizeDecimalString } from '../serialization/decimal.js';
 
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
@@ -21,7 +22,8 @@ function decimalStringField(fieldName: string) {
       required_error: `${fieldName} is required`,
       invalid_type_error: `${fieldName} must be a decimal string, not a number`,
     })
-    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
+    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`)
+    .transform(normalizeDecimalString);
 }
 
 /**
