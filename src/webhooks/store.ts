@@ -365,6 +365,14 @@ export class WebhookDeliveryStore {
   }
 
   /**
+   * Register a delivery ID for deduplication without a full delivery record.
+   * Used by the /receive endpoint for inbound webhook verification.
+   */
+  registerDeliveryId(deliveryId: string): void {
+    this.deliveryIdIndex.set(deliveryId, deliveryId);
+  }
+
+  /**
    * Check if a delivery ID has been seen before (for deduplication)
    */
   isDuplicateDelivery(deliveryId: string): boolean {

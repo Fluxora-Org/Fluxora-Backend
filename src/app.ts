@@ -75,6 +75,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/api/streams', streamsRouter);
   app.use('/api/admin', adminRouter);
   app.use('/internal/indexer', indexerRouter);
+  app.use('/internal/webhooks', webhooksRouter);
   app.use('/api/audit', auditRouter);
   app.use('/admin/dlq', dlqRouter);
   app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));

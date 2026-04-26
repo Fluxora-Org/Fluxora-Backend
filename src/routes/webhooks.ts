@@ -4,6 +4,7 @@
  */
 
 import express from 'express';
+import type { Request, Response } from 'express';
 import { webhookService } from '../webhooks/service.js';
 import { webhookDeliveryStore, type DeadLetterQueueItem, type OutboxItem, type CircuitBreakerState } from '../webhooks/store.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
@@ -75,7 +76,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
  * GET /api/webhooks/deliveries/:deliveryId
  * Get the status of a webhook delivery
  */
-webhooksRouter.get('/deliveries/:deliveryId', (req, res) => {
+webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): void => {
   const { deliveryId } = req.params;
   const requestId = (req as any).id as string | undefined;
 
@@ -107,7 +108,7 @@ webhooksRouter.get('/deliveries/:deliveryId', (req, res) => {
 });
 
 /**
- * GET /api/webhooks/deliveries
+ * GET /deliveries
  * List all webhook deliveries (for monitoring/debugging)
  */
 webhooksRouter.get('/deliveries', (req, res) => {
@@ -392,6 +393,7 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
         message: 'Webhook secret is required as query parameter',
       },
     });
+    return;
   }
 
   try {
