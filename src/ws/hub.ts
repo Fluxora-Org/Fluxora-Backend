@@ -31,7 +31,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
-import type { IncomingMessage } from 'http';
+import type { IncomingMessage, IncomingHttpHeaders } from 'http';
 import type { Server } from 'http';
 import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
@@ -39,6 +39,9 @@ import { verifyWsToken } from '../middleware/tokenAuth.js';
 import type { ContractEventStore } from '../indexer/store.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
+import { getCorrelationId } from '../tracing/middleware.js';
+import { logger } from '../lib/logger.js';
+import { CORRELATION_ID_HEADER, isValidCorrelationId } from '../middleware/correlationId.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -76,6 +79,7 @@ interface ClientState {
   id: string;
   connectedAt: number;
   ip: string;
+  correlationId?: string;
   metrics: ConnectionMetrics;
   subscriptions: Set<string>;
   messageTimestamps: number[];
@@ -182,19 +186,24 @@ export class StreamHub {
     const connectionId = randomUUID();
     const ip = req.socket.remoteAddress ?? 'unknown';
     const connectedAt = Date.now();
+    const correlationId = this.extractCorrelationId(req.headers);
 
     this.clients.set(ws, {
       id: connectionId,
       connectedAt,
       ip,
+      correlationId,
       metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
       subscriptions: new Set(),
       messageTimestamps: [],
     });
 
-    console.info(
-      JSON.stringify({ event: 'ws_connect', connectionId, ip, timestamp: new Date(connectedAt).toISOString() }),
-    );
+    logger.info('WebSocket connected', correlationId, {
+      event: 'ws_connect',
+      connectionId,
+      ip,
+      timestamp: new Date(connectedAt).toISOString(),
+    });
 
     ws.on('message', (data, isBinary) => {
       const state = this.clients.get(ws);
@@ -241,16 +250,14 @@ export class StreamHub {
     }
 
     const durationMs = Date.now() - state.connectedAt;
-    console.info(
-      JSON.stringify({
-        event: 'ws_disconnect',
-        connectionId: state.id,
-        durationMs,
-        code: code ?? 0,
-        reason: reason?.toString('utf8') ?? '',
-        metrics: state.metrics,
-      }),
-    );
+    logger.info('WebSocket disconnected', state.correlationId, {
+      event: 'ws_disconnect',
+      connectionId: state.id,
+      durationMs,
+      code: code ?? 0,
+      reason: reason?.toString('utf8') ?? '',
+      metrics: state.metrics,
+    });
 
     this.clients.delete(ws);
   }
@@ -344,7 +351,8 @@ export class StreamHub {
     const subscribers = this.subscriptions.get(streamId);
     if (!subscribers || subscribers.size === 0) return;
 
-    const message = JSON.stringify({ type: 'stream_update', streamId, eventId, payload });
+    const correlationId = getCorrelationId();
+    const message = JSON.stringify({ type: 'stream_update', streamId, eventId, payload, correlationId });
     const targets = Array.from(subscribers);
 
     if (targets.length <= FANOUT_YIELD_BATCH) {
@@ -396,19 +404,36 @@ export class StreamHub {
     }
 
     // Record a span event for observability (fire-and-forget, no correlationId context here).
+    const correlationId = getCorrelationId();
     const tracer = getTracer();
     const span = tracer.startSpan({
-      traceId: eventId,
+      traceId: correlationId,
       serviceName: 'fluxora-ws',
-      tags: { 'ws.stream_id': streamId, 'ws.event_id': eventId, 'ws.recipients': sent },
+      tags: {
+        'ws.stream_id': streamId,
+        'ws.event_id': eventId,
+        'ws.recipients': sent,
+        'ws.correlation_id': correlationId,
+      },
     });
-    tracer.recordEvent(span, 'ws.broadcast', { streamId, eventId, recipients: sent });
+    tracer.recordEvent(span, 'ws.broadcast', { streamId, eventId, recipients: sent, correlationId });
     tracer.endSpan(span, 'ok');
     
     return sent;
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
+
+  private extractCorrelationId(headers: IncomingHttpHeaders): string | undefined {
+    const incoming = headers[CORRELATION_ID_HEADER];
+    if (typeof incoming === 'string') {
+      const trimmed = incoming.trim();
+      if (trimmed.length > 0 && isValidCorrelationId(trimmed)) {
+        return trimmed;
+      }
+    }
+    return undefined;
+  }
 
   private sendError(ws: WebSocket, code: string, message: string): void {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', code, message }));

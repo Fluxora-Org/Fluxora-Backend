@@ -5,6 +5,8 @@
 
 import { randomUUID } from 'node:crypto';
 import { logger } from '../lib/logger.js';
+import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
+import { getCorrelationId } from '../tracing/middleware.js';
 import type {
   WebhookEvent,
   WebhookDelivery,
@@ -73,7 +75,8 @@ export class WebhookService {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
 
-    logger.info('Attempting webhook delivery', undefined, {
+    const correlationId = getCorrelationId();
+    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
       deliveryId: delivery.deliveryId,
       attempt: attemptNumber,
       maxAttempts: this.policy.maxAttempts,
@@ -93,6 +96,7 @@ export class WebhookService {
         delivery.deliveryId,
         ts,
         signature,
+        correlationId,
       );
 
       attempt.statusCode = response.status;
@@ -173,20 +177,27 @@ export class WebhookService {
     deliveryId: string,
     timestamp: string,
     signature: string,
+    correlationId?: string,
   ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
 
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'x-fluxora-delivery-id': deliveryId,
+        'x-fluxora-timestamp': timestamp,
+        'x-fluxora-signature': signature,
+        'x-fluxora-event': 'webhook.event',
+      };
+
+      if (correlationId && correlationId !== 'unknown') {
+        headers[CORRELATION_ID_HEADER] = correlationId;
+      }
+
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-fluxora-delivery-id': deliveryId,
-          'x-fluxora-timestamp': timestamp,
-          'x-fluxora-signature': signature,
-          'x-fluxora-event': 'webhook.event',
-        },
+        headers,
         body: payload,
         signal: controller.signal,
       });
