@@ -23,6 +23,9 @@ import { checkPendingMigrations } from './db/migrate.js';
 import { getPool } from './db/pool.js';
 import { createStreamHub, getStreamHub } from './ws/hub.js';
 import { webhookDispatcher } from './webhooks/service.js';
+import { createRedisClient } from './redis/client.js';
+import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
+import { setIdempotencyStore } from './routes/streams.js';
 
 // Export a pre-built app instance for use in tests and other consumers.
 export { app } from './app.js';
@@ -37,6 +40,28 @@ async function startServer() {
     // Guard: fail fast if any migrations are pending.
     // Migrations must be applied (e.g. via `pnpm migrate`) before starting.
     await checkPendingMigrations();
+
+    // Wire up Redis-backed idempotency store for POST /api/streams.
+    // Degrades gracefully to NoOp if Redis is disabled or unreachable.
+    let redisClientForIdempotency: Awaited<ReturnType<typeof createRedisClient>> | null = null;
+    if (config.redisEnabled) {
+      try {
+        redisClientForIdempotency = await createRedisClient({ url: config.redisUrl, enabled: true });
+        setIdempotencyStore(
+          new RedisIdempotencyStore(redisClientForIdempotency),
+          config.idempotencyTtlSeconds,
+        );
+        logger.info('Idempotency store: Redis', undefined, { ttlSeconds: config.idempotencyTtlSeconds });
+      } catch (err) {
+        logger.warn('Redis unavailable — idempotency store degraded to NoOp', undefined, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        setIdempotencyStore(new NoOpIdempotencyStore());
+      }
+    } else {
+      logger.info('Redis disabled — idempotency store is NoOp (pass-through)');
+      setIdempotencyStore(new NoOpIdempotencyStore());
+    }
 
     const { createApp } = await import('./app.js');
     const app = createApp({ config });
@@ -62,6 +87,14 @@ async function startServer() {
       if (limiter) await limiter.close();
       logger.info('Rate-limiter store closed');
     });
+
+    if (redisClientForIdempotency) {
+      addShutdownHook(async () => {
+        logger.info('Closing idempotency Redis client...');
+        await redisClientForIdempotency!.close();
+        logger.info('Idempotency Redis client closed');
+      });
+    }
 
     addShutdownHook(async () => {
       logger.info('Closing database connections...');

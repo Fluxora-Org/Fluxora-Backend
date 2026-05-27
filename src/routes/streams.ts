@@ -74,6 +74,12 @@ import {
 } from '../validation/schemas.js';
 import type { StreamStatus, StreamFilter } from '../db/types.js';
 import { streamsCreatedTotal } from '../metrics/businessMetrics.js';
+import {
+  RedisIdempotencyStore,
+  NoOpIdempotencyStore,
+  InMemoryIdempotencyStore,
+  type IdempotencyStore,
+} from '../redis/idempotencyStore.js';
 
 export const streamsRouter = Router();
 
@@ -103,12 +109,6 @@ type NormalizedCreateInput = {
   endTime: number;
 };
 
-type StoredIdempotentResponse = {
-  requestFingerprint: string;
-  statusCode: number;
-  body: ReturnType<typeof successResponse<Stream>>;
-};
-
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
@@ -116,8 +116,13 @@ const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const streamListingDependency = { state: 'healthy' as DependencyState };
 const idempotencyDependency   = { state: 'healthy' as DependencyState };
 
-// In-memory idempotency store (Redis-backed in production; sufficient for now)
-const idempotencyStore = new Map<string, StoredIdempotentResponse>();
+// Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
+// with a RedisIdempotencyStore when Redis is available.
+let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>>> =
+  new InMemoryIdempotencyStore();
+
+// TTL for idempotency entries — overridden in tests and set from config at startup
+let idempotencyTtlSeconds = 86400;
 
 /**
  * Legacy shim — audit.test.ts and streams.test.ts reference this array.
@@ -133,8 +138,27 @@ export function setStreamListingDependencyState(state: DependencyState): void {
 export function setIdempotencyDependencyState(state: DependencyState): void {
   idempotencyDependency.state = state;
 }
+
+/**
+ * Reset the idempotency store to a fresh in-memory instance.
+ * Used in tests to get a clean slate with full idempotency semantics
+ * (no Redis required).
+ */
 export function resetStreamIdempotencyStore(): void {
-  idempotencyStore.clear();
+  idempotencyStore = new InMemoryIdempotencyStore();
+}
+
+/**
+ * Replace the idempotency store implementation.
+ * Called at startup with a RedisIdempotencyStore, and in tests with a
+ * FakeRedisClient-backed store or a NoOpIdempotencyStore.
+ */
+export function setIdempotencyStore(
+  store: IdempotencyStore<ReturnType<typeof successResponse<Stream>>>,
+  ttlSeconds?: number,
+): void {
+  idempotencyStore = store;
+  if (ttlSeconds !== undefined) idempotencyTtlSeconds = ttlSeconds;
 }
 
 // ── DB → API mapper ───────────────────────────────────────────────────────────
@@ -306,11 +330,11 @@ function assertValidApiTransition(
 
 /**
  * Reset test state.
- * In the DB-backed model this only clears the in-memory idempotency store.
+ * Resets the idempotency store to a fresh in-memory instance.
  * Tests that need a clean DB should truncate the table directly.
  */
 export function _resetStreams(): void {
-  idempotencyStore.clear();
+  resetStreamIdempotencyStore();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -452,7 +476,7 @@ streamsRouter.post(
     }
 
     const requestFingerprint = fingerprintInput(normalizedInput);
-    const existingResponse   = idempotencyStore.get(idempotencyKey);
+    const existingResponse   = await idempotencyStore.get(idempotencyKey);
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
@@ -513,7 +537,11 @@ streamsRouter.post(
 
     const stream = toApiStream(upsertResult!.stream);
     const responseEnvelope = successResponse(stream, requestId);
-    idempotencyStore.set(idempotencyKey, { requestFingerprint, statusCode: 201, body: responseEnvelope });
+    await idempotencyStore.set(
+      idempotencyKey,
+      { requestFingerprint, statusCode: 201, body: responseEnvelope },
+      idempotencyTtlSeconds,
+    );
 
     SerializationLogger.amountSerialized(2, requestId);
     info('Stream created', { id: stream.id, requestId, correlationId, action: 'created' });

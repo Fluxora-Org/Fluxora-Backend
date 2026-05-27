@@ -185,6 +185,8 @@ export const EnvSchema = z.object({
   RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
   RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
   RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+  IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
+
   RATE_LIMIT_ENABLED: booleanEnv().default(true),
   RATE_LIMIT_IP_WINDOW_MS: integerEnv('RATE_LIMIT_IP_WINDOW_MS', 1).optional(),
   RATE_LIMIT_IP_MAX: integerEnv('RATE_LIMIT_IP_MAX', 1).optional(),
@@ -249,6 +251,7 @@ export interface Config {
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
+  idempotencyTtlSeconds: number;
   requirePartnerAuth: boolean;
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
@@ -376,6 +379,7 @@ function toConfig(env: ParsedEnv): Config {
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
+    idempotencyTtlSeconds: env.IDEMPOTENCY_TTL_SECONDS,
     requirePartnerAuth: env.REQUIRE_PARTNER_AUTH,
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
