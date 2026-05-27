@@ -305,12 +305,30 @@ function assertValidApiTransition(
 // ── Test helpers (no-op in production) ───────────────────────────────────────
 
 /**
- * Reset test state.
- * In the DB-backed model this only clears the in-memory idempotency store.
- * Tests that need a clean DB should truncate the table directly.
+ * Middleware to enforce stream visibility based on JWT roles and addresses.
+ * Must be used within the router group scope.
+ * @param req Express request object, expected to contain `req.user` from `authenticate` middleware.
+ * @param res Express response object.
+ * @param next Express next middleware function.
  */
-export function _resetStreams(): void {
-  idempotencyStore.clear();
+export function enforceStreamScope(req: Request, res: Response, next: NextFunction): void {
+    // Check if the user is authenticated and if the role requires scoping.
+    if (!req.user || req.user.role === 'operator') {
+        // Operator role bypasses scoping checks.
+        return next();
+    }
+
+    const callerAddress = req.user.address as string | undefined;
+    if (!callerAddress) {
+        // Should not happen if authenticate middleware is working, but safe fail.
+        return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    }
+
+    // Attach caller address to the request object for repository consumption.
+    req.callerAddress = callerAddress;
+
+    // Move to the next handler which will use req.callerAddress
+    next();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
