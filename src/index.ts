@@ -25,7 +25,9 @@ import { createStreamHub, getStreamHub } from './ws/hub.js';
 import { webhookDispatcher } from './webhooks/service.js';
 import { createRedisClient } from './redis/client.js';
 import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
-import { setIdempotencyStore } from './routes/streams.js';
+import { setIdempotencyStore, setStellarAddressValidator } from './routes/streams.js';
+import { StellarAddressValidator } from './validation/stellarAddressValidator.js';
+import { getStellarRpcService } from './services/stellar-rpc.js';
 
 // Export a pre-built app instance for use in tests and other consumers.
 export { app } from './app.js';
@@ -62,6 +64,20 @@ async function startServer() {
       logger.info('Redis disabled — idempotency store is NoOp (pass-through)');
       setIdempotencyStore(new NoOpIdempotencyStore());
     }
+
+    // Wire up Stellar address chain-existence validator for POST /api/streams.
+    // Uses the same Redis client as the idempotency store when available.
+    const rpcService = getStellarRpcService();
+    setStellarAddressValidator(
+      new StellarAddressValidator(
+        rpcService,
+        redisClientForIdempotency,
+        config.stellarAddressCacheTtlSeconds,
+      ),
+    );
+    logger.info('Stellar address validator wired', undefined, {
+      cacheTtlSeconds: config.stellarAddressCacheTtlSeconds,
+    });
 
     const { createApp } = await import('./app.js');
     const app = createApp({ config });

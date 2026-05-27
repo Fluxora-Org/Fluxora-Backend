@@ -294,6 +294,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Unprocessable entity — one or more Stellar addresses in the request
+            body do not exist on-chain. The stream cannot be created because it
+            would never match an on-chain event.
+
+            The `details.missingAddresses` array lists every address that was
+            not found. Addresses that could not be verified due to an RPC outage
+            are omitted (the request is allowed through in that case).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        type: object
+                        properties:
+                          details:
+                            type: object
+                            properties:
+                              missingAddresses:
+                                type: array
+                                items:
+                                  type: string
+                                  pattern: '^G[A-Z2-7]{55}$'
+                                example:
+                                  - 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN'
         '503':
           description: Service unavailable (database, Stellar RPC, or idempotency store down)
           content:
