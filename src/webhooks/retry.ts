@@ -3,7 +3,7 @@
  * Supports multiple backoff strategies and jitter algorithms
  */
 
-import type { WebhookRetryPolicy, WebhookDeliveryAttempt } from './types.js';
+import type { RateLimitStore, SlidingWindowStore } from '../redis/rateLimitStore.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 
 export type BackoffStrategy = 'exponential' | 'linear' | 'fixed';
@@ -94,89 +94,14 @@ export function applyJitter(
   }
 }
 
-/**
- * Calculate the next retry time with enhanced backoff and jitter
- */
-export function calculateNextRetryTime(
-  attemptNumber: number,
-  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  now: number = Date.now(),
-): number {
-  if (attemptNumber >= policy.maxAttempts) {
-    return 0; // No more retries
-  }
+exports.shouldRetry = shouldRetry;
+exports.isRetryableStatusCode = isRetryableStatusCode;
+exports.calculateNextRetryTime = calculateNextRetryTime;
+exports.scheduleWebhookOutboxRetry = scheduleWebhookOutboxRetry;
+exports.generateRetrySchedule = generateRetrySchedule;
+exports.formatRetryPolicy = formatRetryPolicy;
+exports.validateRetryPolicy = validateRetryPolicy;
 
-  const baseDelay = calculateBackoffDelay(attemptNumber, policy);
-  const jitteredDelay = applyJitter(baseDelay, policy);
-  
-  return now + jitteredDelay;
-}
-
-/**
- * Build the durable retry row data for a failed webhook_outbox delivery.
- *
- * The outbox table does not have dedicated retry columns, so retries are
- * represented as a new unprocessed row with created_at set to the next due
- * time. The dispatcher only claims rows whose created_at is in the past.
- */
-export function scheduleWebhookOutboxRetry(
-  input: WebhookOutboxRetryInput,
-): WebhookOutboxRetryPlan {
-  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
-  const nextAttemptNumber = input.attemptNumber + 1;
-
-  if (input.attemptNumber >= policy.maxAttempts) {
-    return {
-      shouldRetry: false,
-      attemptNumber: input.attemptNumber,
-      retryAt: null,
-      payload: input.payload,
-    };
-  }
-
-  const now = input.now ?? Date.now();
-  const retryAt = new Date(calculateNextRetryTime(input.attemptNumber, policy, now));
-  const sourcePayload =
-    typeof input.payload === 'object' && input.payload !== null
-      ? input.payload as Record<string, unknown>
-      : { data: input.payload };
-
-  return {
-    shouldRetry: true,
-    attemptNumber: nextAttemptNumber,
-    retryAt,
-    payload: {
-      ...sourcePayload,
-      _webhookRetry: {
-        attemptNumber: nextAttemptNumber,
-        previousAttemptAt: new Date(now).toISOString(),
-      },
-    },
-  };
-}
-
-/**
- * Generate full retry schedule for a delivery
- */
-export function generateRetrySchedule(
-  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  now: number = Date.now(),
-): RetrySchedule[] {
-  const schedule: RetrySchedule[] = [];
-  
-  for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
-    const delayMs = calculateBackoffDelay(attempt - 1, policy);
-    const jitteredDelay = applyJitter(delayMs, policy);
-    
-    schedule.push({
-      attemptNumber: attempt,
-      delayMs: jitteredDelay,
-      retryAt: now + jitteredDelay,
-    });
-  }
-  
-  return schedule;
-}
 
 /**
  * Determine if a status code is retryable with enhanced logic
@@ -185,34 +110,7 @@ export function isRetryableStatusCode(
   statusCode: number | undefined,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
 ): boolean {
-  if (statusCode === undefined) {
-    return true; // Network errors are retryable
-  }
-  
-  // Check if status code is in retryable list
-  if (policy.retryableStatusCodes.includes(statusCode)) {
-    return true;
-  }
-  
-  // Additional retryable conditions
-  switch (statusCode) {
-    case 408: // Request Timeout
-    case 429: // Too Many Requests
-    case 500: // Internal Server Error
-    case 502: // Bad Gateway
-    case 503: // Service Unavailable
-    case 504: // Gateway Timeout
-      return true;
-      
-    case 413: // Payload Too Large
-    case 414: // URI Too Long
-    case 431: // Request Header Fields Too Large
-      return false; // These are unlikely to be fixed by retrying
-      
-    default:
-      // 4xx errors (except specific ones above) are not retryable
-      return statusCode >= 500;
-  }
+  // ... existing logic ...
 }
 
 /**
