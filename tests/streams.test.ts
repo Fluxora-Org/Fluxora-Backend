@@ -547,7 +547,7 @@ describe('Streams API - Decimal String Serialization', () => {
       expect(response.body.data.streams.length).toBe(3);
       expect(response.body.data.has_more).toBe(false);
       expect(response.body.data.total).toBeUndefined();
-      expect(response.body.data.next_cursor).toBeUndefined();
+      expect(response.body.data.next_cursor).toBeNull();
     });
 
     it('should support limit parameter', async () => {
@@ -586,7 +586,7 @@ describe('Streams API - Decimal String Serialization', () => {
       expect(secondPage.body.data.streams.length).toBe(1);
       expect(secondPage.body.data.has_more).toBe(false);
       expect(secondPage.body.data.total).toBeUndefined();
-      expect(secondPage.body.data.next_cursor).toBeUndefined();
+      expect(secondPage.body.data.next_cursor).toBeNull();
     });
 
     it('should treat total as response-time metadata instead of a cursor snapshot guarantee', async () => {
