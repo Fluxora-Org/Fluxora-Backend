@@ -82,7 +82,6 @@ import {
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
-import { StellarAddressValidator } from '../validation/stellarAddressValidator.js';
 
 export const streamsRouter = Router();
 
@@ -127,9 +126,6 @@ let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>
 // TTL for idempotency entries — overridden in tests and set from config at startup
 let idempotencyTtlSeconds = 86400;
 
-// Stellar address chain-existence validator — null means skip (disabled or not yet wired)
-let stellarAddressValidator: StellarAddressValidator | null = null;
-
 /**
  * Legacy shim — audit.test.ts and streams.test.ts reference this array.
  * The DB-backed implementation no longer uses it for storage; it is kept
@@ -165,15 +161,6 @@ export function setIdempotencyStore(
 ): void {
   idempotencyStore = store;
   if (ttlSeconds !== undefined) idempotencyTtlSeconds = ttlSeconds;
-}
-
-/**
- * Inject the Stellar address validator.
- * Pass null to disable chain-existence checks (e.g. in tests that don't
- * need RPC validation).
- */
-export function setStellarAddressValidator(v: StellarAddressValidator | null): void {
-  stellarAddressValidator = v;
 }
 
 // ── DB → API mapper ───────────────────────────────────────────────────────────
@@ -497,24 +484,6 @@ streamsRouter.post(
     }
 
     const requestFingerprint = fingerprintInput(normalizedInput);
-
-    // Chain-existence check — runs before idempotency lookup so we never
-    // cache a 422 response as a successful creation.
-    if (stellarAddressValidator !== null) {
-      const addrResult = await stellarAddressValidator.validate(
-        normalizedInput.sender,
-        normalizedInput.recipient,
-      );
-      if (!addrResult.valid) {
-        throw new ApiError(
-          ApiErrorCode.UNPROCESSABLE_ENTITY,
-          'One or more addresses do not exist on-chain',
-          422,
-          { missingAddresses: addrResult.missingAddresses },
-        );
-      }
-    }
-
     const existingResponse   = await idempotencyStore.get(idempotencyKey);
 
     if (existingResponse) {
