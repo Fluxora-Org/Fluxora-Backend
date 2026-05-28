@@ -32,6 +32,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Run pnpm audit (high/critical fail)
+        run: pnpm audit --audit-level=high --json > audit.json || true
+
+      - name: Parse audit results and comment on PR
+        run: node .github/workflows/audit-comment.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+
       - name: Check formatting and lint
         run: pnpm run lint
 
