@@ -78,7 +78,7 @@
  *       404: { description: Not found }
  */
 import { Router, type Request, type Response, type NextFunction } from 'express';
-import { authenticate, requireAuth } from '../middleware/auth.js';
+import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { asyncHandler, validationError } from '../middleware/errorHandler.js';
 import { info, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
@@ -126,20 +126,8 @@ export function _resetDlq(): void {
 
 export const dlqRouter = Router();
 
-/** Enforce operator role; must be used after authenticate + requireAuth. */
-function requireOperator(req: Request, res: Response, next: NextFunction): void {
-  if (req.user?.role !== 'operator') {
-    warn('Non-operator attempted DLQ access', { role: req.user?.role, path: req.path });
-    res.status(403).json(
-      errorResponse('FORBIDDEN', 'Operator role required to access the DLQ', undefined, req.id)
-    );
-    return;
-  }
-  next();
-}
-
-// All DLQ routes require authentication + operator role
-dlqRouter.use(authenticate, requireAuth, requireOperator);
+// All DLQ routes require authentication + appropriate permission
+dlqRouter.use(authenticate, requireAuth);
 
 /**
  * GET /admin/dlq
@@ -147,6 +135,7 @@ dlqRouter.use(authenticate, requireAuth, requireOperator);
  */
 dlqRouter.get(
   '/',
+  requirePermission(Permission.DLQ_LIST),
   asyncHandler(async (req: Request, res: Response) => {
     const limitParam  = req.query.limit;
     const offsetParam = req.query.offset;
@@ -205,6 +194,7 @@ dlqRouter.get(
  */
 dlqRouter.get(
   '/:id',
+  requirePermission(Permission.DLQ_READ),
   asyncHandler(async (req: Request, res: Response) => {
     const entry = dlqEntries.find((e) => e.id === req.params.id);
     if (!entry) {
@@ -221,6 +211,7 @@ dlqRouter.get(
  */
 dlqRouter.post(
   '/:id/replay',
+  requirePermission(Permission.DLQ_REPLAY),
   asyncHandler(async (req: Request, res: Response) => {
     const index = dlqEntries.findIndex((e) => e.id === req.params.id);
     if (index === -1) {
@@ -263,6 +254,7 @@ dlqRouter.post(
  */
 dlqRouter.delete(
   '/:id',
+  requirePermission(Permission.DLQ_DELETE),
   asyncHandler(async (req: Request, res: Response) => {
     const index = dlqEntries.findIndex((e) => e.id === req.params.id);
     if (index === -1) {
@@ -281,6 +273,7 @@ dlqRouter.delete(
  */
 dlqRouter.delete(
   '/',
+  requirePermission(Permission.DLQ_DELETE),
   asyncHandler(async (req: Request, res: Response) => {
     const topicFilter = req.query.topic;
     const requestId = req.id;

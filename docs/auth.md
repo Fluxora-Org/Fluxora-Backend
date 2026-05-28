@@ -1,3 +1,31 @@
+# Authentication & Authorization (RBAC)
+
+This document describes the fine-grained permission model introduced to replace simple `role` checks.
+
+JWT claim structure
+- `address` (string): account address
+- `role` (string): convenience hint (e.g. `operator`, `viewer`, `admin`)
+- `permissions` (string[]): explicit permission scopes such as `streams:read` or `admin:pause`
+
+Permission enum (representative)
+- `streams:read`, `streams:write`
+- `admin:pause`, `admin:reindex`, `indexer:replay`
+- `dlq:list`, `dlq:read`, `dlq:replay`, `dlq:delete`
+- `audit:read`, `audit:write`
+
+Roles and default permissions
+- `operator`: elevated operational permissions (streams read/write, DLQ, basic audit read)
+- `viewer`: read-only (`streams:read`)
+- `admin`: all permissions
+
+Middleware
+- `authenticate`: verifies JWT and validates payload with Zod (must include `permissions` array).
+- `requireAuth`: ensures an authenticated user exists.
+- `requirePermission(permission)`: middleware factory that ensures the caller holds the requested permission.
+
+Notes
+- Tokens without a `permissions` claim are rejected by `authenticate`.
+- For backward compatibility in tests and local token generation, `generateToken()` will backfill sensible permissions based on `role` if `permissions` is not supplied.
 # Authentication and Pluggable OIDC Support
 
 Fluxora supports two parallel authentication paths at the session creation endpoint `POST /api/auth/session` to obtain a Fluxora JWT:

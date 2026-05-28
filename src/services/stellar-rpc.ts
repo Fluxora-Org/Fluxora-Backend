@@ -173,6 +173,8 @@ export class CircuitBreaker {
 
 export interface RawRpcClient {
   getLatestLedger(): Promise<{ sequence: number }>;
+  /** Horizon base URL used for account existence checks. */
+  horizonUrl?: string;
 }
 
 export class StellarRpcService {
@@ -221,6 +223,39 @@ export class StellarRpcService {
     return this.breaker.call(() => this.callWithTimeout(
       () => this.getClient().getLatestLedger(),
       'getLatestLedger',
+      opts,
+    ));
+  }
+
+  /**
+   * Check whether a Stellar account exists on-chain via the Horizon REST API.
+   *
+   * Returns true if the account is found (HTTP 200), false if not found
+   * (HTTP 404). Any other error (network, timeout, circuit open) is re-thrown
+   * so callers can decide whether to fail-open or fail-closed.
+   *
+   * Security note: the address is URL-encoded before interpolation to prevent
+   * path traversal via crafted key values.
+   */
+  async accountExists(address: string, opts: RpcCallOptions = {}): Promise<boolean> {
+    return this.breaker.call(() => this.callWithTimeout(
+      async () => {
+        const client = this.getClient();
+        const base = (client.horizonUrl ?? '').replace(/\/$/, '');
+        if (!base) {
+          throw new RpcProviderError('horizonUrl not configured on RPC client', 'PROVIDER');
+        }
+        const url = `${base}/accounts/${encodeURIComponent(address)}`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs) });
+        if (res.status === 200) return true;
+        if (res.status === 404) return false;
+        throw new RpcProviderError(
+          `Horizon returned HTTP ${res.status} for account lookup`,
+          'PROVIDER',
+          res.status,
+        );
+      },
+      'accountExists',
       opts,
     ));
   }
