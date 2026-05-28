@@ -294,6 +294,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Unprocessable entity — one or more Stellar addresses in the request
+            body do not exist on-chain. The stream cannot be created because it
+            would never match an on-chain event.
+
+            The `details.missingAddresses` array lists every address that was
+            not found. Addresses that could not be verified due to an RPC outage
+            are omitted (the request is allowed through in that case).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        type: object
+                        properties:
+                          details:
+                            type: object
+                            properties:
+                              missingAddresses:
+                                type: array
+                                items:
+                                  type: string
+                                  pattern: '^G[A-Z2-7]{55}$'
+                                example:
+                                  - 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN'
         '503':
           description: Service unavailable (database, Stellar RPC, or idempotency store down)
           content:
@@ -310,12 +339,12 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Number of streams to return (1-100, default 50)
+          description: Number of streams to return (1-100, default 20)
           schema:
             type: integer
             minimum: 1
             maximum: 100
-            default: 50
+            default: 20
         - name: cursor
           in: query
           required: false
@@ -852,6 +881,7 @@ components:
       required:
         - streams
         - has_more
+        - next_cursor
       properties:
         streams:
           type: array
@@ -864,7 +894,10 @@ components:
         next_cursor:
           type: string
           nullable: true
-          description: Opaque cursor for the next page (absent when has_more=false).
+          description: |
+            Opaque cursor for the next page. Always present in the response.
+            `null` when `has_more` is false (no further pages).
+            Pass as the `cursor` query parameter on the next request.
           example: eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjLTAifQ
         total:
           type: integer
@@ -884,6 +917,10 @@ components:
           enum: [true]
         data:
           type: object
+          required:
+            - streams
+            - has_more
+            - next_cursor
           properties:
             streams:
               type: array
@@ -891,17 +928,21 @@ components:
                 $ref: '#/components/schemas/Stream'
             has_more:
               type: boolean
-              description: Whether more streams are available
+              description: Whether more streams are available.
               example: false
             next_cursor:
               type: string
               nullable: true
-              description: Pagination cursor for next page (null if no more pages)
+              description: |
+                Opaque cursor for the next page. Always present.
+                `null` when there are no further pages.
+                Encodes the `id` of the last stream on the current page
+                using keyset (`WHERE id > $cursor ORDER BY id ASC`) semantics.
               example: null
             total:
               type: integer
               nullable: true
-              description: Total number of streams (only if include_total=true)
+              description: Total number of streams (only if include_total=true).
               example: null
         meta:
           $ref: '#/components/schemas/ResponseMeta'

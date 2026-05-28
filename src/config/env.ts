@@ -166,6 +166,7 @@ export const EnvSchema = z.object({
   FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
   WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
   WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+  WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
 
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
   ENABLE_RATE_LIMIT: booleanEnv().optional(),
@@ -184,6 +185,8 @@ export const EnvSchema = z.object({
   RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
   RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
   RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+  IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
+
   RATE_LIMIT_ENABLED: booleanEnv().default(true),
   RATE_LIMIT_IP_WINDOW_MS: integerEnv('RATE_LIMIT_IP_WINDOW_MS', 1).optional(),
   RATE_LIMIT_IP_MAX: integerEnv('RATE_LIMIT_IP_MAX', 1).optional(),
@@ -244,9 +247,11 @@ export interface Config {
   webhookSecretPrevious?: string | undefined;
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
+  webhookRetryRps: number;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
+  idempotencyTtlSeconds: number;
   requirePartnerAuth: boolean;
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
@@ -370,9 +375,11 @@ function toConfig(env: ParsedEnv): Config {
     webhookSecretPrevious: env.WEBHOOK_SECRET_PREVIOUS,
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
+    webhookRetryRps: env.WEBHOOK_RETRY_RPS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
+    idempotencyTtlSeconds: env.IDEMPOTENCY_TTL_SECONDS,
     requirePartnerAuth: env.REQUIRE_PARTNER_AUTH,
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,

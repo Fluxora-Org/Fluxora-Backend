@@ -44,6 +44,12 @@ jobs:
       - name: Check formatting and lint
         run: pnpm run lint
 
+      - name: Type check
+        run: pnpm run typecheck
+
+      - name: Format check
+        run: pnpm run format:check
+
       - name: Build
         run: pnpm run build
 

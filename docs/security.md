@@ -15,10 +15,3 @@ isolated and reset between runs.
 The repository's CI will run `pnpm audit --audit-level=high --json` and
 fail the build on any high/critical advisories unless an explicit
 exception is recorded in `.pnpm-audit-exceptions` (see CI docs).
-
-### Audit exceptions
-
-To accept a high/critical advisory (rare, with justification), add an entry
-to a repo-scoped `.pnpm-audit-exceptions` file and include a human-readable
-justification and the advisory id. CI will still surface the advisory but
-will allow the build to proceed when a matching exception is present.
