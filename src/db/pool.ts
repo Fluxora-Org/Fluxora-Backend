@@ -13,9 +13,11 @@
  */
 
 import pg from 'pg';
+import crypto from 'crypto';
 import { logger } from '../lib/logger.js';
 import { traceSpan } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
+import { dbSlowQueriesTotal } from '../metrics/dbMetrics.js';
 
 const { Pool } = pg;
 
@@ -94,6 +96,16 @@ export function setPool(pool: pg.Pool | null): void {
 const PG_UNIQUE_VIOLATION = '23505';
 
 /**
+ * Extract a safe table hint from SQL for metric labelling.
+ * Returns the first table name found after FROM/INTO/UPDATE/JOIN keywords.
+ * Never returns raw SQL or parameter values.
+ */
+export function extractTableHint(sql: string): string {
+  const match = /(?:FROM|INTO|UPDATE|JOIN)\s+["']?(\w+)["']?/i.exec(sql);
+  return match?.[1] ?? 'unknown';
+}
+
+/**
  * Run a query against the pool.
  * - Throws PoolExhaustedError when all connections are busy.
  * - Throws DuplicateEntryError on unique constraint violations.
@@ -103,6 +115,7 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   pool: pg.Pool,
   sql: string,
   params?: unknown[],
+  thresholdMs: number = parseInt(process.env['SLOW_QUERY_THRESHOLD_MS'] ?? '1000', 10),
 ): Promise<pg.QueryResult<T>> {
   // Pool exhaustion check before acquiring
   if (pool.totalCount >= pool.options.max! && pool.idleCount === 0 && pool.waitingCount > 0) {
@@ -120,8 +133,16 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
     try {
       const result = await pool.query<T>(sql, params);
       const latency = Date.now() - start;
-      if (latency > 1_000) {
-        logger.warn('Slow postgres query', undefined, { sql, latencyMs: latency });
+      if (thresholdMs > 0 && latency >= thresholdMs) {
+        const queryHash = crypto.createHash('sha256').update(sql).digest('hex').slice(0, 16);
+        const tableHint = extractTableHint(sql);
+        logger.warn('Slow postgres query', correlationId, {
+          query_hash: queryHash,
+          duration_ms: latency,
+          table_hint: tableHint,
+          correlation_id: correlationId,
+        });
+        dbSlowQueriesTotal.inc({ table_hint: tableHint });
       }
       return result;
     } catch (err) {
