@@ -25,6 +25,7 @@ import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
+import { docsRouter } from './routes/docs.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -82,6 +83,9 @@ export function createApp(options: AppOptions = {}): Express {
 
   // Metrics endpoint - no auth required for Prometheus scraping
   app.use('/metrics', metricsRouter);
+
+  // OpenAPI spec and Swagger UI — no auth required
+  app.use(docsRouter);
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
