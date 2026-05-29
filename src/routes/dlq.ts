@@ -77,12 +77,13 @@
  *       403: { description: Forbidden }
  *       404: { description: Not found }
  */
-import { Router, type Request, type Response, type NextFunction } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { asyncHandler, validationError } from '../middleware/errorHandler.js';
-import { info, warn } from '../utils/logger.js';
+import { info } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { successResponse, errorResponse } from '../utils/response.js';
+import { dlqRepository } from '../db/repositories/dlqRepository.js';
 
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
@@ -96,13 +97,10 @@ export interface DlqEntry {
   correlationId?: string;
 }
 
-// In-memory DLQ store (placeholder — PostgreSQL integration is a follow-up)
-const dlqEntries: DlqEntry[] = [];
-
 /** Enqueue a dead-letter entry. Called by internal workers. */
-export function enqueueDeadLetter(
+export async function enqueueDeadLetter(
   entry: Omit<DlqEntry, 'id' | 'firstFailedAt' | 'lastFailedAt'>,
-): DlqEntry {
+): Promise<DlqEntry> {
   const now = new Date().toISOString();
   const full: DlqEntry = {
     ...entry,
@@ -110,18 +108,8 @@ export function enqueueDeadLetter(
     firstFailedAt: now,
     lastFailedAt: now,
   };
-  dlqEntries.push(full);
+  await dlqRepository.insert(full);
   return full;
-}
-
-/** Return all entries (shallow copy). */
-export function getDlqEntries(): DlqEntry[] {
-  return dlqEntries.slice();
-}
-
-/** Reset — test use only. */
-export function _resetDlq(): void {
-  dlqEntries.length = 0;
 }
 
 export const dlqRouter = Router();
@@ -160,30 +148,19 @@ dlqRouter.get(
       offset = parsed;
     }
 
-    let filtered = dlqEntries.slice();
-    if (typeof topicFilter === 'string' && topicFilter.trim() !== '') {
-      filtered = filtered.filter((e) => e.topic === topicFilter.trim());
-    }
+    const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
+    const { entries, total } = await dlqRepository.findAll({ limit, offset, topic });
 
-    const page = filtered.slice(offset, offset + limit);
+    info('DLQ entries listed', { total, returned: entries.length, offset, limit, requestId });
 
-    info('DLQ entries listed', { total: filtered.length, returned: page.length, offset, limit, requestId });
-
-    // Record audit event for DLQ listing
-    recordAuditEvent(
-      'DLQ_LISTED',
-      'dlq',
-      'list',
-      requestId,
-      { total: filtered.length, returned: page.length, offset, limit, topicFilter }
-    );
+    recordAuditEvent('DLQ_LISTED', 'dlq', 'list', requestId, { total, returned: entries.length, offset, limit, topicFilter });
 
     res.json(successResponse({
-      entries: page,
-      total: filtered.length,
+      entries,
+      total,
       limit,
       offset,
-      has_more: offset + page.length < filtered.length,
+      has_more: offset + entries.length < total,
     }));
   }),
 );
@@ -196,7 +173,7 @@ dlqRouter.get(
   '/:id',
   requirePermission(Permission.DLQ_READ),
   asyncHandler(async (req: Request, res: Response) => {
-    const entry = dlqEntries.find((e) => e.id === req.params.id);
+    const entry = await dlqRepository.findById(req.params.id);
     if (!entry) {
       res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
       return;
@@ -213,21 +190,13 @@ dlqRouter.post(
   '/:id/replay',
   requirePermission(Permission.DLQ_REPLAY),
   asyncHandler(async (req: Request, res: Response) => {
-    const index = dlqEntries.findIndex((e) => e.id === req.params.id);
-    if (index === -1) {
-      res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
-      return;
-    }
-
-    const entry = dlqEntries[index];
+    const entry = await dlqRepository.findById(req.params.id);
     if (!entry) {
       res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
       return;
     }
-    
-    // Reset the entry for replay
-    entry.attempts = 0;
-    entry.lastFailedAt = new Date().toISOString();
+
+    await dlqRepository.update(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
     
     info('DLQ entry replayed', { id: entry.id, topic: entry.topic, requestId: req.id });
     
@@ -256,14 +225,13 @@ dlqRouter.delete(
   '/:id',
   requirePermission(Permission.DLQ_DELETE),
   asyncHandler(async (req: Request, res: Response) => {
-    const index = dlqEntries.findIndex((e) => e.id === req.params.id);
-    if (index === -1) {
+    const deleted = await dlqRepository.deleteById(req.params.id);
+    if (!deleted) {
       res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
       return;
     }
-    const [removed] = dlqEntries.splice(index, 1);
-    info('DLQ entry acknowledged', { id: removed!.id, requestId: req.id });
-    res.json(successResponse({ message: 'DLQ entry removed', id: removed!.id }, req.id));
+    info('DLQ entry acknowledged', { id: req.params.id, requestId: req.id });
+    res.json(successResponse({ message: 'DLQ entry removed', id: req.params.id }, req.id));
   }),
 );
 
@@ -278,42 +246,17 @@ dlqRouter.delete(
     const topicFilter = req.query.topic;
     const requestId = req.id;
 
-    let entriesToRemove = dlqEntries.slice();
-    if (typeof topicFilter === 'string' && topicFilter.trim() !== '') {
-      entriesToRemove = entriesToRemove.filter((e) => e.topic === topicFilter.trim());
-    }
+    const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
+    const purged = await dlqRepository.deleteAll(topic);
 
-    if (entriesToRemove.length === 0) {
-      res.json(successResponse({ message: 'No DLQ entries to purge', purged: 0 }, requestId));
-      return;
-    }
+    info('DLQ entries purged', { count: purged, topicFilter, requestId });
 
-    // Remove entries
-    const removedIds: string[] = [];
-    entriesToRemove.forEach((entry) => {
-      const index = dlqEntries.findIndex((e) => e.id === entry.id);
-      if (index !== -1) {
-        dlqEntries.splice(index, 1);
-        removedIds.push(entry.id);
-      }
-    });
-
-    info('DLQ entries purged', { count: removedIds.length, topicFilter, requestId });
-
-    // Record audit event for DLQ purge
-    recordAuditEvent(
-      'DLQ_PURGED',
-      'dlq',
-      'bulk',
-      requestId,
-      { purgedCount: removedIds.length, topicFilter, removedIds }
-    );
+    recordAuditEvent('DLQ_PURGED', 'dlq', 'bulk', requestId, { purgedCount: purged, topicFilter });
 
     res.json(successResponse({
       message: 'DLQ entries purged',
-      purged: removedIds.length,
+      purged,
       topicFilter: topicFilter || 'all',
-      removedIds,
     }, requestId));
   }),
 );
