@@ -1,37 +1,43 @@
-# Observability Metrics
+# Observability
 
-The application exposes the following Prometheus business metrics at the `/metrics` endpoint.
+## Slow-query logging
 
-## Custom Business Metrics
+Every PostgreSQL query executed through `src/db/pool.ts` is timed. When the duration meets or exceeds `SLOW_QUERY_THRESHOLD_MS`, a structured `WARN` log entry is emitted and a Prometheus counter is incremented.
 
-### 1. Stream Creation Rate
-- **Metric Name**: `fluxora_streams_created_total`
-- **Type**: Counter
-- **Labels**:
-  - `status`: The initial status of the created stream (e.g., `active`).
-- **Meaning**: Total number of treasury streams successfully created.
+### Configuration
 
-### 2. Webhook Delivery Throughput
-- **Metric Name**: `fluxora_webhook_deliveries_total`
-- **Type**: Counter
-- **Labels**:
-  - `outcome`: The outcome of the webhook dispatch (`success` or `failed`).
-- **Meaning**: Total number of webhook delivery attempts.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SLOW_QUERY_THRESHOLD_MS` | `1000` | Threshold in ms. Set to `0` to disable slow-query logging entirely. |
 
-### 3. Webhook Delivery Duration
-- **Metric Name**: `fluxora_webhook_delivery_duration_seconds`
-- **Type**: Histogram
-- **Buckets**: `[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]`
-- **Meaning**: Latency duration of webhook delivery attempts in seconds.
+### Log fields
 
-### 4. Indexer Ingestion Throughput
-- **Metric Name**: `fluxora_indexer_events_ingested_total`
-- **Type**: Counter
-- **Labels**: None
-- **Meaning**: Total number of contract events successfully ingested and persisted by the indexer.
+```json
+{
+  "level": "warn",
+  "message": "Slow postgres query",
+  "query_hash": "a3f1c2d4e5b6a7f8",
+  "duration_ms": 1234,
+  "table_hint": "streams",
+  "correlation_id": "req_abc123"
+}
+```
 
-### 5. Indexer Ingestion Lag
-- **Metric Name**: `fluxora_indexer_lag_seconds`
-- **Type**: Gauge
-- **Labels**: None
-- **Meaning**: Ingestion lag of the indexer in seconds, calculated as the difference between current time and the latest ledger event timestamp (`happenedAt`) in the ingested batch.
+| Field | Description |
+|-------|-------------|
+| `query_hash` | First 16 hex chars of SHA-256(sql). Stable across runs; safe to log. |
+| `duration_ms` | Wall-clock query duration in milliseconds. |
+| `table_hint` | First table name extracted from the SQL keyword context (FROM/INTO/UPDATE/JOIN). |
+| `correlation_id` | Request correlation ID from async context, if available. |
+
+Raw SQL and parameter values are **never** logged to prevent PII/credential leakage.
+
+### Prometheus metric
+
+```
+fluxora_db_slow_queries_total{table_hint="streams"} 3
+```
+
+Counter name: `fluxora_db_slow_queries_total`  
+Label: `table_hint` — the extracted table name (or `unknown`).  
+Scraped at: `GET /metrics`

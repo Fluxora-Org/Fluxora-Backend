@@ -96,13 +96,6 @@ export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): numbe
   }
 }
 
-exports.shouldRetry = shouldRetry;
-exports.isRetryableStatusCode = isRetryableStatusCode;
-exports.calculateNextRetryTime = calculateNextRetryTime;
-exports.scheduleWebhookOutboxRetry = scheduleWebhookOutboxRetry;
-exports.generateRetrySchedule = generateRetrySchedule;
-exports.formatRetryPolicy = formatRetryPolicy;
-exports.validateRetryPolicy = validateRetryPolicy;
 
 
 /**

@@ -91,9 +91,9 @@ describe('query', () => {
     expect(result.rows).toEqual([]);
   });
 
-  it('throws PoolExhaustedError when pool is full and requests are waiting', async () => {
-    const pool = makePool({ totalCount: 10, idleCount: 0, waitingCount: 1 });
-    await expect(query(pool, 'SELECT 1')).rejects.toBeInstanceOf(PoolExhaustedError);
+  it('throws PoolExhaustedError when waiting queue reaches the queue limit', async () => {
+    const pool = makePool({ totalCount: 10, idleCount: 0, waitingCount: 50 });
+    await expect(query(pool, 'SELECT 1', undefined, 50)).rejects.toBeInstanceOf(PoolExhaustedError);
   });
 
   it('throws DuplicateEntryError on unique constraint violation', async () => {
