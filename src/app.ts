@@ -81,7 +81,7 @@ export function createApp(options: AppOptions = {}): Express {
     });
   }
 
-  // Metrics endpoint - no auth required for Prometheus scraping
+  // Metrics endpoint - requires Bearer token (ADMIN_API_KEY) for Prometheus scraping
   app.use('/metrics', metricsRouter);
 
   // OpenAPI spec and Swagger UI — no auth required

@@ -1,6 +1,7 @@
 import express from 'express';
 import type { Request, Response } from 'express';
 import { registry } from '../metrics.js';
+import { requireAdminAuth } from '../middleware/adminAuth.js';
 
 export const metricsRouter = express.Router();
 
@@ -13,9 +14,11 @@ export const metricsRouter = express.Router();
  * - Default Node.js metrics (process info, GC, memory, etc.)
  *
  * Content-Type: text/plain; version=0.0.4
- * This endpoint is typically scraped by Prometheus or similar monitoring systems.
+ *
+ * Protected by Bearer token auth (ADMIN_API_KEY). Prometheus scrape jobs must
+ * include: Authorization: Bearer <ADMIN_API_KEY>
  */
-metricsRouter.get('/', async (_req: Request, res: Response) => {
+metricsRouter.get('/', requireAdminAuth, async (_req: Request, res: Response) => {
   try {
     res.set('Content-Type', registry.contentType);
     const metrics = await registry.metrics();
