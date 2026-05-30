@@ -122,6 +122,7 @@ export const EnvSchema = z.object({
   DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
   DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
   SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
+  STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
@@ -218,6 +219,7 @@ export interface Config {
   databaseConnectionTimeout: number;
   databaseIdleTimeout: number;
   slowQueryThresholdMs: number;
+  statementTimeoutMs: number;
 
   redisUrl: string;
   redisEnabled: boolean;
@@ -344,6 +346,7 @@ function toConfig(env: ParsedEnv): Config {
     databaseConnectionTimeout: env.DB_CONNECTION_TIMEOUT,
     databaseIdleTimeout: env.DB_IDLE_TIMEOUT,
     slowQueryThresholdMs: env.SLOW_QUERY_THRESHOLD_MS,
+    statementTimeoutMs: env.STATEMENT_TIMEOUT_MS,
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
