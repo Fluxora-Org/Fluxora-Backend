@@ -24,7 +24,13 @@ import crypto from 'crypto';
 import { logger } from '../lib/logger.js';
 import { traceSpan } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
-import { dbSlowQueriesTotal } from '../metrics/dbMetrics.js';
+import {
+  dbSlowQueriesTotal,
+  dbPoolActiveConnections,
+  dbPoolIdleConnections,
+  dbPoolWaitingRequests,
+  dbPoolExhaustedTotal,
+} from '../metrics/dbMetrics.js';
 
 const { Pool } = pg;
 
@@ -166,7 +172,7 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   params?: unknown[],
   thresholdMs: number = parseInt(process.env['SLOW_QUERY_THRESHOLD_MS'] ?? '1000', 10),
 ): Promise<pg.QueryResult<T>> {
-  const limit = queueLimit ?? envInt('POOL_QUEUE_LIMIT', 50);
+  const limit = envInt('POOL_QUEUE_LIMIT', 50);
 
   // Fast-fail when the waiting queue has reached the configured limit.
   // This prevents unbounded queuing and gives callers a deterministic 503.
@@ -191,11 +197,11 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
       if (thresholdMs > 0 && latency >= thresholdMs) {
         const queryHash = crypto.createHash('sha256').update(sql).digest('hex').slice(0, 16);
         const tableHint = extractTableHint(sql);
-        logger.warn('Slow postgres query', correlationId, {
+        logger.slowQuery({
           query_hash: queryHash,
           duration_ms: latency,
           table_hint: tableHint,
-          correlation_id: correlationId,
+          ...(correlationId ? { correlation_id: correlationId } : {}),
         });
         dbSlowQueriesTotal.inc({ table_hint: tableHint });
       }
