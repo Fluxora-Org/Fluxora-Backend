@@ -14,6 +14,47 @@ Fluxora Backend uses a `pg.Pool` (node-postgres) for all database access. The po
 | `DB_CONNECTION_TIMEOUT` | `5000` | ms to wait for a connection before timing out |
 | `DB_IDLE_TIMEOUT` | `30000` | ms before an idle connection is closed |
 | `POOL_QUEUE_LIMIT` | `50` | Max requests allowed to queue before fast-failing with 503 |
+| `STATEMENT_TIMEOUT_MS` | `5000` | Per-connection statement timeout in ms. Set to `0` to disable. |
+
+## Statement Timeout
+
+### How it works
+
+On every new physical connection, the pool's `connect` event fires `SET statement_timeout = $1` with the value of `STATEMENT_TIMEOUT_MS`. This applies a session-level limit so any query that runs longer than the configured duration is automatically canceled by PostgreSQL with error code `57014` (`query_canceled`).
+
+```
+new connection established
+       │
+       ▼
+SET statement_timeout = STATEMENT_TIMEOUT_MS
+       │
+       ▼
+connection ready for queries
+       │
+       ▼
+query exceeds timeout?
+       │
+      YES ──► PG error 57014 → QueryTimeoutError → HTTP 504 Gateway Timeout
+       │
+       NO
+       │
+       ▼
+  result returned normally
+```
+
+### Disabling the timeout
+
+Set `STATEMENT_TIMEOUT_MS=0` to skip the `SET statement_timeout` call entirely. This is useful for long-running maintenance scripts or migrations that should not be interrupted.
+
+### Error mapping
+
+| PG error code | Error class | HTTP status |
+|---|---|---|
+| `57014` (query_canceled) | `QueryTimeoutError` | `504 Gateway Timeout` |
+
+### Security note
+
+Using a parameterized query (`SET statement_timeout = $1`) prevents SQL injection. The timeout value is validated as a non-negative integer by the `integerEnv` schema helper before it reaches the pool.
 
 ## Pool Exhaustion Detection
 
@@ -73,14 +114,14 @@ Gauges are updated on every `connect`, `acquire`, and `remove` pool event.
 
 | Event | Trigger | Action |
 |---|---|---|
-| `connect` | New physical connection opened | Sync gauges, debug log |
+| `connect` | New physical connection opened | Apply `statement_timeout`, sync gauges, debug log |
 | `acquire` | Connection checked out | Sync gauges |
 | `remove` | Connection closed/removed | Sync gauges, debug log |
 | `error` | Idle client error | Error log |
 
 ## Caller Behaviour
 
-`PoolExhaustedError` should be mapped to an HTTP `503 Service Unavailable` response. The existing error handler in `src/middleware/errorHandler.ts` handles this.
+`PoolExhaustedError` should be mapped to an HTTP `503 Service Unavailable` response. `QueryTimeoutError` should be mapped to an HTTP `504 Gateway Timeout` response. Both are handled automatically by the error handler in `src/middleware/errorHandler.ts`.
 
 ## Operator Runbook
 

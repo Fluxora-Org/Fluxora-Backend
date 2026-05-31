@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from 'express';
 import { DecimalSerializationError } from '../serialization/decimal.js';
 import { SerializationLogger, error as logError } from '../utils/logger.js';
 import { errorResponse } from '../utils/response.js';
+import { QueryTimeoutError } from '../db/pool.js';
 
 export interface ApiErrorResponse {
   success: false;
@@ -21,6 +22,7 @@ export enum ApiErrorCode {
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
   UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
+  GATEWAY_TIMEOUT = 'GATEWAY_TIMEOUT',
 }
 
 export class ApiError extends Error {
@@ -45,6 +47,13 @@ export function errorHandler(
   _next: NextFunction
 ): void {
   const requestId = req.id ?? (res.locals['requestId'] as string | undefined);
+
+  if (err instanceof QueryTimeoutError) {
+    res.status(504).json(
+      errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
+    );
+    return;
+  }
 
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
@@ -148,4 +157,8 @@ export function payloadTooLarge(message: string, details?: unknown): ApiError {
 
 export function tooManyRequests(message: string, details?: unknown): ApiError {
   return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
+}
+
+export function gatewayTimeout(message: string): ApiError {
+  return new ApiError(ApiErrorCode.GATEWAY_TIMEOUT, message, 504);
 }

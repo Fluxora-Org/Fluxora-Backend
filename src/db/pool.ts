@@ -24,7 +24,7 @@ import crypto from 'crypto';
 import { logger } from '../lib/logger.js';
 import { traceSpan } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
-import { dbSlowQueriesTotal } from '../metrics/dbMetrics.js';
+import { dbSlowQueriesTotal, dbPoolActiveConnections, dbPoolIdleConnections, dbPoolWaitingRequests, dbPoolExhaustedTotal } from '../metrics/dbMetrics.js';
 
 const { Pool } = pg;
 
@@ -41,6 +41,13 @@ export class DuplicateEntryError extends Error {
   constructor(detail?: string) {
     super(detail ?? 'Duplicate entry');
     this.name = 'DuplicateEntryError';
+  }
+}
+
+export class QueryTimeoutError extends Error {
+  constructor() {
+    super('Query exceeded statement_timeout limit');
+    this.name = 'QueryTimeoutError';
   }
 }
 
@@ -61,6 +68,8 @@ export interface PoolConfig {
   idleTimeoutMillis: number;
   /** Max requests allowed to queue before fast-failing with PoolExhaustedError. */
   queueLimit: number;
+  /** SET LOCAL statement_timeout value in ms. 0 = disabled. */
+  statementTimeoutMs: number;
 }
 
 export function resolvePoolConfig(): PoolConfig {
@@ -71,6 +80,7 @@ export function resolvePoolConfig(): PoolConfig {
     connectionTimeoutMillis: envInt('DB_CONNECTION_TIMEOUT', 5_000),
     idleTimeoutMillis: envInt('DB_IDLE_TIMEOUT', 30_000),
     queueLimit: envInt('POOL_QUEUE_LIMIT', 50),
+    statementTimeoutMs: envInt('STATEMENT_TIMEOUT_MS', 5_000),
   };
 }
 
@@ -96,9 +106,20 @@ export function createPool(config?: PoolConfig): pg.Pool {
     idleTimeoutMillis: cfg.idleTimeoutMillis,
   });
 
-  // Track new physical connections
-  pool.on('connect', () => {
+  // Store queueLimit on the pool instance for use in query()
+  (pool as pg.Pool & { _queueLimit?: number })._queueLimit = cfg.queueLimit;
+
+  // Apply statement_timeout on every new physical connection.
+  // SET LOCAL scopes the timeout to the current transaction; for non-transactional
+  // queries we use SET (session-level) so it persists for the connection lifetime.
+  pool.on('connect', (client: pg.PoolClient) => {
     syncGauges(pool);
+    if (cfg.statementTimeoutMs > 0) {
+      // Fire-and-forget; errors are surfaced via pool.on('error')
+      client.query('SET statement_timeout = $1', [cfg.statementTimeoutMs]).catch((err: Error) => {
+        logger.error('Failed to set statement_timeout', undefined, { error: err.message });
+      });
+    }
     logger.debug('Postgres pool: new connection established', undefined, {
       total: pool.totalCount,
       idle: pool.idleCount,
@@ -143,6 +164,7 @@ export function setPool(pool: pg.Pool | null): void {
 // ── Query helper ──────────────────────────────────────────────────────────────
 
 const PG_UNIQUE_VIOLATION = '23505';
+const PG_QUERY_CANCELED = '57014';
 
 /**
  * Extract a safe table hint from SQL for metric labelling.
@@ -157,6 +179,7 @@ export function extractTableHint(sql: string): string {
 /**
  * Run a query against the pool.
  * - Throws PoolExhaustedError when waiting queue exceeds POOL_QUEUE_LIMIT.
+ * - Throws QueryTimeoutError when the query is canceled by statement_timeout (PG 57014).
  * - Throws DuplicateEntryError on unique constraint violations.
  * - Logs pool_exhausted event and high-latency queries.
  */
@@ -166,7 +189,7 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   params?: unknown[],
   thresholdMs: number = parseInt(process.env['SLOW_QUERY_THRESHOLD_MS'] ?? '1000', 10),
 ): Promise<pg.QueryResult<T>> {
-  const limit = queueLimit ?? envInt('POOL_QUEUE_LIMIT', 50);
+  const limit = (pool as pg.Pool & { _queueLimit?: number })._queueLimit ?? envInt('POOL_QUEUE_LIMIT', 50);
 
   // Fast-fail when the waiting queue has reached the configured limit.
   // This prevents unbounded queuing and gives callers a deterministic 503.
@@ -191,16 +214,19 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
       if (thresholdMs > 0 && latency >= thresholdMs) {
         const queryHash = crypto.createHash('sha256').update(sql).digest('hex').slice(0, 16);
         const tableHint = extractTableHint(sql);
-        logger.warn('Slow postgres query', correlationId, {
+        logger.slowQuery({
           query_hash: queryHash,
           duration_ms: latency,
           table_hint: tableHint,
-          correlation_id: correlationId,
+          ...(correlationId ? { correlation_id: correlationId } : {}),
         });
         dbSlowQueriesTotal.inc({ table_hint: tableHint });
       }
       return result;
     } catch (err) {
+      if ((err as NodeJS.ErrnoException & { code?: string }).code === PG_QUERY_CANCELED) {
+        throw new QueryTimeoutError();
+      }
       if ((err as NodeJS.ErrnoException & { code?: string }).code === PG_UNIQUE_VIOLATION) {
         const detail = (err as { detail?: string }).detail;
         throw new DuplicateEntryError(detail);
