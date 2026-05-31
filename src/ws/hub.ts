@@ -38,6 +38,7 @@ import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import type { ContractEventStore } from '../indexer/store.js';
+import { sseEventBus } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -139,6 +140,10 @@ export class StreamHub extends EventEmitter {
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
   private eventStore: ContractEventStore | undefined;
+
+  public getEventStore(): ContractEventStore | undefined {
+    return this.eventStore;
+  }
 
   private readonly metrics: BackpressureMetrics = {
     droppedMessages: 0,
@@ -458,6 +463,9 @@ export class StreamHub extends EventEmitter {
 
     if (await this.dedup.has(streamId, eventId)) return;
     await this.dedup.add(streamId, eventId);
+
+    // Emit to Server-Sent Events bus
+    sseEventBus.emit('stream_update', event);
 
     const subscribers = this.matchingSubscribers(event);
     if (subscribers.size === 0) return;

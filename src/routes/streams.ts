@@ -77,6 +77,9 @@ import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal } from '../metrics/businessMetrics.js';
+import { verifyWsToken } from '../middleware/tokenAuth.js';
+import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
+import { sseEventBus, eventMatchesStreamId } from '../streams/sseEmitter.js';
 import {
   RedisIdempotencyStore,
   NoOpIdempotencyStore,
@@ -707,3 +710,141 @@ streamsRouter.patch(
     res.json(successResponse(toApiStream(updated!), requestId));
   }),
 );
+
+/**
+ * GET /api/streams/:id/events
+ *
+ * Server-Sent Events (SSE) endpoint to receive real-time stream updates.
+ * Supporting standard JWT authentication and Last-Event-ID resumption.
+ */
+streamsRouter.get(
+  '/:id/events',
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+
+    // 1. Verify Stream Existence
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) {
+      throw notFound('Stream', id);
+    }
+
+    // 2. JWT Authentication and Authorization
+    const wsAuthRequired = process.env.WS_AUTH_REQUIRED === 'true';
+    const jwtSecret = process.env.JWT_SECRET;
+    const authResult = verifyWsToken(req, jwtSecret);
+
+    if (wsAuthRequired && !authResult.ok) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: `Authentication required: ${authResult.code}`,
+          requestId,
+        },
+      });
+      return;
+    } else if (!wsAuthRequired && !authResult.ok && authResult.code === 'INVALID_TOKEN') {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Invalid or expired authentication token',
+          requestId,
+        },
+      });
+      return;
+    }
+
+    // 3. Establish Server-Sent Events stream
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    // Send connection ok comment
+    res.write(': ok\n\n');
+
+    // Periodic heartbeat to prevent proxies and load balancers from closing the connection
+    const heartbeatInterval = setInterval(() => {
+      res.write(': heartbeat\n\n');
+    }, 30000);
+
+    // 4. Handle Last-Event-ID Resumption Replay
+    const lastEventId = req.headers['last-event-id'];
+    if (typeof lastEventId === 'string' && lastEventId.trim() !== '') {
+      const hub = getStreamHub();
+      const eventStore = hub?.getEventStore();
+      if (eventStore) {
+        try {
+          let cursor: string | undefined = lastEventId.trim();
+          do {
+            const result = await eventStore.getEvents({
+              afterEventId: cursor,
+              limit: 100,
+            });
+
+            for (const event of result.events) {
+              if (eventMatchesStreamId(event, id)) {
+                res.write(`id: ${event.eventId}\n`);
+                res.write(`event: stream_update\n`);
+                res.write(`data: ${JSON.stringify({
+                  type: 'stream_update',
+                  streamId: id,
+                  eventId: event.eventId,
+                  payload: event.payload,
+                  correlationId: req.correlationId,
+                })}\n\n`);
+              }
+            }
+
+            cursor = result.nextCursor;
+          } while (cursor !== undefined);
+        } catch (err) {
+          warn('Failed to replay SSE events from store', {
+            error: err instanceof Error ? err.message : String(err),
+            requestId,
+          });
+        }
+      }
+    }
+
+    // 5. Subscribe to Real-Time Updates
+    const listener = (event: StreamUpdateEvent) => {
+      if (event.streamId === id) {
+        res.write(`id: ${event.eventId}\n`);
+        res.write(`event: stream_update\n`);
+        res.write(`data: ${JSON.stringify({
+          type: 'stream_update',
+          streamId: event.streamId,
+          eventId: event.eventId,
+          payload: event.payload,
+          correlationId: req.correlationId || event.correlationId,
+        })}\n\n`);
+      }
+    };
+
+    sseEventBus.on('stream_update', listener);
+
+    // 6. Graceful Disconnect Clean Up
+    res.on('close', () => {
+      clearInterval(heartbeatInterval);
+      sseEventBus.off('stream_update', listener);
+    });
+  }),
+);
+
+export function _resetStreams(): void {}
+
+
