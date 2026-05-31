@@ -49,6 +49,12 @@ import {
   parseWsClientMessage,
   type SubscriptionFilter,
 } from './messageHandler.js';
+import {
+  getClientIp,
+  checkLimiter,
+  trackConnection,
+  untrackConnection,
+} from './connectionLimiter.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -170,14 +176,25 @@ export class StreamHub extends EventEmitter {
 
     this.eventStore = options?.eventStore;
 
-    if (this.wsAuthRequired) {
-      // Use noServer mode so we fully control the upgrade handshake.
-      this.wss = new WebSocketServer({ noServer: true });
+    // Use noServer mode so we fully control the upgrade handshake.
+    this.wss = new WebSocketServer({ noServer: true });
 
-      server.on('upgrade', (req, socket, head) => {
-        const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
-        if (pathname !== '/ws/streams') return;
+    server.on('upgrade', (req, socket, head) => {
+      const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
+      if (pathname !== '/ws/streams') return;
 
+      // 1. Connection Limiter Check
+      const ip = getClientIp(req);
+      const limitResult = checkLimiter(ip);
+      if (!limitResult.allowed) {
+        this.wss.handleUpgrade(req, socket, head, (ws) => {
+          ws.close(limitResult.code || 4029, limitResult.reason);
+        });
+        return;
+      }
+
+      // 2. Auth Check (if required)
+      if (this.wsAuthRequired) {
         const result = verifyWsToken(req, this.jwtSecret);
         if (!result.ok) {
           socket.write(
@@ -189,15 +206,13 @@ export class StreamHub extends EventEmitter {
           socket.destroy();
           return;
         }
+      }
 
-        this.wss.handleUpgrade(req, socket, head, (ws) => {
-          this.wss.emit('connection', ws, req);
-        });
+      // 3. Accept Upgrade
+      this.wss.handleUpgrade(req, socket, head, (ws) => {
+        this.wss.emit('connection', ws, req);
       });
-    } else {
-      // Let the WebSocketServer handle upgrades automatically.
-      this.wss = new WebSocketServer({ server, path: '/ws/streams' });
-    }
+    });
 
     this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       this.onConnect(ws, req);
@@ -208,7 +223,8 @@ export class StreamHub extends EventEmitter {
 
   private onConnect(ws: WebSocket, req: IncomingMessage): void {
     const connectionId = randomUUID();
-    const ip = req.socket.remoteAddress ?? 'unknown';
+    const ip = getClientIp(req);
+    trackConnection(ip);
     const connectedAt = Date.now();
     const correlationId = this.extractCorrelationId(req.headers);
     const authenticatedSubject = this.extractAuthenticatedSubject(req);
@@ -274,6 +290,8 @@ export class StreamHub extends EventEmitter {
   private onDisconnect(ws: WebSocket, code?: number, reason?: Buffer): void {
     const state = this.clients.get(ws);
     if (!state) return;
+
+    untrackConnection(state.ip);
 
     for (const filter of state.subscriptionFilters.values()) {
       this.removeSubscriptionFromIndexes(ws, filter);
