@@ -559,3 +559,71 @@ function getCorrelationIdFromContext(): string {
   }
   return 'unknown';
 }
+
+/**
+ * Enrich a specific Span (custom tracer span) and any associated OTel span/active OTel span with stream attributes.
+ */
+export function enrichSpanWithStream(
+  span: Span,
+  streamId?: string,
+  sender?: string,
+  recipient?: string,
+): void {
+  if (!span) return;
+  if (!span.context) {
+    span.context = { traceId: 'unknown', spanId: 'noop' };
+  }
+  if (!span.context.tags) {
+    span.context.tags = {};
+  }
+
+  // 1. Enrich custom span tags
+  if (streamId) span.context.tags['fluxora.stream_id'] = streamId;
+  if (sender) span.context.tags['fluxora.sender'] = sender;
+  if (recipient) span.context.tags['fluxora.recipient'] = recipient;
+
+  // 2. Enrich the internal OTel span if it exists in tags
+  const otelSpan = span.context.tags['_otelSpan'] as any;
+  if (otelSpan && typeof otelSpan.setAttribute === 'function') {
+    try {
+      if (streamId) otelSpan.setAttribute('fluxora.stream_id', streamId);
+      if (sender) otelSpan.setAttribute('fluxora.sender', sender);
+      if (recipient) otelSpan.setAttribute('fluxora.recipient', recipient);
+    } catch {
+      // ignore OTel setAttribute errors
+    }
+  }
+
+  // 3. Enrich the global active OTel span if one exists
+  try {
+    const activeSpan = trace.getActiveSpan();
+    if (activeSpan) {
+      if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
+      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+    }
+  } catch {
+    // ignore active span errors
+  }
+}
+
+/**
+ * Enrich the active OpenTelemetry span with stream attributes.
+ */
+export function enrichActiveSpanWithStream(
+  streamId?: string,
+  sender?: string,
+  recipient?: string,
+): void {
+  try {
+    const activeSpan = trace.getActiveSpan();
+    if (activeSpan) {
+      if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
+      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+    }
+  } catch {
+    // ignore active span errors
+  }
+}
+

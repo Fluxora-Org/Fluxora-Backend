@@ -41,6 +41,8 @@ import {
 } from '../types.js';
 import { info, debug } from '../../utils/logger.js';
 import { dbQueryDurationSeconds } from '../../metrics/dbMetrics.js';
+import { enrichActiveSpanWithStream } from '../../tracing/hooks.js';
+
 
 const REPO = 'streamRepository';
 
@@ -100,6 +102,7 @@ export const streamRepository = {
    * Uses INSERT … ON CONFLICT DO NOTHING for idempotency.
    */
   async upsertStream(input: CreateStreamInput, correlationId?: string): Promise<UpsertResult> {
+    enrichActiveSpanWithStream(input.id, input.sender_address, input.recipient_address);
     return timed('upsertStream', async () => {
       const pool = getPool();
       const insertSql = `
@@ -145,10 +148,12 @@ export const streamRepository = {
 
   /** Update stream status and/or amounts. Validates status transitions. */
   async updateStream(id: string, input: UpdateStreamInput, correlationId?: string): Promise<StreamRecord> {
+    enrichActiveSpanWithStream(id);
     return timed('updateStream', async () => {
       const pool = getPool();
       const current = await this.getById(id);
       if (!current) throw new Error(`Stream not found: ${id}`);
+      enrichActiveSpanWithStream(current.id, current.sender_address, current.recipient_address);
       if (input.status && !isValidStatusTransition(current.status, input.status)) {
         const allowed = STREAM_INVARIANTS.validTransitions[current.status].join(', ');
         throw new Error(`Invalid status transition: ${current.status} → ${input.status}. Allowed: ${allowed || 'none'}`);
@@ -171,10 +176,16 @@ export const streamRepository = {
 
   /** Fetch a single stream by its primary key. */
   async getById(id: string): Promise<StreamRecord | undefined> {
+    enrichActiveSpanWithStream(id);
     return timed('getById', async () => {
       const pool = getPool();
       const result = await query<Record<string, unknown>>(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
-      return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
+      if (result.rows[0]) {
+        const record = rowToRecord(result.rows[0]);
+        enrichActiveSpanWithStream(record.id, record.sender_address, record.recipient_address);
+        return record;
+      }
+      return undefined;
     });
   },
 
@@ -187,7 +198,12 @@ export const streamRepository = {
         'SELECT * FROM streams WHERE transaction_hash = $1 AND event_index = $2',
         [transactionHash, eventIndex],
       );
-      return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
+      if (result.rows[0]) {
+        const record = rowToRecord(result.rows[0]);
+        enrichActiveSpanWithStream(record.id, record.sender_address, record.recipient_address);
+        return record;
+      }
+      return undefined;
     });
   },
 

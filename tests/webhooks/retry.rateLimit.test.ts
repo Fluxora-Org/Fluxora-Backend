@@ -22,7 +22,7 @@ const mockRedisConnection = {
     zremrangebyscore: vi.fn().mockReturnThis(),
     zcard: vi.fn().mockReturnThis(),
     pexpire: vi.fn().mockReturnThis(),
-    exec: vi.fn().mockResolvedValue([null, 'member', [1, 3] /* initial count */]]),
+    exec: vi.fn().mockResolvedValue([null, 'member', [1, 3] /* initial count */]),
     close: vi.fn().mockResolvedValue(null),
 };
 
