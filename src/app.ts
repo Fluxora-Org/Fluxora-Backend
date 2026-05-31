@@ -22,6 +22,8 @@ import { bodySizeLimitMiddleware, BODY_LIMIT_BYTES } from './middleware/requestP
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown } from './shutdown.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
+import { createDeprecationMiddleware } from './middleware/deprecation.js';
+import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
@@ -66,6 +68,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
   app.use(httpMetrics);
+  app.use(createDeprecationMiddleware(routeDeprecations));
   app.use(rateLimiter);
 
   app.use((_req: Request, res: Response, next: NextFunction) => {
