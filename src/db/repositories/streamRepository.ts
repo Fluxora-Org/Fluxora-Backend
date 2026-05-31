@@ -29,6 +29,7 @@
  */
 
 import { getPool, query } from '../pool.js';
+import { getReadPool } from '../replicaPool.js';
 import {
   StreamRecord,
   CreateStreamInput,
@@ -172,7 +173,7 @@ export const streamRepository = {
   /** Fetch a single stream by its primary key. */
   async getById(id: string): Promise<StreamRecord | undefined> {
     return timed('getById', async () => {
-      const pool = getPool();
+      const pool = await getReadPool();
       const result = await query<Record<string, unknown>>(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
       return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
     });
@@ -181,7 +182,7 @@ export const streamRepository = {
   /** Fetch a stream by its blockchain event coordinates (for idempotency). */
   async getByEvent(transactionHash: string, eventIndex: number): Promise<StreamRecord | undefined> {
     return timed('getByEvent', async () => {
-      const pool = getPool();
+      const pool = await getReadPool();
       const result = await query<Record<string, unknown>>(
         pool,
         'SELECT * FROM streams WHERE transaction_hash = $1 AND event_index = $2',
@@ -199,7 +200,7 @@ export const streamRepository = {
     includeTotal?: boolean,
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
-      const pool = getPool();
+      const pool = await getReadPool();
       const conditions: string[] = [];
       const params: unknown[] = [];
       let idx = 1;
@@ -232,7 +233,7 @@ export const streamRepository = {
   /** Offset-based paginated list. */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
-      const pool = getPool();
+      const pool = await getReadPool();
       const conditions: string[] = [];
       const params: unknown[] = [];
       let idx = 1;
@@ -262,7 +263,7 @@ export const streamRepository = {
   /** Count streams grouped by status. */
   async countByStatus(): Promise<Record<StreamStatus, number>> {
     return timed('countByStatus', async () => {
-      const pool = getPool();
+      const pool = await getReadPool();
       const result = await query<{ status: StreamStatus; count: string }>(
         pool,
         'SELECT status, COUNT(*) AS count FROM streams GROUP BY status',

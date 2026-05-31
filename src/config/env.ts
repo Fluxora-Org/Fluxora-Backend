@@ -117,6 +117,7 @@ export const EnvSchema = z.object({
   PORT: integerEnv('PORT', 1, 65535).default(3000),
 
   DATABASE_URL: urlString('DATABASE_URL'),
+  DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
   DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
   DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
   DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
@@ -214,6 +215,9 @@ export interface Config {
   apiVersion: string;
 
   databaseUrl: string;
+  /** Optional read-replica connection string. When set, SELECT queries on
+   *  streams are routed through a dedicated replica pool. */
+  databaseReplicaUrl?: string | undefined;
   databasePoolMin: number;
   databasePoolMax: number;
   databaseConnectionTimeout: number;
@@ -341,6 +345,7 @@ function toConfig(env: ParsedEnv): Config {
     apiVersion: '0.1.0',
 
     databaseUrl: env.DATABASE_URL,
+    databaseReplicaUrl: env.DATABASE_REPLICA_URL,
     databasePoolMin: env.DB_POOL_MIN,
     databasePoolMax: env.DB_POOL_MAX,
     databaseConnectionTimeout: env.DB_CONNECTION_TIMEOUT,
