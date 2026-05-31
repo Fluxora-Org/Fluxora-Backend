@@ -126,6 +126,13 @@ export const EnvSchema = z.object({
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
+  REDIS_MODE: z.enum(['standalone', 'sentinel', 'cluster']).default('standalone'),
+  // Comma-separated list of sentinel nodes: host:port,host:port
+  REDIS_SENTINEL_HOSTS: optionalString('REDIS_SENTINEL_HOSTS'),
+  // Sentinel master name (required when REDIS_MODE=sentinel)
+  REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
+  // Comma-separated list of cluster nodes: host:port,host:port
+  REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
 
   STELLAR_NETWORK: z.enum(['testnet', 'mainnet']).optional(),
   HORIZON_URL: optionalUrlString('HORIZON_URL'),
@@ -223,6 +230,10 @@ export interface Config {
 
   redisUrl: string;
   redisEnabled: boolean;
+  redisMode: 'standalone' | 'sentinel' | 'cluster';
+  redisSentinelHosts?: string | undefined;
+  redisSentinelName?: string | undefined;
+  redisClusterNodes?: string | undefined;
 
   stellarNetwork: StellarNetwork;
   horizonUrl: string;
@@ -350,6 +361,10 @@ function toConfig(env: ParsedEnv): Config {
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
+    redisMode: env.REDIS_MODE,
+    redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
+    redisSentinelName: env.REDIS_SENTINEL_NAME,
+    redisClusterNodes: env.REDIS_CLUSTER_NODES,
 
     stellarNetwork,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
