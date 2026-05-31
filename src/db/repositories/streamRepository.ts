@@ -51,6 +51,10 @@ export interface UpsertResult {
   stream: StreamRecord;
 }
 
+export interface StreamExistenceRecord {
+  updated_at: string;
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /**
@@ -175,6 +179,27 @@ export const streamRepository = {
       const pool = getPool();
       const result = await query<Record<string, unknown>>(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
       return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
+    });
+  },
+
+  /**
+   * Fetch only the minimal metadata needed to answer existence checks.
+   *
+   * This avoids hydrating and serialising the full stream row when callers
+   * only need to know whether the stream exists and to derive cache headers.
+   */
+  async existsById(id: string): Promise<StreamExistenceRecord | undefined> {
+    return timed('existsById', async () => {
+      const pool = getPool();
+      const result = await query<Record<string, unknown>>(
+        pool,
+        'SELECT updated_at FROM streams WHERE id = $1',
+        [id],
+      );
+      if (!result.rows[0]) return undefined;
+      return {
+        updated_at: (result.rows[0]['updated_at'] as Date).toISOString(),
+      };
     });
   },
 

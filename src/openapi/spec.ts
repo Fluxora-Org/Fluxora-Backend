@@ -218,6 +218,20 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: 'head', path: '/api/streams/{id}',
+  summary: 'Check whether a stream exists',
+  tags: ['streams'],
+  request: { params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }) },
+  responses: {
+    '200': {
+      description: 'Stream exists',
+    },
+    '404': errorResponses['404'],
+    '503': errorResponses['503'],
+  },
+});
+
+registry.registerPath({
   method: 'post', path: '/api/streams',
   summary: 'Create stream',
   tags: ['streams'],
