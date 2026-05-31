@@ -170,6 +170,16 @@ adminRouter.post('/api-keys', (req, res) => {
   }
   try {
     const created = createApiKey(name);
+    recordAuditEvent(
+      'API_KEY_CREATED',
+      'api_key',
+      created.id,
+      req.correlationId,
+      {
+        prefix: created.prefix,
+        name: created.name,
+      },
+    );
     res.status(201).json(created);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -184,6 +194,16 @@ adminRouter.post('/api-keys', (req, res) => {
 adminRouter.post('/api-keys/:id/rotate', (req, res) => {
   try {
     const rotated = rotateApiKey(req.params.id);
+    recordAuditEvent(
+      'API_KEY_ROTATED',
+      'api_key',
+      rotated.id,
+      req.correlationId,
+      {
+        prefix: rotated.prefix,
+        name: rotated.name,
+      },
+    );
     res.json(rotated);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -199,6 +219,12 @@ adminRouter.post('/api-keys/:id/rotate', (req, res) => {
 adminRouter.delete('/api-keys/:id', (req, res) => {
   try {
     revokeApiKey(req.params.id);
+    recordAuditEvent(
+      'API_KEY_REVOKED',
+      'api_key',
+      req.params.id,
+      req.correlationId,
+    );
     res.status(204).send();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
