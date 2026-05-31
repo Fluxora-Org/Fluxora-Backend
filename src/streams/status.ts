@@ -87,6 +87,14 @@ const VALID_API_TRANSITIONS: Partial<Record<ApiStreamStatus, readonly ApiStreamS
 };
 
 /**
+ * Returns true when the given API status is terminal (completed or cancelled).
+ * Terminal streams are immutable and safe to cache at the edge.
+ */
+export function isTerminalStatus(status: ApiStreamStatus): boolean {
+  return status === 'completed' || status === 'cancelled';
+}
+
+/**
  * Returns true when moving from `from` → `to` is a permitted transition.
  */
 export function isValidApiTransition(from: ApiStreamStatus, to: ApiStreamStatus): boolean {

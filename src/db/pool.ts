@@ -214,11 +214,11 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
       if (thresholdMs > 0 && latency >= thresholdMs) {
         const queryHash = crypto.createHash('sha256').update(sql).digest('hex').slice(0, 16);
         const tableHint = extractTableHint(sql);
-        logger.warn('Slow postgres query', correlationId, {
+        logger.slowQuery({
           query_hash: queryHash,
           duration_ms: latency,
           table_hint: tableHint,
-          correlation_id: correlationId,
+          ...(correlationId ? { correlation_id: correlationId } : {}),
         });
         dbSlowQueriesTotal.inc({ table_hint: tableHint });
       }

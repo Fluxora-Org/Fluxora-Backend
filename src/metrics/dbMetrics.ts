@@ -1,6 +1,21 @@
 import { Counter, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
+/**
+ * Histogram for PostgreSQL query duration.
+ * Labels: repository (e.g. "streamRepository"), operation (e.g. "upsertStream")
+ */
+export const dbQueryDurationSeconds =
+  (registry.getSingleMetric('fluxora_db_query_duration_seconds') as Histogram<'repository' | 'operation'>) ||
+  new Histogram({
+    name: 'fluxora_db_query_duration_seconds',
+    help: 'Duration of PostgreSQL queries in seconds, partitioned by repository and operation',
+    labelNames: ['repository', 'operation'] as const,
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    registers: [registry],
+  });
+
+/** Counter incremented for every slow query (duration ≥ SLOW_QUERY_THRESHOLD_MS). */
 export const dbSlowQueriesTotal =
   (registry.getSingleMetric('fluxora_db_slow_queries_total') as Counter<'table_hint'>) ||
   new Counter({
@@ -43,6 +58,7 @@ export const dbPoolExhaustedTotal =
   });
 
 export function deRegisterDbMetrics(): void {
+  registry.removeSingleMetric('fluxora_db_query_duration_seconds');
   registry.removeSingleMetric('fluxora_db_slow_queries_total');
   registry.removeSingleMetric('fluxora_db_pool_active_connections');
   registry.removeSingleMetric('fluxora_db_pool_idle_connections');

@@ -15,6 +15,32 @@ import { sanitize, redactKeysInString } from '../pii/sanitizer.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+/**
+ * OCSF (Open Cybersecurity Schema Framework) fields for slow-query log entries.
+ * Compatible with Splunk, Datadog, and Elastic SIEM ingestion pipelines.
+ * Ref: OCSF Database Activity (class_uid 5001)
+ */
+export interface SlowQueryLogEntry {
+  log_type: 'slow_query';
+  /** OCSF class_uid for Database Activity */
+  class_uid: 5001;
+  /** OCSF activity_id: 1 = Query */
+  activity_id: 1;
+  /** OCSF severity_id: 3 = Medium */
+  severity_id: 3;
+  severity: 'Medium';
+  /** ISO-8601 timestamp */
+  time: string;
+  /** SHA-256 prefix of the SQL (never raw SQL) */
+  query_hash: string;
+  /** Wall-clock duration in milliseconds */
+  duration_ms: number;
+  /** Table name extracted from SQL keywords */
+  table_hint: string;
+  /** Request correlation ID */
+  correlation_id?: string;
+}
+
 export interface LogEntry {
     timestamp: string;
     level: LogLevel;
@@ -124,6 +150,24 @@ export class Logger {
             ...(context !== undefined ? { context } : {}),
             ...(errorInfo !== undefined ? { error: errorInfo } : {}),
         });
+    }
+
+    /**
+     * Emit a SIEM-compatible OCSF slow-query log entry.
+     * Fields follow OCSF Database Activity (class_uid 5001).
+     * Raw SQL and parameter values are never included.
+     */
+    slowQuery(fields: Omit<SlowQueryLogEntry, 'log_type' | 'class_uid' | 'activity_id' | 'severity_id' | 'severity' | 'time'>): void {
+        const entry: SlowQueryLogEntry = {
+            log_type: 'slow_query',
+            class_uid: 5001,
+            activity_id: 1,
+            severity_id: 3,
+            severity: 'Medium',
+            time: new Date().toISOString(),
+            ...fields,
+        };
+        console.warn(JSON.stringify(entry));
     }
 
     /**

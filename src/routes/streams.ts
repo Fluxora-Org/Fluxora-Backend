@@ -75,6 +75,7 @@ import {
 } from '../validation/schemas.js';
 import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter } from '../db/types.js';
+import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal } from '../metrics/businessMetrics.js';
 import {
   RedisIdempotencyStore,
@@ -426,6 +427,16 @@ streamsRouter.get(
 
     if (includeTotal && result!.total !== undefined) response.total = result!.total;
 
+    // Cache only when every stream on the page is in a terminal state.
+    // An empty page is treated as all-terminal (nothing mutable present).
+    const allTerminal = pageStreams.every((s) => isTerminalStatus(s.status as ApiStreamStatus));
+    res.set(
+      'Cache-Control',
+      allTerminal
+        ? 'public, max-age=300, stale-while-revalidate=60'
+        : 'private, no-store',
+    );
+
     res.json(successResponse(response, requestId));
   }),
 );
@@ -452,7 +463,14 @@ streamsRouter.get(
     }
 
     if (!record) throw notFound('Stream', id);
-    res.json(successResponse({ stream: toApiStream(record!) }, requestId));
+    const stream = toApiStream(record!);
+    res.set(
+      'Cache-Control',
+      isTerminalStatus(stream.status as ApiStreamStatus)
+        ? 'public, max-age=300, stale-while-revalidate=60'
+        : 'private, no-store',
+    );
+    res.json(successResponse({ stream }, requestId));
   }),
 );
 
