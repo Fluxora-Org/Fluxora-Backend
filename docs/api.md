@@ -1,5 +1,7 @@
 # Fluxora API — Reference
 
+Admin-specific operational endpoints are documented in [docs/api/admin-endpoints.md](docs/api/admin-endpoints.md).
+
 ## Idempotency
 
 ### Overview

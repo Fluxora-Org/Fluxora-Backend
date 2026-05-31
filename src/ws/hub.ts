@@ -160,13 +160,9 @@ export class StreamHub extends EventEmitter {
       this.ownsDedup = true;
     }
 
-    this.wsAuthRequired =
-      options?.wsAuthRequired ??
-      (process.env.WS_AUTH_REQUIRED === 'true');
+    this.wsAuthRequired = options?.wsAuthRequired ?? process.env.WS_AUTH_REQUIRED === 'true';
 
-    this.jwtSecret =
-      options?.jwtSecret ??
-      process.env.JWT_SECRET;
+    this.jwtSecret = options?.jwtSecret ?? process.env.JWT_SECRET;
 
     this.eventStore = options?.eventStore;
 
@@ -182,9 +178,9 @@ export class StreamHub extends EventEmitter {
         if (!result.ok) {
           socket.write(
             'HTTP/1.1 401 Unauthorized\r\n' +
-            'Content-Type: text/plain\r\n' +
-            'Connection: close\r\n\r\n' +
-            `Unauthorized: ${result.code}\r\n`,
+              'Content-Type: text/plain\r\n' +
+              'Connection: close\r\n\r\n' +
+              `Unauthorized: ${result.code}\r\n`
           );
           socket.destroy();
           return;
@@ -368,7 +364,7 @@ export class StreamHub extends EventEmitter {
 
   private authorizeSubscriptionFilter(
     ws: WebSocket,
-    filter: SubscriptionFilter,
+    filter: SubscriptionFilter
   ): { ok: true; filter: SubscriptionFilter } | { ok: false; code: string; message: string } {
     const state = this.clients.get(ws);
     if (!state) {
@@ -386,7 +382,8 @@ export class StreamHub extends EventEmitter {
         return {
           ok: false,
           code: 'UNAUTHORIZED',
-          message: 'recipient_address subscriptions require an authenticated Stellar public key subject',
+          message:
+            'recipient_address subscriptions require an authenticated Stellar public key subject',
         };
       }
 
@@ -451,6 +448,34 @@ export class StreamHub extends EventEmitter {
     }
   }
 
+  /**
+   * Force-close every socket currently subscribed to a stream ID.
+   * Returns the number of sockets targeted before the disconnect completes.
+   */
+  disconnectByStreamId(streamId: string): number {
+    const subscribers = this.streamSubscriptions.get(streamId);
+    if (!subscribers || subscribers.size === 0) {
+      return 0;
+    }
+
+    const targets = Array.from(subscribers);
+    this.streamSubscriptions.delete(streamId);
+
+    for (const ws of targets) {
+      try {
+        ws.close(4000, 'admin-forced-disconnect');
+      } catch {
+        try {
+          ws.terminate();
+        } catch {
+          // no-op
+        }
+      }
+    }
+
+    return targets.length;
+  }
+
   // ── Broadcast ──────────────────────────────────────────────────────────────
 
   async broadcast(event: StreamUpdateEvent): Promise<void> {
@@ -463,7 +488,13 @@ export class StreamHub extends EventEmitter {
     if (subscribers.size === 0) return;
 
     const correlationId = getCorrelationId();
-    const message = JSON.stringify({ type: 'stream_update', streamId, eventId, payload, correlationId });
+    const message = JSON.stringify({
+      type: 'stream_update',
+      streamId,
+      eventId,
+      payload,
+      correlationId,
+    });
     const targets = Array.from(subscribers);
 
     if (targets.length <= FANOUT_YIELD_BATCH) {
@@ -500,9 +531,14 @@ export class StreamHub extends EventEmitter {
     return targets;
   }
 
-  private deliverBatch(batch: WebSocket[], message: string, streamId: string, eventId: string): number {
+  private deliverBatch(
+    batch: WebSocket[],
+    message: string,
+    streamId: string,
+    eventId: string
+  ): number {
     let sent = 0;
-    
+
     for (const ws of batch) {
       if (ws.readyState !== WebSocket.OPEN) continue;
 
@@ -512,7 +548,11 @@ export class StreamHub extends EventEmitter {
         this.metrics.terminatedConnections++;
         this.metrics.droppedMessages++;
         this.emitBackpressure(ws, 'terminate', buffered, this.terminateBytes, streamId, eventId);
-        try { ws.terminate(); } catch { /* ignore */ }
+        try {
+          ws.terminate();
+        } catch {
+          /* ignore */
+        }
         this.onDisconnect(ws);
         continue;
       }
@@ -547,9 +587,14 @@ export class StreamHub extends EventEmitter {
         'ws.correlation_id': correlationId,
       },
     });
-    tracer.recordEvent(span, 'ws.broadcast', { streamId, eventId, recipients: sent, correlationId });
+    tracer.recordEvent(span, 'ws.broadcast', {
+      streamId,
+      eventId,
+      recipients: sent,
+      correlationId,
+    });
     tracer.endSpan(span, 'ok');
-    
+
     return sent;
   }
 
@@ -559,7 +604,7 @@ export class StreamHub extends EventEmitter {
     bufferedAmount: number,
     thresholdBytes: number,
     streamId: string,
-    eventId: string,
+    eventId: string
   ): void {
     const state = this.clients.get(ws);
     if (!state) return;
@@ -636,9 +681,10 @@ export class StreamHub extends EventEmitter {
       return undefined;
     }
 
-    const candidate = (payload as Record<string, unknown>)['recipient_address']
-      ?? (payload as Record<string, unknown>)['recipientAddress']
-      ?? (payload as Record<string, unknown>)['recipient'];
+    const candidate =
+      (payload as Record<string, unknown>)['recipient_address'] ??
+      (payload as Record<string, unknown>)['recipientAddress'] ??
+      (payload as Record<string, unknown>)['recipient'];
 
     if (typeof candidate !== 'string') return undefined;
 
@@ -660,7 +706,8 @@ export class StreamHub extends EventEmitter {
 
   setBackpressureThresholds(opts: { dropBytes?: number; terminateBytes?: number }): void {
     if (typeof opts.dropBytes === 'number' && opts.dropBytes >= 0) this.dropBytes = opts.dropBytes;
-    if (typeof opts.terminateBytes === 'number' && opts.terminateBytes >= 0) this.terminateBytes = opts.terminateBytes;
+    if (typeof opts.terminateBytes === 'number' && opts.terminateBytes >= 0)
+      this.terminateBytes = opts.terminateBytes;
   }
 
   /**
