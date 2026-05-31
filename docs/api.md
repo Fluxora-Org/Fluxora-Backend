@@ -77,3 +77,17 @@ curl -X POST http://localhost:3000/api/streams \
 
 # Idempotency-Replayed: true  →  original response returned, no duplicate stream
 ```
+
+## Caching — GET /api/streams
+
+`Cache-Control` headers are set on all `GET /api/streams` and `GET /api/streams/:id` responses based on the mutability of the returned data.
+
+| Condition | Cache-Control |
+|-----------|---------------|
+| Any stream on the page is `active`, `paused`, or `scheduled` | `private, no-store` |
+| All streams on the page are `completed` or `cancelled` | `public, max-age=300, stale-while-revalidate=60` |
+| Empty page (list endpoint) | `public, max-age=300, stale-while-revalidate=60` |
+
+Terminal statuses (`completed`, `cancelled`) are immutable — the stream data will never change — so responses containing only terminal streams are safe to cache at the edge for up to 5 minutes, with a 60-second stale-while-revalidate window.
+
+Non-terminal streams (`active`, `paused`, `scheduled`) carry live financial state (streamed amounts, remaining balances) that changes continuously. These responses must not be stored by shared caches.

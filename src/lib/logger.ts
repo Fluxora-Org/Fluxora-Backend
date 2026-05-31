@@ -56,4 +56,25 @@ export const logger = {
   error(message: string, correlationId?: string, meta?: Record<string, unknown>): void {
     write('error', message, correlationId, meta);
   },
+  /**
+   * Emit a SIEM-compatible OCSF slow-query log entry (OCSF Database Activity, class_uid 5001).
+   * Raw SQL and parameter values are never included — only the query_hash, duration, and table hint.
+   */
+  slowQuery(fields: {
+    query_hash: string;
+    duration_ms: number;
+    table_hint: string;
+    correlation_id?: string;
+  }): void {
+    const record = {
+      log_type: 'slow_query',
+      class_uid: 5001,       // OCSF Database Activity
+      activity_id: 1,        // Query
+      severity_id: 3,        // Medium
+      severity: 'Medium',
+      time: new Date().toISOString(),
+      ...fields,
+    };
+    process.stdout.write(JSON.stringify(record) + '\n');
+  },
 };
