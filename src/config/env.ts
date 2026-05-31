@@ -200,6 +200,11 @@ export const EnvSchema = z.object({
   RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
   AWS_REGION: optionalString('AWS_REGION'),
   AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
+
+  // S3 Backup Retention Configuration
+  S3_BACKUP_BUCKET: optionalString('S3_BACKUP_BUCKET'),
+  S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
+
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
 }).passthrough();
 
@@ -265,6 +270,10 @@ export interface Config {
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
+
+  // S3 Backup Retention
+  s3BackupBucket?: string | undefined;
+  s3BackupPrefix?: string | undefined;
 }
 
 export class ConfigError extends Error {
@@ -395,6 +404,9 @@ function toConfig(env: ParsedEnv): Config {
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
+
+    s3BackupBucket: env.S3_BACKUP_BUCKET,
+    s3BackupPrefix: env.S3_BACKUP_PREFIX,
   };
 }
 
