@@ -20,7 +20,8 @@ import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { bodySizeLimitMiddleware, BODY_LIMIT_BYTES } from './middleware/requestProtection.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
-import { isShuttingDown } from './shutdown.js';
+import { isShuttingDown, addShutdownHook } from './shutdown.js';
+import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
@@ -44,6 +45,11 @@ export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
   const rateLimiter = createRateLimiter(env);
+
+  startRuntimeMetrics();
+  addShutdownHook(() => {
+    stopRuntimeMetrics();
+  });
 
   // Expose the limiter on app.locals so index.ts can register a shutdown hook
   app.locals.rateLimiter = rateLimiter;
