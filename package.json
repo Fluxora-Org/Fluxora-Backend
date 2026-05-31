@@ -23,7 +23,11 @@
     "docker:seed": "docker-compose exec indexer pnpm run seed",
     "docker:test": "docker-compose exec indexer pnpm test"
   },
-  "keywords": ["indexer", "blockchain", "events"],
+  "keywords": [
+    "indexer",
+    "blockchain",
+    "events"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
@@ -58,6 +62,7 @@
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.59.0",
     "@typescript-eslint/parser": "^8.59.0",
+    "@vitest/coverage-v8": "^4.1.7",
     "eslint": "^10.2.1",
     "eslint-config-prettier": "^10.1.8",
     "jest": "^29.7.0",
