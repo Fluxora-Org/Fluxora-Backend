@@ -1,5 +1,6 @@
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
+import type pg from 'pg';
 import { streamsRouter } from './routes/streams.js';
 import { healthRouter } from './routes/health.js';
 import { indexerRouter } from './routes/indexer.js';
@@ -26,6 +27,7 @@ import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
+import { startVacuumCollector } from './metrics/vacuumCollector.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -38,6 +40,13 @@ export interface AppOptions {
   config?: Config;
   /** Optional health-check manager exposed via `app.locals.healthManager`. */
   healthManager?: HealthCheckManager;
+  /**
+   * Optional pg.Pool used to start the Postgres VACUUM metrics collector.
+   * When provided, a 60-second setInterval is registered and the handle is
+   * stored on app.locals.vacuumInterval for graceful shutdown.
+   * Omit in tests that do not require VACUUM metrics.
+   */
+  pool?: pg.Pool;
 }
 
 export function createApp(options: AppOptions = {}): Express {
@@ -54,6 +63,10 @@ export function createApp(options: AppOptions = {}): Express {
   }
   if (options.healthManager) {
     app.locals.healthManager = options.healthManager;
+  }
+
+  if (options.pool) {
+    app.locals.vacuumInterval = startVacuumCollector(options.pool);
   }
 
   app.use(privacyHeaders);
