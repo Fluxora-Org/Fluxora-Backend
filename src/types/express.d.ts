@@ -14,6 +14,8 @@ declare global {
       correlationId?: string;
       /** Attached by requestIdMiddleware (errors.ts). */
       id?: string;
+      /** Attached by apiVersion middleware based on the Accept-Version header. */
+      apiVersion?: string;
     }
   }
 }

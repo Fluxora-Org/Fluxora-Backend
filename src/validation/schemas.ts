@@ -40,32 +40,13 @@ function stellarPublicKeyField(fieldName: string) {
  * - depositAmount / ratePerSecond: decimal strings only (not numbers)
  * - startTime / endTime: non-negative integers when provided
  */
-export const CreateStreamSchema = z.object({
-  sender: stellarPublicKeyField('sender'),
-  recipient: stellarPublicKeyField('recipient'),
-  depositAmount: decimalStringField('depositAmount')
-    .refine((val) => parseFloat(val) > 0, {
-      message: 'depositAmount must be a positive numeric string',
-    })
-    .optional(),
-  ratePerSecond: decimalStringField('ratePerSecond')
-    .refine((val) => parseFloat(val) > 0, {
-      message: 'ratePerSecond must be a positive numeric string',
-    })
-    .optional(),
-  startTime: z
-    .number({ error: 'startTime must be a number' })
-    .int('startTime must be an integer')
-    .nonnegative('startTime must be a non-negative number')
-    .optional(),
-  endTime: z
-    .number({ error: 'endTime must be a number' })
-    .int('endTime must be an integer')
-    .nonnegative('endTime must be a non-negative integer')
-    .optional(),
+export const StreamBatchCreateSchema = z.object({
+  streams: z.array(CreateStreamSchema).max(100, { message: 'Maximum of 100 streams per batch' })
 });
 
-export type CreateStreamInput = z.infer<typeof CreateStreamSchema>;
+export type StreamBatchCreateInput = {
+  streams: CreateStreamInput[];
+};
 
 /**
  * Schema for GET /api/streams query parameters.

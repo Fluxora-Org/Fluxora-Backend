@@ -1,4 +1,4 @@
-import { Counter, Gauge } from 'prom-client';
+import { Counter, Gauge, Histogram } from 'prom-client';
 import { registry } from '../metrics.js';
 
 /**
@@ -6,7 +6,9 @@ import { registry } from '../metrics.js';
  * Labels: repository (e.g. "streamRepository"), operation (e.g. "upsertStream")
  */
 export const dbQueryDurationSeconds =
-  (registry.getSingleMetric('fluxora_db_query_duration_seconds') as Histogram<'repository' | 'operation'>) ||
+  (registry.getSingleMetric('fluxora_db_query_duration_seconds') as Histogram<
+    'repository' | 'operation'
+  >) ||
   new Histogram({
     name: 'fluxora_db_query_duration_seconds',
     help: 'Duration of PostgreSQL queries in seconds, partitioned by repository and operation',
