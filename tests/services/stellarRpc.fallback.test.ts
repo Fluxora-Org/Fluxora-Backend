@@ -1,0 +1,177 @@
+import express from 'express';
+import request from 'supertest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  CircuitOpenError,
+  StellarRpcService,
+  type RawRpcClient,
+} from '../../src/services/stellar-rpc.js';
+import { createRpcDegradationMiddleware } from '../../src/middleware/rpcDegradation.js';
+import {
+  InMemoryRpcFallbackCache,
+  type RpcFallbackCache,
+} from '../../src/redis/rpcFallbackCache.js';
+
+function makeClient(fn: () => Promise<{ sequence: number }>): RawRpcClient {
+  return { getLatestLedger: fn };
+}
+
+describe('StellarRpcService fallback cache', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('writes successful CLOSED responses to the fallback cache without reading it', async () => {
+    const cache: RpcFallbackCache = {
+      get: vi.fn(async () => null),
+      set: vi.fn(async () => undefined),
+    };
+    const svc = new StellarRpcService(
+      () => makeClient(vi.fn(async () => ({ sequence: 101 }))),
+      { failureThreshold: 1, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+    );
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 101 });
+
+    expect(cache.get).not.toHaveBeenCalled();
+    expect(cache.set).toHaveBeenCalledWith('getLatestLedger', { sequence: 101 }, 60, []);
+    expect(svc.getCircuitState()).toBe('CLOSED');
+  });
+
+  it('serves cached data when the circuit is OPEN and the fallback cache hits', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    let shouldFail = false;
+    const getLatestLedger = vi.fn(async () => {
+      if (shouldFail) throw new Error('rpc down');
+      return { sequence: 200 };
+    });
+    const svc = new StellarRpcService(
+      () => makeClient(getLatestLedger),
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+    );
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 200 });
+    shouldFail = true;
+    await expect(svc.getLatestLedger()).rejects.toThrow('rpc down');
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 200 });
+    expect(getLatestLedger).toHaveBeenCalledTimes(2);
+    expect(svc.getCircuitState()).toBe('OPEN');
+  });
+
+  it('propagates CircuitOpenError when the circuit is OPEN and the cache misses', async () => {
+    const getLatestLedger = vi.fn(async () => {
+      throw new Error('rpc down');
+    });
+    const svc = new StellarRpcService(
+      () => makeClient(getLatestLedger),
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: new InMemoryRpcFallbackCache() },
+    );
+
+    await expect(svc.getLatestLedger()).rejects.toThrow('rpc down');
+    await expect(svc.getLatestLedger()).rejects.toBeInstanceOf(CircuitOpenError);
+    expect(getLatestLedger).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a live HALF_OPEN probe instead of stale cache after reset timeout', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    let sequence = 300;
+    let shouldFail = false;
+    const getLatestLedger = vi.fn(async () => {
+      if (shouldFail) throw new Error('rpc down');
+      return { sequence };
+    });
+    const svc = new StellarRpcService(
+      () => makeClient(getLatestLedger),
+      { failureThreshold: 1, resetTimeoutMs: 1_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+    );
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 300 });
+    shouldFail = true;
+    await expect(svc.getLatestLedger()).rejects.toThrow('rpc down');
+
+    vi.advanceTimersByTime(1_001);
+    shouldFail = false;
+    sequence = 301;
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 301 });
+    expect(svc.getCircuitState()).toBe('CLOSED');
+    expect(getLatestLedger).toHaveBeenCalledTimes(3);
+  });
+
+  it('treats expired fallback entries as misses', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    let shouldFail = false;
+    const getLatestLedger = vi.fn(async () => {
+      if (shouldFail) throw new Error('rpc down');
+      return { sequence: 400 };
+    });
+    const svc = new StellarRpcService(
+      () => makeClient(getLatestLedger),
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 1 },
+    );
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 400 });
+    vi.advanceTimersByTime(1_001);
+    shouldFail = true;
+    await expect(svc.getLatestLedger()).rejects.toThrow('rpc down');
+
+    await expect(svc.getLatestLedger()).rejects.toBeInstanceOf(CircuitOpenError);
+  });
+
+  it('isolates accountExists cache entries by hashed account parameter', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    const fetchMock = vi.fn(async (url: string) => ({
+      status: url.endsWith('/GBEXISTS') ? 200 : 404,
+    })) as unknown as typeof fetch;
+    vi.stubGlobal('fetch', fetchMock);
+
+    let horizonUrl = 'https://horizon.test';
+    const svc = new StellarRpcService(
+      () => ({ getLatestLedger: vi.fn(), horizonUrl }),
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+    );
+
+    await expect(svc.accountExists('GBEXISTS')).resolves.toBe(true);
+    horizonUrl = '';
+    await expect(svc.accountExists('GDMISSING')).rejects.toThrow('horizonUrl not configured');
+
+    await expect(svc.accountExists('GBEXISTS')).resolves.toBe(true);
+    await expect(svc.accountExists('GDMISSING')).rejects.toBeInstanceOf(CircuitOpenError);
+  });
+
+  it('sets X-RPC-Cache: stale on HTTP responses that use stale fallback data', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    let shouldFail = false;
+    const getLatestLedger = vi.fn(async () => {
+      if (shouldFail) throw new Error('rpc down');
+      return { sequence: 500 };
+    });
+    const svc = new StellarRpcService(
+      () => makeClient(getLatestLedger),
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+    );
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 500 });
+    shouldFail = true;
+    await expect(svc.getLatestLedger()).rejects.toThrow('rpc down');
+
+    const app = express();
+    app.use(createRpcDegradationMiddleware(() => svc));
+    app.get('/ledger', async (_req, res) => {
+      res.json(await svc.getLatestLedger());
+    });
+
+    const res = await request(app).get('/ledger');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['x-rpc-cache']).toBe('stale');
+    expect(res.body).toEqual({ sequence: 500 });
+  });
+});

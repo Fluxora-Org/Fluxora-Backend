@@ -43,6 +43,7 @@ describe('GET /openapi.json', () => {
     const paths = res.body.paths as Record<string, unknown>;
     expect(paths['/api/streams']).toBeDefined();
     expect(paths['/api/streams/{id}']).toBeDefined();
+    expect((paths['/api/streams/{id}'] as Record<string, unknown>).head).toBeDefined();
   });
 
   it('covers health routes', async () => {

@@ -3,7 +3,6 @@ import { RateLimitStore } from '../../src/redis/rateLimitStore.js';
 import { SlidingWindowStore } from '../../src/redis/rateLimitStore.js';
 import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
 import { WebhookOutboxRetryInput, EnhancedRetryPolicy, WebhookOutboxRetryPlan } from '../../src/webhooks/retry.js';
-import { getRateLimitStore } from '../../src/webhooks/retry.utils.js'; // Assuming a utility file for getRateLimitStore
 
 // Mock Redis Client for testing the SlidingWindowStore
 const mockRedisClient = {
@@ -41,11 +40,11 @@ describe('Webhook Retry Rate Limiting (RateLimitStore & Retry Logic)', () => {
         mockRedisClient.exec.mockClear();
         mockRedisClient.multi.mockReturnThis();
         mockRedisClient.exec.mockResolvedValue([null, 'member', [1, 1]]); // Default successful count 1 for testing
-        
+
         // Initialize stores for testing
         primaryStore = new SlidingWindowStore(mockRedisClient);
         fallbackStore = new InMemoryStore();
-        
+
         // Mock the rate limit store retrieval (assuming we fix the import path in retry.ts)
         // For simplicity, we use the hybrid approach logic directly here.
         mockRateLimitStore = new class MockStore implements RateLimitStore {
@@ -94,7 +93,7 @@ describe('Webhook Retry Rate Limiting (RateLimitStore & Retry Logic)', () => {
         // Check that primary failed, and in-memory was executed
         expect(mockRedisClient.zadd).toHaveBeenCalledTimes(1);
         expect(result.count).toBe(1); // InMemory always counts 1 on first run
-        
+
     });
 
     it('should correctly calculate the expiry and count when tokens are cleared (simulated)', async () => {
@@ -103,9 +102,9 @@ describe('Webhook Retry Rate Limiting (RateLimitStore & Retry Logic)', () => {
 
         // Simulate cleanup (ZREMRANGEBYSCORE) happening
         mockRedisClient.exec.mockResolvedValue([null, null, [1, 1]]);
-        
+
         await mockRateLimitStore.increment(limitKey, windowMs, 10);
-        
+
         // A subsequent call should show the count being managed
         const result = await mockRateLimitStore.increment(limitKey, windowMs, 10);
         expect(result.count).toBe(2);
@@ -122,7 +121,7 @@ describe('Webhook Retry Rate Limiting (RateLimitStore & Retry Logic)', () => {
             attemptNumber: 1,
             policy: { maxAttempts: 3, initialBackoffMs: 100, backoffMultiplier: 2, maxBackoffMs: 1000, jitterPercent: 10, jitterAlgorithm: 'full' }
         };
-        
+
         // Mock rate limit availability (e.g., 1 attempt allowed)
         (mockRateLimitStore.increment as vi.Mock).mockResolvedValue({ count: 1, resetAt: Date.now() + 60000 });
 
