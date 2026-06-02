@@ -1,5 +1,6 @@
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
+import type pg from 'pg';
 import { streamsRouter } from './routes/streams.js';
 import { healthRouter } from './routes/health.js';
 import { indexerRouter } from './routes/indexer.js';
@@ -19,13 +20,18 @@ import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { bodySizeLimitMiddleware, BODY_LIMIT_BYTES } from './middleware/requestProtection.js';
+import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
-import { isShuttingDown } from './shutdown.js';
+import { isShuttingDown, addShutdownHook } from './shutdown.js';
+import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
+import { createDeprecationMiddleware } from './middleware/deprecation.js';
+import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
+import { startVacuumCollector } from './metrics/vacuumCollector.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -38,12 +44,24 @@ export interface AppOptions {
   config?: Config;
   /** Optional health-check manager exposed via `app.locals.healthManager`. */
   healthManager?: HealthCheckManager;
+  /**
+   * Optional pg.Pool used to start the Postgres VACUUM metrics collector.
+   * When provided, a 60-second setInterval is registered and the handle is
+   * stored on app.locals.vacuumInterval for graceful shutdown.
+   * Omit in tests that do not require VACUUM metrics.
+   */
+  pool?: pg.Pool;
 }
 
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
   const rateLimiter = createRateLimiter(env);
+
+  startRuntimeMetrics();
+  addShutdownHook(() => {
+    stopRuntimeMetrics();
+  });
 
   // Expose the limiter on app.locals so index.ts can register a shutdown hook
   app.locals.rateLimiter = rateLimiter;
@@ -56,6 +74,10 @@ export function createApp(options: AppOptions = {}): Express {
     app.locals.healthManager = options.healthManager;
   }
 
+  if (options.pool) {
+    app.locals.vacuumInterval = startVacuumCollector(options.pool);
+  }
+
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
@@ -63,9 +85,11 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   // Correlation ID must be first so all subsequent middleware/routes have req.correlationId.
   app.use(correlationIdMiddleware);
+  app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
   app.use(httpMetrics);
+  app.use(createDeprecationMiddleware(routeDeprecations));
   app.use(rateLimiter);
 
   app.use((_req: Request, res: Response, next: NextFunction) => {

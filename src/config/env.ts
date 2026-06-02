@@ -173,6 +173,13 @@ export const EnvSchema = z.object({
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
+  REDIS_MODE: z.enum(['standalone', 'sentinel', 'cluster']).default('standalone'),
+  // Comma-separated list of sentinel nodes: host:port,host:port
+  REDIS_SENTINEL_HOSTS: optionalString('REDIS_SENTINEL_HOSTS'),
+  // Sentinel master name (required when REDIS_MODE=sentinel)
+  REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
+  // Comma-separated list of cluster nodes: host:port,host:port
+  REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
 
   STELLAR_NETWORK: z.enum(['testnet', 'mainnet']).optional(),
   STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
@@ -186,6 +193,14 @@ export const EnvSchema = z.object({
   STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
 
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+  PGCRYPTO_KEY: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional(),
+  ),
+  PGCRYPTO_KEY_PREVIOUS: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY_PREVIOUS must be at least 32 characters').optional(),
+  ),
   JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
   API_KEYS: z.string().optional(),
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
@@ -249,6 +264,11 @@ export const EnvSchema = z.object({
   RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
   AWS_REGION: optionalString('AWS_REGION'),
   AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
+
+  // S3 Backup Retention Configuration
+  S3_BACKUP_BUCKET: optionalString('S3_BACKUP_BUCKET'),
+  S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
+
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
 }).passthrough().superRefine((env, ctx) => {
   const stellarNetwork = resolvedStellarNetwork(env);
@@ -286,6 +306,10 @@ export interface Config {
 
   redisUrl: string;
   redisEnabled: boolean;
+  redisMode: 'standalone' | 'sentinel' | 'cluster';
+  redisSentinelHosts?: string | undefined;
+  redisSentinelName?: string | undefined;
+  redisClusterNodes?: string | undefined;
 
   stellarNetwork: StellarNetwork;
   horizonUrl: string;
@@ -293,6 +317,8 @@ export interface Config {
   contractAddresses: ContractAddresses;
 
   jwtSecret: string;
+  pgcryptoKey?: string | undefined;
+  pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
   indexerWorkerToken: string;
@@ -328,6 +354,10 @@ export interface Config {
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
+
+  // S3 Backup Retention
+  s3BackupBucket?: string | undefined;
+  s3BackupPrefix?: string | undefined;
 }
 
 export class ConfigError extends Error {
@@ -412,6 +442,10 @@ function toConfig(env: ParsedEnv): Config {
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
+    redisMode: env.REDIS_MODE,
+    redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
+    redisSentinelName: env.REDIS_SENTINEL_NAME,
+    redisClusterNodes: env.REDIS_CLUSTER_NODES,
 
     stellarNetwork,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
@@ -419,6 +453,8 @@ function toConfig(env: ParsedEnv): Config {
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
 
     jwtSecret: env.JWT_SECRET,
+    pgcryptoKey: env.PGCRYPTO_KEY,
+    pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
     jwtExpiresIn: env.JWT_EXPIRES_IN,
     apiKeys: (env.API_KEYS ?? (env.NODE_ENV === 'test' ? 'test-api-key' : ''))
       .split(',')
@@ -457,6 +493,9 @@ function toConfig(env: ParsedEnv): Config {
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
+
+    s3BackupBucket: env.S3_BACKUP_BUCKET,
+    s3BackupPrefix: env.S3_BACKUP_PREFIX,
   };
 }
 

@@ -41,6 +41,8 @@ import {
 } from '../types.js';
 import { info, debug } from '../../utils/logger.js';
 import { dbQueryDurationSeconds } from '../../metrics/dbMetrics.js';
+import { enrichActiveSpanWithStream } from '../../tracing/hooks.js';
+
 
 const REPO = 'streamRepository';
 
@@ -49,6 +51,10 @@ const REPO = 'streamRepository';
 export interface UpsertResult {
   created: boolean;
   stream: StreamRecord;
+}
+
+export interface StreamExistenceRecord {
+  updated_at: string;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -77,6 +83,14 @@ function rowToRecord(row: Record<string, unknown>): StreamRecord {
   };
 }
 
+function resolvePgcryptoKeys(): { current: string; previous?: string } {
+  const config = getConfig();
+  if (!config.pgcryptoKey) {
+    throw new Error('PGCRYPTO_KEY is required to encrypt and decrypt stream PII');
+  }
+  return { current: config.pgcryptoKey, previous: config.pgcryptoKeyPrevious };
+}
+
 function isValidStatusTransition(from: StreamStatus, to: StreamStatus): boolean {
   const allowed: readonly string[] = STREAM_INVARIANTS.validTransitions[from] ?? [];
   return allowed.includes(to);
@@ -100,31 +114,56 @@ export const streamRepository = {
    * Uses INSERT … ON CONFLICT DO NOTHING for idempotency.
    */
   async upsertStream(input: CreateStreamInput, correlationId?: string): Promise<UpsertResult> {
+    enrichActiveSpanWithStream(input.id, input.sender_address, input.recipient_address);
     return timed('upsertStream', async () => {
       const pool = getPool();
+      const keySet = resolvePgcryptoKeys();
+      const senderHashes = computeAddressHashes(input.sender_address, keySet);
+      const recipientHashes = computeAddressHashes(input.recipient_address, keySet);
+
+      const params: unknown[] = [
+        input.id,
+        input.sender_address,
+        keySet.current,
+        senderHashes.current,
+        input.recipient_address,
+        recipientHashes.current,
+        input.amount,
+        input.streamed_amount,
+        input.remaining_amount,
+        input.rate_per_second,
+        input.start_time,
+        input.end_time,
+        input.contract_id,
+        input.transaction_hash,
+        input.event_index,
+      ];
+
+      const decryptionPreviousKeyIndex = keySet.previous ? params.length + 1 : undefined;
+      if (keySet.previous) {
+        params.push(keySet.previous);
+      }
+
       const insertSql = `
         INSERT INTO streams (
-          id, sender_address, recipient_address,
+          id, sender_address, sender_address_hash,
+          recipient_address, recipient_address_hash,
           amount, streamed_amount, remaining_amount, rate_per_second,
           start_time, end_time, status,
           contract_id, transaction_hash, event_index,
           created_at, updated_at
         ) VALUES (
-          $1, $2, $3,
-          $4, $5, $6, $7,
-          $8, $9, 'active',
-          $10, $11, $12,
+          $1, ${encryptAddressValue(2, 3)}, $4,
+          ${encryptAddressValue(5, 3)}, $6,
+          $7, $8, $9, $10,
+          $11, $12, 'active',
+          $13, $14, $15,
           NOW(), NOW()
         )
         ON CONFLICT (transaction_hash, event_index) DO NOTHING
-        RETURNING *
+        RETURNING ${streamSelectColumns(3, decryptionPreviousKeyIndex)}
       `;
-      const params = [
-        input.id, input.sender_address, input.recipient_address,
-        input.amount, input.streamed_amount, input.remaining_amount, input.rate_per_second,
-        input.start_time, input.end_time,
-        input.contract_id, input.transaction_hash, input.event_index,
-      ];
+
       const result = await query<Record<string, unknown>>(pool, insertSql, params);
       if (result.rows.length > 0) {
         const stream = rowToRecord(result.rows[0]!);
@@ -145,10 +184,12 @@ export const streamRepository = {
 
   /** Update stream status and/or amounts. Validates status transitions. */
   async updateStream(id: string, input: UpdateStreamInput, correlationId?: string): Promise<StreamRecord> {
+    enrichActiveSpanWithStream(id);
     return timed('updateStream', async () => {
       const pool = getPool();
       const current = await this.getById(id);
       if (!current) throw new Error(`Stream not found: ${id}`);
+      enrichActiveSpanWithStream(current.id, current.sender_address, current.recipient_address);
       if (input.status && !isValidStatusTransition(current.status, input.status)) {
         const allowed = STREAM_INVARIANTS.validTransitions[current.status].join(', ');
         throw new Error(`Invalid status transition: ${current.status} → ${input.status}. Allowed: ${allowed || 'none'}`);
@@ -161,7 +202,16 @@ export const streamRepository = {
       if (input.remaining_amount !== undefined) { setClauses.push(`remaining_amount = $${idx++}`); values.push(input.remaining_amount); }
       if (input.end_time !== undefined) { setClauses.push(`end_time = $${idx++}`); values.push(input.end_time); }
       values.push(id);
-      const sql = `UPDATE streams SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`;
+
+      const keySet = resolvePgcryptoKeys();
+      const keyIndex = values.length + 1;
+      const previousKeyIndex = keySet.previous ? keyIndex + 1 : undefined;
+      values.push(keySet.current);
+      if (keySet.previous) {
+        values.push(keySet.previous);
+      }
+
+      const sql = `UPDATE streams SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING ${streamSelectColumns(keyIndex, previousKeyIndex)}`;
       const result = await query<Record<string, unknown>>(pool, sql, values);
       if (result.rows.length === 0) throw new Error(`Stream not found after update: ${id}`);
       info('Stream updated', { id, input, correlationId });
@@ -171,10 +221,37 @@ export const streamRepository = {
 
   /** Fetch a single stream by its primary key. */
   async getById(id: string): Promise<StreamRecord | undefined> {
+    enrichActiveSpanWithStream(id);
     return timed('getById', async () => {
       const pool = getPool();
       const result = await query<Record<string, unknown>>(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
-      return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
+      if (result.rows[0]) {
+        const record = rowToRecord(result.rows[0]);
+        enrichActiveSpanWithStream(record.id, record.sender_address, record.recipient_address);
+        return record;
+      }
+      return undefined;
+    });
+  },
+
+  /**
+   * Fetch only the minimal metadata needed to answer existence checks.
+   *
+   * This avoids hydrating and serialising the full stream row when callers
+   * only need to know whether the stream exists and to derive cache headers.
+   */
+  async existsById(id: string): Promise<StreamExistenceRecord | undefined> {
+    return timed('existsById', async () => {
+      const pool = getPool();
+      const result = await query<Record<string, unknown>>(
+        pool,
+        'SELECT updated_at FROM streams WHERE id = $1',
+        [id],
+      );
+      if (!result.rows[0]) return undefined;
+      return {
+        updated_at: (result.rows[0]['updated_at'] as Date).toISOString(),
+      };
     });
   },
 
@@ -182,12 +259,21 @@ export const streamRepository = {
   async getByEvent(transactionHash: string, eventIndex: number): Promise<StreamRecord | undefined> {
     return timed('getByEvent', async () => {
       const pool = getPool();
+      const keySet = resolvePgcryptoKeys();
+      const params: unknown[] = [transactionHash, eventIndex, keySet.current];
+      if (keySet.previous) params.push(keySet.previous);
+
       const result = await query<Record<string, unknown>>(
         pool,
-        'SELECT * FROM streams WHERE transaction_hash = $1 AND event_index = $2',
-        [transactionHash, eventIndex],
+        `SELECT ${streamSelectColumns(3, keySet.previous ? 4 : undefined)} FROM streams WHERE transaction_hash = $1 AND event_index = $2`,
+        params,
       );
-      return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
+      if (result.rows[0]) {
+        const record = rowToRecord(result.rows[0]);
+        enrichActiveSpanWithStream(record.id, record.sender_address, record.recipient_address);
+        return record;
+      }
+      return undefined;
     });
   },
 
@@ -200,20 +286,46 @@ export const streamRepository = {
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
       const pool = getPool();
+      const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
       const params: unknown[] = [];
       let idx = 1;
+
       if (filter.status) { conditions.push(`status = $${idx++}`); params.push(filter.status); }
-      if (filter.sender_address) { conditions.push(`sender_address = $${idx++}`); params.push(filter.sender_address); }
-      if (filter.recipient_address) { conditions.push(`recipient_address = $${idx++}`); params.push(filter.recipient_address); }
+      if (filter.sender_address) {
+        const hashes = computeAddressHashes(filter.sender_address, keySet);
+        const filterIndex = idx++;
+        const currentHashIndex = idx++;
+        const previousHashIndex = keySet.previous ? idx++ : undefined;
+        conditions.push(senderAddressFilterCondition(filterIndex, currentHashIndex, previousHashIndex));
+        params.push(filter.sender_address, hashes.current);
+        if (hashes.previous) params.push(hashes.previous);
+      }
+      if (filter.recipient_address) {
+        const hashes = computeAddressHashes(filter.recipient_address, keySet);
+        const filterIndex = idx++;
+        const currentHashIndex = idx++;
+        const previousHashIndex = keySet.previous ? idx++ : undefined;
+        conditions.push(recipientAddressFilterCondition(filterIndex, currentHashIndex, previousHashIndex));
+        params.push(filter.recipient_address, hashes.current);
+        if (hashes.previous) params.push(hashes.previous);
+      }
       if (filter.contract_id) { conditions.push(`contract_id = $${idx++}`); params.push(filter.contract_id); }
+
       const whereBase = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
       const cursorConditions = [...conditions];
       const cursorParams = [...params];
       if (afterId) { cursorConditions.push(`id > $${idx++}`); cursorParams.push(afterId); }
       const whereCursor = cursorConditions.length > 0 ? `WHERE ${cursorConditions.join(' AND ')}` : '';
-      const dataSql = `SELECT * FROM streams ${whereCursor} ORDER BY id ASC LIMIT $${idx}`;
+
+      const limitParamIndex = cursorParams.length + 1;
       cursorParams.push(limit + 1);
+      const keyIndex = cursorParams.length + 1;
+      cursorParams.push(keySet.current);
+      const previousKeyIndex = keySet.previous ? cursorParams.length + 1 : undefined;
+      if (keySet.previous) cursorParams.push(keySet.previous);
+
+      const dataSql = `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${whereCursor} ORDER BY id ASC LIMIT $${limitParamIndex}`;
       const [dataResult, countResult] = await Promise.all([
         query<Record<string, unknown>>(pool, dataSql, cursorParams),
         includeTotal
@@ -233,23 +345,48 @@ export const streamRepository = {
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
       const pool = getPool();
+      const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
       const params: unknown[] = [];
       let idx = 1;
+
       if (filter.status) { conditions.push(`status = $${idx++}`); params.push(filter.status); }
-      if (filter.sender_address) { conditions.push(`sender_address = $${idx++}`); params.push(filter.sender_address); }
-      if (filter.recipient_address) { conditions.push(`recipient_address = $${idx++}`); params.push(filter.recipient_address); }
+      if (filter.sender_address) {
+        const hashes = computeAddressHashes(filter.sender_address, keySet);
+        const filterIndex = idx++;
+        const currentHashIndex = idx++;
+        const previousHashIndex = keySet.previous ? idx++ : undefined;
+        conditions.push(senderAddressFilterCondition(filterIndex, currentHashIndex, previousHashIndex));
+        params.push(filter.sender_address, hashes.current);
+        if (hashes.previous) params.push(hashes.previous);
+      }
+      if (filter.recipient_address) {
+        const hashes = computeAddressHashes(filter.recipient_address, keySet);
+        const filterIndex = idx++;
+        const currentHashIndex = idx++;
+        const previousHashIndex = keySet.previous ? idx++ : undefined;
+        conditions.push(recipientAddressFilterCondition(filterIndex, currentHashIndex, previousHashIndex));
+        params.push(filter.recipient_address, hashes.current);
+        if (hashes.previous) params.push(hashes.previous);
+      }
       if (filter.contract_id) { conditions.push(`contract_id = $${idx++}`); params.push(filter.contract_id); }
       if (filter.start_time_from !== undefined) { conditions.push(`start_time >= $${idx++}`); params.push(filter.start_time_from); }
       if (filter.start_time_to !== undefined) { conditions.push(`start_time <= $${idx++}`); params.push(filter.start_time_to); }
       if (filter.end_time_from !== undefined) { conditions.push(`end_time >= $${idx++}`); params.push(filter.end_time_from); }
       if (filter.end_time_to !== undefined) { conditions.push(`end_time <= $${idx++}`); params.push(filter.end_time_to); }
       const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      const countParams = [...params];
+      const keyIndex = params.length + 1;
+      const previousKeyIndex = keySet.previous ? keyIndex + 1 : undefined;
+      params.push(keySet.current);
+      if (keySet.previous) params.push(keySet.previous);
+
       const [countResult, dataResult] = await Promise.all([
-        query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, [...params]),
+        query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT * FROM streams ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
+          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
           [...params, pagination.limit, pagination.offset],
         ),
       ]);

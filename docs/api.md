@@ -1,5 +1,7 @@
 # Fluxora API — Reference
 
+Admin-specific operational endpoints are documented in [docs/api/admin-endpoints.md](docs/api/admin-endpoints.md).
+
 ## Idempotency
 
 ### Overview
@@ -81,6 +83,8 @@ curl -X POST http://localhost:3000/api/streams \
 ## Caching — GET /api/streams
 
 `Cache-Control` headers are set on all `GET /api/streams` and `GET /api/streams/:id` responses based on the mutability of the returned data.
+
+For lightweight existence checks, prefer `HEAD /api/streams/:id`. It returns `200` or `404` without a response body and includes `ETag` and `Last-Modified` headers when the stream exists.
 
 | Condition | Cache-Control |
 |-----------|---------------|
