@@ -1,4 +1,4 @@
-import { logger } from '../lib/logger.js';
+import { randomUUID } from 'crypto';
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';

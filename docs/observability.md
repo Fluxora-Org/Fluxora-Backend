@@ -140,6 +140,30 @@ scrape_configs:
 | `403` | Token present but incorrect |
 | `503` | `ADMIN_API_KEY` not configured on the server |
 
+## Runtime Performance Metrics
+
+The application exposes fine-grained Node.js runtime health indicators to differentiate garbage collection pressure from event loop starvation during load spikes.
+
+### Metrics
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `fluxora_nodejs_heap_used_bytes` | Gauge | Node.js heap used size in bytes. |
+| `fluxora_nodejs_heap_total_bytes` | Gauge | Node.js heap total size in bytes. |
+| `fluxora_nodejs_external_bytes` | Gauge | Node.js external memory size in bytes. |
+| `fluxora_nodejs_event_loop_lag_seconds` | Histogram | Event loop lag measured via a `setTimeout` probe. Buckets: 0.005 to 10 seconds. |
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `METRICS_SAMPLE_INTERVAL_MS` | `10000` | The interval in milliseconds at which to sample runtime metrics. |
+
+### Alert Thresholding Strategy
+
+- **Event Loop Lag**: Alert if p99 lag `> 1s` (indicates severe event loop starvation or long-running synchronous work).
+- **Heap Pressure**: Alert if `fluxora_nodejs_heap_used_bytes` is consistently `> 85%` of `fluxora_nodejs_heap_total_bytes` over a sustained period (indicates GC thrashing).
+
 ## Log aggregation integrations
 
 See the platform-specific guides:

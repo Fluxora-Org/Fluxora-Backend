@@ -1,6 +1,19 @@
 import { z } from 'zod';
 import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
+import {
+  getPinnedAddressNetwork,
+  isValidStellarContractAddress,
+  STELLAR_CONTRACT_ALLOWLIST,
+  STELLAR_NETWORK_PASSPHRASES,
+  type PinnedStellarAddressKind,
+  type PinnedStellarNetwork,
+} from './stellarContracts.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
+export {
+  STELLAR_CONTRACT_ALLOWLIST,
+  STELLAR_NETWORK_PASSPHRASES,
+  isValidStellarContractAddress,
+} from './stellarContracts.js';
 
 type NodeEnv = 'development' | 'staging' | 'production' | 'test';
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -112,6 +125,40 @@ function optionalString(name: string) {
   );
 }
 
+function requiredStellarContractAddress(name: string) {
+  return z
+    .string()
+    .trim()
+    .min(1, `${name} is required`)
+    .regex(/^C[A-Z2-7]{55}$/, `${name} must be a Stellar contract StrKey beginning with C`)
+    .refine(isValidStellarContractAddress, `${name} must be a valid Stellar contract StrKey`);
+}
+
+function resolvedStellarNetwork(env: { NODE_ENV: NodeEnv; STELLAR_NETWORK?: PinnedStellarNetwork }): PinnedStellarNetwork {
+  return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
+}
+
+function validatePinnedAddress(
+  ctx: z.RefinementCtx,
+  network: PinnedStellarNetwork,
+  kind: PinnedStellarAddressKind,
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  address: string,
+): void {
+  const pinnedNetwork = getPinnedAddressNetwork(kind, address);
+
+  if (pinnedNetwork === network) return;
+
+  ctx.addIssue({
+    code: 'custom',
+    path: [path],
+    message:
+      pinnedNetwork === null
+        ? `${path} is not in the known-good ${network} ${kind} address allowlist`
+        : `${path} is pinned for ${pinnedNetwork} but STELLAR_NETWORK resolves to ${network}`,
+  });
+}
+
 export const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'staging', 'production', 'test']).default('development'),
   PORT: integerEnv('PORT', 1, 65535).default(3000),
@@ -127,8 +174,17 @@ export const EnvSchema = z.object({
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
+  REDIS_MODE: z.enum(['standalone', 'sentinel', 'cluster']).default('standalone'),
+  // Comma-separated list of sentinel nodes: host:port,host:port
+  REDIS_SENTINEL_HOSTS: optionalString('REDIS_SENTINEL_HOSTS'),
+  // Sentinel master name (required when REDIS_MODE=sentinel)
+  REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
+  // Comma-separated list of cluster nodes: host:port,host:port
+  REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
 
   STELLAR_NETWORK: z.enum(['testnet', 'mainnet']).optional(),
+  STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
+  STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
   HORIZON_URL: optionalUrlString('HORIZON_URL'),
   HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
   CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
@@ -138,6 +194,14 @@ export const EnvSchema = z.object({
   STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
 
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+  PGCRYPTO_KEY: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional(),
+  ),
+  PGCRYPTO_KEY_PREVIOUS: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY_PREVIOUS must be at least 32 characters').optional(),
+  ),
   JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
   API_KEYS: z.string().optional(),
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
@@ -201,8 +265,27 @@ export const EnvSchema = z.object({
   RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
   AWS_REGION: optionalString('AWS_REGION'),
   AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
+
+  // S3 Backup Retention Configuration
+  S3_BACKUP_BUCKET: optionalString('S3_BACKUP_BUCKET'),
+  S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
+
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
-}).passthrough();
+}).passthrough().superRefine((env, ctx) => {
+  const stellarNetwork = resolvedStellarNetwork(env);
+  const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
+
+  if (env.HORIZON_NETWORK_PASSPHRASE !== undefined && env.HORIZON_NETWORK_PASSPHRASE !== expectedPassphrase) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['HORIZON_NETWORK_PASSPHRASE'],
+      message: `HORIZON_NETWORK_PASSPHRASE must match ${stellarNetwork} passphrase`,
+    });
+  }
+
+  validatePinnedAddress(ctx, stellarNetwork, 'contract', 'STELLAR_CONTRACT_ADDRESS', env.STELLAR_CONTRACT_ADDRESS);
+  validatePinnedAddress(ctx, stellarNetwork, 'token', 'STELLAR_TOKEN_ADDRESS', env.STELLAR_TOKEN_ADDRESS);
+});
 
 type ParsedEnv = z.infer<typeof EnvSchema>;
 
@@ -227,6 +310,10 @@ export interface Config {
 
   redisUrl: string;
   redisEnabled: boolean;
+  redisMode: 'standalone' | 'sentinel' | 'cluster';
+  redisSentinelHosts?: string | undefined;
+  redisSentinelName?: string | undefined;
+  redisClusterNodes?: string | undefined;
 
   stellarNetwork: StellarNetwork;
   horizonUrl: string;
@@ -234,6 +321,8 @@ export interface Config {
   contractAddresses: ContractAddresses;
 
   jwtSecret: string;
+  pgcryptoKey?: string | undefined;
+  pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
   indexerWorkerToken: string;
@@ -269,6 +358,10 @@ export interface Config {
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
+
+  // S3 Backup Retention
+  s3BackupBucket?: string | undefined;
+  s3BackupPrefix?: string | undefined;
 }
 
 export class ConfigError extends Error {
@@ -318,20 +411,19 @@ function parseEnv(env: NodeJS.ProcessEnv): ParsedEnv {
 }
 
 function resolveNetwork(env: ParsedEnv): StellarNetwork {
-  return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
+  return resolvedStellarNetwork(env);
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
-  const defaults = STELLAR_NETWORKS[network];
-  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? defaults.streamingContractAddress;
-
-  if (env.NODE_ENV === 'production' && streaming.includes('PLACEHOLDER')) {
-    throw new EnvironmentError([
-      'CONTRACT_ADDRESS_STREAMING: must be set to a real contract address in production',
-    ]);
+  if (network !== 'testnet' && network !== 'mainnet') {
+    throw new EnvironmentError(`STELLAR_NETWORK: ${network} is not supported for pinned contract configuration`);
   }
 
-  return { streaming };
+  return {
+    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    contract: env.STELLAR_CONTRACT_ADDRESS,
+    token: env.STELLAR_TOKEN_ADDRESS,
+  };
 }
 
 function toConfig(env: ParsedEnv): Config {
@@ -355,6 +447,10 @@ function toConfig(env: ParsedEnv): Config {
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
+    redisMode: env.REDIS_MODE,
+    redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
+    redisSentinelName: env.REDIS_SENTINEL_NAME,
+    redisClusterNodes: env.REDIS_CLUSTER_NODES,
 
     stellarNetwork,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
@@ -362,6 +458,8 @@ function toConfig(env: ParsedEnv): Config {
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
 
     jwtSecret: env.JWT_SECRET,
+    pgcryptoKey: env.PGCRYPTO_KEY,
+    pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
     jwtExpiresIn: env.JWT_EXPIRES_IN,
     apiKeys: (env.API_KEYS ?? (env.NODE_ENV === 'test' ? 'test-api-key' : ''))
       .split(',')
@@ -400,6 +498,9 @@ function toConfig(env: ParsedEnv): Config {
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
+
+    s3BackupBucket: env.S3_BACKUP_BUCKET,
+    s3BackupPrefix: env.S3_BACKUP_PREFIX,
   };
 }
 
