@@ -47,7 +47,7 @@
  * @module routes/streams
  */
 import { Router } from 'express';
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
 import {
   validateDecimalString,
@@ -74,7 +74,7 @@ import {
   formatZodIssues,
 } from '../validation/schemas.js';
 import { PaginationSchema } from '../validation/paginationSchema.js';
-import type { StreamStatus, StreamFilter } from '../db/types.js';
+import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal } from '../metrics/businessMetrics.js';
 import {
@@ -113,6 +113,8 @@ type NormalizedCreateInput = {
 };
 
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
+const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
+const NO_STORE_STREAM_HEADERS = 'private, no-store';
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -166,12 +168,6 @@ export function setIdempotencyStore(
 
 // ── DB → API mapper ───────────────────────────────────────────────────────────
 
-/**
- * Map a StreamRecord (snake_case DB row) to the public Stream shape (camelCase).
- * Preserves decimal-string amounts exactly as stored.
- */
-import type { StreamRecord } from '../db/types.js';
-
 function toApiStream(record: StreamRecord): Stream {
   return {
     id:            record.id,
@@ -183,6 +179,27 @@ function toApiStream(record: StreamRecord): Stream {
     endTime:       record.end_time,
     status:        record.status,
   };
+}
+
+type StreamResourceMetadata = {
+  id: string;
+  updated_at: string;
+};
+
+function streamEntityTag(metadata: StreamResourceMetadata): string {
+  const fingerprint = crypto
+    .createHash('sha256')
+    .update(`${metadata.id}:${metadata.updated_at}`)
+    .digest('base64url');
+  return `W/"${fingerprint}"`;
+}
+
+function setStreamResourceHeaders(
+  res: Response,
+  metadata: StreamResourceMetadata,
+): void {
+  res.set('ETag', streamEntityTag(metadata));
+  res.set('Last-Modified', new Date(metadata.updated_at).toUTCString());
 }
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
@@ -432,12 +449,46 @@ streamsRouter.get(
     const allTerminal = pageStreams.every((s) => isTerminalStatus(s.status as ApiStreamStatus));
     res.set(
       'Cache-Control',
-      allTerminal
-        ? 'public, max-age=300, stale-while-revalidate=60'
-        : 'private, no-store',
+      allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
     );
 
     res.json(successResponse(response, requestId));
+  }),
+);
+
+/**
+ * HEAD /api/streams/:id
+ * Lightweight existence check with cache validators only.
+ */
+streamsRouter.head(
+  '/:id',
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    if (!id) {
+      res.status(404).end();
+      return;
+    }
+
+    debug('Checking stream existence', { id });
+
+    let record;
+    try {
+      record = await streamRepository.existsById(id);
+    } catch (err) {
+      if (err instanceof PoolExhaustedError) {
+        res.status(503).end();
+        return;
+      }
+      throw err;
+    }
+
+    if (!record) {
+      res.status(404).end();
+      return;
+    }
+
+    setStreamResourceHeaders(res, { id, updated_at: record.updated_at });
+    res.status(200).end();
   }),
 );
 
@@ -464,11 +515,12 @@ streamsRouter.get(
 
     if (!record) throw notFound('Stream', id);
     const stream = toApiStream(record!);
+    setStreamResourceHeaders(res, record!);
     res.set(
       'Cache-Control',
       isTerminalStatus(stream.status as ApiStreamStatus)
-        ? 'public, max-age=300, stale-while-revalidate=60'
-        : 'private, no-store',
+        ? CACHEABLE_STREAM_HEADERS
+        : NO_STORE_STREAM_HEADERS,
     );
     res.json(successResponse({ stream }, requestId));
   }),
