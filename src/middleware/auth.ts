@@ -3,6 +3,7 @@ import { verifyToken } from '../lib/auth.js';
 import { ApiErrorCode } from './errorHandler.js';
 import { warn, info, debug } from '../utils/logger.js';
 import { z } from 'zod';
+import { isRevoked } from '../redis/jwtRevocationStore.js';
 
 export enum Permission {
   STREAMS_READ = 'streams:read',
@@ -36,6 +37,7 @@ const tokenSchema = z.object({
   address: z.string(),
   role: z.string(),
   permissions: z.array(z.nativeEnum(Permission)),
+  jti: z.string().optional(),
 });
 
 /**
@@ -43,8 +45,14 @@ const tokenSchema = z.object({
  * If a valid token is present, it attaches the user payload to `req.user`.
  * If an invalid token is present, it returns 401.
  * If no token is present, it proceeds without `req.user`.
+ *
+ * @security
+ * - Verifies JWT signature first (cryptographic integrity)
+ * - Checks Redis revocation list second (immediate invalidation)
+ * - Validates token shape third (schema enforcement)
+ * - Revoked tokens return 401 with code TOKEN_REVOKED
  */
-export function authenticate(req: Request, res: Response, next: NextFunction): void {
+export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
   const requestId = req.id ?? req.correlationId;
 
@@ -62,8 +70,27 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
   }
 
   try {
+    // 1. Verify signature and expiry (cryptographic check)
     const payload = verifyToken(token) as unknown;
-    // Validate token shape and permissions claim strictly here.
+
+    // 2. Check revocation list (immediate invalidation check)
+    const jti = (payload as any)?.jti;
+    if (jti) {
+      const revoked = await isRevoked(jti);
+      if (revoked) {
+        warn('JWT rejected — token revoked', { jti, requestId });
+        res.status(401).json({
+          error: {
+            code: ApiErrorCode.UNAUTHORIZED,
+            message: 'token_revoked',
+            requestId,
+          },
+        });
+        return;
+      }
+    }
+
+    // 3. Validate token shape and permissions claim
     const parsed = tokenSchema.parse(payload);
     req.user = parsed as any;
     info('User authenticated via JWT', { address: parsed.address, requestId });

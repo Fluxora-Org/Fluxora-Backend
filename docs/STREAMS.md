@@ -150,6 +150,19 @@ Get a single stream by ID.
 
 **Responses:** `200 OK` | `404 NOT_FOUND` | `503 SERVICE_UNAVAILABLE`
 
+### HEAD /api/streams/:id
+
+Check whether a stream exists without fetching the full record.
+
+**Success response:** `200 OK`
+
+**Headers:**
+
+- `ETag` - Weak validator derived from the stream ID and last update timestamp
+- `Last-Modified` - Timestamp of the last DB update for the stream
+
+**Responses:** `200 OK` | `404 NOT_FOUND` | `503 SERVICE_UNAVAILABLE`
+
 ### POST /api/streams
 
 Create a new stream.  Requires `Authorization: Bearer <token>` and `Idempotency-Key` header.
@@ -203,7 +216,7 @@ At the DB layer, `upsertStream` uses `INSERT … ON CONFLICT DO NOTHING` on
 
 | Client Type        | Access                                    | Auth required |
 |--------------------|-------------------------------------------|---------------|
-| Public users       | `GET /api/streams`, `GET /api/streams/:id`| No            |
+| Public users       | `GET /api/streams`, `GET /api/streams/:id`, `HEAD /api/streams/:id`| No            |
 | Authenticated users| `POST`, `DELETE`, `PATCH /status`         | JWT Bearer    |
 | Internal workers   | Indexer ingestion via `upsertStream`      | Service account|
 
