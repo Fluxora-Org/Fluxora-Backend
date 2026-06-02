@@ -1,6 +1,19 @@
 import { z } from 'zod';
 import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
+import {
+  getPinnedAddressNetwork,
+  isValidStellarContractAddress,
+  STELLAR_CONTRACT_ALLOWLIST,
+  STELLAR_NETWORK_PASSPHRASES,
+  type PinnedStellarAddressKind,
+  type PinnedStellarNetwork,
+} from './stellarContracts.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
+export {
+  STELLAR_CONTRACT_ALLOWLIST,
+  STELLAR_NETWORK_PASSPHRASES,
+  isValidStellarContractAddress,
+} from './stellarContracts.js';
 
 type NodeEnv = 'development' | 'staging' | 'production' | 'test';
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -112,6 +125,40 @@ function optionalString(name: string) {
   );
 }
 
+function requiredStellarContractAddress(name: string) {
+  return z
+    .string()
+    .trim()
+    .min(1, `${name} is required`)
+    .regex(/^C[A-Z2-7]{55}$/, `${name} must be a Stellar contract StrKey beginning with C`)
+    .refine(isValidStellarContractAddress, `${name} must be a valid Stellar contract StrKey`);
+}
+
+function resolvedStellarNetwork(env: { NODE_ENV: NodeEnv; STELLAR_NETWORK?: PinnedStellarNetwork }): PinnedStellarNetwork {
+  return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
+}
+
+function validatePinnedAddress(
+  ctx: z.RefinementCtx,
+  network: PinnedStellarNetwork,
+  kind: PinnedStellarAddressKind,
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  address: string,
+): void {
+  const pinnedNetwork = getPinnedAddressNetwork(kind, address);
+
+  if (pinnedNetwork === network) return;
+
+  ctx.addIssue({
+    code: 'custom',
+    path: [path],
+    message:
+      pinnedNetwork === null
+        ? `${path} is not in the known-good ${network} ${kind} address allowlist`
+        : `${path} is pinned for ${pinnedNetwork} but STELLAR_NETWORK resolves to ${network}`,
+  });
+}
+
 export const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'staging', 'production', 'test']).default('development'),
   PORT: integerEnv('PORT', 1, 65535).default(3000),
@@ -135,6 +182,8 @@ export const EnvSchema = z.object({
   REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
 
   STELLAR_NETWORK: z.enum(['testnet', 'mainnet']).optional(),
+  STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
+  STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
   HORIZON_URL: optionalUrlString('HORIZON_URL'),
   HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
   CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
@@ -221,17 +270,21 @@ export const EnvSchema = z.object({
   S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
 
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
-})
-  .superRefine((env, ctx) => {
-    if (env.PGCRYPTO_KEY_PREVIOUS && !env.PGCRYPTO_KEY) {
-      ctx.addIssue({
-        path: ['PGCRYPTO_KEY_PREVIOUS'],
-        code: z.ZodIssueCode.custom,
-        message: 'PGCRYPTO_KEY is required when PGCRYPTO_KEY_PREVIOUS is set',
-      });
-    }
-  })
-  .passthrough();
+}).passthrough().superRefine((env, ctx) => {
+  const stellarNetwork = resolvedStellarNetwork(env);
+  const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
+
+  if (env.HORIZON_NETWORK_PASSPHRASE !== undefined && env.HORIZON_NETWORK_PASSPHRASE !== expectedPassphrase) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['HORIZON_NETWORK_PASSPHRASE'],
+      message: `HORIZON_NETWORK_PASSPHRASE must match ${stellarNetwork} passphrase`,
+    });
+  }
+
+  validatePinnedAddress(ctx, stellarNetwork, 'contract', 'STELLAR_CONTRACT_ADDRESS', env.STELLAR_CONTRACT_ADDRESS);
+  validatePinnedAddress(ctx, stellarNetwork, 'token', 'STELLAR_TOKEN_ADDRESS', env.STELLAR_TOKEN_ADDRESS);
+});
 
 type ParsedEnv = z.infer<typeof EnvSchema>;
 
@@ -354,20 +407,19 @@ function parseEnv(env: NodeJS.ProcessEnv): ParsedEnv {
 }
 
 function resolveNetwork(env: ParsedEnv): StellarNetwork {
-  return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
+  return resolvedStellarNetwork(env);
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
-  const defaults = STELLAR_NETWORKS[network];
-  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? defaults.streamingContractAddress;
-
-  if (env.NODE_ENV === 'production' && streaming.includes('PLACEHOLDER')) {
-    throw new EnvironmentError([
-      'CONTRACT_ADDRESS_STREAMING: must be set to a real contract address in production',
-    ]);
+  if (network !== 'testnet' && network !== 'mainnet') {
+    throw new EnvironmentError(`STELLAR_NETWORK: ${network} is not supported for pinned contract configuration`);
   }
 
-  return { streaming };
+  return {
+    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    contract: env.STELLAR_CONTRACT_ADDRESS,
+    token: env.STELLAR_TOKEN_ADDRESS,
+  };
 }
 
 function toConfig(env: ParsedEnv): Config {
