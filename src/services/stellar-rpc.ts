@@ -18,7 +18,19 @@
  *   CANCELLED    — caller aborted via AbortSignal
  */
 
+import { AsyncLocalStorage } from 'async_hooks';
 import { logger } from '../lib/logger.js';
+import {
+  NoOpRpcFallbackCache,
+  RedisRpcFallbackCache,
+  hashCachePart,
+  type RpcFallbackCache,
+} from '../redis/rpcFallbackCache.js';
+import { createRedisClient } from '../redis/client.js';
+import {
+  rpcCircuitOpenFallbackHitsTotal,
+  rpcCircuitOpenFallbackMissesTotal,
+} from '../metrics/rpcMetrics.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -41,6 +53,34 @@ export interface RpcCallOptions {
   timeoutMs?: number;
   /** Optional AbortSignal to cancel the call externally. */
   signal?: AbortSignal;
+}
+
+export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCallOptions {
+  /** TTL for last-known-good fallback entries, seconds. Default 300. */
+  fallbackCacheTtlSeconds?: number;
+  /** Optional cache injection for tests or alternate Redis lifecycle ownership. */
+  fallbackCache?: RpcFallbackCache;
+}
+
+interface RpcRequestMetadata {
+  cacheStatus?: 'stale';
+}
+
+const rpcRequestMetadata = new AsyncLocalStorage<RpcRequestMetadata>();
+
+export function runWithRpcRequestMetadata<T>(fn: () => T): T {
+  return rpcRequestMetadata.run({}, fn);
+}
+
+export function getRpcRequestCacheStatus(): 'stale' | undefined {
+  return rpcRequestMetadata.getStore()?.cacheStatus;
+}
+
+function markStaleRpcCacheResponse(): void {
+  const store = rpcRequestMetadata.getStore();
+  if (store) {
+    store.cacheStatus = 'stale';
+  }
 }
 
 export class RpcProviderError extends Error {
@@ -180,13 +220,17 @@ export interface RawRpcClient {
 export class StellarRpcService {
   private readonly breaker: CircuitBreaker;
   private readonly timeoutMs: number;
+  private readonly fallbackCache: RpcFallbackCache;
+  private readonly fallbackCacheTtlSeconds: number;
 
   constructor(
     private readonly getClient: () => RawRpcClient,
-    opts: CircuitBreakerOptions & RpcCallOptions = {},
+    opts: StellarRpcServiceOptions = {},
   ) {
     this.breaker = new CircuitBreaker(opts);
     this.timeoutMs = opts.timeoutMs ?? 5_000;
+    this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
+    this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
   }
 
   getCircuitState(): CircuitState { return this.breaker.getState(); }
@@ -220,11 +264,12 @@ export class StellarRpcService {
   }
 
   async getLatestLedger(opts: RpcCallOptions = {}): Promise<{ sequence: number }> {
-    return this.breaker.call(() => this.callWithTimeout(
-      () => this.getClient().getLatestLedger(),
+    return this.callWithFallbackCache(
       'getLatestLedger',
+      [],
+      () => this.getClient().getLatestLedger(),
       opts,
-    ));
+    );
   }
 
   /**
@@ -238,7 +283,9 @@ export class StellarRpcService {
    * path traversal via crafted key values.
    */
   async accountExists(address: string, opts: RpcCallOptions = {}): Promise<boolean> {
-    return this.breaker.call(() => this.callWithTimeout(
+    return this.callWithFallbackCache(
+      'accountExists',
+      [hashCachePart(address)],
       async () => {
         const client = this.getClient();
         const base = (client.horizonUrl ?? '').replace(/\/$/, '');
@@ -255,9 +302,43 @@ export class StellarRpcService {
           res.status,
         );
       },
-      'accountExists',
       opts,
-    ));
+    );
+  }
+
+  private async callWithFallbackCache<T>(
+    operation: string,
+    cacheParts: readonly string[],
+    fn: () => Promise<T>,
+    opts: RpcCallOptions = {},
+  ): Promise<T> {
+    try {
+      const result = await this.breaker.call(() => this.callWithTimeout(fn, operation, opts));
+      await this.fallbackCache.set(operation, result, this.fallbackCacheTtlSeconds, cacheParts);
+      return result;
+    } catch (err) {
+      if (!(err instanceof CircuitOpenError)) {
+        throw err;
+      }
+
+      const cached = await this.fallbackCache.get<T>(operation, cacheParts);
+      if (cached !== null) {
+        markStaleRpcCacheResponse();
+        rpcCircuitOpenFallbackHitsTotal.inc({ operation });
+        logger.warn('Serving Stellar RPC response from stale fallback cache', undefined, {
+          event: 'rpc_circuit_open_fallback_hit',
+          operation,
+        });
+        return cached;
+      }
+
+      rpcCircuitOpenFallbackMissesTotal.inc({ operation });
+      logger.warn('Stellar RPC fallback cache miss while circuit is OPEN', undefined, {
+        event: 'rpc_circuit_open_fallback_miss',
+        operation,
+      });
+      throw err;
+    }
   }
 
   private async callWithTimeout<T>(
@@ -355,11 +436,14 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
     const client = getClient ?? (() => {
       throw new RpcProviderError('No Stellar RPC client configured', 'PROVIDER');
     });
+    const redisFallbackCache = createConfiguredRpcFallbackCache();
     _service = new StellarRpcService(client, {
       failureThreshold: parseInt(process.env.RPC_CB_FAILURE_THRESHOLD ?? '5', 10),
       windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
       resetTimeoutMs: parseInt(process.env.RPC_CB_RESET_TIMEOUT_MS ?? '60000', 10),
       timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
+      fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
+      fallbackCache: redisFallbackCache,
     });
   }
   return _service;
@@ -367,4 +451,43 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
 
 export function setStellarRpcService(svc: StellarRpcService | null): void {
   _service = svc;
+}
+
+function createConfiguredRpcFallbackCache(): RpcFallbackCache {
+  if (process.env.REDIS_ENABLED === 'false') {
+    return new NoOpRpcFallbackCache();
+  }
+
+  let cachePromise: Promise<RpcFallbackCache> | null = null;
+  const getCache = async (): Promise<RpcFallbackCache> => {
+    if (!cachePromise) {
+      cachePromise = createRedisClient({
+        url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+        enabled: true,
+      })
+        .then((client) => new RedisRpcFallbackCache(client))
+        .catch((err) => {
+          logger.warn('Failed to initialize Redis RPC fallback cache', undefined, {
+            event: 'rpc_fallback_cache_init_failed',
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return new NoOpRpcFallbackCache();
+        });
+    }
+    return cachePromise;
+  };
+
+  return {
+    async get<T>(operation: string, cacheParts?: readonly string[]): Promise<T | null> {
+      return (await getCache()).get<T>(operation, cacheParts);
+    },
+    async set<T>(
+      operation: string,
+      value: T,
+      ttlSeconds: number,
+      cacheParts?: readonly string[],
+    ): Promise<void> {
+      return (await getCache()).set<T>(operation, value, ttlSeconds, cacheParts);
+    },
+  };
 }

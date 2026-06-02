@@ -7,13 +7,9 @@ import {
   triggerReindex,
   AdminStatePersistenceError,
 } from '../state/adminState.js';
-import {
-  createApiKey,
-  rotateApiKey,
-  revokeApiKey,
-  listApiKeys,
-} from '../lib/apiKey.js';
-import { recordAuditEvent } from '../lib/auditLog.js';
+import { createApiKey, rotateApiKey, revokeApiKey, listApiKeys } from '../lib/apiKey.js';
+import { recordAuditEvent, recordAuditEventToDb } from '../lib/auditLog.js';
+import { getStreamHub } from '../ws/hub.js';
 
 export const adminRouter = Router();
 
@@ -92,18 +88,12 @@ adminRouter.put('/pause', (req, res) => {
     throw err;
   }
 
-  recordAuditEvent(
-    'PAUSE_FLAGS_UPDATED',
-    'pauseFlags',
-    'system',
-    req.correlationId,
-    {
-      previous,
-      updated,
-      ...(streamCreation !== undefined ? { streamCreation } : {}),
-      ...(ingestion !== undefined ? { ingestion } : {}),
-    },
-  );
+  recordAuditEvent('PAUSE_FLAGS_UPDATED', 'pauseFlags', 'system', req.correlationId, {
+    previous,
+    updated,
+    ...(streamCreation !== undefined ? { streamCreation } : {}),
+    ...(ingestion !== undefined ? { ingestion } : {}),
+  });
 
   res.json({ message: 'Pause flags updated.', pauseFlags: updated });
 });
@@ -132,17 +122,63 @@ adminRouter.post('/reindex', async (_req, res) => {
 
   const state = await triggerReindex();
 
-  recordAuditEvent(
-    'REINDEX_TRIGGERED',
-    'reindex',
-    'system',
-    _req.correlationId,
-    { status: state.status, startedAt: state.startedAt },
-  );
+  recordAuditEvent('REINDEX_TRIGGERED', 'reindex', 'system', _req.correlationId, {
+    status: state.status,
+    startedAt: state.startedAt,
+  });
 
   res.status(202).json({
     message: 'Reindex started.',
     reindex: state,
+  });
+});
+
+/**
+ * POST /api/admin/ws/disconnect
+ * Forcibly closes every active WebSocket subscription for a given stream_id.
+ */
+adminRouter.post('/ws/disconnect', async (req, res) => {
+  const { stream_id: streamIdValue } = req.body ?? {};
+
+  if (typeof streamIdValue !== 'string') {
+    res.status(400).json({ error: 'stream_id (string) is required.' });
+    return;
+  }
+
+  const streamId = streamIdValue.trim();
+  if (streamId.length === 0) {
+    res.status(400).json({ error: 'stream_id (string) is required.' });
+    return;
+  }
+
+  const hub = getStreamHub();
+  if (!hub) {
+    res.status(503).json({
+      error: 'WebSocket hub is not initialized. Try again after the service starts.',
+    });
+    return;
+  }
+
+  const disconnectedCount = hub.disconnectByStreamId(streamId);
+
+  try {
+    await recordAuditEventToDb('ADMIN_WS_DISCONNECT', 'stream', streamId, req.correlationId, {
+      disconnectedCount,
+      closeCode: 4000,
+      closeReason: 'admin-forced-disconnect',
+    });
+  } catch (err) {
+    res.status(503).json({
+      error: 'Unable to persist audit log entry. Try again later.',
+      disconnectedCount,
+    });
+    return;
+  }
+
+  res.json({
+    message: 'WebSocket subscribers disconnected.',
+    stream_id: streamId,
+    disconnectedCount,
   });
 });
 

@@ -25,6 +25,7 @@ import { logger } from '../lib/logger.js';
 import { traceSpan } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { dbSlowQueriesTotal, dbPoolActiveConnections, dbPoolIdleConnections, dbPoolWaitingRequests, dbPoolExhaustedTotal } from '../metrics/dbMetrics.js';
+import { syncPoolGauges } from '../metrics/pool.js';
 
 const { Pool } = pg;
 
@@ -70,6 +71,13 @@ export interface PoolConfig {
   queueLimit: number;
   /** SET LOCAL statement_timeout value in ms. 0 = disabled. */
   statementTimeoutMs: number;
+  /**
+   * Stable name for this pool instance, used as the `pool` label on Prometheus
+   * gauges (db_pool_active, db_pool_idle, db_pool_waiting).
+   * Must be a trusted, application-controlled string — never user input.
+   * Defaults to "default".
+   */
+  poolName?: string;
 }
 
 export function resolvePoolConfig(): PoolConfig {
@@ -88,16 +96,20 @@ export function resolvePoolConfig(): PoolConfig {
 
 let _pool: pg.Pool | null = null;
 
-/** Sync pool gauges from current pool state. */
-function syncGauges(pool: pg.Pool): void {
+/** Sync pool gauges from current pool state (both unlabeled legacy and labeled). */
+function syncGauges(pool: pg.Pool, poolName: string): void {
   const active = pool.totalCount - pool.idleCount;
+  // Legacy unlabeled gauges (backward compat)
   dbPoolActiveConnections.set(active < 0 ? 0 : active);
   dbPoolIdleConnections.set(pool.idleCount);
   dbPoolWaitingRequests.set(pool.waitingCount);
+  // Labeled gauges — supports multiple named pools
+  syncPoolGauges(pool, poolName);
 }
 
 export function createPool(config?: PoolConfig): pg.Pool {
   const cfg = config ?? resolvePoolConfig();
+  const poolName = cfg.poolName ?? 'default';
   const pool = new Pool({
     connectionString: cfg.connectionString,
     min: cfg.min,
@@ -113,7 +125,7 @@ export function createPool(config?: PoolConfig): pg.Pool {
   // SET LOCAL scopes the timeout to the current transaction; for non-transactional
   // queries we use SET (session-level) so it persists for the connection lifetime.
   pool.on('connect', (client: pg.PoolClient) => {
-    syncGauges(pool);
+    syncGauges(pool, poolName);
     if (cfg.statementTimeoutMs > 0) {
       // Fire-and-forget; errors are surfaced via pool.on('error')
       client.query('SET statement_timeout = $1', [cfg.statementTimeoutMs]).catch((err: Error) => {
@@ -129,12 +141,12 @@ export function createPool(config?: PoolConfig): pg.Pool {
 
   // Track each connection checkout
   pool.on('acquire', () => {
-    syncGauges(pool);
+    syncGauges(pool, poolName);
   });
 
   // Track connection removal (idle timeout / error)
   pool.on('remove', () => {
-    syncGauges(pool);
+    syncGauges(pool, poolName);
     logger.debug('Postgres pool: connection removed', undefined, {
       total: pool.totalCount,
       idle: pool.idleCount,
