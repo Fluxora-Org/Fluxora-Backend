@@ -60,6 +60,7 @@ import {
   validationError,
   serviceUnavailable,
   asyncHandler,
+  tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
@@ -76,10 +77,19 @@ import {
 import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
-import { streamsCreatedTotal } from '../metrics/businessMetrics.js';
+import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
-import { sseEventBus, eventMatchesStreamId } from '../streams/sseEmitter.js';
+import { getClientIp } from '../ws/connectionLimiter.js';
+import {
+  eventMatchesStreamId,
+  SSE_STREAM_UPDATE_EVENT,
+  subscribeToSseStream,
+} from '../streams/sseEmitter.js';
+import {
+  resolveSseConnectionLimits,
+  tryAcquireSseConnection,
+} from '../streams/sseConnectionLimiter.js';
 import {
   RedisIdempotencyStore,
   NoOpIdempotencyStore,
@@ -118,6 +128,7 @@ type NormalizedCreateInput = {
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
 const NO_STORE_STREAM_HEADERS = 'private, no-store';
+const SSE_HEARTBEAT_INTERVAL_MS = 30_000;
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -779,19 +790,7 @@ streamsRouter.get(
       throw notFound('Stream', '');
     }
 
-    // 1. Verify Stream Existence
-    let record;
-    try {
-      record = await streamRepository.getById(id);
-    } catch (err) {
-      wrapDbError(err);
-    }
-
-    if (!record) {
-      throw notFound('Stream', id);
-    }
-
-    // 2. JWT Authentication and Authorization
+    // 1. JWT Authentication and Authorization
     const wsAuthRequired = process.env.WS_AUTH_REQUIRED === 'true';
     const jwtSecret = process.env.JWT_SECRET;
     const authResult = verifyWsToken(req, jwtSecret);
@@ -818,22 +817,173 @@ streamsRouter.get(
       return;
     }
 
-    // 3. Establish Server-Sent Events stream
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
+    // 2. Reserve bounded SSE capacity before repository work or header flush.
+    const clientIp = getClientIp(req);
+    const sseLimits = resolveSseConnectionLimits();
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
 
-    // Send connection ok comment
-    res.write(': ok\n\n');
+    if (!connectionAttempt.ok) {
+      sseConnectionsRejectedTotal.inc({ reason: connectionAttempt.reason });
+      res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
+      warn('SSE connection rejected by limiter', {
+        id,
+        requestId,
+        ip: clientIp,
+        reason: connectionAttempt.reason,
+        activeConnections: connectionAttempt.activeConnections,
+        activeConnectionsForIp: connectionAttempt.activeConnectionsForIp,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+      });
+      throw tooManyRequests(connectionAttempt.message, {
+        reason: connectionAttempt.reason,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        retryAfterSeconds: connectionAttempt.retryAfterSeconds,
+      });
+    }
 
-    // Periodic heartbeat to prevent proxies and load balancers from closing the connection
-    const heartbeatInterval = setInterval(() => {
-      res.write(': heartbeat\n\n');
-    }, 30000);
+    const sseConnection = connectionAttempt.connection;
+    let cleanedUp = false;
+    let unsubscribeLiveUpdates: (() => void) | undefined;
+    let heartbeatInterval: NodeJS.Timeout | undefined;
+    let maxDurationTimer: NodeJS.Timeout | undefined;
 
-    // 4. Handle Last-Event-ID Resumption Replay
+    function detachLifecycleHandlers(): void {
+      res.off('close', onResponseClose);
+      res.off('error', onResponseError);
+      req.off('aborted', onRequestAborted);
+    }
+
+    /**
+     * Idempotent cleanup for every SSE termination path. The active-connection
+     * handle owns the Map/Gauge decrement, so close/error/timeout signals cannot
+     * double-decrement or leave EventEmitter listeners behind. Lifecycle listeners
+     * are also detached so pre-header failures do not retain route closures longer
+     * than the response object itself.
+     */
+    function cleanup(reason: string): void {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      detachLifecycleHandlers();
+
+      if (heartbeatInterval !== undefined) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = undefined;
+      }
+      if (maxDurationTimer !== undefined) {
+        clearTimeout(maxDurationTimer);
+        maxDurationTimer = undefined;
+      }
+      if (unsubscribeLiveUpdates !== undefined) {
+        unsubscribeLiveUpdates();
+        unsubscribeLiveUpdates = undefined;
+      }
+
+      sseConnection.release();
+      debug('SSE connection cleaned up', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        reason,
+        durationMs: Date.now() - sseConnection.acceptedAt,
+      });
+    }
+
+    function onResponseClose(): void {
+      cleanup('client_close');
+    }
+
+    function onResponseError(err: Error): void {
+      warn('SSE response error', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        error: err.message,
+      });
+      cleanup('response_error');
+    }
+
+    function onRequestAborted(): void {
+      cleanup('client_aborted');
+    }
+
+    const writeSse = (frame: string): boolean => {
+      if (cleanedUp || res.destroyed || res.writableEnded) return false;
+      try {
+        res.write(frame);
+        return true;
+      } catch (err) {
+        warn('SSE write failed; closing connection', {
+          id,
+          requestId,
+          ip: sseConnection.ip,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        cleanup('write_error');
+        try {
+          res.end();
+        } catch {
+          // best-effort shutdown only
+        }
+        return false;
+      }
+    };
+
+    res.once('close', onResponseClose);
+    res.once('error', onResponseError);
+    req.once('aborted', onRequestAborted);
+
+    // 3. Verify stream existence after reserving capacity so over-limit attempts
+    // are rejected before they can fan out into repository work.
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      cleanup('db_error');
+      wrapDbError(err);
+    }
+
+    if (cleanedUp) return;
+
+    if (!record) {
+      cleanup('not_found');
+      throw notFound('Stream', id);
+    }
+
+    try {
+      // 4. Establish Server-Sent Events stream.
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+    } catch (err) {
+      cleanup('flush_error');
+      throw err;
+    }
+
+    // Send connection ok comment.
+    if (!writeSse(': ok\n\n')) return;
+
+    // Periodic heartbeat to prevent proxies and load balancers from closing the connection.
+    heartbeatInterval = setInterval(() => {
+      writeSse(': heartbeat\n\n');
+    }, SSE_HEARTBEAT_INTERVAL_MS);
+    heartbeatInterval.unref?.();
+
+    // Bound long-lived SSE streams. Browser EventSource clients reconnect automatically.
+    maxDurationTimer = setTimeout(() => {
+      if (cleanedUp) return;
+      writeSse(`event: close\ndata: ${JSON.stringify({ reason: 'max_duration' })}\n\n`);
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
+      cleanup('max_duration');
+    }, sseLimits.maxConnectionDurationMs);
+    maxDurationTimer.unref?.();
+
+    // 5. Handle Last-Event-ID Resumption Replay.
     const lastEventId = req.headers['last-event-id'];
     if (typeof lastEventId === 'string' && lastEventId.trim() !== '') {
       const hub = getStreamHub();
@@ -842,27 +992,32 @@ streamsRouter.get(
         try {
           let cursor: string | undefined = lastEventId.trim();
           do {
+            if (cleanedUp) break;
             const result = await eventStore.getEvents({
               afterEventId: cursor,
               limit: 100,
             });
 
             for (const event of result.events) {
+              if (cleanedUp) break;
               if (eventMatchesStreamId(event, id)) {
-                res.write(`id: ${event.eventId}\n`);
-                res.write(`event: stream_update\n`);
-                res.write(`data: ${JSON.stringify({
-                  type: 'stream_update',
-                  streamId: id,
-                  eventId: event.eventId,
-                  payload: event.payload,
-                  correlationId: req.correlationId,
-                })}\n\n`);
+                const written = writeSse(
+                  `id: ${event.eventId}\n` +
+                  `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+                  `data: ${JSON.stringify({
+                    type: 'stream_update',
+                    streamId: id,
+                    eventId: event.eventId,
+                    payload: event.payload,
+                    correlationId: req.correlationId,
+                  })}\n\n`,
+                );
+                if (!written) break;
               }
             }
 
             cursor = result.nextCursor;
-          } while (cursor !== undefined);
+          } while (cursor !== undefined && !cleanedUp);
         } catch (err) {
           warn('Failed to replay SSE events from store', {
             error: err instanceof Error ? err.message : String(err),
@@ -872,28 +1027,26 @@ streamsRouter.get(
       }
     }
 
-    // 5. Subscribe to Real-Time Updates
+    if (cleanedUp) return;
+
+    // 6. Subscribe to Real-Time Updates.
     const listener = (event: StreamUpdateEvent) => {
       if (event.streamId === id) {
-        res.write(`id: ${event.eventId}\n`);
-        res.write(`event: stream_update\n`);
-        res.write(`data: ${JSON.stringify({
-          type: 'stream_update',
-          streamId: event.streamId,
-          eventId: event.eventId,
-          payload: event.payload,
-          correlationId: req.correlationId || event.correlationId,
-        })}\n\n`);
+        writeSse(
+          `id: ${event.eventId}\n` +
+          `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+          `data: ${JSON.stringify({
+            type: 'stream_update',
+            streamId: event.streamId,
+            eventId: event.eventId,
+            payload: event.payload,
+            correlationId: req.correlationId || event.correlationId,
+          })}\n\n`,
+        );
       }
     };
 
-    sseEventBus.on('stream_update', listener);
-
-    // 6. Graceful Disconnect Clean Up
-    res.on('close', () => {
-      clearInterval(heartbeatInterval);
-      sseEventBus.off('stream_update', listener);
-    });
+    unsubscribeLiveUpdates = subscribeToSseStream(id, listener);
   }),
 );
 

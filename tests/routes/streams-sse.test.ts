@@ -4,10 +4,21 @@ initializeConfig();
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { createServer } from 'http';
 import http from 'http';
+import type { ClientRequest, IncomingHttpHeaders, IncomingMessage } from 'http';
 import { createApp } from '../../src/app.js';
-import { sseEventBus } from '../../src/streams/sseEmitter.js';
+import {
+  _resetSseSubscriptionsForTest,
+  getLiveSseSubscriberCount,
+  SSE_STREAM_UPDATE_EVENT,
+  sseEventBus,
+} from '../../src/streams/sseEmitter.js';
 import { getStreamHub } from '../../src/ws/hub.js';
 import { generateToken } from '../../src/lib/auth.js';
+import {
+  _resetSseConnectionLimiter,
+  getActiveSseConnectionCount,
+} from '../../src/streams/sseConnectionLimiter.js';
+import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
 
 // ── Mock the repository and Redis before importing the app ──────────────────────────────
 const mockGetById = vi.fn();
@@ -84,6 +95,32 @@ const TEST_TOKEN = generateToken({ address: VALID_SENDER, role: 'operator' });
 
 const app = createApp();
 
+type MetricSnapshot = {
+  values: Array<{ labels: Record<string, string | number>; value: number }>;
+};
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getMetricValue(
+  metric: { get: () => MetricSnapshot | Promise<MetricSnapshot> },
+  labels: Record<string, string> = {},
+): Promise<number> {
+  const snapshot = await metric.get();
+  const matchingValue = snapshot.values.find((value) =>
+    Object.entries(labels).every(([key, expected]) => String(value.labels[key]) === expected),
+  );
+
+  return matchingValue?.value ?? 0;
+}
+
+type OpenSseConnection = {
+  req: ClientRequest;
+  res: IncomingMessage;
+  data: string;
+};
+
 function makeDbRecord(overrides: Record<string, unknown> = {}) {
   return {
     id: 'stream-abc123-0',
@@ -109,9 +146,72 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
   let server: ReturnType<typeof createServer>;
   let port: number;
 
+  function openSseConnection(path = '/api/streams/stream-123/events'): Promise<OpenSseConnection> {
+    return new Promise((resolve, reject) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path,
+        agent: false,
+      }, (res) => {
+        let data = '';
+        const timeout = setTimeout(() => {
+          req.destroy(new Error('Timed out waiting for SSE acknowledgement'));
+        }, 1000);
+
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+          if (data.includes(': ok\n\n')) {
+            clearTimeout(timeout);
+            resolve({ req, res, data });
+          }
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+    });
+  }
+
+  function requestJson(path = '/api/streams/stream-123/events'): Promise<{
+    status: number;
+    headers: IncomingHttpHeaders;
+    body: any;
+  }> {
+    return new Promise((resolve, reject) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path,
+        agent: false,
+      }, (res) => {
+        let body = '';
+        res.on('data', (chunk) => body += chunk.toString());
+        res.on('end', () => {
+          try {
+            resolve({ status: res.statusCode ?? 0, headers: res.headers, body: JSON.parse(body) });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      });
+      req.on('error', reject);
+    });
+  }
+
+  async function closeSseConnection(connection: OpenSseConnection): Promise<void> {
+    connection.req.destroy();
+    connection.res.destroy();
+    await delay(100);
+  }
+
   beforeEach(async () => {
     vi.clearAllMocks();
     process.env.WS_AUTH_REQUIRED = 'false'; // default to false
+    process.env.SSE_MAX_CONNECTIONS_PER_IP = '10';
+    process.env.SSE_MAX_GLOBAL_CONNECTIONS = '1000';
+    process.env.SSE_MAX_CONNECTION_DURATION_MS = String(30 * 60 * 1000);
+    process.env.SSE_RETRY_AFTER_SECONDS = '15';
+    _resetSseConnectionLimiter();
     mockGetById.mockResolvedValue(undefined);
     mockGetEvents.mockResolvedValue({ events: [], total: 0 });
     
@@ -128,8 +228,10 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    _resetSseConnectionLimiter();
+    _resetSseSubscriptionsForTest();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    sseEventBus.removeAllListeners('stream_update');
+    sseEventBus.removeAllListeners(SSE_STREAM_UPDATE_EVENT);
   });
 
   it('returns 404 if the stream does not exist', async () => {
@@ -196,6 +298,8 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     expect(res.status).toBe(401);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(mockGetById).not.toHaveBeenCalled();
+    expect(getActiveSseConnectionCount()).toBe(0);
   });
 
   it('accepts valid JWT token in Authorization header when WS_AUTH_REQUIRED is true', async () => {
@@ -253,6 +357,8 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     expect(res.status).toBe(401);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(mockGetById).not.toHaveBeenCalled();
+    expect(getActiveSseConnectionCount()).toBe(0);
   });
 
   it('replays historical events using Last-Event-ID header', async () => {
@@ -317,7 +423,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
         res.on('data', (chunk) => {
           data += chunk.toString();
           if (data.includes(': ok\n\n')) {
-            sseEventBus.emit('stream_update', {
+            sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, {
               streamId: 'stream-123',
               eventId: 'evt-live-001',
               payload: { status: 'cancelled' },
@@ -341,7 +447,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
   it('removes listener when client disconnects', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 
-    const initialListeners = sseEventBus.listenerCount('stream_update');
+    const initialListeners = sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT);
 
     const resPromise = new Promise<void>((resolve) => {
       const req = http.get({
@@ -355,7 +461,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
       }, (res) => {
         res.on('data', (chunk) => {
           if (chunk.toString().includes(': ok\n\n')) {
-            expect(sseEventBus.listenerCount('stream_update')).toBe(initialListeners + 1);
+            expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners + 1);
             res.socket?.destroy();
             resolve();
           }
@@ -369,6 +475,153 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     // Give listener time to close in next tick
     await new Promise((r) => setTimeout(r, 100));
     
-    expect(sseEventBus.listenerCount('stream_update')).toBe(initialListeners);
+    expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
+  });
+
+  it('releases the reserved SSE slot when the stream is not found', async () => {
+    process.env.SSE_MAX_CONNECTIONS_PER_IP = '1';
+    mockGetById.mockResolvedValue(undefined);
+
+    const res = await requestJson('/api/streams/stream-missing/events');
+
+    expect(res.status).toBe(404);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(await getMetricValue(sseActiveConnectionsGauge)).toBe(0);
+  });
+
+  it('rejects SSE connections over the per-IP cap with 429 and Retry-After', async () => {
+    process.env.SSE_MAX_CONNECTIONS_PER_IP = '1';
+    process.env.SSE_MAX_GLOBAL_CONNECTIONS = '10';
+    process.env.SSE_RETRY_AFTER_SECONDS = '7';
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const first = await openSseConnection();
+    expect(getActiveSseConnectionCount()).toBe(1);
+
+    const getByIdCallsBeforeRejected = mockGetById.mock.calls.length;
+    const beforeRejected = await getMetricValue(sseConnectionsRejectedTotal, { reason: 'per_ip_limit' });
+    const rejected = await requestJson();
+
+    expect(mockGetById).toHaveBeenCalledTimes(getByIdCallsBeforeRejected);
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers['retry-after']).toBe('7');
+    expect(rejected.body.success).toBe(false);
+    expect(rejected.body.error.code).toBe('TOO_MANY_REQUESTS');
+    expect(rejected.body.error.details.reason).toBe('per_ip_limit');
+    expect(await getMetricValue(sseConnectionsRejectedTotal, { reason: 'per_ip_limit' })).toBe(beforeRejected + 1);
+
+    await closeSseConnection(first);
+    expect(getActiveSseConnectionCount()).toBe(0);
+  });
+
+  it('rejects SSE connections over the global cap with 429 and Retry-After', async () => {
+    process.env.SSE_MAX_CONNECTIONS_PER_IP = '10';
+    process.env.SSE_MAX_GLOBAL_CONNECTIONS = '1';
+    process.env.SSE_RETRY_AFTER_SECONDS = '11';
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const first = await openSseConnection();
+    expect(getActiveSseConnectionCount()).toBe(1);
+
+    const getByIdCallsBeforeRejected = mockGetById.mock.calls.length;
+    const beforeRejected = await getMetricValue(sseConnectionsRejectedTotal, { reason: 'global_limit' });
+    const rejected = await requestJson();
+
+    expect(mockGetById).toHaveBeenCalledTimes(getByIdCallsBeforeRejected);
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers['retry-after']).toBe('11');
+    expect(rejected.body.success).toBe(false);
+    expect(rejected.body.error.code).toBe('TOO_MANY_REQUESTS');
+    expect(rejected.body.error.details.reason).toBe('global_limit');
+    expect(await getMetricValue(sseConnectionsRejectedTotal, { reason: 'global_limit' })).toBe(beforeRejected + 1);
+
+    await closeSseConnection(first);
+    expect(getActiveSseConnectionCount()).toBe(0);
+  });
+
+  it('increments and decrements the active SSE connection gauge', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const connection = await openSseConnection();
+
+    expect(getActiveSseConnectionCount()).toBe(1);
+    expect(await getMetricValue(sseActiveConnectionsGauge)).toBe(1);
+
+    await closeSseConnection(connection);
+
+    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(await getMetricValue(sseActiveConnectionsGauge)).toBe(0);
+  });
+
+  it('closes after max duration and cleans listener/counter state', async () => {
+    process.env.SSE_MAX_CONNECTION_DURATION_MS = '50';
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const initialListeners = sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT);
+
+    const output = await new Promise<string>((resolve, reject) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/streams/stream-123/events',
+        agent: false,
+      }, (res) => {
+        let data = '';
+        const timeout = setTimeout(() => {
+          req.destroy(new Error('Timed out waiting for SSE max-duration close'));
+        }, 1000);
+
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+        });
+        res.on('end', () => {
+          clearTimeout(timeout);
+          resolve(data);
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+    });
+
+    expect(output).toContain(': ok\n\n');
+    expect(output).toContain('event: close');
+    expect(output).toContain('max_duration');
+
+    await delay(50);
+
+    expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
+    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(await getMetricValue(sseActiveConnectionsGauge)).toBe(0);
+  });
+
+  it('uses one shared sseEventBus dispatcher for multiple active SSE subscribers', async () => {
+    process.env.SSE_MAX_CONNECTIONS_PER_IP = '10';
+    process.env.SSE_MAX_GLOBAL_CONNECTIONS = '10';
+    mockGetById.mockImplementation(async (id: string) => makeDbRecord({ id }));
+
+    const initialListeners = sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT);
+
+    const first = await openSseConnection('/api/streams/stream-123/events');
+    const second = await openSseConnection('/api/streams/stream-456/events');
+
+    expect(getActiveSseConnectionCount()).toBe(2);
+    expect(getLiveSseSubscriberCount()).toBe(2);
+    expect(getLiveSseSubscriberCount('stream-123')).toBe(1);
+    expect(getLiveSseSubscriberCount('stream-456')).toBe(1);
+    expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners + 1);
+
+    await closeSseConnection(first);
+
+    expect(getActiveSseConnectionCount()).toBe(1);
+    expect(getLiveSseSubscriberCount()).toBe(1);
+    expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners + 1);
+
+    await closeSseConnection(second);
+
+    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getLiveSseSubscriberCount()).toBe(0);
+    expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
   });
 });

@@ -38,7 +38,7 @@ import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import type { ContractEventStore } from '../indexer/store.js';
-import { sseEventBus } from '../streams/sseEmitter.js';
+import { SSE_STREAM_UPDATE_EVENT, sseEventBus } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -73,6 +73,7 @@ export interface StreamUpdateEvent {
   streamId: string;
   eventId: string;
   payload: unknown;
+  correlationId?: string;
   ledger?: number;
   recipientAddress?: string;
 }
@@ -508,7 +509,7 @@ export class StreamHub extends EventEmitter {
     await this.dedup.add(streamId, eventId);
 
     // Emit to Server-Sent Events bus
-    sseEventBus.emit('stream_update', event);
+    sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, event);
 
     const subscribers = this.matchingSubscribers(event);
     if (subscribers.size === 0) return;

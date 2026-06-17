@@ -10,6 +10,23 @@ export const streamsCreatedTotal =
     registers: [registry],
   });
 
+export const sseActiveConnectionsGauge =
+  (registry.getSingleMetric('fluxora_sse_active_connections') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_active_connections',
+    help: 'Current number of active Server-Sent Events stream connections',
+    registers: [registry],
+  });
+
+export const sseConnectionsRejectedTotal =
+  (registry.getSingleMetric('fluxora_sse_connections_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_sse_connections_rejected_total',
+    help: 'Total number of rejected Server-Sent Events stream connection attempts',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
 export const webhookDeliveriesTotal =
   (registry.getSingleMetric('fluxora_webhook_deliveries_total') as Counter<'outcome'>) ||
   new Counter({
@@ -47,6 +64,8 @@ export const indexerLagSeconds =
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_streams_created_total');
+  registry.removeSingleMetric('fluxora_sse_active_connections');
+  registry.removeSingleMetric('fluxora_sse_connections_rejected_total');
   registry.removeSingleMetric('fluxora_webhook_deliveries_total');
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');

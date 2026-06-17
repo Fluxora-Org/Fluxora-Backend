@@ -242,6 +242,10 @@ export const EnvSchema = z.object({
   REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
   ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
   WS_AUTH_REQUIRED: booleanEnv().default(false),
+  SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+  SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
+  SSE_MAX_CONNECTION_DURATION_MS: integerEnv('SSE_MAX_CONNECTION_DURATION_MS', 1, 86_400_000).default(30 * 60 * 1000),
+  SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
   INDEXER_ENABLED: booleanEnv().default(false),
   WORKER_ENABLED: booleanEnv().default(false),
   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
@@ -353,6 +357,10 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  sseMaxConnectionsPerIp: number;
+  sseMaxGlobalConnections: number;
+  sseMaxConnectionDurationMs: number;
+  sseRetryAfterSeconds: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
   indexerStallThresholdMs: number;
@@ -493,6 +501,10 @@ function toConfig(env: ParsedEnv): Config {
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
+    sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
+    sseMaxConnectionDurationMs: env.SSE_MAX_CONNECTION_DURATION_MS,
+    sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
