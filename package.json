@@ -5,9 +5,9 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "test": "jest",
-    "test:coverage": "jest --coverage",
-    "test:watch": "jest --watch",
+    "test": "jest --config jest.config.cjs",
+    "test:coverage": "jest --config jest.config.cjs --coverage",
+    "test:watch": "jest --config jest.config.cjs --watch",
     "dev": "ts-node src/index.ts",
     "start": "node dist/src/index.js",
     "migrate": "ts-node migrations/run.ts",

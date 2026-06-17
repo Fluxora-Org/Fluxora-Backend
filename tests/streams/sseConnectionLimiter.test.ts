@@ -1,4 +1,3 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { sseActiveConnectionsGauge } from '../../src/metrics/businessMetrics.js';
 import {
   DEFAULT_SSE_MAX_CONNECTIONS_PER_IP,
