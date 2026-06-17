@@ -8,15 +8,20 @@
  * Graceful degradation
  * --------------------
  * If Redis is unavailable (get/set throws), the store logs a warning and
- * returns null / silently skips the write.  The route handler treats a null
- * get() as a cache miss and proceeds normally — idempotency is best-effort
- * when the store is down rather than a hard failure.
+ * returns null / silently skips the write.  The optional `onStateChange`
+ * callback is invoked with `false` on error and `true` on recovery so that
+ * callers can flip an upstream dependency-health flag (→ 503 rather than
+ * silently losing idempotency guarantees).
  *
  * Security notes
  * --------------
  * - Keys are namespaced under `fluxora:idempotency:` to avoid collisions.
  * - The raw Idempotency-Key value is never logged; only its length is.
- * - TTL is enforced by Redis EX so entries are automatically evicted.
+ * - Stored fingerprints are SHA-256 of the normalised request body, so a
+ *   different payload under the same key cannot silently overwrite a cached
+ *   response — it produces a 409 CONFLICT instead.
+ * - TTL is enforced by Redis EX so entries are automatically evicted after
+ *   the configured window (default 86 400 s / 24 h).
  * - The stored value is JSON-serialised; no eval or dynamic code paths.
  *
  * @module redis/idempotencyStore
@@ -28,7 +33,7 @@ export const IDEMPOTENCY_KEY_PREFIX = 'fluxora:idempotency:';
 
 /** Shape stored in Redis for each idempotency entry. */
 export interface IdempotentEntry<T = unknown> {
-  /** SHA-256 fingerprint of the normalised request body. */
+  /** SHA-256 hex digest of the normalised request body. */
   requestFingerprint: string;
   /** HTTP status code of the original response. */
   statusCode: number;
@@ -48,10 +53,38 @@ export interface IdempotencyStore<T = unknown> {
    * Silently no-ops on Redis unavailability.
    */
   set(key: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void>;
+
+  /** Release any external resources (e.g. Redis connection) held by this store. */
+  close(): Promise<void>;
+}
+
+/** Options for {@link RedisIdempotencyStore}. */
+export interface RedisIdempotencyStoreOptions {
+  /**
+   * Called with `true` after every successful Redis operation (indicating
+   * the store is healthy) and with `false` after every error (indicating
+   * the store is degraded).  Use this to flip an upstream dependency-health
+   * flag so that callers can return 503 instead of silently losing guarantees.
+   *
+   * The callback is never called when the store is not used (e.g. NoOp).
+   * Idempotency-Key values are never passed to this callback.
+   */
+  onStateChange?: (healthy: boolean) => void;
 }
 
 export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
-  constructor(private readonly client: RedisClient) {}
+  private readonly onStateChange?: (healthy: boolean) => void;
+
+  /**
+   * @param client  The Redis client to use for storage.
+   * @param options Optional callbacks for health-state reporting.
+   */
+  constructor(
+    private readonly client: RedisClient,
+    options?: RedisIdempotencyStoreOptions,
+  ) {
+    this.onStateChange = options?.onStateChange;
+  }
 
   private buildKey(key: string): string {
     return `${IDEMPOTENCY_KEY_PREFIX}${key}`;
@@ -60,9 +93,11 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   async get(key: string): Promise<IdempotentEntry<T> | null> {
     try {
       const raw = await this.client.get(this.buildKey(key));
+      this.onStateChange?.(true);
       if (raw === null) return null;
       return JSON.parse(raw) as IdempotentEntry<T>;
     } catch (err) {
+      this.onStateChange?.(false);
       console.warn('[IdempotencyStore] Redis get failed — degrading to pass-through', {
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
@@ -74,26 +109,33 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   async set(key: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
     try {
       await this.client.set(this.buildKey(key), JSON.stringify(entry), { ex: ttlSeconds });
+      this.onStateChange?.(true);
     } catch (err) {
+      this.onStateChange?.(false);
       console.warn('[IdempotencyStore] Redis set failed — idempotency not persisted', {
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
+
+  async close(): Promise<void> {
+    await this.client.close();
+  }
 }
 
 /**
- * No-op store used when Redis is disabled or unavailable at startup.
+ * No-op store used when Redis is disabled (`REDIS_ENABLED=false`).
  * Every get() is a miss; every set() is a silent no-op.
  * The route handler degrades gracefully: requests are processed normally
- * but duplicate protection is not enforced.
+ * but duplicate protection is not enforced across instances or restarts.
  */
 export class NoOpIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   async get(_key: string): Promise<IdempotentEntry<T> | null> {
     return null;
   }
   async set(_key: string, _entry: IdempotentEntry<T>, _ttlSeconds: number): Promise<void> {}
+  async close(): Promise<void> {}
 }
 
 /**
@@ -114,6 +156,10 @@ export class InMemoryIdempotencyStore<T = unknown> implements IdempotencyStore<T
   }
 
   clear(): void {
+    this.store.clear();
+  }
+
+  async close(): Promise<void> {
     this.store.clear();
   }
 }

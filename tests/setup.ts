@@ -12,6 +12,9 @@
 
 process.env.NODE_ENV = process.env.NODE_ENV ?? 'test';
 process.env.RATE_LIMIT_ENABLED = process.env.RATE_LIMIT_ENABLED ?? 'false';
+// Disable Redis in tests to prevent connection attempts to a non-existent server.
+// Tests that need Redis semantics use FakeRedisClient or InMemoryIdempotencyStore directly.
+process.env.REDIS_ENABLED = process.env.REDIS_ENABLED ?? 'false';
 process.env.DATABASE_URL =
   process.env.DATABASE_URL ?? 'postgresql://localhost/fluxora_test';
 process.env.JWT_SECRET =

@@ -26,8 +26,10 @@
  *   - Same key + diff body  → 409 CONFLICT
  *   - Missing / bad key     → 400 VALIDATION_ERROR
  *
- * The idempotency store is in-memory (Map) for this iteration.  In production
- * it should be backed by Redis with a 24-hour TTL.
+ * The idempotency store defaults to in-memory at module load and is replaced
+ * at startup with a RedisIdempotencyStore when Redis is available
+ * (REDIS_ENABLED=true, the default).  TTL is driven by IDEMPOTENCY_TTL_SECONDS
+ * (default 86 400 s / 24 h).  See src/app.ts wireIdempotencyStore().
  *
  * Failure modes
  * -------------
@@ -125,7 +127,8 @@ const streamListingDependency = { state: 'healthy' as DependencyState };
 const idempotencyDependency   = { state: 'healthy' as DependencyState };
 
 // Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
-// with a RedisIdempotencyStore when Redis is available.
+// by wireIdempotencyStore() in app.ts with a RedisIdempotencyStore when Redis
+// is available (REDIS_ENABLED=true).
 let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>>> =
   new InMemoryIdempotencyStore();
 
@@ -160,12 +163,17 @@ export function resetStreamIdempotencyStore(): void {
  * Replace the idempotency store implementation.
  * Called at startup with a RedisIdempotencyStore, and in tests with a
  * FakeRedisClient-backed store or a NoOpIdempotencyStore.
+ *
+ * The parameter is typed as `IdempotencyStore<unknown>` so callers do not
+ * need to import the route's private `Stream` / `successResponse` types.
+ * The cast below is safe because the route handler always stores and reads
+ * values of the correct shape.
  */
 export function setIdempotencyStore(
-  store: IdempotencyStore<ReturnType<typeof successResponse<Stream>>>,
+  store: IdempotencyStore<unknown>,
   ttlSeconds?: number,
 ): void {
-  idempotencyStore = store;
+  idempotencyStore = store as IdempotencyStore<ReturnType<typeof successResponse<Stream>>>;
   if (ttlSeconds !== undefined) idempotencyTtlSeconds = ttlSeconds;
 }
 
@@ -314,7 +322,7 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
 }
 
 function fingerprintInput(input: NormalizedCreateInput): string {
-  return JSON.stringify(input);
+  return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
 }
 
 /** Wrap DB errors so pool exhaustion surfaces as 503. */

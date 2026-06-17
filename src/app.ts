@@ -1,7 +1,7 @@
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type pg from 'pg';
-import { streamsRouter } from './routes/streams.js';
+import { streamsRouter, setIdempotencyStore, setIdempotencyDependencyState } from './routes/streams.js';
 import { healthRouter } from './routes/health.js';
 import { indexerRouter } from './routes/indexer.js';
 import { auditRouter } from './routes/audit.js';
@@ -12,7 +12,11 @@ import { webhooksRouter } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders } from './middleware/pii.js';
 import type { Config } from './config/env.js';
+import { loadConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
+import { createRedisClient } from './redis/client.js';
+import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
+import { logger } from './lib/logger.js';
 import { cspNonceMiddleware, createHelmetMiddleware } from './middleware/helmet.js';
 import { metricsRouter } from './routes/metrics.js';
 import { correlationIdMiddleware } from './middleware/correlationId.js';
@@ -53,6 +57,71 @@ export interface AppOptions {
   pool?: pg.Pool;
 }
 
+/**
+ * Wire the idempotency backing store for POST /api/streams.
+ *
+ * When `REDIS_ENABLED=true` (the default): creates a `RedisIdempotencyStore`
+ * backed by the configured Redis instance and calls `setIdempotencyStore()`.
+ * The `onStateChange` callback flips `idempotencyDependency` to unavailable on
+ * Redis errors so that subsequent `POST /api/streams` requests return 503
+ * instead of silently losing cross-instance duplicate protection.
+ * A shutdown hook is registered to close the Redis connection cleanly.
+ *
+ * When `REDIS_ENABLED=false`: installs a `NoOpIdempotencyStore` and logs a
+ * warning about degraded idempotency semantics (no cross-instance dedup).
+ *
+ * The TTL is sourced from `config.idempotencyTtlSeconds`
+ * (`IDEMPOTENCY_TTL_SECONDS` env var, default 86 400 s / 24 h).
+ *
+ * This function never rejects — all errors are caught and logged internally.
+ */
+async function wireIdempotencyStore(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.warn(
+      'Redis disabled — stream idempotency running in NoOp mode; cross-instance duplicate protection is not enforced',
+      undefined,
+      { component: 'idempotency-store', ttlSeconds: config.idempotencyTtlSeconds },
+    );
+    setIdempotencyStore(new NoOpIdempotencyStore(), config.idempotencyTtlSeconds);
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const store = new RedisIdempotencyStore(redisClient, {
+      onStateChange: (healthy: boolean) =>
+        setIdempotencyDependencyState(healthy ? 'healthy' : 'unavailable'),
+    });
+
+    setIdempotencyStore(store, config.idempotencyTtlSeconds);
+    addShutdownHook(() => store.close());
+
+    logger.info(
+      'Redis idempotency store wired',
+      undefined,
+      { component: 'idempotency-store', ttlSeconds: config.idempotencyTtlSeconds },
+    );
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for idempotency store — POST /api/streams will return 503 until Redis is restored',
+      undefined,
+      {
+        component: 'idempotency-store',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setIdempotencyDependencyState('unavailable');
+  }
+}
+
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
@@ -77,6 +146,10 @@ export function createApp(options: AppOptions = {}): Express {
   if (options.pool) {
     app.locals.vacuumInterval = startVacuumCollector(options.pool);
   }
+
+  // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
+  const appConfig = options.config ?? loadConfig();
+  void wireIdempotencyStore(appConfig);
 
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
