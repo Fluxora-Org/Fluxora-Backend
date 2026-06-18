@@ -30,3 +30,25 @@ export const httpRequestDurationSeconds = new Histogram({
   buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
   registers: [registry],
 });
+
+/**
+ * Total requests rejected by the rate limiter with a 429 response.
+ * Labels: identifier_type ('ip' | 'apiKey'), route (path or 'global').
+ */
+export const rateLimitRejectedTotal = new Counter({
+  name: 'rate_limit_rejected_total',
+  help: 'Total requests rejected by the rate limiter (HTTP 429)',
+  labelNames: ['identifier_type', 'route'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total Redis errors that triggered rate-limit fallback to in-memory store.
+ * Labels: operation ('increment' | 'getCount').
+ */
+export const rateLimitRedisErrorsTotal = new Counter({
+  name: 'rate_limit_redis_errors_total',
+  help: 'Total Redis errors that triggered rate-limit fallback to in-memory store',
+  labelNames: ['operation'] as const,
+  registers: [registry],
+});

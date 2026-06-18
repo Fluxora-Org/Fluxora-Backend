@@ -1,4 +1,4 @@
-import { describe, it, expect, jest, afterEach } from '@jest/globals';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   resolvePoolConfig,
   createPool,
@@ -78,8 +78,8 @@ function makePool(overrides: Partial<pg.Pool> = {}): pg.Pool {
     idleCount: 1,
     waitingCount: 0,
     options: { max: 10 },
-    query: jest.fn<() => Promise<pg.QueryResult>>().mockResolvedValue({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] }),
-    on: jest.fn(),
+    query: vi.fn<() => Promise<pg.QueryResult>>().mockResolvedValue({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] }),
+    on: vi.fn(),
     ...overrides,
   } as unknown as pg.Pool;
 }
@@ -91,15 +91,15 @@ describe('query', () => {
     expect(result.rows).toEqual([]);
   });
 
-  it('throws PoolExhaustedError when pool is full and requests are waiting', async () => {
-    const pool = makePool({ totalCount: 10, idleCount: 0, waitingCount: 1 });
-    await expect(query(pool, 'SELECT 1')).rejects.toBeInstanceOf(PoolExhaustedError);
+  it('throws PoolExhaustedError when waiting queue reaches the queue limit', async () => {
+    const pool = makePool({ totalCount: 10, idleCount: 0, waitingCount: 50 });
+    await expect(query(pool, 'SELECT 1', undefined, 50)).rejects.toBeInstanceOf(PoolExhaustedError);
   });
 
   it('throws DuplicateEntryError on unique constraint violation', async () => {
     const pgError = Object.assign(new Error('dup'), { code: '23505', detail: 'Key already exists' });
     const pool = makePool({
-      query: jest.fn<() => Promise<never>>().mockRejectedValue(pgError),
+      query: vi.fn<() => Promise<never>>().mockRejectedValue(pgError),
     });
     await expect(query(pool, 'INSERT INTO t VALUES ($1)', [1])).rejects.toBeInstanceOf(DuplicateEntryError);
   });
@@ -107,7 +107,7 @@ describe('query', () => {
   it('DuplicateEntryError carries the pg detail message', async () => {
     const pgError = Object.assign(new Error('dup'), { code: '23505', detail: 'Key (id)=(1) already exists.' });
     const pool = makePool({
-      query: jest.fn<() => Promise<never>>().mockRejectedValue(pgError),
+      query: vi.fn<() => Promise<never>>().mockRejectedValue(pgError),
     });
     await expect(query(pool, 'INSERT INTO t VALUES ($1)', [1])).rejects.toThrow('Key (id)=(1) already exists.');
   });
@@ -115,17 +115,17 @@ describe('query', () => {
   it('re-throws non-unique-violation errors unchanged', async () => {
     const err = new Error('connection reset');
     const pool = makePool({
-      query: jest.fn<() => Promise<never>>().mockRejectedValue(err),
+      query: vi.fn<() => Promise<never>>().mockRejectedValue(err),
     });
     await expect(query(pool, 'SELECT 1')).rejects.toBe(err);
   });
 
   it('logs a warning for slow queries (latency > 1000ms)', async () => {
     let call = 0;
-    jest.spyOn(Date, 'now').mockImplementation(() => (call++ === 0 ? 1000 : 2001));
+    vi.spyOn(Date, 'now').mockImplementation(() => (call++ === 0 ? 1000 : 2001));
     const pool = makePool();
     await query(pool, 'SELECT slow');
-    jest.spyOn(Date, 'now').mockRestore();
+    vi.spyOn(Date, 'now').mockRestore();
   });
 });
 

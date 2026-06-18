@@ -6,7 +6,7 @@
  * this route (enforce at the gateway / auth middleware layer).
  *
  * Response shape:
- *   { entries: AuditEntry[], total: number }
+ *   { success: true, data: { entries: AuditEntry[], total: number }, meta: ResponseMeta }
  *
  * Failure modes:
  *   - No entries yet → 200 with empty array (not 404).
@@ -14,10 +14,13 @@
 
 import { Router } from 'express';
 import { getAuditEntries } from '../lib/auditLog.js';
+import { successResponse } from '../utils/response.js';
+import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 
 export const auditRouter = Router();
 
-auditRouter.get('/', (_req, res) => {
+auditRouter.get('/', authenticate, requireAuth, requirePermission(Permission.AUDIT_READ), (req, res) => {
+  const requestId = req.id;
   const entries = getAuditEntries();
-  res.json({ entries, total: entries.length });
+  res.json(successResponse({ entries, total: entries.length }, requestId));
 });

@@ -77,10 +77,13 @@
  *       403: { description: Forbidden }
  *       404: { description: Not found }
  */
-import { Router } from 'express';
-import { authenticate, requireAuth } from '../middleware/auth.js';
-import { asyncHandler } from '../middleware/errorHandler.js';
-import { info, warn } from '../utils/logger.js';
+import { Router, type Request, type Response } from 'express';
+import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
+import { asyncHandler, validationError } from '../middleware/errorHandler.js';
+import { info } from '../utils/logger.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
+import { successResponse, errorResponse } from '../utils/response.js';
+import { dlqRepository } from '../db/repositories/dlqRepository.js';
 
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
@@ -94,13 +97,10 @@ export interface DlqEntry {
   correlationId?: string;
 }
 
-// In-memory DLQ store (placeholder — PostgreSQL integration is a follow-up)
-const dlqEntries: DlqEntry[] = [];
-
 /** Enqueue a dead-letter entry. Called by internal workers. */
-export function enqueueDeadLetter(
+export async function enqueueDeadLetter(
   entry: Omit<DlqEntry, 'id' | 'firstFailedAt' | 'lastFailedAt'>,
-): DlqEntry {
+): Promise<DlqEntry> {
   const now = new Date().toISOString();
   const full: DlqEntry = {
     ...entry,
@@ -108,36 +108,14 @@ export function enqueueDeadLetter(
     firstFailedAt: now,
     lastFailedAt: now,
   };
-  dlqEntries.push(full);
+  await dlqRepository.insert(full);
   return full;
-}
-
-/** Return all entries (shallow copy). */
-export function getDlqEntries(): DlqEntry[] {
-  return dlqEntries.slice();
-}
-
-/** Reset — test use only. */
-export function _resetDlq(): void {
-  dlqEntries.length = 0;
 }
 
 export const dlqRouter = Router();
 
-/** Enforce operator role; must be used after authenticate + requireAuth. */
-function requireOperator(req: any, res: any, next: any): void {
-  if (req.user?.role !== 'operator') {
-    warn('Non-operator attempted DLQ access', { role: req.user?.role, path: req.path });
-    res.status(403).json({
-      error: { code: 'FORBIDDEN', message: 'Operator role required to access the DLQ', requestId: req.id },
-    });
-    return;
-  }
-  next();
-}
-
-// All DLQ routes require authentication + operator role
-dlqRouter.use(authenticate, requireAuth, requireOperator);
+// All DLQ routes require authentication + appropriate permission
+dlqRouter.use(authenticate, requireAuth);
 
 /**
  * GET /admin/dlq
@@ -145,7 +123,8 @@ dlqRouter.use(authenticate, requireAuth, requireOperator);
  */
 dlqRouter.get(
   '/',
-  asyncHandler(async (req: any, res: any) => {
+  requirePermission(Permission.DLQ_LIST),
+  asyncHandler(async (req: Request, res: Response) => {
     const limitParam  = req.query.limit;
     const offsetParam = req.query.offset;
     const topicFilter = req.query.topic;
@@ -155,8 +134,7 @@ dlqRouter.get(
     if (limitParam !== undefined) {
       const parsed = Number.parseInt(String(limitParam), 10);
       if (Number.isNaN(parsed) || parsed < 1 || parsed > 100) {
-        res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'limit must be an integer between 1 and 100', requestId } });
-        return;
+        throw validationError('limit must be an integer between 1 and 100');
       }
       limit = parsed;
     }
@@ -165,28 +143,25 @@ dlqRouter.get(
     if (offsetParam !== undefined) {
       const parsed = Number.parseInt(String(offsetParam), 10);
       if (Number.isNaN(parsed) || parsed < 0) {
-        res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'offset must be a non-negative integer', requestId } });
-        return;
+        throw validationError('offset must be a non-negative integer');
       }
       offset = parsed;
     }
 
-    let filtered = dlqEntries.slice();
-    if (typeof topicFilter === 'string' && topicFilter.trim() !== '') {
-      filtered = filtered.filter((e) => e.topic === topicFilter.trim());
-    }
+    const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
+    const { entries, total } = await dlqRepository.findAll({ limit, offset, topic });
 
-    const page = filtered.slice(offset, offset + limit);
+    info('DLQ entries listed', { total, returned: entries.length, offset, limit, requestId });
 
-    info('DLQ entries listed', { total: filtered.length, returned: page.length, offset, limit, requestId });
+    recordAuditEvent('DLQ_LISTED', 'dlq', 'list', requestId, { total, returned: entries.length, offset, limit, topicFilter });
 
-    res.json({
-      entries: page,
-      total: filtered.length,
+    res.json(successResponse({
+      entries,
+      total,
       limit,
       offset,
-      has_more: offset + page.length < filtered.length,
-    });
+      has_more: offset + entries.length < total,
+    }));
   }),
 );
 
@@ -196,13 +171,49 @@ dlqRouter.get(
  */
 dlqRouter.get(
   '/:id',
-  asyncHandler(async (req: any, res: any) => {
-    const entry = dlqEntries.find((e) => e.id === req.params.id);
+  requirePermission(Permission.DLQ_READ),
+  asyncHandler(async (req: Request, res: Response) => {
+    const entry = await dlqRepository.findById(req.params.id);
+    if (!entry) {
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
+      return;
+    }
+    res.json(successResponse({ entry }, req.id));
+  }),
+);
+
+/**
+ * POST /admin/dlq/:id/replay
+ * Replay a DLQ entry by re-enqueuing it for processing.
+ */
+dlqRouter.post(
+  '/:id/replay',
+  requirePermission(Permission.DLQ_REPLAY),
+  asyncHandler(async (req: Request, res: Response) => {
+    const entry = await dlqRepository.findById(req.params.id);
     if (!entry) {
       res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
       return;
     }
-    res.json({ entry });
+
+    await dlqRepository.update(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
+    
+    info('DLQ entry replayed', { id: entry.id, topic: entry.topic, requestId: req.id });
+    
+    // Record audit event for DLQ replay
+    recordAuditEvent(
+      'DLQ_REPLAYED',
+      'dlq',
+      entry.id,
+      req.id,
+      { topic: entry.topic, originalAttempts: entry.attempts }
+    );
+
+    res.json(successResponse({
+      message: 'DLQ entry replayed',
+      id: entry.id,
+      topic: entry.topic,
+    }, req.id));
   }),
 );
 
@@ -212,14 +223,40 @@ dlqRouter.get(
  */
 dlqRouter.delete(
   '/:id',
-  asyncHandler(async (req: any, res: any) => {
-    const index = dlqEntries.findIndex((e) => e.id === req.params.id);
-    if (index === -1) {
-      res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
+  requirePermission(Permission.DLQ_DELETE),
+  asyncHandler(async (req: Request, res: Response) => {
+    const deleted = await dlqRepository.deleteById(req.params.id);
+    if (!deleted) {
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
       return;
     }
-    const [removed] = dlqEntries.splice(index, 1);
-    info('DLQ entry acknowledged', { id: removed!.id, requestId: req.id });
-    res.json({ message: 'DLQ entry removed', id: removed!.id });
+    info('DLQ entry acknowledged', { id: req.params.id, requestId: req.id });
+    res.json(successResponse({ message: 'DLQ entry removed', id: req.params.id }, req.id));
+  }),
+);
+
+/**
+ * DELETE /admin/dlq
+ * Purge all DLQ entries (bulk delete with optional topic filter).
+ */
+dlqRouter.delete(
+  '/',
+  requirePermission(Permission.DLQ_DELETE),
+  asyncHandler(async (req: Request, res: Response) => {
+    const topicFilter = req.query.topic;
+    const requestId = req.id;
+
+    const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
+    const purged = await dlqRepository.deleteAll(topic);
+
+    info('DLQ entries purged', { count: purged, topicFilter, requestId });
+
+    recordAuditEvent('DLQ_PURGED', 'dlq', 'bulk', requestId, { purgedCount: purged, topicFilter });
+
+    res.json(successResponse({
+      message: 'DLQ entries purged',
+      purged,
+      topicFilter: topicFilter || 'all',
+    }, requestId));
   }),
 );

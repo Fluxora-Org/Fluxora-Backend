@@ -1,10 +1,10 @@
-import { describe, it, expect, jest } from '@jest/globals';
+import { describe, it, expect, vi } from 'vitest';
 import { dispatchWebhook } from './dispatcher.js';
 
 describe('Webhook Dispatcher', () => {
   it('includes required headers and signature', async () => {
-    const mockFetch = jest.fn(() => Promise.resolve(new Response(null, { status: 200 })));
-    global.fetch = mockFetch as any;
+    const mockFetch = vi.fn(() => Promise.resolve(new Response(null, { status: 200 })));
+    global.fetch = mockFetch as unknown as typeof fetch;
 
     await dispatchWebhook({
       url: 'https://example.com/webhook',

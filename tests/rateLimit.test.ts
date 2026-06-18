@@ -1,11 +1,16 @@
 import request from 'supertest';
 import { describe, it, expect } from 'vitest';
 import express from 'express';
-import { createRateLimiter } from '../src/middleware/rateLimit';
+import { createRateLimiter } from '../src/middleware/rateLimiter.js';
+import { InMemoryStore } from '../src/redis/rateLimitStore.js';
 
 function buildApp(max: number) {
   const app = express();
-  app.use(createRateLimiter({ windowMs: 60_000, max }));
+  app.use(createRateLimiter({
+    RATE_LIMIT_ENABLED: 'true',
+    RATE_LIMIT_IP_WINDOW_MS: '60000',
+    RATE_LIMIT_IP_MAX: String(max),
+  }, new InMemoryStore()));
   app.get('/ping', (_req, res) => res.json({ ok: true }));
   return app;
 }
@@ -26,10 +31,10 @@ describe('createRateLimiter', () => {
     expect(res.body.error.code).toBe('RATE_LIMIT_EXCEEDED');
   });
 
-  it('sets RateLimit-* headers', async () => {
+  it('sets X-RateLimit-* headers', async () => {
     const app = buildApp(10);
     const res = await request(app).get('/ping');
-    expect(res.headers['ratelimit-limit']).toBeDefined();
-    expect(res.headers['ratelimit-remaining']).toBeDefined();
+    expect(res.headers['x-ratelimit-limit']).toBeDefined();
+    expect(res.headers['x-ratelimit-remaining']).toBeDefined();
   });
 });

@@ -114,16 +114,21 @@ describe('PII policy definitions', () => {
 
     it('includes request metadata fields', () => {
       const fields = redactableFields();
-      expect(fields.has('ipAddress')).toBe(true);
-      expect(fields.has('authToken')).toBe(true);
-      expect(fields.has('userAgent')).toBe(true);
+      expect(fields.has('ipaddress')).toBe(true);
+      expect(fields.has('authtoken')).toBe(true);
+      expect(fields.has('useragent')).toBe(true);
+      // Also check some new fields
+      expect(fields.has('authorization')).toBe(true);
+      expect(fields.has('x-api-key')).toBe(true);
+      expect(fields.has('password')).toBe(true);
+      expect(fields.has('secret')).toBe(true);
     });
 
     it('does not include public fields', () => {
       const fields = redactableFields();
       expect(fields.has('id')).toBe(false);
       expect(fields.has('status')).toBe(false);
-      expect(fields.has('startTime')).toBe(false);
+      expect(fields.has('starttime')).toBe(false);
     });
   });
 });

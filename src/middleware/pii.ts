@@ -8,6 +8,7 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import { logger } from '../logging/logger.js';
+import { redactKeysInString } from '../pii/sanitizer.js';
 
 /**
  * Attaches response headers that instruct clients and intermediaries
@@ -55,8 +56,8 @@ export function safeErrorHandler(
   _next: NextFunction,
 ): void {
   logger.error('unhandled error', {
-    error: err.message,
-    stack: process.env.NODE_ENV === 'production' ? undefined : err.stack,
+    error: redactKeysInString(err.message),
+    stack: process.env.NODE_ENV === 'production' ? undefined : redactKeysInString(err.stack || ''),
   });
 
   res.status(500).json({

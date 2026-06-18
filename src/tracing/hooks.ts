@@ -82,8 +82,11 @@ export interface TracerHooks {
   /**
    * Called when a span is ended.
    * Typically used to finalize, export, or batch spans.
+   *
+   * Implementations may return a Promise — the tracer awaits it during
+   * `flush()` so async exporters can drain before shutdown.
    */
-  onSpanEnd?(span: Span): void;
+  onSpanEnd?(span: Span): void | Promise<void>;
 
   /**
    * Called when an event is recorded within a span.
@@ -114,7 +117,7 @@ export interface TracerConfig {
   /** OpenTelemetry integration (optional). */
   otel?: {
     enabled: boolean;
-    tracerProvider?: any; // OpenTelemetry TracerProvider
+    tracerProvider?: { getTracer(name: string): unknown }; // OpenTelemetry TracerProvider
     instrumentationName?: string;
   };
 
@@ -140,7 +143,10 @@ export class Tracer {
   private config: TracerConfig;
   private activeSpans: Map<string, Span> = new Map();
   private spanIdCounter: number = 0;
-  private otelTracer: any; // OpenTelemetry Tracer, if enabled
+  // OpenTelemetry Tracer, if enabled.  Typed as `unknown` so we can defer all
+  // shape-checking to the call-sites below — the OTel SDK is an optional
+  // dependency and may be absent at runtime.
+  private otelTracer: unknown;
 
   constructor(config: Partial<TracerConfig> = {}) {
     this.config = { ...DEFAULT_TRACER_CONFIG, ...config };
@@ -162,7 +168,7 @@ export class Tracer {
           this.config.otel.instrumentationName || 'fluxora-backend'
         );
       }
-    } catch (err) {
+    } catch {
       // OpenTelemetry initialization failed; continue with disabled OTel
       // but tracing hooks still work.
     }
@@ -206,7 +212,9 @@ export class Tracer {
     span.endTimeMs = Date.now();
     span.durationMs = span.endTimeMs - span.startTimeMs;
     span.status = status;
-    span.statusMessage = statusMessage;
+    if (statusMessage !== undefined) {
+      span.statusMessage = statusMessage;
+    }
 
     this.activeSpans.delete(span.context.spanId);
 
@@ -228,7 +236,7 @@ export class Tracer {
     const event: SpanEvent = {
       name,
       timestamp: Date.now(),
-      attributes,
+      ...(attributes !== undefined ? { attributes } : {}),
     };
 
     span.events.push(event);
@@ -276,13 +284,13 @@ export class Tracer {
     // Hooks may implement async flushing (e.g., batched export)
     if (this.config.hooks && typeof this.config.hooks.onSpanEnd === 'function') {
       for (const span of this.activeSpans.values()) {
-        await new Promise((resolve) => {
+        await new Promise<void>((resolve) => {
           this.safeCall(() => {
-            const result = this.config.hooks!.onSpanEnd?.(span);
-            if (result instanceof Promise) {
-              result.then(resolve).catch(() => resolve());
+            const result: void | Promise<void> = this.config.hooks!.onSpanEnd?.(span);
+            if (result && typeof (result as Promise<void>).then === 'function') {
+              (result as Promise<void>).then(() => resolve()).catch(() => resolve());
             } else {
-              resolve(undefined);
+              resolve();
             }
           });
         });
@@ -297,11 +305,14 @@ export class Tracer {
     if (!this.otelTracer) return;
     try {
       span.context.tags = span.context.tags || {};
-      (span.context.tags as any)._otelSpan = this.otelTracer.startSpan(
+      const tracer = this.otelTracer as {
+        startSpan: (name: string, opts?: { attributes?: Record<string, unknown> }) => unknown;
+      };
+      (span.context.tags as Record<string, unknown>)._otelSpan = tracer.startSpan(
         `${span.context.parentSpanId ? 'child' : 'root'}`,
         { attributes: { traceId: span.context.traceId, spanId: span.context.spanId } }
       );
-    } catch (err) {
+    } catch {
       // OTel error; continue without it
     }
   }
@@ -310,7 +321,13 @@ export class Tracer {
    * OpenTelemetry span end (if enabled).
    */
   private recordOtelSpanEnd(span: Span): void {
-    const otelSpan = (span.context.tags as any)?._otelSpan;
+    const otelSpan = (span.context.tags as Record<string, unknown> | undefined)?.['_otelSpan'] as
+      | {
+          end: () => void;
+          setStatus: (status: { code: number }) => void;
+          addEvent: (name: string, attrs?: Record<string, unknown>) => void;
+        }
+      | undefined;
     if (otelSpan && typeof otelSpan.end === 'function') {
       try {
         otelSpan.setStatus({ code: span.status === 'ok' ? 0 : 1 });
@@ -318,7 +335,7 @@ export class Tracer {
           otelSpan.addEvent(span.status, { description: span.statusMessage });
         }
         otelSpan.end();
-      } catch (err) {
+      } catch {
         // OTel error; continue without it
       }
     }
@@ -328,11 +345,13 @@ export class Tracer {
    * OpenTelemetry event record (if enabled).
    */
   private recordOtelEvent(span: Span, event: SpanEvent): void {
-    const otelSpan = (span.context.tags as any)?._otelSpan;
+    const otelSpan = (span.context.tags as Record<string, unknown> | undefined)?.['_otelSpan'] as
+      | { addEvent: (name: string, attrs?: Record<string, unknown>) => void }
+      | undefined;
     if (otelSpan && typeof otelSpan.addEvent === 'function') {
       try {
         otelSpan.addEvent(event.name, event.attributes);
-      } catch (err) {
+      } catch {
         // OTel error; continue without it
       }
     }
@@ -371,6 +390,46 @@ export class Tracer {
 }
 
 /**
+ * Wrap an async operation in a span.
+ *
+ * Creates a child span under the given correlationId, runs fn, then ends the
+ * span with 'ok' or 'error' depending on whether fn throws.
+ *
+ * Usage:
+ *   const result = await traceSpan('db.query', correlationId, { sql }, async () => {
+ *     return pool.query(sql, params);
+ *   });
+ */
+export async function traceSpan<T>(
+  name: string,
+  correlationId: string,
+  tags: Record<string, unknown>,
+  fn: (span: Span) => Promise<T>,
+  parentSpanId?: string,
+): Promise<T> {
+  const tracer = getTracer();
+  const startContext: Omit<SpanContext, 'spanId'> = {
+    traceId: correlationId,
+    serviceName: 'fluxora-api',
+    tags: { 'span.name': name, ...tags },
+  };
+  if (parentSpanId !== undefined) {
+    startContext.parentSpanId = parentSpanId;
+  }
+  const span = tracer.startSpan(startContext);
+
+  try {
+    const result = await fn(span);
+    tracer.endSpan(span, 'ok');
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    tracer.endSpan(span, 'error', message);
+    throw err;
+  }
+}
+
+/**
  * Global tracer instance.
  */
 let globalTracer: Tracer | null = null;
@@ -399,3 +458,172 @@ export function getTracer(): Tracer {
 export function resetTracer(): void {
   globalTracer = null;
 }
+
+// ── OTel-aware business span helpers ─────────────────────────────────────────
+//
+// These thin wrappers call traceSpan() with well-known semantic attribute keys
+// so that spans emitted by business code are consistent with the OTel SDK spans
+// produced by auto-instrumentation.  All helpers are no-ops when tracing is
+// disabled (traceSpan delegates to the global Tracer which short-circuits).
+
+import { trace, context, SpanStatusCode } from '@opentelemetry/api';
+
+/**
+ * Wrap a database query in an OTel span.
+ *
+ * @param sql     — SQL text (must not contain user-supplied values; use params)
+ * @param dbName  — logical database name for the `db.name` attribute
+ * @param fn      — async operation to wrap
+ *
+ * Security: `sql` is recorded as a span attribute.  Never interpolate
+ * user-controlled values into `sql`; always use parameterised queries.
+ */
+export async function traceDbQuery<T>(
+  sql: string,
+  dbName: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const correlationId = getCorrelationIdFromContext();
+  return traceSpan('db.query', correlationId, { 'db.system': 'postgresql', 'db.name': dbName, 'db.statement': sql }, async () => fn());
+}
+
+/**
+ * Wrap a Redis command in an OTel span.
+ *
+ * @param command — Redis command name (e.g. "GET", "SET")
+ * @param key     — cache key (must not contain PII)
+ */
+export async function traceRedisCommand<T>(
+  command: string,
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const correlationId = getCorrelationIdFromContext();
+  return traceSpan('redis.command', correlationId, { 'db.system': 'redis', 'db.operation': command, 'db.redis.key': key }, async () => fn());
+}
+
+/**
+ * Wrap a Stellar RPC call in an OTel span.
+ *
+ * @param operation — RPC method name (e.g. "getLatestLedger")
+ */
+export async function traceStellarRpc<T>(
+  operation: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const correlationId = getCorrelationIdFromContext();
+  return traceSpan('stellar.rpc', correlationId, { 'rpc.system': 'stellar', 'rpc.method': operation }, async () => fn());
+}
+
+/**
+ * Wrap a webhook dispatch attempt in an OTel span.
+ *
+ * @param event   — event type (e.g. "stream.created")
+ * @param url     — destination URL (must not contain secrets)
+ * @param attempt — retry attempt number (0 = first attempt)
+ */
+export async function traceWebhookDispatch<T>(
+  event: string,
+  url: string,
+  attempt: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const correlationId = getCorrelationIdFromContext();
+  return traceSpan('webhook.dispatch', correlationId, { 'webhook.event': event, 'webhook.url': url, 'webhook.retry': attempt }, async () => fn());
+}
+
+/**
+ * Record a WebSocket broadcast event on the active OTel span (if any).
+ * Does not create a new span — attaches an event to the current context.
+ */
+export function recordWsBroadcast(streamId: string, eventId: string, recipients: number): void {
+  const activeSpan = trace.getActiveSpan();
+  if (!activeSpan) return;
+  activeSpan.addEvent('ws.broadcast', { 'ws.stream_id': streamId, 'ws.event_id': eventId, 'ws.recipients': recipients });
+}
+
+/**
+ * Retrieve the current correlation ID from the OTel context (traceparent trace-id)
+ * or fall back to 'unknown'.  Used internally by the helpers above.
+ */
+function getCorrelationIdFromContext(): string {
+  const spanContext = trace.getActiveSpan()?.spanContext();
+  if (spanContext?.traceId) return spanContext.traceId;
+  // Fall back to the AsyncLocalStorage-based correlation ID if available.
+  try {
+    // Dynamic import avoided — use a lazy require-style approach.
+    // The correlationStore is in middleware.ts; we avoid a circular dep by
+    // reading from the OTel context only.
+  } catch {
+    // ignore
+  }
+  return 'unknown';
+}
+
+/**
+ * Enrich a specific Span (custom tracer span) and any associated OTel span/active OTel span with stream attributes.
+ */
+export function enrichSpanWithStream(
+  span: Span,
+  streamId?: string,
+  sender?: string,
+  recipient?: string,
+): void {
+  if (!span) return;
+  if (!span.context) {
+    span.context = { traceId: 'unknown', spanId: 'noop' };
+  }
+  if (!span.context.tags) {
+    span.context.tags = {};
+  }
+
+  // 1. Enrich custom span tags
+  if (streamId) span.context.tags['fluxora.stream_id'] = streamId;
+  if (sender) span.context.tags['fluxora.sender'] = sender;
+  if (recipient) span.context.tags['fluxora.recipient'] = recipient;
+
+  // 2. Enrich the internal OTel span if it exists in tags
+  const otelSpan = span.context.tags['_otelSpan'] as any;
+  if (otelSpan && typeof otelSpan.setAttribute === 'function') {
+    try {
+      if (streamId) otelSpan.setAttribute('fluxora.stream_id', streamId);
+      if (sender) otelSpan.setAttribute('fluxora.sender', sender);
+      if (recipient) otelSpan.setAttribute('fluxora.recipient', recipient);
+    } catch {
+      // ignore OTel setAttribute errors
+    }
+  }
+
+  // 3. Enrich the global active OTel span if one exists
+  try {
+    const activeSpan = trace.getActiveSpan();
+    if (activeSpan) {
+      if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
+      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+    }
+  } catch {
+    // ignore active span errors
+  }
+}
+
+/**
+ * Enrich the active OpenTelemetry span with stream attributes.
+ */
+export function enrichActiveSpanWithStream(
+  streamId?: string,
+  sender?: string,
+  recipient?: string,
+): void {
+  try {
+    const activeSpan = trace.getActiveSpan();
+    if (activeSpan) {
+      if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
+      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+    }
+  } catch {
+    // ignore active span errors
+  }
+}
+

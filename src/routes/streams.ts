@@ -1,9 +1,11 @@
 /**
- * Streams API routes.
+ * Streams API routes — PostgreSQL-backed.
  *
- * Issue #6  — Input validation layer: all amount fields validated as decimal strings.
- * Issue #34 — Supertest integration tests: routes are designed for full HTTP testability.
+ * All list/get/create/cancel operations delegate to streamRepository.
+ * The in-memory store has been removed; state lives in the `streams` table.
  *
+ * Decimal-string invariant
+ * ------------------------
  * All amount fields (depositAmount, ratePerSecond) are validated as decimal
  * strings before storage and returned as decimal strings in every response.
  * This prevents floating-point precision loss when amounts cross the
@@ -11,90 +13,44 @@
  *
  * Trust boundaries
  * ----------------
- * - Public internet clients: may list, read, create, and cancel streams.
- *   Authentication/authorisation is a planned follow-up (see non-goals below).
- * - Internal workers: same surface; no elevated privileges yet.
+ * - Public internet clients: may list and read streams without authentication.
+ * - Authenticated partners: may create and cancel streams with valid JWT.
+ *
+ * Idempotency
+ * -----------
+ * POST /api/streams requires an Idempotency-Key header (1–128 chars,
+ * [A-Za-z0-9:_-]).  The key is validated by requireIdempotencyKey middleware
+ * before the handler runs.  A SHA-256 fingerprint of the normalised request
+ * body is stored alongside the cached response so that:
+ *   - Same key + same body  → 201 replay (Idempotency-Replayed: true)
+ *   - Same key + diff body  → 409 CONFLICT
+ *   - Missing / bad key     → 400 VALIDATION_ERROR
+ *
+ * The idempotency store defaults to in-memory at module load and is replaced
+ * at startup with a RedisIdempotencyStore when Redis is available
+ * (REDIS_ENABLED=true, the default).  TTL is driven by IDEMPOTENCY_TTL_SECONDS
+ * (default 86 400 s / 24 h).  See src/app.ts wireIdempotencyStore().
  *
  * Failure modes
  * -------------
- * - Invalid decimal string  → 400 VALIDATION_ERROR with per-field details
- * - Missing required field  → 400 VALIDATION_ERROR
- * - Stream not found        → 404 NOT_FOUND
- * - Duplicate cancel        → 409 CONFLICT
- * - Listing dependency down → 503 SERVICE_UNAVAILABLE
- * - Idempotency store down  → 503 SERVICE_UNAVAILABLE
+ * - Missing Idempotency-Key  → 400 VALIDATION_ERROR
+ * - Invalid Idempotency-Key  → 400 VALIDATION_ERROR
+ * - Invalid decimal string   → 400 VALIDATION_ERROR
+ * - Missing required field   → 400 VALIDATION_ERROR
+ * - Missing authentication   → 401 UNAUTHORIZED
+ * - Invalid token            → 401 UNAUTHORIZED
+ * - Stream not found         → 404 NOT_FOUND
+ * - Key reuse / diff payload → 409 CONFLICT
+ * - Duplicate cancel         → 409 CONFLICT
+ * - DB unavailable           → 503 SERVICE_UNAVAILABLE
+ * - Idempotency store down   → 503 SERVICE_UNAVAILABLE
+ * - Address not on-chain     → 422 UNPROCESSABLE_ENTITY
  *
- * Non-goals (intentionally deferred)
- * -----------------------------------
- * - Persistent storage (in-memory only; PostgreSQL integration is follow-up)
- * - Authentication / JWT enforcement on stream routes
- * - Rate limiting
- *
- * @openapi
- * /api/streams:
- *   get:
- *     summary: List streams with cursor pagination
- *     tags: [streams]
- *     parameters:
- *       - name: cursor
- *         in: query
- *         required: false
- *         schema: { type: string }
- *       - name: limit
- *         in: query
- *         schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
- *       - name: include_total
- *         in: query
- *         schema: { type: boolean, default: false }
- *     responses:
- *       200: { description: Paginated list of streams }
- *       400: { description: Invalid pagination parameters }
- *       503: { description: Listing dependency unavailable }
- *   post:
- *     summary: Create a new stream
- *     tags: [streams]
- *     parameters:
- *       - name: Idempotency-Key
- *         in: header
- *         required: true
- *         schema: { type: string, minLength: 1, maxLength: 128 }
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema: { $ref: '#/components/schemas/StreamCreateRequest' }
- *     responses:
- *       201: { description: Stream created }
- *       400: { description: Validation error }
- *       409: { description: Idempotency key conflict }
- *       503: { description: Idempotency dependency unavailable }
- * /api/streams/{id}:
- *   get:
- *     summary: Get a stream by ID
- *     tags: [streams]
- *     parameters:
- *       - name: id
- *         in: path
- *         required: true
- *         schema: { type: string }
- *     responses:
- *       200: { description: Stream details }
- *       404: { description: Not found }
- *   delete:
- *     summary: Cancel a stream
- *     tags: [streams]
- *     parameters:
- *       - name: id
- *         in: path
- *         required: true
- *         schema: { type: string }
- *     responses:
- *       200: { description: Stream cancelled }
- *       404: { description: Not found }
- *       409: { description: Already cancelled or completed }
+ * @module routes/streams
  */
 import { Router } from 'express';
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import crypto from 'crypto';
 import {
   validateDecimalString,
   validateAmountFields,
@@ -106,14 +62,48 @@ import {
   validationError,
   serviceUnavailable,
   asyncHandler,
+  tooManyRequests,
 } from '../middleware/errorHandler.js';
+import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
+import { successResponse, idempotentReplayResponse } from '../utils/response.js';
+import { streamRepository } from '../db/repositories/streamRepository.js';
+import { PoolExhaustedError } from '../db/pool.js';
+import {
+  CreateStreamSchema,
+  parseBody,
+  formatZodIssues,
+} from '../validation/schemas.js';
+import { PaginationSchema } from '../validation/paginationSchema.js';
+import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
+import { isTerminalStatus } from '../streams/status.js';
+import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
+import { verifyWsToken } from '../middleware/tokenAuth.js';
+import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
+import { getClientIp } from '../ws/connectionLimiter.js';
+import {
+  eventMatchesStreamId,
+  SSE_STREAM_UPDATE_EVENT,
+  subscribeToSseStream,
+} from '../streams/sseEmitter.js';
+import {
+  resolveSseConnectionLimits,
+  tryAcquireSseConnection,
+} from '../streams/sseConnectionLimiter.js';
+import {
+  RedisIdempotencyStore,
+  NoOpIdempotencyStore,
+  InMemoryIdempotencyStore,
+  type IdempotencyStore,
+} from '../redis/idempotencyStore.js';
 
 export const streamsRouter = Router();
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
+/** Public-facing stream shape (camelCase, decimal strings). */
 export interface Stream {
   id: string;
   sender: string;
@@ -126,10 +116,9 @@ export interface Stream {
 }
 
 type StreamsCursor = { v: 1; lastId: string };
-type StreamListingDependencyState = 'healthy' | 'unavailable';
-type IdempotencyDependencyState  = 'healthy' | 'unavailable';
+type DependencyState = 'healthy' | 'unavailable';
 
-type NormalizedCreateStreamInput = {
+type NormalizedCreateInput = {
   sender: string;
   recipient: string;
   depositAmount: string;
@@ -138,31 +127,101 @@ type NormalizedCreateStreamInput = {
   endTime: number;
 };
 
-type StoredIdempotentResponse = {
-  requestFingerprint: string;
-  statusCode: number;
-  body: Stream;
-};
-
-// Amount fields that must be decimal strings per serialization policy
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
-
-// ── In-memory store (export for test-level inspection / reset) ────────────────
-export const streams: Stream[] = [];
+const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
+const NO_STORE_STREAM_HEADERS = 'private, no-store';
+const SSE_HEARTBEAT_INTERVAL_MS = 30_000;
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
-const streamListingDependency = { state: 'healthy' as StreamListingDependencyState };
-const idempotencyDependency   = { state: 'healthy' as IdempotencyDependencyState };
-const idempotencyStore        = new Map<string, StoredIdempotentResponse>();
 
-export function setStreamListingDependencyState(state: StreamListingDependencyState): void {
+const streamListingDependency = { state: 'healthy' as DependencyState };
+const idempotencyDependency   = { state: 'healthy' as DependencyState };
+
+// Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
+// by wireIdempotencyStore() in app.ts with a RedisIdempotencyStore when Redis
+// is available (REDIS_ENABLED=true).
+let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>>> =
+  new InMemoryIdempotencyStore();
+
+// TTL for idempotency entries — overridden in tests and set from config at startup
+let idempotencyTtlSeconds = 86400;
+
+/**
+ * Legacy shim — audit.test.ts and streams.test.ts reference this array.
+ * The DB-backed implementation no longer uses it for storage; it is kept
+ * as an empty array so existing test imports do not break.
+ * @deprecated Use streamRepository directly.
+ */
+export const streams: Stream[] = [];
+
+export function setStreamListingDependencyState(state: DependencyState): void {
   streamListingDependency.state = state;
 }
-export function setIdempotencyDependencyState(state: IdempotencyDependencyState): void {
+export function setIdempotencyDependencyState(state: DependencyState): void {
   idempotencyDependency.state = state;
 }
+
+/**
+ * Reset the idempotency store to a fresh in-memory instance.
+ * Used in tests to get a clean slate with full idempotency semantics
+ * (no Redis required).
+ */
 export function resetStreamIdempotencyStore(): void {
-  idempotencyStore.clear();
+  idempotencyStore = new InMemoryIdempotencyStore();
+}
+
+/**
+ * Replace the idempotency store implementation.
+ * Called at startup with a RedisIdempotencyStore, and in tests with a
+ * FakeRedisClient-backed store or a NoOpIdempotencyStore.
+ *
+ * The parameter is typed as `IdempotencyStore<unknown>` so callers do not
+ * need to import the route's private `Stream` / `successResponse` types.
+ * The cast below is safe because the route handler always stores and reads
+ * values of the correct shape.
+ */
+export function setIdempotencyStore(
+  store: IdempotencyStore<unknown>,
+  ttlSeconds?: number,
+): void {
+  idempotencyStore = store as IdempotencyStore<ReturnType<typeof successResponse<Stream>>>;
+  if (ttlSeconds !== undefined) idempotencyTtlSeconds = ttlSeconds;
+}
+
+// ── DB → API mapper ───────────────────────────────────────────────────────────
+
+function toApiStream(record: StreamRecord): Stream {
+  return {
+    id:            record.id,
+    sender:        record.sender_address,
+    recipient:     record.recipient_address,
+    depositAmount: record.amount,
+    ratePerSecond: record.rate_per_second,
+    startTime:     record.start_time,
+    endTime:       record.end_time,
+    status:        record.status,
+  };
+}
+
+type StreamResourceMetadata = {
+  id: string;
+  updated_at: string;
+};
+
+function streamEntityTag(metadata: StreamResourceMetadata): string {
+  const fingerprint = crypto
+    .createHash('sha256')
+    .update(`${metadata.id}:${metadata.updated_at}`)
+    .digest('base64url');
+  return `W/"${fingerprint}"`;
+}
+
+function setStreamResourceHeaders(
+  res: Response,
+  metadata: StreamResourceMetadata,
+): void {
+  res.set('ETag', streamEntityTag(metadata));
+  res.set('Last-Modified', new Date(metadata.updated_at).toUTCString());
 }
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
@@ -216,38 +275,28 @@ function parseIncludeTotal(includeTotalParam: unknown): boolean {
   if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
     throw validationError('include_total must be true or false');
   }
-  if (includeTotalParam === 'true')  return true;
+  if (includeTotalParam === 'true') return true;
   if (includeTotalParam === 'false') return false;
   throw validationError('include_total must be true or false');
 }
 
-function parseIdempotencyKey(headerValue: unknown): string {
-  if (Array.isArray(headerValue) || typeof headerValue !== 'string') {
-    throw validationError('Idempotency-Key header is required for unsafe POST operations');
-  }
-  const trimmed = headerValue.trim();
-  if (trimmed.length < 1 || trimmed.length > 128) {
-    throw validationError('Idempotency-Key header must be between 1 and 128 characters');
-  }
-  if (!/^[A-Za-z0-9:_-]+$/.test(trimmed)) {
-    throw validationError('Idempotency-Key header must use only letters, numbers, colon, underscore, or hyphen');
-  }
-  return trimmed;
-}
+// ── Body normaliser ───────────────────────────────────────────────────────────
 
-// ── Body normaliser (uses Zod-compatible path; also calls decimal validator) ──
+function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateInput {
+  const parseResult = parseBody(CreateStreamSchema, body);
 
-function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCreateStreamInput {
-  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = body;
-
-  if (typeof sender !== 'string' || sender.trim() === '') {
-    throw validationError('sender must be a non-empty string');
-  }
-  if (typeof recipient !== 'string' || recipient.trim() === '') {
-    throw validationError('recipient must be a non-empty string');
+  if (!parseResult.success) {
+    const formatted = formatZodIssues(parseResult.issues);
+    throw new ApiError(
+      ApiErrorCode.VALIDATION_ERROR,
+      formatted[0]?.message ?? 'Validation failed',
+      400,
+      formatted.map((e) => e.message).join('; '),
+    );
   }
 
-  // Validate decimal fields — also catches number types passed as amounts
+  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = parseResult.data;
+
   const amountValidation = validateAmountFields(
     { depositAmount, ratePerSecond } as Record<string, unknown>,
     AMOUNT_FIELDS as unknown as string[],
@@ -261,46 +310,91 @@ function normalizeCreateStreamInput(body: Record<string, unknown>): NormalizedCr
     );
   }
 
-  const depositResult = validateDecimalString(depositAmount, 'depositAmount');
+  const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && depositAmount !== null) {
-    if (parseFloat(validatedDeposit) <= 0) throw validationError('depositAmount must be greater than zero');
+  if (depositAmount !== undefined && parseFloat(validatedDeposit) <= 0) {
+    throw validationError('depositAmount must be greater than zero');
   }
 
-  const rateResult = validateDecimalString(ratePerSecond, 'ratePerSecond');
+  const rateResult = validateDecimalString(ratePerSecond ?? '0', 'ratePerSecond');
   const validatedRate = rateResult.valid && rateResult.value ? rateResult.value : '0';
-  if (ratePerSecond !== undefined && ratePerSecond !== null) {
-    if (parseFloat(validatedRate) < 0) throw validationError('ratePerSecond cannot be negative');
-  }
-
-  let validatedStartTime = Math.floor(Date.now() / 1000);
-  if (startTime !== undefined) {
-    if (typeof startTime !== 'number' || !Number.isInteger(startTime) || startTime < 0) {
-      throw validationError('startTime must be a non-negative integer');
-    }
-    validatedStartTime = startTime;
-  }
-
-  let validatedEndTime = 0;
-  if (endTime !== undefined) {
-    if (typeof endTime !== 'number' || !Number.isInteger(endTime) || endTime < 0) {
-      throw validationError('endTime must be a non-negative integer');
-    }
-    validatedEndTime = endTime;
+  if (ratePerSecond !== undefined && parseFloat(validatedRate) < 0) {
+    throw validationError('ratePerSecond cannot be negative');
   }
 
   return {
-    sender: sender.trim(),
-    recipient: recipient.trim(),
+    sender:        sender.trim(),
+    recipient:     recipient.trim(),
     depositAmount: validatedDeposit,
     ratePerSecond: validatedRate,
-    startTime: validatedStartTime,
-    endTime: validatedEndTime,
+    startTime:     startTime ?? Math.floor(Date.now() / 1000),
+    endTime:       endTime   ?? 0,
   };
 }
 
-function fingerprintCreateStreamInput(input: NormalizedCreateStreamInput): string {
-  return JSON.stringify(input);
+function fingerprintInput(input: NormalizedCreateInput): string {
+  return crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+}
+
+/** Wrap DB errors so pool exhaustion surfaces as 503. */
+function wrapDbError(err: unknown): never {
+  if (err instanceof PoolExhaustedError) {
+    throw serviceUnavailable('Database is temporarily unavailable. Please retry shortly.');
+  }
+  throw err;
+}
+
+// ── API status state machine ──────────────────────────────────────────────────
+
+type ApiStreamStatus = 'scheduled' | 'active' | 'paused' | 'completed' | 'cancelled';
+
+const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
+  scheduled:  ['active', 'cancelled'],
+  active:     ['paused', 'completed', 'cancelled'],
+  paused:     ['active', 'cancelled'],
+  completed:  [],
+  cancelled:  [],
+};
+
+function assertValidApiTransition(
+  from: ApiStreamStatus,
+  to: ApiStreamStatus,
+): { ok: true } | { ok: false; message: string } {
+  const allowed = API_TRANSITIONS[from] ?? [];
+  if (allowed.includes(to)) return { ok: true };
+  if (from === to) return { ok: false, message: `Stream is already ${from}` };
+  if (from === 'completed') return { ok: false, message: 'Stream is already completed and cannot be transitioned' };
+  if (from === 'cancelled') return { ok: false, message: 'Stream is already cancelled and cannot be transitioned' };
+  return { ok: false, message: `Cannot transition stream from '${from}' to '${to}'` };
+}
+
+// ── Test helpers (no-op in production) ───────────────────────────────────────
+
+/**
+ * Middleware to enforce stream visibility based on JWT roles and addresses.
+ * Must be used within the router group scope.
+ * @param req Express request object, expected to contain `req.user` from `authenticate` middleware.
+ * @param res Express response object.
+ * @param next Express next middleware function.
+ */
+export function enforceStreamScope(req: Request, res: Response, next: NextFunction): void {
+    // Check if the user is authenticated and if the role requires scoping.
+    if (!req.user || req.user.role === 'operator') {
+        // Operator role bypasses scoping checks.
+        return next();
+    }
+
+    const callerAddress = req.user.address as string | undefined;
+    if (!callerAddress) {
+        // Should not happen if authenticate middleware is working, but safe fail.
+        return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    }
+
+    // Attach caller address to the request object for repository consumption.
+    req.callerAddress = callerAddress;
+
+    // Move to the next handler which will use req.callerAddress
+    next();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -308,39 +402,115 @@ function fingerprintCreateStreamInput(input: NormalizedCreateStreamInput): strin
 /**
  * GET /api/streams
  * List streams with cursor-based pagination.
+ *
+ * Query params are validated via PaginationSchema (Zod). Invalid params
+ * return 400 VALIDATION_ERROR before any DB call is made.
  */
 streamsRouter.get(
   '/',
-  asyncHandler(async (req: any, res: any) => {
-    const requestId    = req.id as string | undefined;
-    const limit        = parseLimit(req.query.limit);
-    const cursor       = parseCursor(req.query.cursor);
-    const includeTotal = parseIncludeTotal(req.query.include_total);
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.id as string | undefined;
+
+    // Validate all query params in one pass via Zod
+    const parsed = PaginationSchema.safeParse(req.query);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      throw validationError(first?.message ?? 'Invalid query parameters');
+    }
+    const { limit, cursor: rawCursor, status: statusFilter, sender: senderFilter,
+            recipient: recipientFilter, include_total } = parsed.data;
+
+    const cursor       = rawCursor !== undefined ? parseCursor(rawCursor) : undefined;
+    const includeTotal = include_total === 'true';
 
     if (streamListingDependency.state !== 'healthy') {
       warn('Stream listing dependency unavailable', { dependency: 'stream-list-view', requestId });
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
-    const sortedStreams = [...streams].sort((a, b) => a.id.localeCompare(b.id));
-    const startIndex   = cursor ? sortedStreams.findIndex((s) => s.id > cursor.lastId) : 0;
-    const normStart    = startIndex === -1 ? sortedStreams.length : startIndex;
-    const pageStreams   = sortedStreams.slice(normStart, normStart + limit);
-    const hasMore      = normStart + pageStreams.length < sortedStreams.length;
-    const nextCursor   = hasMore && pageStreams.length > 0
+    let result: { streams: Stream[]; hasMore: boolean; total?: number };
+    try {
+      const filter: StreamFilter = {};
+      if (statusFilter !== undefined) filter.status = statusFilter as NonNullable<StreamFilter['status']>;
+      if (senderFilter !== undefined) filter.sender_address = senderFilter;
+      if (recipientFilter !== undefined) filter.recipient_address = recipientFilter;
+      const dbResult = await streamRepository.findWithCursor(
+        filter,
+        limit,
+        cursor?.lastId,
+        includeTotal,
+      );
+      result = {
+        streams: dbResult.streams.map(toApiStream),
+        hasMore: dbResult.hasMore,
+        ...(dbResult.total !== undefined ? { total: dbResult.total } : {}),
+      };
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    const pageStreams = result!.streams;
+    const hasMore     = result!.hasMore;
+    const nextCursor  = hasMore && pageStreams.length > 0
       ? encodeCursor(pageStreams[pageStreams.length - 1]!.id)
-      : undefined;
+      : null;
 
     info('Listing streams', { limit, returned: pageStreams.length, hasMore, requestId });
 
-    const response: { streams: typeof pageStreams; has_more: boolean; total?: number; next_cursor?: string } = {
-      streams: pageStreams,
-      has_more: hasMore,
-    };
-    if (includeTotal)  response.total       = sortedStreams.length;
-    if (nextCursor)    response.next_cursor = nextCursor;
+    const response: {
+      streams: Stream[];
+      has_more: boolean;
+      next_cursor: string | null;
+      total?: number;
+    } = { streams: pageStreams, has_more: hasMore, next_cursor: nextCursor };
 
-    res.json(response);
+    if (includeTotal && result!.total !== undefined) response.total = result!.total;
+
+    // Cache only when every stream on the page is in a terminal state.
+    // An empty page is treated as all-terminal (nothing mutable present).
+    const allTerminal = pageStreams.every((s) => isTerminalStatus(s.status as ApiStreamStatus));
+    res.set(
+      'Cache-Control',
+      allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
+    );
+
+    res.json(successResponse(response, requestId));
+  }),
+);
+
+/**
+ * HEAD /api/streams/:id
+ * Lightweight existence check with cache validators only.
+ */
+streamsRouter.head(
+  '/:id',
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    if (!id) {
+      res.status(404).end();
+      return;
+    }
+
+    debug('Checking stream existence', { id });
+
+    let record;
+    try {
+      record = await streamRepository.existsById(id);
+    } catch (err) {
+      if (err instanceof PoolExhaustedError) {
+        res.status(503).end();
+        return;
+      }
+      throw err;
+    }
+
+    if (!record) {
+      res.status(404).end();
+      return;
+    }
+
+    setStreamResourceHeaders(res, { id, updated_at: record.updated_at });
+    res.status(200).end();
   }),
 );
 
@@ -350,35 +520,66 @@ streamsRouter.get(
  */
 streamsRouter.get(
   '/:id',
-  asyncHandler(async (req: any, res: any) => {
-    const { id } = req.params;
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+    if (!id) {
+      throw notFound('Stream', '');
+    }
     debug('Fetching stream', { id });
-    const stream = streams.find((s) => s.id === id);
-    if (!stream) throw notFound('Stream', id);
-    res.json({ stream });
+
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) throw notFound('Stream', id);
+    const stream = toApiStream(record!);
+    setStreamResourceHeaders(res, record!);
+    res.set(
+      'Cache-Control',
+      isTerminalStatus(stream.status as ApiStreamStatus)
+        ? CACHEABLE_STREAM_HEADERS
+        : NO_STORE_STREAM_HEADERS,
+    );
+    res.json(successResponse({ stream }, requestId));
   }),
 );
 
 /**
  * POST /api/streams
- * Create a new stream. Auth intentionally deferred — see non-goals above.
+ * Create a new stream. Requires authentication + Idempotency-Key header.
+ *
+ * Idempotency-Key is validated by requireIdempotencyKey before this handler
+ * runs; the validated key is available on res.locals.idempotencyKey.
  */
 streamsRouter.post(
   '/',
+  authenticate,
+  requireAuth,
+  requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId      = (req as any).id as string | undefined;
-    const idempotencyKey = parseIdempotencyKey(req.header('Idempotency-Key'));
+    const requestId = req.id;
+    const correlationId = req.correlationId;
+    const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
 
     if (idempotencyDependency.state !== 'healthy') {
-      warn('Idempotency dependency unavailable', { dependency: 'idempotency-store', requestId, idempotencyKey });
+      warn('Idempotency dependency unavailable', {
+        dependency: 'idempotency-store',
+        requestId,
+        // Never log the key value at warn/error level — it could be a secret
+        idempotencyKeyLength: idempotencyKey.length,
+      });
       throw serviceUnavailable('Idempotency processing is temporarily unavailable. Retry after dependency health is restored.');
     }
 
-    info('Creating new stream', { requestId, idempotencyKey });
+    info('Creating new stream', { requestId, correlationId });
 
-    let normalizedInput: NormalizedCreateStreamInput;
+    let normalizedInput: NormalizedCreateInput;
     try {
-      normalizedInput = normalizeCreateStreamInput(req.body ?? {});
+      normalizedInput = normalizeCreateInput(req.body ?? {});
     } catch (error) {
       const av = validateAmountFields(
         { depositAmount: req.body?.depositAmount, ratePerSecond: req.body?.ratePerSecond } as Record<string, unknown>,
@@ -392,73 +593,471 @@ streamsRouter.post(
       throw error;
     }
 
-    const requestFingerprint = fingerprintCreateStreamInput(normalizedInput);
-    const existingResponse   = idempotencyStore.get(idempotencyKey);
+    const requestFingerprint = fingerprintInput(normalizedInput);
+    const existingResponse   = await idempotencyStore.get(idempotencyKey);
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
-        throw new ApiError(ApiErrorCode.CONFLICT, 'Idempotency-Key has already been used for a different request payload', 409, { idempotencyKey });
+        // Log the decision without leaking the key value itself
+        warn('Idempotency-Key reused with different payload', {
+          requestId,
+          correlationId,
+          idempotencyKeyLength: idempotencyKey.length,
+          action: 'conflict',
+        });
+        throw new ApiError(
+          ApiErrorCode.CONFLICT,
+          'Idempotency-Key has already been used for a different request payload',
+          409,
+          { hint: 'Use a new Idempotency-Key or retry with the original request body' },
+        );
       }
-      info('Replaying idempotent stream creation', { requestId, idempotencyKey, streamId: existingResponse.body.id });
+      info('Replaying idempotent stream creation', {
+        requestId,
+        correlationId,
+        streamId: existingResponse.body.data.id,
+        action: 'replay',
+      });
       res.set('Idempotency-Key', idempotencyKey);
       res.set('Idempotency-Replayed', 'true');
-      res.status(existingResponse.statusCode).json(existingResponse.body);
+      res.status(existingResponse.statusCode).json(
+        idempotentReplayResponse(existingResponse.body.data, requestId),
+      );
       return;
     }
 
-    const id     = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const stream: Stream = {
-      id,
-      sender:        normalizedInput.sender,
-      recipient:     normalizedInput.recipient,
-      depositAmount: normalizedInput.depositAmount,
-      ratePerSecond: normalizedInput.ratePerSecond,
-      startTime:     normalizedInput.startTime,
-      endTime:       normalizedInput.endTime,
-      status:        'active',
-    };
+    // Derive a deterministic ID from the request content so replays are safe
+    const idHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(normalizedInput))
+      .digest('hex');
+    const id = `stream-${idHash}-0`;
 
-    streams.push(stream);
-    idempotencyStore.set(idempotencyKey, { requestFingerprint, statusCode: 201, body: stream });
+    let upsertResult;
+    try {
+      upsertResult = await streamRepository.upsertStream({
+        id,
+        sender_address:    normalizedInput.sender,
+        recipient_address: normalizedInput.recipient,
+        amount:            normalizedInput.depositAmount,
+        streamed_amount:   '0',
+        remaining_amount:  normalizedInput.depositAmount,
+        rate_per_second:   normalizedInput.ratePerSecond,
+        start_time:        normalizedInput.startTime,
+        end_time:          normalizedInput.endTime,
+        contract_id:       'api-created',
+        transaction_hash:  idHash,
+        event_index:       0,
+      }, requestId);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    const stream = toApiStream(upsertResult!.stream);
+    const responseEnvelope = successResponse(stream, requestId);
+    await idempotencyStore.set(
+      idempotencyKey,
+      { requestFingerprint, statusCode: 201, body: responseEnvelope },
+      idempotencyTtlSeconds,
+    );
 
     SerializationLogger.amountSerialized(2, requestId);
-    info('Stream created', { id, requestId, idempotencyKey });
+    info('Stream created', { id: stream.id, requestId, correlationId, action: 'created' });
+    recordAuditEvent('STREAM_CREATED', 'stream', stream.id, correlationId ?? '', {
+      depositAmount: normalizedInput.depositAmount,
+      ratePerSecond: normalizedInput.ratePerSecond,
+      sender:        normalizedInput.sender,
+      recipient:     normalizedInput.recipient,
+    });
+
+    streamsCreatedTotal.inc({ status: stream.status });
 
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
-    res.status(201).json(stream);
+    res.status(201).json(responseEnvelope);
   }),
 );
 
 /**
  * DELETE /api/streams/:id
- * Cancel a stream.
+ * Cancel a stream. Requires authentication.
  */
 streamsRouter.delete(
   '/:id',
+  authenticate,
+  requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const { id }    = req.params;
-    const requestId = (req as any).id as string | undefined;
-
-    debug('Deleting stream', { id });
-
-    const index = streams.findIndex((s) => s.id === id);
-    if (index === -1) throw notFound('Stream', id);
-
-    const stream = streams[index];
-    if (stream === undefined) throw notFound('Stream', id);
-
-    if (stream.status === 'cancelled') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Stream is already cancelled', 409, { streamId: id });
+    const id = req.params['id'];
+    const requestId = req.id;
+    if (!id) {
+      throw notFound('Stream', '');
     }
-    if (stream.status === 'completed') {
-      throw new ApiError(ApiErrorCode.CONFLICT, 'Cannot cancel a completed stream', 409, { streamId: id });
+    debug('Cancelling stream', { id });
+
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
     }
 
-    streams[index] = { ...stream, status: 'cancelled' };
-    info('Stream cancelled', { id });
-    recordAuditEvent('STREAM_CANCELLED', 'stream', id as string, (req as any).correlationId);
+    if (!record) throw notFound('Stream', id);
 
-    res.json({ message: 'Stream cancelled', id });
+    const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
+    if (!guard.ok) {
+      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+        streamId: id,
+        currentStatus: record!.status,
+      });
+    }
+
+    try {
+      await streamRepository.updateStream(id, { status: 'cancelled' }, requestId ?? '');
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    info('Stream cancelled', { id, requestId });
+    recordAuditEvent('STREAM_CANCELLED', 'stream', id, req.correlationId ?? '');
+
+    res.json(successResponse({ message: 'Stream cancelled', id }, requestId));
   }),
 );
+
+/**
+ * PATCH /api/streams/:id/status
+ * Transition a stream to a new status.
+ *
+ * Body: { "status": "paused" | "active" | "completed" | "cancelled" }
+ *
+ * Returns 409 CONFLICT when the transition is not permitted by the state machine.
+ */
+streamsRouter.patch(
+  '/:id/status',
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+    const { status: newStatus } = req.body ?? {};
+
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+
+    const validStatuses: ApiStreamStatus[] = ['scheduled', 'active', 'paused', 'completed', 'cancelled'];
+    if (typeof newStatus !== 'string' || !validStatuses.includes(newStatus as ApiStreamStatus)) {
+      throw validationError('status must be one of: scheduled, active, paused, completed, cancelled');
+    }
+
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) throw notFound('Stream', id);
+
+    const guard = assertValidApiTransition(record!.status as ApiStreamStatus, newStatus as ApiStreamStatus);
+    if (!guard.ok) {
+      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+        streamId: id,
+        currentStatus: record!.status,
+        requestedStatus: newStatus,
+      });
+    }
+
+    let updated;
+    try {
+      // 'scheduled' is an API-only concept; map to 'active' in DB
+      const dbStatus = newStatus === 'scheduled' ? 'active' : newStatus as StreamStatus;
+      updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId ?? '');
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    info('Stream status updated', { id, from: record!.status, to: newStatus, requestId });
+    recordAuditEvent('STREAM_STATUS_UPDATED', 'stream', id, req.correlationId ?? '');
+
+    res.json(successResponse(toApiStream(updated!), requestId));
+  }),
+);
+
+/**
+ * GET /api/streams/:id/events
+ *
+ * Server-Sent Events (SSE) endpoint to receive real-time stream updates.
+ * Supporting standard JWT authentication and Last-Event-ID resumption.
+ */
+streamsRouter.get(
+  '/:id/events',
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+
+    // 1. JWT Authentication and Authorization
+    const wsAuthRequired = process.env.WS_AUTH_REQUIRED === 'true';
+    const jwtSecret = process.env.JWT_SECRET;
+    const authResult = verifyWsToken(req, jwtSecret);
+
+    if (wsAuthRequired && !authResult.ok) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: `Authentication required: ${authResult.code}`,
+          requestId,
+        },
+      });
+      return;
+    } else if (!wsAuthRequired && !authResult.ok && authResult.code === 'INVALID_TOKEN') {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Invalid or expired authentication token',
+          requestId,
+        },
+      });
+      return;
+    }
+
+    // 2. Reserve bounded SSE capacity before repository work or header flush.
+    const clientIp = getClientIp(req);
+    const sseLimits = resolveSseConnectionLimits();
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+
+    if (!connectionAttempt.ok) {
+      sseConnectionsRejectedTotal.inc({ reason: connectionAttempt.reason });
+      res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
+      warn('SSE connection rejected by limiter', {
+        id,
+        requestId,
+        ip: clientIp,
+        reason: connectionAttempt.reason,
+        activeConnections: connectionAttempt.activeConnections,
+        activeConnectionsForIp: connectionAttempt.activeConnectionsForIp,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+      });
+      throw tooManyRequests(connectionAttempt.message, {
+        reason: connectionAttempt.reason,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        retryAfterSeconds: connectionAttempt.retryAfterSeconds,
+      });
+    }
+
+    const sseConnection = connectionAttempt.connection;
+    let cleanedUp = false;
+    let unsubscribeLiveUpdates: (() => void) | undefined;
+    let heartbeatInterval: NodeJS.Timeout | undefined;
+    let maxDurationTimer: NodeJS.Timeout | undefined;
+
+    function detachLifecycleHandlers(): void {
+      res.off('close', onResponseClose);
+      res.off('error', onResponseError);
+      req.off('aborted', onRequestAborted);
+    }
+
+    /**
+     * Idempotent cleanup for every SSE termination path. The active-connection
+     * handle owns the Map/Gauge decrement, so close/error/timeout signals cannot
+     * double-decrement or leave EventEmitter listeners behind. Lifecycle listeners
+     * are also detached so pre-header failures do not retain route closures longer
+     * than the response object itself.
+     */
+    function cleanup(reason: string): void {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      detachLifecycleHandlers();
+
+      if (heartbeatInterval !== undefined) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = undefined;
+      }
+      if (maxDurationTimer !== undefined) {
+        clearTimeout(maxDurationTimer);
+        maxDurationTimer = undefined;
+      }
+      if (unsubscribeLiveUpdates !== undefined) {
+        unsubscribeLiveUpdates();
+        unsubscribeLiveUpdates = undefined;
+      }
+
+      sseConnection.release();
+      debug('SSE connection cleaned up', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        reason,
+        durationMs: Date.now() - sseConnection.acceptedAt,
+      });
+    }
+
+    function onResponseClose(): void {
+      cleanup('client_close');
+    }
+
+    function onResponseError(err: Error): void {
+      warn('SSE response error', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        error: err.message,
+      });
+      cleanup('response_error');
+    }
+
+    function onRequestAborted(): void {
+      cleanup('client_aborted');
+    }
+
+    const writeSse = (frame: string): boolean => {
+      if (cleanedUp || res.destroyed || res.writableEnded) return false;
+      try {
+        res.write(frame);
+        return true;
+      } catch (err) {
+        warn('SSE write failed; closing connection', {
+          id,
+          requestId,
+          ip: sseConnection.ip,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        cleanup('write_error');
+        try {
+          res.end();
+        } catch {
+          // best-effort shutdown only
+        }
+        return false;
+      }
+    };
+
+    res.once('close', onResponseClose);
+    res.once('error', onResponseError);
+    req.once('aborted', onRequestAborted);
+
+    // 3. Verify stream existence after reserving capacity so over-limit attempts
+    // are rejected before they can fan out into repository work.
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      cleanup('db_error');
+      wrapDbError(err);
+    }
+
+    if (cleanedUp) return;
+
+    if (!record) {
+      cleanup('not_found');
+      throw notFound('Stream', id);
+    }
+
+    try {
+      // 4. Establish Server-Sent Events stream.
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+    } catch (err) {
+      cleanup('flush_error');
+      throw err;
+    }
+
+    // Send connection ok comment.
+    if (!writeSse(': ok\n\n')) return;
+
+    // Periodic heartbeat to prevent proxies and load balancers from closing the connection.
+    heartbeatInterval = setInterval(() => {
+      writeSse(': heartbeat\n\n');
+    }, SSE_HEARTBEAT_INTERVAL_MS);
+    heartbeatInterval.unref?.();
+
+    // Bound long-lived SSE streams. Browser EventSource clients reconnect automatically.
+    maxDurationTimer = setTimeout(() => {
+      if (cleanedUp) return;
+      writeSse(`event: close\ndata: ${JSON.stringify({ reason: 'max_duration' })}\n\n`);
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
+      cleanup('max_duration');
+    }, sseLimits.maxConnectionDurationMs);
+    maxDurationTimer.unref?.();
+
+    // 5. Handle Last-Event-ID Resumption Replay.
+    const lastEventId = req.headers['last-event-id'];
+    if (typeof lastEventId === 'string' && lastEventId.trim() !== '') {
+      const hub = getStreamHub();
+      const eventStore = hub?.getEventStore();
+      if (eventStore) {
+        try {
+          let cursor: string | undefined = lastEventId.trim();
+          do {
+            if (cleanedUp) break;
+            const result = await eventStore.getEvents({
+              afterEventId: cursor,
+              limit: 100,
+            });
+
+            for (const event of result.events) {
+              if (cleanedUp) break;
+              if (eventMatchesStreamId(event, id)) {
+                const written = writeSse(
+                  `id: ${event.eventId}\n` +
+                  `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+                  `data: ${JSON.stringify({
+                    type: 'stream_update',
+                    streamId: id,
+                    eventId: event.eventId,
+                    payload: event.payload,
+                    correlationId: req.correlationId,
+                  })}\n\n`,
+                );
+                if (!written) break;
+              }
+            }
+
+            cursor = result.nextCursor;
+          } while (cursor !== undefined && !cleanedUp);
+        } catch (err) {
+          warn('Failed to replay SSE events from store', {
+            error: err instanceof Error ? err.message : String(err),
+            requestId,
+          });
+        }
+      }
+    }
+
+    if (cleanedUp) return;
+
+    // 6. Subscribe to Real-Time Updates.
+    const listener = (event: StreamUpdateEvent) => {
+      if (event.streamId === id) {
+        writeSse(
+          `id: ${event.eventId}\n` +
+          `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+          `data: ${JSON.stringify({
+            type: 'stream_update',
+            streamId: event.streamId,
+            eventId: event.eventId,
+            payload: event.payload,
+            correlationId: req.correlationId || event.correlationId,
+          })}\n\n`,
+        );
+      }
+    };
+
+    unsubscribeLiveUpdates = subscribeToSseStream(id, listener);
+  }),
+);
+
+export function _resetStreams(): void {}
+
+

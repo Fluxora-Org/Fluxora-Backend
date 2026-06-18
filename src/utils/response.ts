@@ -2,10 +2,10 @@
  * Consistent JSON envelope helpers for Fluxora Backend
  *
  * All success responses are wrapped in:
- *   { success: true, data: T, meta?: ResponseMeta }
+ *   { success: true, data: T, meta: ResponseMeta }
  *
  * All error responses are wrapped in:
- *   { success: false, error: string, code: string, details?: string, field?: string }
+ *   { success: false, error: { code: string, message: string, details?: unknown, requestId?: string } }
  *
  * This contract is stable — clients and auditors may rely on it.
  */
@@ -15,6 +15,8 @@ export interface ResponseMeta {
     timestamp: string;
     /** Opaque request identifier for log correlation */
     requestId?: string;
+    /** Present on idempotent replays — true when the response was served from cache */
+    idempotencyReplayed?: boolean;
 }
 
 export interface SuccessEnvelope<T> {
@@ -23,12 +25,16 @@ export interface SuccessEnvelope<T> {
     meta: ResponseMeta;
 }
 
+export interface ErrorDetail {
+    code: string;
+    message: string;
+    details?: unknown;
+    requestId?: string;
+}
+
 export interface ErrorEnvelope {
     success: false;
-    error: string;
-    code: string;
-    details?: string;
-    field?: string;
+    error: ErrorDetail;
 }
 
 /**
@@ -46,19 +52,40 @@ export function successResponse<T>(data: T, requestId?: string): SuccessEnvelope
 }
 
 /**
+ * Build a success envelope for an idempotent replay response.
+ *
+ * Identical to successResponse but stamps `meta.idempotencyReplayed = true`
+ * so clients can distinguish a fresh creation from a cached replay without
+ * inspecting the Idempotency-Replayed response header.
+ */
+export function idempotentReplayResponse<T>(data: T, requestId?: string): SuccessEnvelope<T> {
+    return {
+        success: true,
+        data,
+        meta: {
+            timestamp: new Date().toISOString(),
+            ...(requestId ? { requestId } : {}),
+            idempotencyReplayed: true,
+        },
+    };
+}
+
+/**
  * Build an error envelope.
  */
 export function errorResponse(
-    error: string,
     code: string,
-    details?: string,
-    field?: string
+    message: string,
+    details?: unknown,
+    requestId?: string
 ): ErrorEnvelope {
     return {
         success: false,
-        error,
-        code,
-        ...(details !== undefined ? { details } : {}),
-        ...(field !== undefined ? { field } : {}),
+        error: {
+            code,
+            message,
+            ...(details !== undefined ? { details } : {}),
+            ...(requestId !== undefined ? { requestId } : {}),
+        },
     };
 }

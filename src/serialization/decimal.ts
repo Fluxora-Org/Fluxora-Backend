@@ -33,6 +33,37 @@ export const DECIMAL_STRING_PATTERN = /^[+-]?\d+(\.\d+)?$/;
 export const MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 
 /**
+ * Maximum allowed integer part of a decimal amount (int64 max).
+ * Values whose integer part exceeds this are rejected with OUT_OF_RANGE.
+ */
+export const MAX_DECIMAL_INTEGER_PART = 9_223_372_036_854_775_807n;
+
+/**
+ * Normalize a validated decimal string by stripping trailing fractional zeros.
+ * The input must already match DECIMAL_STRING_PATTERN.
+ *
+ * @example
+ * normalizeDecimalString("100.50")      // "100.5"
+ * normalizeDecimalString("1.0000000")   // "1"
+ * normalizeDecimalString("100.0")       // "100"
+ * normalizeDecimalString("0.0000116")   // "0.0000116"  (no trailing zeros)
+ * normalizeDecimalString("100")         // "100"
+ */
+export function normalizeDecimalString(value: string): string {
+  const dotIndex = value.indexOf('.');
+  if (dotIndex === -1) return value;
+
+  // Strip trailing zeros from the fractional part
+  let end = value.length;
+  while (end > dotIndex + 1 && value[end - 1] === '0') end--;
+
+  // If only the dot remains, drop it too
+  if (end === dotIndex + 1) return value.slice(0, dotIndex);
+
+  return value.slice(0, end);
+}
+
+/**
  * Error codes for decimal serialization failures
  */
 export enum DecimalErrorCode {
@@ -140,13 +171,14 @@ export function validateDecimalString(value: unknown, fieldName?: string): Valid
     };
   }
 
-  // Check for out of range (would cause precision loss in JSON)
+  // Check for out of range: compare the integer part against int64 max.
+  // We extract the integer part directly to avoid magnitude errors from
+  // stripping the decimal point (e.g. "1.5" must not be treated as 15).
+  const dotIndex = value.indexOf('.');
+  const integerPart = dotIndex === -1 ? value : value.slice(0, dotIndex);
+  const absIntegerPart = integerPart.replace(/^[+-]/, '');
   try {
-    const bigIntValue = BigInt(value.replace('.', ''));
-    const absBigIntValue = bigIntValue < 0n ? -bigIntValue : bigIntValue;
-    
-    // Allow values up to 10^20 (more than enough for any financial amount)
-    if (absBigIntValue > 10_000_000_000_000_000_000n) {
+    if (BigInt(absIntegerPart) > MAX_DECIMAL_INTEGER_PART) {
       return {
         valid: false,
         error: new DecimalSerializationError(
@@ -158,11 +190,11 @@ export function validateDecimalString(value: unknown, fieldName?: string): Valid
       };
     }
   } catch {
-    // If BigInt conversion fails for any reason, still allow the value
-    // as it's already validated by the regex
+    // BigInt conversion failed — the regex already validated the format,
+    // so this is unreachable in practice; allow the value through.
   }
 
-  return { valid: true, value };
+  return { valid: true, value: normalizeDecimalString(value) };
 }
 
 /**
@@ -188,13 +220,13 @@ export function serializeToDecimalString(value: unknown, fieldName?: string): st
     );
   }
 
-  // Handle strings - validate and return as-is if valid
+  // Handle strings - validate and return normalized form if valid
   if (typeof value === 'string') {
     const result = validateDecimalString(value, fieldName);
     if (!result.valid) {
       throw result.error;
     }
-    return value;
+    return result.value!; // validateDecimalString already normalizes
   }
 
   // Handle numbers

@@ -1,7 +1,27 @@
-import assert from 'node:assert/strict';
-import test from 'node:test';
+import { test, expect } from 'vitest';
 import { WebhookDeliveryStore } from './store.js';
 import type { WebhookDelivery } from './types.js';
+
+// Small assert-compat shim — these tests were originally written for
+// `node:test` and call `assert.equal` / `assert.deepEqual` / etc.  Map them
+// onto vitest's `expect` so we can run under a single test runner.
+const assert = {
+  equal: (actual: unknown, expected: unknown): void => {
+    expect(actual).toEqual(expected);
+  },
+  notEqual: (actual: unknown, expected: unknown): void => {
+    expect(actual).not.toEqual(expected);
+  },
+  deepEqual: (actual: unknown, expected: unknown): void => {
+    expect(actual).toEqual(expected);
+  },
+  ok: (value: unknown, msg?: string): void => {
+    expect(value, msg).toBeTruthy();
+  },
+  match: (value: string, pattern: RegExp): void => {
+    expect(value).toMatch(pattern);
+  },
+};
 
 function createMockDelivery(overrides?: Partial<WebhookDelivery>): WebhookDelivery {
   return {

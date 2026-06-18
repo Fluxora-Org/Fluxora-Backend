@@ -1,5 +1,4 @@
-import assert from 'node:assert/strict';
-import test from 'node:test';
+import { test, expect } from 'vitest';
 import {
   calculateNextRetryTime,
   isRetryableStatusCode,
@@ -7,6 +6,25 @@ import {
   formatRetryPolicy,
 } from './retry.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
+
+// node:test → vitest assert-compat shim (see store.test.ts for rationale).
+const assert = {
+  equal: (actual: unknown, expected: unknown): void => {
+    expect(actual).toEqual(expected);
+  },
+  notEqual: (actual: unknown, expected: unknown): void => {
+    expect(actual).not.toEqual(expected);
+  },
+  deepEqual: (actual: unknown, expected: unknown): void => {
+    expect(actual).toEqual(expected);
+  },
+  ok: (value: unknown, msg?: string): void => {
+    expect(value, msg).toBeTruthy();
+  },
+  match: (value: string, pattern: RegExp): void => {
+    expect(value).toMatch(pattern);
+  },
+};
 
 test('calculateNextRetryTime: exponential backoff with jitter', () => {
   const now = 1000000;

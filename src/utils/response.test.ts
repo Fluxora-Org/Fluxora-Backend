@@ -1,4 +1,4 @@
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect } from 'vitest';
 import { successResponse, errorResponse } from './response.js';
 
 describe('Response envelope helpers', () => {
@@ -41,31 +41,32 @@ describe('Response envelope helpers', () => {
 
     describe('errorResponse', () => {
         it('should build an error envelope', () => {
-            const result = errorResponse('Something went wrong', 'INTERNAL_ERROR');
+            // Signature: errorResponse(code, message, details?, requestId?)
+            const result = errorResponse('INTERNAL_ERROR', 'Something went wrong');
 
             expect(result.success).toBe(false);
-            expect(result.error).toBe('Something went wrong');
-            expect(result.code).toBe('INTERNAL_ERROR');
+            expect(result.error.code).toBe('INTERNAL_ERROR');
+            expect(result.error.message).toBe('Something went wrong');
         });
 
         it('should include details when provided', () => {
-            const result = errorResponse('Bad input', 'VALIDATION_ERROR', 'Field x is required');
-            expect(result.details).toBe('Field x is required');
+            const result = errorResponse('VALIDATION_ERROR', 'Bad input', 'Field x is required');
+            expect(result.error.details).toBe('Field x is required');
         });
 
         it('should omit details when not provided', () => {
-            const result = errorResponse('Bad input', 'VALIDATION_ERROR');
-            expect(result.details).toBeUndefined();
+            const result = errorResponse('VALIDATION_ERROR', 'Bad input');
+            expect(result.error.details).toBeUndefined();
         });
 
-        it('should include field when provided', () => {
-            const result = errorResponse('Bad input', 'VALIDATION_ERROR', undefined, 'sender');
-            expect(result.field).toBe('sender');
+        it('should include requestId when provided', () => {
+            const result = errorResponse('VALIDATION_ERROR', 'Bad input', undefined, 'req-1');
+            expect(result.error.requestId).toBe('req-1');
         });
 
-        it('should omit field when not provided', () => {
-            const result = errorResponse('Bad input', 'VALIDATION_ERROR');
-            expect(result.field).toBeUndefined();
+        it('should omit requestId when not provided', () => {
+            const result = errorResponse('VALIDATION_ERROR', 'Bad input');
+            expect(result.error.requestId).toBeUndefined();
         });
     });
 });

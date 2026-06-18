@@ -15,7 +15,7 @@
  * - Memory is bounded by maxSpans config
  */
 
-import { Span, SpanEvent, TracerHooks, SpanContext } from './hooks.js';
+import { Span, SpanEvent, TracerHooks } from './hooks.js';
 
 /**
  * In-memory span buffer configuration.
@@ -187,7 +187,7 @@ export class SpanBuffer implements TracerHooks {
       } else {
         console.log(JSON.stringify(record));
       }
-    } catch (err) {
+    } catch {
       // Logging error; silent failure
     }
   }
@@ -247,7 +247,15 @@ export class MetricsCollector implements TracerHooks {
   /**
    * Get current metrics.
    */
-  getMetrics() {
+  getMetrics(): {
+    requestsStarted: number;
+    requestsCompleted: number;
+    requestsErrored: number;
+    totalDurationMs: number;
+    dbQueriesExecuted: number;
+    apiCallsMade: number;
+    authFailures: number;
+  } {
     return { ...this.metrics };
   }
 
@@ -312,6 +320,7 @@ export class ErrorClassifier {
     // API / RPC errors
     if (
       name.includes('RPC') ||
+      message.includes('rpc') ||
       message.includes('stellar') ||
       message.includes('horizon')
     ) {
@@ -328,6 +337,7 @@ export class ErrorClassifier {
     if (
       name.includes('Validation') ||
       name.includes('Zod') ||
+      message.includes('validation') ||
       message.includes('invalid')
     ) {
       return ['validation', 'failure'];
@@ -362,7 +372,7 @@ export function createBuiltInHooks(config: {
       handlers.forEach((h) => {
         try {
           h.onSpanStart?.(span);
-        } catch (err) {
+        } catch {
           // Silent failure
         }
       });
@@ -371,7 +381,7 @@ export function createBuiltInHooks(config: {
       handlers.forEach((h) => {
         try {
           h.onSpanEnd?.(span);
-        } catch (err) {
+        } catch {
           // Silent failure
         }
       });
@@ -380,7 +390,7 @@ export function createBuiltInHooks(config: {
       handlers.forEach((h) => {
         try {
           h.onEvent?.(span, event);
-        } catch (err) {
+        } catch {
           // Silent failure
         }
       });
@@ -389,7 +399,7 @@ export function createBuiltInHooks(config: {
       handlers.forEach((h) => {
         try {
           h.onError?.(correlationId, error, context);
-        } catch (err) {
+        } catch {
           // Silent failure
         }
       });

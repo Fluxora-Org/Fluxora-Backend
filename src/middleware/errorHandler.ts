@@ -1,8 +1,11 @@
 import type { Request, Response, NextFunction } from 'express';
-import { DecimalSerializationError, DecimalErrorCode } from '../serialization/decimal.js';
+import { DecimalSerializationError } from '../serialization/decimal.js';
 import { SerializationLogger, error as logError } from '../utils/logger.js';
+import { errorResponse } from '../utils/response.js';
+import { QueryTimeoutError } from '../db/pool.js';
 
 export interface ApiErrorResponse {
+  success: false;
   error: { code: string; message: string; details?: unknown; requestId?: string };
 }
 
@@ -18,6 +21,8 @@ export enum ApiErrorCode {
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
+  UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
+  GATEWAY_TIMEOUT = 'GATEWAY_TIMEOUT',
 }
 
 export class ApiError extends Error {
@@ -37,35 +42,62 @@ export class ApiError extends Error {
  */
 export function errorHandler(
   err: Error,
-  req: any,
-  res: any,
-  _next: any
+  req: Request,
+  res: Response,
+  _next: NextFunction
 ): void {
-  const requestId = (req as Request & { id?: string }).id ?? (res.locals['requestId'] as string | undefined);
+  const requestId = req.id ?? (res.locals['requestId'] as string | undefined);
+
+  if (err instanceof QueryTimeoutError) {
+    res.status(504).json(
+      errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
+    );
+    return;
+  }
 
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
-    res.status(400).json({
-      error: {
-        code: ApiErrorCode.DECIMAL_ERROR,
-        message: err.message,
-        details: { decimalErrorCode: err.code, field: err.field },
-        requestId,
-      },
-    });
+    res.status(400).json(
+      errorResponse(
+        ApiErrorCode.DECIMAL_ERROR,
+        err.message,
+        { decimalErrorCode: err.code, field: err.field },
+        requestId
+      )
+    );
     return;
   }
 
   if (err instanceof ApiError) {
     logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
-    res.status(err.statusCode).json({ error: { code: err.code, message: err.message, details: err.details, requestId } });
+    res.status(err.statusCode).json(
+      errorResponse(err.code, err.message, err.details, requestId)
+    );
     return;
   }
 
   if ((err as { type?: string }).type === 'entity.too.large') {
-    res.status(413).json({
-      error: { code: ApiErrorCode.PAYLOAD_TOO_LARGE, message: 'Request payload exceeds the configured size limit', requestId },
-    });
+    res.status(413).json(
+      errorResponse(
+        ApiErrorCode.PAYLOAD_TOO_LARGE,
+        'Request payload exceeds the configured size limit',
+        undefined,
+        requestId
+      )
+    );
+    return;
+  }
+
+  // express.json() throws SyntaxError on malformed bodies — surface as 400.
+  if (err instanceof SyntaxError && (err as SyntaxError & { status?: number }).status === 400) {
+    res.status(400).json(
+      errorResponse(
+        ApiErrorCode.VALIDATION_ERROR,
+        'Request body is not valid JSON',
+        undefined,
+        requestId,
+      ),
+    );
     return;
   }
 
@@ -76,15 +108,22 @@ export function errorHandler(
     requestId,
   });
 
-  res.status(500).json({
-    error: { code: ApiErrorCode.INTERNAL_ERROR, message: 'An unexpected error occurred. Please try again later.', requestId },
-  });
+  res.status(500).json(
+    errorResponse(
+      ApiErrorCode.INTERNAL_ERROR,
+      'An unexpected error occurred. Please try again later.',
+      undefined,
+      requestId
+    )
+  );
 }
 
 /** Async handler wrapper */
-export function asyncHandler(fn: (req: any, res: any, next: any) => Promise<void>) {
-  return (req: any, res: any, next: any): void => {
-    Promise.resolve(fn(req, res, next)).catch((error) => next(error));
+export function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<void>,
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    Promise.resolve(fn(req, res, next)).catch((error: unknown) => next(error));
   };
 }
 
@@ -118,4 +157,8 @@ export function payloadTooLarge(message: string, details?: unknown): ApiError {
 
 export function tooManyRequests(message: string, details?: unknown): ApiError {
   return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
+}
+
+export function gatewayTimeout(message: string): ApiError {
+  return new ApiError(ApiErrorCode.GATEWAY_TIMEOUT, message, 504);
 }

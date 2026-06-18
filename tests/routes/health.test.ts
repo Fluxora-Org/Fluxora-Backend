@@ -5,6 +5,8 @@ import { app } from '../../src/app.js';
 describe('health routes', () => {
   describe('GET /health', () => {
     it('returns status ok with service name', async () => {
+      // /health uses the flat health-probe shape (not the success envelope)
+      // so external monitors do not need to traverse `data.*`.
       const res = await request(app).get('/health');
       expect(res.status).toBe(200);
       expect(res.body.status).toBe('ok');
@@ -23,8 +25,9 @@ describe('health routes', () => {
     it('returns API info', async () => {
       const res = await request(app).get('/');
       expect(res.status).toBe(200);
-      expect(res.body.name).toBe('Fluxora API');
-      expect(res.body.version).toBe('0.1.0');
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.name).toBe('Fluxora API');
+      expect(res.body.data.version).toBe('0.1.0');
     });
   });
 });

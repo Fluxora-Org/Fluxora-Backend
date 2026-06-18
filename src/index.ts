@@ -1,57 +1,42 @@
-/**
- * Fluxora Backend — server entry point.
- *
- * Responsibilities:
- *  - Bind the Express app to a TCP port.
- *  - Register OS signal handlers for graceful shutdown.
- *
- * Everything else (routes, middleware, app config) lives in app.ts.
- * Shutdown logic (drain + hooks) lives in shutdown.ts.
- */
+import express from 'express';
+import { config } from './config';
+import { indexerRouter } from './routes/indexer';
 
-import http from 'node:http';
-import { createApp } from './app.js';
-import { gracefulShutdown } from './shutdown.js';
-import { logger } from './lib/logger.js';
-import { initializeMigrations } from './db/migrate.js';
+const app = express();
 
-async function start() {
-    try {
-        // Load and validate environment configuration
-        const config = initializeConfig();
-        const { port, nodeEnv, apiVersion } = config;
+// Middleware
+app.use(express.json());
 
-const app = createApp();
-const server = http.createServer(app);
-
-async function startServer() {
-  try {
-    // Run migrations before starting the server
-    await initializeMigrations();
-
-    server.listen(PORT, () => {
-      logger.info('Fluxora API listening', undefined, { port: PORT });
-    });
-  } catch (err) {
-    logger.error('Failed to start Fluxora API', undefined, {
-      error: err instanceof Error ? err.message : 'Unknown error',
-    });
-    process.exit(1);
-  }
-}
-
-void startServer();
-
-    } catch (err) {
-        error('Failed to start application', {}, err as Error);
-        process.exit(1);
-    }
-}
-
-// Global unhandled rejection handler
-process.on('unhandledRejection', (reason) => {
-    error('Unhandled Promise Rejection', { reason: String(reason) });
-    // In production, we might want to exit here to allow a clean restart
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy' });
 });
 
-start();
+// Indexer routes
+app.use(indexerRouter);
+
+// Error handling middleware
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: err.message,
+  });
+});
+
+// Start server
+const server = app.listen(config.server.port, () => {
+  console.log(`Indexer service listening on port ${config.server.port}`);
+  console.log(`Replay batch size: ${config.indexer.replayBatchSize}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+export { app };

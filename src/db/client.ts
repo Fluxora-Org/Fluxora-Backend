@@ -1,17 +1,42 @@
-import { Pool } from 'pg'
+import { Pool, PoolClient } from 'pg';
+import { config } from '../config';
 
-// Utilize the DATABASE_URL environment variable as specified in the README
-export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-})
+/**
+ * PostgreSQL connection pool for the indexer database
+ */
+export class DatabaseClient {
+  private pool: Pool;
 
-export async function getStreamById(id: string) {
-  const query = `
-    SELECT id, sender, recipient, deposit_amount AS "depositAmount", 
-           rate_per_second AS "ratePerSecond", start_time AS "startTime"
-    FROM streams 
-    WHERE id = $1
-  `
-  const { rows } = await pool.query(query, [id])
-  return rows[0] || null
+  constructor() {
+    this.pool = new Pool({
+      connectionString: config.database.url,
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 2000,
+    });
+  }
+
+  /**
+   * Get a client from the pool
+   */
+  async getClient(): Promise<PoolClient> {
+    return this.pool.connect();
+  }
+
+  /**
+   * Execute a query directly
+   */
+  async query(text: string, params?: any[]) {
+    return this.pool.query(text, params);
+  }
+
+  /**
+   * Close the pool
+   */
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
 }
+
+export const db = new DatabaseClient();
+ 

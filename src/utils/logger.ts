@@ -30,10 +30,10 @@ export function debug(message: string, context: LogContext = {}): void {
 }
 
 export const SerializationLogger = {
-  validationFailed: (field: string, raw: unknown, code: string, requestId?: string) => {
+  validationFailed: (field: string, raw: unknown, code: string, requestId?: string): void => {
     warn(`Decimal validation failed: ${field}`, { field, raw, code, requestId });
   },
-  amountSerialized: (count: number, requestId?: string) => {
+  amountSerialized: (count: number, requestId?: string): void => {
     debug(`Amounts serialized: ${count}`, { requestId });
   }
 };

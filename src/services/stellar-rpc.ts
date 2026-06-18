@@ -1,5 +1,6 @@
 /**
- * Stellar RPC service with circuit breaker.
+ * Stellar RPC service with circuit breaker, AbortController-based cancellation,
+ * and structured failure classification.
  *
  * Circuit breaker states:
  *   CLOSED   — normal operation; calls pass through
@@ -9,14 +10,34 @@
  * Trips when: failureCount >= failureThreshold within windowMs.
  * Resets after: resetTimeoutMs of being OPEN.
  *
- * Every failure emits a structured warn log with the error code and duration.
+ * Failure kinds:
+ *   TIMEOUT      — call exceeded timeoutMs
+ *   NETWORK      — connection-level error (ECONNREFUSED, ENOTFOUND, etc.)
+ *   PROVIDER     — RPC returned an error response (4xx/5xx)
+ *   CIRCUIT_OPEN — breaker is OPEN; call was not attempted
+ *   CANCELLED    — caller aborted via AbortSignal
  */
 
+import { AsyncLocalStorage } from 'async_hooks';
 import { logger } from '../lib/logger.js';
+import {
+  NoOpRpcFallbackCache,
+  RedisRpcFallbackCache,
+  hashCachePart,
+  type RpcFallbackCache,
+} from '../redis/rpcFallbackCache.js';
+import { createRedisClient } from '../redis/client.js';
+import {
+  rpcCircuitOpenFallbackHitsTotal,
+  rpcCircuitOpenFallbackMissesTotal,
+} from '../metrics/rpcMetrics.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
+/** Structured classification of every RPC failure. */
+export type RpcFailureKind = 'TIMEOUT' | 'NETWORK' | 'PROVIDER' | 'CIRCUIT_OPEN' | 'CANCELLED';
 
 export interface CircuitBreakerOptions {
   /** Number of failures within windowMs that trips the breaker. Default 5. */
@@ -30,11 +51,42 @@ export interface CircuitBreakerOptions {
 export interface RpcCallOptions {
   /** Timeout for a single RPC call, ms. Default 5_000. */
   timeoutMs?: number;
+  /** Optional AbortSignal to cancel the call externally. */
+  signal?: AbortSignal;
+}
+
+export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCallOptions {
+  /** TTL for last-known-good fallback entries, seconds. Default 300. */
+  fallbackCacheTtlSeconds?: number;
+  /** Optional cache injection for tests or alternate Redis lifecycle ownership. */
+  fallbackCache?: RpcFallbackCache;
+}
+
+interface RpcRequestMetadata {
+  cacheStatus?: 'stale';
+}
+
+const rpcRequestMetadata = new AsyncLocalStorage<RpcRequestMetadata>();
+
+export function runWithRpcRequestMetadata<T>(fn: () => T): T {
+  return rpcRequestMetadata.run({}, fn);
+}
+
+export function getRpcRequestCacheStatus(): 'stale' | undefined {
+  return rpcRequestMetadata.getStore()?.cacheStatus;
+}
+
+function markStaleRpcCacheResponse(): void {
+  const store = rpcRequestMetadata.getStore();
+  if (store) {
+    store.cacheStatus = 'stale';
+  }
 }
 
 export class RpcProviderError extends Error {
   constructor(
     message: string,
+    public readonly kind: RpcFailureKind,
     public readonly statusCode?: number,
     public readonly durationMs?: number,
   ) {
@@ -44,10 +96,36 @@ export class RpcProviderError extends Error {
 }
 
 export class CircuitOpenError extends Error {
+  public readonly kind: RpcFailureKind = 'CIRCUIT_OPEN';
   constructor() {
     super('Stellar RPC circuit breaker is OPEN — calls suspended during cool-off period');
     this.name = 'CircuitOpenError';
   }
+}
+
+// ── Failure classifier ────────────────────────────────────────────────────────
+
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT',
+  'EHOSTUNREACH', 'ENETUNREACH', 'ECONNABORTED',
+]);
+
+function classifyError(err: unknown): RpcFailureKind {
+  if (err instanceof RpcProviderError) return err.kind;
+  if (err instanceof CircuitOpenError) return 'CIRCUIT_OPEN';
+
+  const code = (err as { code?: string }).code;
+  if (code && NETWORK_ERROR_CODES.has(code)) return 'NETWORK';
+
+  const status = (err as { statusCode?: number; status?: number }).statusCode
+    ?? (err as { status?: number }).status;
+  if (status !== undefined) return 'PROVIDER';
+
+  const message = err instanceof Error ? err.message : String(err);
+  if (/timed? ?out/i.test(message)) return 'TIMEOUT';
+  if (/network|connection|socket/i.test(message)) return 'NETWORK';
+
+  return 'PROVIDER';
 }
 
 // ── Circuit breaker ───────────────────────────────────────────────────────────
@@ -68,6 +146,15 @@ export class CircuitBreaker {
   }
 
   getState(): CircuitState { return this.state; }
+
+  /** Number of failures currently in the rolling window. */
+  getFailureCount(): number {
+    this.evictOldFailures();
+    return this.failures.length;
+  }
+
+  /** Epoch ms when the breaker last tripped to OPEN, or 0 if never. */
+  getOpenedAt(): number { return this.openedAt; }
 
   /** Execute fn through the breaker. Throws CircuitOpenError if OPEN. */
   async call<T>(fn: () => Promise<T>): Promise<T> {
@@ -126,18 +213,24 @@ export class CircuitBreaker {
 
 export interface RawRpcClient {
   getLatestLedger(): Promise<{ sequence: number }>;
+  /** Horizon base URL used for account existence checks. */
+  horizonUrl?: string;
 }
 
 export class StellarRpcService {
   private readonly breaker: CircuitBreaker;
   private readonly timeoutMs: number;
+  private readonly fallbackCache: RpcFallbackCache;
+  private readonly fallbackCacheTtlSeconds: number;
 
   constructor(
     private readonly getClient: () => RawRpcClient,
-    opts: CircuitBreakerOptions & RpcCallOptions = {},
+    opts: StellarRpcServiceOptions = {},
   ) {
     this.breaker = new CircuitBreaker(opts);
     this.timeoutMs = opts.timeoutMs ?? 5_000;
+    this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
+    this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
   }
 
   getCircuitState(): CircuitState { return this.breaker.getState(); }
@@ -145,42 +238,193 @@ export class StellarRpcService {
   /** Reset the circuit breaker (manual recovery). */
   resetCircuit(): void { this.breaker.reset(); }
 
-  async getLatestLedger(): Promise<{ sequence: number }> {
-    return this.breaker.call(() => this.callWithTimeout(
-      () => this.getClient().getLatestLedger(),
+  /**
+   * Snapshot of the current degradation posture, consumed by the
+   * `rpcDegradationMiddleware` to decide whether requests should be served
+   * normally, with a staleness warning, or rejected outright.
+   */
+  getDegradationSnapshot(): {
+    circuitState: CircuitState;
+    degraded: boolean;
+    failureCount: number;
+    openedAt: number | null;
+    timestamp: string;
+  } {
+    const circuitState = this.breaker.getState();
+    const openedAtRaw = this.breaker.getOpenedAt();
+    return {
+      circuitState,
+      degraded: circuitState !== 'CLOSED',
+      failureCount: this.breaker.getFailureCount(),
+      // Surface 0 as `null` so callers can use `openedAt != null` as a
+      // "circuit has ever been open" predicate.
+      openedAt: openedAtRaw === 0 ? null : openedAtRaw,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  async getLatestLedger(opts: RpcCallOptions = {}): Promise<{ sequence: number }> {
+    return this.callWithFallbackCache(
       'getLatestLedger',
-    ));
+      [],
+      () => this.getClient().getLatestLedger(),
+      opts,
+    );
+  }
+
+  /**
+   * Check whether a Stellar account exists on-chain via the Horizon REST API.
+   *
+   * Returns true if the account is found (HTTP 200), false if not found
+   * (HTTP 404). Any other error (network, timeout, circuit open) is re-thrown
+   * so callers can decide whether to fail-open or fail-closed.
+   *
+   * Security note: the address is URL-encoded before interpolation to prevent
+   * path traversal via crafted key values.
+   */
+  async accountExists(address: string, opts: RpcCallOptions = {}): Promise<boolean> {
+    return this.callWithFallbackCache(
+      'accountExists',
+      [hashCachePart(address)],
+      async () => {
+        const client = this.getClient();
+        const base = (client.horizonUrl ?? '').replace(/\/$/, '');
+        if (!base) {
+          throw new RpcProviderError('horizonUrl not configured on RPC client', 'PROVIDER');
+        }
+        const url = `${base}/accounts/${encodeURIComponent(address)}`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs) });
+        if (res.status === 200) return true;
+        if (res.status === 404) return false;
+        throw new RpcProviderError(
+          `Horizon returned HTTP ${res.status} for account lookup`,
+          'PROVIDER',
+          res.status,
+        );
+      },
+      opts,
+    );
+  }
+
+  private async callWithFallbackCache<T>(
+    operation: string,
+    cacheParts: readonly string[],
+    fn: () => Promise<T>,
+    opts: RpcCallOptions = {},
+  ): Promise<T> {
+    try {
+      const result = await this.breaker.call(() => this.callWithTimeout(fn, operation, opts));
+      await this.fallbackCache.set(operation, result, this.fallbackCacheTtlSeconds, cacheParts);
+      return result;
+    } catch (err) {
+      if (!(err instanceof CircuitOpenError)) {
+        throw err;
+      }
+
+      const cached = await this.fallbackCache.get<T>(operation, cacheParts);
+      if (cached !== null) {
+        markStaleRpcCacheResponse();
+        rpcCircuitOpenFallbackHitsTotal.inc({ operation });
+        logger.warn('Serving Stellar RPC response from stale fallback cache', undefined, {
+          event: 'rpc_circuit_open_fallback_hit',
+          operation,
+        });
+        return cached;
+      }
+
+      rpcCircuitOpenFallbackMissesTotal.inc({ operation });
+      logger.warn('Stellar RPC fallback cache miss while circuit is OPEN', undefined, {
+        event: 'rpc_circuit_open_fallback_miss',
+        operation,
+      });
+      throw err;
+    }
   }
 
   private async callWithTimeout<T>(
     fn: () => Promise<T>,
     operation: string,
+    opts: RpcCallOptions = {},
   ): Promise<T> {
     const start = Date.now();
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new RpcProviderError(`${operation} timed out`, undefined, this.timeoutMs)), this.timeoutMs),
-    );
+    const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
+    const signal = opts.signal;
 
-    try {
-      const result = await Promise.race([fn(), timeout]);
-      return result;
-    } catch (err) {
-      const durationMs = Date.now() - start;
-      const statusCode = (err as { statusCode?: number }).statusCode;
-      const message = err instanceof Error ? err.message : String(err);
-
-      logger.warn('Stellar RPC call failed', undefined, {
-        event: 'rpc_failure',
-        operation,
-        errorCode: statusCode,
-        durationMs,
-        error: message,
-      });
-
-      if (err instanceof RpcProviderError || err instanceof CircuitOpenError) throw err;
-      throw new RpcProviderError(message, statusCode, durationMs);
+    // Reject immediately if already aborted
+    if (signal?.aborted) {
+      throw new RpcProviderError(`${operation} was cancelled`, 'CANCELLED', undefined, 0);
     }
+
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+
+      const settle = (action: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        action();
+      };
+
+      const timer = setTimeout(() => {
+        const durationMs = Date.now() - start;
+        settle(() => {
+          const err = new RpcProviderError(
+            `${operation} timed out after ${timeoutMs}ms`,
+            'TIMEOUT',
+            undefined,
+            durationMs,
+          );
+          logFailure(operation, err, durationMs);
+          reject(err);
+        });
+      }, timeoutMs);
+
+      const onAbort = () => {
+        const durationMs = Date.now() - start;
+        settle(() => {
+          const err = new RpcProviderError(
+            `${operation} was cancelled`,
+            'CANCELLED',
+            undefined,
+            durationMs,
+          );
+          logFailure(operation, err, durationMs);
+          reject(err);
+        });
+      };
+
+      signal?.addEventListener('abort', onAbort, { once: true });
+
+      fn().then(
+        (result) => settle(() => resolve(result)),
+        (err: unknown) => {
+          const durationMs = Date.now() - start;
+          settle(() => {
+            const kind = classifyError(err);
+            const statusCode = (err as { statusCode?: number }).statusCode;
+            const message = err instanceof Error ? err.message : String(err);
+            const wrapped = err instanceof RpcProviderError
+              ? err
+              : new RpcProviderError(message, kind, statusCode, durationMs);
+            logFailure(operation, wrapped, durationMs);
+            reject(wrapped);
+          });
+        },
+      );
+    });
   }
+}
+
+function logFailure(operation: string, err: RpcProviderError, durationMs: number): void {
+  logger.warn('Stellar RPC call failed', undefined, {
+    event: 'rpc_failure',
+    operation,
+    kind: err.kind,
+    statusCode: err.statusCode,
+    durationMs,
+    error: err.message,
+  });
 }
 
 // ── Singleton ─────────────────────────────────────────────────────────────────
@@ -190,13 +434,16 @@ let _service: StellarRpcService | null = null;
 export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpcService {
   if (!_service) {
     const client = getClient ?? (() => {
-      throw new RpcProviderError('No Stellar RPC client configured');
+      throw new RpcProviderError('No Stellar RPC client configured', 'PROVIDER');
     });
+    const redisFallbackCache = createConfiguredRpcFallbackCache();
     _service = new StellarRpcService(client, {
       failureThreshold: parseInt(process.env.RPC_CB_FAILURE_THRESHOLD ?? '5', 10),
       windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
       resetTimeoutMs: parseInt(process.env.RPC_CB_RESET_TIMEOUT_MS ?? '60000', 10),
       timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
+      fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
+      fallbackCache: redisFallbackCache,
     });
   }
   return _service;
@@ -204,4 +451,43 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
 
 export function setStellarRpcService(svc: StellarRpcService | null): void {
   _service = svc;
+}
+
+function createConfiguredRpcFallbackCache(): RpcFallbackCache {
+  if (process.env.REDIS_ENABLED === 'false') {
+    return new NoOpRpcFallbackCache();
+  }
+
+  let cachePromise: Promise<RpcFallbackCache> | null = null;
+  const getCache = async (): Promise<RpcFallbackCache> => {
+    if (!cachePromise) {
+      cachePromise = createRedisClient({
+        url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+        enabled: true,
+      })
+        .then((client) => new RedisRpcFallbackCache(client))
+        .catch((err) => {
+          logger.warn('Failed to initialize Redis RPC fallback cache', undefined, {
+            event: 'rpc_fallback_cache_init_failed',
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return new NoOpRpcFallbackCache();
+        });
+    }
+    return cachePromise;
+  };
+
+  return {
+    async get<T>(operation: string, cacheParts?: readonly string[]): Promise<T | null> {
+      return (await getCache()).get<T>(operation, cacheParts);
+    },
+    async set<T>(
+      operation: string,
+      value: T,
+      ttlSeconds: number,
+      cacheParts?: readonly string[],
+    ): Promise<void> {
+      return (await getCache()).set<T>(operation, value, ttlSeconds, cacheParts);
+    },
+  };
 }

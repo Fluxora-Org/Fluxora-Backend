@@ -16,8 +16,8 @@ import {
   tracingMiddleware,
   getTraceContext,
   recordTraceEvent,
-} from '../src/tracing/middleware.js';
-import { initializeTracer, resetTracer } from '../src/tracing/hooks.js';
+} from '../../src/tracing/middleware.js';
+import { initializeTracer, resetTracer } from '../../src/tracing/hooks.js';
 
 describe('Tracing Middleware', () => {
   let app: Express;

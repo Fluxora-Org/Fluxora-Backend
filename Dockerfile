@@ -1,29 +1,54 @@
-FROM node:20-bookworm-slim AS deps
+# Build stage
+FROM node:18-alpine AS builder
 
 WORKDIR /app
 
-# Install dependencies once to maximize build cache reuse.
-COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+# Copy package files
+COPY package.json pnpm-lock.yaml* ./
 
+# Install pnpm and dependencies
+RUN npm install -g pnpm && \
+    pnpm install --frozen-lockfile
 
-FROM node:20-bookworm-slim AS runtime
+# Copy source code
+COPY . .
 
-ENV NODE_ENV=production
-ENV PORT=3000
+# Build TypeScript
+RUN pnpm run build
+
+# Production stage
+FROM node:18-alpine
 
 WORKDIR /app
 
-COPY --from=deps /app/node_modules ./node_modules
-COPY --chown=node:node package.json ./package.json
-COPY --chown=node:node tsconfig.json ./tsconfig.json
-COPY --chown=node:node src ./src
+# Install pnpm
+RUN npm install -g pnpm
 
-USER node
+# Copy package files
+COPY package.json pnpm-lock.yaml* ./
 
+# Install production dependencies only
+RUN pnpm install --prod --frozen-lockfile
+
+# Copy built application from builder
+COPY --from=builder /app/dist ./dist
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Change ownership
+RUN chown -R nodejs:nodejs /app
+
+# Switch to non-root user
+USER nodejs
+
+# Expose port
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/health').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))"
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
-CMD ["node", "--import", "tsx", "src/index.ts"]
+# Start application
+CMD ["node", "dist/src/index.js"]

@@ -19,13 +19,13 @@ import {
   initializeTracer,
   getTracer,
   resetTracer,
-} from '../src/tracing/hooks.js';
+} from '../../src/tracing/hooks.js';
 import {
   SpanBuffer,
   MetricsCollector,
   ErrorClassifier,
   createBuiltInHooks,
-} from '../src/tracing/builtin.js';
+} from '../../src/tracing/builtin.js';
 
 describe('Distributed Tracing Hooks', () => {
   beforeEach(() => {

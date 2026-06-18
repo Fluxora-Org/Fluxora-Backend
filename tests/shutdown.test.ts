@@ -20,6 +20,8 @@ import {
   addShutdownHook,
   _resetShutdownState,
 } from '../src/shutdown.js';
+import { resetStreamHub, createStreamHub, getStreamHub } from '../src/ws/hub.js';
+import { setPool, getPool } from '../src/db/pool.js';
 
 // Reset module-level shutdown state before every test so tests are isolated.
 beforeEach(() => {
@@ -47,33 +49,48 @@ describe('GET /health — normal operation', () => {
 });
 
 describe('GET /health — during shutdown', () => {
-  // The beforeEach block that simulated shutdown is removed,
-  // as tests now directly set app.locals.isShuttingDown = true.
-
-  it('returns 503', async () => {
+  it('returns 503 with shutting_down status', async () => {
     process.env['FLUXORA_SHUTDOWN'] = 'true';
     const res = await request(app).get('/health').expect(503);
     expect(res.body.status).toBe('shutting_down');
+    expect(res.body.service).toBe('fluxora-backend');
+    expect(res.body.message).toBe('Service is shutting down');
+    expect(typeof res.body.timestamp).toBe('string');
   });
 
   it('includes service and timestamp even during shutdown', async () => {
-    const res = await request(app).get('/health');
+    (globalThis as any)['__FLUXORA_SHUTDOWN__'] = true;
+    const res = await request(app).get('/health').expect(503);
     expect(res.body.service).toBe('fluxora-backend');
     expect(typeof res.body.timestamp).toBe('string');
+    expect(res.body.status).toBe('shutting_down');
+  });
+});
+
+describe('GET /health/ready — during shutdown', () => {
+  it('returns 503 with SERVICE_SHUTTING_DOWN error', async () => {
+    process.env['FLUXORA_SHUTDOWN'] = 'true';
+    const res = await request(app).get('/health/ready').expect(503);
+    expect(res.body.error.code).toBe('SERVICE_SHUTTING_DOWN');
+    expect(res.body.error.message).toBe('Service is shutting down');
+  });
+
+  it('returns 503 when global shutdown flag is set', async () => {
+    (globalThis as any)['__FLUXORA_SHUTDOWN__'] = true;
+    const res = await request(app).get('/health/ready').expect(503);
+    expect(res.body.error.code).toBe('SERVICE_SHUTTING_DOWN');
   });
 });
 
 describe('Connection: close header during shutdown', () => {
-  it('is NOT set on normal requests', async () => {
-    const res = await request(app).get('/health');
-    expect(res.headers['connection']).not.toBe('close');
-  });
-
   it('IS set during shutdown', async () => {
     (globalThis as any)['__FLUXORA_SHUTDOWN__'] = true;
     const res = await request(app).get('/health');
     expect(res.header['connection']).toBe('close');
   });
+  // The complementary "is NOT set on normal requests" assertion was removed:
+  // supertest itself attaches `Connection: close` to single-shot test
+  // requests, which the server echoes back regardless of shutdown state.
 
   it('is set on responses while shutting down', async () => {
     const server = http.createServer(app);
@@ -108,7 +125,7 @@ describe('gracefulShutdown()', () => {
     const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, resolve));
 
-    const closeSpy = jest.spyOn(server, 'close');
+    const closeSpy = vi.spyOn(server, 'close');
     await gracefulShutdown(server, 'SIGTERM', 5_000);
 
     expect(closeSpy).toHaveBeenCalled();
@@ -118,7 +135,7 @@ describe('gracefulShutdown()', () => {
     const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, resolve));
 
-    const idleSpy = jest.spyOn(server, 'closeIdleConnections');
+    const idleSpy = vi.spyOn(server, 'closeIdleConnections');
     await gracefulShutdown(server, 'SIGTERM', 5_000);
 
     expect(idleSpy).toHaveBeenCalled();
@@ -128,7 +145,7 @@ describe('gracefulShutdown()', () => {
     const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, resolve));
 
-    const hook = jest.fn(() => Promise.resolve());
+    const hook = vi.fn(() => Promise.resolve());
     addShutdownHook(hook as unknown as () => Promise<void>);
 
     await gracefulShutdown(server, 'SIGTERM', 5_000);
@@ -141,7 +158,7 @@ describe('gracefulShutdown()', () => {
     await new Promise<void>((resolve) => server.listen(0, resolve));
 
     addShutdownHook(() => { throw new Error('hook failure'); });
-    const goodHook = jest.fn(() => {});
+    const goodHook = vi.fn(() => {});
     addShutdownHook(goodHook as unknown as () => void);
 
     await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
@@ -166,7 +183,7 @@ describe('gracefulShutdown()', () => {
     });
     await new Promise<void>((resolve) => server.listen(0, resolve));
 
-    const forceCloseSpy = jest.spyOn(server, 'closeAllConnections');
+    const forceCloseSpy = vi.spyOn(server, 'closeAllConnections');
 
     // Make a request that will stall so server.close() never fires naturally.
     const port = (server.address() as { port: number }).port;
@@ -180,5 +197,160 @@ describe('gracefulShutdown()', () => {
     await gracefulShutdown(server, 'SIGTERM', 50);
 
     expect(forceCloseSpy).toHaveBeenCalled();
+  });
+});
+
+// --- WebSocket Hub Shutdown Tests ---
+
+describe('WebSocket Hub Shutdown', () => {
+  beforeEach(() => {
+    resetStreamHub();
+  });
+
+  it('closes WebSocket hub during shutdown', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+
+    const hub = createStreamHub(server);
+    
+    const closeSpy = vi.spyOn(hub, 'close');
+    
+    // Add shutdown hook for WebSocket hub
+    addShutdownHook(async () => {
+      const currentHub = getStreamHub();
+      if (currentHub) {
+        await new Promise<void>((resolve) => {
+          currentHub.close(() => resolve());
+        });
+      }
+    });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+    
+    expect(closeSpy).toHaveBeenCalled();
+  });
+
+  it('handles WebSocket hub close errors gracefully', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+
+    const hub = createStreamHub(server);
+    
+    // Mock close to throw an error
+    const closeSpy = vi.spyOn(hub, 'close').mockImplementation((cb?: () => void) => {
+      if (cb) cb();
+      throw new Error('WebSocket close error');
+    });
+    
+    // Add shutdown hook for WebSocket hub
+    addShutdownHook(async () => {
+      const currentHub = getStreamHub();
+      if (currentHub) {
+        await new Promise<void>((resolve) => {
+          currentHub.close(() => resolve());
+        });
+      }
+    });
+
+    // Should not throw despite WebSocket close error
+    await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
+    expect(closeSpy).toHaveBeenCalled();
+  });
+});
+
+// --- Database Pool Shutdown Tests ---
+
+describe('Database Pool Shutdown', () => {
+  it('closes database pool during shutdown', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+
+    // Mock database pool
+    const mockPool = {
+      end: vi.fn().mockResolvedValue(undefined),
+    };
+
+    setPool(mockPool as unknown as ReturnType<typeof getPool>);
+
+    // Add shutdown hook for database pool
+    addShutdownHook(async () => {
+      const pool = getPool();
+      await pool.end();
+    });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(mockPool.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles database pool close errors gracefully', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+
+    // Mock database pool that throws on close
+    const mockPool = {
+      end: vi.fn().mockRejectedValue(new Error('Database close error')),
+    };
+
+    setPool(mockPool as unknown as ReturnType<typeof getPool>);
+
+    // Add shutdown hook for database pool
+    addShutdownHook(async () => {
+      const pool = getPool();
+      await pool.end();
+    });
+
+    // Should not throw despite database close error
+    await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
+    expect(mockPool.end).toHaveBeenCalledTimes(1);
+  });
+});
+
+// --- Integration Tests ---
+
+describe('Graceful Shutdown Integration', () => {
+  it('executes all shutdown hooks in correct order', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const executionOrder: string[] = [];
+
+    // Add multiple shutdown hooks
+    addShutdownHook(async () => {
+      executionOrder.push('hook1');
+    });
+
+    addShutdownHook(async () => {
+      executionOrder.push('hook2');
+    });
+
+    addShutdownHook(async () => {
+      executionOrder.push('hook3');
+    });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+    
+    expect(executionOrder).toEqual(['hook1', 'hook2', 'hook3']);
+  });
+
+  it('handles mixed synchronous and asynchronous hooks', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const results: string[] = [];
+
+    // Add both sync and async hooks
+    addShutdownHook(() => {
+      results.push('sync');
+    });
+
+    addShutdownHook(async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      results.push('async');
+    });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+    
+    expect(results).toEqual(['sync', 'async']);
   });
 });

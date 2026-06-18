@@ -102,6 +102,81 @@ export const REQUEST_FIELD_POLICIES: Record<string, FieldPolicy> = {
     redactInLogs: true,
     rationale: 'Bearer token — must never appear in any log output.',
   },
+  authorization: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Authorization header containing credentials or tokens.',
+  },
+  'x-api-key': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'API key used for authentication.',
+  },
+  'idempotency-key': {
+    classification: DataClassification.INTERNAL,
+    redactInLogs: true,
+    rationale: 'Idempotency key could be correlated to specific requests.',
+  },
+  password: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Password or credential in request body.',
+  },
+  secret: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Secret value in request body or response.',
+  },
+  token: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Token value in request body or response.',
+  },
+  credential: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Credential value in request body or response.',
+  },
+  key: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Key value that could be sensitive.',
+  },
+  'private-key': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Private key material.',
+  },
+  'api-key': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'API key value.',
+  },
+  'access-token': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Access token value.',
+  },
+  'refresh-token': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Refresh token value.',
+  },
+  'session-id': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Session identifier.',
+  },
+  cookie: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Cookie value containing session or authentication data.',
+  },
+  'set-cookie': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Set-Cookie header containing session data.',
+  },
 };
 
 /** Retention schedule exposed via the privacy endpoint. */
@@ -209,14 +284,15 @@ export const TRUST_BOUNDARIES: TrustBoundary[] = [
 /**
  * Returns the set of field names that must be redacted before logging,
  * combining both stream and request policies.
+ * Returns field names in lowercase for case-insensitive matching.
  */
 export function redactableFields(): Set<string> {
   const fields = new Set<string>();
   for (const [name, policy] of Object.entries(STREAM_FIELD_POLICIES)) {
-    if (policy.redactInLogs) fields.add(name);
+    if (policy.redactInLogs) fields.add(name.toLowerCase());
   }
   for (const [name, policy] of Object.entries(REQUEST_FIELD_POLICIES)) {
-    if (policy.redactInLogs) fields.add(name);
+    if (policy.redactInLogs) fields.add(name.toLowerCase());
   }
   return fields;
 }

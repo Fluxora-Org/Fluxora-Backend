@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
     Logger,
     ContextualLogger,
@@ -155,12 +155,14 @@ describe('Logger Module', () => {
 
         it('should allow child context to override parent', () => {
             const logger = new Logger('info');
-            const child = logger.child({ key: 'parent' });
+            // `key` is in the PII redaction list — use a non-redacted field so
+            // we can observe the override.
+            const child = logger.child({ label: 'parent' });
 
-            child.info('test', { key: 'child' });
+            child.info('test', { label: 'child' });
 
             const entry = JSON.parse(logs[0].msg);
-            expect(entry.context.key).toBe('child');
+            expect(entry.context.label).toBe('child');
         });
 
         it('should log errors with context', () => {

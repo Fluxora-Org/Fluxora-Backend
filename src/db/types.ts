@@ -159,3 +159,111 @@ export const STREAM_INVARIANTS = {
 
 /** Type for valid status transitions */
 export type ValidTransitions = typeof STREAM_INVARIANTS.validTransitions;
+
+// ─── API Key Management ───────────────────────────────────────────────────────
+
+/**
+ * A stored API key record. The raw key is never persisted — only its SHA-256
+ * hex digest is stored so a database breach does not expose live credentials.
+ */
+export interface ApiKeyRecord {
+  /** Stable opaque identifier (cuid2) */
+  id: string;
+  /** Human-readable label supplied at creation time */
+  name: string;
+  /** SHA-256 hex digest of the raw key */
+  keyHash: string;
+  /** Key prefix (first 8 chars) for display / lookup without exposing the full key */
+  prefix: string;
+  /** ISO-8601 creation timestamp */
+  createdAt: string;
+  /** ISO-8601 last-rotated timestamp, or null if never rotated */
+  rotatedAt: string | null;
+  /** Whether the key is still active */
+  active: boolean;
+}
+
+/**
+ * Returned once at creation / rotation time. The caller must store `key`
+ * immediately — it will never be retrievable again.
+ */
+export interface ApiKeyCreated {
+  id: string;
+  name: string;
+  /** The raw key — shown exactly once */
+  key: string;
+  prefix: string;
+  createdAt: string;
+}
+
+// ─── Stream Event Store ───────────────────────────────────────────────────────
+
+/**
+ * An append-only record of a contract event as ingested from the chain.
+ * Used for replay and debugging. Amounts in payload must follow the
+ * decimal-string serialization policy.
+ */
+export interface StreamEventRecord {
+  /** Stable unique identifier for this event (chain-derived) */
+  eventId: string;
+  /** Ledger sequence number */
+  ledger: number;
+  /** Ledger hash for reorg detection */
+  ledgerHash: string;
+  /** Soroban contract ID */
+  contractId: string;
+  /** Event topic (e.g. "stream.created") */
+  topic: string;
+  /** Transaction hash */
+  txHash: string;
+  /** Transaction index within the ledger */
+  txIndex: number;
+  /** Operation index within the transaction */
+  operationIndex: number;
+  /** Event index within the operation */
+  eventIndex: number;
+  /**
+   * Arbitrary event payload. Amount fields (depositAmount, ratePerSecond, etc.)
+   * MUST be decimal strings per the serialization policy.
+   */
+  payload: Record<string, unknown>;
+  /** ISO-8601 timestamp when the event occurred on-chain */
+  happenedAt: string;
+  /** ISO-8601 timestamp when the event was ingested into the store */
+  ingestedAt: string;
+}
+
+/** Filter options for replaying events from the store */
+export interface StreamEventReplayFilter {
+  /** Only return events at or after this ledger (inclusive) */
+  fromLedger?: number;
+  /** Only return events at or before this ledger (inclusive) */
+  toledger?: number;
+  /** Only return events for this contract */
+  contractId?: string;
+  /** Only return events with this topic */
+  topic?: string;
+  /** Maximum number of events to return (default 100, max 1000) */
+  limit?: number;
+  /** Offset for pagination */
+  offset?: number;
+  /**
+   * Cursor-based replay: only return events that come strictly after this
+   * eventId in the canonical (ledger ASC, eventId ASC) ordering.
+   * When present, `offset` is ignored.
+   */
+  afterEventId?: string;
+}
+
+/** Result of a replay query */
+export interface StreamEventReplayResult {
+  events: StreamEventRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+  /**
+   * Opaque cursor for the next page. Pass as `afterEventId` in the next
+   * request. Absent when there are no more events.
+   */
+  nextCursor?: string;
+}

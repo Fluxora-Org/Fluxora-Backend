@@ -1,3 +1,4 @@
+import { getConfig } from './env.js';
 export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy';
 
 export interface DependencyHealth {
@@ -18,13 +19,13 @@ export interface HealthReport {
 
 export interface HealthChecker {
   name: string;
-  check(): Promise<{ latency: number; error?: string }>;
+  /** Return `degraded: true` to signal high-latency / partial availability without a hard error. */
+  check(): Promise<{ latency: number; error?: string; degraded?: boolean }>;
 }
 
 export class HealthCheckManager {
-  private checkers: Map<string, HealthChecker> = new Map();
-  private lastResults: Map<string, DependencyHealth> = new Map();
-  private startTime = Date.now();
+  private get timeoutMs() { return getConfig().healthCheckTimeoutMs; }
+  private get intervalMs() { return getConfig().healthCheckIntervalMs; }
 
   registerChecker(checker: HealthChecker): void {
     this.checkers.set(checker.name, checker);
@@ -69,11 +70,21 @@ export class HealthCheckManager {
     try {
       const result = await checker.check();
       const latency = result.latency ?? Date.now() - startTime;
+
+      let status: HealthStatus;
+      if (result.error) {
+        status = 'unhealthy';
+      } else if (result.degraded) {
+        status = 'degraded';
+      } else {
+        status = 'healthy';
+      }
+
       const health: DependencyHealth = {
         name: checker.name,
-        status: result.error ? 'unhealthy' : 'healthy',
+        status,
         latency,
-        error: result.error,
+        ...(result.error !== undefined ? { error: result.error } : {}),
         lastChecked: new Date().toISOString(),
       };
 

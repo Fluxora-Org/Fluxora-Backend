@@ -23,7 +23,52 @@ interface LogEntry {
   [key: string]: unknown;
 }
 
+const DUPLICATE_ERROR_WINDOW_MS = 5_000;
+const recentErrorFingerprints = new Map<string, number>();
+
+function normalizeFingerprintPart(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return '';
+}
+
+function buildErrorFingerprint(message: string, meta?: Record<string, unknown>): string {
+  const parts = [
+    message,
+    normalizeFingerprintPart(meta?.correlationId),
+    normalizeFingerprintPart(meta?.requestId),
+    normalizeFingerprintPart(meta?.method),
+    normalizeFingerprintPart(meta?.path),
+    normalizeFingerprintPart(meta?.statusCode),
+    normalizeFingerprintPart(meta?.errorCode),
+  ];
+  return parts.filter((p) => p.length > 0).join('|');
+}
+
+function shouldSuppressDuplicateError(message: string, meta?: Record<string, unknown>): boolean {
+  const fingerprint = buildErrorFingerprint(message, meta);
+  if (!fingerprint) return false;
+
+  const now = Date.now();
+  const previous = recentErrorFingerprints.get(fingerprint);
+  recentErrorFingerprints.set(fingerprint, now);
+
+  // Opportunistic cleanup while we are touching the map.
+  for (const [key, ts] of recentErrorFingerprints.entries()) {
+    if (now - ts > DUPLICATE_ERROR_WINDOW_MS) {
+      recentErrorFingerprints.delete(key);
+    }
+  }
+
+  return previous !== undefined && now - previous <= DUPLICATE_ERROR_WINDOW_MS;
+}
+
 function emit(level: LogLevel, message: string, meta?: Record<string, unknown>): void {
+  if (level === LogLevel.ERROR && shouldSuppressDuplicateError(message, meta)) {
+    return;
+  }
+
   const entry: LogEntry = {
     level,
     ts: new Date().toISOString(),
@@ -67,3 +112,7 @@ export const logger = {
     emit(LogLevel.ERROR, message, meta);
   },
 };
+
+export function _resetLoggerForTest(): void {
+  recentErrorFingerprints.clear();
+}

@@ -40,6 +40,17 @@ describe('admin routes', () => {
     expect(res.status).toBe(403);
   });
 
+  it('allows unauthenticated read-only status checks', async () => {
+    const res = await request(app).get('/api/admin/status/read-only');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      pauseFlags: {
+        streamCreation: false,
+        ingestion: false,
+      },
+    });
+  });
+
   // ── GET /api/admin/status ──────────────────────────────────
 
   describe('GET /api/admin/status', () => {

@@ -2,17 +2,20 @@
 
 ## Overview
 
-This document specifies the retry policy for failed webhook deliveries in the Fluxora backend. The policy ensures operator-grade reliability with predictable behavior for webhook consumers and clear failure modes for integrators.
+This document specifies the enhanced retry policy for failed webhook deliveries in the Fluxora backend. The policy ensures operator-grade reliability with predictable behavior for webhook consumers and clear failure modes for integrators.
 
 ## Service-Level Outcomes
 
 The Fluxora backend guarantees:
 
-1. **Durable delivery attempts** - Failed webhooks are retried with exponential backoff
-2. **Predictable retry behavior** - Consumers can rely on consistent retry timing and limits
-3. **Deduplication support** - Delivery IDs enable idempotent webhook processing
-4. **Observable health** - Operators can monitor delivery status and diagnose failures
-5. **Secure delivery** - HMAC-SHA256 signatures prevent tampering and replay attacks
+1. **Durable delivery attempts** - Failed webhooks are retried with configurable backoff strategies
+2. **Outbox pattern** - Reliable webhook delivery with transactional guarantees
+3. **Dead-letter queue** - Failed deliveries are preserved for inspection and manual retry
+4. **Circuit breaker protection** - Automatic protection against failing endpoints
+5. **Predictable retry behavior** - Consumers can rely on consistent retry timing and limits
+6. **Deduplication support** - Delivery IDs enable idempotent webhook processing
+7. **Observable health** - Operators can monitor delivery status and diagnose failures
+8. **Secure delivery** - HMAC-SHA256 signatures prevent tampering and replay attacks
 
 ## Retry Policy Configuration
 
@@ -26,9 +29,42 @@ The Fluxora backend guarantees:
   maxBackoffMs: 60000,               // Cap backoff at 60 seconds
   jitterPercent: 10,                 // ±10% jitter to prevent thundering herd
   timeoutMs: 30000,                  // 30 second timeout per attempt
-  retryableStatusCodes: [408, 429, 500, 502, 503, 504]
+  retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+  backoffStrategy: 'exponential',    // exponential | linear | fixed
+  jitterAlgorithm: 'full',           // full | equal | decorrelated
+  deadLetterAfterMs: 3600000,        // Send to DLQ after 1 hour (optional)
+  circuitBreakerThreshold: 10,       // Open circuit after 10 failures (optional)
+  circuitBreakerResetMs: 300000      // Reset circuit after 5 minutes (optional)
 }
 ```
+
+### Enhanced Backoff Strategies
+
+#### Exponential Backoff (Default)
+- Delay = initialBackoffMs * (multiplier ^ attemptNumber)
+- Example: 1s, 2s, 4s, 8s, 16s (capped at maxBackoffMs)
+
+#### Linear Backoff
+- Delay = initialBackoffMs + (attemptNumber * initialBackoffMs)
+- Example: 1s, 2s, 3s, 4s, 5s
+
+#### Fixed Backoff
+- Delay = initialBackoffMs (constant)
+- Example: 1s, 1s, 1s, 1s, 1s
+
+### Jitter Algorithms
+
+#### Full Jitter (Default)
+- Random delay between 0 and calculated backoff
+- Prevents thundering herd effectively
+
+#### Equal Jitter
+- Delay = (backoff/2) + random(0, backoff/2)
+- Balances load spreading and promptness
+
+#### Decorrelated Jitter
+- Delay = random(0, backoff * 3)
+- Adapts to varying load conditions
 
 ### Backoff Schedule
 
@@ -117,18 +153,25 @@ Total maximum delivery window: ~31 seconds
 
 ### States
 
-1. **pending** - Delivery queued or waiting for retry
-2. **delivered** - Successfully delivered (2xx response)
-3. **failed** - Delivery failed but may be retried
-4. **permanent_failure** - Delivery failed and will not be retried
+1. **queued** - Added to outbox, waiting for processing
+2. **pending** - Delivery in progress or waiting for retry
+3. **delivered** - Successfully delivered (2xx response)
+4. **failed** - Delivery failed but may be retried
+5. **permanent_failure** - Delivery failed and moved to DLQ
 
 ### State Transitions
 
 ```
+queued
+  |- pending (when processed by outbox worker)
+
 pending
-  ├─→ delivered (on 2xx response)
-  ├─→ pending (on retryable error, schedule next retry)
-  └─→ permanent_failure (on non-retryable error or max attempts exceeded)
+  |- delivered (on 2xx response)
+  |- pending (on retryable error, schedule next retry)
+  |- permanent_failure (on non-retryable error or max attempts exceeded)
+
+permanent_failure
+  |- queued (manual retry from DLQ)
 ```
 
 ## Webhook Delivery Endpoints
@@ -216,6 +259,14 @@ x-fluxora-signature: <hex-encoded-signature>
 {"event": "stream.created", "data": {...}}
 ```
 
+### Process Outbox Items
+
+```
+POST /internal/webhooks/process-outbox?secret=webhook_secret_123
+```
+
+This endpoint should be called periodically (e.g., every 5 seconds) by a background job to process outbox items.
+
 ### Process Pending Retries
 
 ```
@@ -223,6 +274,111 @@ POST /internal/webhooks/retry?secret=webhook_secret_123
 ```
 
 This endpoint should be called periodically (e.g., every 10 seconds) by a background job to process pending retries.
+
+### View Outbox Status
+
+```
+GET /api/webhooks/outbox?priority=high&status=ready
+```
+
+Response:
+```json
+{
+  "total": 15,
+  "items": [
+    {
+      "id": "outbox_123",
+      "deliveryId": "deliv_123",
+      "eventId": "event_123",
+      "eventType": "stream.created",
+      "endpointUrl": "https://consumer.example.com/webhook",
+      "priority": "high",
+      "attempts": 0,
+      "maxAttempts": 5,
+      "scheduledFor": "2024-03-10T12:00:00Z",
+      "createdAt": "2024-03-10T12:00:00Z"
+    }
+  ]
+}
+```
+
+### View Dead-Letter Queue
+
+```
+GET /api/webhooks/dlq?limit=50
+```
+
+Response:
+```json
+{
+  "total": 3,
+  "items": [
+    {
+      "id": "dlq_123",
+      "deliveryId": "deliv_123",
+      "eventId": "event_123",
+      "eventType": "stream.created",
+      "endpointUrl": "https://consumer.example.com/webhook",
+      "failureReason": "Max attempts exceeded",
+      "attemptCount": 5,
+      "createdAt": "2024-03-10T12:00:00Z",
+      "processedAt": null
+    }
+  ]
+}
+```
+
+### Retry DLQ Item
+
+```
+POST /api/webhooks/dlq/dlq_123/retry
+Content-Type: application/json
+
+{
+  "secret": "webhook_secret_123"
+}
+```
+
+### View Circuit Breaker Status
+
+```
+GET /api/webhooks/circuit-breakers
+```
+
+Response:
+```json
+{
+  "total": 2,
+  "states": [
+    {
+      "endpointUrl": "https://consumer.example.com/webhook",
+      "state": "open",
+      "failureCount": 15,
+      "lastFailureTime": "2024-03-10T12:00:00Z",
+      "nextAttemptTime": "2024-03-10T12:05:00Z"
+    }
+  ]
+}
+```
+
+### Get Delivery Metrics
+
+```
+GET /api/webhooks/metrics
+```
+
+Response:
+```json
+{
+  "totalDeliveries": 1000,
+  "successfulDeliveries": 950,
+  "failedDeliveries": 30,
+  "dlqItems": 20,
+  "outboxItems": 5,
+  "successRate": 95.0,
+  "failureRate": 5.0
+}
+```
 
 ## Webhook Headers
 
