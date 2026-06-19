@@ -45,6 +45,39 @@ const StreamObject = registry.register(
   }).openapi({ description: 'A treasury stream record' }),
 );
 
+const ContractEventTopic = registry.register(
+  'ContractEventTopic',
+  z.enum(['stream.created', 'stream.updated', 'stream.cancelled']).openapi({
+    example: 'stream.created',
+    description: 'Canonical Fluxora stream event topic emitted by the indexer',
+  }),
+);
+
+const ContractEvent = registry.register(
+  'ContractEvent',
+  z.object({
+    eventId: z.string().min(1).max(128).openapi({ example: 'evt-001' }),
+    ledger: z.number().int().nonnegative().openapi({ example: 1000 }),
+    ledgerHash: z.string().min(1).max(128).optional().openapi({ example: 'ledger-hash-001' }),
+    contractId: z.string().min(1).max(128).openapi({ example: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }),
+    topic: ContractEventTopic,
+    txHash: z.string().min(1).max(128).openapi({ example: 'tx-hash-001' }),
+    txIndex: z.number().int().nonnegative().openapi({ example: 0 }),
+    operationIndex: z.number().int().nonnegative().openapi({ example: 0 }),
+    eventIndex: z.number().int().nonnegative().openapi({ example: 0 }),
+    payload: z.record(z.string(), z.unknown()).openapi({
+      example: {
+        id: 'stream-abc123',
+        sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+        recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+        depositAmount: '1000000.0000000',
+        ratePerSecond: '0.0000116',
+      },
+    }),
+    happenedAt: z.string().datetime().openapi({ example: '2026-01-01T00:00:00.000Z' }),
+  }).strict().openapi({ description: 'Contract event accepted by the internal indexer ingest endpoint' }),
+);
+
 const ResponseMeta = registry.register(
   'ResponseMeta',
   z.object({
@@ -656,8 +689,28 @@ registry.registerPath({
       required: true,
       content: {
         'application/json': {
-          schema: z.object({ events: z.array(z.record(z.string(), z.unknown())).max(100) }),
-          example: { events: [{ eventId: 'evt-001', ledger: 1000, contractId: 'C...', topic: 'stream.created', payload: {} }] },
+          schema: z.object({ events: z.array(ContractEvent).max(100) }),
+          example: {
+            events: [
+              {
+                eventId: 'evt-001',
+                ledger: 1000,
+                ledgerHash: 'ledger-hash-001',
+                contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+                topic: 'stream.created',
+                txHash: 'tx-hash-001',
+                txIndex: 0,
+                operationIndex: 0,
+                eventIndex: 0,
+                payload: {
+                  id: 'stream-abc123',
+                  depositAmount: '1000000.0000000',
+                  ratePerSecond: '0.0000116',
+                },
+                happenedAt: '2026-01-01T00:00:00.000Z',
+              },
+            ],
+          },
         },
       },
     },

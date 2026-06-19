@@ -124,6 +124,42 @@ describe('GET /openapi.json', () => {
     expect(sec?.some((s) => 'indexerWorkerToken' in s)).toBe(true);
   });
 
+  it('documents typed contract event ingest payloads', async () => {
+    const res = await request(app).get('/openapi.json');
+    const components = res.body.components?.schemas as Record<string, Record<string, unknown>>;
+    const contractEvent = components?.ContractEvent;
+    const topic = components?.ContractEventTopic;
+    const route = (res.body.paths['/internal/indexer/contract-events'] as Record<string, unknown>)?.post as
+      | Record<string, unknown>
+      | undefined;
+    const requestBody = route?.requestBody as Record<string, unknown> | undefined;
+    const bodyContent = requestBody?.content as Record<string, unknown> | undefined;
+    const content = bodyContent?.['application/json'] as Record<string, unknown> | undefined;
+    const example = content?.example as { events?: Array<Record<string, unknown>> } | undefined;
+
+    expect(contractEvent).toBeDefined();
+    expect(topic?.enum).toEqual(['stream.created', 'stream.updated', 'stream.cancelled']);
+    expect(contractEvent.required).toEqual(
+      expect.arrayContaining([
+        'eventId',
+        'ledger',
+        'contractId',
+        'topic',
+        'txHash',
+        'txIndex',
+        'operationIndex',
+        'eventIndex',
+        'payload',
+        'happenedAt',
+      ]),
+    );
+    expect(example?.events?.[0]).toMatchObject({
+      ledger: 1000,
+      topic: 'stream.created',
+      eventIndex: 0,
+    });
+  });
+
   it('includes error response schemas (400, 401, 404, 500)', async () => {
     const res = await request(app).get('/openapi.json');
     const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
