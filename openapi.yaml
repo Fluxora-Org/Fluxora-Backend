@@ -1137,6 +1137,7 @@ components:
                 - FORBIDDEN
                 - PAYLOAD_TOO_LARGE
                 - TOO_MANY_REQUESTS
+                - REQUEST_TIMEOUT
                 - SERVICE_UNAVAILABLE
                 - INTERNAL_ERROR
                 - DECIMAL_ERROR

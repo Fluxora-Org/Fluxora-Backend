@@ -248,6 +248,7 @@ Every error response uses this envelope:
 | `PAYLOAD_TOO_LARGE` | 413 | Request body exceeds 256 KiB |
 | `TOO_MANY_REQUESTS` | 429 | Rate limit exceeded |
 | `METHOD_NOT_ALLOWED` | 405 | HTTP method not supported on this path |
+| `REQUEST_TIMEOUT` | 408 | Request socket timed out before completion |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
 | `SERVICE_UNAVAILABLE` | 503 | Dependency (DB, Redis, Stellar RPC) is down |
 

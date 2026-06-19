@@ -23,7 +23,7 @@
  */
 
 import type { Request, Response, NextFunction } from 'express';
-import { ApiErrorCode, payloadTooLarge, validationError } from './errorHandler.js';
+import { payloadTooLarge, requestTimeout, validationError } from './errorHandler.js';
 
 // ── Idempotency-Key constants ─────────────────────────────────────────────────
 
@@ -165,12 +165,7 @@ export function requestTimeoutMiddleware(timeoutMs: number): (req: Request, res:
   return (req: Request, res: Response, next: NextFunction): void => {
     req.socket.setTimeout(timeoutMs, () => {
       if (!res.headersSent) {
-        next(
-          Object.assign(new Error(`Request timed out after ${timeoutMs}ms`), {
-            statusCode: 408,
-            code: ApiErrorCode.INTERNAL_ERROR,
-          }),
-        );
+        next(requestTimeout('Request timed out'));
       }
       req.socket.destroy();
     });

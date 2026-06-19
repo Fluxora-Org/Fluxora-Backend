@@ -9,15 +9,17 @@
  *   - BODY_LIMIT_BYTES constant: exported value equals 256 KiB
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
+import type { Request, Response } from 'express';
 import {
   BODY_LIMIT_BYTES,
   bodySizeLimitMiddleware,
   jsonDepthMiddleware,
+  requestTimeoutMiddleware,
 } from '../src/middleware/requestProtection.js';
-import { errorHandler } from '../src/middleware/errorHandler.js';
+import { ApiError, ApiErrorCode, errorHandler } from '../src/middleware/errorHandler.js';
 
 function buildApp() {
   const app = express();
@@ -106,5 +108,37 @@ describe('jsonDepthMiddleware', () => {
 
     const res = await request(appWithGet).get('/ping');
     expect(res.status).toBe(200);
+  });
+});
+
+describe('requestTimeoutMiddleware', () => {
+  it('emits a 408 REQUEST_TIMEOUT ApiError without leaking timeout internals', () => {
+    let timeoutHandler: (() => void) | undefined;
+    const req = {
+      socket: {
+        setTimeout: vi.fn((_timeoutMs: number, handler?: () => void) => {
+          timeoutHandler = handler;
+        }),
+        destroy: vi.fn(),
+      },
+    } as unknown as Request;
+    const res = {
+      headersSent: false,
+      on: vi.fn(),
+    } as unknown as Response;
+    const next = vi.fn();
+
+    requestTimeoutMiddleware(2500)(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+
+    timeoutHandler?.();
+
+    expect(next).toHaveBeenCalledTimes(2);
+    const error = next.mock.calls[1]?.[0];
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).code).toBe(ApiErrorCode.REQUEST_TIMEOUT);
+    expect((error as ApiError).statusCode).toBe(408);
+    expect((error as ApiError).message).toBe('Request timed out');
+    expect(req.socket.destroy).toHaveBeenCalledOnce();
   });
 });
