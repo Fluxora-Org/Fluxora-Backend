@@ -1,10 +1,10 @@
-import { randomUUID } from 'crypto';
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { computeWebhookSignature } from './signature.js';
 import { calculateNextRetryTime, shouldRetry } from './retry.js';
+import { logger } from '../lib/logger.js';
 
 export interface WebhookDispatchOptions {
   url: string;
