@@ -170,6 +170,7 @@ describe('closeRevocationStore', () => {
 
   it('is safe to call multiple times', async () => {
     mockRedis.quit.mockResolvedValue('OK');
+    await revoke('jti-1', 3600); // Initialize client
     await closeRevocationStore();
     await closeRevocationStore(); // Second call should not throw
     expect(mockRedis.quit).toHaveBeenCalledTimes(1);
