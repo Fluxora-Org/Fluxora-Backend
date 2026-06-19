@@ -427,6 +427,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
               streamId: 'stream-123',
               eventId: 'evt-live-001',
               payload: { status: 'cancelled' },
+              correlationId: 'corr-live-001',
             });
           }
           if (data.includes('evt-live-001') && data.includes('cancelled')) {
@@ -441,6 +442,8 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     const output = await resPromise;
     expect(output).toContain('id: evt-live-001');
     expect(output).toContain('event: stream_update');
+    expect(output).toContain(': correlation-id: corr-live-001');
+    expect(output).toContain('"correlationId":"corr-live-001"');
     expect(output).toContain('cancelled');
   });
 

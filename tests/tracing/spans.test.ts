@@ -11,7 +11,14 @@ import {
   resetTracer,
   getTracer,
   traceSpan,
+  traceSseDispatch,
 } from '../../src/tracing/hooks.js';
+import {
+  _resetSseSubscriptionsForTest,
+  SSE_STREAM_UPDATE_EVENT,
+  sseEventBus,
+  subscribeToSseStream,
+} from '../../src/streams/sseEmitter.js';
 import {
   tracingMiddleware,
   getCorrelationId,
@@ -79,6 +86,59 @@ describe('traceSpan helper', () => {
 
     const result = await traceSpan('test.op', 'corr-4', {}, async () => 'hello');
     expect(result).toBe('hello');
+  });
+
+  it('records SSE dispatch spans and closes them when a subscriber throws', () => {
+    const buffer = new SpanBuffer({ logEvents: false });
+    resetTracer();
+    initializeTracer({ enabled: true, hooks: buffer });
+
+    expect(() => {
+      traceSseDispatch('stream-123', 'evt-1', 2, 'corr-sse', () => {
+        throw new Error('client write failed');
+      });
+    }).toThrow('client write failed');
+
+    const spans = buffer.getSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].status).toBe('error');
+    expect(spans[0].statusMessage).toBe('client write failed');
+    expect(spans[0].context.traceId).toBe('corr-sse');
+    expect(spans[0].context.tags?.['span.name']).toBe('sse.dispatch');
+    expect(spans[0].context.tags?.['sse.subscribers']).toBe(2);
+  });
+
+  it('closes an ok SSE dispatch span when fan-out isolates a failing subscriber', () => {
+    const buffer = new SpanBuffer({ logEvents: false });
+    resetTracer();
+    initializeTracer({ enabled: true, hooks: buffer });
+    _resetSseSubscriptionsForTest();
+
+    const unsubscribeFailing = subscribeToSseStream('stream-123', () => {
+      throw new Error('client write failed');
+    });
+    const delivered = vi.fn();
+    const unsubscribeHealthy = subscribeToSseStream('stream-123', delivered);
+
+    try {
+      sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, {
+        streamId: 'stream-123',
+        eventId: 'evt-2',
+        payload: { status: 'active' },
+        correlationId: 'corr-sse',
+      });
+
+      expect(delivered).toHaveBeenCalledOnce();
+      const spans = buffer.getSpans();
+      expect(spans).toHaveLength(1);
+      expect(spans[0].status).toBe('ok');
+      expect(spans[0].context.traceId).toBe('corr-sse');
+      expect(spans[0].events[0]?.name).toBe('sse.dispatch');
+    } finally {
+      unsubscribeFailing();
+      unsubscribeHealthy();
+      _resetSseSubscriptionsForTest();
+    }
   });
 });
 

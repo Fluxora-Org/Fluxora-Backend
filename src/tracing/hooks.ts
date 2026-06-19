@@ -430,6 +430,50 @@ export async function traceSpan<T>(
 }
 
 /**
+ * Wrap local Server-Sent Events fan-out in a tracing span.
+ *
+ * The span records fan-out size and event identity without storing payload
+ * bodies, token material, or client addresses.
+ */
+export function traceSseDispatch<T>(
+  streamId: string,
+  eventId: string,
+  subscriberCount: number,
+  correlationId: string | undefined,
+  fn: (span: Span) => T,
+): T {
+  const tracer = getTracer();
+  const traceId = correlationId?.trim() || getCorrelationIdFromContext();
+  const span = tracer.startSpan({
+    traceId,
+    serviceName: 'fluxora-sse',
+    tags: {
+      'span.name': 'sse.dispatch',
+      'sse.stream_id': streamId,
+      'sse.event_id': eventId,
+      'sse.subscribers': subscriberCount,
+      'sse.correlation_id': traceId,
+    },
+  });
+
+  try {
+    const result = fn(span);
+    tracer.recordEvent(span, 'sse.dispatch', {
+      streamId,
+      eventId,
+      subscribers: subscriberCount,
+      correlationId: traceId,
+    });
+    tracer.endSpan(span, 'ok');
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    tracer.endSpan(span, 'error', message);
+    throw err;
+  }
+}
+
+/**
  * Global tracer instance.
  */
 let globalTracer: Tracer | null = null;
@@ -626,4 +670,3 @@ export function enrichActiveSpanWithStream(
     // ignore active span errors
   }
 }
-

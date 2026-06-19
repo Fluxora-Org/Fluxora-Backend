@@ -1009,15 +1009,17 @@ streamsRouter.get(
             for (const event of result.events) {
               if (cleanedUp) break;
               if (eventMatchesStreamId(event, id)) {
+                const frameCorrelationId = req.correlationId;
                 const written = writeSse(
                   `id: ${event.eventId}\n` +
                   `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+                  `: correlation-id: ${frameCorrelationId ?? 'unknown'}\n` +
                   `data: ${JSON.stringify({
                     type: 'stream_update',
                     streamId: id,
                     eventId: event.eventId,
                     payload: event.payload,
-                    correlationId: req.correlationId,
+                    correlationId: frameCorrelationId,
                   })}\n\n`,
                 );
                 if (!written) break;
@@ -1040,15 +1042,17 @@ streamsRouter.get(
     // 6. Subscribe to Real-Time Updates.
     const listener = (event: StreamUpdateEvent) => {
       if (event.streamId === id) {
+        const frameCorrelationId = event.correlationId || req.correlationId;
         writeSse(
           `id: ${event.eventId}\n` +
           `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+          `: correlation-id: ${frameCorrelationId ?? 'unknown'}\n` +
           `data: ${JSON.stringify({
             type: 'stream_update',
             streamId: event.streamId,
             eventId: event.eventId,
             payload: event.payload,
-            correlationId: req.correlationId || event.correlationId,
+            correlationId: frameCorrelationId,
           })}\n\n`,
         );
       }
@@ -1059,5 +1063,3 @@ streamsRouter.get(
 );
 
 export function _resetStreams(): void {}
-
-
