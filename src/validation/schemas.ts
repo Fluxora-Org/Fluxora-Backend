@@ -10,6 +10,10 @@
  * @module validation/schemas
  */
 import { z } from 'zod';
+import {
+  MAX_DECIMAL_INTEGER_PART,
+  STELLAR_DECIMALS,
+} from '../serialization/decimal.js';
 
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
@@ -17,11 +21,38 @@ export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
 /** Regex for valid Stellar public keys: G followed by 55 base32 characters */
 export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 
+function getDecimalParts(value: string): { integerPart: string; fractionalPart: string } {
+  const [integerPart = '', fractionalPart = ''] = value.split('.');
+  return {
+    integerPart: integerPart.replace(/^[+-]/, ''),
+    fractionalPart,
+  };
+}
+
+function isWithinDecimalMagnitude(value: string): boolean {
+  try {
+    const { integerPart } = getDecimalParts(value);
+    return BigInt(integerPart) <= MAX_DECIMAL_INTEGER_PART;
+  } catch {
+    return false;
+  }
+}
+
+function hasStellarPrecision(value: string): boolean {
+  return getDecimalParts(value).fractionalPart.length <= STELLAR_DECIMALS;
+}
+
 /** Reusable decimal-string field schema */
 function decimalStringField(fieldName: string) {
   return z
     .string({ error: `${fieldName} must be a decimal string, not a number` })
-    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
+    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`)
+    .refine(isWithinDecimalMagnitude, {
+      message: `${fieldName} exceeds the maximum supported integer part`,
+    })
+    .refine(hasStellarPrecision, {
+      message: `${fieldName} cannot exceed ${STELLAR_DECIMALS} fractional digits`,
+    });
 }
 
 /** Reusable Stellar public key field schema */
@@ -40,6 +71,33 @@ function stellarPublicKeyField(fieldName: string) {
  * - depositAmount / ratePerSecond: decimal strings only (not numbers)
  * - startTime / endTime: non-negative integers when provided
  */
+export const CreateStreamSchema = z.object({
+  sender: stellarPublicKeyField('sender'),
+  recipient: stellarPublicKeyField('recipient'),
+  depositAmount: decimalStringField('depositAmount')
+    .refine((val) => parseFloat(val) > 0, {
+      message: 'depositAmount must be a positive numeric string',
+    })
+    .optional(),
+  ratePerSecond: decimalStringField('ratePerSecond')
+    .refine((val) => parseFloat(val) > 0, {
+      message: 'ratePerSecond must be a positive numeric string',
+    })
+    .optional(),
+  startTime: z
+    .number({ error: 'startTime must be a number' })
+    .int('startTime must be an integer')
+    .nonnegative('startTime must be a non-negative number')
+    .optional(),
+  endTime: z
+    .number({ error: 'endTime must be a number' })
+    .int('endTime must be an integer')
+    .nonnegative('endTime must be a non-negative integer')
+    .optional(),
+});
+
+export type CreateStreamInput = z.infer<typeof CreateStreamSchema>;
+
 export const StreamBatchCreateSchema = z.object({
   streams: z.array(CreateStreamSchema).max(100, { message: 'Maximum of 100 streams per batch' })
 });

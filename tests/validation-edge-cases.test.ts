@@ -24,6 +24,10 @@ import {
     validateJsonDepth,
     validateRequestSize,
 } from '../src/config/validation';
+import { CreateStreamSchema } from '../src/validation/schemas';
+
+const VALID_STELLAR_SENDER = 'GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX';
+const VALID_STELLAR_RECIPIENT = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX';
 
 describe('Validation Edge Cases & Failure Modes', () => {
     describe('Abuse Scenarios: Oversized Payloads', () => {
@@ -166,6 +170,48 @@ describe('Validation Edge Cases & Failure Modes', () => {
         it('should handle very large number strings', () => {
             const huge = '99999999999999999999999999999999';
             expect(() => validateAmount(huge)).toThrow(ValidationError);
+        });
+    });
+
+    describe('Boundary Conditions: Decimal String Schema Validation', () => {
+        const baseStream = {
+            sender: VALID_STELLAR_SENDER,
+            recipient: VALID_STELLAR_RECIPIENT,
+            depositAmount: '1000000000',
+            ratePerSecond: '0.0000116',
+        };
+
+        it('should accept max in-range Stellar decimal strings', () => {
+            const result = CreateStreamSchema.safeParse({
+                ...baseStream,
+                depositAmount: '9223372036854775807.9999999',
+            });
+
+            expect(result.success).toBe(true);
+        });
+
+        it('should reject decimal strings whose integer part exceeds the supported maximum', () => {
+            const result = CreateStreamSchema.safeParse({
+                ...baseStream,
+                depositAmount: '9223372036854775808',
+            });
+
+            expect(result.success).toBe(false);
+            if (!result.success) {
+                expect(result.error.issues[0]?.message).toContain('maximum supported integer part');
+            }
+        });
+
+        it('should reject decimal strings with more than Stellar precision', () => {
+            const result = CreateStreamSchema.safeParse({
+                ...baseStream,
+                ratePerSecond: '0.00000001',
+            });
+
+            expect(result.success).toBe(false);
+            if (!result.success) {
+                expect(result.error.issues[0]?.message).toContain('fractional digits');
+            }
         });
     });
 
