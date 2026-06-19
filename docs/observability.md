@@ -164,6 +164,31 @@ The application exposes fine-grained Node.js runtime health indicators to differ
 - **Event Loop Lag**: Alert if p99 lag `> 1s` (indicates severe event loop starvation or long-running synchronous work).
 - **Heap Pressure**: Alert if `fluxora_nodejs_heap_used_bytes` is consistently `> 85%` of `fluxora_nodejs_heap_total_bytes` over a sustained period (indicates GC thrashing).
 
+## Authentication Latency Metrics
+
+Authentication hot paths export bounded-label histograms for operator dashboards. The only label is `outcome`; token contents, API keys, key prefixes, addresses, and request identifiers are not recorded.
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `fluxora_auth_jwt_verify_duration_seconds` | Histogram | `outcome="success|failure"` | Time spent verifying JWT signature and expiry. |
+| `fluxora_auth_apikey_lookup_duration_seconds` | Histogram | `outcome="success|failure"` | Time spent hashing and comparing API keys against active records. |
+
+Example p95 PromQL:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum(rate(fluxora_auth_jwt_verify_duration_seconds_bucket[5m])) by (le, outcome)
+)
+```
+
+```promql
+histogram_quantile(
+  0.95,
+  sum(rate(fluxora_auth_apikey_lookup_duration_seconds_bucket[5m])) by (le, outcome)
+)
+```
+
 ## Log aggregation integrations
 
 See the platform-specific guides:

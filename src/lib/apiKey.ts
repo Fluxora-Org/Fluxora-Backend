@@ -1,6 +1,7 @@
 import { createId } from '@paralleldrive/cuid2';
 import { createHash, timingSafeEqual } from 'crypto';
 import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 
 // ---------------------------------------------------------------------------
 // In-memory store (replace with DB-backed store when persistence is needed)
@@ -97,24 +98,32 @@ export function listApiKeys(): ApiKeyRecord[] {
  * Validates a raw API key against the stored hashes using constant-time comparison.
  */
 export function isValidApiKey(rawKey: string): boolean {
-  if (!rawKey) return false;
+  const endLookupTimer = authApiKeyLookupDurationSeconds.startTimer();
+  let outcome: 'success' | 'failure' = 'failure';
 
-  const hash = sha256hex(rawKey);
-  const hashBuf = Buffer.from(hash, 'hex');
+  try {
+    if (!rawKey) return false;
 
-  for (const record of store.values()) {
-    if (!record.active) continue;
-    try {
-      const storedBuf = Buffer.from(record.keyHash, 'hex');
-      if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
-        return true;
+    const hash = sha256hex(rawKey);
+    const hashBuf = Buffer.from(hash, 'hex');
+
+    for (const record of store.values()) {
+      if (!record.active) continue;
+      try {
+        const storedBuf = Buffer.from(record.keyHash, 'hex');
+        if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
+          outcome = 'success';
+          return true;
+        }
+      } catch {
+        // length mismatch — skip
       }
-    } catch {
-      // length mismatch — skip
     }
-  }
 
-  return false;
+    return false;
+  } finally {
+    endLookupTimer({ outcome });
+  }
 }
 
 /**

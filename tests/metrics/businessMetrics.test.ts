@@ -4,12 +4,15 @@ import { app } from '../../src/app.js';
 import { registry } from '../../src/metrics.js';
 import {
   streamsCreatedTotal,
+  authApiKeyLookupDurationSeconds,
+  authJwtVerifyDurationSeconds,
   webhookDeliveriesTotal,
   webhookDeliveryDurationSeconds,
   indexerEventsIngestedTotal,
   indexerLagSeconds,
   deRegisterBusinessMetrics,
 } from '../../src/metrics/businessMetrics.js';
+import { _resetApiKeyStoreForTest, createApiKey, isValidApiKey } from '../../src/lib/apiKey.js';
 import { WebhookService } from '../../src/webhooks/service.js';
 import { IndexerIngestionService } from '../../src/indexer/service.js';
 import { InMemoryContractEventStore } from '../../src/indexer/store.js';
@@ -19,10 +22,13 @@ beforeEach(() => {
   // Reset existing metrics if they are still registered
   try {
     streamsCreatedTotal.reset();
+    authApiKeyLookupDurationSeconds.reset();
+    authJwtVerifyDurationSeconds.reset();
     webhookDeliveriesTotal.reset();
     webhookDeliveryDurationSeconds.reset();
     indexerEventsIngestedTotal.reset();
     indexerLagSeconds.reset();
+    _resetApiKeyStoreForTest();
   } catch {
     // no-op if already de-registered
   }
@@ -184,6 +190,27 @@ describe('Business Metrics Integration', () => {
     expect(res.status).toBe(200);
     expect(res.text).toContain('fluxora_streams_created_total');
     expect(res.text).toContain('status="active"');
+  });
+
+  it('records API key lookup latency without exposing key material', async () => {
+    const created = createApiKey('service-a');
+
+    expect(isValidApiKey(created.key)).toBe(true);
+    expect(isValidApiKey('flx_invalid')).toBe(false);
+
+    const metric = await authApiKeyLookupDurationSeconds.get();
+    const outcomes = metric.values
+      .filter((value) => value.metricName.endsWith('_count'))
+      .map((value) => value.labels);
+
+    expect(outcomes).toEqual(
+      expect.arrayContaining([
+        { outcome: 'success' },
+        { outcome: 'failure' },
+      ]),
+    );
+    expect(JSON.stringify(metric.values)).not.toContain(created.key);
+    expect(JSON.stringify(metric.values)).not.toContain(created.prefix);
   });
 
   // 4. Double Registration & De-registration protection

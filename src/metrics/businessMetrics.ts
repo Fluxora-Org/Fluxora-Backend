@@ -45,6 +45,26 @@ export const webhookDeliveryDurationSeconds =
     registers: [registry],
   });
 
+export const authJwtVerifyDurationSeconds =
+  (registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds') as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_auth_jwt_verify_duration_seconds',
+    help: 'Duration of JWT signature and expiry verification in seconds',
+    labelNames: ['outcome'] as const,
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [registry],
+  });
+
+export const authApiKeyLookupDurationSeconds =
+  (registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds') as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_auth_apikey_lookup_duration_seconds',
+    help: 'Duration of API key hash lookup in seconds',
+    labelNames: ['outcome'] as const,
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [registry],
+  });
+
 export const indexerEventsIngestedTotal =
   (registry.getSingleMetric('fluxora_indexer_events_ingested_total') as Counter) ||
   new Counter({
@@ -68,6 +88,8 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_connections_rejected_total');
   registry.removeSingleMetric('fluxora_webhook_deliveries_total');
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
+  registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
+  registry.removeSingleMetric('fluxora_auth_apikey_lookup_duration_seconds');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
 }
