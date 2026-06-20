@@ -263,3 +263,39 @@ export function getPoolMetrics(pool: pg.Pool): PoolMetrics {
     waiting: pool.waitingCount,
   };
 }
+
+// ── Client checkout helper ────────────────────────────────────────────────────
+
+/**
+ * Acquire a `PoolClient`, execute `fn`, then unconditionally release the client.
+ *
+ * Use this instead of manual `pool.connect()` / `client.release()` pairs to
+ * guarantee the connection is always returned to the pool — even when `fn`
+ * throws or rejects.
+ *
+ * @example
+ * ```ts
+ * const result = await withClient(pool, async (client) => {
+ *   await client.query('BEGIN');
+ *   await client.query('INSERT INTO …');
+ *   await client.query('COMMIT');
+ *   return { ok: true };
+ * });
+ * ```
+ *
+ * @param pool  The connection pool to borrow from.
+ * @param fn    Async callback that receives the checked-out client.
+ * @returns     Whatever `fn` returns.
+ * @throws      Re-throws any error from `fn` after releasing the client.
+ */
+export async function withClient<T>(
+  pool: pg.Pool,
+  fn: (client: pg.PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}

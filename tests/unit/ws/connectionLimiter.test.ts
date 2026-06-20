@@ -12,7 +12,7 @@ describe('connectionLimiter', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
-    jest.resetModules();
+    vi.resetModules();
     process.env = { ...originalEnv };
     _resetLimiter();
     
@@ -117,7 +117,7 @@ describe('connectionLimiter', () => {
     });
 
     it('ban expires after TTL', () => {
-        jest.useFakeTimers();
+        vi.useFakeTimers();
         trackConnection(ip);
         trackConnection(ip);
         
@@ -129,14 +129,14 @@ describe('connectionLimiter', () => {
         expect(checkLimiter(ip).reason).toBe('IP banned due to abuse');
         
         // Fast forward 61 seconds
-        jest.advanceTimersByTime(61000);
+        vi.advanceTimersByTime(61000);
         
         // Still rejected because of connection limit, but not because of ban
         const result = checkLimiter(ip);
         expect(result.allowed).toBe(false);
         expect(result.reason).toBe('Too many connections');
         
-        jest.useRealTimers();
+        vi.useRealTimers();
     });
   });
 });

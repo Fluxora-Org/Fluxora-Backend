@@ -107,7 +107,7 @@ export async function isRevoked(jti: string): Promise<boolean> {
 
   try {
     const exists = await client.exists(key);
-    const revoked = exists === 1;
+    const revoked = exists > 0;
     debug('JWT revocation check', { jti, revoked });
     return revoked;
   } catch (error) {

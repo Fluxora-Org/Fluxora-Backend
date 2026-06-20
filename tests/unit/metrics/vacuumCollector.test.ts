@@ -67,7 +67,16 @@ function getGaugeValue(gauge: ReturnType<typeof pgDeadTuples>, labels: Record<st
 let warnSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
-  deRegisterVacuumMetrics();
+  // Clear any existing metrics state to prevent cross-test leakage in Vitest's shared module cache
+  pgDeadTuples.reset();
+  pgBloatRatio.reset();
+  pgLastAutovacuumAgeSeconds.reset();
+
+  // Ensure they are registered in the Prometheus registry
+  try { registry.registerMetric(pgDeadTuples); } catch {}
+  try { registry.registerMetric(pgBloatRatio); } catch {}
+  try { registry.registerMetric(pgLastAutovacuumAgeSeconds); } catch {}
+
   // Silence logger output in tests
   warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 });
