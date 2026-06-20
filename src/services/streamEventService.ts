@@ -13,6 +13,7 @@ import { CreateStreamInput, StreamStatus } from "../db/types.js";
 import { info, warn, error as logError, debug } from "../utils/logger.js";
 import { getStreamHub } from "../ws/hub.js";
 import { enrichActiveSpanWithStream } from "../tracing/hooks.js";
+import { deriveStreamId } from "../streams/sseEmitter.js";
 
 
 /**
@@ -96,7 +97,7 @@ export const streamEventService = {
 
     try {
       // Generate deterministic stream ID from chain data
-      const streamId = generateStreamId(
+      const streamId = deriveStreamId(
         event.transactionHash,
         event.eventIndex,
       );
@@ -385,12 +386,5 @@ export const streamEventService = {
   },
 };
 
-/**
- * Generate a deterministic stream ID from transaction hash and event index
- *
- * Format: stream-{txHash}-{eventIndex}
- * This ensures the same event always produces the same ID
- */
-function generateStreamId(transactionHash: string, eventIndex: number): string {
-  return `stream-${transactionHash}-${eventIndex}`;
-}
+
+

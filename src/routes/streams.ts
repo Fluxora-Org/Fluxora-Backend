@@ -971,8 +971,10 @@ streamsRouter.get(
       throw err;
     }
 
-    // Send connection ok comment.
-    if (!writeSse(': ok\n\n')) return;
+    // Send connection ok comment + retry hint so browser EventSource knows the
+    // reconnect interval (ms). This is the SSE-spec mechanism for communicating
+    // the backoff to the client.
+    if (!writeSse(': ok\n\nretry: 5000\n\n')) return;
 
     // Periodic heartbeat to prevent proxies and load balancers from closing the connection.
     heartbeatInterval = setInterval(() => {
@@ -992,13 +994,25 @@ streamsRouter.get(
     maxDurationTimer.unref?.();
 
     // 5. Handle Last-Event-ID Resumption Replay.
-    const lastEventId = req.headers['last-event-id'];
-    if (typeof lastEventId === 'string' && lastEventId.trim() !== '') {
+    // Security: validate the header value to prevent unbounded replay or injection.
+    // A valid event ID is 1–200 printable non-whitespace characters.
+    const rawLastEventId = req.headers['last-event-id'];
+    const lastEventId =
+      typeof rawLastEventId === 'string' &&
+      /^[\x21-\x7E]{1,200}$/.test(rawLastEventId.trim())
+        ? rawLastEventId.trim()
+        : undefined;
+
+    if (lastEventId) {
       const hub = getStreamHub();
       const eventStore = hub?.getEventStore();
       if (eventStore) {
         try {
-          let cursor: string | undefined = lastEventId.trim();
+          let cursor: string | undefined = lastEventId;
+          // Bound the replay to at most SSE_REPLAY_MAX_PAGES pages so a
+          // client-supplied cursor cannot force a full-table scan.
+          const SSE_REPLAY_MAX_PAGES = 10;
+          let pagesRead = 0;
           do {
             if (cleanedUp) break;
             const result = await eventStore.getEvents({
@@ -1025,7 +1039,8 @@ streamsRouter.get(
             }
 
             cursor = result.nextCursor;
-          } while (cursor !== undefined && !cleanedUp);
+            pagesRead++;
+          } while (cursor !== undefined && !cleanedUp && pagesRead < SSE_REPLAY_MAX_PAGES);
         } catch (err) {
           warn('Failed to replay SSE events from store', {
             error: err instanceof Error ? err.message : String(err),

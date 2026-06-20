@@ -32,6 +32,14 @@ function stellarPublicKeyField(fieldName: string) {
     .regex(STELLAR_PUBLIC_KEY_REGEX, `${fieldName} must be a valid Stellar public key (G...)`);
 }
 
+/** Reusable non-negative integer field schema */
+function nonNegativeIntegerField(fieldName: string) {
+  return z
+    .number({ error: `${fieldName} must be a number` })
+    .int(`${fieldName} must be an integer`)
+    .nonnegative(`${fieldName} must be non-negative`);
+}
+
 /**
  * Schema for POST /api/streams body.
  *
@@ -40,13 +48,66 @@ function stellarPublicKeyField(fieldName: string) {
  * - depositAmount / ratePerSecond: decimal strings only (not numbers)
  * - startTime / endTime: non-negative integers when provided
  */
-export const StreamBatchCreateSchema = z.object({
-  streams: z.array(CreateStreamSchema).max(100, { message: 'Maximum of 100 streams per batch' })
+export const CreateStreamSchema = z.object({
+  sender: stellarPublicKeyField('sender'),
+  recipient: stellarPublicKeyField('recipient'),
+  depositAmount: decimalStringField('depositAmount').optional(),
+  ratePerSecond: decimalStringField('ratePerSecond').optional(),
+  startTime: nonNegativeIntegerField('startTime').optional(),
+  endTime: nonNegativeIntegerField('endTime').optional(),
 });
 
-export type StreamBatchCreateInput = {
-  streams: CreateStreamInput[];
-};
+export type CreateStreamInput = z.infer<typeof CreateStreamSchema>;
+
+/**
+ * Schema for batch stream creation at the indexing boundary.
+ *
+ * The duplicate guard keys entries by the same per-row idempotency coordinates
+ * enforced by the streams table: `(transaction_hash, event_index)`.
+ */
+export const StreamBatchCreateSchema = z.object({
+  streams: z
+    .array(z.object({
+      id: z.string({ error: 'id must be a string' }).min(1, 'id must be a non-empty string'),
+      sender_address: stellarPublicKeyField('sender_address'),
+      recipient_address: stellarPublicKeyField('recipient_address'),
+      amount: decimalStringField('amount'),
+      streamed_amount: decimalStringField('streamed_amount'),
+      remaining_amount: decimalStringField('remaining_amount'),
+      rate_per_second: decimalStringField('rate_per_second'),
+      start_time: nonNegativeIntegerField('start_time'),
+      end_time: nonNegativeIntegerField('end_time'),
+      contract_id: z
+        .string({ error: 'contract_id must be a string' })
+        .min(1, 'contract_id must be a non-empty string'),
+      transaction_hash: z
+        .string({ error: 'transaction_hash must be a string' })
+        .min(1, 'transaction_hash must be a non-empty string'),
+      event_index: nonNegativeIntegerField('event_index'),
+    }))
+    .max(100, { message: 'Maximum of 100 streams per batch' })
+}).superRefine((batch, ctx) => {
+  // superRefine lets the validation error identify the offending duplicate row.
+  const seen = new Map<string, number>();
+
+  batch.streams.forEach((stream, index) => {
+    const identityKey = JSON.stringify([stream.transaction_hash, stream.event_index]);
+    const firstIndex = seen.get(identityKey);
+
+    if (firstIndex !== undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['streams', index],
+        message: `Duplicate stream identity tuple at index ${index}; first seen at index ${firstIndex}`,
+      });
+      return;
+    }
+
+    seen.set(identityKey, index);
+  });
+});
+
+export type StreamBatchCreateInput = z.infer<typeof StreamBatchCreateSchema>;
 
 /**
  * Schema for GET /api/streams query parameters.
