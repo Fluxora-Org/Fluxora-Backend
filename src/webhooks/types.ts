@@ -51,5 +51,5 @@ export const DEFAULT_RETRY_POLICY: WebhookRetryPolicy = {
   maxBackoffMs: 60000,
   jitterPercent: 10,
   timeoutMs: 30000,
-  retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+  retryableStatusCodes: [408, 425, 429, 500, 502, 503, 504],
 };

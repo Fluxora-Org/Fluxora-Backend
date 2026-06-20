@@ -115,11 +115,12 @@ describe('Webhook Retry Rate Limiting (RateLimitStore & Retry Logic)', () => {
     it('should use the rate limit check before calculating next retry time', async () => {
         // This mock tests the integration point structure
         const payload: WebhookOutboxRetryInput = {
+            consumerUrl: 'https://example.com/webhook',
             streamId: 'stream1',
             eventType: 'event',
             payload: { id: 123 },
             attemptNumber: 1,
-            policy: { maxAttempts: 3, initialBackoffMs: 100, backoffMultiplier: 2, maxBackoffMs: 1000, jitterPercent: 10, jitterAlgorithm: 'full' }
+            policy: { maxAttempts: 3, initialBackoffMs: 100, backoffMultiplier: 2, maxBackoffMs: 1000, jitterPercent: 10, timeoutMs: 5000, retryableStatusCodes: [429, 500, 502, 503, 504], jitterAlgorithm: 'full' }
         };
 
         // Mock rate limit availability (e.g., 1 attempt allowed)

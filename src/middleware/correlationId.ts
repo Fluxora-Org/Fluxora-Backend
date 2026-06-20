@@ -5,14 +5,15 @@
  * during that request can be linked together.
  *
  * Behaviour:
- * - If the incoming request carries an `x-correlation-id` header with a
- *   non-empty string value, that value is reused.
- * - Otherwise a new UUID v4 is generated via `crypto.randomUUID()`.
+ * - If the incoming request carries a valid UUID-shaped `x-correlation-id`
+ *   header, the trimmed value is reused.
+ * - Missing, blank, malformed, oversized, or control-character-bearing values
+ *   are rejected and replaced.
  *
  * The resolved ID is written to `req.correlationId` and echoed back in the
  * `x-correlation-id` response header.
  *
- * Trust boundary: accepted as-is for tracing only — never used for auth.
+ * Trust boundary: accepted only after validation for tracing, never auth.
  */
 
 import { randomUUID } from 'crypto';
@@ -22,10 +23,19 @@ import { correlationStore } from '../tracing/middleware.js';
 /** Canonical header name used for correlation IDs throughout the service. */
 export const CORRELATION_ID_HEADER = 'x-correlation-id';
 
+export const MAX_CORRELATION_ID_LENGTH = 36;
+
 const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+/**
+ * Returns whether a client-supplied correlation ID is safe to reuse.
+ *
+ * The middleware accepts only UUID-shaped values so untrusted request headers
+ * cannot smuggle log-forging payloads or unbounded strings into downstream
+ * traces and webhook headers.
+ */
 export function isValidCorrelationId(value: string): boolean {
-  return UUID_V4_REGEX.test(value);
+  return value.length <= MAX_CORRELATION_ID_LENGTH && UUID_V4_REGEX.test(value);
 }
 
 function resolveCorrelationId(incoming: unknown): string {
