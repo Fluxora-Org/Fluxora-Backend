@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { generateToken } from '../lib/auth.js';
-import { validationError, unauthorized, asyncHandler, forbidden } from '../middleware/errorHandler.js';
+import { validationError, unauthorized, asyncHandler } from '../middleware/errorHandler.js';
 import { info } from '../utils/logger.js';
 import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
@@ -124,6 +124,7 @@ authRouter.post(
 
 const RevokeRequestSchema = z.object({
   jti: z.string().min(1, 'jti is required'),
+  exp: z.coerce.number().int().positive('exp is required'),
   ttl: z.coerce.number().int().positive().optional(),
 });
 
@@ -134,7 +135,9 @@ const RevokeRequestSchema = z.object({
  *     summary: Revoke a JWT by its jti claim
  *     description: |
  *       Admin-only endpoint to immediately invalidate a JWT before its natural expiry.
- *       Adds the jti to the Redis-backed revocation list with a TTL.
+ *       Adds the jti to the Redis-backed revocation list. The stored TTL is
+ *       derived from the token exp claim (`max(0, exp - now)`) so revocation
+ *       covers the full remaining token lifetime without storing past expiry.
  *     tags:
  *       - auth
  *     security:
@@ -149,9 +152,12 @@ const RevokeRequestSchema = z.object({
  *               jti:
  *                 type: string
  *                 description: JWT ID (jti) claim to revoke
+ *               exp:
+ *                 type: integer
+ *                 description: JWT exp claim as a Unix timestamp in seconds
  *               ttl:
  *                 type: integer
- *                 description: Time-to-live in seconds (optional, defaults to 7 days)
+ *                 description: Optional caller TTL. It is validated, then bounded by exp.
  *     responses:
  *       200:
  *         description: Token revoked successfully
@@ -184,16 +190,25 @@ authRouter.post(
       throw validationError('Invalid revocation request', result.error.format());
     }
 
-    const { jti, ttl } = result.data;
+    const { jti, exp, ttl } = result.data;
 
-    await revoke(jti, ttl);
+    const revocation = await revoke(jti, { exp, ttl });
 
-    info('JWT revoked via admin endpoint', { jti, ttlSeconds: ttl, revokedBy: (req.user as any)?.address, requestId });
+    const revokedBy = (req.user as { address?: string } | undefined)?.address;
+
+    info('JWT revoked via admin endpoint', {
+      jti,
+      ttlSeconds: revocation.ttlSeconds,
+      revoked: revocation.revoked,
+      revokedBy,
+      requestId,
+    });
 
     res.json({
       success: true,
       jti,
-      ttl: ttl ?? null,
+      revoked: revocation.revoked,
+      ttl: revocation.ttlSeconds,
     });
   })
 );

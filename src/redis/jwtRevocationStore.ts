@@ -16,6 +16,17 @@ const DEFAULT_REVOCATION_TTL_SECONDS = 7 * 24 * 60 * 60; // 604800 seconds
 
 let redis: Redis | null = null;
 
+export interface JwtRevocationOptions {
+  ttl?: number;
+  exp: number;
+  nowSeconds?: number;
+}
+
+export interface JwtRevocationResult {
+  revoked: boolean;
+  ttlSeconds: number;
+}
+
 /**
  * Lazily initialize and return the shared Redis client.
  * Reuses the same connection across calls.
@@ -55,8 +66,39 @@ function buildKey(jti: string): string {
   return `${REVOCATION_PREFIX}:${jti}`;
 }
 
+function assertPositiveInteger(value: number, field: string): void {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new TypeError(`${field} must be a positive integer`);
+  }
+}
+
+function resolveRevocationTtl(input: number | JwtRevocationOptions | undefined): number {
+  if (typeof input === 'number' || input === undefined) {
+    const ttl = input ?? DEFAULT_REVOCATION_TTL_SECONDS;
+    assertPositiveInteger(ttl, 'ttl');
+    return ttl;
+  }
+
+  const { ttl, exp, nowSeconds = Date.now() / 1000 } = input;
+  assertPositiveInteger(exp, 'exp');
+  if (ttl !== undefined) {
+    assertPositiveInteger(ttl, 'ttl');
+  }
+
+  return Math.max(0, Math.ceil(exp - nowSeconds));
+}
+
 /**
  * Revoke a JWT by its jti claim, storing it in Redis with a TTL.
+ *
+ * When an `exp` claim is provided, the Redis TTL is derived from the token's
+ * remaining lifetime (`ceil(exp - now)`). Caller TTLs are accepted for input
+ * validation, but the JWT expiry remains authoritative so a revoked token
+ * cannot become accepted again before natural expiry, and Redis does not store
+ * revocations past token expiry. Already-expired tokens are treated as no-ops.
+ *
+ * The numeric TTL overload is kept for legacy callers that cannot supply `exp`.
+ * New JWT revocation flows should pass `{ exp, ttl }`.
  *
  * @param jti — The JWT ID (jti) claim to revoke
  * @param ttl — Time-to-live in seconds. Defaults to 7 days.
@@ -67,13 +109,19 @@ function buildKey(jti: string): string {
  * - Overwrites any existing entry (idempotent — duplicate revocations are safe)
  * - Logs revocation for audit trail
  */
-export async function revoke(jti: string, ttl: number = DEFAULT_REVOCATION_TTL_SECONDS): Promise<void> {
+export async function revoke(
+  jti: string,
+  options?: number | JwtRevocationOptions,
+): Promise<JwtRevocationResult> {
   if (!jti || typeof jti !== 'string') {
     throw new TypeError('jti must be a non-empty string');
   }
 
+  const ttl = resolveRevocationTtl(options);
+
   if (ttl <= 0) {
-    throw new TypeError('ttl must be a positive integer');
+    info('JWT revocation skipped for expired token', { jti });
+    return { revoked: false, ttlSeconds: 0 };
   }
 
   const client = getRedisClient();
@@ -81,6 +129,7 @@ export async function revoke(jti: string, ttl: number = DEFAULT_REVOCATION_TTL_S
 
   await client.set(key, '1', 'EX', ttl);
   info('JWT revoked', { jti, ttlSeconds: ttl });
+  return { revoked: true, ttlSeconds: ttl };
 }
 
 /**
