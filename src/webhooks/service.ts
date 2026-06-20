@@ -17,8 +17,12 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, shouldRetry } from './retry.js';
+import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
 import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
+import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
+import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
+import type { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
+import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
 
 interface OutboxRow {
   id: string;
@@ -43,7 +47,10 @@ export interface WebhookDispatcherOptions {
   pollIntervalMs?: number;
   batchSize?: number;
   pool?: DbPool;
-  policy?: WebhookRetryPolicy;
+  policy?: EnhancedRetryPolicy;
+  circuitBreakerStore?: WebhookCircuitBreakerStore;
+  rateLimiter?: WebhookRateLimiter;
+  rateLimitConfig?: RateLimitConfig;
 }
 
 interface ResolvedEndpoint {
@@ -55,6 +62,22 @@ function parsePositiveInteger(value: string | undefined, fallback: number): numb
   if (!value) return fallback;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInteger(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function resolveWebhookRetryPolicy(override?: EnhancedRetryPolicy): EnhancedRetryPolicy {
+  const threshold = parseNonNegativeInteger(process.env.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD, 0);
+  const resetMs = parsePositiveInteger(process.env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS, 300_000);
+  return {
+    ...DEFAULT_RETRY_POLICY,
+    ...(threshold > 0 ? { circuitBreakerThreshold: threshold, circuitBreakerResetMs: resetMs } : {}),
+    ...override,
+  };
 }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -100,10 +123,15 @@ function extractAttemptNumber(payload: unknown): number {
 }
 
 export class WebhookService {
-  private policy: WebhookRetryPolicy;
+  private policy: EnhancedRetryPolicy;
+  private readonly circuitBreakerStore: WebhookCircuitBreakerStore;
 
-  constructor(policy: WebhookRetryPolicy = DEFAULT_RETRY_POLICY) {
+  constructor(
+    policy: EnhancedRetryPolicy = resolveWebhookRetryPolicy(),
+    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore(),
+  ) {
     this.policy = policy;
+    this.circuitBreakerStore = circuitBreakerStore;
   }
 
   /**
@@ -139,10 +167,117 @@ export class WebhookService {
       endpointUrl,
     });
 
-    // Attempt immediate delivery
+    // Attempt immediate delivery when the circuit breaker allows it.
+    const gate = await checkWebhookDeliveryGate(endpointUrl, this.policy, {
+      circuitBreakerStore: this.circuitBreakerStore,
+    });
+    if (!gate.canDeliver) {
+      const attempt: WebhookDeliveryAttempt = {
+        attemptNumber: 1,
+        timestamp: Date.now(),
+        nextRetryAt: gate.retryAt!.getTime(),
+      };
+      delivery.attempts.push(attempt);
+      webhookDeliveryStore.store(delivery);
+      return delivery;
+    }
+
     await this.attemptDelivery(delivery, secret, timestamp);
 
     return delivery;
+  }
+
+  /**
+   * Perform the HTTP request and update delivery state without touching the circuit breaker.
+   * Used by {@link attemptWebhookDeliveryWithRateLimit} so breaker accounting stays in one place.
+   */
+  async runDeliveryAttempt(
+    delivery: WebhookDelivery,
+    secret: string,
+    timestamp?: string,
+  ): Promise<WebhookDeliveryAttempt> {
+    const ts = timestamp || Math.floor(Date.now() / 1000).toString();
+    const attemptNumber = delivery.attempts.length + 1;
+    const correlationId = getCorrelationId();
+    const signature = computeWebhookSignature(secret, ts, delivery.payload);
+    const attempt: WebhookDeliveryAttempt = {
+      attemptNumber,
+      timestamp: Date.now(),
+    };
+    const startTime = Date.now();
+
+    try {
+      const response = await this.sendWebhook(
+        delivery.endpointUrl,
+        delivery.payload,
+        delivery.deliveryId,
+        delivery.eventType,
+        ts,
+        signature,
+        correlationId,
+      );
+      attempt.statusCode = response.status;
+
+      if (response.ok) {
+        delivery.status = 'delivered';
+        delivery.attempts.push(attempt);
+        webhookDeliveryStore.store(delivery);
+        logger.info('Webhook delivered successfully', undefined, {
+          deliveryId: delivery.deliveryId,
+          statusCode: response.status,
+          attempt: attemptNumber,
+        });
+        webhookDeliveriesTotal.inc({ outcome: 'success' });
+      } else {
+        delivery.attempts.push(attempt);
+        delivery.status = 'pending';
+        webhookDeliveryStore.store(delivery);
+        webhookDeliveriesTotal.inc({ outcome: 'failed' });
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      attempt.error = errorMessage;
+      delivery.attempts.push(attempt);
+      delivery.status = 'pending';
+      webhookDeliveryStore.store(delivery);
+      webhookDeliveriesTotal.inc({ outcome: 'failed' });
+    } finally {
+      const durationSeconds = (Date.now() - startTime) / 1000;
+      webhookDeliveryDurationSeconds.observe(durationSeconds);
+    }
+
+    return attempt;
+  }
+
+  private async recordBreakerOutcome(
+    endpointUrl: string,
+    attempt: WebhookDeliveryAttempt,
+  ): Promise<number> {
+    const success =
+      attempt.statusCode !== undefined &&
+      attempt.statusCode >= 200 &&
+      attempt.statusCode < 300 &&
+      !attempt.error;
+
+    if (success) {
+      const record = await this.circuitBreakerStore.recordSuccess(
+        endpointUrl,
+        this.policy as CircuitBreakerPolicy,
+      );
+      return record.consecutiveFailures;
+    }
+
+    if (!countsTowardCircuitBreaker(attempt, this.policy)) {
+      const state = await this.circuitBreakerStore.getState(endpointUrl);
+      return state?.consecutiveFailures ?? 0;
+    }
+
+    const record = await this.circuitBreakerStore.recordFailure(
+      endpointUrl,
+      this.policy as CircuitBreakerPolicy,
+      Date.now(),
+    );
+    return record.consecutiveFailures;
   }
 
   /**
@@ -163,98 +298,33 @@ export class WebhookService {
       maxAttempts: this.policy.maxAttempts,
     });
 
-    const signature = computeWebhookSignature(secret, ts, delivery.payload);
+    const attempt = await this.runDeliveryAttempt(delivery, secret, ts);
+    const consecutiveFailures = await this.recordBreakerOutcome(delivery.endpointUrl, attempt);
 
-    const attempt: WebhookDeliveryAttempt = {
-      attemptNumber,
-      timestamp: Date.now(),
-    };
-
-    const startTime = Date.now();
-    try {
-      const response = await this.sendWebhook(
-        delivery.endpointUrl,
-        delivery.payload,
-        delivery.deliveryId,
-        delivery.eventType,
-        ts,
-        signature,
-        correlationId,
-      );
-
-      attempt.statusCode = response.status;
-
-      if (response.ok) {
-        delivery.status = 'delivered';
-        delivery.attempts.push(attempt);
-        webhookDeliveryStore.store(delivery);
-
-        logger.info('Webhook delivered successfully', undefined, {
-          deliveryId: delivery.deliveryId,
-          statusCode: response.status,
-          attempt: attemptNumber,
-        });
-        webhookDeliveriesTotal.inc({ outcome: 'success' });
-      } else {
-        // Handle non-2xx responses
-        if (shouldRetry(attempt, attemptNumber, this.policy)) {
-          attempt.nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
-          delivery.status = 'pending';
-
-          logger.warn('Webhook delivery failed, will retry', undefined, {
-            deliveryId: delivery.deliveryId,
-            statusCode: response.status,
-            attempt: attemptNumber,
-            nextRetryAt: new Date(attempt.nextRetryAt).toISOString(),
-          });
-        } else {
-          delivery.status = 'permanent_failure';
-          logger.error('Webhook delivery failed permanently', undefined, {
-            deliveryId: delivery.deliveryId,
-            statusCode: response.status,
-            attempt: attemptNumber,
-            maxAttempts: this.policy.maxAttempts,
-          });
-        }
-
-        delivery.attempts.push(attempt);
-        webhookDeliveryStore.store(delivery);
-        webhookDeliveriesTotal.inc({ outcome: 'failed' });
-      }
-    } catch (error) {
-      // Network error or timeout
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      if (shouldRetry(attempt, attemptNumber, this.policy)) {
-        attempt.error = errorMessage;
-        attempt.nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
-        delivery.status = 'pending';
-
-        logger.warn('Webhook delivery failed with error, will retry', undefined, {
-          deliveryId: delivery.deliveryId,
-          error: errorMessage,
-          attempt: attemptNumber,
-          nextRetryAt: new Date(attempt.nextRetryAt).toISOString(),
-        });
-      } else {
-        attempt.error = errorMessage;
-        delivery.status = 'permanent_failure';
-
-        logger.error('Webhook delivery failed permanently with error', undefined, {
-          deliveryId: delivery.deliveryId,
-          error: errorMessage,
-          attempt: attemptNumber,
-          maxAttempts: this.policy.maxAttempts,
-        });
-      }
-
-      delivery.attempts.push(attempt);
-      webhookDeliveryStore.store(delivery);
-      webhookDeliveriesTotal.inc({ outcome: 'failed' });
-    } finally {
-      const durationSeconds = (Date.now() - startTime) / 1000;
-      webhookDeliveryDurationSeconds.observe(durationSeconds);
+    if (delivery.status === 'delivered') {
+      return;
     }
+
+    if (shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures)) {
+      attempt.nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
+      delivery.status = 'pending';
+      logger.warn('Webhook delivery failed, will retry', undefined, {
+        deliveryId: delivery.deliveryId,
+        statusCode: attempt.statusCode,
+        attempt: attemptNumber,
+        nextRetryAt: new Date(attempt.nextRetryAt).toISOString(),
+      });
+    } else {
+      delivery.status = 'permanent_failure';
+      logger.error('Webhook delivery failed permanently', undefined, {
+        deliveryId: delivery.deliveryId,
+        statusCode: attempt.statusCode,
+        attempt: attemptNumber,
+        maxAttempts: this.policy.maxAttempts,
+      });
+    }
+
+    webhookDeliveryStore.store(delivery);
   }
 
   /**
@@ -315,6 +385,18 @@ export class WebhookService {
     });
 
     for (const delivery of pendingRetries) {
+      const gate = await checkWebhookDeliveryGate(delivery.endpointUrl, this.policy, {
+        circuitBreakerStore: this.circuitBreakerStore,
+      });
+      if (!gate.canDeliver) {
+        const lastAttempt = delivery.attempts[delivery.attempts.length - 1];
+        if (lastAttempt) {
+          lastAttempt.nextRetryAt = gate.retryAt!.getTime();
+          webhookDeliveryStore.store(delivery);
+        }
+        continue;
+      }
+
       const timestamp = Math.floor(Date.now() / 1000).toString();
       await this.attemptDelivery(delivery, secret, timestamp);
     }
@@ -354,8 +436,11 @@ export class WebhookDispatcher {
   private readonly pollIntervalMs: number;
   private readonly batchSize: number;
   private readonly pool: DbPool;
-  private readonly policy: WebhookRetryPolicy;
+  private readonly policy: EnhancedRetryPolicy;
   private readonly service: WebhookService;
+  private readonly circuitBreakerStore: WebhookCircuitBreakerStore;
+  private readonly rateLimiter?: WebhookRateLimiter;
+  private readonly rateLimitConfig: RateLimitConfig;
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
   private inFlight: Promise<void> | null = null;
@@ -367,8 +452,14 @@ export class WebhookDispatcher {
       options.pollIntervalMs ?? parsePositiveInteger(process.env.WEBHOOK_POLL_INTERVAL_MS, 10_000);
     this.batchSize = options.batchSize ?? parsePositiveInteger(process.env.WEBHOOK_BATCH_SIZE, 10);
     this.pool = options.pool ?? (getPool() as unknown as DbPool);
-    this.policy = options.policy ?? DEFAULT_RETRY_POLICY;
-    this.service = new WebhookService(this.policy);
+    this.policy = resolveWebhookRetryPolicy(options.policy);
+    this.circuitBreakerStore = options.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
+    this.rateLimiter = options.rateLimiter;
+    this.rateLimitConfig = options.rateLimitConfig ?? {
+      limit: parsePositiveInteger(process.env.WEBHOOK_RETRY_RPS, DEFAULT_WEBHOOK_RETRY_RPS),
+      windowMs: 1000,
+    };
+    this.service = new WebhookService(this.policy, this.circuitBreakerStore);
   }
 
   start(): void {
@@ -497,22 +588,58 @@ export class WebhookDispatcher {
       payload: payloadString,
     };
 
-    await this.service.attemptDelivery(delivery, endpoint.secret);
+    const result = await attemptWebhookDeliveryWithRateLimit(
+      {
+        consumerUrl: endpoint.endpointUrl,
+        streamId: row.stream_id,
+        eventType: row.event_type,
+        payload,
+        attemptNumber,
+        policy: this.policy,
+      },
+      () => this.service.runDeliveryAttempt(delivery, endpoint.secret),
+      {
+        circuitBreakerStore: this.circuitBreakerStore,
+        rateLimiter: this.rateLimiter,
+        rateLimitConfig: this.rateLimitConfig,
+      },
+    );
+
     await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
+
+    if (!result.attempt) {
+      if (result.shouldRetry && result.retryAt) {
+        await client.query(
+          `
+            INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
+            VALUES ($1, $2, $3::jsonb, $4, false)
+          `,
+          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt],
+        );
+      }
+      return;
+    }
+
+    const attempt = result.attempt;
+    if (result.shouldRetry) {
+      attempt.nextRetryAt = result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
+      delivery.status = 'pending';
+    } else if (
+      attempt.statusCode !== undefined &&
+      attempt.statusCode >= 200 &&
+      attempt.statusCode < 300 &&
+      !attempt.error
+    ) {
+      delivery.status = 'delivered';
+    } else {
+      delivery.status = 'permanent_failure';
+    }
 
     if (delivery.status === 'delivered' || delivery.status === 'permanent_failure') {
       return;
     }
 
-    const retry = scheduleWebhookOutboxRetry({
-      streamId: row.stream_id,
-      eventType: row.event_type,
-      payload,
-      attemptNumber,
-      policy: this.policy,
-    });
-
-    if (!retry.shouldRetry || !retry.retryAt) {
+    if (!result.shouldRetry || !result.retryAt) {
       return;
     }
 
@@ -521,7 +648,7 @@ export class WebhookDispatcher {
         INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
         VALUES ($1, $2, $3::jsonb, $4, false)
       `,
-      [row.stream_id, row.event_type, JSON.stringify(retry.payload), retry.retryAt],
+      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt],
     );
   }
 }

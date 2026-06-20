@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebhookDispatcher } from '../../src/webhooks/service.js';
-import type { WebhookRetryPolicy } from '../../src/webhooks/types.js';
+import type { EnhancedRetryPolicy } from '../../src/webhooks/retry.js';
+import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
+import { RedisWebhookCircuitBreakerStore } from '../../src/redis/webhookCircuitBreakerStore.js';
 
 interface MockClient {
   queries: Array<{ sql: string; params: unknown[] | undefined }>;
@@ -9,7 +11,7 @@ interface MockClient {
   release: ReturnType<typeof vi.fn>;
 }
 
-const policy: WebhookRetryPolicy = {
+const policy: EnhancedRetryPolicy = {
   maxAttempts: 3,
   initialBackoffMs: 1000,
   backoffMultiplier: 1,
@@ -17,6 +19,8 @@ const policy: WebhookRetryPolicy = {
   jitterPercent: 0,
   timeoutMs: 1000,
   retryableStatusCodes: [500],
+  circuitBreakerThreshold: 2,
+  circuitBreakerResetMs: 60_000,
 };
 
 function createClient(rows: unknown[]): MockClient {
@@ -36,7 +40,7 @@ function createClient(rows: unknown[]): MockClient {
   return client;
 }
 
-function createDispatcher(client: MockClient): WebhookDispatcher {
+function createDispatcher(client: MockClient, breaker: RedisWebhookCircuitBreakerStore): WebhookDispatcher {
   return new WebhookDispatcher({
     endpointUrl: 'https://consumer.example/webhooks',
     secret: 'test-secret',
@@ -46,15 +50,23 @@ function createDispatcher(client: MockClient): WebhookDispatcher {
     pool: {
       connect: vi.fn(async () => client),
     },
+    circuitBreakerStore: breaker,
   });
 }
 
 describe('WebhookDispatcher outbox polling', () => {
+  let redis: FakeRedisClient;
+  let breaker: RedisWebhookCircuitBreakerStore;
+
   beforeEach(() => {
+    redis = new FakeRedisClient();
+    breaker = new RedisWebhookCircuitBreakerStore(redis);
     vi.spyOn(Math, 'random').mockReturnValue(0.5);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await breaker.close();
+    redis.reset();
     vi.restoreAllMocks();
   });
 
@@ -62,7 +74,7 @@ describe('WebhookDispatcher outbox polling', () => {
     const client = createClient([]);
     global.fetch = vi.fn() as unknown as typeof fetch;
 
-    await createDispatcher(client).pollOnce();
+    await createDispatcher(client, breaker).pollOnce();
 
     expect(global.fetch).not.toHaveBeenCalled();
     expect(client.queries.some(q => q.sql.includes('COMMIT'))).toBe(true);
@@ -81,7 +93,7 @@ describe('WebhookDispatcher outbox polling', () => {
     ]);
     global.fetch = vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch;
 
-    await createDispatcher(client).pollOnce();
+    await createDispatcher(client, breaker).pollOnce();
 
     const select = client.queries.find(q => q.sql.includes('SELECT id, stream_id'));
     expect(select?.sql).toContain('FOR UPDATE SKIP LOCKED');
@@ -112,7 +124,7 @@ describe('WebhookDispatcher outbox polling', () => {
     ]);
     global.fetch = vi.fn(async () => new Response(null, { status: 500, statusText: 'Server Error' })) as unknown as typeof fetch;
 
-    await createDispatcher(client).pollOnce();
+    await createDispatcher(client, breaker).pollOnce();
 
     const insert = client.queries.find(q => q.sql.includes('INSERT INTO webhook_outbox'));
     expect(client.queries).toEqual(
@@ -147,9 +159,62 @@ describe('WebhookDispatcher outbox polling', () => {
     ]);
     global.fetch = vi.fn(async () => new Response(null, { status: 500, statusText: 'Server Error' })) as unknown as typeof fetch;
 
-    await createDispatcher(client).pollOnce();
+    await createDispatcher(client, breaker).pollOnce();
 
     expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('defers delivery when the shared Redis circuit breaker is open', async () => {
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    await breaker.recordFailure('https://consumer.example/webhooks', policy, now);
+    await breaker.recordFailure('https://consumer.example/webhooks', policy, now + 1);
+
+    const client = createClient([
+      {
+        id: '46',
+        stream_id: 'stream-5',
+        event_type: 'stream.created',
+        payload: { id: 'evt-5' },
+        created_at: new Date(now),
+      },
+    ]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    const insert = client.queries.find(q => q.sql.includes('INSERT INTO webhook_outbox'));
+    expect(insert).toBeDefined();
+    expect(insert?.params?.[3]).toEqual(new Date((await breaker.getState('https://consumer.example/webhooks'))!.resetAt));
+  });
+
+  it('re-enqueues outbox rows when half-open probe contention blocks delivery', async () => {
+    const now = 8_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    for (let i = 0; i < 2; i++) {
+      await breaker.recordFailure('https://consumer.example/webhooks', policy, now);
+    }
+    const openState = await breaker.getState('https://consumer.example/webhooks');
+    await breaker.checkAndClaimAttempt('https://consumer.example/webhooks', policy, openState!.resetAt);
+
+    const client = createClient([
+      {
+        id: '47',
+        stream_id: 'stream-6',
+        event_type: 'stream.created',
+        payload: { id: 'evt-6' },
+        created_at: new Date(now),
+      },
+    ]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    const insert = client.queries.find(q => q.sql.includes('INSERT INTO webhook_outbox'));
+    expect(insert).toBeDefined();
+    expect(insert?.params?.[3]).toEqual(new Date(now + 1_000));
   });
 
   it('drains an in-flight delivery when stopped during shutdown', async () => {
@@ -168,14 +233,16 @@ describe('WebhookDispatcher outbox polling', () => {
         releaseFetch = () => resolve(new Response(null, { status: 200 }));
       }),
     ) as unknown as typeof fetch;
-    const dispatcher = createDispatcher(client);
+    const dispatcher = createDispatcher(client, breaker);
 
     const poll = dispatcher.pollOnce();
     const stopped = dispatcher.stop();
 
-    await Promise.resolve();
+    while (!releaseFetch) {
+      await Promise.resolve();
+    }
     expect(client.release).not.toHaveBeenCalled();
-    releaseFetch?.();
+    releaseFetch();
 
     await Promise.all([poll, stopped]);
     expect(client.release).toHaveBeenCalledOnce();
