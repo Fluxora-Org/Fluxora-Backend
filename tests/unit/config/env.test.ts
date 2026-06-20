@@ -18,7 +18,7 @@ function setBaseEnv(overrides: NodeJS.ProcessEnv = {}) {
 }
 
 async function loadEnvModule() {
-  jest.resetModules();
+  vi.resetModules();
   return import('../../../src/config/env');
 }
 
@@ -27,7 +27,7 @@ describe('stellar environment pinning', () => {
 
   afterEach(() => {
     process.env = originalEnv;
-    jest.resetModules();
+    vi.resetModules();
   });
 
   it('accepts known-good testnet contract and token addresses', async () => {

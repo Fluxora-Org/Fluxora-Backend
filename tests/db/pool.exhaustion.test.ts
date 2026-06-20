@@ -278,3 +278,107 @@ describe('prom-client gauges — sync via syncGauges', () => {
     expect(val.values[0]?.value).toBe(12);
   });
 });
+
+// ── Replay: pool not exhausted during multi-batch replay ─────────────────────
+
+describe('IndexerService replay — pool not exhausted', () => {
+  /**
+   * Verifies that a replay of N batches never holds more than 1 simultaneous
+   * connection, so a pool with max=2 is never exhausted even when many batches
+   * are processed sequentially.
+   *
+   * The mock pool counts concurrent checkouts; the assertion that
+   * maxConcurrentConnections <= 1 proves that per-batch release/re-acquire
+   * is working correctly.
+   */
+  it('holds at most 1 connection simultaneously across 5 batches on a pool with max=2', async () => {
+    const { IndexerService, ReplayCursorRepository, replayLock } = await import(
+      '../../src/indexer/service.js'
+    );
+    const { deRegisterIndexerMetrics } = await import('../../src/metrics/indexerMetrics.js');
+    deRegisterIndexerMetrics();
+
+    // Reset concurrent-replay lock in case a prior test left it held.
+    if (replayLock.isHeld()) {
+      (replayLock as unknown as { _isReplaying: boolean })._isReplaying = false;
+    }
+
+    let concurrentConnections = 0;
+    let maxConcurrentConnections = 0;
+
+    const TOTAL_EVENTS = 10; // 5 batches × 2 rows
+    const events = Array.from({ length: TOTAL_EVENTS }, (_, i) => ({
+      event_id: `e${i + 1}`,
+      contract_id: 'contract-pool-test',
+      ledger: 1,
+      event_type: 'transfer',
+      event_data: {},
+      block_height: (i + 1) * 100,
+      transaction_hash: `tx${i}`,
+    }));
+
+    let connectCallIdx = 0;
+
+    const pool = {
+      connect: vi.fn(async () => {
+        concurrentConnections++;
+        if (concurrentConnections > maxConcurrentConnections) {
+          maxConcurrentConnections = concurrentConnections;
+        }
+        const thisCallIdx = connectCallIdx++;
+        // connection 0: cursor resolution (findActive + create + count)
+        // connections 1-5: one per batch
+        // connection 6: completeCursor
+        return {
+          query: vi.fn(async (sql: string) => {
+            if (sql.includes('COUNT(*)')) return { rows: [{ count: String(TOTAL_EVENTS) }] };
+            if (sql.includes('INSERT INTO replay_cursors')) {
+              return {
+                rows: [{
+                  id: 'pool-test-cursor',
+                  contract_id: 'contract-pool-test',
+                  ledger: 1,
+                  from_block: null,
+                  to_block: null,
+                  total_rows: TOTAL_EVENTS,
+                  last_committed_offset: 0,
+                  started_at: new Date(),
+                  completed_at: null,
+                }],
+              };
+            }
+            if (sql.includes('FROM historical_events')) {
+              // Return the correct slice based on which batch connection this is.
+              // thisCallIdx 0 is cursor client; 1+ are batch clients
+              const batchIdx = thisCallIdx - 1;
+              const batchEvents = events.slice(batchIdx * 2, batchIdx * 2 + 2);
+              return { rows: batchEvents };
+            }
+            return { rows: [] };
+          }),
+          release: vi.fn(() => {
+            concurrentConnections--;
+          }),
+        } as unknown as import('pg').PoolClient;
+      }),
+      totalCount: 2,
+      idleCount: 2,
+      waitingCount: 0,
+    } as unknown as import('pg').Pool;
+
+    const cursorRepo = new ReplayCursorRepository();
+    // Patch findActive to return null (no prior cursor)
+    vi.spyOn(cursorRepo, 'findActive').mockResolvedValue(null);
+    vi.spyOn(cursorRepo, 'advanceOffset').mockResolvedValue(undefined);
+    vi.spyOn(cursorRepo, 'markCompleted').mockResolvedValue(undefined);
+
+    const svc = new IndexerService(pool, 2, 0, 0, cursorRepo);
+    await svc.replayEvents({ contract_id: 'contract-pool-test', ledger: 1 });
+
+    // The key assertion: never more than 1 connection held at once
+    expect(maxConcurrentConnections).toBeLessThanOrEqual(1);
+    // All 5 batches were processed
+    expect(cursorRepo.advanceOffset).toHaveBeenCalledTimes(5);
+  });
+});
+

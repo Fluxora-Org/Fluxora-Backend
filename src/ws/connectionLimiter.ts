@@ -1,20 +1,6 @@
 import type { IncomingMessage } from 'node:http';
 import { logger } from '../lib/logger.js';
 
-// Configuration from environment variables
-const MAX_CONNECTIONS_PER_IP = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
-const ABUSE_THRESHOLD = parseInt(process.env.WS_ABUSE_THRESHOLD || '5', 10);
-const BAN_TTL_S = parseInt(process.env.WS_BAN_TTL_S || '3600', 10);
-const ABUSE_WINDOW_MS = 60_000; // 1 minute sliding window for abuse detection
-
-// Trusted proxy list for X-Forwarded-For
-const TRUSTED_PROXIES = new Set(
-  (process.env.WS_TRUSTED_PROXIES || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-);
-
 // In-memory state
 const connectionCounts = new Map<string, number>();
 const rejectionHistory = new Map<string, number[]>(); // IP -> timestamps of rejections
@@ -27,8 +13,14 @@ const activeBans = new Map<string, number>(); // IP -> expiry timestamp
 export function getClientIp(req: IncomingMessage): string {
   const remoteAddress = req.socket.remoteAddress || 'unknown';
   const xForwardedFor = req.headers['x-forwarded-for'];
+  const trustedProxies = new Set(
+    (process.env.WS_TRUSTED_PROXIES || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
 
-  if (xForwardedFor && TRUSTED_PROXIES.has(remoteAddress)) {
+  if (xForwardedFor && trustedProxies.has(remoteAddress)) {
     const ips = (Array.isArray(xForwardedFor) ? xForwardedFor[0] : xForwardedFor)
       .split(',')
       .map((s) => s.trim());
@@ -44,6 +36,7 @@ export function getClientIp(req: IncomingMessage): string {
  */
 export function checkLimiter(ip: string): { allowed: boolean; code?: number; reason?: string } {
   const now = Date.now();
+  const maxConnections = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
 
   // 1. Check if IP is currently banned
   const banExpiry = activeBans.get(ip);
@@ -56,7 +49,7 @@ export function checkLimiter(ip: string): { allowed: boolean; code?: number; rea
 
   // 2. Check connection limit
   const currentCount = connectionCounts.get(ip) || 0;
-  if (currentCount >= MAX_CONNECTIONS_PER_IP) {
+  if (currentCount >= maxConnections) {
     recordRejection(ip, now);
     return { allowed: false, code: 4029, reason: 'Too many connections' };
   }
@@ -68,16 +61,20 @@ export function checkLimiter(ip: string): { allowed: boolean; code?: number; rea
  * Records a rejection and checks if the IP should be banned for abuse.
  */
 function recordRejection(ip: string, now: number): void {
+  const abuseThreshold = parseInt(process.env.WS_ABUSE_THRESHOLD || '5', 10);
+  const banTtl = parseInt(process.env.WS_BAN_TTL_S || '3600', 10);
+  const abuseWindowMs = 60_000; // 1 minute sliding window for abuse detection
+
   let rejections = rejectionHistory.get(ip) || [];
-  // Sliding window: only keep rejections within the last ABUSE_WINDOW_MS
-  rejections = rejections.filter((t) => now - t < ABUSE_WINDOW_MS);
+  // Sliding window: only keep rejections within the last abuseWindowMs
+  rejections = rejections.filter((t) => now - t < abuseWindowMs);
   rejections.push(now);
   rejectionHistory.set(ip, rejections);
 
-  if (rejections.length > ABUSE_THRESHOLD) {
-    activeBans.set(ip, now + BAN_TTL_S * 1000);
+  if (rejections.length > abuseThreshold) {
+    activeBans.set(ip, now + banTtl * 1000);
     rejectionHistory.delete(ip);
-    logger.warn('IP banned for WebSocket abuse', undefined, { ip, banTtl: BAN_TTL_S });
+    logger.warn('IP banned for WebSocket abuse', undefined, { ip, banTtl });
   }
 }
 

@@ -11,7 +11,7 @@ describe('Idempotency Middleware', () => {
   beforeEach(() => {
     store = new InMemoryIdempotencyStore();
     app = express();
-    app.use(express.json());
+    app.use(express.json({ limit: '1mb' }));
     app.use(createIdempotencyMiddleware(store));
 
     app.post('/test', (req, res) => {

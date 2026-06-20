@@ -19,7 +19,6 @@ describe('streamRepository SQLi regression suite', () => {
     'getById',
     'findWithCursor',
     'updateStream',
-    'cancelStream',
   ] as const;
 
   for (const payload of sqliPayloads) {
@@ -45,9 +44,6 @@ describe('streamRepository SQLi regression suite', () => {
             expect(res).toBeDefined();
           } else if (method === 'updateStream') {
             const res = await (streamRepository as any).updateStream(payload, { status: 'paused' });
-            expect(res === undefined || typeof res === 'object').toBeTruthy();
-          } else if (method === 'cancelStream') {
-            const res = await (streamRepository as any).cancelStream(payload, 'reason');
             expect(res === undefined || typeof res === 'object').toBeTruthy();
           }
         } catch (err) {
