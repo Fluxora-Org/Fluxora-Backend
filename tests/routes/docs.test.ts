@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../../src/app.js';
+import { ContractEventSchema } from '../../src/openapi/spec.js';
 import { resetSpecCache } from '../../src/routes/docs.js';
 
 beforeEach(() => {
@@ -143,6 +144,7 @@ describe('GET /openapi.json', () => {
       expect.arrayContaining([
         'eventId',
         'ledger',
+        'ledgerHash',
         'contractId',
         'topic',
         'txHash',
@@ -155,9 +157,29 @@ describe('GET /openapi.json', () => {
     );
     expect(example?.events?.[0]).toMatchObject({
       ledger: 1000,
+      ledgerHash: 'ledger-hash-001',
       topic: 'stream.created',
       eventIndex: 0,
     });
+  });
+
+  it('uses a strict contract event schema for documented ingest payloads', () => {
+    const result = ContractEventSchema.safeParse({
+      eventId: 'evt-001',
+      ledger: 1000,
+      ledgerHash: 'ledger-hash-001',
+      contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      topic: 'stream.created',
+      txHash: 'tx-hash-001',
+      txIndex: 0,
+      operationIndex: 0,
+      eventIndex: 0,
+      payload: {},
+      happenedAt: '2026-01-01T00:00:00.000Z',
+      unexpected: true,
+    });
+
+    expect(result.success).toBe(false);
   });
 
   it('includes error response schemas (400, 401, 404, 500)', async () => {

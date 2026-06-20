@@ -45,9 +45,33 @@ const StreamObject = registry.register(
   }).openapi({ description: 'A treasury stream record' }),
 );
 
+export const ContractEventTopicSchema = z.enum(['stream.created', 'stream.updated', 'stream.cancelled']);
+
+export const ContractEventSchema = z.object({
+  eventId: z.string().min(1).max(128).openapi({ example: 'evt-001' }),
+  ledger: z.number().int().nonnegative().openapi({ example: 1000 }),
+  ledgerHash: z.string().min(1).max(128).openapi({ example: 'ledger-hash-001' }),
+  contractId: z.string().min(1).max(128).openapi({ example: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }),
+  topic: ContractEventTopicSchema,
+  txHash: z.string().min(1).max(128).openapi({ example: 'tx-hash-001' }),
+  txIndex: z.number().int().nonnegative().openapi({ example: 0 }),
+  operationIndex: z.number().int().nonnegative().openapi({ example: 0 }),
+  eventIndex: z.number().int().nonnegative().openapi({ example: 0 }),
+  payload: z.record(z.string(), z.unknown()).openapi({
+    example: {
+      id: 'stream-abc123',
+      sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+      recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+      depositAmount: '1000000.0000000',
+      ratePerSecond: '0.0000116',
+    },
+  }),
+  happenedAt: z.string().datetime().openapi({ example: '2026-01-01T00:00:00.000Z' }),
+}).strict();
+
 const ContractEventTopic = registry.register(
   'ContractEventTopic',
-  z.enum(['stream.created', 'stream.updated', 'stream.cancelled']).openapi({
+  ContractEventTopicSchema.openapi({
     example: 'stream.created',
     description: 'Canonical Fluxora stream event topic emitted by the indexer',
   }),
@@ -55,27 +79,9 @@ const ContractEventTopic = registry.register(
 
 const ContractEvent = registry.register(
   'ContractEvent',
-  z.object({
-    eventId: z.string().min(1).max(128).openapi({ example: 'evt-001' }),
-    ledger: z.number().int().nonnegative().openapi({ example: 1000 }),
-    ledgerHash: z.string().min(1).max(128).optional().openapi({ example: 'ledger-hash-001' }),
-    contractId: z.string().min(1).max(128).openapi({ example: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }),
-    topic: ContractEventTopic,
-    txHash: z.string().min(1).max(128).openapi({ example: 'tx-hash-001' }),
-    txIndex: z.number().int().nonnegative().openapi({ example: 0 }),
-    operationIndex: z.number().int().nonnegative().openapi({ example: 0 }),
-    eventIndex: z.number().int().nonnegative().openapi({ example: 0 }),
-    payload: z.record(z.string(), z.unknown()).openapi({
-      example: {
-        id: 'stream-abc123',
-        sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
-        recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
-        depositAmount: '1000000.0000000',
-        ratePerSecond: '0.0000116',
-      },
-    }),
-    happenedAt: z.string().datetime().openapi({ example: '2026-01-01T00:00:00.000Z' }),
-  }).strict().openapi({ description: 'Contract event accepted by the internal indexer ingest endpoint' }),
+  ContractEventSchema.extend({ topic: ContractEventTopic }).strict().openapi({
+    description: 'Contract event accepted by the internal indexer ingest endpoint',
+  }),
 );
 
 const ResponseMeta = registry.register(
