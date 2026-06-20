@@ -43,7 +43,14 @@ import {
 import { info, debug } from '../../utils/logger.js';
 import { dbQueryDurationSeconds } from '../../metrics/dbMetrics.js';
 import { enrichActiveSpanWithStream } from '../../tracing/hooks.js';
-
+import { getConfig } from '../../config/env.js';
+import { computeAddressHashes } from '../../pii/pgcryptoEncryption.js';
+import {
+  encryptAddressValue,
+  recipientAddressFilterCondition,
+  senderAddressFilterCondition,
+  streamSelectColumns,
+} from '../queries/streams.js';
 
 const REPO = 'streamRepository';
 
@@ -260,9 +267,15 @@ export const streamRepository = {
   async getByEvent(transactionHash: string, eventIndex: number): Promise<StreamRecord | undefined> {
     return timed('getByEvent', async () => {
       const pool = await getReadPool();
+      const keySet = resolvePgcryptoKeys();
+      const params: unknown[] = [transactionHash, eventIndex, keySet.current];
+      const previousKeyIndex = keySet.previous ? params.length + 1 : undefined;
+      if (keySet.previous) {
+        params.push(keySet.previous);
+      }
       const result = await query<Record<string, unknown>>(
         pool,
-        `SELECT ${streamSelectColumns(3, keySet.previous ? 4 : undefined)} FROM streams WHERE transaction_hash = $1 AND event_index = $2`,
+        `SELECT ${streamSelectColumns(3, previousKeyIndex)} FROM streams WHERE transaction_hash = $1 AND event_index = $2`,
         params,
       );
       if (result.rows[0]) {
@@ -283,6 +296,7 @@ export const streamRepository = {
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
       const pool = await getReadPool();
+      const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
       const params: unknown[] = [];
       let idx = 1;
@@ -341,6 +355,7 @@ export const streamRepository = {
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
       const pool = await getReadPool();
+      const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
       const params: unknown[] = [];
       let idx = 1;
