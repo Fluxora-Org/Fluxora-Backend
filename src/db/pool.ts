@@ -128,7 +128,7 @@ export function createPool(config?: PoolConfig): pg.Pool {
     syncGauges(pool, poolName);
     if (cfg.statementTimeoutMs > 0) {
       // Fire-and-forget; errors are surfaced via pool.on('error')
-      client.query('SET statement_timeout = $1', [cfg.statementTimeoutMs]).catch((err: Error) => {
+      client.query(`SET statement_timeout = ${cfg.statementTimeoutMs}`).catch((err: Error) => {
         logger.error('Failed to set statement_timeout', undefined, { error: err.message });
       });
     }

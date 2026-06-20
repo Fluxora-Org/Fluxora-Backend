@@ -110,7 +110,7 @@ describe('createPool — connect hook applies statement_timeout', () => {
     // Simulate a new physical connection arriving
     (pool as unknown as { emit: (e: string, c: pg.PoolClient) => void }).emit('connect', client);
 
-    expect(client.query).toHaveBeenCalledWith('SET statement_timeout = $1', [3000]);
+    expect(client.query).toHaveBeenCalledWith('SET statement_timeout = 3000');
     pool.end();
   });
 
@@ -149,8 +149,8 @@ describe('createPool — connect hook applies statement_timeout', () => {
     emit('connect', client1);
     emit('connect', client2);
 
-    expect(client1.query).toHaveBeenCalledWith('SET statement_timeout = $1', [5000]);
-    expect(client2.query).toHaveBeenCalledWith('SET statement_timeout = $1', [5000]);
+    expect(client1.query).toHaveBeenCalledWith('SET statement_timeout = 5000');
+    expect(client2.query).toHaveBeenCalledWith('SET statement_timeout = 5000');
     pool.end();
   });
 });
