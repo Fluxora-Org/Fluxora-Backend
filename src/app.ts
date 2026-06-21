@@ -28,7 +28,11 @@ import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { bodySizeLimitMiddleware, BODY_LIMIT_BYTES } from './middleware/requestProtection.js';
+import {
+  bodySizeLimitMiddleware,
+  requestTimeoutMiddleware,
+  BODY_LIMIT_BYTES,
+} from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
@@ -198,6 +202,7 @@ export function createApp(options: AppOptions = {}): Express {
   void wireIdempotencyStore(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
 
+  app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
@@ -222,6 +227,9 @@ export function createApp(options: AppOptions = {}): Express {
   if (options.includeTestRoutes) {
     app.get('/__test/error', () => {
       throw new Error('Intentional test error');
+    });
+    app.get('/__test/timeout', () => {
+      return;
     });
   }
 
