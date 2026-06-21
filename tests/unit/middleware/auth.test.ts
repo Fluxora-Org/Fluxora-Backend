@@ -3,6 +3,7 @@ import { Request, Response, NextFunction } from 'express';
 import { authenticate, requireAuth, requirePermission, Permission } from '../../../src/middleware/auth.js';
 import { verifyToken } from '../../../src/lib/auth.js';
 import { isRevoked } from '../../../src/redis/jwtRevocationStore.js';
+import { authJwtVerifyDurationSeconds } from '../../../src/metrics/businessMetrics.js';
 
 // ── Mocks ──
 
@@ -55,6 +56,7 @@ function mockNext(): NextFunction {
 describe('authenticate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    authJwtVerifyDurationSeconds.reset();
   });
 
   // ── Happy path ──
@@ -78,6 +80,13 @@ describe('authenticate', () => {
     expect(next).toHaveBeenCalled();
     expect(req.user).toEqual(expect.objectContaining(payload));
     expect(isRevoked).toHaveBeenCalledWith('jti-valid');
+    const value = await authJwtVerifyDurationSeconds.get();
+    const successCount = value.values.find(
+      (metric) =>
+        metric.metricName === 'fluxora_auth_jwt_verify_duration_seconds_count' &&
+        metric.labels.outcome === 'success',
+    );
+    expect(successCount?.value).toBe(1);
   });
 
   it('proceeds without user when no auth header', async () => {
@@ -170,6 +179,13 @@ describe('authenticate', () => {
 
     expect(res.statusCode).toBe(401);
     expect((res as any).jsonBody.error.message).toContain('Invalid or expired');
+    const value = await authJwtVerifyDurationSeconds.get();
+    const failureCount = value.values.find(
+      (metric) =>
+        metric.metricName === 'fluxora_auth_jwt_verify_duration_seconds_count' &&
+        metric.labels.outcome === 'failure',
+    );
+    expect(failureCount?.value).toBe(1);
   });
 
   it('returns 401 for expired token', async () => {

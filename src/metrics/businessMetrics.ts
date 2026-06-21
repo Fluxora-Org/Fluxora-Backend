@@ -45,6 +45,44 @@ export const webhookDeliveryDurationSeconds =
     registers: [registry],
   });
 
+/**
+ * JWT verification latency in seconds, labeled only by aggregate outcome.
+ * Never add token, subject, jti, or role labels here.
+ */
+export const authJwtVerifyDurationSeconds =
+  (registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds') as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_auth_jwt_verify_duration_seconds',
+    help: 'Duration of JWT verification in seconds',
+    labelNames: ['outcome'] as const,
+    buckets: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [registry],
+  });
+
+/**
+ * API-key lookup latency in seconds, labeled only by aggregate outcome.
+ * Never add key id, prefix, raw key material, or caller labels here.
+ */
+export const authApiKeyLookupDurationSeconds =
+  (registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds') as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_auth_apikey_lookup_duration_seconds',
+    help: 'Duration of API-key lookup in seconds',
+    labelNames: ['outcome'] as const,
+    buckets: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [registry],
+  });
+
+export type AuthLatencyOutcome = 'success' | 'failure';
+
+export function recordJwtVerifyDuration(durationSeconds: number, outcome: AuthLatencyOutcome): void {
+  authJwtVerifyDurationSeconds.observe({ outcome }, durationSeconds);
+}
+
+export function recordApiKeyLookupDuration(durationSeconds: number, outcome: AuthLatencyOutcome): void {
+  authApiKeyLookupDurationSeconds.observe({ outcome }, durationSeconds);
+}
+
 export const indexerEventsIngestedTotal =
   (registry.getSingleMetric('fluxora_indexer_events_ingested_total') as Counter) ||
   new Counter({
@@ -68,6 +106,8 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_connections_rejected_total');
   registry.removeSingleMetric('fluxora_webhook_deliveries_total');
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
+  registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
+  registry.removeSingleMetric('fluxora_auth_apikey_lookup_duration_seconds');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
 }

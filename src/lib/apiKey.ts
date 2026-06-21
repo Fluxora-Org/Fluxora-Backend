@@ -1,6 +1,7 @@
 import { createId } from '@paralleldrive/cuid2';
 import { createHash, timingSafeEqual } from 'crypto';
 import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import { recordApiKeyLookupDuration } from '../metrics/businessMetrics.js';
 
 // ---------------------------------------------------------------------------
 // In-memory store (replace with DB-backed store when persistence is needed)
@@ -97,7 +98,15 @@ export function listApiKeys(): ApiKeyRecord[] {
  * Validates a raw API key against the stored hashes using constant-time comparison.
  */
 export function isValidApiKey(rawKey: string): boolean {
-  if (!rawKey) return false;
+  const lookupStart = process.hrtime.bigint();
+  const observeLookup = (outcome: 'success' | 'failure'): void => {
+    recordApiKeyLookupDuration(Number(process.hrtime.bigint() - lookupStart) / 1_000_000_000, outcome);
+  };
+
+  if (!rawKey) {
+    observeLookup('failure');
+    return false;
+  }
 
   const hash = sha256hex(rawKey);
   const hashBuf = Buffer.from(hash, 'hex');
@@ -107,6 +116,7 @@ export function isValidApiKey(rawKey: string): boolean {
     try {
       const storedBuf = Buffer.from(record.keyHash, 'hex');
       if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
+        observeLookup('success');
         return true;
       }
     } catch {
@@ -114,6 +124,7 @@ export function isValidApiKey(rawKey: string): boolean {
     }
   }
 
+  observeLookup('failure');
   return false;
 }
 

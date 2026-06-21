@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, beforeAll } from 'vitest';
 import { generateToken, verifyToken, UserPayload } from '../../src/lib/auth.js';
 import { initializeConfig } from '../../src/config/env.js';
+import { authApiKeyLookupDurationSeconds } from '../../src/metrics/businessMetrics.js';
 import {
   createApiKey,
   rotateApiKey,
@@ -55,6 +56,7 @@ describe('Auth Module', () => {
 describe('API Key Management', () => {
   beforeEach(() => {
     _resetApiKeyStoreForTest();
+    authApiKeyLookupDurationSeconds.reset();
   });
 
   describe('createApiKey', () => {
@@ -95,6 +97,33 @@ describe('API Key Management', () => {
     it('rejects an unknown key', () => {
       createApiKey('svc');
       expect(isValidApiKey('flx_notakey')).toBe(false);
+    });
+
+    it('records lookup latency without key-specific labels', async () => {
+      const { key } = createApiKey('svc');
+      expect(isValidApiKey(key)).toBe(true);
+      expect(isValidApiKey('flx_notakey')).toBe(false);
+
+      const value = await authApiKeyLookupDurationSeconds.get();
+      const successCount = value.values.find(
+        (metric) =>
+          metric.metricName === 'fluxora_auth_apikey_lookup_duration_seconds_count' &&
+          metric.labels.outcome === 'success',
+      );
+      const failureCount = value.values.find(
+        (metric) =>
+          metric.metricName === 'fluxora_auth_apikey_lookup_duration_seconds_count' &&
+          metric.labels.outcome === 'failure',
+      );
+
+      expect(successCount?.value).toBe(1);
+      expect(failureCount?.value).toBe(1);
+      for (const metric of value.values) {
+        expect(metric.labels).toHaveProperty('outcome');
+        expect(metric.labels).not.toHaveProperty('key');
+        expect(metric.labels).not.toHaveProperty('keyId');
+        expect(metric.labels).not.toHaveProperty('prefix');
+      }
     });
 
     it('rejects empty string', () => {

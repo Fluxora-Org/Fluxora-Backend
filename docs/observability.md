@@ -140,6 +140,33 @@ scrape_configs:
 | `403` | Token present but incorrect |
 | `503` | `ADMIN_API_KEY` not configured on the server |
 
+## Authentication latency metrics
+
+Authentication is on the request path for protected routes. Fluxora exports bounded Prometheus histograms so operators can spot slow JWT verification or API-key lookup without exposing credential material.
+
+### Metrics
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `fluxora_auth_jwt_verify_duration_seconds` | Histogram | `outcome` (`success` or `failure`) | Wall-clock duration of JWT signature/expiry verification. |
+| `fluxora_auth_apikey_lookup_duration_seconds` | Histogram | `outcome` (`success` or `failure`) | Wall-clock duration of API-key hash lookup. |
+
+**Buckets (seconds):** 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1
+
+Only the low-cardinality `outcome` label is emitted. API key ids, prefixes, raw keys, JWT subjects, `jti` values, addresses, and roles are never metric labels.
+
+### Example PromQL
+
+```promql
+histogram_quantile(0.95, sum by (le, outcome) (rate(fluxora_auth_jwt_verify_duration_seconds_bucket[5m])))
+```
+
+```promql
+histogram_quantile(0.95, sum by (le, outcome) (rate(fluxora_auth_apikey_lookup_duration_seconds_bucket[5m])))
+```
+
+Alert if p95 authentication latency stays above `100ms` for 10 minutes, or if failure-labeled latency diverges from success-labeled latency during a credential-store incident.
+
 ## Runtime Performance Metrics
 
 The application exposes fine-grained Node.js runtime health indicators to differentiate garbage collection pressure from event loop starvation during load spikes.

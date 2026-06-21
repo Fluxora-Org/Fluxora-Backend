@@ -4,6 +4,7 @@ import { ApiErrorCode } from './errorHandler.js';
 import { warn, info, debug } from '../utils/logger.js';
 import { z } from 'zod';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
+import { recordJwtVerifyDuration } from '../metrics/businessMetrics.js';
 
 export enum Permission {
   STREAMS_READ = 'streams:read',
@@ -71,7 +72,15 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 
   try {
     // 1. Verify signature and expiry (cryptographic check)
-    const payload = verifyToken(token) as unknown;
+    const verifyStart = process.hrtime.bigint();
+    let payload: unknown;
+    try {
+      payload = verifyToken(token) as unknown;
+      recordJwtVerifyDuration(Number(process.hrtime.bigint() - verifyStart) / 1_000_000_000, 'success');
+    } catch (error) {
+      recordJwtVerifyDuration(Number(process.hrtime.bigint() - verifyStart) / 1_000_000_000, 'failure');
+      throw error;
+    }
 
     // 2. Check revocation list (immediate invalidation check)
     const jti = (payload as any)?.jti;
