@@ -25,7 +25,7 @@ import { logger } from '../lib/logger.js';
 import { getPool, createPool, resolvePoolConfig } from './pool.js';
 import type { PoolConfig } from './pool.js';
 
-const { Pool } = pg;
+const READ_REPLICA_POOL_NAME = 'read-replica';
 
 // ── Internal state ────────────────────────────────────────────────────────────
 
@@ -46,6 +46,13 @@ function safeHostname(connectionString: string): string {
   }
 }
 
+function envInt(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (!value) return fallback;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 // ── Pool creation ─────────────────────────────────────────────────────────────
 
 /**
@@ -63,22 +70,29 @@ export function resolveReplicaPoolConfig(): PoolConfig | null {
   return {
     ...primaryCfg,
     connectionString: replicaUrl,
+    queueLimit: envInt('DATABASE_REPLICA_POOL_QUEUE_LIMIT', primaryCfg.queueLimit),
+    statementTimeoutMs: envInt(
+      'DATABASE_REPLICA_STATEMENT_TIMEOUT_MS',
+      primaryCfg.statementTimeoutMs,
+    ),
+    poolName: READ_REPLICA_POOL_NAME,
   };
 }
 
 /**
  * Create a pg.Pool for the read replica.
- * Sets `default_transaction_read_only = on` on every new connection so that
- * accidental INSERT/UPDATE/DELETE statements are rejected by PostgreSQL.
+ *
+ * Reuses the primary pool factory so replica reads get the same queue-limit,
+ * statement_timeout, slow-query, and labeled pool telemetry protections as the
+ * primary pool. It then adds `default_transaction_read_only = on` on every new
+ * connection so accidental INSERT/UPDATE/DELETE statements are rejected by
+ * PostgreSQL.
  */
 export function createReplicaPool(config?: PoolConfig): pg.Pool {
   const cfg = config ?? resolveReplicaPoolConfig()!;
-  const pool = new Pool({
-    connectionString: cfg.connectionString,
-    min: cfg.min,
-    max: cfg.max,
-    connectionTimeoutMillis: cfg.connectionTimeoutMillis,
-    idleTimeoutMillis: cfg.idleTimeoutMillis,
+  const pool = createPool({
+    ...cfg,
+    poolName: cfg.poolName ?? READ_REPLICA_POOL_NAME,
   });
 
   // Enforce read-only mode on every physical connection to prevent
