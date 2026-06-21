@@ -57,6 +57,11 @@ curl -N \
 ### Behavior
 When `Last-Event-ID` is provided, the server queries the `ContractEventStore` to replay historical events that occurred after the specified cursor before switching to live broadcast delivery.
 
+If the event store returns `STALE_CURSOR`, the supplied cursor has been evicted,
+usually because a reorg rollback removed it. The server emits an SSE `error`
+event with code `STALE_CURSOR` and closes the response; clients should discard
+that cursor and re-sync from the last trusted `fromLedger` checkpoint.
+
 ---
 
 ## Connection Limits and Maximum Duration

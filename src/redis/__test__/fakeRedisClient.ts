@@ -160,6 +160,20 @@ export class FakeRedisClient implements RedisClient {
         this.strings.set(key, value);
     }
 
+    async setNx(key: string, value: string, _pxMs: number): Promise<boolean> {
+        this.maybeThrow('setNx');
+        if (this.strings.has(key)) return false;
+        this.strings.set(key, value);
+        return true;
+    }
+
+    async del(key: string): Promise<void> {
+        this.maybeThrow('del');
+        this.strings.delete(key);
+        this.sortedSets.delete(key);
+        this.ttls.delete(key);
+    }
+
     async exists(key: string): Promise<boolean> {
         this.maybeThrow('exists');
         return this.strings.has(key) || this.sortedSets.has(key);

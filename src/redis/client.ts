@@ -33,6 +33,9 @@ export interface RedisPipeline {
 export interface RedisClient {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, options?: { ex?: number }): Promise<void>;
+  /** SET key value NX PX ms — returns true when the key was created. */
+  setNx(key: string, value: string, pxMs: number): Promise<boolean>;
+  del(key: string): Promise<void>;
   exists(key: string): Promise<boolean>;
   close(): Promise<void>;
   multi(): RedisPipeline;
@@ -92,6 +95,15 @@ class IORedisClient implements RedisClient {
     } else {
       await this.client.set(key, value);
     }
+  }
+
+  async setNx(key: string, value: string, pxMs: number): Promise<boolean> {
+    const result = await this.client.set(key, value, 'PX', pxMs, 'NX');
+    return result === 'OK';
+  }
+
+  async del(key: string): Promise<void> {
+    await this.client.del(key);
   }
 
   async exists(key: string): Promise<boolean> {
@@ -266,6 +278,8 @@ export async function createRedisClient(config: RedisConfig): Promise<RedisClien
 export class NoOpRedisClient implements RedisClient {
   async get(): Promise<string | null> { return null; }
   async set(): Promise<void> { return; }
+  async setNx(): Promise<boolean> { return true; }
+  async del(): Promise<void> { return; }
   async exists(): Promise<boolean> { return false; }
   async close(): Promise<void> { return; }
   multi(): RedisPipeline {

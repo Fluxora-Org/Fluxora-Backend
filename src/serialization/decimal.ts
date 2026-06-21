@@ -64,6 +64,31 @@ export function normalizeDecimalString(value: string): string {
 }
 
 /**
+ * Compare a validated decimal string against zero without converting it to a
+ * JavaScript number.
+ *
+ * This preserves sign checks for values beyond Number.MAX_SAFE_INTEGER and for
+ * high-precision fractional values that `parseFloat` can round to +/-0.
+ *
+ * @returns -1 when negative, 0 when mathematically zero, and 1 when positive.
+ * @throws DecimalSerializationError when the input is not a valid decimal string.
+ */
+export function compareDecimalStringToZero(value: string): -1 | 0 | 1 {
+  const validated = validateDecimalString(value);
+  if (!validated.valid || !validated.value) {
+    throw validated.error!;
+  }
+
+  const normalized = validated.value;
+  const unsigned = normalized.replace(/^[+-]/, '');
+  const [integerPart, fractionalPart = ''] = unsigned.split('.');
+  const hasNonZeroDigit = `${integerPart}${fractionalPart}`.split('').some((digit) => digit !== '0');
+
+  if (!hasNonZeroDigit) return 0;
+  return normalized.startsWith('-') ? -1 : 1;
+}
+
+/**
  * Error codes for decimal serialization failures
  */
 export enum DecimalErrorCode {
