@@ -151,6 +151,12 @@ describe('WebhookService', () => {
     expect(delivery.status).toBe('permanent_failure');
     expect(delivery.attempts.length).toBe(1);
     expect(delivery.attempts[0].statusCode).toBe(404);
+
+    const dlqItems = webhookDeliveryStore.getDeadLetterQueueItems();
+    expect(dlqItems).toHaveLength(1);
+    expect(dlqItems[0].deliveryId).toBe(delivery.deliveryId);
+    expect(dlqItems[0].originalDelivery.attempts).toHaveLength(1);
+    expect(dlqItems[0].failureReason).toContain('HTTP 404');
   });
 
   it('respects max attempts', async () => {
@@ -191,6 +197,44 @@ describe('WebhookService', () => {
 
     expect(delivery.attempts.length).toBe(2);
     expect(delivery.status).toBe('permanent_failure');
+
+    const dlqItems = webhookDeliveryStore.getDeadLetterQueueItems();
+    expect(dlqItems).toHaveLength(1);
+    expect(dlqItems[0].deliveryId).toBe(delivery.deliveryId);
+    expect(dlqItems[0].originalDelivery.attempts).toHaveLength(2);
+    expect(dlqItems[0].failureReason).toContain('HTTP 503');
+  });
+
+  it('does not enqueue duplicate DLQ entries when permanent failure is retried', async () => {
+    const service = new WebhookService({
+      maxAttempts: 1,
+      initialBackoffMs: 100,
+      backoffMultiplier: 2,
+      maxBackoffMs: 1000,
+      jitterPercent: 0,
+      timeoutMs: 5000,
+      retryableStatusCodes: [500, 502, 503, 504, 408, 429],
+    });
+    const delivery = {
+      id: 'delivery_duplicate_dlq',
+      deliveryId: 'deliv_duplicate_dlq',
+      eventId: 'event_duplicate_dlq',
+      eventType: 'stream.created' as const,
+      endpointUrl: 'https://example.com/webhook',
+      status: 'pending' as const,
+      attempts: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      payload: '{"test": "data"}',
+    };
+    mockFetchResponses.set('https://example.com/webhook', new Response(null, { status: 503 }));
+
+    await service.attemptDelivery(delivery, 'secret123', '123456');
+    await service.attemptDelivery(delivery, 'secret123', '123457');
+
+    const dlqItems = webhookDeliveryStore.getDeadLetterQueueItems();
+    expect(dlqItems).toHaveLength(1);
+    expect(dlqItems[0].deliveryId).toBe(delivery.deliveryId);
   });
 
   it('sends correct headers', async () => {

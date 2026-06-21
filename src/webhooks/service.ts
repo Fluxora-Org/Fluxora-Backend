@@ -99,6 +99,24 @@ function extractAttemptNumber(payload: unknown): number {
     : 1;
 }
 
+function enqueuePermanentFailureToDlq(
+  delivery: WebhookDelivery,
+  failureReason: string,
+): string | undefined {
+  const alreadyQueued = webhookDeliveryStore
+    .getDeadLetterQueueItems()
+    .some((item) => item.deliveryId === delivery.deliveryId);
+
+  if (alreadyQueued) {
+    logger.warn('Webhook permanent failure already exists in dead-letter queue', undefined, {
+      deliveryId: delivery.deliveryId,
+    });
+    return undefined;
+  }
+
+  return webhookDeliveryStore.addToDeadLetterQueue(delivery, failureReason);
+}
+
 export class WebhookService {
   private policy: WebhookRetryPolicy;
 
@@ -219,6 +237,12 @@ export class WebhookService {
 
         delivery.attempts.push(attempt);
         webhookDeliveryStore.store(delivery);
+        if (delivery.status === 'permanent_failure') {
+          enqueuePermanentFailureToDlq(
+            delivery,
+            `HTTP ${response.status} after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`,
+          );
+        }
         webhookDeliveriesTotal.inc({ outcome: 'failed' });
       }
     } catch (error) {
@@ -250,6 +274,12 @@ export class WebhookService {
 
       delivery.attempts.push(attempt);
       webhookDeliveryStore.store(delivery);
+      if (delivery.status === 'permanent_failure') {
+        enqueuePermanentFailureToDlq(
+          delivery,
+          `${errorMessage} after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`,
+        );
+      }
       webhookDeliveriesTotal.inc({ outcome: 'failed' });
     } finally {
       const durationSeconds = (Date.now() - startTime) / 1000;
