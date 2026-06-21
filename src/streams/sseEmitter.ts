@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import type { Response } from 'express';
 import type { StreamEventRecord } from '../db/types.js';
 
 export const SSE_STREAM_UPDATE_EVENT = 'stream_update';
@@ -21,6 +22,7 @@ export interface LiveSseStreamUpdateEvent {
 export type SseStreamSubscriber = (event: LiveSseStreamUpdateEvent) => void;
 
 const liveSubscribersByStreamId = new Map<string, Set<SseStreamSubscriber>>();
+const activeSseResponses = new Set<Response>();
 
 function totalLiveSubscriberCount(): number {
   let total = 0;
@@ -107,8 +109,64 @@ export function getLiveSseSubscriberCount(streamId?: string): number {
   return totalLiveSubscriberCount();
 }
 
+/**
+ * Track an established SSE response so graceful shutdown can actively close it.
+ *
+ * The caller owns normal request lifecycle cleanup; the returned function
+ * removes the response from the drain registry and is safe to call more than
+ * once.
+ */
+export function registerSseResponseForDrain(res: Response): () => void {
+  activeSseResponses.add(res);
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeSseResponses.delete(res);
+  };
+}
+
+/**
+ * End all active SSE responses with a final reconnect hint.
+ *
+ * This runs before server.close() waits for active requests so EventSource
+ * clients do not hold the process open until the hard shutdown timeout.
+ */
+export function drainSseConnections(
+  reason = 'server_shutdown',
+  retryMs = 15_000,
+): number {
+  let closed = 0;
+  for (const res of Array.from(activeSseResponses)) {
+    activeSseResponses.delete(res);
+    if (res.destroyed || res.writableEnded) continue;
+
+    try {
+      res.write(`retry: ${retryMs}\n`);
+      res.write(`event: close\ndata: ${JSON.stringify({ reason })}\n\n`);
+    } catch {
+      // best-effort drain; end/destroy below is still attempted
+    }
+
+    try {
+      res.end();
+      closed++;
+    } catch {
+      try {
+        res.destroy();
+      } catch {
+        // Nothing more to do for a broken response.
+      }
+    }
+  }
+  detachDispatchIfIdle();
+  return closed;
+}
+
 export function _resetSseSubscriptionsForTest(): void {
   liveSubscribersByStreamId.clear();
+  activeSseResponses.clear();
   sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
 }
 

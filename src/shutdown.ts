@@ -1,5 +1,5 @@
 /**
- * Graceful shutdown: drain HTTP + DB pool.
+ * Graceful shutdown: drain HTTP + long-lived services + external pools.
  *
  * Guarantees:
  *  - All in-flight HTTP requests are allowed to complete before the process exits.
@@ -7,6 +7,7 @@
  *    as soon as the last active request finishes.
  *  - A hard timeout prevents the process from hanging indefinitely when a request
  *    stalls or a dependency is unresponsive.
+ *  - Long-lived response/work drains can be registered via addShutdownDrainHook().
  *  - DB / external-pool teardown hooks can be registered via addShutdownHook().
  *  - Health endpoint returns 503 once shutdown begins so load balancers stop
  *    routing new traffic to this instance.
@@ -22,6 +23,7 @@ import http from 'node:http';
 import { logger } from './lib/logger.js';
 
 let shuttingDown = false;
+const drainHooks: Array<() => Promise<void> | void> = [];
 const hooks: Array<() => Promise<void> | void> = [];
 
 export interface DrainableService {
@@ -44,11 +46,20 @@ export function addShutdownHook(fn: () => Promise<void> | void): void {
 }
 
 /**
+ * Register a drain hook that runs after shutdown is announced but before the
+ * HTTP server waits for active requests to complete. Use this for long-lived
+ * responses such as SSE streams that would otherwise keep server.close() open.
+ */
+export function addShutdownDrainHook(fn: () => Promise<void> | void): void {
+  drainHooks.push(fn);
+}
+
+/**
  * Register a service that must stop accepting new work and drain in-flight
  * operations during graceful shutdown.
  */
 export function addDrainableShutdownHook(service: DrainableService): void {
-  addShutdownHook(() => service.stop());
+  addShutdownDrainHook(() => service.stop());
 }
 
 /**
@@ -59,17 +70,39 @@ export function _resetShutdownState(): void {
   shuttingDown = false;
   delete process.env['FLUXORA_SHUTDOWN'];
   delete (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'];
+  drainHooks.length = 0;
   hooks.length = 0;
+}
+
+export function _getShutdownHookCounts(): { drain: number; teardown: number } {
+  return { drain: drainHooks.length, teardown: hooks.length };
+}
+
+async function runHooks(
+  phase: 'drain' | 'teardown',
+  registeredHooks: Array<() => Promise<void> | void>,
+): Promise<void> {
+  for (const hook of registeredHooks) {
+    try {
+      await hook();
+    } catch (err) {
+      logger.error('Shutdown hook threw an error', undefined, {
+        phase,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 /**
  * Initiate a graceful shutdown:
  *  1. Mark the service as shutting down (health → 503).
- *  2. Stop accepting new connections.
- *  3. Close idle keep-alive connections immediately.
- *  4. Wait for in-flight requests to drain (up to `timeout` ms).
- *  5. Run registered teardown hooks (DB pool close, etc.).
- *  6. If the timeout is exceeded, force-close all connections and resolve.
+ *  2. Run registered drain hooks (SSE, workers, other long-lived work).
+ *  3. Stop accepting new connections.
+ *  4. Close idle keep-alive connections immediately.
+ *  5. Wait for in-flight requests to drain (up to `timeout` ms).
+ *  6. Run registered teardown hooks (DB pool close, Redis quit, etc.).
+ *  7. If the timeout is exceeded, force-close all connections and resolve.
  *
  * @param server   The http.Server returned by server.listen().
  * @param signal   The OS signal that triggered shutdown (for logging).
@@ -86,6 +119,8 @@ export function gracefulShutdown(
   }
 
   shuttingDown = true;
+  process.env['FLUXORA_SHUTDOWN'] = 'true';
+  (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'] = true;
   logger.warn('Shutdown signal received, draining HTTP connections', undefined, { signal, timeoutMs: timeout });
 
   return new Promise<void>((resolve) => {
@@ -100,15 +135,7 @@ export function gracefulShutdown(
         server.closeAllConnections();
       }
 
-      for (const hook of hooks) {
-        try {
-          await hook();
-        } catch (err) {
-          logger.error('Shutdown hook threw an error', undefined, {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
+      await runHooks('teardown', hooks);
 
       logger.info('Graceful shutdown complete');
       resolve();
@@ -118,14 +145,18 @@ export function gracefulShutdown(
     // Prevent the timer from keeping the event loop alive artificially.
     if (typeof forceTimer.unref === 'function') forceTimer.unref();
 
-    // Stop accepting new TCP connections.
-    server.close(() => {
-      clearTimeout(forceTimer);
-      void finish(false);
-    });
+    void (async () => {
+      await runHooks('drain', drainHooks);
 
-    // Immediately reclaim idle keep-alive connections so server.close()
-    // only waits for connections that are actively serving a request.
-    server.closeIdleConnections();
+      // Stop accepting new TCP connections.
+      server.close(() => {
+        clearTimeout(forceTimer);
+        void finish(false);
+      });
+
+      // Immediately reclaim idle keep-alive connections so server.close()
+      // only waits for connections that are actively serving a request.
+      server.closeIdleConnections();
+    })();
   });
 }

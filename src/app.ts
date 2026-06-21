@@ -35,7 +35,7 @@ import {
 } from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
-import { isShuttingDown, addShutdownHook } from './shutdown.js';
+import { isShuttingDown, addShutdownHook, addShutdownDrainHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createDeprecationMiddleware } from './middleware/deprecation.js';
@@ -45,6 +45,8 @@ import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { indexerService } from './indexer/service.js';
+import { drainSseConnections } from './streams/sseEmitter.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -66,6 +68,13 @@ export interface AppOptions {
   pool?: pg.Pool;
 }
 
+function registerProcessDrainHooks(): void {
+  addShutdownDrainHook(() => {
+    drainSseConnections();
+  });
+  addShutdownDrainHook(() => indexerService.stop());
+}
+
 /**
  * Wire the idempotency backing store for POST /api/streams.
  *
@@ -74,7 +83,7 @@ export interface AppOptions {
  * The `onStateChange` callback flips `idempotencyDependency` to unavailable on
  * Redis errors so that subsequent `POST /api/streams` requests return 503
  * instead of silently losing cross-instance duplicate protection.
- * A shutdown hook is registered to close the Redis connection cleanly.
+ * Redis sockets created here are closed by the central Redis shutdown hook.
  *
  * When `REDIS_ENABLED=false`: installs a `NoOpIdempotencyStore` and logs a
  * warning about degraded idempotency semantics (no cross-instance dedup).
@@ -111,7 +120,6 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
     });
 
     setIdempotencyStore(store, config.idempotencyTtlSeconds);
-    addShutdownHook(() => store.close());
 
     logger.info(
       'Redis idempotency store wired',
@@ -154,7 +162,6 @@ async function wireWebhookCircuitBreakerStore(config: Config): Promise<void> {
 
     const store = createWebhookCircuitBreakerStore(redisClient);
     setWebhookCircuitBreakerStore(store);
-    addShutdownHook(() => store.close());
 
     logger.info('Redis webhook circuit breaker store wired', undefined, {
       component: 'webhook-circuit-breaker',
@@ -177,6 +184,7 @@ export function createApp(options: AppOptions = {}): Express {
   const env = options.env ?? (process.env as Record<string, string | undefined>);
   const rateLimiter = createRateLimiter(env);
 
+  registerProcessDrainHooks();
   startRuntimeMetrics();
   addShutdownHook(() => {
     stopRuntimeMetrics();
@@ -184,6 +192,7 @@ export function createApp(options: AppOptions = {}): Express {
 
   // Expose the limiter on app.locals so index.ts can register a shutdown hook
   app.locals.rateLimiter = rateLimiter;
+  addShutdownHook(() => rateLimiter.close());
 
   // Inject config and healthManager into app.locals for route handlers
   if (options.config) {
@@ -194,7 +203,11 @@ export function createApp(options: AppOptions = {}): Express {
   }
 
   if (options.pool) {
-    app.locals.vacuumInterval = startVacuumCollector(options.pool);
+    const vacuumInterval = startVacuumCollector(options.pool);
+    app.locals.vacuumInterval = vacuumInterval;
+    addShutdownHook(() => {
+      clearInterval(vacuumInterval);
+    });
   }
 
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).

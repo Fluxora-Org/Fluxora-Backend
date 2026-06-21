@@ -46,6 +46,17 @@ export interface RedisClientFactory {
   createClient(config: RedisConfig): Promise<RedisClient>;
 }
 
+const activeRedisClients = new Set<RedisClient>();
+
+function registerRedisClient(client: RedisClient): RedisClient {
+  activeRedisClients.add(client);
+  return client;
+}
+
+function unregisterRedisClient(client: RedisClient): void {
+  activeRedisClients.delete(client);
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -83,6 +94,8 @@ function attachLogListeners(client: Redis | Cluster, mode: string): void {
 // ---------------------------------------------------------------------------
 
 class IORedisClient implements RedisClient {
+  private closed = false;
+
   constructor(private readonly client: Redis | Cluster) {}
 
   async get(key: string): Promise<string | null> {
@@ -111,6 +124,9 @@ class IORedisClient implements RedisClient {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    unregisterRedisClient(this);
     await this.client.quit();
   }
 
@@ -268,7 +284,36 @@ export function getRedisClientFactory(): RedisClientFactory {
 }
 
 export async function createRedisClient(config: RedisConfig): Promise<RedisClient> {
-  return factory.createClient(config);
+  return registerRedisClient(await factory.createClient(config));
+}
+
+/**
+ * Quit every Redis client created through createRedisClient().
+ *
+ * This central shutdown hook covers idempotency, circuit-breaker, rate-limit,
+ * and future Redis users without relying on each store to be registered in the
+ * correct teardown order.
+ */
+export async function closeAllRedisClients(): Promise<void> {
+  const clients = Array.from(activeRedisClients);
+  await Promise.all(
+    clients.map(async (client) => {
+      try {
+        await client.close();
+      } finally {
+        unregisterRedisClient(client);
+      }
+    }),
+  );
+}
+
+export function getActiveRedisClientCount(): number {
+  return activeRedisClients.size;
+}
+
+/** Testing helper. */
+export function _resetRedisClientRegistryForTest(): void {
+  activeRedisClients.clear();
 }
 
 // ---------------------------------------------------------------------------

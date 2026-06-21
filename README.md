@@ -142,6 +142,20 @@ The test suite includes:
 | `REPLAY_BATCH_SIZE` | 1000 | Number of events per batch insert |
 | `PORT` | 3000 | HTTP server port |
 
+## Graceful Shutdown
+
+`SIGTERM` and `SIGINT` use the shared `gracefulShutdown()` path in `src/shutdown.ts`; `src/index.ts` no longer exits through a separate `server.close()` handler.
+
+Shutdown order:
+
+1. Mark the process as shutting down so health/readiness returns 503 and new responses include `Connection: close`.
+2. Run drain hooks before waiting on HTTP close. The SSE drain writes a final `retry:` hint plus `event: close`, then ends active EventSource responses.
+3. Signal the indexer replay service to stop at the next safe batch boundary. The current batch can commit and advance `replay_cursors.last_committed_offset`; incomplete cursors are not marked complete so replay can resume.
+4. Stop accepting HTTP connections and wait for in-flight requests, with the existing hard timeout and forced-close fallback.
+5. Run teardown hooks in order: database pool close, then Redis client `quit()` for clients created through `createRedisClient()`.
+
+The shutdown path logs hook failures but continues remaining hooks. It does not log Redis URLs, database URLs, webhook secrets, or raw SSE payloads during teardown.
+
 ### Batch Size Tuning
 
 - **Small (100-500)**: Lower memory, more round-trips

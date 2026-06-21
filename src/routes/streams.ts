@@ -87,6 +87,7 @@ import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 import {
   eventMatchesStreamId,
+  registerSseResponseForDrain,
   SSE_STREAM_UPDATE_EVENT,
   subscribeToSseStream,
 } from '../streams/sseEmitter.js';
@@ -95,8 +96,6 @@ import {
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
 import {
-  RedisIdempotencyStore,
-  NoOpIdempotencyStore,
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
@@ -254,16 +253,6 @@ function decodeCursor(cursor: string): StreamsCursor {
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
 
-function parseLimit(limitParam: unknown): number {
-  if (limitParam === undefined) return 50;
-  if (Array.isArray(limitParam) || typeof limitParam !== 'string' || !/^\d+$/.test(limitParam)) {
-    throw validationError('limit must be an integer between 1 and 100');
-  }
-  const n = Number.parseInt(limitParam, 10);
-  if (n < 1 || n > 100) throw validationError('limit must be an integer between 1 and 100');
-  return n;
-}
-
 function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
   if (cursorParam === undefined) return undefined;
   if (Array.isArray(cursorParam) || typeof cursorParam !== 'string' || cursorParam.trim() === '') {
@@ -272,15 +261,6 @@ function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
   return decodeCursor(cursorParam);
 }
 
-function parseIncludeTotal(includeTotalParam: unknown): boolean {
-  if (includeTotalParam === undefined) return false;
-  if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
-    throw validationError('include_total must be true or false');
-  }
-  if (includeTotalParam === 'true') return true;
-  if (includeTotalParam === 'false') return false;
-  throw validationError('include_total must be true or false');
-}
 
 // ── Body normaliser ───────────────────────────────────────────────────────────
 
@@ -389,7 +369,8 @@ export function enforceStreamScope(req: Request, res: Response, next: NextFuncti
     const callerAddress = req.user.address as string | undefined;
     if (!callerAddress) {
         // Should not happen if authenticate middleware is working, but safe fail.
-        return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+        res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+        return;
     }
 
     // Attach caller address to the request object for repository consumption.
@@ -856,6 +837,7 @@ streamsRouter.get(
     const sseConnection = connectionAttempt.connection;
     let cleanedUp = false;
     let unsubscribeLiveUpdates: (() => void) | undefined;
+    let releaseSseDrainRegistration: (() => void) | undefined;
     let heartbeatInterval: NodeJS.Timeout | undefined;
     let maxDurationTimer: NodeJS.Timeout | undefined;
 
@@ -884,6 +866,10 @@ streamsRouter.get(
       if (maxDurationTimer !== undefined) {
         clearTimeout(maxDurationTimer);
         maxDurationTimer = undefined;
+      }
+      if (releaseSseDrainRegistration !== undefined) {
+        releaseSseDrainRegistration();
+        releaseSseDrainRegistration = undefined;
       }
       if (unsubscribeLiveUpdates !== undefined) {
         unsubscribeLiveUpdates();
@@ -968,6 +954,7 @@ streamsRouter.get(
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders();
+      releaseSseDrainRegistration = registerSseResponseForDrain(res);
     } catch (err) {
       cleanup('flush_error');
       throw err;

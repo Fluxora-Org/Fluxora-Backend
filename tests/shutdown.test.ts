@@ -11,25 +11,89 @@
  */
 
 import http from 'node:http';
-import { vi as jest } from 'vitest';
+import express from 'express';
+import type { Response } from 'express';
+import { vi } from 'vitest';
 import request from 'supertest';
-import { app } from '../src/app.js';
 import {
   gracefulShutdown,
   isShuttingDown,
+  addShutdownDrainHook,
   addShutdownHook,
   _resetShutdownState,
 } from '../src/shutdown.js';
 import { resetStreamHub, createStreamHub, getStreamHub } from '../src/ws/hub.js';
 import { setPool, getPool } from '../src/db/pool.js';
+import {
+  drainSseConnections,
+  getLiveSseSubscriberCount,
+  registerSseResponseForDrain,
+  subscribeToSseStream,
+  _resetSseSubscriptionsForTest,
+} from '../src/streams/sseEmitter.js';
+import {
+  closeAllRedisClients,
+  createRedisClient,
+  DefaultRedisClientFactory,
+  getActiveRedisClientCount,
+  setRedisClientFactory,
+  _resetRedisClientRegistryForTest,
+  type RedisClient,
+} from '../src/redis/client.js';
+
+function createHealthTestApp() {
+  const app = express();
+  app.use((_req, res, next) => {
+    if (isShuttingDown()) {
+      res.setHeader('Connection', 'close');
+    }
+    next();
+  });
+  app.get('/health', (_req, res) => {
+    if (isShuttingDown()) {
+      res.status(503).json({
+        status: 'shutting_down',
+        service: 'fluxora-backend',
+        message: 'Service is shutting down',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    res.json({
+      status: 'ok',
+      service: 'fluxora-backend',
+      timestamp: new Date().toISOString(),
+    });
+  });
+  app.get('/health/ready', (_req, res) => {
+    if (isShuttingDown()) {
+      res.status(503).json({
+        error: {
+          code: 'SERVICE_SHUTTING_DOWN',
+          message: 'Service is shutting down',
+        },
+      });
+      return;
+    }
+    res.json({ status: 'healthy' });
+  });
+  return app;
+}
+
+const app = createHealthTestApp();
 
 // Reset module-level shutdown state before every test so tests are isolated.
 beforeEach(() => {
   _resetShutdownState();
+  _resetSseSubscriptionsForTest();
+  _resetRedisClientRegistryForTest();
 });
 
 afterEach(async () => {
   _resetShutdownState();
+  _resetSseSubscriptionsForTest();
+  _resetRedisClientRegistryForTest();
+  setRedisClientFactory(new DefaultRedisClientFactory());
 });
 
 // ─── Health endpoint ──────────────────────────────────────────────────────────
@@ -59,7 +123,7 @@ describe('GET /health — during shutdown', () => {
   });
 
   it('includes service and timestamp even during shutdown', async () => {
-    (globalThis as any)['__FLUXORA_SHUTDOWN__'] = true;
+    (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'] = true;
     const res = await request(app).get('/health').expect(503);
     expect(res.body.service).toBe('fluxora-backend');
     expect(typeof res.body.timestamp).toBe('string');
@@ -76,7 +140,7 @@ describe('GET /health/ready — during shutdown', () => {
   });
 
   it('returns 503 when global shutdown flag is set', async () => {
-    (globalThis as any)['__FLUXORA_SHUTDOWN__'] = true;
+    (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'] = true;
     const res = await request(app).get('/health/ready').expect(503);
     expect(res.body.error.code).toBe('SERVICE_SHUTTING_DOWN');
   });
@@ -84,7 +148,7 @@ describe('GET /health/ready — during shutdown', () => {
 
 describe('Connection: close header during shutdown', () => {
   it('IS set during shutdown', async () => {
-    (globalThis as any)['__FLUXORA_SHUTDOWN__'] = true;
+    (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'] = true;
     const res = await request(app).get('/health');
     expect(res.header['connection']).toBe('close');
   });
@@ -333,6 +397,34 @@ describe('Graceful Shutdown Integration', () => {
     expect(executionOrder).toEqual(['hook1', 'hook2', 'hook3']);
   });
 
+  it('runs drain hooks before waiting on HTTP close, then teardown hooks', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const executionOrder: string[] = [];
+    addShutdownDrainHook(() => {
+      executionOrder.push('drain:sse');
+    });
+    addShutdownDrainHook(() => {
+      executionOrder.push('drain:indexer');
+    });
+    addShutdownHook(() => {
+      executionOrder.push('teardown:db');
+    });
+    addShutdownHook(() => {
+      executionOrder.push('teardown:redis');
+    });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(executionOrder).toEqual([
+      'drain:sse',
+      'drain:indexer',
+      'teardown:db',
+      'teardown:redis',
+    ]);
+  });
+
   it('handles mixed synchronous and asynchronous hooks', async () => {
     const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, resolve));
@@ -352,5 +444,60 @@ describe('Graceful Shutdown Integration', () => {
     await gracefulShutdown(server, 'SIGTERM', 5_000);
     
     expect(results).toEqual(['sync', 'async']);
+  });
+});
+
+describe('SSE shutdown drain', () => {
+  it('ends registered SSE responses with a retry hint and close event', () => {
+    const writes: string[] = [];
+    const res = {
+      destroyed: false,
+      writableEnded: false,
+      write: vi.fn((frame: string) => {
+        writes.push(frame);
+        return true;
+      }),
+      end: vi.fn(),
+      destroy: vi.fn(),
+    };
+
+    registerSseResponseForDrain(res as unknown as Response);
+
+    const closed = drainSseConnections('server_shutdown', 15_000);
+
+    expect(closed).toBe(1);
+    expect(writes.join('')).toContain('retry: 15000');
+    expect(writes.join('')).toContain('event: close');
+    expect(writes.join('')).toContain('server_shutdown');
+    expect(res.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears live SSE subscriptions during test reset', () => {
+    const unsubscribe = subscribeToSseStream('stream-1', () => {});
+    expect(getLiveSseSubscriberCount('stream-1')).toBe(1);
+    unsubscribe();
+    expect(getLiveSseSubscriberCount('stream-1')).toBe(0);
+  });
+});
+
+describe('Redis shutdown drain', () => {
+  it('closes every Redis client created through the factory exactly once', async () => {
+    const clientA = { close: vi.fn().mockResolvedValue(undefined) } as unknown as RedisClient;
+    const clientB = { close: vi.fn().mockResolvedValue(undefined) } as unknown as RedisClient;
+    setRedisClientFactory({
+      createClient: vi.fn()
+        .mockResolvedValueOnce(clientA)
+        .mockResolvedValueOnce(clientB),
+    });
+
+    await createRedisClient({ url: 'redis://localhost:6379', enabled: true });
+    await createRedisClient({ url: 'redis://localhost:6379', enabled: true });
+
+    expect(getActiveRedisClientCount()).toBe(2);
+    await closeAllRedisClients();
+
+    expect(clientA.close).toHaveBeenCalledTimes(1);
+    expect(clientB.close).toHaveBeenCalledTimes(1);
+    expect(getActiveRedisClientCount()).toBe(0);
   });
 });

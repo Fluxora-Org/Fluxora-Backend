@@ -235,7 +235,7 @@ describe('IndexerService — max-range guard', () => {
   it('allows a range exactly at the limit', async () => {
     // Set up zero-event replay so it exits immediately
     const cursorRepo = makeCursorRepo({
-      create: vi.fn(async (_c, cid, ledger, fb, tb, total) => ({
+      create: vi.fn(async (_c, cid, ledger, fb, tb, _total) => ({
         id: 'c1',
         contract_id: cid,
         ledger,
@@ -448,6 +448,52 @@ describe('IndexerService — per-batch commits', () => {
     expect(cursorCalls).not.toContain('BEGIN');
     expect(cursorCalls).not.toContain('COMMIT');
   });
+
+  it('stop() lets the current batch commit and leaves cursor incomplete for resume', async () => {
+    const events = [
+      makeEvent('e1', 100),
+      makeEvent('e2', 200),
+      makeEvent('e3', 300),
+      makeEvent('e4', 400),
+    ];
+
+    const cursorClient = makeClient(async (sql) => {
+      if (sql.includes('COUNT')) return { rows: [{ count: '4' }] };
+      return { rows: [] };
+    });
+    const batchClient = makeClient(async (sql) => {
+      if (sql.includes('FROM historical_events')) return { rows: events.slice(0, 2) };
+      return { rows: [] };
+    });
+
+    let svc: IndexerService;
+    const cursorRepo = makeCursorRepo({
+      create: vi.fn(async (_c, cid, ledger) => ({
+        id: 'stop-cursor',
+        contract_id: cid,
+        ledger,
+        from_block: null,
+        to_block: null,
+        total_rows: 4,
+        last_committed_offset: 0,
+        started_at: new Date(),
+        completed_at: null,
+      })),
+      advanceOffset: vi.fn(async () => {
+        void svc.stop();
+      }),
+    });
+
+    const pool = makePool(cursorClient, batchClient);
+    svc = makeService(pool, cursorRepo, { batchSize: 2 });
+
+    await expect(svc.replayEvents(REQUEST)).resolves.toBeUndefined();
+
+    expect(cursorRepo.advanceOffset).toHaveBeenCalledWith(batchClient, 'stop-cursor', 2);
+    expect(batchClient.query).toHaveBeenCalledWith('COMMIT');
+    expect(cursorRepo.markCompleted).not.toHaveBeenCalled();
+    expect(replayLock.isHeld()).toBe(false);
+  });
 });
 
 // ── Crash-resume (partial commit) ─────────────────────────────────────────────
@@ -529,9 +575,7 @@ describe('IndexerService — crash-resume semantics', () => {
     });
 
     // This batch client throws during INSERT
-    let callCount = 0;
     const failingBatchClient = makeClient(async (sql) => {
-      callCount++;
       if (sql.trim() === 'BEGIN') return { rows: [] };
       if (sql.includes('FROM historical_events')) return { rows: [makeEvent('e1'), makeEvent('e2')] };
       if (sql.includes('INSERT INTO contract_events')) throw new Error('simulated DB failure');

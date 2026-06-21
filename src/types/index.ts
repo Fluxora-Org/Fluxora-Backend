@@ -1,12 +1,14 @@
+import type { QueryResultRow } from 'pg';
+
 /**
  * Contract event structure
  */
-export interface ContractEvent {
+export interface ContractEvent extends QueryResultRow {
   event_id: string;
   contract_id: string;
   ledger: number;
   event_type: string;
-  event_data: any;
+  event_data: unknown;
   block_height: number;
   transaction_hash: string;
   ingested_at?: Date | null;
@@ -36,7 +38,7 @@ export interface ReplayProgress {
  * Durable DB-backed cursor that persists replay progress across process crashes.
  * Stored in the `replay_cursors` table; updated atomically within each batch transaction.
  */
-export interface ReplayCursor {
+export interface ReplayCursor extends QueryResultRow {
   /** UUID primary key */
   id: string;
   contract_id: string;

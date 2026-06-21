@@ -1,6 +1,15 @@
 import express from 'express';
 import { config } from './config';
 import { indexerRouter } from './routes/indexer';
+import { getPool } from './db/pool';
+import { indexerService } from './indexer/service';
+import { closeAllRedisClients } from './redis/client';
+import {
+  addShutdownDrainHook,
+  addShutdownHook,
+  gracefulShutdown,
+} from './shutdown';
+import { drainSseConnections } from './streams/sseEmitter';
 
 const app = express();
 
@@ -16,7 +25,7 @@ app.get('/health', (req, res) => {
 app.use(indexerRouter);
 
 // Error handling middleware
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('Unhandled error:', err);
   res.status(500).json({
     error: 'Internal server error',
@@ -25,18 +34,31 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 });
 
 // Start server
-const server = app.listen(config.server.port, () => {
-  console.log(`Indexer service listening on port ${config.server.port}`);
+const port = Number.parseInt(process.env.PORT ?? '3000', 10);
+const server = app.listen(port, () => {
+  console.log(`Indexer service listening on port ${port}`);
   console.log(`Replay batch size: ${config.indexer.replayBatchSize}`);
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+addShutdownDrainHook(() => {
+  drainSseConnections();
 });
+addShutdownDrainHook(() => indexerService.stop());
+addShutdownHook(() => getPool().end());
+addShutdownHook(() => closeAllRedisClients());
+
+function handleShutdown(signal: NodeJS.Signals): void {
+  void gracefulShutdown(server, signal)
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error('Graceful shutdown failed:', err);
+      process.exit(1);
+    });
+}
+
+process.on('SIGTERM', handleShutdown);
+process.on('SIGINT', handleShutdown);
 
 export { app };

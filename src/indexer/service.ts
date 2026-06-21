@@ -251,6 +251,9 @@ export class IndexerService {
   private replayBudgetMs: number;
   private cursorRepo: ReplayCursorRepository;
   private pool: pg.Pool;
+  private stopRequested = false;
+  private replayDone: Promise<void> | null = null;
+  private resolveReplayDone: (() => void) | null = null;
 
   constructor(
     pool?: pg.Pool,
@@ -291,7 +294,14 @@ export class IndexerService {
     if (replayLock.isHeld()) {
       throw new Error('Replay operation already in progress');
     }
+    if (this.stopRequested) {
+      throw new Error('Replay service is stopping for shutdown');
+    }
     replayLock.acquire();
+    this.stopRequested = false;
+    this.replayDone = new Promise<void>((resolve) => {
+      this.resolveReplayDone = resolve;
+    });
 
     const replayStart = Date.now();
     let cursor: ReplayCursor | null = null;
@@ -322,10 +332,21 @@ export class IndexerService {
 
       let offset = cursor.last_committed_offset;
       let batchIndex = 0;
-      let lastBatchRowCount = 0;
 
       // 5. Per-batch loop — each iteration uses a fresh connection.
       while (offset < totalRows) {
+        if (this.stopRequested) {
+          logger.info('replay_stop_requested', undefined, {
+            event: 'replay_stop_requested',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            offset,
+            total_rows: totalRows,
+          });
+          break;
+        }
+
         // Budget guard: abort if the wall-clock limit has been exceeded.
         if (this.replayBudgetMs > 0) {
           const elapsed = Date.now() - replayStart;
@@ -350,7 +371,6 @@ export class IndexerService {
         const newOffset = offset + batchResult.rowsFetched;
         offset = newOffset;
         batchIndex++;
-        lastBatchRowCount = batchResult.rowsFetched;
 
         // Update in-memory progress.
         replayState.updateProgress(batchResult.rowsFetched, newOffset);
@@ -383,10 +403,28 @@ export class IndexerService {
           rows_remaining: Math.max(0, totalRows - newOffset),
           rows_per_sec: Math.round(rowsPerSec * 10) / 10,
         });
+
+        if (this.stopRequested) {
+          logger.info('replay_stop_requested', undefined, {
+            event: 'replay_stop_requested',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            offset: newOffset,
+            total_rows: totalRows,
+          });
+          break;
+        }
       }
 
-      // 6. Mark cursor as complete and record duration.
-      await this.completeCursor(cursor.id);
+      // 6. Mark cursor as complete only when all rows have committed. A
+      // shutdown stop leaves the cursor incomplete so the next replay resumes
+      // from the last transactionally persisted offset.
+      const completed = offset >= totalRows;
+
+      if (completed) {
+        await this.completeCursor(cursor.id);
+      }
       replayState.endReplay();
 
       const durationSec = (Date.now() - replayStart) / 1_000;
@@ -396,21 +434,48 @@ export class IndexerService {
       );
       indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);
 
-      logger.info('replay_completed', undefined, {
-        event: 'replay_completed',
-        contract_id: request.contract_id,
-        ledger: request.ledger,
-        cursor_id: cursor.id,
-        total_rows: totalRows,
-        duration_sec: Math.round(durationSec * 100) / 100,
-      });
+      if (completed) {
+        logger.info('replay_completed', undefined, {
+          event: 'replay_completed',
+          contract_id: request.contract_id,
+          ledger: request.ledger,
+          cursor_id: cursor.id,
+          total_rows: totalRows,
+          duration_sec: Math.round(durationSec * 100) / 100,
+        });
+      } else {
+        logger.info('replay_stopped', undefined, {
+          event: 'replay_stopped',
+          contract_id: request.contract_id,
+          ledger: request.ledger,
+          cursor_id: cursor.id,
+          committed_offset: offset,
+          total_rows: totalRows,
+          duration_sec: Math.round(durationSec * 100) / 100,
+        });
+      }
     } catch (error) {
       replayState.endReplay();
       indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);
       throw error;
     } finally {
       replayLock.release();
+      this.resolveReplayDone?.();
+      this.replayDone = null;
+      this.resolveReplayDone = null;
     }
+  }
+
+  /**
+   * Request that the replay loop stops at the next safe batch boundary.
+   *
+   * Already committed batches have advanced the durable cursor inside the same
+   * transaction as their inserts; leaving the cursor incomplete allows a later
+   * replay to resume without marking partial work as complete.
+   */
+  async stop(): Promise<void> {
+    this.stopRequested = true;
+    await this.replayDone;
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────────
@@ -477,6 +542,7 @@ export class IndexerService {
     offset: number,
     batchIndex: number,
   ): Promise<{ rowsFetched: number }> {
+    void batchIndex;
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');

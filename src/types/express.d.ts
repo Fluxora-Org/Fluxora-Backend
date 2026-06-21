@@ -16,6 +16,8 @@ declare global {
       id?: string;
       /** Attached by apiVersion middleware based on the Accept-Version header. */
       apiVersion?: string;
+      /** Attached by stream visibility middleware for scoped repository reads. */
+      callerAddress?: string;
     }
   }
 }
