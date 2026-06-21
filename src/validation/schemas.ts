@@ -10,18 +10,54 @@
  * @module validation/schemas
  */
 import { z } from 'zod';
+import {
+  MAX_DECIMAL_INTEGER_PART,
+  STELLAR_DECIMALS,
+} from '../serialization/decimal.js';
 
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
+const MAX_DECIMAL_INTEGER_PART_STRING = MAX_DECIMAL_INTEGER_PART.toString();
 
 /** Regex for valid Stellar public keys: G followed by 55 base32 characters */
 export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 
-/** Reusable decimal-string field schema */
+/** Returns true when the integer part is within the serializer's max magnitude. */
+function hasSupportedIntegerMagnitude(value: string): boolean {
+  if (!DECIMAL_STRING_REGEX.test(value)) return true;
+
+  const integerPart = value.split('.')[0]!.replace(/^[+-]/, '').replace(/^0+/, '') || '0';
+  if (integerPart.length !== MAX_DECIMAL_INTEGER_PART_STRING.length) {
+    return integerPart.length < MAX_DECIMAL_INTEGER_PART_STRING.length;
+  }
+
+  return integerPart <= MAX_DECIMAL_INTEGER_PART_STRING;
+}
+
+/** Returns true when the fractional precision fits Stellar's stroop scale. */
+function hasStellarFractionalPrecision(value: string): boolean {
+  if (!DECIMAL_STRING_REGEX.test(value)) return true;
+  return (value.split('.')[1]?.length ?? 0) <= STELLAR_DECIMALS;
+}
+
+/**
+ * Reusable decimal-string field schema for Stellar amount inputs.
+ *
+ * The regex keeps the public API strict about JSON string shape. The bounds
+ * refinements align accepted values with the decimal serializer's maximum
+ * integer magnitude and Stellar's seven-decimal stroop precision before values
+ * reach route or database code.
+ */
 function decimalStringField(fieldName: string) {
   return z
     .string({ error: `${fieldName} must be a decimal string, not a number` })
-    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
+    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`)
+    .refine(hasSupportedIntegerMagnitude, {
+      message: `${fieldName} exceeds maximum supported integer value ${MAX_DECIMAL_INTEGER_PART_STRING}`,
+    })
+    .refine(hasStellarFractionalPrecision, {
+      message: `${fieldName} must have at most ${STELLAR_DECIMALS} decimal places`,
+    });
 }
 
 /** Reusable Stellar public key field schema */

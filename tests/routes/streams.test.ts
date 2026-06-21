@@ -559,33 +559,20 @@ describe('streams routes', () => {
       expect(res.body.data.ratePerSecond).toBe('0.0000116');
     });
 
-    it('accepts large and high-precision decimal strings without numeric coercion', async () => {
-      const preciseBody = {
+    it('rejects decimal strings outside schema bounds before persistence', async () => {
+      const outOfBoundsBody = {
         ...validBody,
         depositAmount: '9007199254740993.000000000000000001',
         ratePerSecond: '+0.000000000000000001',
       };
-      mockUpsertStream.mockResolvedValue({
-        created: true,
-        stream: makeDbRecord({
-          amount: '9007199254740993.000000000000000001',
-          rate_per_second: '+0.000000000000000001',
-        }),
-      });
 
-      const res = await post(preciseBody, uniqueKey());
+      const res = await post(outOfBoundsBody, uniqueKey());
 
-      expect(res.status).toBe(201);
-      expect(mockUpsertStream).toHaveBeenCalledTimes(1);
-      expect(mockUpsertStream.mock.calls[0]?.[0]).toEqual(
-        expect.objectContaining({
-          amount: '9007199254740993.000000000000000001',
-          remaining_amount: '9007199254740993.000000000000000001',
-          rate_per_second: '+0.000000000000000001',
-        }),
-      );
-      expect(res.body.data.depositAmount).toBe('9007199254740993.000000000000000001');
-      expect(res.body.data.ratePerSecond).toBe('+0.000000000000000001');
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+      expect(res.body.error.details).toContain('depositAmount must have at most 7 decimal places');
+      expect(res.body.error.details).toContain('ratePerSecond must have at most 7 decimal places');
+      expect(mockUpsertStream).not.toHaveBeenCalled();
     });
   });
 
