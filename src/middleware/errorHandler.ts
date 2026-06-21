@@ -2,7 +2,9 @@ import type { Request, Response, NextFunction } from 'express';
 import { DecimalSerializationError } from '../serialization/decimal.js';
 import { SerializationLogger, error as logError } from '../utils/logger.js';
 import { errorResponse } from '../utils/response.js';
-import { QueryTimeoutError } from '../db/pool.js';
+import { ApiError } from '../errors.js';
+
+export { ApiError } from '../errors.js';
 
 export interface ApiErrorResponse {
   success: false;
@@ -26,18 +28,6 @@ export enum ApiErrorCode {
   GATEWAY_TIMEOUT = 'GATEWAY_TIMEOUT',
 }
 
-export class ApiError extends Error {
-  constructor(
-    public readonly code: ApiErrorCode,
-    message: string,
-    public readonly statusCode: number = 500,
-    public readonly details?: unknown,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
-}
-
 /**
  * Express error handler middleware
  */
@@ -49,7 +39,7 @@ export function errorHandler(
 ): void {
   const requestId = req.id ?? (res.locals['requestId'] as string | undefined);
 
-  if (err instanceof QueryTimeoutError) {
+  if (err.name === 'QueryTimeoutError') {
     res.status(504).json(
       errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
     );
@@ -70,9 +60,18 @@ export function errorHandler(
   }
 
   if (err instanceof ApiError) {
-    logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
+    const clientCode = err.expose ? err.code : ApiErrorCode.INTERNAL_ERROR;
+    const clientMessage = err.expose ? err.message : 'An unexpected error occurred. Please try again later.';
+    const clientDetails = err.expose ? err.details : undefined;
+    logError(`API error: ${err.message}`, {
+      code: err.code,
+      statusCode: err.statusCode,
+      details: err.details,
+      expose: err.expose,
+      requestId,
+    });
     res.status(err.statusCode).json(
-      errorResponse(err.code, err.message, err.details, requestId)
+      errorResponse(clientCode, clientMessage, clientDetails, requestId)
     );
     return;
   }
@@ -129,41 +128,41 @@ export function asyncHandler(
 }
 
 export function notFound(resource: string, id?: string): ApiError {
-  return new ApiError(ApiErrorCode.NOT_FOUND, id !== undefined ? `${resource} '${id}' not found` : `${resource} not found`, 404);
+  return new ApiError(404, ApiErrorCode.NOT_FOUND, id !== undefined ? `${resource} '${id}' not found` : `${resource} not found`);
 }
 
 export function validationError(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.VALIDATION_ERROR, message, 400, details);
+  return new ApiError(400, ApiErrorCode.VALIDATION_ERROR, message, details);
 }
 
 export function conflictError(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.CONFLICT, message, 409, details);
+  return new ApiError(409, ApiErrorCode.CONFLICT, message, details);
 }
 
 export function serviceUnavailable(message: string): ApiError {
-  return new ApiError(ApiErrorCode.SERVICE_UNAVAILABLE, message, 503);
+  return new ApiError(503, ApiErrorCode.SERVICE_UNAVAILABLE, message);
 }
 
 export function unauthorized(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.UNAUTHORIZED, message, 401, details);
+  return new ApiError(401, ApiErrorCode.UNAUTHORIZED, message, details);
 }
 
 export function forbidden(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.FORBIDDEN, message, 403, details);
+  return new ApiError(403, ApiErrorCode.FORBIDDEN, message, details);
 }
 
 export function payloadTooLarge(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.PAYLOAD_TOO_LARGE, message, 413, details);
+  return new ApiError(413, ApiErrorCode.PAYLOAD_TOO_LARGE, message, details);
 }
 
 export function tooManyRequests(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
+  return new ApiError(429, ApiErrorCode.TOO_MANY_REQUESTS, message, details);
 }
 
 export function requestTimeout(message: string): ApiError {
-  return new ApiError(ApiErrorCode.REQUEST_TIMEOUT, message, 408);
+  return new ApiError(408, ApiErrorCode.REQUEST_TIMEOUT, message);
 }
 
 export function gatewayTimeout(message: string): ApiError {
-  return new ApiError(ApiErrorCode.GATEWAY_TIMEOUT, message, 504);
+  return new ApiError(504, ApiErrorCode.GATEWAY_TIMEOUT, message);
 }

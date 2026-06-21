@@ -1,33 +1,62 @@
 import { randomUUID } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
-import { ApiError as MiddlewareApiError } from './middleware/errorHandler.js';
 
+/**
+ * Canonical API error type.
+ *
+ * `expose=false` keeps internal messages/details out of client responses while
+ * preserving the original error metadata for logs.
+ */
 export class ApiError extends Error {
-  status: number;
-  code: string;
-  details: Record<string, unknown> | undefined;
-  expose: boolean;
+  readonly status: number;
+  readonly statusCode: number;
+  readonly code: string;
+  readonly details: unknown | undefined;
+  readonly expose: boolean;
 
   constructor(
     status: number,
     code: string,
     message: string,
-    details?: Record<string, unknown>,
+    details?: unknown,
+    expose?: boolean,
+  );
+  constructor(
+    code: string,
+    message: string,
+    statusCode?: number,
+    details?: unknown,
+    expose?: boolean,
+  );
+  constructor(
+    statusOrCode: number | string,
+    codeOrMessage: string,
+    messageOrStatusCode: string | number = 500,
+    details?: unknown,
     expose = true,
   ) {
-    super(message);
+    const legacyOrder = typeof statusOrCode === 'string';
+    const status = legacyOrder
+      ? (typeof messageOrStatusCode === 'number' ? messageOrStatusCode : 500)
+      : statusOrCode;
+    const code = legacyOrder ? statusOrCode : codeOrMessage;
+    const resolvedMessage = legacyOrder ? codeOrMessage : String(messageOrStatusCode);
+
+    super(resolvedMessage);
+    this.name = 'ApiError';
     this.status = status;
+    this.statusCode = status;
     this.code = code;
     this.details = details;
     this.expose = expose;
   }
 }
 
-export function serviceUnavailable(message: string, details?: Record<string, unknown>): ApiError {
+export function serviceUnavailable(message: string, details?: unknown): ApiError {
   return new ApiError(503, 'service_unavailable', message, details);
 }
 
-export function unauthorizedError(message: string, details?: Record<string, unknown>): ApiError {
+export function unauthorizedError(message: string, details?: unknown): ApiError {
   return new ApiError(401, 'unauthorized', message, details);
 }
 
@@ -52,11 +81,6 @@ function normalizeExpressError(error: unknown): ApiError {
     return new ApiError(413, 'payload_too_large', 'Request body exceeds the 256 KiB limit');
   }
   if (error instanceof ApiError) return error;
-
-  // Also handle ApiError from middleware/errorHandler (streams route)
-  if (error instanceof MiddlewareApiError) {
-    return new ApiError(error.statusCode, error.code, error.message, undefined, true);
-  }
 
   return new ApiError(500, 'internal_error', 'Internal server error', undefined, false);
 }
@@ -88,11 +112,11 @@ export function errorHandler(
 
   const errorBody: Record<string, unknown> = {
     code: normalized.code,
-    message: normalized.message,
+    message: normalized.expose ? normalized.message : 'Internal server error',
     status: normalized.status,
     requestId,
   };
-  if (normalized.details !== undefined) {
+  if (normalized.expose && normalized.details !== undefined) {
     errorBody['details'] = normalized.details;
   }
 
