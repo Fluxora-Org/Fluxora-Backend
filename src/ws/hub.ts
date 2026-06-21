@@ -66,6 +66,8 @@ export const RATE_LIMIT_WINDOW_MS = 10_000;
 export const BACKPRESSURE_DROP_BYTES = 1 * 1024 * 1024;
 export const BACKPRESSURE_TERMINATE_BYTES = 4 * 1024 * 1024;
 export const FANOUT_YIELD_BATCH = 256;
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -112,6 +114,10 @@ interface ClientState {
   metrics: ConnectionMetrics;
   subscriptionFilters: Map<string, SubscriptionFilter>;
   messageTimestamps: number[];
+  isAlive: boolean;
+  awaitingPong: boolean;
+  lastPongAt: number;
+  lastPingAt?: number;
 }
 
 // ── Hub options ───────────────────────────────────────────────────────────────
@@ -133,6 +139,16 @@ export interface StreamHubOptions {
    * When absent, replayFromCursor sends an empty result.
    */
   eventStore?: ContractEventStore;
+  /**
+   * Milliseconds between server ping frames. Defaults to
+   * WS_HEARTBEAT_INTERVAL_MS or 30 seconds.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * Milliseconds a socket may go without answering the latest ping before the
+   * hub terminates it. Defaults to WS_HEARTBEAT_TIMEOUT_MS or 60 seconds.
+   */
+  heartbeatTimeoutMs?: number;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -146,6 +162,9 @@ export class StreamHub extends EventEmitter {
   private readonly ownsDedup: boolean;
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private heartbeatInterval: NodeJS.Timeout | undefined;
   private eventStore: ContractEventStore | undefined;
 
   public getEventStore(): ContractEventStore | undefined {
@@ -177,6 +196,17 @@ export class StreamHub extends EventEmitter {
     this.jwtSecret = options?.jwtSecret ?? process.env.JWT_SECRET;
 
     this.eventStore = options?.eventStore;
+
+    this.heartbeatIntervalMs = this.resolvePositiveInteger(
+      options?.heartbeatIntervalMs,
+      'WS_HEARTBEAT_INTERVAL_MS',
+      DEFAULT_HEARTBEAT_INTERVAL_MS,
+    );
+    this.heartbeatTimeoutMs = this.resolvePositiveInteger(
+      options?.heartbeatTimeoutMs,
+      'WS_HEARTBEAT_TIMEOUT_MS',
+      DEFAULT_HEARTBEAT_TIMEOUT_MS,
+    );
 
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
@@ -219,6 +249,8 @@ export class StreamHub extends EventEmitter {
     this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       this.onConnect(ws, req);
     });
+
+    this.startHeartbeat();
   }
 
   // ── Connection lifecycle ───────────────────────────────────────────────────
@@ -238,6 +270,9 @@ export class StreamHub extends EventEmitter {
       metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
       subscriptionFilters: new Map(),
       messageTimestamps: [],
+      isAlive: true,
+      awaitingPong: false,
+      lastPongAt: connectedAt,
     };
     if (correlationId !== undefined) {
       state.correlationId = correlationId;
@@ -285,6 +320,7 @@ export class StreamHub extends EventEmitter {
       this.handleMessage(ws, raw);
     });
 
+    ws.on('pong', () => this.markAlive(ws));
     ws.on('close', (code, reason) => this.onDisconnect(ws, code, reason));
     ws.on('error', () => ws.close(1011, 'Internal Error'));
   }
@@ -310,6 +346,74 @@ export class StreamHub extends EventEmitter {
     });
 
     this.clients.delete(ws);
+  }
+
+  /**
+   * Send periodic WebSocket ping control frames and reap half-open sockets that
+   * stop answering. Reaping routes through onDisconnect so connection-limiter
+   * counters and subscription indexes are released exactly once.
+   */
+  private startHeartbeat(): void {
+    if (this.heartbeatInterval !== undefined) return;
+    this.heartbeatInterval = setInterval(() => this.runHeartbeat(), this.heartbeatIntervalMs);
+    this.heartbeatInterval.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval === undefined) return;
+    clearInterval(this.heartbeatInterval);
+    this.heartbeatInterval = undefined;
+  }
+
+  private runHeartbeat(now = Date.now()): void {
+    for (const [ws, state] of this.clients) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+
+      if (
+        state.awaitingPong &&
+        state.lastPingAt !== undefined &&
+        now - state.lastPingAt >= this.heartbeatTimeoutMs
+      ) {
+        this.reapDeadConnection(ws, state, now - state.lastPingAt);
+        continue;
+      }
+
+      if (state.awaitingPong) continue;
+
+      state.isAlive = false;
+      state.awaitingPong = true;
+      state.lastPingAt = now;
+      try {
+        ws.ping();
+      } catch {
+        this.reapDeadConnection(ws, state, 0);
+      }
+    }
+  }
+
+  private markAlive(ws: WebSocket): void {
+    const state = this.clients.get(ws);
+    if (!state) return;
+    state.isAlive = true;
+    state.awaitingPong = false;
+    state.lastPongAt = Date.now();
+    delete state.lastPingAt;
+  }
+
+  private reapDeadConnection(ws: WebSocket, state: ClientState, missedMs: number): void {
+    logger.warn('WebSocket heartbeat missed; terminating stale connection', state.correlationId, {
+      event: 'ws_heartbeat_reap',
+      connectionId: state.id,
+      ip: state.ip,
+      missedMs,
+    });
+
+    try {
+      ws.terminate();
+    } catch {
+      // no-op
+    }
+    this.onDisconnect(ws, 4000, Buffer.from('heartbeat-timeout'));
   }
 
   // ── Rate limiting ──────────────────────────────────────────────────────────
@@ -723,6 +827,15 @@ export class StreamHub extends EventEmitter {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', code, message }));
   }
 
+  private resolvePositiveInteger(
+    optionValue: number | undefined,
+    envName: string,
+    fallback: number,
+  ): number {
+    const raw = optionValue ?? Number.parseInt(process.env[envName] ?? '', 10);
+    return Number.isSafeInteger(raw) && raw > 0 ? raw : fallback;
+  }
+
   get clientCount(): number {
     return this.clients.size;
   }
@@ -821,6 +934,7 @@ export class StreamHub extends EventEmitter {
   }
 
   async close(cb?: () => void): Promise<void> {
+    this.stopHeartbeat();
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
   }

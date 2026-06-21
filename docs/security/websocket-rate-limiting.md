@@ -15,6 +15,29 @@ The following environment variables control the connection limiting behavior:
 | `WS_MAX_CONNECTIONS_PER_IP` | `10` | Maximum number of concurrent WebSocket connections allowed from a single IP. |
 | `WS_ABUSE_THRESHOLD` | `5` | Number of rejected connection attempts allowed within a sliding window before an IP is banned. |
 | `WS_BAN_TTL_S` | `3600` | Duration (in seconds) for which an IP is banned after triggering the abuse threshold. |
+| `WS_HEARTBEAT_INTERVAL_MS` | `30000` | Interval between server ping control frames sent to connected clients. |
+| `WS_HEARTBEAT_TIMEOUT_MS` | `60000` | Time a socket may wait for a pong response before the hub terminates it. |
+
+## Heartbeat Reaping
+
+The WebSocket hub sends periodic ping control frames to every connected client.
+Each connection is marked alive when it is accepted and again whenever the
+server receives a `pong` frame. If a socket does not answer the latest ping
+within `WS_HEARTBEAT_TIMEOUT_MS`, the hub terminates it and runs the normal
+disconnect cleanup path.
+
+This cleanup path removes stream and recipient subscriptions and decrements the
+per-IP connection count maintained by the limiter. As a result, half-open
+connections behind proxies or firewalls cannot keep occupying an IP's
+connection slots forever.
+
+Heartbeat pongs are only liveness signals. They do not reset abuse-ban state,
+increase rate limits, or let a banned IP bypass `WS_MAX_CONNECTIONS_PER_IP`.
+
+```env
+WS_HEARTBEAT_INTERVAL_MS=30000
+WS_HEARTBEAT_TIMEOUT_MS=60000
+```
 
 ## Connection Rejection
 

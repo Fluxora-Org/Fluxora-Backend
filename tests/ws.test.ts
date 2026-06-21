@@ -19,26 +19,29 @@ import {
   StreamHubOptions,
   MAX_MESSAGE_BYTES,
   RATE_LIMIT_MAX,
-  RATE_LIMIT_WINDOW_MS,
 } from '../src/ws/hub.js';
-import { InMemoryDedupCache } from '../src/redis/dedup.js';
+import { _resetLimiter } from '../src/ws/connectionLimiter.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function createTestServer(): { server: http.Server; hub: StreamHub; port: number } {
+async function setup(): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  _resetLimiter();
   const server = http.createServer();
   const hub = new StreamHub(server);
-  return new Promise<{ server: http.Server; hub: StreamHub; port: number }>((resolve) => {
+  return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const addr = server.address() as { port: number };
       resolve({ server, hub, port: addr.port });
     });
-  }) as unknown as { server: http.Server; hub: StreamHub; port: number };
+  });
 }
 
-async function setup(): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+async function setupWithOptions(
+  options: StreamHubOptions,
+): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  _resetLimiter();
   const server = http.createServer();
-  const hub = new StreamHub(server);
+  const hub = new StreamHub(server, options);
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const addr = server.address() as { port: number };
@@ -439,11 +442,13 @@ describe('WebSocket hub — RPC dependency failure modes', () => {
 });
 
 describe('WebSocket hub — backpressure strategy', () => {
+  const originalEnv = { ...process.env };
   let server: http.Server;
   let hub: StreamHub;
   let port: number;
 
   beforeEach(async () => {
+    process.env = { ...originalEnv, WS_MAX_CONNECTIONS_PER_IP: '512' };
     ({ server, hub, port } = await setup());
     hub._resetDedup();
     hub._resetMetrics();
@@ -451,6 +456,8 @@ describe('WebSocket hub — backpressure strategy', () => {
 
   afterEach(async () => {
     await teardown(server, hub);
+    _resetLimiter();
+    process.env = originalEnv;
   });
 
   it('preserves decimal-string payload fields verbatim (no Number coercion)', async () => {
@@ -691,6 +698,83 @@ describe('WebSocket hub — backpressure strategy', () => {
   });
 });
 
+describe('WebSocket hub — heartbeat reaping', () => {
+  const originalEnv = { ...process.env };
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+
+  beforeEach(async () => {
+    process.env = { ...originalEnv, WS_MAX_CONNECTIONS_PER_IP: '1' };
+    _resetLimiter();
+    ({ server, hub, port } = await setupWithOptions({
+      heartbeatIntervalMs: 10_000,
+      heartbeatTimeoutMs: 5,
+    }));
+  });
+
+  afterEach(async () => {
+    await teardown(server, hub);
+    _resetLimiter();
+    process.env = originalEnv;
+  });
+
+  it('pings connected sockets and marks them alive on pong', async () => {
+    const ws = await connect(port);
+    const serverSocket = Array.from((hub as any).clients.keys())[0] as WebSocket;
+    const pingSpy = vi.spyOn(serverSocket, 'ping').mockImplementation(() => undefined);
+
+    (hub as any).runHeartbeat(1_000);
+
+    const state = (hub as any).clients.get(serverSocket) as any;
+    expect(pingSpy).toHaveBeenCalledTimes(1);
+    expect(state.awaitingPong).toBe(true);
+    expect(state.isAlive).toBe(false);
+
+    serverSocket.emit('pong', Buffer.alloc(0));
+
+    expect(state.awaitingPong).toBe(false);
+    expect(state.isAlive).toBe(true);
+    expect(state.lastPingAt).toBeUndefined();
+
+    ws.close();
+  });
+
+  it('terminates half-open sockets and releases the per-IP connection slot', async () => {
+    const staleClient = await connect(port);
+    const serverSocket = Array.from((hub as any).clients.keys())[0] as WebSocket;
+    vi.spyOn(serverSocket, 'ping').mockImplementation(() => undefined);
+    const terminateSpy = vi.spyOn(serverSocket, 'terminate').mockImplementation(() => undefined);
+
+    (hub as any).runHeartbeat(2_000);
+    (hub as any).runHeartbeat(2_006);
+
+    expect(terminateSpy).toHaveBeenCalledTimes(1);
+    expect(hub.clientCount).toBe(0);
+
+    const replacement = await connect(port);
+    await sleep(30);
+    expect(hub.clientCount).toBe(1);
+
+    staleClient.close();
+    replacement.close();
+  });
+
+  it('clears the heartbeat interval on close', async () => {
+    expect((hub as any).heartbeatInterval).toBeDefined();
+
+    await teardown(server, hub);
+
+    expect((hub as any).heartbeatInterval).toBeUndefined();
+
+    // afterEach should not close it again.
+    server = http.createServer();
+    hub = new StreamHub(server, { heartbeatIntervalMs: 10_000, heartbeatTimeoutMs: 5 });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as { port: number }).port;
+  });
+});
+
 describe('WebSocket hub — observability and metrics', () => {
   let server: http.Server;
   let hub: StreamHub;
@@ -781,6 +865,7 @@ function makeToken(payload: object = { sub: 'user-1' }, secret = TEST_JWT_SECRET
 }
 
 async function setupWithAuth(opts: { wsAuthRequired: boolean; jwtSecret?: string } = { wsAuthRequired: true }): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  _resetLimiter();
   const server = http.createServer();
   const hub = new StreamHub(server, {
     wsAuthRequired: opts.wsAuthRequired,
@@ -936,6 +1021,7 @@ function makeStoreRecord(eventId: string, ledger: number, topic = 'stream.create
 }
 
 async function setupWithStore(store: InMemoryContractEventStore): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  _resetLimiter();
   const server = http.createServer();
   const hub = new StreamHub(server, { eventStore: store });
   return new Promise((resolve) => {
