@@ -549,6 +549,19 @@ Emitted by `src/ws/hub.ts` for every `broadcast()` call that delivers at least o
 
 This span uses `eventId` as its `traceId` because broadcasts happen outside an HTTP request context.
 
+### Server-Sent Events Fan-Out - `sse.dispatch`
+
+Emitted by `src/streams/sseEmitter.ts` for each live SSE stream update delivered through the shared SSE dispatcher.
+
+| Attribute | Value |
+|-----------|-------|
+| `span.name` | `sse.dispatch` |
+| `sse.stream_id` | Stream being emitted |
+| `sse.event_id` | Unique update event identifier |
+| `sse.subscriber_count` | Number of SSE subscribers targeted by the fan-out |
+
+The span is per update, not per subscriber, so fan-out cardinality stays bounded. SSE `data:` frames also include `correlationId` and `traceId` with the same non-sensitive correlation identifier so browser/EventSource clients can correlate a received update with backend logs and spans.
+
 ---
 
 ## correlationId Propagation Through Async Boundaries

@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import type { StreamEventRecord } from '../db/types.js';
+import { traceSseDispatch } from '../tracing/hooks.js';
 
 export const SSE_STREAM_UPDATE_EVENT = 'stream_update';
 
@@ -38,13 +39,16 @@ function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
 
   // Snapshot before iterating so a subscriber can disconnect during delivery
   // without mutating the Set currently being traversed.
-  for (const subscriber of Array.from(subscribers)) {
-    try {
-      subscriber(event);
-    } catch {
-      // Isolate one failing connection from the rest of the stream fan-out.
+  const targets = Array.from(subscribers);
+  traceSseDispatch(event.streamId, event.eventId, targets.length, event.correlationId, () => {
+    for (const subscriber of targets) {
+      try {
+        subscriber(event);
+      } catch {
+        // Isolate one failing connection from the rest of the stream fan-out.
+      }
     }
-  }
+  });
 }
 
 function isDispatchAttached(): boolean {

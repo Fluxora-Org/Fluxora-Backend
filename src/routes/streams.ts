@@ -95,8 +95,6 @@ import {
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
 import {
-  RedisIdempotencyStore,
-  NoOpIdempotencyStore,
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
@@ -254,32 +252,12 @@ function decodeCursor(cursor: string): StreamsCursor {
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
 
-function parseLimit(limitParam: unknown): number {
-  if (limitParam === undefined) return 50;
-  if (Array.isArray(limitParam) || typeof limitParam !== 'string' || !/^\d+$/.test(limitParam)) {
-    throw validationError('limit must be an integer between 1 and 100');
-  }
-  const n = Number.parseInt(limitParam, 10);
-  if (n < 1 || n > 100) throw validationError('limit must be an integer between 1 and 100');
-  return n;
-}
-
 function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
   if (cursorParam === undefined) return undefined;
   if (Array.isArray(cursorParam) || typeof cursorParam !== 'string' || cursorParam.trim() === '') {
     throw validationError('cursor must be a valid opaque pagination token');
   }
   return decodeCursor(cursorParam);
-}
-
-function parseIncludeTotal(includeTotalParam: unknown): boolean {
-  if (includeTotalParam === undefined) return false;
-  if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
-    throw validationError('include_total must be true or false');
-  }
-  if (includeTotalParam === 'true') return true;
-  if (includeTotalParam === 'false') return false;
-  throw validationError('include_total must be true or false');
 }
 
 // ── Body normaliser ───────────────────────────────────────────────────────────
@@ -1034,6 +1012,7 @@ streamsRouter.get(
                     eventId: event.eventId,
                     payload: event.payload,
                     correlationId: req.correlationId,
+                    traceId: req.correlationId,
                   })}\n\n`,
                 );
                 if (!written) break;
@@ -1073,6 +1052,7 @@ streamsRouter.get(
     // 6. Subscribe to Real-Time Updates.
     const listener = (event: StreamUpdateEvent) => {
       if (event.streamId === id) {
+        const traceId = event.correlationId || req.correlationId;
         writeSse(
           `id: ${event.eventId}\n` +
           `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
@@ -1081,7 +1061,8 @@ streamsRouter.get(
             streamId: event.streamId,
             eventId: event.eventId,
             payload: event.payload,
-            correlationId: req.correlationId || event.correlationId,
+            correlationId: traceId,
+            traceId,
           })}\n\n`,
         );
       }

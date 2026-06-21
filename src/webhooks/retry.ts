@@ -134,62 +134,6 @@ export function isRetryableStatusCode(
   return policy.retryableStatusCodes.includes(statusCode);
 }
 
-/** Return the absolute timestamp for the next retry attempt. */
-export function calculateNextRetryTime(
-  attemptNumber: number,
-  policy: EnhancedRetryPolicy,
-  now: number = Date.now(),
-): number {
-  const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
-  return now + delayMs;
-}
-
-/** Generate retry metadata for every configured attempt. */
-export function generateRetrySchedule(
-  policy: EnhancedRetryPolicy,
-  now: number = Date.now(),
-): RetrySchedule[] {
-  return Array.from({ length: policy.maxAttempts }, (_, index) => {
-    const attemptNumber = index + 1;
-    const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
-
-    return {
-      attemptNumber,
-      delayMs,
-      retryAt: now + delayMs,
-    };
-  });
-}
-
-/** Attach retry metadata to an outbox payload and return the next retry time. */
-export function scheduleWebhookOutboxRetry(input: WebhookOutboxRetryInput): WebhookOutboxRetryPlan {
-  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
-  const nextAttemptNumber = input.attemptNumber + 1;
-
-  if (nextAttemptNumber > policy.maxAttempts) {
-    return {
-      shouldRetry: false,
-      attemptNumber: input.attemptNumber,
-      retryAt: null,
-      payload: input.payload,
-    };
-  }
-
-  const payload =
-    typeof input.payload === 'object' && input.payload !== null && !Array.isArray(input.payload)
-      ? { ...(input.payload as Record<string, unknown>), _webhookRetry: { attemptNumber: nextAttemptNumber } }
-      : { _webhookRetry: { attemptNumber: nextAttemptNumber } };
-
-  return {
-    shouldRetry: true,
-    attemptNumber: nextAttemptNumber,
-    retryAt: new Date(calculateNextRetryTime(input.attemptNumber, policy, input.now)),
-    payload,
-  };
-  const retryable = policy.retryableStatusCodes ?? DEFAULT_RETRY_POLICY.retryableStatusCodes;
-  return retryable.includes(statusCode);
-}
-
 /**
  * Calculate the absolute timestamp (ms since epoch) at which the next retry
  * should be attempted, or 0 if the attempt number has reached maxAttempts.

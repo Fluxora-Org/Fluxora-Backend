@@ -30,6 +30,7 @@ import {
   traceRedisCommand,
   traceStellarRpc,
   traceWebhookDispatch,
+  traceSseDispatch,
   recordWsBroadcast,
 } from '../../src/tracing/hooks.js';
 import { SpanBuffer } from '../../src/tracing/builtin.js';
@@ -293,6 +294,41 @@ describe('traceWebhookDispatch', () => {
   });
 });
 
+describe('traceSseDispatch', () => {
+  let buffer: SpanBuffer;
+
+  beforeEach(() => {
+    buffer = new SpanBuffer({ logEvents: false });
+    resetTracer();
+    initializeTracer({ enabled: true, hooks: buffer });
+  });
+  afterEach(() => resetTracer());
+
+  it('returns the result of fn', () => {
+    const result = traceSseDispatch('stream-1', 'evt-1', 2, 'corr-1', () => 'sent');
+    expect(result).toBe('sent');
+  });
+
+  it('records a span with sse.* attributes', () => {
+    traceSseDispatch('stream-1', 'evt-1', 2, 'corr-1', () => {});
+
+    const spans = buffer.getSpans();
+    expect(spans[0].context.traceId).toBe('corr-1');
+    expect(spans[0].context.tags?.['sse.stream_id']).toBe('stream-1');
+    expect(spans[0].context.tags?.['sse.event_id']).toBe('evt-1');
+    expect(spans[0].context.tags?.['sse.subscriber_count']).toBe(2);
+    expect(spans[0].status).toBe('ok');
+  });
+
+  it('marks span as error when fan-out throws', () => {
+    expect(() => traceSseDispatch('stream-1', 'evt-1', 2, 'corr-1', () => {
+      throw new Error('write failed');
+    })).toThrow('write failed');
+
+    expect(buffer.getSpans()[0].status).toBe('error');
+  });
+});
+
 describe('recordWsBroadcast', () => {
   it('is a no-op when there is no active OTel span', () => {
     expect(() => recordWsBroadcast('stream-1', 'evt-1', 5)).not.toThrow();
@@ -318,6 +354,11 @@ describe('helpers with tracing disabled', () => {
 
   it('traceWebhookDispatch still returns fn result when tracing is disabled', async () => {
     const result = await traceWebhookDispatch('stream.created', 'https://x.com', 0, async () => true);
+    expect(result).toBe(true);
+  });
+
+  it('traceSseDispatch still returns fn result when tracing is disabled', () => {
+    const result = traceSseDispatch('stream-1', 'evt-1', 0, undefined, () => true);
     expect(result).toBe(true);
   });
 });

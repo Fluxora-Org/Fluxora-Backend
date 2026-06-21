@@ -11,6 +11,7 @@ import {
   getLiveSseSubscriberCount,
   SSE_STREAM_UPDATE_EVENT,
   sseEventBus,
+  subscribeToSseStream,
 } from '../../src/streams/sseEmitter.js';
 import { getStreamHub } from '../../src/ws/hub.js';
 import { generateToken } from '../../src/lib/auth.js';
@@ -20,6 +21,8 @@ import {
 } from '../../src/streams/sseConnectionLimiter.js';
 import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
 import { StaleCursorError } from '../../src/indexer/store.js';
+import { SpanBuffer } from '../../src/tracing/builtin.js';
+import { initializeTracer, resetTracer } from '../../src/tracing/hooks.js';
 
 // ── Mock the repository and Redis before importing the app ──────────────────────────────
 const mockGetById = vi.fn();
@@ -213,6 +216,8 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     process.env.SSE_MAX_CONNECTION_DURATION_MS = String(30 * 60 * 1000);
     process.env.SSE_RETRY_AFTER_SECONDS = '15';
     _resetSseConnectionLimiter();
+    resetTracer();
+    initializeTracer({ enabled: false });
     mockGetById.mockResolvedValue(undefined);
     mockGetEvents.mockResolvedValue({ events: [], total: 0 });
     
@@ -229,6 +234,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    resetTracer();
     _resetSseConnectionLimiter();
     _resetSseSubscriptionsForTest();
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -444,17 +450,23 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
 
   it('streams live events via sseEventBus', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+    const spanBuffer = new SpanBuffer({ logEvents: false });
+    resetTracer();
+    initializeTracer({ enabled: true, hooks: spanBuffer });
 
     const resPromise = new Promise<string>((resolve) => {
       const req = http.get(`http://127.0.0.1:${port}/api/streams/stream-123/events`, (res) => {
         let data = '';
+        let liveEventEmitted = false;
         res.on('data', (chunk) => {
           data += chunk.toString();
-          if (data.includes(': ok\n\n')) {
+          if (!liveEventEmitted && data.includes(': ok\n\n')) {
+            liveEventEmitted = true;
             sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, {
               streamId: 'stream-123',
               eventId: 'evt-live-001',
               payload: { status: 'cancelled' },
+              correlationId: 'corr-live-001',
             });
           }
           if (data.includes('evt-live-001') && data.includes('cancelled')) {
@@ -470,6 +482,54 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     expect(output).toContain('id: evt-live-001');
     expect(output).toContain('event: stream_update');
     expect(output).toContain('cancelled');
+    expect(output).toContain('"correlationId":"corr-live-001"');
+    expect(output).toContain('"traceId":"corr-live-001"');
+
+    const sseSpans = spanBuffer.getSpans().filter(
+      (span) => span.context.tags?.['span.name'] === 'sse.dispatch',
+    );
+    expect(sseSpans).toHaveLength(1);
+    expect(sseSpans[0].context.traceId).toBe('corr-live-001');
+    expect(sseSpans[0].context.tags).toMatchObject({
+      'span.name': 'sse.dispatch',
+      'sse.stream_id': 'stream-123',
+      'sse.event_id': 'evt-live-001',
+      'sse.subscriber_count': 1,
+    });
+    expect(sseSpans[0].status).toBe('ok');
+  });
+
+  it('closes the SSE fan-out span when one subscriber throws', () => {
+    const spanBuffer = new SpanBuffer({ logEvents: false });
+    resetTracer();
+    initializeTracer({ enabled: true, hooks: spanBuffer });
+
+    const unsubscribeThrowing = subscribeToSseStream('stream-123', () => {
+      throw new Error('socket closed');
+    });
+    const delivered = vi.fn();
+    const unsubscribeHealthy = subscribeToSseStream('stream-123', delivered);
+
+    sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, {
+      streamId: 'stream-123',
+      eventId: 'evt-live-throw',
+      payload: { status: 'active' },
+      correlationId: 'corr-live-throw',
+    });
+
+    expect(delivered).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: 'evt-live-throw',
+      correlationId: 'corr-live-throw',
+    }));
+
+    const spans = spanBuffer.getSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].context.traceId).toBe('corr-live-throw');
+    expect(spans[0].context.tags?.['sse.subscriber_count']).toBe(2);
+    expect(spans[0].status).toBe('ok');
+
+    unsubscribeThrowing();
+    unsubscribeHealthy();
   });
 
   it('removes listener when client disconnects', async () => {

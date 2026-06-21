@@ -19,6 +19,7 @@ import {
   initializeTracer,
   getTracer,
   resetTracer,
+  traceSseDispatch,
 } from '../../src/tracing/hooks.js';
 import {
   SpanBuffer,
@@ -428,6 +429,56 @@ describe('Distributed Tracing Hooks', () => {
       const retrieved = tracer.getSpan(span.context.spanId);
 
       expect(retrieved).toBe(span);
+    });
+  });
+
+  describe('traceSseDispatch helper', () => {
+    it('records one span per fan-out with bounded subscriber count', () => {
+      const buffer = new SpanBuffer({ logEvents: false });
+      initializeTracer({ enabled: true, hooks: buffer });
+
+      const result = traceSseDispatch(
+        'stream-123',
+        'evt-123',
+        3,
+        'corr-sse-123',
+        () => 'delivered',
+      );
+
+      expect(result).toBe('delivered');
+      const spans = buffer.getSpans();
+      expect(spans).toHaveLength(1);
+      expect(spans[0].context.traceId).toBe('corr-sse-123');
+      expect(spans[0].context.serviceName).toBe('fluxora-sse');
+      expect(spans[0].context.tags).toMatchObject({
+        'span.name': 'sse.dispatch',
+        'sse.stream_id': 'stream-123',
+        'sse.event_id': 'evt-123',
+        'sse.subscriber_count': 3,
+      });
+      expect(spans[0].events[0].name).toBe('sse.dispatch');
+      expect(spans[0].status).toBe('ok');
+    });
+
+    it('closes the span as error when fan-out throws', () => {
+      const buffer = new SpanBuffer({ logEvents: false });
+      initializeTracer({ enabled: true, hooks: buffer });
+
+      expect(() => traceSseDispatch(
+        'stream-123',
+        'evt-err',
+        1,
+        'corr-sse-err',
+        () => {
+          throw new Error('subscriber write failed');
+        },
+      )).toThrow('subscriber write failed');
+
+      const spans = buffer.getSpans();
+      expect(spans).toHaveLength(1);
+      expect(spans[0].status).toBe('error');
+      expect(spans[0].statusMessage).toBe('subscriber write failed');
+      expect(spans[0].events[0].name).toBe('sse.dispatch.error');
     });
   });
 

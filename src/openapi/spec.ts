@@ -249,23 +249,6 @@ const StreamListPage = registry.register(
   }),
 );
 
-/** 400 body specific to invalid/expired cursor. */
-const InvalidCursorError = z.object({
-  success: z.literal(false),
-  error: z.object({
-    code: z.literal('VALIDATION_ERROR').openapi({ example: 'VALIDATION_ERROR' }),
-    message: z.string().openapi({
-      example: 'cursor must be a valid opaque pagination token',
-    }),
-  }),
-}).openapi({
-  description:
-    'Returned when the `cursor` parameter is present but cannot be decoded ' +
-    '(bad base64url, wrong JSON shape, missing version tag, or empty lastId). ' +
-    'The client must discard the cursor and restart pagination from the first page ' +
-    'by omitting the `cursor` parameter.',
-});
-
 registry.registerPath({
   method: 'get', path: '/api/streams',
   summary: 'List streams (cursor-paginated)',
@@ -291,7 +274,7 @@ registry.registerPath({
       }),
       cursor: z.string().optional().openapi({
         description:
-          'Opaque cursor from the previous page's `next_cursor`. ' +
+          "Opaque cursor from the previous page's `next_cursor`. " +
           'Omit to request the first page. ' +
           'Treated as a black box — do not construct manually.',
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',

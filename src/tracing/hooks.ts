@@ -466,7 +466,7 @@ export function resetTracer(): void {
 // produced by auto-instrumentation.  All helpers are no-ops when tracing is
 // disabled (traceSpan delegates to the global Tracer which short-circuits).
 
-import { trace, context, SpanStatusCode } from '@opentelemetry/api';
+import { trace } from '@opentelemetry/api';
 
 /**
  * Wrap a database query in an OTel span.
@@ -533,6 +533,62 @@ export async function traceWebhookDispatch<T>(
 }
 
 /**
+ * Wrap one Server-Sent Events fan-out in a bounded tracing span.
+ *
+ * The span is per emitted stream update, not per subscriber, so high fan-out
+ * streams record subscriber cardinality without creating one span per client.
+ *
+ * `correlationId` is safe to expose as the trace identifier for SSE clients:
+ * it is generated/validated by the correlation middleware when it originates
+ * from a request, and it carries no auth tokens or secrets.
+ */
+export function traceSseDispatch<T>(
+  streamId: string,
+  eventId: string,
+  subscriberCount: number,
+  correlationId: string | undefined,
+  fn: (span: Span) => T,
+): T {
+  const traceId = correlationId && correlationId.length > 0
+    ? correlationId
+    : getCorrelationIdFromContext();
+  const tracer = getTracer();
+  const boundedSubscriberCount = Math.max(0, subscriberCount);
+  const span = tracer.startSpan({
+    traceId,
+    serviceName: 'fluxora-sse',
+    tags: {
+      'span.name': 'sse.dispatch',
+      'sse.stream_id': streamId,
+      'sse.event_id': eventId,
+      'sse.subscriber_count': boundedSubscriberCount,
+    },
+  });
+
+  try {
+    const result = fn(span);
+    tracer.recordEvent(span, 'sse.dispatch', {
+      streamId,
+      eventId,
+      subscriberCount: boundedSubscriberCount,
+      correlationId: traceId,
+    });
+    tracer.endSpan(span, 'ok');
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    tracer.recordEvent(span, 'sse.dispatch.error', {
+      streamId,
+      eventId,
+      subscriberCount: boundedSubscriberCount,
+      error: message,
+    });
+    tracer.endSpan(span, 'error', message);
+    throw err;
+  }
+}
+
+/**
  * Record a WebSocket broadcast event on the active OTel span (if any).
  * Does not create a new span — attaches an event to the current context.
  */
@@ -583,7 +639,9 @@ export function enrichSpanWithStream(
   if (recipient) span.context.tags['fluxora.recipient'] = recipient;
 
   // 2. Enrich the internal OTel span if it exists in tags
-  const otelSpan = span.context.tags['_otelSpan'] as any;
+  const otelSpan = span.context.tags['_otelSpan'] as
+    | { setAttribute: (key: string, value: string) => void }
+    | undefined;
   if (otelSpan && typeof otelSpan.setAttribute === 'function') {
     try {
       if (streamId) otelSpan.setAttribute('fluxora.stream_id', streamId);

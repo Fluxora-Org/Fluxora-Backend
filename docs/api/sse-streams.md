@@ -116,6 +116,12 @@ The endpoint exports these Prometheus metrics through the existing registry:
 
 Live updates are indexed by `streamId` in memory. A broadcast for `stream-123` is delivered only to active SSE clients subscribed to `stream-123`; other SSE connections do not run per-event filter checks.
 
+### Trace propagation
+
+Each `stream_update` SSE data payload includes both `correlationId` and `traceId`. They carry the same non-sensitive correlation identifier for the emitted update so clients can link received events back to server logs and tracing spans. The value is either the originating event correlation ID or, for replayed events, the current SSE request correlation ID.
+
+When tracing is enabled, live fan-out is wrapped in one `sse.dispatch` span per emitted stream update. The span records `sse.stream_id`, `sse.event_id`, and `sse.subscriber_count`; it does not create one span per subscriber. Subscriber write failures are isolated so one broken connection cannot stop the rest of the fan-out, and the dispatch span is still closed.
+
 ---
 
 ## Heartbeat and Keep-Alive
@@ -139,11 +145,11 @@ Upon initial connection, the server sends an `: ok` acknowledgement. Then, as st
 
 id: evt-001
 event: stream_update
-data: {"type":"stream_update","streamId":"stream-123","eventId":"evt-001","payload":{"status":"active","streamedAmount":"100"},"correlationId":"44526bf5-b33d-45f2-bd1d-9ce414f13635"}
+data: {"type":"stream_update","streamId":"stream-123","eventId":"evt-001","payload":{"status":"active","streamedAmount":"100"},"correlationId":"44526bf5-b33d-45f2-bd1d-9ce414f13635","traceId":"44526bf5-b33d-45f2-bd1d-9ce414f13635"}
 
 : heartbeat
 
 id: evt-002
 event: stream_update
-data: {"type":"stream_update","streamId":"stream-123","eventId":"evt-002","payload":{"status":"completed","streamedAmount":"1000"},"correlationId":"63ad759f-ba95-4c6b-a5db-86a491fcded9"}
+data: {"type":"stream_update","streamId":"stream-123","eventId":"evt-002","payload":{"status":"completed","streamedAmount":"1000"},"correlationId":"63ad759f-ba95-4c6b-a5db-86a491fcded9","traceId":"63ad759f-ba95-4c6b-a5db-86a491fcded9"}
 ```
