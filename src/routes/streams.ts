@@ -52,6 +52,7 @@ import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
 import {
+  compareDecimalStringToZero,
   validateDecimalString,
   validateAmountFields,
 } from '../serialization/decimal.js';
@@ -313,13 +314,13 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
 
   const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && parseFloat(validatedDeposit) <= 0) {
+  if (depositAmount !== undefined && compareDecimalStringToZero(validatedDeposit) <= 0) {
     throw validationError('depositAmount must be greater than zero');
   }
 
   const rateResult = validateDecimalString(ratePerSecond ?? '0', 'ratePerSecond');
   const validatedRate = rateResult.valid && rateResult.value ? rateResult.value : '0';
-  if (ratePerSecond !== undefined && parseFloat(validatedRate) < 0) {
+  if (ratePerSecond !== undefined && compareDecimalStringToZero(validatedRate) < 0) {
     throw validationError('ratePerSecond cannot be negative');
   }
 
