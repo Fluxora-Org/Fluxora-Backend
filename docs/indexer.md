@@ -132,6 +132,14 @@ Get current replay progress and indexer status.
 curl http://localhost:3000/internal/indexer/status
 ```
 
+### Cursor replay recovery
+
+Consumers that resume from a stored `afterEventId` must treat `STALE_CURSOR`
+as a signal that the cursor row was removed, for example by a reorg rollback.
+The correct recovery path is to discard that cursor and re-sync from the last
+trusted `fromLedger` checkpoint, then continue normal cursor replay from the
+new page results.
+
 ## Database Schema
 
 ### Tables

@@ -268,6 +268,15 @@ docs/
 
 See [docs/indexer.md](docs/indexer.md) for detailed troubleshooting.
 
+## Webhook resilience
+
+Outbound webhook retries use two Redis-backed per-consumer controls:
+
+- **Rate limiting** (`src/redis/webhookRateLimit.ts`): sliding-window cap via `WEBHOOK_RETRY_RPS` (default `10`/s).
+- **Circuit breaker** (`src/redis/webhookCircuitBreakerStore.ts`): shared `closed` → `open` → `half-open` state keyed by SHA-256 hash of the consumer URL. After `circuitBreakerThreshold` consecutive failures, deliveries are deferred until `circuitBreakerResetMs`, then a single cross-instance probe is allowed.
+
+`attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for details.
+
 ## 📝 License
 
 MIT

@@ -9,7 +9,13 @@
  * so no delivery is silently lost.
  */
 
-import type { RateLimitStore, SlidingWindowStore } from '../redis/rateLimitStore.js';
+import type { RateLimitConfig, WebhookRateLimiter } from '../redis/webhookRateLimit.js';
+import type {
+  CircuitBreakerPolicy,
+  WebhookCircuitBreakerCheckResult,
+  WebhookCircuitBreakerStore,
+} from '../redis/webhookCircuitBreakerStore.js';
+import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 
@@ -197,6 +203,40 @@ export function calculateCircuitBreakerResetTime(
   return policy.circuitBreakerResetMs ? now + policy.circuitBreakerResetMs : 0;
 }
 
+/** Short backoff when another instance holds the half-open probe lock. */
+export const HALF_OPEN_CONTENTION_DEFERRAL_MS = 1_000;
+
+/**
+ * Resolve when a gated delivery should be retried.
+ * Half-open contention uses a short deferral so outbox rows are never dropped.
+ */
+export function resolveCircuitBreakerDeferral(
+  breaker: Pick<WebhookCircuitBreakerCheckResult, 'state' | 'resetAt'>,
+  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
+  now: number = Date.now(),
+): Date {
+  if (breaker.resetAt !== null && breaker.resetAt > now) {
+    return new Date(breaker.resetAt);
+  }
+  if (breaker.state === 'half-open') {
+    return new Date(now + HALF_OPEN_CONTENTION_DEFERRAL_MS);
+  }
+  const resetAt = calculateCircuitBreakerResetTime(policy, now);
+  return new Date(Math.max(resetAt, now + HALF_OPEN_CONTENTION_DEFERRAL_MS));
+}
+
+/** Return true when a failed attempt should increment the circuit-breaker failure count. */
+export function countsTowardCircuitBreaker(
+  attempt: WebhookDeliveryAttempt,
+  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
+): boolean {
+  if (attempt.statusCode !== undefined && attempt.statusCode >= 200 && attempt.statusCode < 300 && !attempt.error) {
+    return false;
+  }
+  if (attempt.statusCode === undefined) return true;
+  return isRetryableStatusCode(attempt.statusCode, policy);
+}
+
 /** Return a human-readable summary of the retry policy (for logging). */
 export function formatRetryPolicy(policy: EnhancedRetryPolicy): string {
   const base =
@@ -229,4 +269,171 @@ export function validateRetryPolicy(policy: EnhancedRetryPolicy): string[] {
     errors.push('deadLetterAfterMs must be at least 60000ms (1 minute)');
 
   return errors;
+}
+
+export interface WebhookDeliveryGateDeps {
+  rateLimiter?: WebhookRateLimiter;
+  circuitBreakerStore?: WebhookCircuitBreakerStore;
+  rateLimitConfig?: RateLimitConfig;
+}
+
+export interface WebhookDeliveryGateResult {
+  canDeliver: boolean;
+  retryAt: Date | null;
+  rateLimited?: boolean;
+  circuitBreakerOpen?: boolean;
+  consecutiveFailures: number;
+}
+
+function augmentPayloadWithRetry(payload: unknown, attemptNumber: number): unknown {
+  const base: Record<string, unknown> =
+    typeof payload === 'object' && payload !== null
+      ? { ...(payload as Record<string, unknown>) }
+      : { value: payload };
+  base['_webhookRetry'] = { attemptNumber };
+  return base;
+}
+
+/**
+ * Evaluate rate-limit and circuit-breaker gates before an outbound webhook attempt.
+ */
+export async function checkWebhookDeliveryGate(
+  consumerUrl: string,
+  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
+  deps: WebhookDeliveryGateDeps = {},
+  now: number = Date.now(),
+): Promise<WebhookDeliveryGateResult> {
+  const circuitBreakerStore = deps.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
+
+  const breaker = await circuitBreakerStore.checkAndClaimAttempt(consumerUrl, policy, now);
+  if (!breaker.allowed) {
+    return {
+      canDeliver: false,
+      retryAt: resolveCircuitBreakerDeferral(breaker, policy, now),
+      circuitBreakerOpen: breaker.state === 'open' || breaker.state === 'half-open',
+      consecutiveFailures: breaker.consecutiveFailures,
+    };
+  }
+
+  if (deps.rateLimiter && deps.rateLimitConfig) {
+    const limit = await deps.rateLimiter.checkLimit(consumerUrl, deps.rateLimitConfig);
+    if (!limit.canAttempt) {
+      return {
+        canDeliver: false,
+        retryAt: new Date(now + (limit.retryAfterMs ?? deps.rateLimitConfig.windowMs)),
+        rateLimited: true,
+        consecutiveFailures: breaker.consecutiveFailures,
+      };
+    }
+  }
+
+  return {
+    canDeliver: true,
+    retryAt: null,
+    consecutiveFailures: breaker.consecutiveFailures,
+  };
+}
+
+/**
+ * Wrap a webhook delivery with per-consumer rate limiting and circuit-breaker protection.
+ */
+export async function attemptWebhookDeliveryWithRateLimit(
+  input: WebhookOutboxRetryInput,
+  deliver: () => Promise<WebhookDeliveryAttempt>,
+  deps: WebhookDeliveryGateDeps = {},
+): Promise<WebhookOutboxRetryPlan & { attempt?: WebhookDeliveryAttempt }> {
+  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
+  const now = input.now ?? Date.now();
+  const gate = await checkWebhookDeliveryGate(input.consumerUrl, policy, deps, now);
+
+  if (!gate.canDeliver) {
+    return {
+      shouldRetry: true,
+      attemptNumber: input.attemptNumber + 1,
+      retryAt: gate.retryAt,
+      payload: input.payload,
+      rateLimited: gate.rateLimited,
+    };
+  }
+
+  const attempt = await deliver();
+  const circuitBreakerStore = deps.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
+  const success =
+    attempt.statusCode !== undefined &&
+    attempt.statusCode >= 200 &&
+    attempt.statusCode < 300 &&
+    !attempt.error;
+
+  let consecutiveFailures = gate.consecutiveFailures;
+  if (success) {
+    const breakerRecord = await circuitBreakerStore.recordSuccess(
+      input.consumerUrl,
+      policy as CircuitBreakerPolicy,
+    );
+    consecutiveFailures = breakerRecord.consecutiveFailures;
+  } else if (countsTowardCircuitBreaker(attempt, policy)) {
+    const breakerRecord = await circuitBreakerStore.recordFailure(
+      input.consumerUrl,
+      policy as CircuitBreakerPolicy,
+      now,
+    );
+    consecutiveFailures = breakerRecord.consecutiveFailures;
+  }
+
+  const retryable = shouldRetry(attempt, input.attemptNumber, policy, consecutiveFailures);
+  if (!retryable) {
+    return {
+      shouldRetry: false,
+      attemptNumber: input.attemptNumber + 1,
+      retryAt: null,
+      payload: input.payload,
+      attempt,
+    };
+  }
+
+  const retryAtMs = calculateNextRetryTime(input.attemptNumber, policy, now);
+
+  return {
+    shouldRetry: true,
+    attemptNumber: input.attemptNumber + 1,
+    retryAt: new Date(retryAtMs),
+    payload: augmentPayloadWithRetry(input.payload, input.attemptNumber + 1),
+    attempt,
+  };
+}
+
+/** Schedule a durable outbox retry row after a failed delivery attempt. */
+export function scheduleWebhookOutboxRetry(input: {
+  streamId: string;
+  eventType: string;
+  payload: unknown;
+  attemptNumber: number;
+  policy?: EnhancedRetryPolicy;
+  now?: number;
+  lastAttempt?: WebhookDeliveryAttempt;
+  consecutiveFailures?: number;
+}): WebhookOutboxRetryPlan {
+  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
+  const now = input.now ?? Date.now();
+  const attempt: WebhookDeliveryAttempt = input.lastAttempt ?? {
+    attemptNumber: input.attemptNumber,
+    timestamp: now,
+  };
+
+  if (!shouldRetry(attempt, input.attemptNumber, policy, input.consecutiveFailures ?? 0)) {
+    return {
+      shouldRetry: false,
+      attemptNumber: input.attemptNumber + 1,
+      retryAt: null,
+      payload: input.payload,
+    };
+  }
+
+  const retryAtMs = calculateNextRetryTime(input.attemptNumber, policy, now);
+  return {
+    shouldRetry: true,
+    attemptNumber: input.attemptNumber + 1,
+    retryAt: new Date(retryAtMs),
+    payload: augmentPayloadWithRetry(input.payload, input.attemptNumber + 1),
+  };
 }

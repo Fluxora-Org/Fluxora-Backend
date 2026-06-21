@@ -601,13 +601,13 @@ describe('Enhanced Webhook Features', () => {
   });
 
   describe('Circuit Breaker', () => {
-    it('tracks circuit breaker state per endpoint', () => {
+    it('tracks circuit breaker state per endpoint via the shared store', async () => {
+      const { InMemoryWebhookCircuitBreakerStore } = await import('../src/redis/webhookCircuitBreakerStore.js');
+      const breaker = new InMemoryWebhookCircuitBreakerStore();
       const endpoint = 'https://example.com/webhook';
-      
-      // Initial state should be undefined
-      expect(webhookDeliveryStore.getCircuitBreakerState(endpoint)).toBeUndefined();
 
-      // Update with success
+      expect(await breaker.getState(endpoint)).toBeNull();
+
       const policy: EnhancedRetryPolicy = {
         maxAttempts: 5,
         initialBackoffMs: 1000,
@@ -616,22 +616,27 @@ describe('Enhanced Webhook Features', () => {
         jitterPercent: 10,
         timeoutMs: 30000,
         retryableStatusCodes: [500, 502, 503, 504],
+        circuitBreakerThreshold: 3,
+        circuitBreakerResetMs: 60_000,
       };
 
-      const state1 = webhookDeliveryStore.updateCircuitBreakerState(endpoint, true, policy);
-      expect(state1.state).toBe('closed');
-      expect(state1.failureCount).toBe(0);
+      await breaker.recordSuccess(endpoint, policy);
+      let state = await breaker.getState(endpoint);
+      expect(state?.state).toBe('closed');
+      expect(state?.consecutiveFailures).toBe(0);
 
-      // Update with failure
-      const state2 = webhookDeliveryStore.updateCircuitBreakerState(endpoint, false, policy);
-      expect(state2.state).toBe('closed');
-      expect(state2.failureCount).toBe(1);
+      await breaker.recordFailure(endpoint, policy, Date.now());
+      state = await breaker.getState(endpoint);
+      expect(state?.state).toBe('closed');
+      expect(state?.consecutiveFailures).toBe(1);
 
-      // Check endpoint availability
-      expect(webhookDeliveryStore.isEndpointAvailable(endpoint)).toBe(true);
+      const gate = await breaker.checkAndClaimAttempt(endpoint, policy);
+      expect(gate.allowed).toBe(true);
     });
 
-    it('opens circuit breaker after threshold', () => {
+    it('opens circuit breaker after threshold', async () => {
+      const { InMemoryWebhookCircuitBreakerStore } = await import('../src/redis/webhookCircuitBreakerStore.js');
+      const breaker = new InMemoryWebhookCircuitBreakerStore();
       const endpoint = 'https://failing.example.com/webhook';
       const policy: EnhancedRetryPolicy = {
         maxAttempts: 5,
@@ -645,14 +650,15 @@ describe('Enhanced Webhook Features', () => {
         circuitBreakerResetMs: 60000,
       };
 
-      // Add failures to reach threshold
+      const now = Date.now();
       for (let i = 0; i < 3; i++) {
-        webhookDeliveryStore.updateCircuitBreakerState(endpoint, false, policy);
+        await breaker.recordFailure(endpoint, policy, now);
       }
 
-      const state = webhookDeliveryStore.getCircuitBreakerState(endpoint);
+      const state = await breaker.getState(endpoint);
       expect(state?.state).toBe('open');
-      expect(webhookDeliveryStore.isEndpointAvailable(endpoint)).toBe(false);
+      const gate = await breaker.checkAndClaimAttempt(endpoint, policy, now);
+      expect(gate.allowed).toBe(false);
     });
   });
 

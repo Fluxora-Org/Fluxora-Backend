@@ -9,6 +9,7 @@
  */
 
 import {
+  compareDecimalStringToZero,
   validateDecimalString,
   serializeToDecimalString,
   deserializeToNumber,
@@ -66,6 +67,33 @@ describe('Decimal String Serialization Policy', () => {
     it('handles negative values', () => {
       expect(normalizeDecimalString('-100.50')).toBe('-100.5');
       expect(normalizeDecimalString('-1.0')).toBe('-1');
+    });
+  });
+
+  describe('compareDecimalStringToZero', () => {
+    it('compares values above Number.MAX_SAFE_INTEGER without rounding', () => {
+      expect(compareDecimalStringToZero('9007199254740993')).toBe(1);
+      expect(compareDecimalStringToZero('-9007199254740993')).toBe(-1);
+    });
+
+    it('treats normalized zeros as zero', () => {
+      expect(compareDecimalStringToZero('0')).toBe(0);
+      expect(compareDecimalStringToZero('+0.0000000')).toBe(0);
+      expect(compareDecimalStringToZero('-0.0000000')).toBe(0);
+    });
+
+    it('preserves high-precision fractional signs that parseFloat underflows', () => {
+      const tinyPositive = `0.${'0'.repeat(400)}1`;
+      const tinyNegative = `-0.${'0'.repeat(400)}1`;
+
+      expect(Number.parseFloat(tinyPositive)).toBe(0);
+      expect(Object.is(Number.parseFloat(tinyNegative), -0)).toBe(true);
+      expect(compareDecimalStringToZero(tinyPositive)).toBe(1);
+      expect(compareDecimalStringToZero(tinyNegative)).toBe(-1);
+    });
+
+    it('throws on malformed decimal strings', () => {
+      expect(() => compareDecimalStringToZero('1e10')).toThrow(DecimalSerializationError);
     });
   });
 
