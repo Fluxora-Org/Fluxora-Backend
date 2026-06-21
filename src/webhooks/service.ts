@@ -12,13 +12,18 @@ import type {
   WebhookEvent,
   WebhookDelivery,
   WebhookDeliveryAttempt,
-  WebhookRetryPolicy,
 } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, scheduleWebhookOutboxRetry, shouldRetry } from './retry.js';
-import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
+import {
+  attemptWebhookDeliveryWithRateLimit,
+  calculateNextRetryTime,
+  checkWebhookDeliveryGate,
+  countsTowardCircuitBreaker,
+  shouldRetry,
+  type EnhancedRetryPolicy,
+} from './retry.js';
 import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
 import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
@@ -31,6 +36,8 @@ interface OutboxRow {
   event_type: string;
   payload: unknown;
   created_at: Date | string;
+  attempt_count: number | string | null;
+  next_attempt_at: Date | string | null;
 }
 
 interface DbClient {
@@ -113,14 +120,23 @@ function normalizePayload(payload: unknown): unknown {
   return payload;
 }
 
-function extractAttemptNumber(payload: unknown): number {
-  if (typeof payload !== 'object' || payload === null) return 1;
-  const retry = (payload as Record<string, unknown>)['_webhookRetry'];
-  if (typeof retry !== 'object' || retry === null) return 1;
-  const attemptNumber = (retry as Record<string, unknown>)['attemptNumber'];
-  return typeof attemptNumber === 'number' && Number.isFinite(attemptNumber) && attemptNumber > 0
-    ? Math.floor(attemptNumber)
-    : 1;
+function parseOutboxAttemptCount(value: number | string | null | undefined): number {
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? 0), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function deliverySucceeded(attempt: WebhookDeliveryAttempt): boolean {
+  return attempt.statusCode !== undefined &&
+    attempt.statusCode >= 200 &&
+    attempt.statusCode < 300 &&
+    !attempt.error;
+}
+
+function describeOutboxFailure(attempt: WebhookDeliveryAttempt, attemptNumber: number): string {
+  const suffix = `after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`;
+  if (attempt.error) return `${attempt.error} ${suffix}`;
+  if (attempt.statusCode !== undefined) return `HTTP ${attempt.statusCode} ${suffix}`;
+  return `Webhook delivery failed ${suffix}`;
 }
 
 function enqueuePermanentFailureToDlq(
@@ -607,11 +623,11 @@ export class WebhookDispatcher {
       await client.query('BEGIN');
       const result = await client.query<OutboxRow>(
         `
-          SELECT id, stream_id, event_type, payload, created_at
+          SELECT id, stream_id, event_type, payload, created_at, attempt_count, next_attempt_at
           FROM webhook_outbox
           WHERE processed = false
-            AND created_at <= NOW()
-          ORDER BY created_at ASC, id ASC
+            AND next_attempt_at <= NOW()
+          ORDER BY next_attempt_at ASC, created_at ASC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         `,
@@ -647,7 +663,8 @@ export class WebhookDispatcher {
 
     const payload = normalizePayload(row.payload);
     const payloadString = JSON.stringify(payload);
-    const attemptNumber = extractAttemptNumber(payload);
+    const previousAttempts = parseOutboxAttemptCount(row.attempt_count);
+    const attemptNumber = previousAttempts + 1;
     const delivery: WebhookDelivery = {
       id: `outbox_${row.id}`,
       deliveryId: `outbox_${row.id}`,
@@ -655,7 +672,7 @@ export class WebhookDispatcher {
       eventType: row.event_type as WebhookEvent['type'],
       endpointUrl: endpoint.endpointUrl,
       status: 'pending',
-      attempts: Array.from({ length: Math.max(0, attemptNumber - 1) }, (_, index) => ({
+      attempts: Array.from({ length: previousAttempts }, (_, index) => ({
         attemptNumber: index + 1,
         timestamp: Date.now(),
       })),
@@ -681,50 +698,83 @@ export class WebhookDispatcher {
       },
     );
 
-    await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
-
     if (!result.attempt) {
       if (result.shouldRetry && result.retryAt) {
         await client.query(
           `
-            INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
-            VALUES ($1, $2, $3::jsonb, $4, false)
+            UPDATE webhook_outbox
+            SET next_attempt_at = $2,
+                payload = $3::jsonb
+            WHERE id = $1
           `,
-          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt],
+          [row.id, result.retryAt, JSON.stringify(payload)],
         );
       }
       return;
     }
 
     const attempt = result.attempt;
-    if (result.shouldRetry) {
-      attempt.nextRetryAt = result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
-      delivery.status = 'pending';
-    } else if (
-      attempt.statusCode !== undefined &&
-      attempt.statusCode >= 200 &&
-      attempt.statusCode < 300 &&
-      !attempt.error
-    ) {
-      delivery.status = 'delivered';
-    } else {
-      delivery.status = 'permanent_failure';
-    }
-
-    if (delivery.status === 'delivered' || delivery.status === 'permanent_failure') {
+    if (deliverySucceeded(attempt)) {
+      await client.query(
+        `
+          UPDATE webhook_outbox
+          SET processed = true,
+              attempt_count = $2,
+              next_attempt_at = NULL
+          WHERE id = $1
+        `,
+        [row.id, attemptNumber],
+      );
       return;
     }
 
-    if (!result.shouldRetry || !result.retryAt) {
+    if (result.shouldRetry && result.retryAt) {
+      attempt.nextRetryAt = result.retryAt.getTime();
+      await client.query(
+        `
+          UPDATE webhook_outbox
+          SET attempt_count = $2,
+              next_attempt_at = $3,
+              payload = $4::jsonb,
+              processed = false
+          WHERE id = $1
+        `,
+        [row.id, attemptNumber, result.retryAt, JSON.stringify(result.payload)],
+      );
       return;
     }
 
     await client.query(
       `
-        INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
-        VALUES ($1, $2, $3::jsonb, $4, false)
+        INSERT INTO dead_letter_queue
+          (id, topic, payload, error, attempts, correlation_id, first_failed_at, last_failed_at)
+        VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $7)
+        ON CONFLICT (id) DO UPDATE
+        SET payload = EXCLUDED.payload,
+            error = EXCLUDED.error,
+            attempts = EXCLUDED.attempts,
+            last_failed_at = EXCLUDED.last_failed_at
       `,
-      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt],
+      [
+        `webhook-outbox-${row.id}`,
+        row.event_type,
+        JSON.stringify(payload),
+        describeOutboxFailure(attempt, attemptNumber),
+        attemptNumber,
+        null,
+        new Date(),
+      ],
+    );
+
+    await client.query(
+      `
+        UPDATE webhook_outbox
+        SET processed = true,
+            attempt_count = $2,
+            next_attempt_at = NULL
+        WHERE id = $1
+      `,
+      [row.id, attemptNumber],
     );
   }
 }
