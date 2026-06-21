@@ -36,6 +36,14 @@ export const webhookDeliveriesTotal =
     registers: [registry],
   });
 
+export const webhooksSuppressedByReorgTotal =
+  (registry.getSingleMetric('fluxora_webhooks_suppressed_by_reorg_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_webhooks_suppressed_by_reorg_total',
+    help: 'Total number of webhook deliveries skipped because their ledger was rolled back by a reorg',
+    registers: [registry],
+  });
+
 export const webhookDeliveryDurationSeconds =
   (registry.getSingleMetric('fluxora_webhook_delivery_duration_seconds') as Histogram) ||
   new Histogram({
@@ -67,6 +75,7 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_active_connections');
   registry.removeSingleMetric('fluxora_sse_connections_rejected_total');
   registry.removeSingleMetric('fluxora_webhook_deliveries_total');
+  registry.removeSingleMetric('fluxora_webhooks_suppressed_by_reorg_total');
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');

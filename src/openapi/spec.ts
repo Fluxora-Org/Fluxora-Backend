@@ -291,7 +291,7 @@ registry.registerPath({
       }),
       cursor: z.string().optional().openapi({
         description:
-          'Opaque cursor from the previous page's `next_cursor`. ' +
+          "Opaque cursor from the previous page's `next_cursor`. " +
           'Omit to request the first page. ' +
           'Treated as a black box — do not construct manually.',
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
@@ -407,7 +407,7 @@ registry.registerPath({
         'Discard the cursor and restart pagination from page 1 (omit `cursor`).',
       content: {
         'application/json': {
-          schema: ErrorEnvelope,
+          schema: InvalidCursorError.or(ErrorEnvelope),
           examples: {
             invalidCursor: {
               summary: 'Invalid or expired cursor',

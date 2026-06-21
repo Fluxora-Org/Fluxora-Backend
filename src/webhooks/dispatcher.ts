@@ -5,7 +5,7 @@ import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { computeWebhookSignature } from './signature.js';
 import { calculateNextRetryTime, shouldRetry, resolveCircuitBreakerDeferral, countsTowardCircuitBreaker } from './retry.js';
-import { logger } from '../lib/logger.js';
+import { webhooksSuppressedByReorgTotal } from '../metrics/businessMetrics.js';
 import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import type { EnhancedRetryPolicy } from './retry.js';
@@ -307,6 +307,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
     try {
       const { isLedgerRolledBack } = await import('../indexer/service.js');
       if (isLedgerRolledBack(opts.ledger)) {
+        webhooksSuppressedByReorgTotal.inc();
         return;
       }
     } catch {

@@ -3,12 +3,164 @@ import { db } from '../db/client';
 import { config } from '../config';
 import { ContractEvent, ReplayProgress, ReplayCursor, ReplayRequest } from '../types';
 import { logger } from '../lib/logger.js';
+import type { ContractEventStore } from './store.js';
+import type { ContractEventRecord } from './types.js';
 import {
   indexerReplayBatchesCommittedTotal,
   indexerReplayRowsCommittedTotal,
   indexerReplayRowsPerSecond,
   indexerReplayDurationSeconds,
 } from '../metrics/indexerMetrics.js';
+import {
+  indexerEventsIngestedTotal,
+  indexerLagSeconds,
+} from '../metrics/businessMetrics.js';
+
+export interface RolledBackLedgerRange {
+  /** First ledger removed from the canonical store. */
+  fromLedger: number;
+  /** Highest ledger removed from the canonical store. */
+  toLedger: number;
+  /** New canonical tip observed after the rollback was applied. */
+  observedAtLedger: number;
+  /** Hash evicted at the fork boundary, when known. */
+  evictedHash?: string;
+  /** Replacement hash at the fork boundary, when known. */
+  incomingHash?: string;
+  /** ISO-8601 time the rollback record was created. */
+  rolledBackAt: string;
+}
+
+const ROLLED_BACK_LEDGER_RETENTION_DEPTH = 5;
+const MAX_ROLLED_BACK_LEDGER_RANGES = 256;
+
+const rolledBackLedgerRanges: RolledBackLedgerRange[] = [];
+
+function pruneRolledBackLedgerRanges(observedLedger: number): void {
+  const minRetainedLedger = observedLedger - ROLLED_BACK_LEDGER_RETENTION_DEPTH;
+  for (let index = rolledBackLedgerRanges.length - 1; index >= 0; index--) {
+    if (rolledBackLedgerRanges[index]!.toLedger < minRetainedLedger) {
+      rolledBackLedgerRanges.splice(index, 1);
+    }
+  }
+
+  if (rolledBackLedgerRanges.length > MAX_ROLLED_BACK_LEDGER_RANGES) {
+    rolledBackLedgerRanges.splice(
+      0,
+      rolledBackLedgerRanges.length - MAX_ROLLED_BACK_LEDGER_RANGES,
+    );
+  }
+}
+
+/**
+ * Record the ledger range removed by a chain reorganisation.
+ *
+ * Rollback records are intentionally process-local and short-lived. They cover
+ * the recently orphaned ledger interval so webhook delivery can suppress
+ * events from the abandoned fork while the indexer catches up to the canonical
+ * chain. Records are pruned once the observed canonical ledger is more than
+ * five ledgers past the rolled-back range, and the in-memory list is capped to
+ * avoid unbounded growth under repeated reorgs.
+ */
+export function recordRolledBackLedgers(record: {
+  fromLedger: number;
+  toLedger?: number;
+  observedAtLedger?: number;
+  evictedHash?: string;
+  incomingHash?: string;
+  rolledBackAt?: string;
+}): void {
+  const fromLedger = Math.floor(record.fromLedger);
+  const toLedger = Math.floor(record.toLedger ?? record.fromLedger);
+  const observedAtLedger = Math.floor(record.observedAtLedger ?? toLedger);
+
+  if (!Number.isFinite(fromLedger) || !Number.isFinite(toLedger) || fromLedger < 0) {
+    return;
+  }
+
+  const normalized: RolledBackLedgerRange = {
+    fromLedger,
+    toLedger: Math.max(fromLedger, toLedger),
+    observedAtLedger: Math.max(observedAtLedger, fromLedger),
+    rolledBackAt: record.rolledBackAt ?? new Date().toISOString(),
+  };
+
+  if (record.evictedHash !== undefined) {
+    normalized.evictedHash = record.evictedHash;
+  }
+  if (record.incomingHash !== undefined) {
+    normalized.incomingHash = record.incomingHash;
+  }
+
+  rolledBackLedgerRanges.push(normalized);
+  pruneRolledBackLedgerRanges(normalized.observedAtLedger);
+}
+
+/**
+ * Advance rollback-record retention without creating a new rollback record.
+ *
+ * The indexer calls this after ordinary canonical ingestion so stale rollback
+ * ranges age out once the chain has moved safely beyond the reorg window.
+ */
+export function pruneRolledBackLedgersAt(observedLedger: number): void {
+  if (Number.isFinite(observedLedger)) {
+    pruneRolledBackLedgerRanges(Math.floor(observedLedger));
+  }
+}
+
+/**
+ * Return whether `ledger` is in a recently rolled-back ledger range.
+ *
+ * This API is deliberately fail-open for callers: invalid or unknown ledgers
+ * return `false`, allowing delivery to continue. Callers that cannot import or
+ * execute this function should also deliver rather than drop webhooks.
+ */
+export function isLedgerRolledBack(ledger: number): boolean {
+  if (!Number.isFinite(ledger)) {
+    return false;
+  }
+
+  const normalizedLedger = Math.floor(ledger);
+  return rolledBackLedgerRanges.some(
+    (range) => normalizedLedger >= range.fromLedger && normalizedLedger <= range.toLedger,
+  );
+}
+
+/** Test-only reset hook for rollback suppression state. */
+export function _resetRolledBackLedgers(): void {
+  rolledBackLedgerRanges.length = 0;
+}
+
+export class IndexerIngestionService {
+  constructor(private readonly store: ContractEventStore) {}
+
+  async ingest(
+    input: { events: ContractEventRecord[] },
+    _context: { actor?: string } = {},
+  ): Promise<{ insertedCount: number; duplicateCount: number }> {
+    const events = input.events ?? [];
+    const result = await this.store.insertMany(events);
+    const insertedCount = result.insertedEventIds.length;
+
+    if (insertedCount > 0) {
+      indexerEventsIngestedTotal.inc(insertedCount);
+      const newestInsertedEvent = events
+        .filter((event) => result.insertedEventIds.includes(event.eventId))
+        .sort((a, b) => b.ledger - a.ledger)[0];
+
+      if (newestInsertedEvent) {
+        indexerLagSeconds.set(
+          Math.max(0, (Date.now() - new Date(newestInsertedEvent.happenedAt).getTime()) / 1000),
+        );
+      }
+    }
+
+    return {
+      insertedCount,
+      duplicateCount: result.duplicateEventIds.length,
+    };
+  }
+}
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -322,7 +474,6 @@ export class IndexerService {
 
       let offset = cursor.last_committed_offset;
       let batchIndex = 0;
-      let lastBatchRowCount = 0;
 
       // 5. Per-batch loop — each iteration uses a fresh connection.
       while (offset < totalRows) {
@@ -350,7 +501,6 @@ export class IndexerService {
         const newOffset = offset + batchResult.rowsFetched;
         offset = newOffset;
         batchIndex++;
-        lastBatchRowCount = batchResult.rowsFetched;
 
         // Update in-memory progress.
         replayState.updateProgress(batchResult.rowsFetched, newOffset);
@@ -475,7 +625,7 @@ export class IndexerService {
     cursorId: string,
     request: ReplayRequest,
     offset: number,
-    batchIndex: number,
+    _batchIndex: number,
   ): Promise<{ rowsFetched: number }> {
     const client = await this.pool.connect();
     try {
