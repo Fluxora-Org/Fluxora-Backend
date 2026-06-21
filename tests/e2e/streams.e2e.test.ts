@@ -29,10 +29,8 @@ import { createApp } from '../../src/app.js';
 // ---------------------------------------------------------------------------
 
 const isLiveDb = Boolean(process.env['DATABASE_URL']);
-
-if (!isLiveDb) {
-  // Stub the repository so the test can run without a real database.
-  const mockStream = {
+const { mockStream } = vi.hoisted(() => ({
+  mockStream: {
     id: 'e2e-stream-001',
     sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
     recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
@@ -42,8 +40,11 @@ if (!isLiveDb) {
     status: 'active',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  };
+  },
+}));
 
+if (!isLiveDb) {
+  // Stub the repository so the test can run without a real database.
   vi.mock('../../src/db/repositories/streamRepository.js', () => ({
     streamRepository: {
       upsertStream: vi.fn().mockResolvedValue(mockStream),

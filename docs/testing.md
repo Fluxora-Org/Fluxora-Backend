@@ -1,10 +1,28 @@
-# Fluxora Integration Testing: Admin Routes
+# Fluxora Testing
 
-This document provides a concise overview of the integration test suites covering the administrative route surface in `src/routes/admin.ts` and the Dead-Letter Queue (DLQ) surface in `src/routes/dlq.ts`.
+Fluxora standardizes on **Vitest** for unit, integration, route, and end-to-end test suites. The repository previously carried Jest configuration files and Jest-only dev dependencies, but the specs already use Vitest imports and the CI job runs `pnpm run test:coverage`. Keeping a single runner prevents specs from being skipped by one tool while another tool reports coverage.
+
+## Runner
+
+Use these package scripts:
+
+```bash
+pnpm test
+pnpm run test:coverage
+pnpm run test:watch
+```
+
+`vitest.config.ts` is the only test-runner config. Its include patterns cover every `*.test.ts` file under `tests/` and `src/`, and `tests/tooling/testRunnerCoverage.test.ts` guards that contract so new specs are not silently missed. Coverage uses the v8 provider and writes `coverage/lcov.info`, which is the path uploaded by `.github/workflows/ci.yml`.
+
+The current test-file inventory is 118 specs: 103 under `tests/` and 15 under `src/`. All use Vitest APIs; no `@jest/globals` imports or `jest.*` calls should be introduced.
+
+## Security Notes
+
+`tests/setup.ts` only sets deterministic test defaults such as `NODE_ENV=test`, `REDIS_ENABLED=false`, local database URLs, and test-only JWT/indexer tokens. Do not load production secrets or point default tests at real Redis, database, Stellar, or RPC infrastructure. Coverage artifacts should stay under `coverage/` and must not include environment dumps or secret values.
 
 ## Structure
 
-Admin integration tests are divided into isolated vitest suites under `tests/routes/`:
+Admin integration tests are divided into isolated Vitest suites under `tests/routes/`:
 - `admin.pause.test.ts`: Toggling operational pause flags and read-only status.
 - `admin.reindex.test.ts`: Triggering and checking background reindexing.
 - `admin.apiKeys.test.ts`: Creating, listing, and revoking API keys.

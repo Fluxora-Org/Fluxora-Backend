@@ -61,11 +61,14 @@ jobs:
         run: pnpm run lint || echo "Linter not configured"
         continue-on-error: true
 
-      - name: Run tests
+      - name: Run Vitest tests with coverage
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
           REPLAY_BATCH_SIZE: 100
-        run: pnpm test:coverage
+        run: pnpm run test:coverage
+
+      - name: Verify Vitest coverage artifact
+        run: test -f coverage/lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
