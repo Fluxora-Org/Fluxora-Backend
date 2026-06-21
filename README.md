@@ -2,7 +2,7 @@
 
 High-performance contract event indexer with optimized batch processing and PostgreSQL indexing for efficient historical event replay.
 
-## 🚀 Features
+## ?? Features
 
 - **Batch Insert Processing**: 50x faster than single-row inserts
 - **Optimized Database Indexes**: Composite and partial indexes for replay queries
@@ -11,13 +11,13 @@ High-performance contract event indexer with optimized batch processing and Post
 - **Security Hardened**: Parameterized queries, input validation, concurrent operation prevention
 - **Comprehensive Testing**: 80%+ code coverage with edge case handling
 
-## 📋 Requirements
+## ?? Requirements
 
 - Node.js 18+
 - PostgreSQL 12+
 - pnpm (or npm/yarn)
 
-## 🛠️ Installation
+## ??? Installation
 
 ```bash
 # Install dependencies
@@ -30,7 +30,7 @@ cp .env.example .env
 # DATABASE_URL=postgresql://user:password@localhost:5432/indexer_db
 ```
 
-## 🗄️ Database Setup
+## ??? Database Setup
 
 ```bash
 # Run migrations to create tables and indexes
@@ -42,7 +42,7 @@ This creates:
 - `contract_events` table (replay destination)
 - Optimized indexes for replay queries
 
-## 🏃 Running the Service
+## ?? Running the Service
 
 ```bash
 # Development mode
@@ -55,7 +55,7 @@ node dist/src/index.js
 
 The service will start on port 3000 (configurable via `PORT` environment variable).
 
-## 📡 API Usage
+## ?? API Usage
 
 ### Start a Replay
 
@@ -105,7 +105,7 @@ Response:
 }
 ```
 
-## 🧪 Testing
+## ?? Testing
 
 ```bash
 # Run all tests
@@ -121,18 +121,18 @@ pnpm test tests/indexer/service.replay.test.ts
 ### Test Coverage
 
 The test suite includes:
-- ✅ Input validation (invalid parameters)
-- ✅ Empty replay sets
-- ✅ Batch processing with various sizes
-- ✅ Batch boundary alignment
-- ✅ Duplicate event handling (ON CONFLICT)
-- ✅ Concurrent replay prevention
-- ✅ Transaction rollback on errors
-- ✅ Progress tracking and estimation
-- ✅ Block range filtering
-- ✅ SQL injection prevention
+- ? Input validation (invalid parameters)
+- ? Empty replay sets
+- ? Batch processing with various sizes
+- ? Batch boundary alignment
+- ? Duplicate event handling (ON CONFLICT)
+- ? Concurrent replay prevention
+- ? Transaction rollback on errors
+- ? Progress tracking and estimation
+- ? Block range filtering
+- ? SQL injection prevention
 
-## ⚙️ Configuration
+## ?? Configuration
 
 ### Environment Variables
 
@@ -145,10 +145,10 @@ The test suite includes:
 ### Batch Size Tuning
 
 - **Small (100-500)**: Lower memory, more round-trips
-- **Medium (1000-2000)**: Balanced performance ⭐ recommended
+- **Medium (1000-2000)**: Balanced performance ? recommended
 - **Large (5000+)**: Faster bulk operations, higher memory
 
-## 🔒 Security
+## ?? Security
 
 ### Implemented Protections
 
@@ -171,7 +171,7 @@ Target URLs, webhook secrets, signatures, and raw payloads are intentionally omi
 
 ### Production Recommendations
 
-⚠️ The `/internal/indexer/*` endpoints are **not authenticated** by default.
+?? The `/internal/indexer/*` endpoints are **not authenticated** by default.
 
 Before deploying to production:
 
@@ -189,7 +189,7 @@ Additional recommendations:
 - Use API keys or JWT tokens
 - Enable HTTPS/TLS
 
-## 📊 Performance
+## ?? Performance
 
 ### Batch Insert Performance
 
@@ -205,7 +205,7 @@ For a table with 10M events:
 - Unindexed query: ~30-60 seconds
 - Indexed query: ~10-50 milliseconds
 
-## 📚 Documentation
+## ?? Documentation
 
 See [docs/indexer.md](docs/indexer.md) for comprehensive documentation including:
 - Detailed API reference
@@ -214,29 +214,29 @@ See [docs/indexer.md](docs/indexer.md) for comprehensive documentation including
 - Troubleshooting guide
 - Monitoring recommendations
 
-## 🏗️ Architecture
+## ??? Architecture
 
 ```
 src/
-├── config/          # Configuration management
-├── db/              # Database client and connection pooling
-├── indexer/         # Core replay service logic
-├── routes/          # Express route handlers
-└── types/           # TypeScript type definitions
+??? config/          # Configuration management
+??? db/              # Database client and connection pooling
+??? indexer/         # Core replay service logic
+??? routes/          # Express route handlers
+??? types/           # TypeScript type definitions
 
 migrations/
-├── 000_initial_schema.ts              # Create tables
-└── 001_add_contract_events_replay_indexes.ts  # Add indexes
+??? 000_initial_schema.ts              # Create tables
+??? 001_add_contract_events_replay_indexes.ts  # Add indexes
 
 tests/
-└── indexer/
-    └── service.replay.test.ts         # Comprehensive test suite
+??? indexer/
+    ??? service.replay.test.ts         # Comprehensive test suite
 
 docs/
-└── indexer.md                         # Full documentation
+??? indexer.md                         # Full documentation
 ```
 
-## 🔄 Development Workflow
+## ?? Development Workflow
 
 ### Suggested Execution
 
@@ -245,12 +245,12 @@ docs/
    git checkout -b feature/indexer-replay-batching
    ```
 
-2. **Implement changes**: ✅ Complete
-   - ✅ Batch insert logic in `src/indexer/service.ts`
-   - ✅ Index migration in `migrations/001_add_contract_events_replay_indexes.ts`
-   - ✅ Progress API in `src/routes/indexer.ts`
-   - ✅ Comprehensive tests in `tests/indexer/service.replay.test.ts`
-   - ✅ Documentation in `docs/indexer.md`
+2. **Implement changes**: ? Complete
+   - ? Batch insert logic in `src/indexer/service.ts`
+   - ? Index migration in `migrations/001_add_contract_events_replay_indexes.ts`
+   - ? Progress API in `src/routes/indexer.ts`
+   - ? Comprehensive tests in `tests/indexer/service.replay.test.ts`
+   - ? Documentation in `docs/indexer.md`
 
 3. **Test**:
    ```bash
@@ -263,7 +263,7 @@ docs/
    git commit -m "perf: batch contract-event replay inserts and add targeted DB indexes"
    ```
 
-## 🐛 Troubleshooting
+## ?? Troubleshooting
 
 ### Replay Times Out
 - Reduce `REPLAY_BATCH_SIZE`
@@ -285,15 +285,25 @@ See [docs/indexer.md](docs/indexer.md) for detailed troubleshooting.
 Outbound webhook retries use two Redis-backed per-consumer controls:
 
 - **Rate limiting** (`src/redis/webhookRateLimit.ts`): sliding-window cap via `WEBHOOK_RETRY_RPS` (default `10`/s).
-- **Circuit breaker** (`src/redis/webhookCircuitBreakerStore.ts`): shared `closed` → `open` → `half-open` state keyed by SHA-256 hash of the consumer URL. After `circuitBreakerThreshold` consecutive failures, deliveries are deferred until `circuitBreakerResetMs`, then a single cross-instance probe is allowed.
+- **Circuit breaker** (`src/redis/webhookCircuitBreakerStore.ts`): shared `closed` ? `open` ? `half-open` state keyed by SHA-256 hash of the consumer URL. After `circuitBreakerThreshold` consecutive failures, deliveries are deferred until `circuitBreakerResetMs`, then a single cross-instance probe is allowed.
 
 `attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for details.
 
-## 📝 License
+### DLQ replay suspension
+
+The admin DLQ API tracks consecutive replay failures per consumer endpoint URL when webhook deliveries return to the DLQ. Set `DLQ_REPLAY_SUSPEND_THRESHOLD` to control how many consecutive failures suspend a consumer; the default is `3`.
+
+- `GET /admin/dlq` and `GET /admin/dlq/:id` include a `consumerReplay` summary with `consumerUrlHash`, `consecutiveFailures`, `suspended`, and `suspendedAt` when the DLQ payload identifies an endpoint.
+- `POST /admin/dlq/:id/replay` returns `409 DLQ_CONSUMER_SUSPENDED` while the consumer is suspended.
+- `POST /admin/dlq/consumers/reenable` with `{ "consumerUrl": "https://consumer.example/webhook" }` resets the failure counter and allows operators to replay entries again.
+
+Suspension and re-enable actions emit audit events keyed by a hash of the consumer URL so operator logs do not expose third-party endpoint URLs.
+
+## ?? License
 
 MIT
 
-## 🤝 Contributing
+## ?? Contributing
 
 1. Fork the repository
 2. Create a feature branch

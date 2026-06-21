@@ -1,7 +1,8 @@
 import { getPool, query } from '../pool.js';
-import type { DlqEntry } from '../../routes/dlq.js';
+import type { DlqConsumerReplayState, DlqEntry } from '../../routes/dlq.js';
+import { hashDlqConsumerUrl } from '../../lib/dlqConsumer.js';
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ?? Internal helpers ??????????????????????????????????????????????????????????
 
 function rowToEntry(row: Record<string, unknown>): DlqEntry {
   return {
@@ -16,7 +17,23 @@ function rowToEntry(row: Record<string, unknown>): DlqEntry {
   };
 }
 
-// ── Repository ────────────────────────────────────────────────────────────────
+function nullableDateToIso(value: unknown): string | undefined {
+  if (!value) return undefined;
+  return value instanceof Date ? value.toISOString() : new Date(String(value)).toISOString();
+}
+
+function rowToConsumerReplayState(row: Record<string, unknown>): DlqConsumerReplayState {
+  return {
+    consumerUrl: row['consumer_url'] as string,
+    consumerUrlHash: row['consumer_url_hash'] as string,
+    consecutiveFailures: Number(row['consecutive_failures'] ?? 0),
+    suspended: Boolean(row['suspended']),
+    suspendedAt: nullableDateToIso(row['suspended_at']),
+    updatedAt: nullableDateToIso(row['updated_at']) ?? new Date(0).toISOString(),
+  };
+}
+
+// ?? Repository ????????????????????????????????????????????????????????????????
 
 export const dlqRepository = {
   async insert(entry: DlqEntry): Promise<void> {
@@ -105,5 +122,86 @@ export const dlqRepository = {
     }
     const result = await query(pool, 'DELETE FROM dead_letter_queue');
     return result.rowCount ?? 0;
+  },
+
+  async deleteAllConsumerReplayStates(): Promise<number> {
+    const pool = getPool();
+    const result = await query(pool, 'DELETE FROM dlq_consumer_replay_state');
+    return result.rowCount ?? 0;
+  },
+
+  async findConsumerReplayState(consumerUrl: string): Promise<DlqConsumerReplayState | undefined> {
+    const pool = getPool();
+    const result = await query<Record<string, unknown>>(
+      pool,
+      'SELECT * FROM dlq_consumer_replay_state WHERE consumer_url_hash = $1',
+      [hashDlqConsumerUrl(consumerUrl)],
+    );
+    return result.rows[0] ? rowToConsumerReplayState(result.rows[0]) : undefined;
+  },
+
+  async findConsumerReplayStates(consumerUrls: string[]): Promise<Map<string, DlqConsumerReplayState>> {
+    const uniqueUrls = Array.from(new Set(consumerUrls));
+    if (uniqueUrls.length === 0) return new Map();
+
+    const pool = getPool();
+    const hashes = uniqueUrls.map(hashDlqConsumerUrl);
+    const result = await query<Record<string, unknown>>(
+      pool,
+      'SELECT * FROM dlq_consumer_replay_state WHERE consumer_url_hash = ANY($1::text[])',
+      [hashes],
+    );
+
+    const byUrl = new Map<string, DlqConsumerReplayState>();
+    for (const row of result.rows) {
+      const state = rowToConsumerReplayState(row);
+      byUrl.set(state.consumerUrl, state);
+    }
+    return byUrl;
+  },
+
+  async recordConsumerReplayFailure(consumerUrl: string, threshold: number): Promise<DlqConsumerReplayState> {
+    const pool = getPool();
+    const hash = hashDlqConsumerUrl(consumerUrl);
+    const result = await query<Record<string, unknown>>(
+      pool,
+      `
+        INSERT INTO dlq_consumer_replay_state
+          (consumer_url_hash, consumer_url, consecutive_failures, suspended, suspended_at, updated_at)
+        VALUES ($1, $2, 1, $3, CASE WHEN $3 THEN NOW() ELSE NULL END, NOW())
+        ON CONFLICT (consumer_url_hash) DO UPDATE SET
+          consumer_url = EXCLUDED.consumer_url,
+          consecutive_failures = dlq_consumer_replay_state.consecutive_failures + 1,
+          suspended = dlq_consumer_replay_state.suspended
+            OR (dlq_consumer_replay_state.consecutive_failures + 1 >= $4),
+          suspended_at = CASE
+            WHEN dlq_consumer_replay_state.suspended THEN dlq_consumer_replay_state.suspended_at
+            WHEN dlq_consumer_replay_state.consecutive_failures + 1 >= $4 THEN NOW()
+            ELSE NULL
+          END,
+          updated_at = NOW()
+        RETURNING *
+      `,
+      [hash, consumerUrl, 1 >= threshold, threshold],
+    );
+    return rowToConsumerReplayState(result.rows[0]!);
+  },
+
+  async reenableConsumer(consumerUrl: string): Promise<DlqConsumerReplayState | undefined> {
+    const pool = getPool();
+    const result = await query<Record<string, unknown>>(
+      pool,
+      `
+        UPDATE dlq_consumer_replay_state
+        SET consecutive_failures = 0,
+            suspended = false,
+            suspended_at = NULL,
+            updated_at = NOW()
+        WHERE consumer_url_hash = $1
+        RETURNING *
+      `,
+      [hashDlqConsumerUrl(consumerUrl)],
+    );
+    return result.rows[0] ? rowToConsumerReplayState(result.rows[0]) : undefined;
   },
 };

@@ -6,13 +6,13 @@
  * in this module mutates or removes existing records.
  *
  * Three write paths:
- *  1. `recordAuditEvent`          – in-memory only; never throws; used by
+ *  1. `recordAuditEvent`          - in-memory only; never throws; used by
  *                                   non-transactional callers (admin routes, etc.)
  *  2. `buildAuditEntry` +
- *     `writeAuditEntryToDb`       – used inside DB transactions so the audit
+ *     `writeAuditEntryToDb`       - used inside DB transactions so the audit
  *                                   row is committed or rolled back atomically
  *                                   with the primary stream operation.
- *  3. `recordAuditEventToDb`       – non-transactional helper that writes to
+ *  3. `recordAuditEventToDb`       - non-transactional helper that writes to
  *                                   the shared Postgres audit table and then
  *                                   mirrors the entry into the in-memory log.
  *
@@ -30,7 +30,7 @@
 import { logger } from './logger.js';
 import { getPool, query } from '../db/pool.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_REENABLED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.
@@ -77,7 +77,7 @@ function appendAuditEntry(entry: AuditEntry): void {
   });
 }
 
-// ── In-memory path (non-transactional) ───────────────────────────────────────
+// ?? In-memory path (non-transactional) ???????????????????????????????????????
 
 /**
  * Append an audit entry to the in-memory log. Never throws.
@@ -112,7 +112,7 @@ export function recordAuditEvent(
   }
 }
 
-// ── Transactional path (DB-backed) ───────────────────────────────────────────
+// ?? Transactional path (DB-backed) ???????????????????????????????????????????
 
 /**
  * Build an AuditEntry without writing it anywhere.
@@ -196,7 +196,7 @@ export async function recordAuditEventToDb(
   return entry;
 }
 
-// ── Queries ───────────────────────────────────────────────────────────────────
+// ?? Queries ???????????????????????????????????????????????????????????????????
 
 /** Return a shallow copy of all in-memory entries (oldest first). */
 export function getAuditEntries(): AuditEntry[] {
@@ -204,9 +204,9 @@ export function getAuditEntries(): AuditEntry[] {
   return [...(log ?? [])];
 }
 
-// ── Test helpers ──────────────────────────────────────────────────────────────
+// ?? Test helpers ??????????????????????????????????????????????????????????????
 
-/** Reset store — test use only. */
+/** Reset store - test use only. */
 export function _resetAuditLog(): void {
   const log = (globalThis as Record<string, unknown>)[AUDIT_LOG_KEY];
   if (Array.isArray(log)) {
