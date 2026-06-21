@@ -31,6 +31,31 @@ scrape_configs:
 | `403` | Token present but incorrect |
 | `503` | `ADMIN_API_KEY` not configured on the server |
 
+## Webhook backlog metrics
+
+Webhook dead-letter queue and outbox backlog metrics are exported from the
+admin-protected `GET /metrics` endpoint. They are aggregate gauges with no
+consumer URL labels, so a scrape cannot leak webhook destinations or create
+unbounded label cardinality.
+
+| Metric | Type | Description | Suggested alert |
+|--------|------|-------------|-----------------|
+| `fluxora_webhook_dlq_items` | Gauge | Current number of webhook deliveries in the dead-letter queue. | Page when `> 0` for 10 minutes. |
+| `fluxora_webhook_outbox_pending_items` | Gauge | Current number of pending webhook outbox items waiting for delivery. | Warn when `> 100` for 15 minutes or increasing for 30 minutes. |
+| `fluxora_webhook_circuit_breaker_open_endpoints` | Gauge | Process-local count of webhook endpoints currently in the open circuit-breaker phase. | Warn when `> 0` for 5 minutes. |
+
+Example alert:
+
+```yaml
+- alert: FluxoraWebhookDlqBacklog
+  expr: fluxora_webhook_dlq_items > 0
+  for: 10m
+  labels:
+    severity: page
+  annotations:
+    summary: Webhook dead-letter queue is accumulating failed deliveries
+```
+
 ## Slow-query logging
 
 Every repository method in `src/db/repositories/streamRepository.ts` is instrumented with a Prometheus histogram.

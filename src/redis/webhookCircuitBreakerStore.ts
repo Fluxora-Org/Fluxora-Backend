@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Counter } from 'prom-client';
 import type { RedisClient } from './client.js';
 import { registry } from '../metrics.js';
+import { recordWebhookCircuitBreakerTransition } from '../metrics/businessMetrics.js';
 
 export interface CircuitBreakerPolicy {
   circuitBreakerThreshold?: number;
@@ -79,7 +80,9 @@ function ttlSec(policy: CircuitBreakerPolicy): number {
 }
 
 function emit(from: WebhookCircuitBreakerPhase, to: WebhookCircuitBreakerPhase): void {
-  if (from !== to) transitionsTotal.inc({ from_state: from, to_state: to });
+  if (from === to) return;
+  transitionsTotal.inc({ from_state: from, to_state: to });
+  recordWebhookCircuitBreakerTransition(from, to);
 }
 
 function parse(raw: string | null): WebhookCircuitBreakerRecord {

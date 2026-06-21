@@ -8,14 +8,21 @@ import {
   webhookDeliveryDurationSeconds,
   indexerEventsIngestedTotal,
   indexerLagSeconds,
+  syncWebhookStoreMetrics,
   deRegisterBusinessMetrics,
 } from '../../src/metrics/businessMetrics.js';
 import { WebhookService } from '../../src/webhooks/service.js';
 import { IndexerIngestionService } from '../../src/indexer/service.js';
 import { InMemoryContractEventStore } from '../../src/indexer/store.js';
 
+const ADMIN_KEY = 'business-metrics-admin-key';
+let originalAdminKey: string | undefined;
+
 // Setup fresh metrics before each test in this suite
 beforeEach(() => {
+  originalAdminKey = process.env.ADMIN_API_KEY;
+  process.env.ADMIN_API_KEY = ADMIN_KEY;
+
   // Reset existing metrics if they are still registered
   try {
     streamsCreatedTotal.reset();
@@ -25,6 +32,14 @@ beforeEach(() => {
     indexerLagSeconds.reset();
   } catch {
     // no-op if already de-registered
+  }
+});
+
+afterEach(() => {
+  if (originalAdminKey !== undefined) {
+    process.env.ADMIN_API_KEY = originalAdminKey;
+  } else {
+    delete process.env.ADMIN_API_KEY;
   }
 });
 
@@ -179,11 +194,16 @@ describe('Business Metrics Integration', () => {
   // 3. Scrape integration
   it('exposes custom business metrics in /metrics endpoint', async () => {
     streamsCreatedTotal.inc({ status: 'active' });
+    syncWebhookStoreMetrics({ dlqItems: 1, outboxItems: 2 });
 
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(200);
     expect(res.text).toContain('fluxora_streams_created_total');
     expect(res.text).toContain('status="active"');
+    expect(res.text).toMatch(/fluxora_webhook_dlq_items\{[^}]*\} 1/);
+    expect(res.text).toMatch(/fluxora_webhook_outbox_pending_items\{[^}]*\} 2/);
   });
 
   // 4. Double Registration & De-registration protection
@@ -195,5 +215,6 @@ describe('Business Metrics Integration', () => {
     // Verify calling deRegister removes them
     deRegisterBusinessMetrics();
     expect(registry.getSingleMetric('fluxora_streams_created_total')).toBeUndefined();
+    expect(registry.getSingleMetric('fluxora_webhook_dlq_items')).toBeUndefined();
   });
 });

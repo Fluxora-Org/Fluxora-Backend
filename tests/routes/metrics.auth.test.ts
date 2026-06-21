@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../../src/app.js';
+import { syncWebhookStoreMetrics } from '../../src/metrics/businessMetrics.js';
 
 const ADMIN_KEY = 'test-metrics-admin-key';
 
@@ -41,6 +42,18 @@ describe('GET /metrics auth', () => {
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(200);
     expect(res.text).toContain('# HELP');
+  });
+
+  it('exposes webhook backlog gauges only through the admin-protected metrics route', async () => {
+    syncWebhookStoreMetrics({ dlqItems: 2, outboxItems: 4 });
+
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
+
+    expect(res.status).toBe(200);
+    expect(res.text).toMatch(/fluxora_webhook_dlq_items\{[^}]*\} 2/);
+    expect(res.text).toMatch(/fluxora_webhook_outbox_pending_items\{[^}]*\} 4/);
   });
 
   it('returns 503 when ADMIN_API_KEY is not configured', async () => {

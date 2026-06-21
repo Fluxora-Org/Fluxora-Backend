@@ -11,6 +11,8 @@ export const metricsRouter = express.Router();
  * Returns Prometheus-format metrics including:
  * - http_requests_total: Counter of HTTP requests by method, route, status_code
  * - http_request_duration_seconds: Histogram of request latency
+ * - fluxora_webhook_dlq_items / fluxora_webhook_outbox_pending_items
+ *   aggregate webhook backlog gauges
  * - Default Node.js metrics (process info, GC, memory, etc.)
  *
  * Content-Type: text/plain; version=0.0.4

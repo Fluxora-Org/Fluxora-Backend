@@ -45,6 +45,8 @@ import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { registerWebhookStoreMetricsSource } from './metrics/businessMetrics.js';
+import { webhookDeliveryStore } from './webhooks/store.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -201,6 +203,7 @@ export function createApp(options: AppOptions = {}): Express {
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
+  registerWebhookStoreMetricsSource(() => webhookDeliveryStore.getMetrics());
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   app.use(privacyHeaders);
