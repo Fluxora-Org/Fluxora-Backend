@@ -11,6 +11,8 @@ Required configuration:
 - `WEBHOOK_POLL_INTERVAL_MS`: polling interval in milliseconds. Defaults to `10000`.
 - `WEBHOOK_BATCH_SIZE`: rows claimed per poll. Defaults to `10`.
 - `WEBHOOK_RETRY_RPS`: maximum outbound retry attempts per second per consumer URL. Defaults to `10`. Set lower (e.g. `2`) for consumers known to be slow or fragile.
+- `WEBHOOK_RETRY_JITTER_ALGORITHM`: retry backoff jitter algorithm. Supports `full`, `equal`, and `decorrelated`. Defaults to `full`.
+- `WEBHOOK_RETRY_JITTER_PERCENT`: non-negative jitter percentage toggle. Defaults to `10`; set to `0` for deterministic no-jitter backoff.
 - `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD`: consecutive retryable failures before the circuit opens. Defaults to `0` (disabled). Set e.g. `10` to enable cross-instance protection.
 - `WEBHOOK_CIRCUIT_BREAKER_RESET_MS`: how long the circuit stays open before a single half-open probe. Defaults to `300000` (5 minutes).
 
@@ -33,6 +35,12 @@ FOR UPDATE SKIP LOCKED
 `FOR UPDATE SKIP LOCKED` lets multiple API instances run dispatchers concurrently without claiming the same row at the same time. A row is marked `processed = true` only after the HTTP attempt is complete. If the process exits before commit, PostgreSQL releases the lock and the row remains unprocessed for another worker to deliver, which provides at-least-once delivery.
 
 Failed retryable deliveries are delegated to `src/webhooks/retry.ts`. The original row is marked processed and a new unprocessed row is inserted with `created_at` set to the next retry time. The dispatcher only claims rows whose `created_at` is due, so retries remain durable in PostgreSQL without holding process memory.
+
+## Retry jitter
+
+Webhook retry delays use capped exponential backoff plus configurable jitter so a burst of failing deliveries does not retry in lockstep. `full` jitter selects a delay between `0` and the capped raw backoff delay; `equal` jitter keeps retries in the upper half of that range; `decorrelated` jitter uses the previous retry delay to spread later retries more aggressively while still capping at `maxBackoffMs`.
+
+Durable outbox retries store the previous delay in `_webhookRetry.previousDelayMs`, so decorrelated jitter keeps its state across process restarts. All algorithms clamp delays to non-negative values and never exceed the configured maximum backoff.
 
 ## Retry rate limiting
 

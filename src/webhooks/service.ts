@@ -8,19 +8,27 @@ import { logger } from '../lib/logger.js';
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { getPool } from '../db/pool.js';
-import type {
-  WebhookEvent,
-  WebhookDelivery,
-  WebhookDeliveryAttempt,
-  WebhookRetryPolicy,
-} from './types.js';
+import type { WebhookEvent, WebhookDelivery, WebhookDeliveryAttempt } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, scheduleWebhookOutboxRetry, shouldRetry } from './retry.js';
-import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
-import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
-import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
+import {
+  calculateNextRetryTime,
+  shouldRetry,
+  checkWebhookDeliveryGate,
+  attemptWebhookDeliveryWithRateLimit,
+  countsTowardCircuitBreaker,
+  type EnhancedRetryPolicy,
+  type JitterAlgorithm,
+} from './retry.js';
+import {
+  webhookDeliveriesTotal,
+  webhookDeliveryDurationSeconds,
+} from '../metrics/businessMetrics.js';
+import type {
+  WebhookCircuitBreakerStore,
+  CircuitBreakerPolicy,
+} from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import type { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
 import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
@@ -71,12 +79,26 @@ function parseNonNegativeInteger(value: string | undefined, fallback: number): n
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function parseWebhookJitterAlgorithm(value: string | undefined): JitterAlgorithm | undefined {
+  if (!value) return undefined;
+  return value === 'full' || value === 'equal' || value === 'decorrelated' ? value : undefined;
+}
+
 function resolveWebhookRetryPolicy(override?: EnhancedRetryPolicy): EnhancedRetryPolicy {
   const threshold = parseNonNegativeInteger(process.env.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD, 0);
   const resetMs = parsePositiveInteger(process.env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS, 300_000);
+  const jitterPercent = parseNonNegativeInteger(
+    process.env.WEBHOOK_RETRY_JITTER_PERCENT,
+    DEFAULT_RETRY_POLICY.jitterPercent
+  );
+  const jitterAlgorithm = parseWebhookJitterAlgorithm(process.env.WEBHOOK_RETRY_JITTER_ALGORITHM);
   return {
     ...DEFAULT_RETRY_POLICY,
-    ...(threshold > 0 ? { circuitBreakerThreshold: threshold, circuitBreakerResetMs: resetMs } : {}),
+    jitterPercent,
+    jitterAlgorithm: jitterAlgorithm ?? 'full',
+    ...(threshold > 0
+      ? { circuitBreakerThreshold: threshold, circuitBreakerResetMs: resetMs }
+      : {}),
     ...override,
   };
 }
@@ -96,7 +118,11 @@ function assertSafeWebhookEndpoint(endpointUrl: string): void {
     throw new Error('Webhook endpoint must use http or https');
   }
 
-  if (process.env.NODE_ENV === 'production' && url.protocol !== 'https:' && !isLoopbackHostname(url.hostname)) {
+  if (
+    process.env.NODE_ENV === 'production' &&
+    url.protocol !== 'https:' &&
+    !isLoopbackHostname(url.hostname)
+  ) {
     throw new Error('Webhook endpoint must use https in production');
   }
 }
@@ -125,7 +151,7 @@ function extractAttemptNumber(payload: unknown): number {
 
 function enqueuePermanentFailureToDlq(
   delivery: WebhookDelivery,
-  failureReason: string,
+  failureReason: string
 ): string | undefined {
   const alreadyQueued = webhookDeliveryStore
     .getDeadLetterQueueItems()
@@ -147,7 +173,7 @@ export class WebhookService {
 
   constructor(
     policy: EnhancedRetryPolicy = resolveWebhookRetryPolicy(),
-    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore(),
+    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore()
   ) {
     this.policy = policy;
     this.circuitBreakerStore = circuitBreakerStore;
@@ -159,7 +185,7 @@ export class WebhookService {
   async queueDelivery(
     event: WebhookEvent,
     endpointUrl: string,
-    secret: string,
+    secret: string
   ): Promise<WebhookDelivery> {
     const deliveryId = `deliv_${randomUUID()}`;
     const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -212,17 +238,21 @@ export class WebhookService {
   async runDeliveryAttempt(
     delivery: WebhookDelivery,
     secret: string,
-    timestamp?: string,
+    timestamp?: string
   ): Promise<WebhookDeliveryAttempt> {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
     const correlationId = getCorrelationId();
-    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
-      deliveryId: delivery.deliveryId,
-      eventType: delivery.eventType,
-      attemptNumber,
-      maxAttempts: this.policy.maxAttempts,
-    });
+    logger.info(
+      'Attempting webhook delivery',
+      correlationId !== 'unknown' ? correlationId : undefined,
+      {
+        deliveryId: delivery.deliveryId,
+        eventType: delivery.eventType,
+        attemptNumber,
+        maxAttempts: this.policy.maxAttempts,
+      }
+    );
 
     const signature = computeWebhookSignature(secret, ts, delivery.payload);
     const attempt: WebhookDeliveryAttempt = {
@@ -239,7 +269,7 @@ export class WebhookService {
         delivery.eventType,
         ts,
         signature,
-        correlationId,
+        correlationId
       );
       attempt.statusCode = response.status;
 
@@ -320,7 +350,7 @@ export class WebhookService {
 
   private async recordBreakerOutcome(
     endpointUrl: string,
-    attempt: WebhookDeliveryAttempt,
+    attempt: WebhookDeliveryAttempt
   ): Promise<number> {
     const success =
       attempt.statusCode !== undefined &&
@@ -331,7 +361,7 @@ export class WebhookService {
     if (success) {
       const record = await this.circuitBreakerStore.recordSuccess(
         endpointUrl,
-        this.policy as CircuitBreakerPolicy,
+        this.policy as CircuitBreakerPolicy
       );
       return record.consecutiveFailures;
     }
@@ -344,7 +374,7 @@ export class WebhookService {
     const record = await this.circuitBreakerStore.recordFailure(
       endpointUrl,
       this.policy as CircuitBreakerPolicy,
-      Date.now(),
+      Date.now()
     );
     return record.consecutiveFailures;
   }
@@ -355,17 +385,21 @@ export class WebhookService {
   async attemptDelivery(
     delivery: WebhookDelivery,
     secret: string,
-    timestamp?: string,
+    timestamp?: string
   ): Promise<void> {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
 
     const correlationId = getCorrelationId();
-    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
-      deliveryId: delivery.deliveryId,
-      attempt: attemptNumber,
-      maxAttempts: this.policy.maxAttempts,
-    });
+    logger.info(
+      'Attempting webhook delivery',
+      correlationId !== 'unknown' ? correlationId : undefined,
+      {
+        deliveryId: delivery.deliveryId,
+        attempt: attemptNumber,
+        maxAttempts: this.policy.maxAttempts,
+      }
+    );
 
     const attempt = await this.runDeliveryAttempt(delivery, secret, ts);
     const consecutiveFailures = await this.recordBreakerOutcome(delivery.endpointUrl, attempt);
@@ -413,7 +447,7 @@ export class WebhookService {
     eventType: string,
     timestamp: string,
     signature: string,
-    correlationId?: string,
+    correlationId?: string
   ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
@@ -542,7 +576,9 @@ export class WebhookDispatcher {
     if (!this.stopped) return;
 
     if (!this.endpointUrl || !this.secret) {
-      logger.warn('Webhook outbox dispatcher disabled; WEBHOOK_URL and WEBHOOK_SECRET are required');
+      logger.warn(
+        'Webhook outbox dispatcher disabled; WEBHOOK_URL and WEBHOOK_SECRET are required'
+      );
       return;
     }
 
@@ -585,11 +621,12 @@ export class WebhookDispatcher {
     if (!this.endpointUrl || !this.secret) return null;
 
     const payload = normalizePayload(row.payload);
-    const payloadObject = typeof payload === 'object' && payload !== null
-      ? payload as Record<string, unknown>
-      : {};
+    const payloadObject =
+      typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
     const endpointUrl =
-      typeof payloadObject['endpointUrl'] === 'string' ? payloadObject['endpointUrl'] : this.endpointUrl;
+      typeof payloadObject['endpointUrl'] === 'string'
+        ? payloadObject['endpointUrl']
+        : this.endpointUrl;
     const secret =
       typeof payloadObject['secret'] === 'string' ? payloadObject['secret'] : this.secret;
 
@@ -615,7 +652,7 @@ export class WebhookDispatcher {
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         `,
-        [this.batchSize],
+        [this.batchSize]
       );
 
       if (result.rows.length === 0) {
@@ -641,7 +678,9 @@ export class WebhookDispatcher {
   private async deliverRow(client: DbClient, row: OutboxRow): Promise<void> {
     const endpoint = this.resolveEndpoint(row);
     if (!endpoint) {
-      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, { outboxId: row.id });
+      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, {
+        outboxId: row.id,
+      });
       return;
     }
 
@@ -678,7 +717,7 @@ export class WebhookDispatcher {
         circuitBreakerStore: this.circuitBreakerStore,
         rateLimiter: this.rateLimiter,
         rateLimitConfig: this.rateLimitConfig,
-      },
+      }
     );
 
     await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
@@ -690,7 +729,7 @@ export class WebhookDispatcher {
             INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
             VALUES ($1, $2, $3::jsonb, $4, false)
           `,
-          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt],
+          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt]
         );
       }
       return;
@@ -698,7 +737,8 @@ export class WebhookDispatcher {
 
     const attempt = result.attempt;
     if (result.shouldRetry) {
-      attempt.nextRetryAt = result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
+      attempt.nextRetryAt =
+        result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
       delivery.status = 'pending';
     } else if (
       attempt.statusCode !== undefined &&
@@ -724,7 +764,7 @@ export class WebhookDispatcher {
         INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
         VALUES ($1, $2, $3::jsonb, $4, false)
       `,
-      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt],
+      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt]
     );
   }
 }

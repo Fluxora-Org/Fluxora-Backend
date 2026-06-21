@@ -1,6 +1,8 @@
 import { test, expect } from 'vitest';
 import {
+  applyJitter,
   calculateNextRetryTime,
+  generateRetrySchedule,
   isRetryableStatusCode,
   shouldRetry,
   formatRetryPolicy,
@@ -95,22 +97,96 @@ test('calculateNextRetryTime: applies jitter within bounds', () => {
   };
 
   // Run multiple times to verify jitter is applied
-  const retries = Array.from({ length: 10 }, () =>
-    calculateNextRetryTime(0, policy, now),
-  );
+  const retries = Array.from({ length: 10 }, () => calculateNextRetryTime(0, policy, now));
 
   // All should be within ±10% of 1000ms
-  const minExpected = now + 900;
-  const maxExpected = now + 1100;
+  const minExpected = now;
+  const maxExpected = now + 1000;
 
   for (const retry of retries) {
-    assert.ok(retry >= minExpected && retry <= maxExpected,
-      `Retry ${retry} outside bounds [${minExpected}, ${maxExpected}]`);
+    assert.ok(
+      retry >= minExpected && retry <= maxExpected,
+      `Retry ${retry} outside bounds [${minExpected}, ${maxExpected}]`
+    );
   }
 
   // Should have some variation (not all the same)
   const uniqueRetries = new Set(retries);
   assert.ok(uniqueRetries.size > 1, 'Jitter should produce variation');
+});
+
+test('calculateNextRetryTime: full jitter uses injectable random source', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    initialBackoffMs: 1000,
+    backoffMultiplier: 2,
+    maxBackoffMs: 60000,
+    jitterPercent: 10,
+  };
+
+  assert.equal(calculateNextRetryTime(1, policy, now, { random: () => 0 }), now);
+  assert.equal(calculateNextRetryTime(1, policy, now, { random: () => 0.5 }), now + 1000);
+  assert.equal(calculateNextRetryTime(1, policy, now, { random: () => 1 }), now + 2000);
+});
+
+test('applyJitter: equal jitter keeps delay in upper half of raw backoff', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    jitterPercent: 10,
+    jitterAlgorithm: 'equal' as const,
+  };
+
+  assert.equal(applyJitter(2000, policy, { random: () => 0 }), 1000);
+  assert.equal(applyJitter(2000, policy, { random: () => 1 }), 2000);
+});
+
+test('applyJitter: clamps injected random values and never returns a negative delay', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    maxBackoffMs: 2000,
+    jitterPercent: 10,
+  };
+
+  assert.equal(applyJitter(2000, policy, { random: () => -1 }), 0);
+  assert.equal(applyJitter(2000, policy, { random: () => Number.NaN }), 0);
+  assert.equal(applyJitter(2000, policy, { random: () => 2 }), 2000);
+});
+
+test('applyJitter: decorrelated jitter uses previous delay and caps at maxBackoffMs', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    initialBackoffMs: 1000,
+    maxBackoffMs: 5000,
+    jitterPercent: 10,
+    jitterAlgorithm: 'decorrelated' as const,
+  };
+
+  assert.equal(applyJitter(2000, policy, { previousDelayMs: 2000, random: () => 0 }), 1000);
+  assert.equal(applyJitter(2000, policy, { previousDelayMs: 2000, random: () => 1 }), 5000);
+});
+
+test('generateRetrySchedule: carries decorrelated previous delay through the schedule', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    maxAttempts: 3,
+    initialBackoffMs: 1000,
+    maxBackoffMs: 10000,
+    jitterPercent: 10,
+    jitterAlgorithm: 'decorrelated' as const,
+  };
+
+  const schedule = generateRetrySchedule(policy, now, { random: () => 1 });
+
+  assert.deepEqual(
+    schedule.map((entry) => entry.delayMs),
+    [3000, 9000, 10000]
+  );
+  assert.deepEqual(
+    schedule.map((entry) => entry.retryAt),
+    [now + 3000, now + 9000, now + 10000]
+  );
 });
 
 test('isRetryableStatusCode: retries on 5xx errors', () => {

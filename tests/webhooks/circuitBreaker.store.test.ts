@@ -49,7 +49,9 @@ describe('RedisWebhookCircuitBreakerStore', () => {
 
   it('hashes consumer URLs before composing Redis keys', () => {
     expect(hashConsumerUrl(consumerUrl)).toHaveLength(16);
-    expect(`${WEBHOOK_CIRCUIT_BREAKER_KEY_PREFIX}${hashConsumerUrl("https://evil/redis\nkey")}`).not.toContain('\n');
+    expect(
+      `${WEBHOOK_CIRCUIT_BREAKER_KEY_PREFIX}${hashConsumerUrl('https://evil/redis\nkey')}`
+    ).not.toContain('\n');
   });
 
   it('opens after threshold failures and blocks until reset expiry', async () => {
@@ -222,7 +224,12 @@ describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () =>
       await store.recordFailure(consumerUrl, policy, now);
     }
 
-    const gate = await checkWebhookDeliveryGate(consumerUrl, policy, { circuitBreakerStore: store }, now + 1000);
+    const gate = await checkWebhookDeliveryGate(
+      consumerUrl,
+      policy,
+      { circuitBreakerStore: store },
+      now + 1000
+    );
     expect(gate.canDeliver).toBe(false);
     expect(gate.circuitBreakerOpen).toBe(true);
     expect(gate.retryAt).not.toBeNull();
@@ -235,7 +242,12 @@ describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () =>
     }
     await store.checkAndClaimAttempt(consumerUrl, policy, now + 60_000);
 
-    const gate = await checkWebhookDeliveryGate(consumerUrl, policy, { circuitBreakerStore: store }, now + 60_000);
+    const gate = await checkWebhookDeliveryGate(
+      consumerUrl,
+      policy,
+      { circuitBreakerStore: store },
+      now + 60_000
+    );
     expect(gate.canDeliver).toBe(false);
     expect(gate.retryAt).toEqual(new Date(now + 60_000 + HALF_OPEN_CONTENTION_DEFERRAL_MS));
   });
@@ -255,7 +267,7 @@ describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () =>
         policy,
       },
       deliver,
-      { circuitBreakerStore: store },
+      { circuitBreakerStore: store }
     );
 
     const state = await store.getState(consumerUrl);
@@ -279,7 +291,7 @@ describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () =>
         policy,
       },
       deliver,
-      { circuitBreakerStore: store },
+      { circuitBreakerStore: store }
     );
 
     expect(deliver).toHaveBeenCalledOnce();
@@ -312,6 +324,36 @@ describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () =>
 
     expect(plan.shouldRetry).toBe(true);
     expect(plan.retryAt).toEqual(new Date(now + 2000));
-    expect(plan.payload).toMatchObject({ id: 'evt-1', _webhookRetry: { attemptNumber: 2 } });
+    expect(plan.payload).toMatchObject({
+      id: 'evt-1',
+      _webhookRetry: { attemptNumber: 2, previousDelayMs: 2000 },
+    });
+  });
+
+  it('persists decorrelated jitter delay metadata across durable outbox retries', () => {
+    const now = Date.now();
+    const plan = scheduleWebhookOutboxRetry({
+      streamId: 'stream-1',
+      eventType: 'stream.created',
+      payload: { id: 'evt-1', _webhookRetry: { attemptNumber: 1, previousDelayMs: 2000 } },
+      attemptNumber: 1,
+      policy: {
+        ...policy,
+        initialBackoffMs: 1000,
+        maxBackoffMs: 10_000,
+        jitterPercent: 10,
+        jitterAlgorithm: 'decorrelated',
+        random: () => 1,
+      },
+      now,
+      lastAttempt: { attemptNumber: 1, timestamp: now, statusCode: 500 },
+    });
+
+    expect(plan.shouldRetry).toBe(true);
+    expect(plan.retryAt).toEqual(new Date(now + 6000));
+    expect(plan.payload).toMatchObject({
+      id: 'evt-1',
+      _webhookRetry: { attemptNumber: 2, previousDelayMs: 6000 },
+    });
   });
 });

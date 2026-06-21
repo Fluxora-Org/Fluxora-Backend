@@ -282,6 +282,8 @@ See [docs/indexer.md](docs/indexer.md) for detailed troubleshooting.
 
 ## Webhook resilience
 
+Retry backoff applies configurable full, equal, or decorrelated jitter so recovering consumers do not receive synchronized retry bursts. Jittered delays are clamped to non-negative values and the configured max backoff ceiling.
+
 Outbound webhook retries use two Redis-backed per-consumer controls:
 
 - **Rate limiting** (`src/redis/webhookRateLimit.ts`): sliding-window cap via `WEBHOOK_RETRY_RPS` (default `10`/s).

@@ -40,7 +40,10 @@ function createClient(rows: unknown[]): MockClient {
   return client;
 }
 
-function createDispatcher(client: MockClient, breaker: RedisWebhookCircuitBreakerStore): WebhookDispatcher {
+function createDispatcher(
+  client: MockClient,
+  breaker: RedisWebhookCircuitBreakerStore
+): WebhookDispatcher {
   return new WebhookDispatcher({
     endpointUrl: 'https://consumer.example/webhooks',
     secret: 'test-secret',
@@ -54,17 +57,31 @@ function createDispatcher(client: MockClient, breaker: RedisWebhookCircuitBreake
   });
 }
 
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
+
 describe('WebhookDispatcher outbox polling', () => {
   let redis: FakeRedisClient;
   let breaker: RedisWebhookCircuitBreakerStore;
+  let previousJitterAlgorithm: string | undefined;
+  let previousJitterPercent: string | undefined;
 
   beforeEach(() => {
+    previousJitterAlgorithm = process.env.WEBHOOK_RETRY_JITTER_ALGORITHM;
+    previousJitterPercent = process.env.WEBHOOK_RETRY_JITTER_PERCENT;
     redis = new FakeRedisClient();
     breaker = new RedisWebhookCircuitBreakerStore(redis);
     vi.spyOn(Math, 'random').mockReturnValue(0.5);
   });
 
   afterEach(async () => {
+    restoreEnv('WEBHOOK_RETRY_JITTER_ALGORITHM', previousJitterAlgorithm);
+    restoreEnv('WEBHOOK_RETRY_JITTER_PERCENT', previousJitterPercent);
     await breaker.close();
     redis.reset();
     vi.restoreAllMocks();
@@ -77,7 +94,7 @@ describe('WebhookDispatcher outbox polling', () => {
     await createDispatcher(client, breaker).pollOnce();
 
     expect(global.fetch).not.toHaveBeenCalled();
-    expect(client.queries.some(q => q.sql.includes('COMMIT'))).toBe(true);
+    expect(client.queries.some((q) => q.sql.includes('COMMIT'))).toBe(true);
     expect(client.release).toHaveBeenCalledOnce();
   });
 
@@ -91,11 +108,13 @@ describe('WebhookDispatcher outbox polling', () => {
         created_at: new Date(),
       },
     ]);
-    global.fetch = vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch;
+    global.fetch = vi.fn(
+      async () => new Response(null, { status: 204 })
+    ) as unknown as typeof fetch;
 
     await createDispatcher(client, breaker).pollOnce();
 
-    const select = client.queries.find(q => q.sql.includes('SELECT id, stream_id'));
+    const select = client.queries.find((q) => q.sql.includes('SELECT id, stream_id'));
     expect(select?.sql).toContain('FOR UPDATE SKIP LOCKED');
     expect(select?.params).toEqual([5]);
     expect(global.fetch).toHaveBeenCalledOnce();
@@ -105,9 +124,9 @@ describe('WebhookDispatcher outbox polling', () => {
           sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
           params: ['42'],
         }),
-      ]),
+      ])
     );
-    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(client.queries.some((q) => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
   });
 
   it('marks failed attempts processed and delegates retry scheduling to a future outbox row', async () => {
@@ -122,18 +141,20 @@ describe('WebhookDispatcher outbox polling', () => {
         created_at: new Date(now),
       },
     ]);
-    global.fetch = vi.fn(async () => new Response(null, { status: 500, statusText: 'Server Error' })) as unknown as typeof fetch;
+    global.fetch = vi.fn(
+      async () => new Response(null, { status: 500, statusText: 'Server Error' })
+    ) as unknown as typeof fetch;
 
     await createDispatcher(client, breaker).pollOnce();
 
-    const insert = client.queries.find(q => q.sql.includes('INSERT INTO webhook_outbox'));
+    const insert = client.queries.find((q) => q.sql.includes('INSERT INTO webhook_outbox'));
     expect(client.queries).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
           params: ['43'],
         }),
-      ]),
+      ])
     );
     expect(insert?.params?.[0]).toBe('stream-2');
     expect(insert?.params?.[1]).toBe('stream.updated');
@@ -142,6 +163,45 @@ describe('WebhookDispatcher outbox polling', () => {
       _webhookRetry: { attemptNumber: 2 },
     });
     expect(insert?.params?.[3]).toEqual(new Date(now + 1000));
+  });
+
+  it('honors webhook jitter algorithm environment config for durable retry rows', async () => {
+    const now = new Date('2026-05-26T12:00:00.000Z').getTime();
+    process.env.WEBHOOK_RETRY_JITTER_ALGORITHM = 'decorrelated';
+    process.env.WEBHOOK_RETRY_JITTER_PERCENT = '10';
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+
+    const client = createClient([
+      {
+        id: '48',
+        stream_id: 'stream-7',
+        event_type: 'stream.updated',
+        payload: { id: 'evt-7' },
+        created_at: new Date(now),
+      },
+    ]);
+    global.fetch = vi.fn(
+      async () => new Response(null, { status: 500, statusText: 'Server Error' })
+    ) as unknown as typeof fetch;
+
+    await new WebhookDispatcher({
+      endpointUrl: 'https://consumer.example/webhooks',
+      secret: 'test-secret',
+      pollIntervalMs: 60_000,
+      batchSize: 5,
+      pool: {
+        connect: vi.fn(async () => client),
+      },
+      circuitBreakerStore: breaker,
+    }).pollOnce();
+
+    const insert = client.queries.find((q) => q.sql.includes('INSERT INTO webhook_outbox'));
+    expect(insert?.params?.[3]).toEqual(new Date(now + 3000));
+    expect(JSON.parse(insert?.params?.[2] as string)).toMatchObject({
+      id: 'evt-7',
+      _webhookRetry: { attemptNumber: 2, previousDelayMs: 3000 },
+    });
   });
 
   it('does not enqueue another row after retry attempts are exhausted', async () => {
@@ -157,11 +217,13 @@ describe('WebhookDispatcher outbox polling', () => {
         created_at: new Date(),
       },
     ]);
-    global.fetch = vi.fn(async () => new Response(null, { status: 500, statusText: 'Server Error' })) as unknown as typeof fetch;
+    global.fetch = vi.fn(
+      async () => new Response(null, { status: 500, statusText: 'Server Error' })
+    ) as unknown as typeof fetch;
 
     await createDispatcher(client, breaker).pollOnce();
 
-    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(client.queries.some((q) => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
   });
 
   it('defers delivery when the shared Redis circuit breaker is open', async () => {
@@ -184,9 +246,11 @@ describe('WebhookDispatcher outbox polling', () => {
     await createDispatcher(client, breaker).pollOnce();
 
     expect(global.fetch).not.toHaveBeenCalled();
-    const insert = client.queries.find(q => q.sql.includes('INSERT INTO webhook_outbox'));
+    const insert = client.queries.find((q) => q.sql.includes('INSERT INTO webhook_outbox'));
     expect(insert).toBeDefined();
-    expect(insert?.params?.[3]).toEqual(new Date((await breaker.getState('https://consumer.example/webhooks'))!.resetAt));
+    expect(insert?.params?.[3]).toEqual(
+      new Date((await breaker.getState('https://consumer.example/webhooks'))!.resetAt)
+    );
   });
 
   it('re-enqueues outbox rows when half-open probe contention blocks delivery', async () => {
@@ -196,7 +260,11 @@ describe('WebhookDispatcher outbox polling', () => {
       await breaker.recordFailure('https://consumer.example/webhooks', policy, now);
     }
     const openState = await breaker.getState('https://consumer.example/webhooks');
-    await breaker.checkAndClaimAttempt('https://consumer.example/webhooks', policy, openState!.resetAt);
+    await breaker.checkAndClaimAttempt(
+      'https://consumer.example/webhooks',
+      policy,
+      openState!.resetAt
+    );
 
     const client = createClient([
       {
@@ -212,7 +280,7 @@ describe('WebhookDispatcher outbox polling', () => {
     await createDispatcher(client, breaker).pollOnce();
 
     expect(global.fetch).not.toHaveBeenCalled();
-    const insert = client.queries.find(q => q.sql.includes('INSERT INTO webhook_outbox'));
+    const insert = client.queries.find((q) => q.sql.includes('INSERT INTO webhook_outbox'));
     expect(insert).toBeDefined();
     expect(insert?.params?.[3]).toEqual(new Date(now + 1_000));
   });
@@ -229,9 +297,10 @@ describe('WebhookDispatcher outbox polling', () => {
       },
     ]);
     global.fetch = vi.fn(
-      async () => new Promise<Response>((resolve) => {
-        releaseFetch = () => resolve(new Response(null, { status: 200 }));
-      }),
+      async () =>
+        new Promise<Response>((resolve) => {
+          releaseFetch = () => resolve(new Response(null, { status: 200 }));
+        })
     ) as unknown as typeof fetch;
     const dispatcher = createDispatcher(client, breaker);
 
@@ -250,6 +319,6 @@ describe('WebhookDispatcher outbox polling', () => {
 
     await Promise.all([poll, stopped]);
     expect(client.release).toHaveBeenCalledOnce();
-    expect(client.queries.some(q => q.sql.includes('COMMIT'))).toBe(true);
+    expect(client.queries.some((q) => q.sql.includes('COMMIT'))).toBe(true);
   });
 });
