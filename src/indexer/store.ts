@@ -3,6 +3,17 @@ import { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } f
 
 export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
 
+export const STALE_CURSOR_ERROR_CODE = 'STALE_CURSOR';
+
+export class StaleCursorError extends Error {
+  public readonly code = STALE_CURSOR_ERROR_CODE;
+
+  constructor(public readonly afterEventId: string) {
+    super(`Replay cursor '${afterEventId}' no longer exists; resync from fromLedger`);
+    this.name = 'StaleCursorError';
+  }
+}
+
 /** Record of a chain reorg that evicted previously stored events. */
 export interface ReorgRecord {
   /** The ledger at which the fork occurred — all events at or above this were evicted. */
@@ -90,8 +101,7 @@ export class InMemoryContractEventStore implements ContractEventStore {
     if (filter.afterEventId !== undefined) {
       const idx = results.findIndex((r) => r.eventId === filter.afterEventId);
       if (idx === -1) {
-        // Unknown cursor — treat as "past end of store", return empty
-        results = [];
+        throw new StaleCursorError(filter.afterEventId);
       } else {
         results = results.slice(idx + 1);
       }
@@ -254,17 +264,16 @@ export class PostgresContractEventStore implements ContractEventStore {
         `SELECT ledger FROM ${this.tableName} WHERE event_id = $1 LIMIT 1`,
         [filter.afterEventId],
       );
-      if (cursorResult.rows.length > 0) {
-        const cursorRow = cursorResult.rows[0];
-        if (cursorRow) {
-          const cursorLedger = cursorRow.ledger;
-          values.push(cursorLedger, filter.afterEventId);
-          conditions.push(
-            `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
-          );
-        }
+      const cursorRow = cursorResult.rows[0];
+      if (!cursorRow) {
+        throw new StaleCursorError(filter.afterEventId);
       }
-      // If cursor row not found, return empty (cursor is past the end of the store)
+
+      const cursorLedger = cursorRow.ledger;
+      values.push(cursorLedger, filter.afterEventId);
+      conditions.push(
+        `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
+      );
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';

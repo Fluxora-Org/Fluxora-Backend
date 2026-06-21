@@ -19,6 +19,7 @@ import {
   getActiveSseConnectionCount,
 } from '../../src/streams/sseConnectionLimiter.js';
 import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
+import { StaleCursorError } from '../../src/indexer/store.js';
 
 // ── Mock the repository and Redis before importing the app ──────────────────────────────
 const mockGetById = vi.fn();
@@ -412,6 +413,33 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
       afterEventId: 'evt-99',
       limit: 100,
     });
+  });
+
+  it('returns a STALE_CURSOR SSE error when Last-Event-ID was evicted', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+    mockGetEvents.mockRejectedValue(new StaleCursorError('evt-evicted'));
+
+    const resPromise = new Promise<string>((resolve) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/streams/stream-123/events',
+        headers: {
+          'Last-Event-ID': 'evt-evicted',
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+        });
+        res.on('end', () => resolve(data));
+      });
+      req.on('error', () => resolve(''));
+    });
+
+    const output = await resPromise;
+    expect(output).toContain('event: error');
+    expect(output).toContain('"code":"STALE_CURSOR"');
   });
 
   it('streams live events via sseEventBus', async () => {

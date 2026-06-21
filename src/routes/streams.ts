@@ -52,6 +52,7 @@ import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
 import {
+  compareDecimalStringToZero,
   validateDecimalString,
   validateAmountFields,
 } from '../serialization/decimal.js';
@@ -82,6 +83,7 @@ import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
+import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 import {
   eventMatchesStreamId,
@@ -312,13 +314,13 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
 
   const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && parseFloat(validatedDeposit) <= 0) {
+  if (depositAmount !== undefined && compareDecimalStringToZero(validatedDeposit) <= 0) {
     throw validationError('depositAmount must be greater than zero');
   }
 
   const rateResult = validateDecimalString(ratePerSecond ?? '0', 'ratePerSecond');
   const validatedRate = rateResult.valid && rateResult.value ? rateResult.value : '0';
-  if (ratePerSecond !== undefined && parseFloat(validatedRate) < 0) {
+  if (ratePerSecond !== undefined && compareDecimalStringToZero(validatedRate) < 0) {
     throw validationError('ratePerSecond cannot be negative');
   }
 
@@ -1042,6 +1044,22 @@ streamsRouter.get(
             pagesRead++;
           } while (cursor !== undefined && !cleanedUp && pagesRead < SSE_REPLAY_MAX_PAGES);
         } catch (err) {
+          if (err instanceof StaleCursorError) {
+            writeSse(
+              `event: error\ndata: ${JSON.stringify({
+                code: STALE_CURSOR_ERROR_CODE,
+                message: 'Replay cursor no longer exists; resync from fromLedger',
+              })}\n\n`,
+            );
+            warn('SSE replay cursor is stale', {
+              afterEventId: err.afterEventId,
+              requestId,
+            });
+            res.end();
+            cleanup('stale_cursor');
+            return;
+          }
+
           warn('Failed to replay SSE events from store', {
             error: err instanceof Error ? err.message : String(err),
             requestId,
@@ -1074,5 +1092,3 @@ streamsRouter.get(
 );
 
 export function _resetStreams(): void {}
-
-

@@ -25,11 +25,15 @@ import {
   RedisRpcFallbackCache,
   hashCachePart,
   type RpcFallbackCache,
+  type RpcFallbackCacheEntry,
 } from '../redis/rpcFallbackCache.js';
 import { createRedisClient } from '../redis/client.js';
 import {
   rpcCircuitOpenFallbackHitsTotal,
   rpcCircuitOpenFallbackMissesTotal,
+  rpcFallbackCacheEarlyRefreshesTotal,
+  rpcFallbackCacheHitsTotal,
+  rpcFallbackCacheMissesTotal,
 } from '../metrics/rpcMetrics.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -60,6 +64,8 @@ export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCall
   fallbackCacheTtlSeconds?: number;
   /** Optional cache injection for tests or alternate Redis lifecycle ownership. */
   fallbackCache?: RpcFallbackCache;
+  /** XFetch-style beta factor. Set to 0 to disable early-expiry reads. */
+  fallbackCacheEarlyExpiryBeta?: number;
 }
 
 interface RpcRequestMetadata {
@@ -222,6 +228,8 @@ export class StellarRpcService {
   private readonly timeoutMs: number;
   private readonly fallbackCache: RpcFallbackCache;
   private readonly fallbackCacheTtlSeconds: number;
+  private readonly fallbackCacheEarlyExpiryBeta: number;
+  private readonly earlyRefreshes = new Map<string, Promise<void>>();
 
   constructor(
     private readonly getClient: () => RawRpcClient,
@@ -231,6 +239,7 @@ export class StellarRpcService {
     this.timeoutMs = opts.timeoutMs ?? 5_000;
     this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
     this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
+    this.fallbackCacheEarlyExpiryBeta = Math.max(0, opts.fallbackCacheEarlyExpiryBeta ?? 0);
   }
 
   getCircuitState(): CircuitState { return this.breaker.getState(); }
@@ -312,9 +321,22 @@ export class StellarRpcService {
     fn: () => Promise<T>,
     opts: RpcCallOptions = {},
   ): Promise<T> {
+    if (this.breaker.getState() === 'CLOSED' && this.fallbackCacheEarlyExpiryBeta > 0) {
+      const cached = await this.getClosedCircuitCacheEntry<T>(operation, cacheParts);
+      if (cached !== null) {
+        rpcFallbackCacheHitsTotal.inc({ operation });
+        if (shouldEarlyRefresh(cached, this.fallbackCacheEarlyExpiryBeta)) {
+          this.startEarlyRefresh(operation, cacheParts, fn, opts);
+        }
+        return cached.value;
+      }
+      rpcFallbackCacheMissesTotal.inc({ operation });
+    }
+
     try {
+      const refreshStartedAt = Date.now();
       const result = await this.breaker.call(() => this.callWithTimeout(fn, operation, opts));
-      await this.fallbackCache.set(operation, result, this.fallbackCacheTtlSeconds, cacheParts);
+      await this.writeFallbackCache(operation, result, cacheParts, Date.now() - refreshStartedAt);
       return result;
     } catch (err) {
       if (!(err instanceof CircuitOpenError)) {
@@ -339,6 +361,57 @@ export class StellarRpcService {
       });
       throw err;
     }
+  }
+
+  private async getClosedCircuitCacheEntry<T>(
+    operation: string,
+    cacheParts: readonly string[],
+  ): Promise<RpcFallbackCacheEntry<T> | null> {
+    if (!this.fallbackCache.getEntry) return null;
+    return this.fallbackCache.getEntry<T>(operation, cacheParts);
+  }
+
+  private startEarlyRefresh<T>(
+    operation: string,
+    cacheParts: readonly string[],
+    fn: () => Promise<T>,
+    opts: RpcCallOptions,
+  ): void {
+    const refreshKey = buildRefreshKey(operation, cacheParts);
+    if (this.earlyRefreshes.has(refreshKey)) return;
+
+    rpcFallbackCacheEarlyRefreshesTotal.inc({ operation });
+    const refreshStartedAt = Date.now();
+    const refresh = this.breaker.call(() => this.callWithTimeout(fn, operation, opts))
+      .then((result) => this.writeFallbackCache(operation, result, cacheParts, Date.now() - refreshStartedAt))
+      .catch((err: unknown) => {
+        logger.warn('Stellar RPC fallback cache early refresh failed', undefined, {
+          event: 'rpc_fallback_cache_early_refresh_failed',
+          operation,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        this.earlyRefreshes.delete(refreshKey);
+      });
+
+    this.earlyRefreshes.set(refreshKey, refresh);
+  }
+
+  private async writeFallbackCache<T>(
+    operation: string,
+    value: T,
+    cacheParts: readonly string[],
+    refreshDurationMs: number = 1,
+  ): Promise<void> {
+    if (this.fallbackCache.setEntry) {
+      await this.fallbackCache.setEntry(operation, value, this.fallbackCacheTtlSeconds, cacheParts, {
+        refreshDurationMs,
+      });
+      return;
+    }
+
+    await this.fallbackCache.set(operation, value, this.fallbackCacheTtlSeconds, cacheParts);
   }
 
   private async callWithTimeout<T>(
@@ -429,6 +502,30 @@ function logFailure(operation: string, err: RpcProviderError, durationMs: number
 
 // ── Singleton ─────────────────────────────────────────────────────────────────
 
+function buildRefreshKey(operation: string, cacheParts: readonly string[]): string {
+  return `${operation}::${cacheParts.join('::')}`;
+}
+
+/**
+ * XFetch-style probabilistic early expiry. As the Redis TTL boundary nears,
+ * this becomes more likely to return true. The caller still serves the cached
+ * response and starts a single background refresh so concurrent requests do not
+ * stampede the Stellar RPC provider.
+ */
+function shouldEarlyRefresh<T>(
+  entry: RpcFallbackCacheEntry<T>,
+  beta: number,
+  nowMs: number = Date.now(),
+  random: () => number = Math.random,
+): boolean {
+  if (beta <= 0) return false;
+  if (entry.expiresAt <= nowMs) return true;
+
+  const refreshDurationMs = Math.max(1, entry.refreshDurationMs);
+  const uniform = Math.max(Number.EPSILON, Math.min(1, random()));
+  return nowMs - beta * refreshDurationMs * Math.log(uniform) >= entry.expiresAt;
+}
+
 let _service: StellarRpcService | null = null;
 
 export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpcService {
@@ -443,6 +540,7 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       resetTimeoutMs: parseInt(process.env.RPC_CB_RESET_TIMEOUT_MS ?? '60000', 10),
       timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
       fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
+      fallbackCacheEarlyExpiryBeta: parseFloat(process.env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA ?? '0'),
       fallbackCache: redisFallbackCache,
     });
   }
@@ -481,6 +579,10 @@ function createConfiguredRpcFallbackCache(): RpcFallbackCache {
     async get<T>(operation: string, cacheParts?: readonly string[]): Promise<T | null> {
       return (await getCache()).get<T>(operation, cacheParts);
     },
+    async getEntry<T>(operation: string, cacheParts?: readonly string[]) {
+      const cache = await getCache();
+      return cache.getEntry ? cache.getEntry<T>(operation, cacheParts) : null;
+    },
     async set<T>(
       operation: string,
       value: T,
@@ -488,6 +590,19 @@ function createConfiguredRpcFallbackCache(): RpcFallbackCache {
       cacheParts?: readonly string[],
     ): Promise<void> {
       return (await getCache()).set<T>(operation, value, ttlSeconds, cacheParts);
+    },
+    async setEntry<T>(
+      operation: string,
+      value: T,
+      ttlSeconds: number,
+      cacheParts?: readonly string[],
+      options?: Parameters<NonNullable<RpcFallbackCache['setEntry']>>[4],
+    ): Promise<void> {
+      const cache = await getCache();
+      if (cache.setEntry) {
+        return cache.setEntry<T>(operation, value, ttlSeconds, cacheParts, options);
+      }
+      return cache.set<T>(operation, value, ttlSeconds, cacheParts);
     },
   };
 }
