@@ -10,7 +10,10 @@ beforeEach(() => {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Traverse a resolved $ref or inline schema in the components. */
-function resolveRef(spec: Record<string, unknown>, ref: string): Record<string, unknown> | undefined {
+function resolveRef(
+  spec: Record<string, unknown>,
+  ref: string
+): Record<string, unknown> | undefined {
   // ref format: '#/components/schemas/Foo'
   const parts = ref.replace('#/', '').split('/');
   let node: unknown = spec;
@@ -19,6 +22,10 @@ function resolveRef(spec: Record<string, unknown>, ref: string): Record<string, 
     node = (node as Record<string, unknown>)[part];
   }
   return node as Record<string, unknown>;
+}
+
+function schemaProperties(schema: Record<string, unknown>): Record<string, unknown> {
+  return (schema['properties'] ?? {}) as Record<string, unknown>;
 }
 
 describe('GET /openapi.json', () => {
@@ -125,7 +132,10 @@ describe('GET /openapi.json', () => {
 
   it('POST /api/streams requires bearerAuth security', async () => {
     const res = await request(app).get('/openapi.json');
-    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<
+      string,
+      unknown
+    >;
     expect(postStreams?.security).toBeDefined();
     const sec = postStreams.security as Array<Record<string, unknown>>;
     expect(sec.some((s) => 'bearerAuth' in s)).toBe(true);
@@ -133,14 +143,18 @@ describe('GET /openapi.json', () => {
 
   it('POST /internal/indexer/contract-events requires indexerWorkerToken', async () => {
     const res = await request(app).get('/openapi.json');
-    const route = (res.body.paths['/internal/indexer/contract-events'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const route = (res.body.paths['/internal/indexer/contract-events'] as Record<string, unknown>)
+      ?.post as Record<string, unknown>;
     const sec = route?.security as Array<Record<string, unknown>>;
     expect(sec?.some((s) => 'indexerWorkerToken' in s)).toBe(true);
   });
 
   it('includes error response schemas (400, 401, 404, 500)', async () => {
     const res = await request(app).get('/openapi.json');
-    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<
+      string,
+      unknown
+    >;
     const responses = postStreams?.responses as Record<string, unknown>;
     expect(responses?.['400']).toBeDefined();
     expect(responses?.['401']).toBeDefined();
@@ -148,9 +162,15 @@ describe('GET /openapi.json', () => {
 
   it('includes example payloads for POST /api/streams', async () => {
     const res = await request(app).get('/openapi.json');
-    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<
+      string,
+      unknown
+    >;
     const body = postStreams?.requestBody as Record<string, unknown>;
-    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     expect(content?.example).toBeDefined();
   });
 
@@ -169,12 +189,85 @@ describe('GET /openapi.json', () => {
     expect(res.headers['cache-control']).toMatch(/max-age/);
   });
 
+  describe('Stream schema drift guard', () => {
+    const streamRecordToApiKeys = {
+      id: 'id',
+      sender_address: 'sender',
+      recipient_address: 'recipient',
+      amount: 'depositAmount',
+      streamed_amount: 'streamedAmount',
+      remaining_amount: 'remainingAmount',
+      rate_per_second: 'ratePerSecond',
+      start_time: 'startTime',
+      end_time: 'endTime',
+      status: 'status',
+    } as const;
+
+    it('documents every public stream field mapped from StreamRecord', async () => {
+      const res = await request(app).get('/openapi.json');
+      const schemas = (res.body.components?.schemas ?? {}) as Record<string, unknown>;
+      const streamSchema = schemas['Stream'] as Record<string, unknown>;
+      const documentedKeys = Object.keys(schemaProperties(streamSchema)).sort();
+      const mappedKeys = Object.values(streamRecordToApiKeys).sort();
+
+      expect(documentedKeys).toEqual(mappedKeys);
+    });
+
+    it('does not expose raw database column names in the public Stream schema', async () => {
+      const res = await request(app).get('/openapi.json');
+      const schemas = (res.body.components?.schemas ?? {}) as Record<string, unknown>;
+      const streamSchema = schemas['Stream'] as Record<string, unknown>;
+      const documentedKeys = Object.keys(schemaProperties(streamSchema));
+
+      expect(documentedKeys).not.toContain('sender_address');
+      expect(documentedKeys).not.toContain('recipient_address');
+      expect(documentedKeys).not.toContain('rate_per_second');
+      expect(documentedKeys).not.toContain('streamed_amount');
+      expect(documentedKeys).not.toContain('remaining_amount');
+    });
+
+    it('keeps StreamStatus aligned with persisted stream statuses', async () => {
+      const res = await request(app).get('/openapi.json');
+      const schemas = (res.body.components?.schemas ?? {}) as Record<string, unknown>;
+      const streamStatus = schemas['StreamStatus'] as Record<string, unknown>;
+
+      expect(streamStatus['enum']).toEqual(['active', 'paused', 'completed', 'cancelled']);
+      expect(streamStatus['enum']).not.toContain('scheduled');
+    });
+
+    it('documents all monetary response fields as decimal strings', async () => {
+      const res = await request(app).get('/openapi.json');
+      const spec = res.body as Record<string, unknown>;
+      const schemas = (spec.components as Record<string, unknown>)?.['schemas'] as Record<
+        string,
+        unknown
+      >;
+      const streamSchema = schemas['Stream'] as Record<string, unknown>;
+      const props = schemaProperties(streamSchema);
+
+      for (const key of ['depositAmount', 'streamedAmount', 'remainingAmount', 'ratePerSecond']) {
+        const fieldSchema = props[key] as Record<string, unknown>;
+        expect(fieldSchema['$ref']).toBe('#/components/schemas/DecimalString');
+        const resolved = resolveRef(spec, fieldSchema['$ref'] as string);
+        expect(resolved?.['type']).toBe('string');
+      }
+    });
+
+    it('uses real-looking Stellar G-address examples consistently', async () => {
+      const res = await request(app).get('/openapi.json');
+      const schemas = (res.body.components?.schemas ?? {}) as Record<string, unknown>;
+      const stellarAddress = schemas['StellarAddress'] as Record<string, unknown>;
+
+      expect(stellarAddress['example']).toMatch(/^G[A-Z2-7]{55}$/);
+    });
+  });
+
   it('returns the same spec on repeated calls (cached)', async () => {
     const res1 = await request(app).get('/openapi.json');
     const res2 = await request(app).get('/openapi.json');
     expect(res1.body.info.version).toBe(res2.body.info.version);
     expect(Object.keys(res1.body.paths as object).length).toBe(
-      Object.keys(res2.body.paths as object).length,
+      Object.keys(res2.body.paths as object).length
     );
   });
 
@@ -184,9 +277,8 @@ describe('GET /openapi.json', () => {
     async function getListOp() {
       const res = await request(app).get('/openapi.json');
       const spec = res.body as Record<string, unknown>;
-      return (
-        (spec.paths as Record<string, unknown>)['/api/streams'] as Record<string, unknown>
-      )?.get as Record<string, unknown>;
+      return ((spec.paths as Record<string, unknown>)['/api/streams'] as Record<string, unknown>)
+        ?.get as Record<string, unknown>;
     }
 
     // ── cursor param documentation ───────────────────────────────────────────
@@ -204,7 +296,9 @@ describe('GET /openapi.json', () => {
       const params = op.parameters as Array<Record<string, unknown>>;
       const cursorParam = params?.find((p) => p['name'] === 'cursor');
       const schema = cursorParam?.['schema'] as Record<string, unknown>;
-      const description: string = (schema?.['description'] ?? cursorParam?.['description'] ?? '') as string;
+      const description: string = (schema?.['description'] ??
+        cursorParam?.['description'] ??
+        '') as string;
       expect(description.toLowerCase()).toMatch(/opaque/);
     });
 
@@ -234,7 +328,10 @@ describe('GET /openapi.json', () => {
       const cursorParam = params?.find((p) => p['name'] === 'cursor');
       const schema = cursorParam?.['schema'] as Record<string, unknown>;
       const example = schema?.['example'] as string;
-      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<string, unknown>;
+      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<
+        string,
+        unknown
+      >;
       expect(decoded['v']).toBe(1);
       expect(typeof decoded['lastId']).toBe('string');
       expect((decoded['lastId'] as string).length).toBeGreaterThan(0);
@@ -306,7 +403,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r400 = responses?.['400'] as Record<string, unknown>;
-      const content = (r400?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r400?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown> | undefined;
       expect(examples?.['invalidCursor']).toBeDefined();
     });
@@ -315,7 +414,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r400 = responses?.['400'] as Record<string, unknown>;
-      const content = (r400?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r400?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const example = examples?.['invalidCursor'] as Record<string, unknown>;
       const value = example?.['value'] as Record<string, unknown>;
@@ -326,7 +427,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r400 = responses?.['400'] as Record<string, unknown>;
-      const content = (r400?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r400?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const example = examples?.['invalidCursor'] as Record<string, unknown>;
       const value = example?.['value'] as Record<string, unknown>;
@@ -341,7 +444,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r200 = responses?.['200'] as Record<string, unknown>;
-      const content = (r200?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r200?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown> | undefined;
       expect(examples).toBeDefined();
     });
@@ -349,7 +454,9 @@ describe('GET /openapi.json', () => {
     it('200 response has firstPage example', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       expect(examples?.['firstPage']).toBeDefined();
     });
@@ -357,7 +464,9 @@ describe('GET /openapi.json', () => {
     it('200 response has nextPage example', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       expect(examples?.['nextPage']).toBeDefined();
     });
@@ -365,7 +474,9 @@ describe('GET /openapi.json', () => {
     it('200 response has lastPage example', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       expect(examples?.['lastPage']).toBeDefined();
     });
@@ -373,10 +484,15 @@ describe('GET /openapi.json', () => {
     it('firstPage example has has_more=true and non-null next_cursor', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const firstPage = examples?.['firstPage'] as Record<string, unknown>;
-      const data = ((firstPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (firstPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       expect(data?.['has_more']).toBe(true);
       expect(data?.['next_cursor']).not.toBeNull();
       expect(typeof data?.['next_cursor']).toBe('string');
@@ -385,12 +501,20 @@ describe('GET /openapi.json', () => {
     it('firstPage example next_cursor decodes to a valid v:1 cursor', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const firstPage = examples?.['firstPage'] as Record<string, unknown>;
-      const data = ((firstPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (firstPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       const token = data?.['next_cursor'] as string;
-      const decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8')) as Record<string, unknown>;
+      const decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8')) as Record<
+        string,
+        unknown
+      >;
       expect(decoded['v']).toBe(1);
       expect(typeof decoded['lastId']).toBe('string');
     });
@@ -398,10 +522,15 @@ describe('GET /openapi.json', () => {
     it('nextPage example has has_more=true and non-null next_cursor', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const nextPage = examples?.['nextPage'] as Record<string, unknown>;
-      const data = ((nextPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (nextPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       expect(data?.['has_more']).toBe(true);
       expect(data?.['next_cursor']).not.toBeNull();
     });
@@ -409,10 +538,15 @@ describe('GET /openapi.json', () => {
     it('lastPage example has has_more=false and next_cursor=null', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const lastPage = examples?.['lastPage'] as Record<string, unknown>;
-      const data = ((lastPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (lastPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       expect(data?.['has_more']).toBe(false);
       expect(data?.['next_cursor']).toBeNull();
     });
@@ -420,11 +554,16 @@ describe('GET /openapi.json', () => {
     it('each page example contains a non-empty streams array', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       for (const key of ['firstPage', 'nextPage', 'lastPage']) {
         const ex = examples?.[key] as Record<string, unknown>;
-        const data = ((ex?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+        const data = (ex?.['value'] as Record<string, unknown>)?.['data'] as Record<
+          string,
+          unknown
+        >;
         expect(Array.isArray(data?.['streams'])).toBe(true);
         expect((data?.['streams'] as unknown[]).length).toBeGreaterThan(0);
       }
@@ -462,7 +601,10 @@ describe('GET /openapi.json', () => {
       const schema = schemas['StreamCursorToken'] as Record<string, unknown>;
       const example = schema?.['example'] as string;
       // The decoded payload should contain a stream-id (string), not a raw integer id
-      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<string, unknown>;
+      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<
+        string,
+        unknown
+      >;
       expect(typeof decoded['lastId']).toBe('string');
       // lastId must not be a plain number string that could enumerate internal rows
       expect(isNaN(Number(decoded['lastId']))).toBe(true);
@@ -481,7 +623,8 @@ describe('GET /openapi.json', () => {
       const schemas = (res.body?.components?.schemas ?? {}) as Record<string, unknown>;
       const schema = schemas['StreamListPage'] as Record<string, unknown>;
       const props = schema?.['properties'] as Record<string, unknown>;
-      const hasMorDesc = ((props?.['has_more'] as Record<string, unknown>)?.['description'] ?? '') as string;
+      const hasMorDesc = ((props?.['has_more'] as Record<string, unknown>)?.['description'] ??
+        '') as string;
       expect(hasMorDesc.toLowerCase()).toMatch(/page|more/);
     });
 

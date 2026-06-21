@@ -14,35 +14,47 @@ extendZodWithOpenApi(z);
 
 export const registry = new OpenAPIRegistry();
 
+const EXAMPLE_SENDER = 'GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX';
+const EXAMPLE_RECIPIENT = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX';
+const NEXT_CURSOR_DESCRIPTION =
+  'Cursor to pass as `cursor` on the next request. Null on the last page (has_more=false).';
+
 // ── Shared schemas ────────────────────────────────────────────────────────────
 
 const DecimalString = registry.register(
   'DecimalString',
-  z.string().openapi({ example: '1000000.0000000', description: 'Decimal string amount' }),
+  z.string().openapi({ example: '1000000.0000000', description: 'Decimal string amount' })
 );
 
 const StellarAddress = registry.register(
   'StellarAddress',
-  z.string().openapi({ example: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN', description: 'Stellar public key (G…)' }),
+  z
+    .string()
+    .openapi({ example: EXAMPLE_SENDER, description: 'Stellar public key beginning with G' })
 );
 
+/** Source of truth: matches StreamStatus in src/db/types.ts and the DB CHECK constraint. */
 const StreamStatus = registry.register(
   'StreamStatus',
-  z.enum(['scheduled', 'active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' }),
+  z.enum(['active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' })
 );
 
 const StreamObject = registry.register(
   'Stream',
-  z.object({
-    id: z.string().openapi({ example: 'stream-abc123' }),
-    sender: StellarAddress,
-    recipient: StellarAddress,
-    depositAmount: DecimalString,
-    ratePerSecond: DecimalString,
-    startTime: z.number().int().openapi({ example: 1700000000 }),
-    endTime: z.number().int().openapi({ example: 0 }),
-    status: StreamStatus,
-  }).openapi({ description: 'A treasury stream record' }),
+  z
+    .object({
+      id: z.string().openapi({ example: 'stream-abc123' }),
+      sender: StellarAddress,
+      recipient: StellarAddress,
+      depositAmount: DecimalString,
+      streamedAmount: DecimalString,
+      remainingAmount: DecimalString,
+      ratePerSecond: DecimalString,
+      startTime: z.number().int().openapi({ example: 1700000000 }),
+      endTime: z.number().int().openapi({ example: 0 }),
+      status: StreamStatus,
+    })
+    .openapi({ description: 'A treasury stream record' })
 );
 
 const ResponseMeta = registry.register(
@@ -51,7 +63,7 @@ const ResponseMeta = registry.register(
     timestamp: z.string().openapi({ example: '2026-01-01T00:00:00.000Z' }),
     requestId: z.string().optional().openapi({ example: 'req_abc123' }),
     idempotencyReplayed: z.boolean().optional(),
-  }),
+  })
 );
 
 const ErrorEnvelope = registry.register(
@@ -64,7 +76,7 @@ const ErrorEnvelope = registry.register(
       details: z.unknown().optional(),
       requestId: z.string().optional(),
     }),
-  }),
+  })
 );
 
 // ── Security schemes ──────────────────────────────────────────────────────────
@@ -90,28 +102,56 @@ function successSchema<T extends z.ZodTypeAny>(dataSchema: T) {
 }
 
 const errorResponses = {
-  '400': { description: 'Validation error', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '401': { description: 'Unauthorized', content: { 'application/json': { schema: ErrorEnvelope } } },
+  '400': {
+    description: 'Validation error',
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
+  '401': {
+    description: 'Unauthorized',
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
   '403': { description: 'Forbidden', content: { 'application/json': { schema: ErrorEnvelope } } },
   '404': { description: 'Not found', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '408': { description: 'Request timeout', content: { 'application/json': { schema: ErrorEnvelope } } },
+  '408': {
+    description: 'Request timeout',
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
   '409': { description: 'Conflict', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '422': { description: 'Unprocessable entity', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '429': { description: 'Too many requests', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '500': { description: 'Internal server error', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '503': { description: 'Service unavailable', content: { 'application/json': { schema: ErrorEnvelope } } },
+  '422': {
+    description: 'Unprocessable entity',
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
+  '429': {
+    description: 'Too many requests',
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
+  '500': {
+    description: 'Internal server error',
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
+  '503': {
+    description: 'Service unavailable',
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
 } as const;
 
 // ── GET / ─────────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/',
+  method: 'get',
+  path: '/',
   summary: 'API info',
   tags: ['meta'],
   responses: {
     '200': {
       description: 'API metadata',
-      content: { 'application/json': { schema: successSchema(z.object({ name: z.string(), version: z.string(), docs: z.string() })) } },
+      content: {
+        'application/json': {
+          schema: successSchema(
+            z.object({ name: z.string(), version: z.string(), docs: z.string() })
+          ),
+        },
+      },
     },
   },
 });
@@ -119,7 +159,8 @@ registry.registerPath({
 // ── Health ────────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/health',
+  method: 'get',
+  path: '/health',
   summary: 'Liveness probe',
   tags: ['health'],
   responses: {
@@ -133,7 +174,12 @@ registry.registerPath({
             network: z.string(),
             timestamp: z.string(),
           }),
-          example: { status: 'ok', service: 'fluxora-backend', network: 'testnet', timestamp: '2026-01-01T00:00:00.000Z' },
+          example: {
+            status: 'ok',
+            service: 'fluxora-backend',
+            network: 'testnet',
+            timestamp: '2026-01-01T00:00:00.000Z',
+          },
         },
       },
     },
@@ -142,26 +188,43 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'get', path: '/health/ready',
+  method: 'get',
+  path: '/health/ready',
   summary: 'Readiness probe',
   tags: ['health'],
   responses: {
     '200': {
       description: 'All dependencies healthy or degraded',
-      content: { 'application/json': { schema: z.object({ status: z.enum(['healthy', 'degraded']), version: z.string(), dependencies: z.record(z.string(), z.string()) }) } },
+      content: {
+        'application/json': {
+          schema: z.object({
+            status: z.enum(['healthy', 'degraded']),
+            version: z.string(),
+            dependencies: z.record(z.string(), z.string()),
+          }),
+        },
+      },
     },
-    '503': { description: 'One or more dependencies unhealthy', content: { 'application/json': { schema: ErrorEnvelope } } },
+    '503': {
+      description: 'One or more dependencies unhealthy',
+      content: { 'application/json': { schema: ErrorEnvelope } },
+    },
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/health/live',
+  method: 'get',
+  path: '/health/live',
   summary: 'Detailed health report',
   tags: ['health'],
   responses: {
     '200': {
       description: 'Full health report',
-      content: { 'application/json': { schema: successSchema(z.object({ report: z.record(z.string(), z.unknown()) })) } },
+      content: {
+        'application/json': {
+          schema: successSchema(z.object({ report: z.record(z.string(), z.unknown()) })),
+        },
+      },
     },
     '500': errorResponses['500'],
   },
@@ -222,7 +285,7 @@ const StreamCursorToken = registry.register(
       'Cursors do not expose internal row ids or PII. ' +
       'Stable across inserts; invalid/expired cursors return 400 INVALID_CURSOR.',
     example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
-  }),
+  })
 );
 
 /** Reusable list-page response schema. */
@@ -237,37 +300,38 @@ const StreamListPage = registry.register(
       example: true,
     }),
     next_cursor: StreamCursorToken.nullable().openapi({
-      description:
-        'Cursor to pass as `cursor` on the next request. ' +
-        'Null on the last page (has_more=false).',
+      description: NEXT_CURSOR_DESCRIPTION,
       example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
     }),
     total: z.number().int().optional().openapi({
       description: 'Total matching rows. Only present when include_total=true.',
       example: 42,
     }),
-  }),
+  })
 );
 
 /** 400 body specific to invalid/expired cursor. */
-const InvalidCursorError = z.object({
-  success: z.literal(false),
-  error: z.object({
-    code: z.literal('VALIDATION_ERROR').openapi({ example: 'VALIDATION_ERROR' }),
-    message: z.string().openapi({
-      example: 'cursor must be a valid opaque pagination token',
+const InvalidCursorError = z
+  .object({
+    success: z.literal(false),
+    error: z.object({
+      code: z.literal('VALIDATION_ERROR').openapi({ example: 'VALIDATION_ERROR' }),
+      message: z.string().openapi({
+        example: 'cursor must be a valid opaque pagination token',
+      }),
     }),
-  }),
-}).openapi({
-  description:
-    'Returned when the `cursor` parameter is present but cannot be decoded ' +
-    '(bad base64url, wrong JSON shape, missing version tag, or empty lastId). ' +
-    'The client must discard the cursor and restart pagination from the first page ' +
-    'by omitting the `cursor` parameter.',
-});
+  })
+  .openapi({
+    description:
+      'Returned when the `cursor` parameter is present but cannot be decoded ' +
+      '(bad base64url, wrong JSON shape, missing version tag, or empty lastId). ' +
+      'The client must discard the cursor and restart pagination from the first page ' +
+      'by omitting the `cursor` parameter.',
+  });
 
 registry.registerPath({
-  method: 'get', path: '/api/streams',
+  method: 'get',
+  path: '/api/streams',
   summary: 'List streams (cursor-paginated)',
   description:
     '## Cursor Pagination\n\n' +
@@ -289,21 +353,24 @@ registry.registerPath({
         example: '20',
         description: 'Page size (1–100, default 20).',
       }),
-      cursor: z.string().optional().openapi({
-        description:
-          'Opaque cursor from the previous page's `next_cursor`. ' +
-          'Omit to request the first page. ' +
-          'Treated as a black box — do not construct manually.',
-        example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
-      }),
+      cursor: z
+        .string()
+        .optional()
+        .openapi({
+          description:
+            "Opaque cursor from the previous page's `next_cursor`. " +
+            'Omit to request the first page. ' +
+            'Treated as a black box — do not construct manually.',
+          example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
+        }),
       status: z.string().optional().openapi({ example: 'active' }),
       sender: z.string().optional().openapi({
         description: 'Filter by sender Stellar address.',
-        example: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+        example: EXAMPLE_SENDER,
       }),
       recipient: z.string().optional().openapi({
         description: 'Filter by recipient Stellar address.',
-        example: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+        example: EXAMPLE_RECIPIENT,
       }),
       include_total: z.enum(['true', 'false']).optional().openapi({
         description: 'When "true", include total count of matching rows in the response.',
@@ -321,16 +388,19 @@ registry.registerPath({
           examples: {
             firstPage: {
               summary: 'First page (no cursor supplied)',
-              description: 'Omit `cursor` to request the first page. `has_more: true` means more pages follow.',
+              description:
+                'Omit `cursor` to request the first page. `has_more: true` means more pages follow.',
               value: {
                 success: true,
                 data: {
                   streams: [
                     {
                       id: 'stream-aaa111',
-                      sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
-                      recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+                      sender: EXAMPLE_SENDER,
+                      recipient: EXAMPLE_RECIPIENT,
                       depositAmount: '1000000.0000000',
+                      streamedAmount: '0',
+                      remainingAmount: '1000000.0000000',
                       ratePerSecond: '0.0000116',
                       startTime: 1700000000,
                       endTime: 0,
@@ -354,9 +424,11 @@ registry.registerPath({
                   streams: [
                     {
                       id: 'stream-bbb222',
-                      sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
-                      recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+                      sender: EXAMPLE_SENDER,
+                      recipient: EXAMPLE_RECIPIENT,
                       depositAmount: '500000.0000000',
+                      streamedAmount: '1000.0000000',
+                      remainingAmount: '499000.0000000',
                       ratePerSecond: '0.0000058',
                       startTime: 1700001000,
                       endTime: 0,
@@ -380,9 +452,11 @@ registry.registerPath({
                   streams: [
                     {
                       id: 'stream-zzz999',
-                      sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
-                      recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+                      sender: EXAMPLE_SENDER,
+                      recipient: EXAMPLE_RECIPIENT,
                       depositAmount: '250000.0000000',
+                      streamedAmount: '250000.0000000',
+                      remainingAmount: '0',
                       ratePerSecond: '0.0000029',
                       startTime: 1700002000,
                       endTime: 1800000000,
@@ -407,7 +481,7 @@ registry.registerPath({
         'Discard the cursor and restart pagination from page 1 (omit `cursor`).',
       content: {
         'application/json': {
-          schema: ErrorEnvelope,
+          schema: InvalidCursorError,
           examples: {
             invalidCursor: {
               summary: 'Invalid or expired cursor',
@@ -438,14 +512,17 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'get', path: '/api/streams/{id}',
+  method: 'get',
+  path: '/api/streams/{id}',
   summary: 'Get stream by ID',
   tags: ['streams'],
   request: { params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }) },
   responses: {
     '200': {
       description: 'Stream record',
-      content: { 'application/json': { schema: successSchema(z.object({ stream: StreamObject })) } },
+      content: {
+        'application/json': { schema: successSchema(z.object({ stream: StreamObject })) },
+      },
     },
     '404': errorResponses['404'],
     '503': errorResponses['503'],
@@ -453,7 +530,8 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'head', path: '/api/streams/{id}',
+  method: 'head',
+  path: '/api/streams/{id}',
   summary: 'Check whether a stream exists',
   tags: ['streams'],
   request: { params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }) },
@@ -467,12 +545,20 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'post', path: '/api/streams',
+  method: 'post',
+  path: '/api/streams',
   summary: 'Create stream',
   tags: ['streams'],
   security: [{ bearerAuth: [] }],
   request: {
-    headers: z.object({ 'Idempotency-Key': z.string().openapi({ description: 'Unique key (1–128 chars) to prevent duplicate creation', example: 'my-key-001' }) }),
+    headers: z.object({
+      'Idempotency-Key': z
+        .string()
+        .openapi({
+          description: 'Unique key (1–128 chars) to prevent duplicate creation',
+          example: 'my-key-001',
+        }),
+    }),
     body: {
       required: true,
       content: {
@@ -486,8 +572,8 @@ registry.registerPath({
             endTime: z.number().int().optional().openapi({ example: 0 }),
           }),
           example: {
-            sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
-            recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+            sender: EXAMPLE_SENDER,
+            recipient: EXAMPLE_RECIPIENT,
             depositAmount: '1000000.0000000',
             ratePerSecond: '0.0000116',
             startTime: 1700000000,
@@ -509,7 +595,8 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'delete', path: '/api/streams/{id}',
+  method: 'delete',
+  path: '/api/streams/{id}',
   summary: 'Cancel stream',
   tags: ['streams'],
   security: [{ bearerAuth: [] }],
@@ -517,7 +604,11 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Stream cancelled',
-      content: { 'application/json': { schema: successSchema(z.object({ message: z.string(), id: z.string() })) } },
+      content: {
+        'application/json': {
+          schema: successSchema(z.object({ message: z.string(), id: z.string() })),
+        },
+      },
     },
     '401': errorResponses['401'],
     '404': errorResponses['404'],
@@ -527,7 +618,8 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'patch', path: '/api/streams/{id}/status',
+  method: 'patch',
+  path: '/api/streams/{id}/status',
   summary: 'Transition stream status',
   tags: ['streams'],
   request: {
@@ -543,7 +635,10 @@ registry.registerPath({
     },
   },
   responses: {
-    '200': { description: 'Updated stream', content: { 'application/json': { schema: successSchema(StreamObject) } } },
+    '200': {
+      description: 'Updated stream',
+      content: { 'application/json': { schema: successSchema(StreamObject) } },
+    },
     '400': errorResponses['400'],
     '404': errorResponses['404'],
     '409': errorResponses['409'],
@@ -554,7 +649,8 @@ registry.registerPath({
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'post', path: '/api/auth/session',
+  method: 'post',
+  path: '/api/auth/session',
   summary: 'Create session (get JWT)',
   tags: ['auth'],
   request: {
@@ -563,7 +659,7 @@ registry.registerPath({
       content: {
         'application/json': {
           schema: z.object({
-            address: z.string().optional().openapi({ example: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN' }),
+            address: z.string().optional().openapi({ example: EXAMPLE_SENDER }),
             role: z.enum(['operator', 'viewer']).optional().openapi({ example: 'viewer' }),
             idToken: z.string().optional().openapi({ description: 'External OIDC ID token' }),
           }),
@@ -576,7 +672,10 @@ registry.registerPath({
       description: 'JWT issued',
       content: {
         'application/json': {
-          schema: z.object({ token: z.string(), user: z.object({ address: z.string(), role: z.string() }) }),
+          schema: z.object({
+            token: z.string(),
+            user: z.object({ address: z.string(), role: z.string() }),
+          }),
           example: { token: 'eyJ...', user: { address: 'GAAZI4...', role: 'viewer' } },
         },
       },
@@ -589,7 +688,8 @@ registry.registerPath({
 // ── Audit ─────────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/api/audit',
+  method: 'get',
+  path: '/api/audit',
   summary: 'List audit log entries',
   tags: ['audit'],
   security: [{ bearerAuth: [] }],
@@ -598,10 +698,12 @@ registry.registerPath({
       description: 'Audit entries',
       content: {
         'application/json': {
-          schema: successSchema(z.object({
-            entries: z.array(z.record(z.string(), z.unknown())),
-            total: z.number().int(),
-          })),
+          schema: successSchema(
+            z.object({
+              entries: z.array(z.record(z.string(), z.unknown())),
+              total: z.number().int(),
+            })
+          ),
         },
       },
     },
@@ -613,58 +715,88 @@ registry.registerPath({
 // ── Privacy ───────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/api/privacy/policy',
+  method: 'get',
+  path: '/api/privacy/policy',
   summary: 'PII policy document',
   tags: ['privacy'],
   responses: {
-    '200': { description: 'Full PII policy', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Full PII policy',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/api/privacy/retention',
+  method: 'get',
+  path: '/api/privacy/retention',
   summary: 'Data retention schedule',
   tags: ['privacy'],
   responses: {
-    '200': { description: 'Retention schedule', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Retention schedule',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
   },
 });
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/api/admin/status/read-only',
+  method: 'get',
+  path: '/api/admin/status/read-only',
   summary: 'Read pause flags (no auth)',
   tags: ['admin'],
   responses: {
-    '200': { description: 'Pause flags', content: { 'application/json': { schema: z.object({ pauseFlags: z.record(z.string(), z.boolean()) }) } } },
+    '200': {
+      description: 'Pause flags',
+      content: {
+        'application/json': { schema: z.object({ pauseFlags: z.record(z.string(), z.boolean()) }) },
+      },
+    },
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/api/admin/status',
+  method: 'get',
+  path: '/api/admin/status',
   summary: 'Admin status (pause flags + reindex state)',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'Admin status', content: { 'application/json': { schema: z.object({ pauseFlags: z.record(z.string(), z.boolean()), reindex: z.record(z.string(), z.unknown()) }) } } },
+    '200': {
+      description: 'Admin status',
+      content: {
+        'application/json': {
+          schema: z.object({
+            pauseFlags: z.record(z.string(), z.boolean()),
+            reindex: z.record(z.string(), z.unknown()),
+          }),
+        },
+      },
+    },
     '401': errorResponses['401'],
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/api/admin/pause',
+  method: 'get',
+  path: '/api/admin/pause',
   summary: 'Get pause flags',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'Pause flags', content: { 'application/json': { schema: z.record(z.string(), z.boolean()) } } },
+    '200': {
+      description: 'Pause flags',
+      content: { 'application/json': { schema: z.record(z.string(), z.boolean()) } },
+    },
     '401': errorResponses['401'],
   },
 });
 
 registry.registerPath({
-  method: 'put', path: '/api/admin/pause',
+  method: 'put',
+  path: '/api/admin/pause',
   summary: 'Update pause flags',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
@@ -683,7 +815,14 @@ registry.registerPath({
     },
   },
   responses: {
-    '200': { description: 'Updated pause flags', content: { 'application/json': { schema: z.object({ message: z.string(), pauseFlags: z.record(z.string(), z.boolean()) }) } } },
+    '200': {
+      description: 'Updated pause flags',
+      content: {
+        'application/json': {
+          schema: z.object({ message: z.string(), pauseFlags: z.record(z.string(), z.boolean()) }),
+        },
+      },
+    },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '503': errorResponses['503'],
@@ -691,69 +830,105 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'get', path: '/api/admin/reindex',
+  method: 'get',
+  path: '/api/admin/reindex',
   summary: 'Get reindex state',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'Reindex state', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Reindex state',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '401': errorResponses['401'],
   },
 });
 
 registry.registerPath({
-  method: 'post', path: '/api/admin/reindex',
+  method: 'post',
+  path: '/api/admin/reindex',
   summary: 'Trigger reindex',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '202': { description: 'Reindex started', content: { 'application/json': { schema: z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) }) } } },
+    '202': {
+      description: 'Reindex started',
+      content: {
+        'application/json': {
+          schema: z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) }),
+        },
+      },
+    },
     '401': errorResponses['401'],
     '409': errorResponses['409'],
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/api/admin/api-keys',
+  method: 'get',
+  path: '/api/admin/api-keys',
   summary: 'List API keys (hashes only)',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'API key list', content: { 'application/json': { schema: z.object({ apiKeys: z.array(z.record(z.string(), z.unknown())) }) } } },
+    '200': {
+      description: 'API key list',
+      content: {
+        'application/json': {
+          schema: z.object({ apiKeys: z.array(z.record(z.string(), z.unknown())) }),
+        },
+      },
+    },
     '401': errorResponses['401'],
   },
 });
 
 registry.registerPath({
-  method: 'post', path: '/api/admin/api-keys',
+  method: 'post',
+  path: '/api/admin/api-keys',
   summary: 'Create API key',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   request: {
-    body: { required: true, content: { 'application/json': { schema: z.object({ name: z.string().openapi({ example: 'my-service' }) }) } } },
+    body: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: z.object({ name: z.string().openapi({ example: 'my-service' }) }),
+        },
+      },
+    },
   },
   responses: {
-    '201': { description: 'API key created (raw key returned once)', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '201': {
+      description: 'API key created (raw key returned once)',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
   },
 });
 
 registry.registerPath({
-  method: 'post', path: '/api/admin/api-keys/{id}/rotate',
+  method: 'post',
+  path: '/api/admin/api-keys/{id}/rotate',
   summary: 'Rotate API key',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
   responses: {
-    '200': { description: 'New raw key returned once', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'New raw key returned once',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '401': errorResponses['401'],
     '404': errorResponses['404'],
   },
 });
 
 registry.registerPath({
-  method: 'delete', path: '/api/admin/api-keys/{id}',
+  method: 'delete',
+  path: '/api/admin/api-keys/{id}',
   summary: 'Revoke API key',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
@@ -768,7 +943,8 @@ registry.registerPath({
 // ── DLQ ───────────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/admin/dlq',
+  method: 'get',
+  path: '/admin/dlq',
   summary: 'List dead-letter queue entries',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
@@ -780,7 +956,10 @@ registry.registerPath({
     }),
   },
   responses: {
-    '200': { description: 'DLQ entries', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'DLQ entries',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '403': errorResponses['403'],
@@ -788,13 +967,17 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'get', path: '/admin/dlq/{id}',
+  method: 'get',
+  path: '/admin/dlq/{id}',
   summary: 'Get DLQ entry',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
   responses: {
-    '200': { description: 'DLQ entry', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'DLQ entry',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
     '404': errorResponses['404'],
@@ -802,13 +985,17 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'delete', path: '/admin/dlq/{id}',
+  method: 'delete',
+  path: '/admin/dlq/{id}',
   summary: 'Delete DLQ entry',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
   responses: {
-    '200': { description: 'Entry deleted', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Entry deleted',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
     '404': errorResponses['404'],
@@ -816,13 +1003,17 @@ registry.registerPath({
 });
 
 registry.registerPath({
-  method: 'post', path: '/admin/dlq/{id}/retry',
+  method: 'post',
+  path: '/admin/dlq/{id}/retry',
   summary: 'Retry DLQ entry',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
   responses: {
-    '200': { description: 'Retry queued', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Retry queued',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
     '404': errorResponses['404'],
@@ -832,27 +1023,36 @@ registry.registerPath({
 // ── Rate limits ───────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/api/rate-limits',
+  method: 'get',
+  path: '/api/rate-limits',
   summary: "Caller's current rate-limit status",
   tags: ['rate-limits'],
   responses: {
-    '200': { description: 'Rate-limit status', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Rate-limit status',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/api/rate-limits/config',
+  method: 'get',
+  path: '/api/rate-limits/config',
   summary: 'Active rate-limit config (admin)',
   tags: ['rate-limits'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'Rate-limit config', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Rate-limit config',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '401': errorResponses['401'],
   },
 });
 
 registry.registerPath({
-  method: 'put', path: '/api/rate-limits/config',
+  method: 'put',
+  path: '/api/rate-limits/config',
   summary: 'Update rate-limit config (admin)',
   tags: ['rate-limits'],
   security: [{ bearerAuth: [] }],
@@ -862,9 +1062,27 @@ registry.registerPath({
       content: {
         'application/json': {
           schema: z.object({
-            ip: z.object({ windowMs: z.number().optional(), max: z.number().optional(), enabled: z.boolean().optional() }).optional(),
-            apiKey: z.object({ windowMs: z.number().optional(), max: z.number().optional(), enabled: z.boolean().optional() }).optional(),
-            admin: z.object({ windowMs: z.number().optional(), max: z.number().optional(), enabled: z.boolean().optional() }).optional(),
+            ip: z
+              .object({
+                windowMs: z.number().optional(),
+                max: z.number().optional(),
+                enabled: z.boolean().optional(),
+              })
+              .optional(),
+            apiKey: z
+              .object({
+                windowMs: z.number().optional(),
+                max: z.number().optional(),
+                enabled: z.boolean().optional(),
+              })
+              .optional(),
+            admin: z
+              .object({
+                windowMs: z.number().optional(),
+                max: z.number().optional(),
+                enabled: z.boolean().optional(),
+              })
+              .optional(),
           }),
           example: { ip: { max: 200 } },
         },
@@ -872,7 +1090,10 @@ registry.registerPath({
     },
   },
   responses: {
-    '200': { description: 'Updated config', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Updated config',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '409': errorResponses['409'],
@@ -882,7 +1103,8 @@ registry.registerPath({
 // ── Internal indexer ──────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'post', path: '/internal/indexer/contract-events',
+  method: 'post',
+  path: '/internal/indexer/contract-events',
   summary: 'Ingest contract event batch',
   tags: ['indexer'],
   security: [{ indexerWorkerToken: [] }],
@@ -892,23 +1114,52 @@ registry.registerPath({
       content: {
         'application/json': {
           schema: z.object({ events: z.array(z.record(z.string(), z.unknown())).max(100) }),
-          example: { events: [{ eventId: 'evt-001', ledger: 1000, contractId: 'C...', topic: 'stream.created', payload: {} }] },
+          example: {
+            events: [
+              {
+                eventId: 'evt-001',
+                ledger: 1000,
+                contractId: 'C...',
+                topic: 'stream.created',
+                payload: {},
+              },
+            ],
+          },
         },
       },
     },
   },
   responses: {
-    '200': { description: 'Batch persisted', content: { 'application/json': { schema: successSchema(z.object({ outcome: z.string(), insertedCount: z.number(), duplicateCount: z.number(), insertedEventIds: z.array(z.string()), duplicateEventIds: z.array(z.string()) })) } } },
+    '200': {
+      description: 'Batch persisted',
+      content: {
+        'application/json': {
+          schema: successSchema(
+            z.object({
+              outcome: z.string(),
+              insertedCount: z.number(),
+              duplicateCount: z.number(),
+              insertedEventIds: z.array(z.string()),
+              duplicateEventIds: z.array(z.string()),
+            })
+          ),
+        },
+      },
+    },
     '401': errorResponses['401'],
     '409': errorResponses['409'],
-    '413': { description: 'Payload too large', content: { 'application/json': { schema: ErrorEnvelope } } },
+    '413': {
+      description: 'Payload too large',
+      content: { 'application/json': { schema: ErrorEnvelope } },
+    },
     '429': errorResponses['429'],
     '503': errorResponses['503'],
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/internal/indexer/events',
+  method: 'get',
+  path: '/internal/indexer/events',
   summary: 'List stored contract events',
   tags: ['indexer'],
   security: [{ indexerWorkerToken: [] }],
@@ -923,19 +1174,26 @@ registry.registerPath({
     }),
   },
   responses: {
-    '200': { description: 'Event list', content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } } },
+    '200': {
+      description: 'Event list',
+      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+    },
     '401': errorResponses['401'],
   },
 });
 
 registry.registerPath({
-  method: 'get', path: '/internal/indexer/events/replay',
+  method: 'get',
+  path: '/internal/indexer/events/replay',
   summary: 'Cursor-based event replay',
   tags: ['indexer'],
   security: [{ indexerWorkerToken: [] }],
   request: {
     query: z.object({
-      afterEventId: z.string().optional().openapi({ description: 'Exclusive cursor; omit to start from beginning' }),
+      afterEventId: z
+        .string()
+        .optional()
+        .openapi({ description: 'Exclusive cursor; omit to start from beginning' }),
       fromLedger: z.string().optional(),
       toledger: z.string().optional(),
       contractId: z.string().optional(),
@@ -944,7 +1202,10 @@ registry.registerPath({
     }),
   },
   responses: {
-    '200': { description: 'Cursor-paginated event page', content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } } },
+    '200': {
+      description: 'Cursor-paginated event page',
+      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+    },
     '401': errorResponses['401'],
   },
 });
@@ -952,33 +1213,63 @@ registry.registerPath({
 // ── Webhooks ──────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'post', path: '/internal/webhooks/receive',
+  method: 'post',
+  path: '/internal/webhooks/receive',
   summary: 'Receive and verify an inbound Fluxora webhook',
   tags: ['webhooks'],
   request: {
     headers: z.object({
-      'x-fluxora-delivery-id': z.string().openapi({ description: 'Stable delivery ID for deduplication' }),
+      'x-fluxora-delivery-id': z
+        .string()
+        .openapi({ description: 'Stable delivery ID for deduplication' }),
       'x-fluxora-timestamp': z.string().openapi({ description: 'Unix timestamp in seconds' }),
       'x-fluxora-signature': z.string().openapi({ description: 'HMAC-SHA256 hex signature' }),
       'x-fluxora-event': z.string().optional().openapi({ example: 'stream.created' }),
     }),
-    body: { required: true, content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    body: {
+      required: true,
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
   },
   responses: {
-    '200': { description: 'Webhook verified and accepted', content: { 'application/json': { schema: z.object({ ok: z.literal(true), deliveryId: z.string(), eventType: z.string().nullable(), event: z.unknown() }) } } },
+    '200': {
+      description: 'Webhook verified and accepted',
+      content: {
+        'application/json': {
+          schema: z.object({
+            ok: z.literal(true),
+            deliveryId: z.string(),
+            eventType: z.string().nullable(),
+            event: z.unknown(),
+          }),
+        },
+      },
+    },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
-    '413': { description: 'Payload too large', content: { 'application/json': { schema: ErrorEnvelope } } },
+    '413': {
+      description: 'Payload too large',
+      content: { 'application/json': { schema: ErrorEnvelope } },
+    },
   },
 });
 
 registry.registerPath({
-  method: 'post', path: '/internal/webhooks/queue',
+  method: 'post',
+  path: '/internal/webhooks/queue',
   summary: 'Queue a webhook delivery',
   tags: ['webhooks'],
-  request: { body: { required: true, content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } } },
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
+  },
   responses: {
-    '200': { description: 'Queued', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': {
+      description: 'Queued',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
     '400': errorResponses['400'],
   },
 });
@@ -986,11 +1277,15 @@ registry.registerPath({
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
 registry.registerPath({
-  method: 'get', path: '/metrics',
+  method: 'get',
+  path: '/metrics',
   summary: 'Prometheus metrics',
   tags: ['observability'],
   responses: {
-    '200': { description: 'Prometheus text format', content: { 'text/plain': { schema: z.string() } } },
+    '200': {
+      description: 'Prometheus text format',
+      content: { 'text/plain': { schema: z.string() } },
+    },
   },
 });
 
@@ -1002,7 +1297,7 @@ registry.registerPath({
  */
 export function buildOpenApiSpec(): Record<string, unknown> {
   const generator = new OpenApiGeneratorV31(registry.definitions);
-  return generator.generateDocument({
+  const document = generator.generateDocument({
     openapi: '3.1.0',
     info: {
       title: 'Fluxora Backend API',
@@ -1010,7 +1305,10 @@ export function buildOpenApiSpec(): Record<string, unknown> {
       description:
         'REST API for the Fluxora treasury streaming protocol on Stellar. ' +
         'Covers stream CRUD, health, admin, indexer ingestion, webhook delivery, and observability.',
-      contact: { name: 'Fluxora Engineering', url: 'https://github.com/Fluxora-Org/Fluxora-Backend' },
+      contact: {
+        name: 'Fluxora Engineering',
+        url: 'https://github.com/Fluxora-Org/Fluxora-Backend',
+      },
       license: { name: 'MIT' },
     },
     servers: [{ url: 'http://localhost:3000', description: 'Local development' }],
@@ -1028,4 +1326,25 @@ export function buildOpenApiSpec(): Record<string, unknown> {
       { name: 'observability', description: 'Metrics' },
     ],
   }) as unknown as Record<string, unknown>;
+
+  applyOpenApiMetadataFixups(document);
+  return document;
+}
+
+function asObject(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function applyOpenApiMetadataFixups(document: Record<string, unknown>): void {
+  const components = asObject(document['components']);
+  const schemas = asObject(components?.['schemas']);
+  const streamListPage = asObject(schemas?.['StreamListPage']);
+  const streamListPageProperties = asObject(streamListPage?.['properties']);
+  const nextCursor = asObject(streamListPageProperties?.['next_cursor']);
+
+  if (nextCursor && typeof nextCursor['description'] !== 'string') {
+    nextCursor['description'] = NEXT_CURSOR_DESCRIPTION;
+  }
 }
