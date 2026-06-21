@@ -10,6 +10,10 @@
 import { createStreamHub, getStreamHub } from '../ws/hub.js';
 import type { Server } from 'http';
 import { info, warn } from '../utils/logger.js';
+import { loadConfig } from '../config/env.js';
+import { createRedisClient, type RedisClient } from '../redis/client.js';
+import { setWebSocketBanRedisClient } from '../ws/connectionLimiter.js';
+import { addShutdownHook } from '../shutdown.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -33,6 +37,45 @@ export type BroadcastMessage = StreamBroadcastEvent | DegradedBroadcastEvent;
 // ── Module state ─────────────────────────────────────────────────────────────
 
 let hubInitialized = false;
+let limiterRedisClient: RedisClient | null = null;
+let limiterRedisShutdownHookRegistered = false;
+
+async function wireWebSocketBanStore(): Promise<void> {
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    setWebSocketBanRedisClient(null);
+    warn('Configuration unavailable for WebSocket abuse ban Redis store; using in-process fallback', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  if (!config.redisEnabled) {
+    setWebSocketBanRedisClient(null);
+    warn('Redis disabled - WebSocket abuse bans will use in-process memory only');
+    return;
+  }
+
+  try {
+    limiterRedisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+    setWebSocketBanRedisClient(limiterRedisClient);
+    info('Redis WebSocket abuse ban store wired');
+  } catch (err) {
+    setWebSocketBanRedisClient(null);
+    warn('Redis WebSocket abuse ban store unavailable; using in-process fallback', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -47,6 +90,17 @@ export function attachWebSocketServer(httpServer: Server): void {
   
   // Always create a new hub for the given server
   createStreamHub(httpServer);
+  void wireWebSocketBanStore();
+  if (!limiterRedisShutdownHookRegistered) {
+    addShutdownHook(async () => {
+      if (limiterRedisClient) {
+        await limiterRedisClient.close();
+        limiterRedisClient = null;
+        setWebSocketBanRedisClient(null);
+      }
+    });
+    limiterRedisShutdownHookRegistered = true;
+  }
   hubInitialized = true;
   
   warn('attachWebSocketServer is deprecated - use StreamHub directly for new code');
@@ -115,5 +169,11 @@ export function closeWebSocketServer(): Promise<void> {
       hubInitialized = false;
       resolve();
     });
+  }).then(async () => {
+    if (limiterRedisClient) {
+      await limiterRedisClient.close();
+      limiterRedisClient = null;
+      setWebSocketBanRedisClient(null);
+    }
   });
 }

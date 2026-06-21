@@ -31,11 +31,13 @@
 
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage, IncomingHttpHeaders } from 'http';
 import type { Server } from 'http';
 import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
+import type { RedisClient } from '../redis/client.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError, type ContractEventStore } from '../indexer/store.js';
 import { SSE_STREAM_UPDATE_EVENT, sseEventBus } from '../streams/sseEmitter.js';
@@ -52,7 +54,8 @@ import {
 } from './messageHandler.js';
 import {
   getClientIp,
-  checkLimiter,
+  checkLimiterForConnection,
+  setWebSocketBanRedisClient,
   trackConnection,
   untrackConnection,
 } from './connectionLimiter.js';
@@ -133,6 +136,11 @@ export interface StreamHubOptions {
    * When absent, replayFromCursor sends an empty result.
    */
   eventStore?: ContractEventStore;
+  /**
+   * Optional Redis client used by the connection limiter to persist abuse bans
+   * across process restarts and multiple API instances.
+   */
+  banRedisClient?: RedisClient | null;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -177,17 +185,30 @@ export class StreamHub extends EventEmitter {
     this.jwtSecret = options?.jwtSecret ?? process.env.JWT_SECRET;
 
     this.eventStore = options?.eventStore;
+    if ('banRedisClient' in (options ?? {})) {
+      setWebSocketBanRedisClient(options?.banRedisClient ?? null);
+    }
 
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
 
     server.on('upgrade', (req, socket, head) => {
+      void this.handleUpgrade(req, socket, head);
+    });
+
+    this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+      this.onConnect(ws, req);
+    });
+  }
+
+  private async handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    try {
       const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
       if (pathname !== '/ws/streams') return;
 
       // 1. Connection Limiter Check
       const ip = getClientIp(req);
-      const limitResult = checkLimiter(ip);
+      const limitResult = await checkLimiterForConnection(ip);
       if (!limitResult.allowed) {
         this.wss.handleUpgrade(req, socket, head, (ws) => {
           ws.close(limitResult.code || 4029, limitResult.reason);
@@ -214,11 +235,13 @@ export class StreamHub extends EventEmitter {
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         this.wss.emit('connection', ws, req);
       });
-    });
-
-    this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-      this.onConnect(ws, req);
-    });
+    } catch (err) {
+      logger.error('WebSocket upgrade failed', undefined, {
+        event: 'ws_upgrade_failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      socket.destroy();
+    }
   }
 
   // ── Connection lifecycle ───────────────────────────────────────────────────

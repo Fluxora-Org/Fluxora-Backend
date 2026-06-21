@@ -22,10 +22,12 @@ import {
   RATE_LIMIT_WINDOW_MS,
 } from '../src/ws/hub.js';
 import { InMemoryDedupCache } from '../src/redis/dedup.js';
+import { _resetLimiter } from '../src/ws/connectionLimiter.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function createTestServer(): { server: http.Server; hub: StreamHub; port: number } {
+  _resetLimiter();
   const server = http.createServer();
   const hub = new StreamHub(server);
   return new Promise<{ server: http.Server; hub: StreamHub; port: number }>((resolve) => {
@@ -37,6 +39,7 @@ function createTestServer(): { server: http.Server; hub: StreamHub; port: number
 }
 
 async function setup(): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  _resetLimiter();
   const server = http.createServer();
   const hub = new StreamHub(server);
   return new Promise((resolve) => {
@@ -49,7 +52,10 @@ async function setup(): Promise<{ server: http.Server; hub: StreamHub; port: num
 
 async function teardown(server: http.Server, hub: StreamHub): Promise<void> {
   return new Promise((resolve) => {
-    hub.close(() => server.close(() => resolve()));
+    hub.close(() => server.close(() => {
+      _resetLimiter();
+      resolve();
+    }));
   });
 }
 
@@ -592,6 +598,8 @@ describe('WebSocket hub — backpressure strategy', () => {
   it('chunks large fanouts across setImmediate boundaries without stalling the event loop', async () => {
     // Connect enough clients to exceed FANOUT_YIELD_BATCH (256).
     const N = 260;
+    const originalMaxConnections = process.env.WS_MAX_CONNECTIONS_PER_IP;
+    process.env.WS_MAX_CONNECTIONS_PER_IP = '512';
     const clients: WebSocket[] = [];
     for (let i = 0; i < N; i++) {
       clients.push(await connect(port));
@@ -625,6 +633,11 @@ describe('WebSocket hub — backpressure strategy', () => {
     expect(timerFiredAt - timerSet).toBeLessThan(1000);
 
     for (const c of clients) c.close();
+    if (originalMaxConnections === undefined) {
+      delete process.env.WS_MAX_CONNECTIONS_PER_IP;
+    } else {
+      process.env.WS_MAX_CONNECTIONS_PER_IP = originalMaxConnections;
+    }
     await sleep(100);
   });
 
@@ -781,6 +794,7 @@ function makeToken(payload: object = { sub: 'user-1' }, secret = TEST_JWT_SECRET
 }
 
 async function setupWithAuth(opts: { wsAuthRequired: boolean; jwtSecret?: string } = { wsAuthRequired: true }): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  _resetLimiter();
   const server = http.createServer();
   const hub = new StreamHub(server, {
     wsAuthRequired: opts.wsAuthRequired,
@@ -936,6 +950,7 @@ function makeStoreRecord(eventId: string, ledger: number, topic = 'stream.create
 }
 
 async function setupWithStore(store: InMemoryContractEventStore): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  _resetLimiter();
   const server = http.createServer();
   const hub = new StreamHub(server, { eventStore: store });
   return new Promise((resolve) => {
@@ -1060,6 +1075,7 @@ describe('StreamHub.replayFromCursor — event store replay', () => {
 
   it('sends REPLAY_UNAVAILABLE error when no event store is configured', async () => {
     // Hub without an event store
+    _resetLimiter();
     const plainServer = http.createServer();
     const plainHub = new StreamHub(plainServer);
     await new Promise<void>((resolve) => plainServer.listen(0, '127.0.0.1', resolve));

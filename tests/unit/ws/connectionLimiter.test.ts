@@ -3,10 +3,16 @@ import { Socket } from 'node:net';
 import { 
   getClientIp, 
   checkLimiter, 
+  checkLimiterForConnection,
+  setWebSocketBanRedisClient,
   trackConnection, 
   untrackConnection, 
   _resetLimiter 
 } from '../../../src/ws/connectionLimiter.js';
+import { FakeRedisClient } from '../../../src/redis/__test__/fakeRedisClient.js';
+import { getAuditEntries, _resetAuditLog } from '../../../src/lib/auditLog.js';
+import { StreamHub } from '../../../src/ws/hub.js';
+import http from 'node:http';
 
 describe('connectionLimiter', () => {
   const originalEnv = process.env;
@@ -15,6 +21,7 @@ describe('connectionLimiter', () => {
     vi.resetModules();
     process.env = { ...originalEnv };
     _resetLimiter();
+    _resetAuditLog();
     
     process.env.WS_MAX_CONNECTIONS_PER_IP = '2';
     process.env.WS_ABUSE_THRESHOLD = '2';
@@ -114,6 +121,84 @@ describe('connectionLimiter', () => {
       const result = checkLimiter(ip);
       expect(result.allowed).toBe(false);
       expect(result.reason).toBe('IP banned due to abuse');
+    });
+
+    it('persists abuse bans in Redis and reloads them after local state reset', async () => {
+      const redis = new FakeRedisClient();
+      setWebSocketBanRedisClient(redis);
+
+      trackConnection(ip);
+      trackConnection(ip);
+
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+
+      expect((await checkLimiterForConnection(ip)).reason).toBe('IP banned due to abuse');
+
+      _resetLimiter({ keepBanStore: true });
+
+      const result = await checkLimiterForConnection(ip);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('IP banned due to abuse');
+    });
+
+    it('accepts a Redis ban client through StreamHub options', async () => {
+      const redis = new FakeRedisClient();
+      const server = http.createServer();
+      const hub = new StreamHub(server, { banRedisClient: redis });
+
+      trackConnection(ip);
+      trackConnection(ip);
+
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+
+      _resetLimiter({ keepBanStore: true });
+      const result = await checkLimiterForConnection(ip);
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('IP banned due to abuse');
+
+      await new Promise<void>((resolve) => hub.close(() => resolve()));
+    });
+
+    it('falls back to the local ban cache when Redis is unavailable', async () => {
+      const redis = new FakeRedisClient();
+      setWebSocketBanRedisClient(redis);
+
+      trackConnection(ip);
+      trackConnection(ip);
+
+      redis.throwOnNext('set');
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+
+      redis.throwOnNext('get');
+      const result = await checkLimiterForConnection(ip);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('IP banned due to abuse');
+    });
+
+    it('records audit entries for ban creation and expiry', async () => {
+      vi.useFakeTimers();
+      process.env.WS_BAN_TTL_S = '1';
+
+      trackConnection(ip);
+      trackConnection(ip);
+
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+      await checkLimiterForConnection(ip);
+
+      expect(getAuditEntries().some((entry) => entry.action === 'WS_ABUSE_BAN_CREATED')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(1100);
+
+      expect(getAuditEntries().some((entry) => entry.action === 'WS_ABUSE_BAN_EXPIRED')).toBe(true);
+      vi.useRealTimers();
     });
 
     it('ban expires after TTL', () => {

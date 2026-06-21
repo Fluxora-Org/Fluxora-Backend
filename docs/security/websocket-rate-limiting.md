@@ -32,6 +32,16 @@ During the ban period (`WS_BAN_TTL_S`):
 - All new connection attempts from the banned IP are rejected with close code `4029`.
 - The close reason will be "IP banned due to abuse".
 
+When Redis is enabled (`REDIS_ENABLED=true`), abuse bans are also written to a
+Redis key with a TTL that matches `WS_BAN_TTL_S`. This lets deploys, crashes, and
+multi-instance rollouts share the same ban decision instead of resetting it on
+process restart. The in-process map remains a read-through cache so healthy
+connections do not require a Redis round trip after the first ban lookup.
+
+If Redis is unavailable, the limiter logs `ws_ban_redis_unavailable` and falls
+back to the local cache instead of allowing a banned client through. Ban creation
+and expiry are mirrored to the internal audit log with hashed IP resource IDs.
+
 ## IP Spoofing Mitigation
 
 To prevent IP spoofing, the connection limiter only trusts the `X-Forwarded-For` header if the request originates from a known proxy.
