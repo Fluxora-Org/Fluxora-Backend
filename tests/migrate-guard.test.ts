@@ -112,6 +112,29 @@ describe('checkPendingMigrations', () => {
     await expect(checkPendingMigrations()).resolves.toBeUndefined()
   })
 
+  it('ignores non-migration scripts when comparing disk files to pgmigrations', async () => {
+    mockMigrationsOnDisk(['001_create_streams.ts', 'run.ts', 'helper.cjs', 'README.md'])
+    mockAppliedMigrations(['001_create_streams'])
+
+    await expect(checkPendingMigrations()).resolves.toBeUndefined()
+  })
+
+  it('detects all repository migration files that share the node-pg-migrate ledger', async () => {
+    const migrationFiles = [
+      '1774715000000_initial_schema.ts',
+      '1774715050000_add_contract_events_replay_indexes.ts',
+      '1774715100000_create_replay_cursors.ts',
+      '1774715131962_streams-table.ts',
+      '1774715200000_audit-and-webhook-outbox.ts',
+      '1774715300000_dead-letter-queue.ts',
+      '1774715400000_enable_pgcrypto_encrypt_addresses.ts',
+    ]
+    mockMigrationsOnDisk([...migrationFiles, 'run.ts'])
+    mockAppliedMigrations(migrationFiles.map((file) => file.replace(/\.ts$/, '')))
+
+    await expect(checkPendingMigrations()).resolves.toBeUndefined()
+  })
+
   // ── Short-circuit paths (no DB call) ────────────────────────────────────────
 
   it('resolves without querying DB when no migration files exist on disk', async () => {

@@ -12,13 +12,11 @@ import fs from 'fs';
 import pg from 'pg';
 import { info, error as logError } from '../utils/logger.js';
 import path from 'path';
-import { fileURLToPath } from 'url';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const MIGRATIONS_DIR = path.join(__dirname, '../../migrations');
+const MIGRATIONS_DIR = path.resolve(__dirname, '../../migrations');
 const MIGRATIONS_TABLE = 'pgmigrations';
+const MIGRATION_FILE_PATTERN = /^\d+_.+\.(js|ts|mjs|cjs)$/;
+const NON_MIGRATION_IGNORE_PATTERN = '(?!\\d+_.+\\.(?:js|ts|mjs|cjs)$).*';
 
 /**
  * Thrown when the database has unapplied migrations at startup.
@@ -52,7 +50,7 @@ function getMigrationNamesOnDisk(): string[] {
   }
   return fs
     .readdirSync(MIGRATIONS_DIR)
-    .filter((f) => /\.(js|ts|mjs|cjs)$/.test(f))
+    .filter((f) => MIGRATION_FILE_PATTERN.test(f))
     .sort()
     .map(migrationNameFromFile);
 }
@@ -142,6 +140,7 @@ export async function migrate(): Promise<void> {
       dir: MIGRATIONS_DIR,
       direction: 'up',
       migrationsTable: MIGRATIONS_TABLE,
+      ignorePattern: NON_MIGRATION_IGNORE_PATTERN,
       count: Infinity,
       logger: {
         info: (msg: string) => info(msg),
@@ -163,4 +162,12 @@ export async function migrate(): Promise<void> {
  */
 export async function initializeMigrations(): Promise<void> {
   await migrate();
+}
+
+if (require.main === module) {
+  migrate().catch((err) => {
+    const message = err instanceof Error ? err.stack ?? err.message : String(err);
+    logError(`Migration command failed: ${message}`);
+    process.exit(1);
+  });
 }

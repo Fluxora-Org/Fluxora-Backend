@@ -10,7 +10,7 @@
     "test:watch": "vitest",
     "dev": "ts-node src/index.ts",
     "start": "node dist/src/index.js",
-    "migrate": "ts-node migrations/run.ts",
+    "migrate": "tsx src/db/migrate.ts",
     "seed": "ts-node scripts/seed-test-data.ts",
     "benchmark": "ts-node scripts/benchmark.ts",
     "verify": "ts-node scripts/verify-setup.ts",

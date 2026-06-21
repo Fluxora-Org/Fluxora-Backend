@@ -41,31 +41,18 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
   pgm.createIndex('streams', 'contract_id');
   pgm.createIndex('streams', 'created_at');
 
-  // Contract events table for the indexer service
-  pgm.createTable('contract_events', {
-    event_id: { type: 'text', primaryKey: true },
-    ledger: { type: 'integer', notNull: true },
-    contract_id: { type: 'text', notNull: true },
-    topic: { type: 'text', notNull: true },
-    tx_hash: { type: 'text', notNull: true },
-    tx_index: { type: 'integer', notNull: true },
-    operation_index: { type: 'integer', notNull: true },
-    event_index: { type: 'integer', notNull: true },
-    payload: { type: 'jsonb', notNull: true },
-    happened_at: { type: 'timestamp with time zone', notNull: true },
-    ingested_at: {
-      type: 'timestamp with time zone',
-      notNull: true,
-      default: pgm.func('current_timestamp'),
-    },
-  });
-
-  pgm.createIndex('contract_events', 'contract_id');
-  pgm.createIndex('contract_events', 'tx_hash');
-  pgm.createIndex('contract_events', 'happened_at');
+  // contract_events is created by 1774715000000_initial_schema.ts and indexed
+  // by 1774715050000_add_contract_events_replay_indexes.ts. This migration only
+  // adds the event-store indexes that originally lived next to the duplicate
+  // table definition.
+  pgm.createIndex('contract_events', 'contract_id', { ifNotExists: true });
+  pgm.createIndex('contract_events', 'tx_hash', { ifNotExists: true });
+  pgm.createIndex('contract_events', 'happened_at', { ifNotExists: true });
 }
 
 export async function down(pgm: MigrationBuilder): Promise<void> {
-  pgm.dropTable('contract_events');
+  pgm.dropIndex('contract_events', 'happened_at', { ifExists: true });
+  pgm.dropIndex('contract_events', 'tx_hash', { ifExists: true });
+  pgm.dropIndex('contract_events', 'contract_id', { ifExists: true });
   pgm.dropTable('streams');
 }

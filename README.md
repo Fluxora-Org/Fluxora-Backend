@@ -37,9 +37,20 @@ cp .env.example .env
 pnpm run migrate
 ```
 
+`pnpm run migrate` uses the single node-pg-migrate entry point in `src/db/migrate.ts`.
+Every migration file under `migrations/` must use the node-pg-migrate
+`MigrationBuilder` signature, a timestamp-style numeric prefix such as
+`1774715131962_streams-table.ts`, and the shared `pgmigrations` ledger. Startup
+checks compare that same file set against `pgmigrations` and fail closed when any
+file is unapplied. New migrations should use timestamp prefixes so ordering is
+stable under node-pg-migrate; legacy `000_`/`001_` migration names were converted
+to timestamp prefixes for the same reason.
+
 This creates:
 - `historical_events` table (source data)
 - `contract_events` table (replay destination)
+- `streams` table (API write model)
+- `replay_cursors` table (crash-safe replay progress)
 - Optimized indexes for replay queries
 
 ## 🏃 Running the Service
@@ -225,8 +236,9 @@ src/
 └── types/           # TypeScript type definitions
 
 migrations/
-├── 000_initial_schema.ts              # Create tables
-└── 001_add_contract_events_replay_indexes.ts  # Add indexes
+├── 1774715000000_initial_schema.ts     # Create tables
+├── 1774715050000_add_contract_events_replay_indexes.ts  # Add indexes
+└── 1774715100000_create_replay_cursors.ts  # Durable replay progress
 
 tests/
 └── indexer/
@@ -247,7 +259,7 @@ docs/
 
 2. **Implement changes**: ✅ Complete
    - ✅ Batch insert logic in `src/indexer/service.ts`
-   - ✅ Index migration in `migrations/001_add_contract_events_replay_indexes.ts`
+   - ✅ Index migration in `migrations/1774715050000_add_contract_events_replay_indexes.ts`
    - ✅ Progress API in `src/routes/indexer.ts`
    - ✅ Comprehensive tests in `tests/indexer/service.replay.test.ts`
    - ✅ Documentation in `docs/indexer.md`
