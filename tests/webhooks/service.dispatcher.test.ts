@@ -3,6 +3,7 @@ import { WebhookDispatcher } from '../../src/webhooks/service.js';
 import type { EnhancedRetryPolicy } from '../../src/webhooks/retry.js';
 import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
 import { RedisWebhookCircuitBreakerStore } from '../../src/redis/webhookCircuitBreakerStore.js';
+import { webhookDeliveryStore } from '../../src/webhooks/store.js';
 
 interface MockClient {
   queries: Array<{ sql: string; params: unknown[] | undefined }>;
@@ -61,12 +62,14 @@ describe('WebhookDispatcher outbox polling', () => {
   beforeEach(() => {
     redis = new FakeRedisClient();
     breaker = new RedisWebhookCircuitBreakerStore(redis);
+    webhookDeliveryStore.clear();
     vi.spyOn(Math, 'random').mockReturnValue(0.5);
   });
 
   afterEach(async () => {
     await breaker.close();
     redis.reset();
+    webhookDeliveryStore.clear();
     vi.restoreAllMocks();
   });
 
@@ -162,6 +165,122 @@ describe('WebhookDispatcher outbox polling', () => {
     await createDispatcher(client, breaker).pollOnce();
 
     expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(webhookDeliveryStore.getDeadLetterQueueItems()).toEqual([
+      expect.objectContaining({
+        deliveryId: 'outbox_44',
+        failureCode: 'exhausted_retry',
+        failureReason: 'HTTP 500 after 3 attempts',
+      }),
+    ]);
+  });
+
+  it('fast-tracks invalid JSON payloads to the dead-letter queue without delivery', async () => {
+    const client = createClient([
+      {
+        id: '48',
+        stream_id: 'stream-7',
+        event_type: 'stream.created',
+        payload: '{"id":',
+        created_at: new Date(),
+      },
+    ]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
+          params: ['48'],
+        }),
+      ]),
+    );
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(webhookDeliveryStore.getDeadLetterQueueItems()).toEqual([
+      expect.objectContaining({
+        deliveryId: 'outbox_48',
+        failureCode: 'poison_payload',
+        failureReason: 'Webhook outbox payload is not valid JSON',
+      }),
+    ]);
+  });
+
+  it('fast-tracks malformed consumer URLs to the dead-letter queue without retrying', async () => {
+    const client = createClient([
+      {
+        id: '49',
+        stream_id: 'stream-8',
+        event_type: 'stream.created',
+        payload: { id: 'evt-8', endpointUrl: 'ftp://consumer.example/webhooks' },
+        created_at: new Date(),
+      },
+    ]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(webhookDeliveryStore.getDeadLetterQueueItems()).toEqual([
+      expect.objectContaining({
+        deliveryId: 'outbox_49',
+        endpointUrl: 'ftp://consumer.example/webhooks',
+        failureCode: 'poison_endpoint',
+        failureReason: 'Webhook endpoint must use http or https',
+      }),
+    ]);
+  });
+
+  it('fast-tracks payloads whose event marker disagrees with event_type', async () => {
+    const client = createClient([
+      {
+        id: '51',
+        stream_id: 'stream-10',
+        event_type: 'stream.updated',
+        payload: { id: 'evt-10', event: 'stream.cancelled' },
+        created_at: new Date(),
+      },
+    ]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(webhookDeliveryStore.getDeadLetterQueueItems()).toEqual([
+      expect.objectContaining({
+        deliveryId: 'outbox_51',
+        failureCode: 'poison_payload',
+        failureReason: 'Webhook outbox payload event does not match event_type',
+      }),
+    ]);
+  });
+
+  it('moves non-retryable HTTP responses to the dead-letter queue with a poison status code', async () => {
+    const client = createClient([
+      {
+        id: '50',
+        stream_id: 'stream-9',
+        event_type: 'stream.created',
+        payload: { id: 'evt-9' },
+        created_at: new Date(),
+      },
+    ]);
+    global.fetch = vi.fn(async () => new Response(null, { status: 400, statusText: 'Bad Request' })) as unknown as typeof fetch;
+
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).toHaveBeenCalledOnce();
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(webhookDeliveryStore.getDeadLetterQueueItems()).toEqual([
+      expect.objectContaining({
+        deliveryId: 'outbox_50',
+        failureCode: 'poison_status',
+        failureReason: 'HTTP 400 after 1 attempt',
+      }),
+    ]);
   });
 
   it('defers delivery when the shared Redis circuit breaker is open', async () => {

@@ -29,7 +29,7 @@ webhooksRouter.post(
   (req, res): void => {
     const rawBody = req.body as Buffer;
     const headers = req.headers as Record<string, string | undefined>;
-    // `verifyWebhookSignature` uses exact-optional types — only forward
+    // `verifyWebhookSignature` uses exact-optional types - only forward
     // properties when they are actually set.
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
@@ -262,6 +262,7 @@ webhooksRouter.get('/dlq', (req, res) => {
       eventType: item.eventType,
       endpointUrl: item.endpointUrl,
       failureReason: item.failureReason,
+      failureCode: item.failureCode,
       attemptCount: item.originalDelivery.attempts.length,
       createdAt: new Date(item.createdAt).toISOString(),
       processedAt: item.processedAt ? new Date(item.processedAt).toISOString() : null,

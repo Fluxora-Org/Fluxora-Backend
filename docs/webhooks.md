@@ -34,6 +34,19 @@ FOR UPDATE SKIP LOCKED
 
 Failed retryable deliveries are delegated to `src/webhooks/retry.ts`. The original row is marked processed and a new unprocessed row is inserted with `created_at` set to the next retry time. The dispatcher only claims rows whose `created_at` is due, so retries remain durable in PostgreSQL without holding process memory.
 
+## Poison delivery handling
+
+The dispatcher fast-tracks rows that cannot be repaired by retrying to the dead-letter queue. Operators can distinguish these from exhausted transient failures with the `failureCode` returned by `GET /api/webhooks/dlq`.
+
+| `failureCode` | Meaning |
+|---------------|---------|
+| `poison_payload` | The stored outbox payload is not valid JSON, is not a JSON object, uses an unsupported `event_type`, or has a payload `event` marker that does not match `event_type`. |
+| `poison_endpoint` | The configured or per-row consumer URL is malformed or violates endpoint safety rules. |
+| `poison_status` | The consumer returned a non-retryable HTTP status, such as `400`, `401`, `403`, `404`, or `422`. |
+| `exhausted_retry` | A transient failure reached `maxAttempts` and no further retry row will be enqueued. |
+
+Poison rows are marked processed before being added to the DLQ so a single bad payload or endpoint cannot roll back the whole batch and block later outbox rows.
+
 ## Retry rate limiting
 
 To prevent a slow or error-prone consumer from being bombarded with retries, `attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` enforces a per-consumer-URL sliding-window rate limit before each outbound attempt.
@@ -54,7 +67,7 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 
 1. Before firing a retry, the dispatcher calls `checkWebhookDeliveryGate` / `attemptWebhookDeliveryWithRateLimit` with the consumer endpoint URL.
 2. The circuit breaker store reads/writes JSON state at `webhook_cb:{sha256(url)}`. Half-open probe ownership is tracked with `webhook_cb_probe:{sha256(url)}` via Redis `SET NX`.
-3. When the circuit is open, the outbox row is re-enqueued with `created_at = resetAt` — no HTTP call is made.
+3. When the circuit is open, the outbox row is re-enqueued with `created_at = resetAt` - no HTTP call is made.
 4. Successful deliveries reset the breaker; retryable failures increment the shared failure counter.
 5. State transitions increment `fluxora_webhook_circuit_breaker_transitions_total{from_state,to_state}`.
 

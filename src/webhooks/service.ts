@@ -10,15 +10,15 @@ import { getCorrelationId } from '../tracing/middleware.js';
 import { getPool } from '../db/pool.js';
 import type {
   WebhookEvent,
+  WebhookEventType,
   WebhookDelivery,
   WebhookDeliveryAttempt,
-  WebhookRetryPolicy,
 } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
+import type { DeadLetterQueueReasonCode } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, scheduleWebhookOutboxRetry, shouldRetry } from './retry.js';
-import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
+import { calculateNextRetryTime, shouldRetry, isRetryableStatusCode, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
 import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
 import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
@@ -58,6 +58,26 @@ interface ResolvedEndpoint {
   endpointUrl: string;
   secret: string;
 }
+
+const WEBHOOK_EVENT_TYPES = new Set<WebhookEventType>([
+  'stream.created',
+  'stream.updated',
+  'stream.cancelled',
+]);
+
+interface PoisonClassification {
+  code: DeadLetterQueueReasonCode;
+  reason: string;
+}
+
+type PayloadValidationResult =
+  | { ok: true; payload: Record<string, unknown> }
+  | { ok: false; poison: PoisonClassification };
+
+type EndpointResolutionResult =
+  | { ok: true; endpoint: ResolvedEndpoint }
+  | { ok: false; poison: PoisonClassification }
+  | { ok: false; missing: true };
 
 function parsePositiveInteger(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -101,16 +121,69 @@ function assertSafeWebhookEndpoint(endpointUrl: string): void {
   }
 }
 
-function normalizePayload(payload: unknown): unknown {
+function validateWebhookOutboxPayload(payload: unknown): PayloadValidationResult {
   if (typeof payload === 'string') {
     try {
-      return JSON.parse(payload);
+      const parsed = JSON.parse(payload);
+      return validateWebhookOutboxPayload(parsed);
     } catch {
-      return payload;
+      return {
+        ok: false,
+        poison: {
+          code: 'poison_payload',
+          reason: 'Webhook outbox payload is not valid JSON',
+        },
+      };
     }
   }
 
-  return payload;
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return {
+      ok: false,
+      poison: {
+        code: 'poison_payload',
+        reason: 'Webhook outbox payload must be a JSON object',
+      },
+    };
+  }
+
+  return { ok: true, payload: payload as Record<string, unknown> };
+}
+
+function validateWebhookOutboxEvent(row: OutboxRow, payload: Record<string, unknown>): PoisonClassification | null {
+  if (!WEBHOOK_EVENT_TYPES.has(row.event_type as WebhookEventType)) {
+    return {
+      code: 'poison_payload',
+      reason: `Webhook outbox event_type is not supported: ${row.event_type}`,
+    };
+  }
+
+  const payloadEvent = payload['event'];
+  if (payloadEvent !== undefined && payloadEvent !== row.event_type) {
+    return {
+      code: 'poison_payload',
+      reason: 'Webhook outbox payload event does not match event_type',
+    };
+  }
+
+  return null;
+}
+
+function isSuccessfulAttempt(attempt: WebhookDeliveryAttempt): boolean {
+  return (
+    attempt.statusCode !== undefined &&
+    attempt.statusCode >= 200 &&
+    attempt.statusCode < 300 &&
+    !attempt.error
+  );
+}
+
+function describePermanentFailure(
+  attempt: WebhookDeliveryAttempt,
+  attemptNumber: number,
+): string {
+  const attempts = `after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`;
+  return attempt.error ? `${attempt.error} ${attempts}` : `HTTP ${attempt.statusCode} ${attempts}`;
 }
 
 function extractAttemptNumber(payload: unknown): number {
@@ -126,6 +199,7 @@ function extractAttemptNumber(payload: unknown): number {
 function enqueuePermanentFailureToDlq(
   delivery: WebhookDelivery,
   failureReason: string,
+  failureCode: DeadLetterQueueReasonCode = 'exhausted_retry',
 ): string | undefined {
   const alreadyQueued = webhookDeliveryStore
     .getDeadLetterQueueItems()
@@ -138,7 +212,7 @@ function enqueuePermanentFailureToDlq(
     return undefined;
   }
 
-  return webhookDeliveryStore.addToDeadLetterQueue(delivery, failureReason);
+  return webhookDeliveryStore.addToDeadLetterQueue(delivery, failureReason, failureCode);
 }
 
 export class WebhookService {
@@ -581,20 +655,27 @@ export class WebhookDispatcher {
     return this.inFlight;
   }
 
-  private resolveEndpoint(row: OutboxRow): ResolvedEndpoint | null {
-    if (!this.endpointUrl || !this.secret) return null;
+  private resolveEndpoint(payloadObject: Record<string, unknown>): EndpointResolutionResult {
+    if (!this.endpointUrl || !this.secret) return { ok: false, missing: true };
 
-    const payload = normalizePayload(row.payload);
-    const payloadObject = typeof payload === 'object' && payload !== null
-      ? payload as Record<string, unknown>
-      : {};
     const endpointUrl =
       typeof payloadObject['endpointUrl'] === 'string' ? payloadObject['endpointUrl'] : this.endpointUrl;
     const secret =
       typeof payloadObject['secret'] === 'string' ? payloadObject['secret'] : this.secret;
 
-    assertSafeWebhookEndpoint(endpointUrl);
-    return { endpointUrl, secret };
+    try {
+      assertSafeWebhookEndpoint(endpointUrl);
+    } catch (error) {
+      return {
+        ok: false,
+        poison: {
+          code: 'poison_endpoint',
+          reason: error instanceof Error ? error.message : 'Webhook endpoint URL is invalid',
+        },
+      };
+    }
+
+    return { ok: true, endpoint: { endpointUrl, secret } };
   }
 
   private async processBatch(): Promise<void> {
@@ -638,22 +719,18 @@ export class WebhookDispatcher {
     }
   }
 
-  private async deliverRow(client: DbClient, row: OutboxRow): Promise<void> {
-    const endpoint = this.resolveEndpoint(row);
-    if (!endpoint) {
-      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, { outboxId: row.id });
-      return;
-    }
-
-    const payload = normalizePayload(row.payload);
-    const payloadString = JSON.stringify(payload);
-    const attemptNumber = extractAttemptNumber(payload);
-    const delivery: WebhookDelivery = {
+  private buildDelivery(
+    row: OutboxRow,
+    endpointUrl: string,
+    payload: Record<string, unknown>,
+    attemptNumber: number,
+  ): WebhookDelivery {
+    return {
       id: `outbox_${row.id}`,
       deliveryId: `outbox_${row.id}`,
       eventId: row.stream_id,
       eventType: row.event_type as WebhookEvent['type'],
-      endpointUrl: endpoint.endpointUrl,
+      endpointUrl,
       status: 'pending',
       attempts: Array.from({ length: Math.max(0, attemptNumber - 1) }, (_, index) => ({
         attemptNumber: index + 1,
@@ -661,8 +738,70 @@ export class WebhookDispatcher {
       })),
       createdAt: new Date(row.created_at).getTime(),
       updatedAt: Date.now(),
-      payload: payloadString,
+      payload: JSON.stringify(payload),
     };
+  }
+
+  private async moveRowToDlq(
+    client: DbClient,
+    row: OutboxRow,
+    payload: Record<string, unknown>,
+    endpointUrl: string,
+    poison: PoisonClassification,
+    attemptNumber = extractAttemptNumber(payload),
+  ): Promise<void> {
+    const delivery = this.buildDelivery(row, endpointUrl, payload, attemptNumber);
+    delivery.status = 'permanent_failure';
+    await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
+    enqueuePermanentFailureToDlq(delivery, poison.reason, poison.code);
+  }
+
+  private async deliverRow(client: DbClient, row: OutboxRow): Promise<void> {
+    const payloadValidation = validateWebhookOutboxPayload(row.payload);
+    if (payloadValidation.ok === false) {
+      await this.moveRowToDlq(
+        client,
+        row,
+        { rawPayload: typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload) },
+        this.endpointUrl ?? 'invalid://webhook-endpoint',
+        payloadValidation.poison,
+      );
+      return;
+    }
+
+    const payload = payloadValidation.payload;
+    const eventPoison = validateWebhookOutboxEvent(row, payload);
+    if (eventPoison) {
+      await this.moveRowToDlq(
+        client,
+        row,
+        payload,
+        this.endpointUrl ?? 'invalid://webhook-endpoint',
+        eventPoison,
+      );
+      return;
+    }
+
+    const endpointResolution = this.resolveEndpoint(payload);
+    if (endpointResolution.ok === false && 'missing' in endpointResolution) {
+      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, { outboxId: row.id });
+      return;
+    }
+
+    if (endpointResolution.ok === false) {
+      await this.moveRowToDlq(
+        client,
+        row,
+        payload,
+        typeof payload['endpointUrl'] === 'string' ? payload['endpointUrl'] : this.endpointUrl ?? 'invalid://webhook-endpoint',
+        endpointResolution.poison,
+      );
+      return;
+    }
+
+    const endpoint = endpointResolution.endpoint;
+    const attemptNumber = extractAttemptNumber(payload);
+    const delivery = this.buildDelivery(row, endpoint.endpointUrl, payload, attemptNumber);
 
     const result = await attemptWebhookDeliveryWithRateLimit(
       {
@@ -701,17 +840,26 @@ export class WebhookDispatcher {
       attempt.nextRetryAt = result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
       delivery.status = 'pending';
     } else if (
-      attempt.statusCode !== undefined &&
-      attempt.statusCode >= 200 &&
-      attempt.statusCode < 300 &&
-      !attempt.error
+      isSuccessfulAttempt(attempt)
     ) {
       delivery.status = 'delivered';
     } else {
       delivery.status = 'permanent_failure';
     }
 
-    if (delivery.status === 'delivered' || delivery.status === 'permanent_failure') {
+    if (delivery.status === 'permanent_failure') {
+      const failureCode = attempt.statusCode !== undefined && !isRetryableStatusCode(attempt.statusCode, this.policy)
+        ? 'poison_status'
+        : 'exhausted_retry';
+      enqueuePermanentFailureToDlq(
+        delivery,
+        describePermanentFailure(attempt, attemptNumber),
+        failureCode,
+      );
+      return;
+    }
+
+    if (delivery.status === 'delivered') {
       return;
     }
 

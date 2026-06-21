@@ -6,6 +6,12 @@
 import type { WebhookDelivery, WebhookDeliveryStatus } from './types.js';
 import { logger } from '../lib/logger.js';
 
+export type DeadLetterQueueReasonCode =
+  | 'poison_payload'
+  | 'poison_endpoint'
+  | 'poison_status'
+  | 'exhausted_retry';
+
 export interface DeadLetterQueueItem {
   id: string;
   deliveryId: string;
@@ -15,6 +21,7 @@ export interface DeadLetterQueueItem {
   payload: string;
   originalDelivery: WebhookDelivery;
   failureReason: string;
+  failureCode: DeadLetterQueueReasonCode;
   createdAt: number;
   processedAt?: number;
 }
@@ -193,7 +200,11 @@ export class WebhookDeliveryStore {
   /**
    * Add failed delivery to dead-letter queue
    */
-  addToDeadLetterQueue(delivery: WebhookDelivery, failureReason: string): string {
+  addToDeadLetterQueue(
+    delivery: WebhookDelivery,
+    failureReason: string,
+    failureCode: DeadLetterQueueReasonCode = 'exhausted_retry',
+  ): string {
     const id = `dlq_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
     const dlqItem: DeadLetterQueueItem = {
@@ -205,6 +216,7 @@ export class WebhookDeliveryStore {
       payload: delivery.payload,
       originalDelivery: delivery,
       failureReason,
+      failureCode,
       createdAt: Date.now(),
     };
     
@@ -215,6 +227,7 @@ export class WebhookDeliveryStore {
       dlqId: id,
       deliveryId: delivery.deliveryId,
       failureReason,
+      failureCode,
       attemptCount: delivery.attempts.length,
     });
     
