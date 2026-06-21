@@ -181,6 +181,8 @@ export interface ApiKeyRecord {
   rotatedAt: string | null;
   /** Whether the key is still active */
   active: boolean;
+  /** Permission scopes granted to this key, e.g. `streams:read`. */
+  scopes: string[];
 }
 
 /**
@@ -194,6 +196,8 @@ export interface ApiKeyCreated {
   key: string;
   prefix: string;
   createdAt: string;
+  /** Permission scopes granted to this key. */
+  scopes: string[];
 }
 
 // ─── Stream Event Store ───────────────────────────────────────────────────────

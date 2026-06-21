@@ -1,6 +1,7 @@
 import { createId } from '@paralleldrive/cuid2';
 import { createHash, timingSafeEqual } from 'crypto';
 import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import { DEFAULT_API_KEY_SCOPES, isKnownPermission } from './permissions.js';
 
 // ---------------------------------------------------------------------------
 // In-memory store (replace with DB-backed store when persistence is needed)
@@ -21,6 +22,43 @@ function generateRawKey(): string {
   return `flx_${randomBytes(32).toString('hex')}`;
 }
 
+function sanitizeStoredScopes(scopes: unknown): string[] {
+  if (scopes === undefined) return [...DEFAULT_API_KEY_SCOPES];
+  if (!Array.isArray(scopes)) return [];
+
+  const normalized = scopes
+    .filter((scope): scope is string => typeof scope === 'string')
+    .map((scope) => scope.trim())
+    .filter((scope) => scope.length > 0);
+
+  if (normalized.length === 0) return [];
+  if (normalized.some((scope) => !isKnownPermission(scope))) return [];
+
+  return Array.from(new Set(normalized));
+}
+
+export function normalizeApiKeyScopes(scopes?: readonly string[]): string[] {
+  if (scopes === undefined) return [...DEFAULT_API_KEY_SCOPES];
+  if (!Array.isArray(scopes)) {
+    throw new Error('scopes must be an array of permission strings');
+  }
+
+  const normalized = Array.from(
+    new Set(scopes.map((scope) => (typeof scope === 'string' ? scope.trim() : ''))),
+  ).filter((scope) => scope.length > 0);
+
+  if (normalized.length === 0) {
+    throw new Error('scopes must include at least one permission');
+  }
+
+  const unknown = normalized.filter((scope) => !isKnownPermission(scope));
+  if (unknown.length > 0) {
+    throw new Error(`unknown API key scope: ${unknown.join(', ')}`);
+  }
+
+  return normalized;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -28,7 +66,7 @@ function generateRawKey(): string {
 /**
  * Creates a new API key. Returns the record plus the raw key (shown once).
  */
-export function createApiKey(name: string): ApiKeyCreated {
+export function createApiKey(name: string, scopes?: readonly string[]): ApiKeyCreated {
   if (!name || typeof name !== 'string' || !name.trim()) {
     throw new Error('name is required');
   }
@@ -36,6 +74,7 @@ export function createApiKey(name: string): ApiKeyCreated {
   const raw = generateRawKey();
   const id = createId();
   const now = new Date().toISOString();
+  const normalizedScopes = normalizeApiKeyScopes(scopes);
 
   const record: ApiKeyRecord = {
     id,
@@ -45,11 +84,19 @@ export function createApiKey(name: string): ApiKeyCreated {
     createdAt: now,
     rotatedAt: null,
     active: true,
+    scopes: normalizedScopes,
   };
 
   store.set(id, record);
 
-  return { id, name: record.name, key: raw, prefix: record.prefix, createdAt: now };
+  return {
+    id,
+    name: record.name,
+    key: raw,
+    prefix: record.prefix,
+    createdAt: now,
+    scopes: [...record.scopes],
+  };
 }
 
 /**
@@ -73,7 +120,14 @@ export function rotateApiKey(id: string): ApiKeyCreated {
 
   store.set(id, updated);
 
-  return { id, name: record.name, key: raw, prefix: updated.prefix, createdAt: record.createdAt };
+  return {
+    id,
+    name: record.name,
+    key: raw,
+    prefix: updated.prefix,
+    createdAt: record.createdAt,
+    scopes: [...sanitizeStoredScopes(updated.scopes)],
+  };
 }
 
 /**
@@ -90,14 +144,17 @@ export function revokeApiKey(id: string): void {
  * Returns all stored key records (hashes only — raw keys are never stored).
  */
 export function listApiKeys(): ApiKeyRecord[] {
-  return Array.from(store.values());
+  return Array.from(store.values()).map((record) => ({
+    ...record,
+    scopes: sanitizeStoredScopes(record.scopes),
+  }));
 }
 
 /**
- * Validates a raw API key against the stored hashes using constant-time comparison.
+ * Looks up a raw API key against the stored hashes using constant-time comparison.
  */
-export function isValidApiKey(rawKey: string): boolean {
-  if (!rawKey) return false;
+export function findApiKeyRecord(rawKey: string): ApiKeyRecord | undefined {
+  if (!rawKey) return undefined;
 
   const hash = sha256hex(rawKey);
   const hashBuf = Buffer.from(hash, 'hex');
@@ -107,14 +164,24 @@ export function isValidApiKey(rawKey: string): boolean {
     try {
       const storedBuf = Buffer.from(record.keyHash, 'hex');
       if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
-        return true;
+        return {
+          ...record,
+          scopes: sanitizeStoredScopes(record.scopes),
+        };
       }
     } catch {
       // length mismatch — skip
     }
   }
 
-  return false;
+  return undefined;
+}
+
+/**
+ * Validates a raw API key against the stored hashes using constant-time comparison.
+ */
+export function isValidApiKey(rawKey: string): boolean {
+  return findApiKeyRecord(rawKey) !== undefined;
 }
 
 /**

@@ -76,6 +76,13 @@ registry.registerComponent('securitySchemes', 'bearerAuth', {
   description: 'JWT issued by POST /api/auth/session',
 });
 
+registry.registerComponent('securitySchemes', 'apiKeyAuth', {
+  type: 'apiKey',
+  in: 'header',
+  name: 'x-api-key',
+  description: 'Scoped service API key. Stream writes require streams:write; stream reads require streams:read when a key is supplied.',
+});
+
 registry.registerComponent('securitySchemes', 'indexerWorkerToken', {
   type: 'apiKey',
   in: 'header',
@@ -212,7 +219,7 @@ registry.registerPath({
  */
 
 /** Cursor token schema with full semantics documented. */
-const StreamCursorToken = registry.register(
+registry.register(
   'StreamCursorToken',
   z.string().openapi({
     description:
@@ -236,9 +243,10 @@ const StreamListPage = registry.register(
       description: 'True when additional pages exist. Fetch them by passing `next_cursor`.',
       example: true,
     }),
-    next_cursor: StreamCursorToken.nullable().openapi({
+    next_cursor: z.string().nullable().openapi({
       description:
         'Cursor to pass as `cursor` on the next request. ' +
+        'Uses the same opaque format as StreamCursorToken. ' +
         'Null on the last page (has_more=false).',
       example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
     }),
@@ -291,7 +299,7 @@ registry.registerPath({
       }),
       cursor: z.string().optional().openapi({
         description:
-          'Opaque cursor from the previous page's `next_cursor`. ' +
+          "Opaque cursor from the previous page's `next_cursor`. " +
           'Omit to request the first page. ' +
           'Treated as a black box — do not construct manually.',
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
@@ -407,7 +415,7 @@ registry.registerPath({
         'Discard the cursor and restart pagination from page 1 (omit `cursor`).',
       content: {
         'application/json': {
-          schema: ErrorEnvelope,
+          schema: InvalidCursorError,
           examples: {
             invalidCursor: {
               summary: 'Invalid or expired cursor',
@@ -470,7 +478,7 @@ registry.registerPath({
   method: 'post', path: '/api/streams',
   summary: 'Create stream',
   tags: ['streams'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   request: {
     headers: z.object({ 'Idempotency-Key': z.string().openapi({ description: 'Unique key (1–128 chars) to prevent duplicate creation', example: 'my-key-001' }) }),
     body: {
@@ -503,6 +511,7 @@ registry.registerPath({
     },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
     '409': errorResponses['409'],
     '503': errorResponses['503'],
   },
@@ -512,7 +521,7 @@ registry.registerPath({
   method: 'delete', path: '/api/streams/{id}',
   summary: 'Cancel stream',
   tags: ['streams'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   request: { params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }) },
   responses: {
     '200': {
@@ -520,6 +529,7 @@ registry.registerPath({
       content: { 'application/json': { schema: successSchema(z.object({ message: z.string(), id: z.string() })) } },
     },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
     '404': errorResponses['404'],
     '409': errorResponses['409'],
     '503': errorResponses['503'],
@@ -530,6 +540,7 @@ registry.registerPath({
   method: 'patch', path: '/api/streams/{id}/status',
   summary: 'Transition stream status',
   tags: ['streams'],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   request: {
     params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }),
     body: {
@@ -545,6 +556,8 @@ registry.registerPath({
   responses: {
     '200': { description: 'Updated stream', content: { 'application/json': { schema: successSchema(StreamObject) } } },
     '400': errorResponses['400'],
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
     '404': errorResponses['404'],
     '409': errorResponses['409'],
     '503': errorResponses['503'],
@@ -645,10 +658,11 @@ registry.registerPath({
   method: 'get', path: '/api/admin/status',
   summary: 'Admin status (pause flags + reindex state)',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   responses: {
     '200': { description: 'Admin status', content: { 'application/json': { schema: z.object({ pauseFlags: z.record(z.string(), z.boolean()), reindex: z.record(z.string(), z.unknown()) }) } } },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
   },
 });
 
@@ -656,10 +670,11 @@ registry.registerPath({
   method: 'get', path: '/api/admin/pause',
   summary: 'Get pause flags',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   responses: {
     '200': { description: 'Pause flags', content: { 'application/json': { schema: z.record(z.string(), z.boolean()) } } },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
   },
 });
 
@@ -667,7 +682,7 @@ registry.registerPath({
   method: 'put', path: '/api/admin/pause',
   summary: 'Update pause flags',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   request: {
     body: {
       required: true,
@@ -694,10 +709,11 @@ registry.registerPath({
   method: 'get', path: '/api/admin/reindex',
   summary: 'Get reindex state',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   responses: {
     '200': { description: 'Reindex state', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
   },
 });
 
@@ -705,10 +721,11 @@ registry.registerPath({
   method: 'post', path: '/api/admin/reindex',
   summary: 'Trigger reindex',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   responses: {
     '202': { description: 'Reindex started', content: { 'application/json': { schema: z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) }) } } },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
     '409': errorResponses['409'],
   },
 });
@@ -717,10 +734,11 @@ registry.registerPath({
   method: 'get', path: '/api/admin/api-keys',
   summary: 'List API keys (hashes only)',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   responses: {
     '200': { description: 'API key list', content: { 'application/json': { schema: z.object({ apiKeys: z.array(z.record(z.string(), z.unknown())) }) } } },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
   },
 });
 
@@ -728,14 +746,28 @@ registry.registerPath({
   method: 'post', path: '/api/admin/api-keys',
   summary: 'Create API key',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   request: {
-    body: { required: true, content: { 'application/json': { schema: z.object({ name: z.string().openapi({ example: 'my-service' }) }) } } },
+    body: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: z.object({
+            name: z.string().openapi({ example: 'my-service' }),
+            scopes: z.array(z.string()).optional().openapi({
+              example: ['streams:read'],
+              description: 'Optional explicit permission scopes. Omit for the legacy full-scope default.',
+            }),
+          }),
+        },
+      },
+    },
   },
   responses: {
     '201': { description: 'API key created (raw key returned once)', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
   },
 });
 
@@ -743,11 +775,12 @@ registry.registerPath({
   method: 'post', path: '/api/admin/api-keys/{id}/rotate',
   summary: 'Rotate API key',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
   responses: {
     '200': { description: 'New raw key returned once', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
     '404': errorResponses['404'],
   },
 });
@@ -756,11 +789,12 @@ registry.registerPath({
   method: 'delete', path: '/api/admin/api-keys/{id}',
   summary: 'Revoke API key',
   tags: ['admin'],
-  security: [{ bearerAuth: [] }],
+  security: [{ bearerAuth: [] }, { apiKeyAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
   responses: {
     '204': { description: 'Key revoked' },
     '401': errorResponses['401'],
+    '403': errorResponses['403'],
     '404': errorResponses['404'],
   },
 });

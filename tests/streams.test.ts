@@ -36,6 +36,9 @@ vi.mock('../src/db/pool.js', () => ({
   PoolExhaustedError:  class PoolExhaustedError extends Error {
     constructor() { super('pool exhausted'); this.name = 'PoolExhaustedError'; }
   },
+  QueryTimeoutError:  class QueryTimeoutError extends Error {
+    constructor() { super('query timeout'); this.name = 'QueryTimeoutError'; }
+  },
   DuplicateEntryError: class DuplicateEntryError extends Error {
     constructor(d?: string) { super(d ?? 'duplicate'); this.name = 'DuplicateEntryError'; }
   },
@@ -788,61 +791,56 @@ describe('Stream Status Transitions', () => {
     return res.body.data as { id: string; status: string };
   }
 
+  function patchStatus(id: string, body: Record<string, unknown>) {
+    return request(app)
+      .patch(`/api/streams/${id}/status`)
+      .set('Authorization', `Bearer ${testToken}`)
+      .send(body);
+  }
+
   // ── PATCH /:id/status ────────────────────────────────────────────────────
 
   describe('PATCH /api/streams/:id/status', () => {
     it('transitions active → paused', async () => {
       const { id } = await createStream();
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'paused' });
+      const res = await patchStatus(id, { status: 'paused' });
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('paused');
     });
 
     it('transitions active → cancelled', async () => {
       const { id } = await createStream();
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'cancelled' });
+      const res = await patchStatus(id, { status: 'cancelled' });
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('cancelled');
     });
 
     it('transitions active → completed', async () => {
       const { id } = await createStream();
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'completed' });
+      const res = await patchStatus(id, { status: 'completed' });
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('completed');
     });
 
     it('transitions paused → active', async () => {
       const { id } = await createStream();
-      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'paused' });
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'active' });
+      await patchStatus(id, { status: 'paused' });
+      const res = await patchStatus(id, { status: 'active' });
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('active');
     });
 
     it('returns 409 for active → active (no-op invalid)', async () => {
       const { id } = await createStream();
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'active' });
+      const res = await patchStatus(id, { status: 'active' });
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('CONFLICT');
     });
 
     it('returns 409 when transitioning from a terminal status (completed)', async () => {
       const { id } = await createStream();
-      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'completed' });
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'active' });
+      await patchStatus(id, { status: 'completed' });
+      const res = await patchStatus(id, { status: 'active' });
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('CONFLICT');
       expect(res.body.error.message).toMatch(/completed/);
@@ -850,34 +848,29 @@ describe('Stream Status Transitions', () => {
 
     it('returns 409 when transitioning from a terminal status (cancelled)', async () => {
       const { id } = await createStream();
-      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'cancelled' });
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'active' });
+      await patchStatus(id, { status: 'cancelled' });
+      const res = await patchStatus(id, { status: 'active' });
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('CONFLICT');
     });
 
     it('returns 400 for an unknown status value', async () => {
       const { id } = await createStream();
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'unknown' });
+      const res = await patchStatus(id, { status: 'unknown' });
       expect(res.status).toBe(400);
       expect(res.body.error.code).toBe('VALIDATION_ERROR');
     });
 
     it('returns 400 when status field is missing', async () => {
       const { id } = await createStream();
-      const res = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({});
+      const res = await patchStatus(id, {});
       expect(res.status).toBe(400);
     });
 
     it('returns 404 for unknown stream id', async () => {
       const res = await request(app)
         .patch('/api/streams/nonexistent/status')
+        .set('Authorization', `Bearer ${testToken}`)
         .send({ status: 'paused' });
       expect(res.status).toBe(404);
     });
@@ -889,9 +882,7 @@ describe('Stream Status Transitions', () => {
         ratePerSecond: '0.0000116',
       });
       const { id } = res1.body.data;
-      const res2 = await request(app)
-        .patch(`/api/streams/${id}/status`)
-        .send({ status: 'paused' });
+      const res2 = await patchStatus(id, { status: 'paused' });
       expect(res2.status).toBe(200);
       // Trailing zeros are stripped by the validator on the initial POST, so
       // the stored value is the canonical "1000000" / "0.0000116".
@@ -915,7 +906,7 @@ describe('Stream Status Transitions', () => {
 
     it('returns 409 when cancelling a completed stream', async () => {
       const { id } = await createStream();
-      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'completed' });
+      await patchStatus(id, { status: 'completed' });
       const res = await request(app).delete(`/api/streams/${id}`).set('Authorization', auth);
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('CONFLICT');
@@ -931,7 +922,7 @@ describe('Stream Status Transitions', () => {
 
     it('cancels a paused stream successfully', async () => {
       const { id } = await createStream();
-      await request(app).patch(`/api/streams/${id}/status`).send({ status: 'paused' });
+      await patchStatus(id, { status: 'paused' });
       const res = await request(app).delete(`/api/streams/${id}`).set('Authorization', auth);
       expect(res.status).toBe(200);
     });

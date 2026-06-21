@@ -10,6 +10,13 @@ declare global {
     interface Request {
       /** Attached by auth middleware when a valid JWT is present. */
       user?: UserPayload;
+      /** Attached by auth middleware when a valid scoped API key is present. */
+      apiKey?: {
+        id: string;
+        name: string;
+        prefix: string;
+        scopes: string[];
+      };
       /** Attached by correlationId middleware. */
       correlationId?: string;
       /** Attached by requestIdMiddleware (errors.ts). */

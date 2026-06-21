@@ -6,9 +6,11 @@ import {
   rotateApiKey,
   revokeApiKey,
   listApiKeys,
+  findApiKeyRecord,
   isValidApiKey,
   _resetApiKeyStoreForTest,
 } from '../../src/lib/apiKey.js';
+import { DEFAULT_API_KEY_SCOPES, Permission } from '../../src/lib/permissions.js';
 
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 
@@ -64,6 +66,7 @@ describe('API Key Management', () => {
       expect(result.name).toBe('my-service');
       expect(result.id).toBeTruthy();
       expect(result.prefix).toBe(result.key.slice(0, 8));
+      expect(result.scopes).toEqual([...DEFAULT_API_KEY_SCOPES]);
     });
 
     it('stores the key as a hash (raw key not in store)', () => {
@@ -72,6 +75,18 @@ describe('API Key Management', () => {
       const record = records.find((r) => r.id === id)!;
       expect(record.keyHash).not.toBe(key);
       expect(record.keyHash).toHaveLength(64); // sha256 hex
+      expect(record.scopes).toEqual([...DEFAULT_API_KEY_SCOPES]);
+    });
+
+    it('stores explicit scopes for least-privilege keys', () => {
+      const result = createApiKey('read-only', [Permission.STREAMS_READ]);
+      expect(result.scopes).toEqual([Permission.STREAMS_READ]);
+      expect(listApiKeys()[0]!.scopes).toEqual([Permission.STREAMS_READ]);
+    });
+
+    it('rejects empty or unknown scopes', () => {
+      expect(() => createApiKey('empty', [])).toThrow('at least one permission');
+      expect(() => createApiKey('unknown', ['streams:read', 'made-up:scope'])).toThrow('unknown API key scope');
     });
 
     it('throws when name is empty', () => {
@@ -100,6 +115,13 @@ describe('API Key Management', () => {
     it('rejects empty string', () => {
       expect(isValidApiKey('')).toBe(false);
     });
+
+    it('returns the scoped key record for a matching raw key', () => {
+      const { key, id } = createApiKey('svc', [Permission.STREAMS_WRITE]);
+      const record = findApiKeyRecord(key);
+      expect(record?.id).toBe(id);
+      expect(record?.scopes).toEqual([Permission.STREAMS_WRITE]);
+    });
   });
 
   describe('rotateApiKey', () => {
@@ -117,6 +139,13 @@ describe('API Key Management', () => {
       rotateApiKey(id);
       const record = listApiKeys().find((r) => r.id === id)!;
       expect(record.rotatedAt).not.toBeNull();
+    });
+
+    it('preserves scopes while rotating the raw secret', () => {
+      const { id } = createApiKey('svc', [Permission.STREAMS_READ]);
+      const rotated = rotateApiKey(id);
+      expect(rotated.scopes).toEqual([Permission.STREAMS_READ]);
+      expect(listApiKeys().find((r) => r.id === id)!.scopes).toEqual([Permission.STREAMS_READ]);
     });
 
     it('throws for unknown id', () => {

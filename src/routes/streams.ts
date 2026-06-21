@@ -68,7 +68,13 @@ import {
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
+import {
+  authenticate,
+  Permission,
+  requireAuth,
+  requireScope,
+  requireScopeIfAuthenticated,
+} from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
@@ -95,8 +101,6 @@ import {
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
 import {
-  RedisIdempotencyStore,
-  NoOpIdempotencyStore,
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
@@ -254,32 +258,12 @@ function decodeCursor(cursor: string): StreamsCursor {
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
 
-function parseLimit(limitParam: unknown): number {
-  if (limitParam === undefined) return 50;
-  if (Array.isArray(limitParam) || typeof limitParam !== 'string' || !/^\d+$/.test(limitParam)) {
-    throw validationError('limit must be an integer between 1 and 100');
-  }
-  const n = Number.parseInt(limitParam, 10);
-  if (n < 1 || n > 100) throw validationError('limit must be an integer between 1 and 100');
-  return n;
-}
-
 function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
   if (cursorParam === undefined) return undefined;
   if (Array.isArray(cursorParam) || typeof cursorParam !== 'string' || cursorParam.trim() === '') {
     throw validationError('cursor must be a valid opaque pagination token');
   }
   return decodeCursor(cursorParam);
-}
-
-function parseIncludeTotal(includeTotalParam: unknown): boolean {
-  if (includeTotalParam === undefined) return false;
-  if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
-    throw validationError('include_total must be true or false');
-  }
-  if (includeTotalParam === 'true') return true;
-  if (includeTotalParam === 'false') return false;
-  throw validationError('include_total must be true or false');
 }
 
 // ── Body normaliser ───────────────────────────────────────────────────────────
@@ -380,23 +364,25 @@ function assertValidApiTransition(
  * @param next Express next middleware function.
  */
 export function enforceStreamScope(req: Request, res: Response, next: NextFunction): void {
-    // Check if the user is authenticated and if the role requires scoping.
-    if (!req.user || req.user.role === 'operator') {
-        // Operator role bypasses scoping checks.
-        return next();
-    }
-
-    const callerAddress = req.user.address as string | undefined;
-    if (!callerAddress) {
-        // Should not happen if authenticate middleware is working, but safe fail.
-        return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
-    }
-
-    // Attach caller address to the request object for repository consumption.
-    req.callerAddress = callerAddress;
-
-    // Move to the next handler which will use req.callerAddress
+  // Check if the user is authenticated and if the role requires scoping.
+  if (!req.user || req.user.role === 'operator') {
+    // Operator role bypasses scoping checks.
     next();
+    return;
+  }
+
+  const callerAddress = req.user.address;
+  if (!callerAddress) {
+    // Should not happen if authenticate middleware is working, but safe fail.
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    return;
+  }
+
+  // Attach caller address to the request object for repository consumption.
+  req.callerAddress = callerAddress;
+
+  // Move to the next handler which will use req.callerAddress
+  next();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -410,6 +396,8 @@ export function enforceStreamScope(req: Request, res: Response, next: NextFuncti
  */
 streamsRouter.get(
   '/',
+  authenticate,
+  requireScopeIfAuthenticated(Permission.STREAMS_READ),
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = req.id as string | undefined;
 
@@ -486,6 +474,8 @@ streamsRouter.get(
  */
 streamsRouter.head(
   '/:id',
+  authenticate,
+  requireScopeIfAuthenticated(Permission.STREAMS_READ),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     if (!id) {
@@ -522,6 +512,8 @@ streamsRouter.head(
  */
 streamsRouter.get(
   '/:id',
+  authenticate,
+  requireScopeIfAuthenticated(Permission.STREAMS_READ),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.id;
@@ -561,6 +553,7 @@ streamsRouter.post(
   '/',
   authenticate,
   requireAuth,
+  requireScope(Permission.STREAMS_WRITE),
   requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = req.id;
@@ -688,6 +681,7 @@ streamsRouter.delete(
   '/:id',
   authenticate,
   requireAuth,
+  requireScope(Permission.STREAMS_WRITE),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.id;
@@ -736,6 +730,9 @@ streamsRouter.delete(
  */
 streamsRouter.patch(
   '/:id/status',
+  authenticate,
+  requireAuth,
+  requireScope(Permission.STREAMS_WRITE),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.id;

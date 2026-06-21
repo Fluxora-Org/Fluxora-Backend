@@ -1,6 +1,7 @@
 import jwt, { type SignOptions } from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
 import { warn } from '../utils/logger.js';
+import { ROLE_PERMISSIONS } from './permissions.js';
 
 export interface UserPayload {
   address: string;
@@ -29,20 +30,7 @@ export function generateToken(payload: UserPayload): string {
   // explicit permissions in production tokens.
   const derived = { ...payload } as UserPayload;
   if (!Array.isArray(derived.permissions)) {
-    if (derived.role === 'operator') {
-      derived.permissions = [
-        'streams:read',
-        'streams:write',
-        'dlq:list',
-        'dlq:read',
-        'dlq:replay',
-        'dlq:delete',
-        'audit:read',
-      ];
-    } else {
-      // viewer or unknown role -> minimal read-only permissions
-      derived.permissions = ['streams:read'];
-    }
+    derived.permissions = [...(ROLE_PERMISSIONS[derived.role] ?? ROLE_PERMISSIONS.viewer)];
   }
 
   return jwt.sign(derived, jwtSecret, options);

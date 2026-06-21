@@ -1,7 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import request from 'supertest';
-import { app } from '../../src/app.js';
-import { resetSpecCache } from '../../src/routes/docs.js';
+import express from 'express';
+import { docsRouter, resetSpecCache } from '../../src/routes/docs.js';
+
+const app = express();
+app.use(docsRouter);
 
 beforeEach(() => {
   resetSpecCache();

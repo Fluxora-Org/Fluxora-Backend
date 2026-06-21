@@ -20,8 +20,18 @@ Roles and default permissions
 
 Middleware
 - `authenticate`: verifies JWT and validates payload with Zod (must include `permissions` array).
+- `authenticate`: also accepts `x-api-key` when no Bearer JWT is present, attaching a service principal with the key's stored scopes.
 - `requireAuth`: ensures an authenticated user exists.
 - `requirePermission(permission)`: middleware factory that ensures the caller holds the requested permission.
+- `requireScope(scope)`: same scope gate for JWT and API key principals. Missing, empty, malformed, or unknown scope sets fail closed.
+
+API key scopes
+- `ApiKeyRecord.scopes` is the authorization source for service API keys.
+- API key creation accepts an optional `scopes` array, for example `["streams:read"]`.
+- Omitting `scopes` uses the documented legacy default: all current permissions. This keeps existing keys working while new keys can be issued with least privilege.
+- Unknown or empty scopes are rejected at creation time. If a stored key ever has an empty or invalid scope set, `requireScope` denies access with `403`.
+- Public stream read routes remain anonymously readable. When a client supplies `x-api-key` on those routes, the key must include `streams:read`.
+- Stream write routes require `streams:write`; admin routes require their matching `admin:*` scope.
 
 Notes
 - Tokens without a `permissions` claim are rejected by `authenticate`.

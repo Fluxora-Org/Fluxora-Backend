@@ -14,7 +14,7 @@ type CorsResponse = {
 type CorsNext = (err?: unknown) => void;
 
 const DEFAULT_ALLOWED_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
-const DEFAULT_ALLOWED_HEADERS = 'Content-Type,Authorization,X-Correlation-ID';
+const DEFAULT_ALLOWED_HEADERS = 'Content-Type,Authorization,X-API-Key,X-Correlation-ID';
 const PREFLIGHT_MAX_AGE = '86400'; // 24 hours in seconds
 
 function parseAllowedOrigins(raw: string | undefined): Set<string> {

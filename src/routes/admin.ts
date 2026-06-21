@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
+import { Permission, requireScope } from '../middleware/auth.js';
 import {
   getPauseFlags,
   setPauseFlags,
@@ -30,7 +31,7 @@ adminRouter.use(requireAdminAuth);
  * Returns current pause flags and reindex state so operators can
  * inspect service posture at a glance.
  */
-adminRouter.get('/status', (_req, res) => {
+adminRouter.get('/status', requireScope(Permission.ADMIN_READ), (_req, res) => {
   res.json({
     pauseFlags: getPauseFlags(),
     reindex: getReindexState(),
@@ -41,7 +42,7 @@ adminRouter.get('/status', (_req, res) => {
  * GET /api/admin/pause
  * Read-only view of the current pause flags.
  */
-adminRouter.get('/pause', (_req, res) => {
+adminRouter.get('/pause', requireScope(Permission.ADMIN_PAUSE), (_req, res) => {
   res.json(getPauseFlags());
 });
 
@@ -52,7 +53,7 @@ adminRouter.get('/pause', (_req, res) => {
  * Body (all fields optional):
  *   { "streamCreation": true, "ingestion": false }
  */
-adminRouter.put('/pause', (req, res) => {
+adminRouter.put('/pause', requireScope(Permission.ADMIN_PAUSE), (req, res) => {
   const { streamCreation, ingestion } = req.body ?? {};
 
   if (streamCreation === undefined && ingestion === undefined) {
@@ -102,7 +103,7 @@ adminRouter.put('/pause', (req, res) => {
  * GET /api/admin/reindex
  * Returns the current reindex job state.
  */
-adminRouter.get('/reindex', (_req, res) => {
+adminRouter.get('/reindex', requireScope(Permission.ADMIN_REINDEX), (_req, res) => {
   res.json(getReindexState());
 });
 
@@ -110,7 +111,7 @@ adminRouter.get('/reindex', (_req, res) => {
  * POST /api/admin/reindex
  * Triggers a reindex operation. Returns 409 if one is already running.
  */
-adminRouter.post('/reindex', async (_req, res) => {
+adminRouter.post('/reindex', requireScope(Permission.ADMIN_REINDEX), async (_req, res) => {
   const current = getReindexState();
   if (current.status === 'running') {
     res.status(409).json({
@@ -137,7 +138,7 @@ adminRouter.post('/reindex', async (_req, res) => {
  * POST /api/admin/ws/disconnect
  * Forcibly closes every active WebSocket subscription for a given stream_id.
  */
-adminRouter.post('/ws/disconnect', async (req, res) => {
+adminRouter.post('/ws/disconnect', requireScope(Permission.ADMIN_PAUSE), async (req, res) => {
   const { stream_id: streamIdValue } = req.body ?? {};
 
   if (typeof streamIdValue !== 'string') {
@@ -167,7 +168,7 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
       closeCode: 4000,
       closeReason: 'admin-forced-disconnect',
     });
-  } catch (err) {
+  } catch {
     res.status(503).json({
       error: 'Unable to persist audit log entry. Try again later.',
       disconnectedCount,
@@ -188,7 +189,7 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
  * GET /api/admin/api-keys
  * Lists all API key records (hashes only — raw keys are never returned).
  */
-adminRouter.get('/api-keys', (_req, res) => {
+adminRouter.get('/api-keys', requireScope(Permission.ADMIN_API_KEYS), (_req, res) => {
   res.json({ apiKeys: listApiKeys() });
 });
 
@@ -196,16 +197,16 @@ adminRouter.get('/api-keys', (_req, res) => {
  * POST /api/admin/api-keys
  * Creates a new API key. The raw key is returned exactly once.
  *
- * Body: { "name": "my-service" }
+ * Body: { "name": "my-service", "scopes": ["streams:read"] }
  */
-adminRouter.post('/api-keys', (req, res) => {
-  const { name } = req.body ?? {};
+adminRouter.post('/api-keys', requireScope(Permission.ADMIN_API_KEYS), (req, res) => {
+  const { name, scopes } = req.body ?? {};
   if (!name || typeof name !== 'string') {
     res.status(400).json({ error: 'name (string) is required.' });
     return;
   }
   try {
-    const created = createApiKey(name);
+    const created = createApiKey(name, scopes);
     recordAuditEvent(
       'API_KEY_CREATED',
       'api_key',
@@ -214,6 +215,7 @@ adminRouter.post('/api-keys', (req, res) => {
       {
         prefix: created.prefix,
         name: created.name,
+        scopes: created.scopes,
       },
     );
     res.status(201).json(created);
@@ -227,7 +229,7 @@ adminRouter.post('/api-keys', (req, res) => {
  * Issues a new raw key for an existing key record. The old key is immediately
  * invalidated. The new raw key is returned exactly once.
  */
-adminRouter.post('/api-keys/:id/rotate', (req, res) => {
+adminRouter.post('/api-keys/:id/rotate', requireScope(Permission.ADMIN_API_KEYS), (req, res) => {
   try {
     const rotated = rotateApiKey(req.params.id);
     recordAuditEvent(
@@ -238,6 +240,7 @@ adminRouter.post('/api-keys/:id/rotate', (req, res) => {
       {
         prefix: rotated.prefix,
         name: rotated.name,
+        scopes: rotated.scopes,
       },
     );
     res.json(rotated);
@@ -252,7 +255,7 @@ adminRouter.post('/api-keys/:id/rotate', (req, res) => {
  * DELETE /api/admin/api-keys/:id
  * Revokes an API key. Revoked keys cannot authenticate requests.
  */
-adminRouter.delete('/api-keys/:id', (req, res) => {
+adminRouter.delete('/api-keys/:id', requireScope(Permission.ADMIN_API_KEYS), (req, res) => {
   try {
     revokeApiKey(req.params.id);
     recordAuditEvent(

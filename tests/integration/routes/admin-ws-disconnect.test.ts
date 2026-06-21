@@ -21,6 +21,12 @@ vi.mock('../../../src/db/pool.js', () => ({
       this.name = 'PoolExhaustedError';
     }
   },
+  QueryTimeoutError: class QueryTimeoutError extends Error {
+    constructor() {
+      super('query timeout');
+      this.name = 'QueryTimeoutError';
+    }
+  },
   DuplicateEntryError: class DuplicateEntryError extends Error {
     constructor(detail?: string) {
       super(detail ?? 'duplicate');

@@ -18,6 +18,7 @@
  */
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import request from 'supertest';
+import express from 'express';
 
 // ── Mock the repository before importing the app ──────────────────────────────
 const mockGetById        = vi.fn();
@@ -41,19 +42,26 @@ vi.mock('../../src/db/pool.js', () => ({
   PoolExhaustedError:  class PoolExhaustedError extends Error {
     constructor() { super('pool exhausted'); this.name = 'PoolExhaustedError'; }
   },
+  QueryTimeoutError:  class QueryTimeoutError extends Error {
+    constructor() { super('query timeout'); this.name = 'QueryTimeoutError'; }
+  },
   DuplicateEntryError: class DuplicateEntryError extends Error {
     constructor(d?: string) { super(d ?? 'duplicate'); this.name = 'DuplicateEntryError'; }
   },
 }));
 
-import { createApp } from '../../src/app.js';
 import {
+  streamsRouter,
   _resetStreams,
+  resetStreamIdempotencyStore,
   setStreamListingDependencyState,
   setIdempotencyDependencyState,
 } from '../../src/routes/streams.js';
+import { errorHandler } from '../../src/middleware/errorHandler.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
+import { createApiKey, _resetApiKeyStoreForTest } from '../../src/lib/apiKey.js';
+import { Permission } from '../../src/lib/permissions.js';
 
 // Initialize config before importing anything that needs it
 initializeConfig();
@@ -65,7 +73,10 @@ const VALID_RECIPIENT = 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUX
 
 const TEST_TOKEN = generateToken({ address: VALID_SENDER, role: 'operator' });
 
-const app = createApp();
+const app = express();
+app.use(express.json());
+app.use('/api/streams', streamsRouter);
+app.use(errorHandler);
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -119,6 +130,8 @@ describe('streams routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     _resetStreams();
+    resetStreamIdempotencyStore();
+    _resetApiKeyStoreForTest();
     setStreamListingDependencyState('healthy');
     setIdempotencyDependencyState('healthy');
 
@@ -591,6 +604,59 @@ describe('streams routes', () => {
 
   // ── DELETE /api/streams/:id ───────────────────────────────────────────────
 
+  describe('API key scope enforcement', () => {
+    it('allows a read-scoped API key to list streams', async () => {
+      const { key } = createApiKey('reader', [Permission.STREAMS_READ]);
+      mockFindWithCursor.mockResolvedValue({ streams: [makeDbRecord()], hasMore: false });
+
+      const res = await request(app)
+        .get('/api/streams')
+        .set('x-api-key', key);
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.streams).toHaveLength(1);
+    });
+
+    it('blocks a read-scoped API key from creating streams', async () => {
+      const { key } = createApiKey('reader', [Permission.STREAMS_READ]);
+
+      const res = await request(app)
+        .post('/api/streams')
+        .set('x-api-key', key)
+        .set('Idempotency-Key', uniqueKey('read-only-write'))
+        .send(validBody);
+
+      expect(res.status).toBe(403);
+      expect(res.body.error.code).toBe('FORBIDDEN');
+      expect(mockUpsertStream).not.toHaveBeenCalled();
+    });
+
+    it('allows a write-scoped API key to create streams', async () => {
+      const { key } = createApiKey('writer', [Permission.STREAMS_WRITE]);
+
+      const res = await request(app)
+        .post('/api/streams')
+        .set('x-api-key', key)
+        .set('Idempotency-Key', uniqueKey('write-key'))
+        .send(validBody);
+
+      expect(res.status).toBe(201);
+      expect(mockUpsertStream).toHaveBeenCalledTimes(1);
+    });
+
+    it('blocks a write-only API key from reading streams', async () => {
+      const { key } = createApiKey('writer', [Permission.STREAMS_WRITE]);
+
+      const res = await request(app)
+        .get('/api/streams')
+        .set('x-api-key', key);
+
+      expect(res.status).toBe(403);
+      expect(res.body.error.code).toBe('FORBIDDEN');
+      expect(mockFindWithCursor).not.toHaveBeenCalled();
+    });
+  });
+
   describe('DELETE /api/streams/:id', () => {
     it('cancels an active stream', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'active' }));
@@ -643,7 +709,10 @@ describe('streams routes', () => {
     it('transitions active → paused', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'active' }));
       mockUpdateStream.mockResolvedValue(makeDbRecord({ status: 'paused' }));
-      const res = await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'paused' });
+      const res = await request(app)
+        .patch('/api/streams/stream-abc-0/status')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ status: 'paused' });
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('paused');
     });
@@ -651,35 +720,53 @@ describe('streams routes', () => {
     it('transitions paused → active', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'paused' }));
       mockUpdateStream.mockResolvedValue(makeDbRecord({ status: 'active' }));
-      const res = await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'active' });
+      const res = await request(app)
+        .patch('/api/streams/stream-abc-0/status')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ status: 'active' });
       expect(res.status).toBe(200);
     });
 
     it('returns 409 for invalid transition: completed → active', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'completed' }));
-      const res = await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'active' });
+      const res = await request(app)
+        .patch('/api/streams/stream-abc-0/status')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ status: 'active' });
       expect(res.status).toBe(409);
       expect(res.body.error.code).toBe('CONFLICT');
     });
 
     it('returns 409 for invalid transition: cancelled → paused', async () => {
       mockGetById.mockResolvedValue(makeDbRecord({ status: 'cancelled' }));
-      expect((await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'paused' })).status).toBe(409);
+      expect((await request(app)
+        .patch('/api/streams/stream-abc-0/status')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ status: 'paused' })).status).toBe(409);
     });
 
     it('returns 400 for unknown status value', async () => {
-      expect((await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'unknown-status' })).status).toBe(400);
+      expect((await request(app)
+        .patch('/api/streams/stream-abc-0/status')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ status: 'unknown-status' })).status).toBe(400);
     });
 
     it('returns 404 when stream not found', async () => {
       mockGetById.mockResolvedValue(undefined);
-      expect((await request(app).patch('/api/streams/stream-nonexistent/status').send({ status: 'paused' })).status).toBe(404);
+      expect((await request(app)
+        .patch('/api/streams/stream-nonexistent/status')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ status: 'paused' })).status).toBe(404);
     });
 
     it('returns 503 when pool is exhausted', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockGetById.mockRejectedValue(new PoolExhaustedError());
-      expect((await request(app).patch('/api/streams/stream-abc-0/status').send({ status: 'paused' })).status).toBe(503);
+      expect((await request(app)
+        .patch('/api/streams/stream-abc-0/status')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ status: 'paused' })).status).toBe(503);
     });
   });
 

@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Request, Response, NextFunction } from 'express';
-import { authenticate, requireAuth, requirePermission, Permission } from '../../../src/middleware/auth.js';
+import { authenticate, requireAuth, requirePermission, requireScope, Permission } from '../../../src/middleware/auth.js';
 import { verifyToken } from '../../../src/lib/auth.js';
 import { isRevoked } from '../../../src/redis/jwtRevocationStore.js';
+import { createApiKey, _resetApiKeyStoreForTest } from '../../../src/lib/apiKey.js';
 
 // ── Mocks ──
 
@@ -22,9 +23,12 @@ vi.mock('../../../src/utils/logger.js', () => ({
 
 // ── Helpers ──
 
-function mockReq(opts: { authHeader?: string; id?: string } = {}): Partial<Request> {
+function mockReq(opts: { authHeader?: string; id?: string; apiKey?: string } = {}): Partial<Request> {
+  const headers: Record<string, string> = {};
+  if (opts.authHeader) headers.authorization = opts.authHeader;
+  if (opts.apiKey) headers['x-api-key'] = opts.apiKey;
   return {
-    headers: opts.authHeader ? { authorization: opts.authHeader } : {},
+    headers,
     id: opts.id ?? 'req-123',
     correlationId: opts.id ?? 'req-123',
   };
@@ -55,6 +59,7 @@ function mockNext(): NextFunction {
 describe('authenticate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    _resetApiKeyStoreForTest();
   });
 
   // ── Happy path ──
@@ -90,6 +95,59 @@ describe('authenticate', () => {
     expect(next).toHaveBeenCalled();
     expect(req.user).toBeUndefined();
     expect(verifyToken).not.toHaveBeenCalled();
+  });
+
+  it('authenticates a valid API key and attaches its scopes', async () => {
+    const { key, id } = createApiKey('svc', [Permission.STREAMS_READ]);
+    const req = mockReq({ apiKey: key }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(req.user).toEqual(expect.objectContaining({
+      address: `api-key:${id}`,
+      role: 'service',
+      permissions: [Permission.STREAMS_READ],
+    }));
+    expect(req.apiKey).toEqual(expect.objectContaining({
+      id,
+      scopes: [Permission.STREAMS_READ],
+    }));
+    expect(verifyToken).not.toHaveBeenCalled();
+  });
+
+  it('returns 401 for an invalid API key', async () => {
+    const req = mockReq({ apiKey: 'flx_invalid' }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    expect(res.statusCode).toBe(401);
+    expect((res as any).jsonBody.error.code).toBe('UNAUTHORIZED');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('prefers a valid Bearer JWT when both JWT and API key are present', async () => {
+    const payload = {
+      address: 'GABC...',
+      role: 'operator',
+      permissions: [Permission.STREAMS_WRITE],
+    };
+    const { key } = createApiKey('svc', [Permission.STREAMS_READ]);
+    (verifyToken as any).mockReturnValue(payload);
+
+    const req = mockReq({ authHeader: 'Bearer valid-token', apiKey: key }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(req.user).toEqual(expect.objectContaining(payload));
+    expect(req.apiKey).toBeUndefined();
   });
 
   // ── Revocation checks ──
@@ -276,6 +334,22 @@ describe('requirePermission', () => {
     requirePermission(Permission.STREAMS_READ)(req, res, next);
 
     expect(res.statusCode).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('requireScope', () => {
+  it('fails closed for an empty scope set', () => {
+    const req = {
+      user: { permissions: [] },
+    } as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope(Permission.STREAMS_READ)(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect((res as any).jsonBody.error.details.requiredScope).toBe(Permission.STREAMS_READ);
     expect(next).not.toHaveBeenCalled();
   });
 });

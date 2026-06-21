@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
-import { app } from '../../src/app.js';
-import { _resetApiKeyStoreForTest } from '../../src/lib/apiKey.js';
+import express from 'express';
+import { adminRouter } from '../../src/routes/admin.js';
+import { createApiKey, _resetApiKeyStoreForTest } from '../../src/lib/apiKey.js';
+import { DEFAULT_API_KEY_SCOPES, Permission } from '../../src/lib/permissions.js';
+
+const app = express();
+app.use(express.json());
+app.use('/api/admin', adminRouter);
 
 const ADMIN_KEY = 'test-admin-key-for-apikey-routes';
 
@@ -57,6 +63,36 @@ describe('admin API key routes', () => {
     expect(res.body.name).toBe('service-a');
     expect(res.body).toHaveProperty('key'); // Raw key should be returned
     expect(res.body.key).toMatch(/^flx_/);
+    expect(res.body.scopes).toEqual([...DEFAULT_API_KEY_SCOPES]);
+  });
+
+  it('creates a least-privilege API key with explicit scopes', async () => {
+    const res = await authed(
+      request(app)
+        .post('/api/admin/api-keys')
+        .send({ name: 'read-only', scopes: [Permission.STREAMS_READ] })
+    );
+    expect(res.status).toBe(201);
+    expect(res.body.scopes).toEqual([Permission.STREAMS_READ]);
+
+    const listRes = await authed(request(app).get('/api/admin/api-keys'));
+    expect(listRes.body.apiKeys[0].scopes).toEqual([Permission.STREAMS_READ]);
+  });
+
+  it('rejects empty and unknown scopes with 400', async () => {
+    const emptyRes = await authed(
+      request(app)
+        .post('/api/admin/api-keys')
+        .send({ name: 'empty-scopes', scopes: [] })
+    );
+    expect(emptyRes.status).toBe(400);
+
+    const unknownRes = await authed(
+      request(app)
+        .post('/api/admin/api-keys')
+        .send({ name: 'bad-scope', scopes: ['streams:read', 'unknown:scope'] })
+    );
+    expect(unknownRes.status).toBe(400);
   });
 
   it('rejects creation when name is missing or invalid with 400', async () => {
@@ -84,6 +120,27 @@ describe('admin API key routes', () => {
     expect(res.body.apiKeys[0].name).toBe('service-a');
     expect(res.body.apiKeys[0]).not.toHaveProperty('key'); // Raw key must never be listed
     expect(res.body.apiKeys[0]).toHaveProperty('keyHash');
+    expect(res.body.apiKeys[0].scopes).toEqual([...DEFAULT_API_KEY_SCOPES]);
+  });
+
+  it('allows admin API-key credentials only for matching admin scopes', async () => {
+    const { key: pauseKey } = createApiKey('pause-admin', [Permission.ADMIN_PAUSE]);
+    const pauseRes = await request(app)
+      .get('/api/admin/pause')
+      .set('x-api-key', pauseKey);
+    expect(pauseRes.status).toBe(200);
+
+    const apiKeysRes = await request(app)
+      .get('/api/admin/api-keys')
+      .set('x-api-key', pauseKey);
+    expect(apiKeysRes.status).toBe(403);
+    expect(apiKeysRes.body.error.code).toBe('FORBIDDEN');
+
+    const { key: keyAdmin } = createApiKey('key-admin', [Permission.ADMIN_API_KEYS]);
+    const listRes = await request(app)
+      .get('/api/admin/api-keys')
+      .set('x-api-key', keyAdmin);
+    expect(listRes.status).toBe(200);
   });
 
   // 5. authenticated API-key deletion

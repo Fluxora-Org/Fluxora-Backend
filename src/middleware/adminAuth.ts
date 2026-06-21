@@ -1,4 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
+import { findApiKeyRecord, getApiKeyFromRequest } from '../lib/apiKey.js';
+import { DEFAULT_API_KEY_SCOPES } from '../lib/permissions.js';
 
 /**
  * Middleware that gates admin routes behind a Bearer token.
@@ -9,6 +11,28 @@ import type { Request, Response, NextFunction } from 'express';
  */
 export function requireAdminAuth(req: Request, res: Response, next: NextFunction): void {
   const adminKey = process.env.ADMIN_API_KEY;
+  const rawApiKey = getApiKeyFromRequest(req.headers);
+
+  if (rawApiKey) {
+    const record = findApiKeyRecord(rawApiKey);
+    if (!record) {
+      res.status(401).json({ error: 'Invalid API key.' });
+      return;
+    }
+    req.user = {
+      address: `api-key:${record.id}`,
+      role: 'service',
+      permissions: record.scopes,
+    };
+    req.apiKey = {
+      id: record.id,
+      name: record.name,
+      prefix: record.prefix,
+      scopes: record.scopes,
+    };
+    next();
+    return;
+  }
 
   if (!adminKey) {
     res.status(503).json({
@@ -41,6 +65,11 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
     return;
   }
 
+  req.user = {
+    address: 'admin-api-key',
+    role: 'admin',
+    permissions: [...DEFAULT_API_KEY_SCOPES],
+  };
   next();
 }
 

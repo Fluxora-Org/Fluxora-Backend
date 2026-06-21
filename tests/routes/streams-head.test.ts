@@ -22,6 +22,9 @@ vi.mock('../../src/db/pool.js', () => ({
   PoolExhaustedError: class PoolExhaustedError extends Error {
     constructor() { super('pool exhausted'); this.name = 'PoolExhaustedError'; }
   },
+  QueryTimeoutError: class QueryTimeoutError extends Error {
+    constructor() { super('query timeout'); this.name = 'QueryTimeoutError'; }
+  },
 }));
 
 import { streamsRouter } from '../../src/routes/streams.js';
