@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const originalEnv = process.env;
+const TESTNET_CONTRACT = 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC';
+const TESTNET_TOKEN = 'CBFFW3D5R2P3BQOS4P2AKFRHHBEVU234RWPK7QGR4LZQIFJGG5EFTAK6';
 
 function validEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
@@ -8,6 +10,9 @@ function validEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     DATABASE_URL: 'postgresql://localhost/fluxora_test',
     JWT_SECRET: 'a-very-long-secret-key-for-testing-only-12345',
     INDEXER_WORKER_TOKEN: 'indexer-worker-token-for-testing-only-12345',
+    STELLAR_NETWORK: 'testnet',
+    STELLAR_CONTRACT_ADDRESS: TESTNET_CONTRACT,
+    STELLAR_TOKEN_ADDRESS: TESTNET_TOKEN,
     ...overrides,
   };
 }
@@ -60,6 +65,22 @@ describe('EnvSchema startup validation', () => {
     expect(config.redisEnabled).toBe(true);
     expect(config.maxRequestSizeBytes).toBe(1024 * 1024);
     expect(config.webhookPollIntervalMs).toBe(10000);
+    expect(config.replicaMaxLagSeconds).toBe(30);
+  });
+
+  it('validates and exposes the replica lag failover threshold', async () => {
+    const { loadConfig } = await importEnvWith(validEnv({ REPLICA_MAX_LAG_SECONDS: '45' }));
+
+    const config = loadConfig();
+
+    expect(config.replicaMaxLagSeconds).toBe(45);
+  });
+
+  it('rejects negative replica lag thresholds', async () => {
+    await expect(importEnvWith(validEnv({ REPLICA_MAX_LAG_SECONDS: '-1' }))).rejects.toMatchObject({
+      name: 'EnvironmentError',
+      message: expect.stringContaining('REPLICA_MAX_LAG_SECONDS'),
+    });
   });
 
   it('does not include secret values in validation messages', async () => {

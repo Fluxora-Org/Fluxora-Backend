@@ -15,6 +15,8 @@ Fluxora Backend uses a `pg.Pool` (node-postgres) for all database access. The po
 | `DB_IDLE_TIMEOUT` | `30000` | ms before an idle connection is closed |
 | `POOL_QUEUE_LIMIT` | `50` | Max requests allowed to queue before fast-failing with 503 |
 | `STATEMENT_TIMEOUT_MS` | `5000` | Per-connection statement timeout in ms. Set to `0` to disable. |
+| `DATABASE_REPLICA_URL` | unset | Optional read-replica connection string for stream read queries |
+| `REPLICA_MAX_LAG_SECONDS` | `30` | Max tolerated replica replay lag before reads fall back to primary |
 
 ## Statement Timeout
 
@@ -118,6 +120,14 @@ Gauges are updated on every `connect`, `acquire`, and `remove` pool event.
 | `acquire` | Connection checked out | Sync gauges |
 | `remove` | Connection closed/removed | Sync gauges, debug log |
 | `error` | Idle client error | Error log |
+
+## Read Replica Lag Failover
+
+When `DATABASE_REPLICA_URL` is set, stream read queries use a dedicated read-only replica pool. Before serving each read, the pool probes `pg_last_xact_replay_timestamp()` and computes replay lag in seconds. If the lag is unknown, the probe fails, or lag is greater than `REPLICA_MAX_LAG_SECONDS`, that read falls back to the primary pool.
+
+Fallback is reversible. Later reads probe the replica again, so traffic returns to the replica once lag drops below the threshold. The probe does not log the replica URL or credentials.
+
+Prometheus exposes `fluxora_db_replica_lag_seconds` as the last observed lag value. The metric has no host or URL labels to avoid leaking topology details.
 
 ## Caller Behaviour
 

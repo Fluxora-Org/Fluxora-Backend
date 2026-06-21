@@ -59,6 +59,14 @@ export const dbPoolExhaustedTotal =
     registers: [registry],
   });
 
+export const dbReplicaLagSeconds =
+  (registry.getSingleMetric('fluxora_db_replica_lag_seconds') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_db_replica_lag_seconds',
+    help: 'Last observed read-replica replay lag in seconds; 0 when reads use primary or the replica is current',
+    registers: [registry],
+  });
+
 export function deRegisterDbMetrics(): void {
   registry.removeSingleMetric('fluxora_db_query_duration_seconds');
   registry.removeSingleMetric('fluxora_db_slow_queries_total');
@@ -66,4 +74,5 @@ export function deRegisterDbMetrics(): void {
   registry.removeSingleMetric('fluxora_db_pool_idle_connections');
   registry.removeSingleMetric('fluxora_db_pool_waiting_requests');
   registry.removeSingleMetric('fluxora_db_pool_exhausted_total');
+  registry.removeSingleMetric('fluxora_db_replica_lag_seconds');
 }

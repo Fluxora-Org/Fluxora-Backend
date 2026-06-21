@@ -3,7 +3,6 @@ import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from '.
 import {
   getPinnedAddressNetwork,
   isValidStellarContractAddress,
-  STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
   type PinnedStellarAddressKind,
   type PinnedStellarNetwork,
@@ -165,6 +164,7 @@ export const EnvSchema = z.object({
 
   DATABASE_URL: urlString('DATABASE_URL'),
   DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
+  REPLICA_MAX_LAG_SECONDS: integerEnv('REPLICA_MAX_LAG_SECONDS', 0).default(30),
   DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
   DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
   DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
@@ -307,6 +307,7 @@ export interface Config {
   /** Optional read-replica connection string. When set, SELECT queries on
    *  streams are routed through a dedicated replica pool. */
   databaseReplicaUrl?: string | undefined;
+  replicaMaxLagSeconds: number;
   databasePoolMin: number;
   databasePoolMax: number;
   databaseConnectionTimeout: number;
@@ -448,6 +449,7 @@ function toConfig(env: ParsedEnv): Config {
 
     databaseUrl: env.DATABASE_URL,
     databaseReplicaUrl: env.DATABASE_REPLICA_URL,
+    replicaMaxLagSeconds: env.REPLICA_MAX_LAG_SECONDS,
     databasePoolMin: env.DB_POOL_MIN,
     databasePoolMax: env.DB_POOL_MAX,
     databaseConnectionTimeout: env.DB_CONNECTION_TIMEOUT,

@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import pg from 'pg';
+import { dbReplicaLagSeconds } from '../../src/metrics/dbMetrics.js';
 
 // ── Mock the pg module ────────────────────────────────────────────────────────
 
@@ -114,19 +115,45 @@ describe('replicaPool', () => {
   // ── checkReplicaHealth ────────────────────────────────────────────────────
 
   describe('checkReplicaHealth', () => {
-    it('returns true when SELECT 1 succeeds', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+    it('returns healthy when replica lag is within the threshold', async () => {
+      process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: '2.5' }] });
       const pool = new pg.Pool();
       const healthy = await checkReplicaHealth(pool);
-      expect(healthy).toBe(true);
-      expect(mockQuery).toHaveBeenCalledWith('SELECT 1');
+      expect(healthy).toEqual({ healthy: true, lagSeconds: 2.5 });
+      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('pg_last_xact_replay_timestamp()'));
     });
 
-    it('returns false when SELECT 1 throws', async () => {
+    it('returns stale when replica lag exceeds the threshold', async () => {
+      process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: '31' }] });
+      const pool = new pg.Pool();
+      const health = await checkReplicaHealth(pool);
+      expect(health).toEqual({ healthy: false, lagSeconds: 31, reason: 'lag_exceeded' });
+    });
+
+    it('returns unhealthy when replica lag cannot be determined', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: null }] });
+      const pool = new pg.Pool();
+      const health = await checkReplicaHealth(pool);
+      expect(health).toEqual({ healthy: false, lagSeconds: 0, reason: 'lag_unknown' });
+    });
+
+    it('returns unhealthy when the lag probe throws', async () => {
       mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
       const pool = new pg.Pool();
-      const healthy = await checkReplicaHealth(pool);
-      expect(healthy).toBe(false);
+      const health = await checkReplicaHealth(pool);
+      expect(health).toEqual({ healthy: false, lagSeconds: 0, reason: 'query_failed' });
+    });
+
+    it('updates the replica lag metric without exposing topology labels', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: '7' }] });
+      const pool = new pg.Pool();
+      await checkReplicaHealth(pool);
+
+      const metric = await dbReplicaLagSeconds.get();
+      expect(metric.values[0]?.value).toBe(7);
+      expect(metric.values[0]?.labels).toEqual({});
     });
   });
 
@@ -134,7 +161,7 @@ describe('replicaPool', () => {
 
   describe('createReplicaPool', () => {
     it('creates a pool and registers a connect handler for read-only mode', () => {
-      const pool = createReplicaPool({
+      createReplicaPool({
         connectionString: 'postgresql://replica:5432/fluxora',
         min: 1,
         max: 5,
@@ -187,7 +214,7 @@ describe('replicaPool', () => {
 
     it('returns the replica pool when DATABASE_REPLICA_URL is set and replica is healthy', async () => {
       process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
-      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: '0.2' }] });
 
       const pool = await getReadPool();
       // Should NOT be the primary pool
@@ -202,15 +229,29 @@ describe('replicaPool', () => {
       expect(pool).toBe(mockPrimaryPool);
     });
 
-    it('caches the result after the first call (healthy replica)', async () => {
+    it('falls back to primary when replica lag is above the threshold', async () => {
       process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
-      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: '120' }] });
 
-      const pool1 = await getReadPool();
-      const pool2 = await getReadPool();
-      expect(pool1).toBe(pool2);
-      // SELECT 1 should only be called once (health-check)
-      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const pool = await getReadPool();
+      expect(pool).toBe(mockPrimaryPool);
+      expect(mockEnd).not.toHaveBeenCalled();
+    });
+
+    it('rechecks lag on later reads so stale fallback is reversible', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ lag_seconds: '90' }] })
+        .mockResolvedValueOnce({ rows: [{ lag_seconds: '1' }] });
+
+      const first = await getReadPool();
+      const second = await getReadPool();
+
+      expect(first).toBe(mockPrimaryPool);
+      expect(second).not.toBe(mockPrimaryPool);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
     });
 
     it('caches the result after the first call (no replica URL)', async () => {
@@ -222,12 +263,12 @@ describe('replicaPool', () => {
       expect(pool1).toBe(mockPrimaryPool);
     });
 
-    it('closes the replica pool on health-check failure before falling back', async () => {
+    it('keeps the replica pool available after temporary health-check failure', async () => {
       process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
       mockQuery.mockRejectedValueOnce(new Error('ECONNREFUSED'));
 
       await getReadPool();
-      expect(mockEnd).toHaveBeenCalled();
+      expect(mockEnd).not.toHaveBeenCalled();
     });
   });
 
@@ -243,7 +284,7 @@ describe('replicaPool', () => {
 
       // Now set the replica URL
       process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
-      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: '0' }] });
 
       const pool2 = await getReadPool();
       expect(pool2).not.toBe(mockPrimaryPool);

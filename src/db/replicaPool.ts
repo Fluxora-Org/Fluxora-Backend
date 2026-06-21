@@ -22,16 +22,30 @@
 
 import pg from 'pg';
 import { logger } from '../lib/logger.js';
-import { getPool, createPool, resolvePoolConfig } from './pool.js';
+import { getPool, resolvePoolConfig } from './pool.js';
 import type { PoolConfig } from './pool.js';
+import { dbReplicaLagSeconds } from '../metrics/dbMetrics.js';
 
 const { Pool } = pg;
+const DEFAULT_REPLICA_MAX_LAG_SECONDS = 30;
 
 // ── Internal state ────────────────────────────────────────────────────────────
 
 let _replicaPool: pg.Pool | null = null;
-let _replicaHealthy = false;
 let _healthCheckDone = false;
+
+export interface ReplicaHealth {
+  healthy: boolean;
+  lagSeconds: number;
+  reason?: 'query_failed' | 'lag_unknown' | 'lag_exceeded';
+}
+
+function replicaMaxLagSeconds(): number {
+  const raw = process.env['REPLICA_MAX_LAG_SECONDS'];
+  if (raw === undefined || raw.trim() === '') return DEFAULT_REPLICA_MAX_LAG_SECONDS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_REPLICA_MAX_LAG_SECONDS;
+}
 
 /**
  * Extract hostname from a connection string for safe logging.
@@ -104,23 +118,51 @@ export function createReplicaPool(config?: PoolConfig): pg.Pool {
 // ── Health check ──────────────────────────────────────────────────────────────
 
 /**
- * Run a lightweight health-check query (`SELECT 1`) against the replica pool.
- * Returns `true` when the replica is reachable, `false` otherwise.
+ * Check replica connectivity and replay freshness.
  *
- * The check is deliberately simple — it validates TCP connectivity and basic
- * query execution rather than replication lag (which depends on deployment
- * topology and is better monitored externally).
+ * `pg_last_xact_replay_timestamp()` is NULL on a primary or when the replica has
+ * not replayed a transaction yet. For an explicitly configured read-replica,
+ * that is treated as unknown freshness and reads fall back to the primary.
  */
-export async function checkReplicaHealth(pool: pg.Pool): Promise<boolean> {
+export async function checkReplicaHealth(pool: pg.Pool): Promise<ReplicaHealth> {
+  const maxLagSeconds = replicaMaxLagSeconds();
+
   try {
-    await pool.query('SELECT 1');
-    return true;
+    const result = await pool.query<{ lag_seconds: number | string | null }>(
+      `
+        SELECT EXTRACT(
+          EPOCH FROM now() - pg_last_xact_replay_timestamp()
+        ) AS lag_seconds
+      `,
+    );
+    const rawLag = result.rows[0]?.lag_seconds;
+    const lagSeconds = rawLag === null || rawLag === undefined ? Number.NaN : Number(rawLag);
+
+    if (!Number.isFinite(lagSeconds)) {
+      dbReplicaLagSeconds.set(0);
+      logger.warn('Replica health-check could not determine replication lag; falling back to primary');
+      return { healthy: false, lagSeconds: 0, reason: 'lag_unknown' };
+    }
+
+    const normalizedLag = Math.max(0, lagSeconds);
+    dbReplicaLagSeconds.set(normalizedLag);
+
+    if (normalizedLag > maxLagSeconds) {
+      logger.warn('Replica lag exceeds threshold; falling back to primary', undefined, {
+        lagSeconds: normalizedLag,
+        maxLagSeconds,
+      });
+      return { healthy: false, lagSeconds: normalizedLag, reason: 'lag_exceeded' };
+    }
+
+    return { healthy: true, lagSeconds: normalizedLag };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    logger.warn('Replica health-check failed — falling back to primary', undefined, {
+    dbReplicaLagSeconds.set(0);
+    logger.warn('Replica health-check failed; falling back to primary', undefined, {
       error: message,
     });
-    return false;
+    return { healthy: false, lagSeconds: 0, reason: 'query_failed' };
   }
 }
 
@@ -141,32 +183,30 @@ export async function checkReplicaHealth(pool: pg.Pool): Promise<boolean> {
  */
 export async function getReadPool(): Promise<pg.Pool> {
   // Fast path: already resolved.
-  if (_healthCheckDone) {
-    return _replicaHealthy && _replicaPool ? _replicaPool : getPool();
+  if (_healthCheckDone && !_replicaPool) {
+    return getPool();
   }
 
   const cfg = resolveReplicaPoolConfig();
   if (!cfg) {
     logger.info('DATABASE_REPLICA_URL not set — reads will use the primary pool');
     _healthCheckDone = true;
-    _replicaHealthy = false;
+    dbReplicaLagSeconds.set(0);
     return getPool();
   }
 
-  _replicaPool = createReplicaPool(cfg);
-  _replicaHealthy = await checkReplicaHealth(_replicaPool);
+  _replicaPool ??= createReplicaPool(cfg);
+  const health = await checkReplicaHealth(_replicaPool);
   _healthCheckDone = true;
 
-  if (_replicaHealthy) {
+  if (health.healthy) {
     logger.info('Read-replica pool initialised', undefined, {
       host: safeHostname(cfg.connectionString),
+      lagSeconds: health.lagSeconds,
     });
     return _replicaPool;
   }
 
-  // Replica unreachable — close its pool and fall back.
-  await _replicaPool.end().catch(() => {});
-  _replicaPool = null;
   return getPool();
 }
 
@@ -175,13 +215,12 @@ export async function getReadPool(): Promise<pg.Pool> {
 /** Reset internal state (for tests only). */
 export function resetReplicaPool(): void {
   _replicaPool = null;
-  _replicaHealthy = false;
   _healthCheckDone = false;
+  dbReplicaLagSeconds.set(0);
 }
 
 /** Replace the singleton replica pool (for tests only). */
 export function setReplicaPool(pool: pg.Pool | null, healthy = true): void {
   _replicaPool = pool;
-  _replicaHealthy = healthy;
-  _healthCheckDone = true;
+  _healthCheckDone = !healthy || pool === null;
 }
