@@ -52,6 +52,7 @@ import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
 import {
+  compareDecimalStringToZero,
   validateDecimalString,
   validateAmountFields,
 } from '../serialization/decimal.js';
@@ -82,6 +83,7 @@ import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
+import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 import {
   eventMatchesStreamId,
@@ -312,13 +314,13 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
 
   const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && parseFloat(validatedDeposit) <= 0) {
+  if (depositAmount !== undefined && compareDecimalStringToZero(validatedDeposit) <= 0) {
     throw validationError('depositAmount must be greater than zero');
   }
 
   const rateResult = validateDecimalString(ratePerSecond ?? '0', 'ratePerSecond');
   const validatedRate = rateResult.valid && rateResult.value ? rateResult.value : '0';
-  if (ratePerSecond !== undefined && parseFloat(validatedRate) < 0) {
+  if (ratePerSecond !== undefined && compareDecimalStringToZero(validatedRate) < 0) {
     throw validationError('ratePerSecond cannot be negative');
   }
 
@@ -971,8 +973,10 @@ streamsRouter.get(
       throw err;
     }
 
-    // Send connection ok comment.
-    if (!writeSse(': ok\n\n')) return;
+    // Send connection ok comment + retry hint so browser EventSource knows the
+    // reconnect interval (ms). This is the SSE-spec mechanism for communicating
+    // the backoff to the client.
+    if (!writeSse(': ok\n\nretry: 5000\n\n')) return;
 
     // Periodic heartbeat to prevent proxies and load balancers from closing the connection.
     heartbeatInterval = setInterval(() => {
@@ -992,13 +996,25 @@ streamsRouter.get(
     maxDurationTimer.unref?.();
 
     // 5. Handle Last-Event-ID Resumption Replay.
-    const lastEventId = req.headers['last-event-id'];
-    if (typeof lastEventId === 'string' && lastEventId.trim() !== '') {
+    // Security: validate the header value to prevent unbounded replay or injection.
+    // A valid event ID is 1–200 printable non-whitespace characters.
+    const rawLastEventId = req.headers['last-event-id'];
+    const lastEventId =
+      typeof rawLastEventId === 'string' &&
+      /^[\x21-\x7E]{1,200}$/.test(rawLastEventId.trim())
+        ? rawLastEventId.trim()
+        : undefined;
+
+    if (lastEventId) {
       const hub = getStreamHub();
       const eventStore = hub?.getEventStore();
       if (eventStore) {
         try {
-          let cursor: string | undefined = lastEventId.trim();
+          let cursor: string | undefined = lastEventId;
+          // Bound the replay to at most SSE_REPLAY_MAX_PAGES pages so a
+          // client-supplied cursor cannot force a full-table scan.
+          const SSE_REPLAY_MAX_PAGES = 10;
+          let pagesRead = 0;
           do {
             if (cleanedUp) break;
             const result = await eventStore.getEvents({
@@ -1025,8 +1041,25 @@ streamsRouter.get(
             }
 
             cursor = result.nextCursor;
-          } while (cursor !== undefined && !cleanedUp);
+            pagesRead++;
+          } while (cursor !== undefined && !cleanedUp && pagesRead < SSE_REPLAY_MAX_PAGES);
         } catch (err) {
+          if (err instanceof StaleCursorError) {
+            writeSse(
+              `event: error\ndata: ${JSON.stringify({
+                code: STALE_CURSOR_ERROR_CODE,
+                message: 'Replay cursor no longer exists; resync from fromLedger',
+              })}\n\n`,
+            );
+            warn('SSE replay cursor is stale', {
+              afterEventId: err.afterEventId,
+              requestId,
+            });
+            res.end();
+            cleanup('stale_cursor');
+            return;
+          }
+
           warn('Failed to replay SSE events from store', {
             error: err instanceof Error ? err.message : String(err),
             requestId,
@@ -1059,5 +1092,3 @@ streamsRouter.get(
 );
 
 export function _resetStreams(): void {}
-
-

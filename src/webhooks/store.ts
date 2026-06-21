@@ -4,7 +4,6 @@
  */
 
 import type { WebhookDelivery, WebhookDeliveryStatus } from './types.js';
-import type { EnhancedRetryPolicy } from './retry.js';
 import { logger } from '../lib/logger.js';
 
 export interface DeadLetterQueueItem {
@@ -35,13 +34,6 @@ export interface OutboxItem {
   maxAttempts: number;
 }
 
-export interface CircuitBreakerState {
-  endpointUrl: string;
-  state: 'closed' | 'open' | 'half-open';
-  failureCount: number;
-  lastFailureTime: number;
-  nextAttemptTime: number;
-}
 
 export class WebhookDeliveryStore {
   // Main delivery storage
@@ -54,9 +46,6 @@ export class WebhookDeliveryStore {
 
   // Dead-letter queue for failed deliveries
   private deadLetterQueue: Map<string, DeadLetterQueueItem> = new Map();
-
-  // Circuit breaker state per endpoint
-  private circuitBreakers: Map<string, CircuitBreakerState> = new Map();
 
   // Metrics
   private metrics = {
@@ -261,80 +250,8 @@ export class WebhookDeliveryStore {
   }
 
   /**
-   * Get circuit breaker state for endpoint
-   */
-  getCircuitBreakerState(endpointUrl: string): CircuitBreakerState | undefined {
-    return this.circuitBreakers.get(endpointUrl);
-  }
-
-  /**
-   * Update circuit breaker state
-   */
-  updateCircuitBreakerState(
-    endpointUrl: string,
-    success: boolean,
-    policy: EnhancedRetryPolicy,
-  ): CircuitBreakerState {
-    const now = Date.now();
-    let state = this.circuitBreakers.get(endpointUrl);
-    
-    if (!state) {
-      state = {
-        endpointUrl,
-        state: 'closed',
-        failureCount: 0,
-        lastFailureTime: 0,
-        nextAttemptTime: 0,
-      };
-      this.circuitBreakers.set(endpointUrl, state);
-    }
-    
-    if (success) {
-      // Reset on success
-      state.failureCount = 0;
-      state.state = 'closed';
-    } else {
-      state.failureCount++;
-      state.lastFailureTime = now;
-      
-      // Check if we should open the circuit breaker
-      if (policy.circuitBreakerThreshold && 
-          state.failureCount >= policy.circuitBreakerThreshold) {
-        state.state = 'open';
-        state.nextAttemptTime = now + (policy.circuitBreakerResetMs || 300000); // Default 5 minutes
-      }
-    }
-    
-    return state;
-  }
-
-  /**
-   * Check if endpoint is available (circuit breaker logic)
-   */
-  isEndpointAvailable(endpointUrl: string): boolean {
-    const state = this.circuitBreakers.get(endpointUrl);
-    if (!state) return true;
-    
-    const now = Date.now();
-    
-    switch (state.state) {
-      case 'closed':
-        return true;
-      case 'open':
-        if (now >= state.nextAttemptTime) {
-          state.state = 'half-open';
-          return true;
-        }
-        return false;
-      case 'half-open':
-        return true;
-      default:
-        return true;
-    }
-  }
-
-  /**
-   * Get all pending deliveries that are ready for retry
+   * Get all pending deliveries that are ready for retry.
+   * Circuit-breaker gating is applied by {@link WebhookService.processPendingRetries}.
    */
   getPendingRetries(now: number = Date.now()): WebhookDelivery[] {
     const retries: WebhookDelivery[] = [];
@@ -342,10 +259,7 @@ export class WebhookDeliveryStore {
       if (delivery.status === 'pending') {
         const lastAttempt = delivery.attempts[delivery.attempts.length - 1];
         if (lastAttempt?.nextRetryAt && lastAttempt.nextRetryAt <= now) {
-          // Check circuit breaker
-          if (this.isEndpointAvailable(delivery.endpointUrl)) {
-            retries.push(delivery);
-          }
+          retries.push(delivery);
         }
       }
     }
@@ -437,7 +351,6 @@ export class WebhookDeliveryStore {
     this.outbox.clear();
     this.outboxPriorityQueue.clear();
     this.deadLetterQueue.clear();
-    this.circuitBreakers.clear();
     
     this.metrics = {
       totalDeliveries: 0,
@@ -460,13 +373,6 @@ export class WebhookDeliveryStore {
    */
   getAllOutboxItems(): OutboxItem[] {
     return Array.from(this.outbox.values());
-  }
-
-  /**
-   * Get all circuit breaker states (for monitoring)
-   */
-  getAllCircuitBreakerStates(): CircuitBreakerState[] {
-    return Array.from(this.circuitBreakers.values());
   }
 }
 

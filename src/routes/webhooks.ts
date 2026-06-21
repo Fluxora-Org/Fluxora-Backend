@@ -7,6 +7,7 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import { webhookService } from '../webhooks/service.js';
 import { webhookDeliveryStore } from '../webhooks/store.js';
+import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
@@ -355,20 +356,34 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
 
 /**
  * GET /api/webhooks/circuit-breakers
- * List circuit breaker states
+ * Look up Redis-backed circuit breaker state for a consumer endpoint.
  */
-webhooksRouter.get('/circuit-breakers', (req, res) => {
-  const states = webhookDeliveryStore.getAllCircuitBreakerStates();
+webhooksRouter.get('/circuit-breakers', async (req, res) => {
+  const endpointUrl = typeof req.query.endpointUrl === 'string' ? req.query.endpointUrl : undefined;
+  if (!endpointUrl) {
+    res.json({
+      total: 0,
+      states: [],
+      note: 'Provide endpointUrl query parameter to inspect Redis-backed circuit breaker state',
+    });
+    return;
+  }
+
+  const state = await getWebhookCircuitBreakerStore().getState(endpointUrl);
+  if (!state) {
+    res.json({ total: 0, states: [] });
+    return;
+  }
 
   res.json({
-    total: states.length,
-    states: states.map(state => ({
-      endpointUrl: state.endpointUrl,
+    total: 1,
+    states: [{
+      endpointUrl,
       state: state.state,
-      failureCount: state.failureCount,
-      lastFailureTime: state.lastFailureTime ? new Date(state.lastFailureTime).toISOString() : null,
-      nextAttemptTime: state.nextAttemptTime ? new Date(state.nextAttemptTime).toISOString() : null,
-    })),
+      failureCount: state.consecutiveFailures,
+      lastFailureTime: null,
+      nextAttemptTime: state.resetAt > 0 ? new Date(state.resetAt).toISOString() : null,
+    }],
   });
 });
 
@@ -376,13 +391,13 @@ webhooksRouter.get('/circuit-breakers', (req, res) => {
  * POST /api/webhooks/circuit-breakers/:endpointUrl/reset
  * Reset circuit breaker for an endpoint
  */
-webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', (req, res) => {
+webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => {
   const { endpointUrl } = req.params;
   
   // URL decode the endpoint URL
   const decodedUrl = decodeURIComponent(endpointUrl);
   
-  // This would need to be implemented in the store
+  await getWebhookCircuitBreakerStore().recordSuccess(decodedUrl, {});
   logger.info('Circuit breaker reset requested', undefined, { endpointUrl: decodedUrl });
 
   res.json({

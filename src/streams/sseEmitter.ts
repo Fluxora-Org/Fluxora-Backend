@@ -113,12 +113,32 @@ export function _resetSseSubscriptionsForTest(): void {
 }
 
 /**
+ * Derive the canonical stream ID from the chain-level identifiers used by the
+ * ingestion path.
+ *
+ * Format: `stream-{transactionHash}-{eventIndex}`
+ *
+ * This is the single source of truth for stream ID derivation. Both the SSE
+ * matching logic and the ingestion service (`streamEventService`) must import
+ * and call this helper so that the format cannot silently diverge.
+ *
+ * @param transactionHash - The Stellar transaction hash (hex string)
+ * @param eventIndex      - The zero-based event index within the transaction
+ */
+export function deriveStreamId(transactionHash: string, eventIndex: number): string {
+  return `stream-${transactionHash}-${eventIndex}`;
+}
+
+/**
  * Checks if a historical or live StreamEventRecord belongs to a specific stream ID.
  *
- * Mapping logic:
- * 1. Matches exact stream ID inside the payload under `id` or `streamId`.
- * 2. If the topic is 'stream.created', checks if the transaction hash and event index
- *    combine deterministically to form the requested stream ID: `stream-{txHash}-{eventIndex}`.
+ * Matching strategy (first match wins):
+ * 1. Explicit `id` or `streamId` field inside the event payload.
+ * 2. Canonical derivation via `deriveStreamId(event.txHash, event.eventIndex)`.
+ *
+ * Using the shared `deriveStreamId` helper guarantees that the format used here
+ * stays in sync with the ingestion path — the previous inline template literal
+ * was a divergence risk.
  */
 export function eventMatchesStreamId(event: StreamEventRecord, id: string): boolean {
   if (!event || !id) return false;
@@ -131,8 +151,7 @@ export function eventMatchesStreamId(event: StreamEventRecord, id: string): bool
   }
 
   if (event.txHash && typeof event.eventIndex === 'number') {
-    const derivedId = `stream-${event.txHash}-${event.eventIndex}`;
-    if (derivedId === id) return true;
+    if (deriveStreamId(event.txHash, event.eventIndex) === id) return true;
   }
 
   return false;

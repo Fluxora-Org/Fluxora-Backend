@@ -19,6 +19,7 @@ export enum ApiErrorCode {
   PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
   TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
+  REQUEST_TIMEOUT = 'REQUEST_TIMEOUT',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
   UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
@@ -157,6 +158,10 @@ export function payloadTooLarge(message: string, details?: unknown): ApiError {
 
 export function tooManyRequests(message: string, details?: unknown): ApiError {
   return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
+}
+
+export function requestTimeout(message: string): ApiError {
+  return new ApiError(ApiErrorCode.REQUEST_TIMEOUT, message, 408);
 }
 
 export function gatewayTimeout(message: string): ApiError {

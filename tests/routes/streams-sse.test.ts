@@ -19,6 +19,7 @@ import {
   getActiveSseConnectionCount,
 } from '../../src/streams/sseConnectionLimiter.js';
 import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
+import { StaleCursorError } from '../../src/indexer/store.js';
 
 // ── Mock the repository and Redis before importing the app ──────────────────────────────
 const mockGetById = vi.fn();
@@ -414,6 +415,33 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     });
   });
 
+  it('returns a STALE_CURSOR SSE error when Last-Event-ID was evicted', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+    mockGetEvents.mockRejectedValue(new StaleCursorError('evt-evicted'));
+
+    const resPromise = new Promise<string>((resolve) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/streams/stream-123/events',
+        headers: {
+          'Last-Event-ID': 'evt-evicted',
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+        });
+        res.on('end', () => resolve(data));
+      });
+      req.on('error', () => resolve(''));
+    });
+
+    const output = await resPromise;
+    expect(output).toContain('event: error');
+    expect(output).toContain('"code":"STALE_CURSOR"');
+  });
+
   it('streams live events via sseEventBus', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 
@@ -623,5 +651,138 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     expect(getActiveSseConnectionCount()).toBe(0);
     expect(getLiveSseSubscriberCount()).toBe(0);
     expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
+  });
+
+  it('sends retry hint in the SSE stream on connect', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const output = await new Promise<string>((resolve, reject) => {
+      const req = http.get(`http://127.0.0.1:${port}/api/streams/stream-123/events`, (res) => {
+        let data = '';
+        const timeout = setTimeout(() => req.destroy(new Error('timeout')), 1000);
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+          if (data.includes('retry:')) {
+            clearTimeout(timeout);
+            req.destroy();
+            resolve(data);
+          }
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+    });
+
+    expect(output).toContain('retry: 5000');
+  });
+
+  it('ignores malformed Last-Event-ID (whitespace-only)', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const resPromise = new Promise<string>((resolve) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/streams/stream-123/events',
+        headers: { 'Last-Event-ID': '   ' },
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+          if (data.includes(': ok\n\n')) {
+            req.destroy();
+            resolve(data);
+          }
+        });
+      });
+      req.on('error', () => resolve(''));
+    });
+
+    await resPromise;
+    // Malformed ID should not trigger any getEvents call
+    expect(mockGetEvents).not.toHaveBeenCalled();
+  });
+
+  it('ignores Last-Event-ID longer than 200 characters', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const resPromise = new Promise<string>((resolve) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/streams/stream-123/events',
+        headers: { 'Last-Event-ID': 'a'.repeat(201) },
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+          if (data.includes(': ok\n\n')) {
+            req.destroy();
+            resolve(data);
+          }
+        });
+      });
+      req.on('error', () => resolve(''));
+    });
+
+    await resPromise;
+    expect(mockGetEvents).not.toHaveBeenCalled();
+  });
+});
+
+// ── Unit tests for sseEmitter helpers ─────────────────────────────────────────
+
+import { deriveStreamId, eventMatchesStreamId } from '../../src/streams/sseEmitter.js';
+import type { StreamEventRecord } from '../../src/db/types.js';
+
+function makeEventRecord(overrides: Partial<StreamEventRecord> = {}): StreamEventRecord {
+  return {
+    eventId: 'evt-1',
+    ledger: 100,
+    ledgerHash: 'hash-100',
+    contractId: 'contract-abc',
+    topic: 'stream.created',
+    txHash: 'abc123',
+    txIndex: 0,
+    operationIndex: 0,
+    eventIndex: 0,
+    payload: {},
+    happenedAt: '2026-01-01T00:00:00.000Z',
+    ingestedAt: '2026-01-01T00:00:01.000Z',
+    ...overrides,
+  };
+}
+
+describe('deriveStreamId', () => {
+  it('produces canonical stream-{txHash}-{eventIndex} format', () => {
+    expect(deriveStreamId('abc123', 0)).toBe('stream-abc123-0');
+    expect(deriveStreamId('deadbeef', 5)).toBe('stream-deadbeef-5');
+  });
+});
+
+describe('eventMatchesStreamId', () => {
+  it('matches via payload.id', () => {
+    const event = makeEventRecord({ payload: { id: 'stream-abc123-0' } });
+    expect(eventMatchesStreamId(event, 'stream-abc123-0')).toBe(true);
+  });
+
+  it('matches via payload.streamId', () => {
+    const event = makeEventRecord({ payload: { streamId: 'stream-abc123-0' } });
+    expect(eventMatchesStreamId(event, 'stream-abc123-0')).toBe(true);
+  });
+
+  it('matches via canonical deriveStreamId derivation from txHash + eventIndex', () => {
+    const event = makeEventRecord({ txHash: 'abc123', eventIndex: 0, payload: {} });
+    expect(eventMatchesStreamId(event, 'stream-abc123-0')).toBe(true);
+  });
+
+  it('does not match a different stream id', () => {
+    const event = makeEventRecord({ txHash: 'abc123', eventIndex: 0, payload: {} });
+    expect(eventMatchesStreamId(event, 'stream-abc123-1')).toBe(false);
+  });
+
+  it('returns false for falsy inputs', () => {
+    expect(eventMatchesStreamId(null as unknown as StreamEventRecord, 'stream-abc123-0')).toBe(false);
+    expect(eventMatchesStreamId(makeEventRecord(), '')).toBe(false);
   });
 });

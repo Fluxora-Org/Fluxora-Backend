@@ -16,10 +16,36 @@ import { logger } from '../lib/logger.js';
 
 export const RPC_FALLBACK_CACHE_PREFIX = 'rpc:cache::';
 const SAFE_OPERATION = /^[A-Za-z0-9._-]+$/;
+const RPC_FALLBACK_CACHE_ENVELOPE_VERSION = 1;
+
+export interface RpcFallbackCacheEntry<T> {
+  value: T;
+  writtenAt: number;
+  expiresAt: number;
+  ttlSeconds: number;
+  refreshDurationMs: number;
+}
+
+interface RpcFallbackCacheEnvelope<T> extends RpcFallbackCacheEntry<T> {
+  version: typeof RPC_FALLBACK_CACHE_ENVELOPE_VERSION;
+}
+
+export interface RpcFallbackCacheSetOptions {
+  nowMs?: number;
+  refreshDurationMs?: number;
+}
 
 export interface RpcFallbackCache {
   get<T>(operation: string, cacheParts?: readonly string[]): Promise<T | null>;
   set<T>(operation: string, value: T, ttlSeconds: number, cacheParts?: readonly string[]): Promise<void>;
+  getEntry?<T>(operation: string, cacheParts?: readonly string[]): Promise<RpcFallbackCacheEntry<T> | null>;
+  setEntry?<T>(
+    operation: string,
+    value: T,
+    ttlSeconds: number,
+    cacheParts?: readonly string[],
+    options?: RpcFallbackCacheSetOptions,
+  ): Promise<void>;
 }
 
 export function hashCachePart(value: string): string {
@@ -40,6 +66,52 @@ function buildCacheKey(operation: string, cacheParts: readonly string[] = []): s
   return `${RPC_FALLBACK_CACHE_PREFIX}${[operation, ...cacheParts].join('::')}`;
 }
 
+function isCacheEnvelope<T>(value: unknown): value is RpcFallbackCacheEnvelope<T> {
+  return typeof value === 'object'
+    && value !== null
+    && (value as { version?: unknown }).version === RPC_FALLBACK_CACHE_ENVELOPE_VERSION
+    && 'value' in value
+    && typeof (value as { writtenAt?: unknown }).writtenAt === 'number'
+    && typeof (value as { expiresAt?: unknown }).expiresAt === 'number'
+    && typeof (value as { ttlSeconds?: unknown }).ttlSeconds === 'number'
+    && typeof (value as { refreshDurationMs?: unknown }).refreshDurationMs === 'number';
+}
+
+function createCacheEnvelope<T>(
+  value: T,
+  ttlSeconds: number,
+  options: RpcFallbackCacheSetOptions = {},
+): RpcFallbackCacheEnvelope<T> {
+  const writtenAt = options.nowMs ?? Date.now();
+  return {
+    version: RPC_FALLBACK_CACHE_ENVELOPE_VERSION,
+    value,
+    writtenAt,
+    expiresAt: writtenAt + ttlSeconds * 1000,
+    ttlSeconds,
+    refreshDurationMs: Math.max(1, Math.floor(options.refreshDurationMs ?? 1)),
+  };
+}
+
+function parseCachedValue<T>(raw: string): T {
+  const parsed = JSON.parse(raw) as unknown;
+  return isCacheEnvelope<T>(parsed) ? parsed.value : parsed as T;
+}
+
+function parseCacheEntry<T>(raw: string): RpcFallbackCacheEntry<T> | null {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!isCacheEnvelope<T>(parsed)) {
+    return null;
+  }
+  return {
+    value: parsed.value,
+    writtenAt: parsed.writtenAt,
+    expiresAt: parsed.expiresAt,
+    ttlSeconds: parsed.ttlSeconds,
+    refreshDurationMs: parsed.refreshDurationMs,
+  };
+}
+
 export class RedisRpcFallbackCache implements RpcFallbackCache {
   constructor(private readonly client: RedisClient) {}
 
@@ -49,10 +121,30 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
     try {
       const raw = await this.client.get(key);
       if (raw === null) return null;
-      return JSON.parse(raw) as T;
+      return parseCachedValue<T>(raw);
     } catch (err) {
       logger.warn('Stellar RPC fallback cache read failed', undefined, {
         event: 'rpc_fallback_cache_read_failed',
+        operation,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  async getEntry<T>(
+    operation: string,
+    cacheParts: readonly string[] = [],
+  ): Promise<RpcFallbackCacheEntry<T> | null> {
+    const key = buildCacheKey(operation, cacheParts);
+
+    try {
+      const raw = await this.client.get(key);
+      if (raw === null) return null;
+      return parseCacheEntry<T>(raw);
+    } catch (err) {
+      logger.warn('Stellar RPC fallback cache metadata read failed', undefined, {
+        event: 'rpc_fallback_cache_metadata_read_failed',
         operation,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -66,6 +158,16 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
     ttlSeconds: number,
     cacheParts: readonly string[] = [],
   ): Promise<void> {
+    return this.setEntry(operation, value, ttlSeconds, cacheParts);
+  }
+
+  async setEntry<T>(
+    operation: string,
+    value: T,
+    ttlSeconds: number,
+    cacheParts: readonly string[] = [],
+    options: RpcFallbackCacheSetOptions = {},
+  ): Promise<void> {
     const key = buildCacheKey(operation, cacheParts);
 
     if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1) {
@@ -78,7 +180,7 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
     }
 
     try {
-      await this.client.set(key, JSON.stringify(value), { ex: ttlSeconds });
+      await this.client.set(key, JSON.stringify(createCacheEnvelope(value, ttlSeconds, options)), { ex: ttlSeconds });
     } catch (err) {
       logger.warn('Stellar RPC fallback cache write failed', undefined, {
         event: 'rpc_fallback_cache_write_failed',
@@ -97,6 +199,14 @@ export class NoOpRpcFallbackCache implements RpcFallbackCache {
   async set<T>(): Promise<void> {
     return;
   }
+
+  async getEntry<T>(): Promise<RpcFallbackCacheEntry<T> | null> {
+    return null;
+  }
+
+  async setEntry<T>(): Promise<void> {
+    return;
+  }
 }
 
 export class InMemoryRpcFallbackCache implements RpcFallbackCache {
@@ -112,7 +222,23 @@ export class InMemoryRpcFallbackCache implements RpcFallbackCache {
       return null;
     }
 
-    return JSON.parse(entry.value) as T;
+    return parseCachedValue<T>(entry.value);
+  }
+
+  async getEntry<T>(
+    operation: string,
+    cacheParts: readonly string[] = [],
+  ): Promise<RpcFallbackCacheEntry<T> | null> {
+    const key = buildCacheKey(operation, cacheParts);
+    const entry = this.entries.get(key);
+    if (!entry) return null;
+
+    if (entry.expiresAt <= Date.now()) {
+      this.entries.delete(key);
+      return null;
+    }
+
+    return parseCacheEntry<T>(entry.value);
   }
 
   async set<T>(
@@ -121,10 +247,21 @@ export class InMemoryRpcFallbackCache implements RpcFallbackCache {
     ttlSeconds: number,
     cacheParts: readonly string[] = [],
   ): Promise<void> {
+    return this.setEntry(operation, value, ttlSeconds, cacheParts);
+  }
+
+  async setEntry<T>(
+    operation: string,
+    value: T,
+    ttlSeconds: number,
+    cacheParts: readonly string[] = [],
+    options: RpcFallbackCacheSetOptions = {},
+  ): Promise<void> {
     const key = buildCacheKey(operation, cacheParts);
+    const envelope = createCacheEnvelope(value, ttlSeconds, options);
     this.entries.set(key, {
-      value: JSON.stringify(value),
-      expiresAt: Date.now() + ttlSeconds * 1000,
+      value: JSON.stringify(envelope),
+      expiresAt: envelope.expiresAt,
     });
   }
 

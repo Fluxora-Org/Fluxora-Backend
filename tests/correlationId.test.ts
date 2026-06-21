@@ -1,12 +1,52 @@
 import http from 'http';
 import { once } from 'node:events';
+import express from 'express';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { app } from '../src/app';
-import { correlationIdMiddleware, CORRELATION_ID_HEADER, isValidCorrelationId } from '../src/middleware/correlationId';
+
+vi.mock('../src/ws/messageHandler', () => ({
+  isValidStellarPublicKey: (value: string) => value.startsWith('G'),
+  parseHandshakeSubscriptionFilter: () => ({ ok: true, filter: null }),
+  parseWsClientMessage: (message: { type?: string; streamId?: string; stream_id?: string }) => {
+    if (message.type === 'subscribe' || message.type === 'unsubscribe') {
+      return {
+        ok: true,
+        message: {
+          type: message.type,
+          filter: { streamId: message.streamId ?? message.stream_id },
+        },
+      };
+    }
+
+    return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${message.type}` };
+  },
+}));
+
+import {
+  correlationIdMiddleware,
+  CORRELATION_ID_HEADER,
+  isValidCorrelationId,
+  MAX_CORRELATION_ID_LENGTH,
+} from '../src/middleware/correlationId';
 import { correlationStore, getCorrelationId } from '../src/tracing/middleware';
 import { StreamHub } from '../src/ws/hub';
 import { webhookDispatcher } from '../src/webhooks/dispatcher';
+
+function createCorrelationIdTestApp() {
+  const app = express();
+
+  app.use(express.json());
+  app.use(correlationIdMiddleware);
+  app.get('/', (_req, res) => res.json({ ok: true }));
+  app.get('/health', (_req, res) => res.json({ ok: true }));
+  app.get('/api/streams', (_req, res) => res.json({ streams: [] }));
+  app.post('/api/streams', (_req, res) => res.status(201).json({ ok: true }));
+
+  return app;
+}
+
+const app = createCorrelationIdTestApp();
 
 describe('correlationId middleware', () => {
   describe('ID generation', () => {
@@ -61,6 +101,30 @@ describe('correlationId middleware', () => {
       expect(id).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
       );
+    });
+
+    it('generates a new ID when incoming header is malformed', async () => {
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, 'not-a-uuid');
+      const id = res.headers[CORRELATION_ID_HEADER] as string;
+      expect(id).not.toBe('not-a-uuid');
+      expect(isValidCorrelationId(id)).toBe(true);
+    });
+
+    it('rejects oversized inbound correlation IDs', () => {
+      const oversized = '1'.repeat(MAX_CORRELATION_ID_LENGTH + 1);
+      expect(isValidCorrelationId(oversized)).toBe(false);
+    });
+
+    it('regenerates control-character-bearing inbound IDs', () => {
+      const maliciousId = '11111111-1111-4111-8111-111111111111\nlog=forged';
+      const req = { headers: { [CORRELATION_ID_HEADER]: maliciousId } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(maliciousId);
+        expect(req.correlationId).not.toContain('\n');
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
     });
   });
 
@@ -241,5 +305,40 @@ describe('correlation ID propagation across transports', () => {
 
     const headers = captured?.headers as Record<string, string>;
     expect(headers[CORRELATION_ID_HEADER]).toBe('webhook-corr-123');
+  });
+
+  it('propagates a regenerated ID to downstream webhooks after rejecting a bad inbound ID', async () => {
+    let captured: RequestInit | undefined;
+    const maliciousId = '11111111-1111-4111-8111-111111111111\nlog=forged';
+    const req = { headers: { [CORRELATION_ID_HEADER]: maliciousId } } as any;
+    const res = { setHeader: vi.fn() } as any;
+
+    global.fetch = (async (_url: string, options?: RequestInit) => {
+      captured = options;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await new Promise<void>((resolve, reject) => {
+      correlationIdMiddleware(req, res, () => {
+        void webhookDispatcher.dispatch({
+          url: 'https://example.com/webhook',
+          secret: 'secret',
+          payload: JSON.stringify({ foo: 'bar' }),
+          deliveryId: 'deliv-bad-correlation-id',
+          eventType: 'stream.created',
+        }).then((result) => {
+          expect(result.success).toBe(true);
+          resolve();
+        }, reject);
+      });
+    });
+
+    const regeneratedId = req.correlationId as string;
+    const headers = captured?.headers as Record<string, string>;
+    expect(regeneratedId).not.toBe(maliciousId);
+    expect(regeneratedId).not.toContain('\n');
+    expect(isValidCorrelationId(regeneratedId)).toBe(true);
+    expect(res.setHeader).toHaveBeenCalledWith(CORRELATION_ID_HEADER, regeneratedId);
+    expect(headers[CORRELATION_ID_HEADER]).toBe(regeneratedId);
   });
 });

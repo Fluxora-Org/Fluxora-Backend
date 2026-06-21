@@ -94,6 +94,7 @@ const errorResponses = {
   '401': { description: 'Unauthorized', content: { 'application/json': { schema: ErrorEnvelope } } },
   '403': { description: 'Forbidden', content: { 'application/json': { schema: ErrorEnvelope } } },
   '404': { description: 'Not found', content: { 'application/json': { schema: ErrorEnvelope } } },
+  '408': { description: 'Request timeout', content: { 'application/json': { schema: ErrorEnvelope } } },
   '409': { description: 'Conflict', content: { 'application/json': { schema: ErrorEnvelope } } },
   '422': { description: 'Unprocessable entity', content: { 'application/json': { schema: ErrorEnvelope } } },
   '429': { description: 'Too many requests', content: { 'application/json': { schema: ErrorEnvelope } } },

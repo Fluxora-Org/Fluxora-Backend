@@ -16,6 +16,11 @@ import { loadConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
 import { createRedisClient } from './redis/client.js';
 import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
+import {
+  createWebhookCircuitBreakerStore,
+  setWebhookCircuitBreakerStore,
+  InMemoryWebhookCircuitBreakerStore,
+} from './redis/webhookCircuitBreakerStore.js';
 import { logger } from './lib/logger.js';
 import { cspNonceMiddleware, createHelmetMiddleware } from './middleware/helmet.js';
 import { metricsRouter } from './routes/metrics.js';
@@ -23,7 +28,11 @@ import { correlationIdMiddleware } from './middleware/correlationId.js';
 import { corsAllowlistMiddleware } from './middleware/cors.js';
 import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { bodySizeLimitMiddleware, BODY_LIMIT_BYTES } from './middleware/requestProtection.js';
+import {
+  bodySizeLimitMiddleware,
+  requestTimeoutMiddleware,
+  BODY_LIMIT_BYTES,
+} from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
@@ -122,6 +131,47 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
   }
 }
 
+async function wireWebhookCircuitBreakerStore(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.warn(
+      'Redis disabled — webhook circuit breaker using in-process fallback; state is not shared across instances',
+      undefined,
+      { component: 'webhook-circuit-breaker' },
+    );
+    setWebhookCircuitBreakerStore(new InMemoryWebhookCircuitBreakerStore());
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const store = createWebhookCircuitBreakerStore(redisClient);
+    setWebhookCircuitBreakerStore(store);
+    addShutdownHook(() => store.close());
+
+    logger.info('Redis webhook circuit breaker store wired', undefined, {
+      component: 'webhook-circuit-breaker',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for webhook circuit breaker — falling back to in-process store',
+      undefined,
+      {
+        component: 'webhook-circuit-breaker',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setWebhookCircuitBreakerStore(new InMemoryWebhookCircuitBreakerStore());
+  }
+}
+
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
@@ -150,7 +200,9 @@ export function createApp(options: AppOptions = {}): Express {
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
+  void wireWebhookCircuitBreakerStore(appConfig);
 
+  app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
@@ -175,6 +227,9 @@ export function createApp(options: AppOptions = {}): Express {
   if (options.includeTestRoutes) {
     app.get('/__test/error', () => {
       throw new Error('Intentional test error');
+    });
+    app.get('/__test/timeout', () => {
+      return;
     });
   }
 

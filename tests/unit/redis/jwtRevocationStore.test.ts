@@ -45,7 +45,7 @@ describe('revoke', () => {
   it('stores jti in Redis with SET and EX', async () => {
     mockRedis.set.mockResolvedValue('OK');
 
-    await revoke('jti-123', 3600);
+    const result = await revoke('jti-123', 3600);
 
     expect(mockRedis.set).toHaveBeenCalledWith(
       'jwt:revoked:jti-123',
@@ -53,6 +53,7 @@ describe('revoke', () => {
       'EX',
       3600,
     );
+    expect(result).toEqual({ revoked: true, ttlSeconds: 3600 });
   });
 
   it('uses default TTL when not provided', async () => {
@@ -83,6 +84,73 @@ describe('revoke', () => {
     );
   });
 
+  it('derives TTL from exp when caller TTL is longer than remaining token lifetime', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+
+    const result = await revoke('jti-long-ttl', {
+      ttl: 7200,
+      exp: 1_700_003_600,
+      nowSeconds: 1_700_000_000,
+    });
+
+    expect(mockRedis.set).toHaveBeenCalledWith(
+      'jwt:revoked:jti-long-ttl',
+      '1',
+      'EX',
+      3600,
+    );
+    expect(result).toEqual({ revoked: true, ttlSeconds: 3600 });
+  });
+
+  it('derives TTL from exp when caller TTL is shorter than remaining token lifetime', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+
+    const result = await revoke('jti-short-ttl', {
+      ttl: 60,
+      exp: 1_700_003_600,
+      nowSeconds: 1_700_000_000,
+    });
+
+    expect(mockRedis.set).toHaveBeenCalledWith(
+      'jwt:revoked:jti-short-ttl',
+      '1',
+      'EX',
+      3600,
+    );
+    expect(result).toEqual({ revoked: true, ttlSeconds: 3600 });
+  });
+
+  it('derives TTL from exp when caller TTL equals remaining token lifetime', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+
+    const result = await revoke('jti-equal-ttl', {
+      ttl: 3600,
+      exp: 1_700_003_600,
+      nowSeconds: 1_700_000_000,
+    });
+
+    expect(mockRedis.set).toHaveBeenCalledWith(
+      'jwt:revoked:jti-equal-ttl',
+      '1',
+      'EX',
+      3600,
+    );
+    expect(result).toEqual({ revoked: true, ttlSeconds: 3600 });
+  });
+
+  it('treats already-expired tokens as revocation no-ops', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+
+    const result = await revoke('jti-expired', {
+      ttl: 3600,
+      exp: 1_699_999_990,
+      nowSeconds: 1_700_000_000,
+    });
+
+    expect(result).toEqual({ revoked: false, ttlSeconds: 0 });
+    expect(mockRedis.set).not.toHaveBeenCalled();
+  });
+
   it('rejects empty jti', async () => {
     await expect(revoke('', 3600)).rejects.toThrow('jti must be a non-empty string');
   });
@@ -97,6 +165,12 @@ describe('revoke', () => {
 
   it('rejects negative TTL', async () => {
     await expect(revoke('jti-000', -1)).rejects.toThrow('ttl must be a positive integer');
+  });
+
+  it('rejects exp-aware revocation when exp is missing', async () => {
+    await expect(revoke('jti-missing-exp', { ttl: 3600 } as unknown as { exp: number })).rejects.toThrow(
+      'exp must be a positive integer',
+    );
   });
 
   it('rejects TTL less than current time (effectively expired)', async () => {
@@ -170,6 +244,7 @@ describe('closeRevocationStore', () => {
 
   it('is safe to call multiple times', async () => {
     mockRedis.quit.mockResolvedValue('OK');
+    await revoke('jti-1', 3600); // Initialize client
     await closeRevocationStore();
     await closeRevocationStore(); // Second call should not throw
     expect(mockRedis.quit).toHaveBeenCalledTimes(1);

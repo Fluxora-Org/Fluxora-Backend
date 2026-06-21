@@ -4,7 +4,11 @@ import { logger } from '../lib/logger.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, shouldRetry } from './retry.js';
+import { calculateNextRetryTime, shouldRetry, resolveCircuitBreakerDeferral, countsTowardCircuitBreaker } from './retry.js';
+import { logger } from '../lib/logger.js';
+import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
+import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
+import type { EnhancedRetryPolicy } from './retry.js';
 
 export interface WebhookDispatchOptions {
   url: string;
@@ -15,6 +19,7 @@ export interface WebhookDispatchOptions {
   policy?: WebhookRetryPolicy;
   attemptNumber?: number;
   correlationId?: string;
+  circuitBreakerStore?: WebhookCircuitBreakerStore;
 }
 
 export interface WebhookDispatchResult {
@@ -29,10 +34,15 @@ export interface WebhookDispatchResult {
  * Enhanced webhook dispatcher with durable delivery and proper error handling
  */
 export class WebhookDispatcher {
-  private policy: WebhookRetryPolicy;
+  private policy: EnhancedRetryPolicy;
+  private readonly circuitBreakerStore: WebhookCircuitBreakerStore;
 
-  constructor(policy: WebhookRetryPolicy = DEFAULT_RETRY_POLICY) {
+  constructor(
+    policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
+    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore(),
+  ) {
     this.policy = policy;
+    this.circuitBreakerStore = circuitBreakerStore;
   }
 
   /**
@@ -44,9 +54,36 @@ export class WebhookDispatcher {
    * intentionally excluded from log metadata.
    */
   async dispatch(options: WebhookDispatchOptions): Promise<WebhookDispatchResult> {
-    const { url, secret, payload, deliveryId, eventType, attemptNumber = 1, correlationId } = options;
+    const {
+      url,
+      secret,
+      payload,
+      deliveryId,
+      eventType,
+      attemptNumber = 1,
+      correlationId,
+      circuitBreakerStore = this.circuitBreakerStore,
+    } = options;
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const effectiveCorrelationId = correlationId ?? getCorrelationId();
+    const enhancedPolicy = this.policy as EnhancedRetryPolicy;
+
+    const gate = await circuitBreakerStore.checkAndClaimAttempt(url, enhancedPolicy);
+    if (!gate.allowed) {
+      const nextRetryAt = resolveCircuitBreakerDeferral(gate, enhancedPolicy).getTime();
+      logger.warn('Webhook delivery deferred by circuit breaker', undefined, {
+        deliveryId,
+        attemptNumber,
+        state: gate.state,
+        nextRetryAt: new Date(nextRetryAt).toISOString(),
+      });
+      return {
+        success: false,
+        error: `Circuit breaker ${gate.state}`,
+        nextRetryAt,
+        shouldRetry: true,
+      };
+    }
 
     logger.info('Dispatching webhook', effectiveCorrelationId !== 'unknown' ? effectiveCorrelationId : undefined, {
       deliveryId,
@@ -66,6 +103,7 @@ export class WebhookDispatcher {
       };
 
       if (response.ok) {
+        await circuitBreakerStore.recordSuccess(url, enhancedPolicy as CircuitBreakerPolicy);
         logger.info('Webhook delivered successfully', undefined, {
           deliveryId,
           eventType,
@@ -84,7 +122,10 @@ export class WebhookDispatcher {
       const errorMessage = `HTTP ${response.status}: ${response.statusText}`;
       attempt.error = errorMessage;
 
-      const retryable = shouldRetry(attempt, attemptNumber, this.policy);
+      const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
+        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
+      const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
@@ -126,7 +167,10 @@ export class WebhookDispatcher {
         error: errorMessage,
       };
 
-      const retryable = shouldRetry(attempt, attemptNumber, this.policy);
+      const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
+        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
+      const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
