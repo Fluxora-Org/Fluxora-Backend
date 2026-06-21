@@ -46,6 +46,7 @@ import { enrichActiveSpanWithStream } from '../../tracing/hooks.js';
 
 
 const REPO = 'streamRepository';
+export const STREAM_OFFSET_ORDER_BY = 'created_at DESC, id DESC';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -337,7 +338,13 @@ export const streamRepository = {
     });
   },
 
-  /** Offset-based paginated list. */
+  /**
+   * Offset-based paginated list.
+   *
+   * Ordering is fixed to (created_at DESC, id DESC) so rows sharing the same
+   * created_at still page deterministically. Do not interpolate client input
+   * into ORDER BY; filters remain parameterized below.
+   */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
       const pool = await getReadPool();
@@ -381,7 +388,7 @@ export const streamRepository = {
         query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY ${STREAM_OFFSET_ORDER_BY} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
           [...params, pagination.limit, pagination.offset],
         ),
       ]);
