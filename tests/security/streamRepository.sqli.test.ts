@@ -1,57 +1,92 @@
-import { describe, it, beforeAll, expect } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { sqliPayloads } from './fixtures/sqliPayloads.js';
 
-// The tests here are a regression harness. They exercise the repository
-// entrypoints with adversarial input and assert that parameterized queries
-// do not return unrelated rows or throw due to injection payloads.
+const mockQuery = vi.fn();
 
+vi.mock('../../src/db/pool.js', () => ({
+  getPool: vi.fn(() => ({})),
+  query: (...args: unknown[]) => mockQuery(...args),
+  PoolExhaustedError: class PoolExhaustedError extends Error {
+    constructor() {
+      super('pool exhausted');
+      this.name = 'PoolExhaustedError';
+    }
+  },
+  DuplicateEntryError: class DuplicateEntryError extends Error {
+    constructor(detail?: string) {
+      super(detail ?? 'duplicate');
+      this.name = 'DuplicateEntryError';
+    }
+  },
+}));
+
+vi.mock('../../src/db/replicaPool.js', () => ({
+  getReadPool: vi.fn(async () => ({})),
+}));
+
+import { initializeConfig, resetConfig } from '../../src/config/env.js';
 import { streamRepository } from '../../src/db/repositories/streamRepository.js';
 
+const PGCRYPTO_KEY = 'stream-repository-sqli-test-key-12345';
+const ROW = {
+  id: 'stream-sqli-0',
+  sender_address: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+  recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+  amount: '1000',
+  streamed_amount: '0',
+  remaining_amount: '1000',
+  rate_per_second: '10',
+  start_time: '1700000000',
+  end_time: '0',
+  status: 'active',
+  contract_id: 'api-created',
+  transaction_hash: 'a'.repeat(64),
+  event_index: 0,
+  created_at: new Date('2024-01-01T00:00:00Z'),
+  updated_at: new Date('2024-01-01T00:00:00Z'),
+};
+
+function assertPayloadIsParameterized(payload: string): void {
+  const calls = mockQuery.mock.calls as Array<[unknown, string, unknown[] | undefined]>;
+  expect(calls.length).toBeGreaterThan(0);
+  expect(calls.some(([, , params]) => Array.isArray(params) && params.includes(payload))).toBe(true);
+  for (const [, sql] of calls) {
+    expect(sql).not.toContain(payload);
+  }
+}
+
 describe('streamRepository SQLi regression suite', () => {
-  beforeAll(() => {
-    // repository should be usable in test mode; if the repo requires a DB,
-    // tests should mock pool/query. This file provides the harness and
-    // payload library — adapt to CI DB as needed.
+  beforeEach(() => {
+    process.env.PGCRYPTO_KEY = PGCRYPTO_KEY;
+    resetConfig();
+    initializeConfig();
+    mockQuery.mockReset();
   });
 
-  const methods = [
-    'upsertStream',
-    'getById',
-    'findWithCursor',
-    'updateStream',
-  ] as const;
-
   for (const payload of sqliPayloads) {
-    for (const method of methods) {
-      it(`should safely handle payload [${payload}] in ${method}`, async () => {
-        // Call each repository method with the adversarial payload in a
-        // user-controlled field and assert it doesn't return unrelated rows.
-        // The exact assertions depend on the repository API; keep them
-        // defensive (no crash, no unexpected non-empty result for lookups).
+    it(`keeps getById payload parameterized [${payload}]`, async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
 
-        try {
-          if (method === 'upsertStream') {
-            const id = `sqli-test-${Math.random().toString(36).slice(2, 8)}`;
-            const result = await (streamRepository as any).upsertStream({ id, contract_id: payload });
-            expect(result).toBeDefined();
-          } else if (method === 'getById') {
-            const res = await (streamRepository as any).getById(payload);
-            // Should either return undefined/null or a single matching row —
-            // never rows from unrelated ids.
-            expect(res === undefined || typeof res === 'object').toBeTruthy();
-          } else if (method === 'findWithCursor') {
-            const res = await (streamRepository as any).findWithCursor({ filter: { contractId: payload }, limit: 1 });
-            expect(res).toBeDefined();
-          } else if (method === 'updateStream') {
-            const res = await (streamRepository as any).updateStream(payload, { status: 'paused' });
-            expect(res === undefined || typeof res === 'object').toBeTruthy();
-          }
-        } catch (err) {
-          // Throwing due to SQL syntax injected into parameters would be a
-          // regression; surface the error so CI can triage.
-          throw err;
-        }
-      });
-    }
+      await expect(streamRepository.getById(payload)).resolves.toBeUndefined();
+
+      assertPayloadIsParameterized(payload);
+    });
+
+    it(`keeps findWithCursor contract filter parameterized [${payload}]`, async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [ROW] });
+
+      await expect(streamRepository.findWithCursor({ contract_id: payload }, 1)).resolves.toBeDefined();
+
+      assertPayloadIsParameterized(payload);
+    });
+
+    it(`keeps updateStream id parameterized [${payload}]`, async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [ROW] });
+      mockQuery.mockResolvedValueOnce({ rows: [{ ...ROW, status: 'paused' }] });
+
+      await expect(streamRepository.updateStream(payload, { status: 'paused' })).resolves.toBeDefined();
+
+      assertPayloadIsParameterized(payload);
+    });
   }
 });

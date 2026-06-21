@@ -20,12 +20,19 @@ vi.mock('../src/db/pool.js', () => ({
   },
 }));
 
+vi.mock('../src/db/replicaPool.js', () => ({
+  getReadPool: vi.fn(async () => ({})),
+}));
+
+import { initializeConfig, resetConfig } from '../src/config/env.js';
 import { streamRepository } from '../src/db/repositories/streamRepository.js';
-import type { CreateStreamInput, UpdateStreamInput } from '../src/db/types.js';
+import type { CreateStreamInput } from '../src/db/types.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const TX_HASH = 'a'.repeat(64);
+const PGCRYPTO_KEY = 'stream-repository-test-key-current-123';
+const PGCRYPTO_KEY_PREVIOUS = 'stream-repository-test-key-previous-456';
 
 function makeRow(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
@@ -80,11 +87,17 @@ function queryReturnsEmpty() {
 
 describe('streamRepository', () => {
   beforeEach(() => {
+    process.env.PGCRYPTO_KEY = PGCRYPTO_KEY;
+    delete process.env.PGCRYPTO_KEY_PREVIOUS;
+    resetConfig();
+    initializeConfig();
     vi.clearAllMocks();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    resetConfig();
+    delete process.env.PGCRYPTO_KEY_PREVIOUS;
   });
 
   // ── upsertStream ────────────────────────────────────────────────────────────
@@ -177,12 +190,32 @@ describe('streamRepository', () => {
       queryReturnsRows([makeRow()]);
       const record = await streamRepository.getByEvent(TX_HASH, 0);
       expect(record).toBeDefined();
+      expect(mockQuery).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.stringContaining('WHERE transaction_hash = $1 AND event_index = $2'),
+        [TX_HASH, 0, PGCRYPTO_KEY],
+      );
     });
 
     it('returns undefined when not found', async () => {
       queryReturnsEmpty();
       const record = await streamRepository.getByEvent('deadbeef', 99);
       expect(record).toBeUndefined();
+    });
+
+    it('keeps previous pgcrypto key aligned after event lookup params', async () => {
+      process.env.PGCRYPTO_KEY_PREVIOUS = PGCRYPTO_KEY_PREVIOUS;
+      resetConfig();
+      initializeConfig();
+      queryReturnsRows([makeRow()]);
+
+      await streamRepository.getByEvent(TX_HASH, 0);
+
+      expect(mockQuery).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.stringContaining('decrypt_stream_address(sender_address, $3, $4)'),
+        [TX_HASH, 0, PGCRYPTO_KEY, PGCRYPTO_KEY_PREVIOUS],
+      );
     });
   });
 
@@ -283,6 +316,78 @@ describe('streamRepository', () => {
 
       const result = await streamRepository.findWithCursor({}, 50, 'stream-a');
       expect(result.streams[0]!.id).toBe('stream-b');
+    });
+
+    it('keeps address filters and decryption keys parameterized with previous key rotation', async () => {
+      process.env.PGCRYPTO_KEY_PREVIOUS = PGCRYPTO_KEY_PREVIOUS;
+      resetConfig();
+      initializeConfig();
+      queryReturnsRows([makeRow()]);
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '1' }] });
+
+      await streamRepository.findWithCursor(
+        {
+          status: 'active',
+          sender_address: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+          recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+          contract_id: 'api-created',
+        },
+        10,
+        'stream-a',
+        true,
+      );
+
+      const [dataSql, dataParams] = mockQuery.mock.calls[0]!.slice(1) as [string, unknown[]];
+      expect(dataSql).toContain('sender_address_hash = $3 OR sender_address_hash = $4');
+      expect(dataSql).toContain('recipient_address_hash = $6 OR recipient_address_hash = $7');
+      expect(dataSql).toContain('id > $9');
+      expect(dataSql).toContain('LIMIT $10');
+      expect(dataSql).toContain('decrypt_stream_address(sender_address, $11, $12)');
+      expect(dataParams[0]).toBe('active');
+      expect(dataParams[1]).toBe('GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7');
+      expect(dataParams[4]).toBe('GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR');
+      expect(dataParams[7]).toBe('api-created');
+      expect(dataParams[8]).toBe('stream-a');
+      expect(dataParams[9]).toBe(11);
+      expect(dataParams[10]).toBe(PGCRYPTO_KEY);
+      expect(dataParams[11]).toBe(PGCRYPTO_KEY_PREVIOUS);
+    });
+  });
+
+  // ── find ───────────────────────────────────────────────────────────────────
+
+  describe('find', () => {
+    it('keeps offset pagination filters and decryption keys parameterized', async () => {
+      process.env.PGCRYPTO_KEY_PREVIOUS = PGCRYPTO_KEY_PREVIOUS;
+      resetConfig();
+      initializeConfig();
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '1' }] });
+      queryReturnsRows([makeRow()]);
+
+      const result = await streamRepository.find(
+        {
+          status: 'active',
+          sender_address: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+          recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+          contract_id: 'api-created',
+          start_time_from: 1,
+          start_time_to: 2,
+          end_time_from: 3,
+          end_time_to: 4,
+        },
+        { limit: 25, offset: 50 },
+      );
+
+      expect(result.streams).toHaveLength(1);
+      const [dataSql, dataParams] = mockQuery.mock.calls[1]!.slice(1) as [string, unknown[]];
+      expect(dataSql).toContain('sender_address_hash = $3 OR sender_address_hash = $4');
+      expect(dataSql).toContain('recipient_address_hash = $6 OR recipient_address_hash = $7');
+      expect(dataSql).toContain('decrypt_stream_address(sender_address, $13, $14)');
+      expect(dataSql).toContain('LIMIT $15 OFFSET $16');
+      expect(dataParams[12]).toBe(PGCRYPTO_KEY);
+      expect(dataParams[13]).toBe(PGCRYPTO_KEY_PREVIOUS);
+      expect(dataParams[14]).toBe(25);
+      expect(dataParams[15]).toBe(50);
     });
   });
 
