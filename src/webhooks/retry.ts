@@ -9,7 +9,6 @@
  * so no delivery is silently lost.
  */
 
-import type { RateLimitStore, SlidingWindowStore } from '../redis/rateLimitStore.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 
@@ -32,7 +31,7 @@ export interface RetrySchedule {
 
 export interface WebhookOutboxRetryInput {
   /** The actual consumer endpoint URL — used as the rate-limit key. */
-  consumerUrl: string;
+  consumerUrl?: string;
   streamId: string;
   eventType: string;
   payload: unknown;
@@ -98,14 +97,67 @@ export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): numbe
 
 
 
-/**
- * Determine if a status code is retryable with enhanced logic
- */
+/** Determine if a status code is retryable with enhanced logic. */
 export function isRetryableStatusCode(
   statusCode: number | undefined,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
 ): boolean {
-  // ... existing logic ...
+  if (statusCode === undefined) return true;
+  return policy.retryableStatusCodes.includes(statusCode);
+}
+
+/** Return the absolute timestamp for the next retry attempt. */
+export function calculateNextRetryTime(
+  attemptNumber: number,
+  policy: EnhancedRetryPolicy,
+  now: number = Date.now(),
+): number {
+  const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
+  return now + delayMs;
+}
+
+/** Generate retry metadata for every configured attempt. */
+export function generateRetrySchedule(
+  policy: EnhancedRetryPolicy,
+  now: number = Date.now(),
+): RetrySchedule[] {
+  return Array.from({ length: policy.maxAttempts }, (_, index) => {
+    const attemptNumber = index + 1;
+    const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
+
+    return {
+      attemptNumber,
+      delayMs,
+      retryAt: now + delayMs,
+    };
+  });
+}
+
+/** Attach retry metadata to an outbox payload and return the next retry time. */
+export function scheduleWebhookOutboxRetry(input: WebhookOutboxRetryInput): WebhookOutboxRetryPlan {
+  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
+  const nextAttemptNumber = input.attemptNumber + 1;
+
+  if (nextAttemptNumber > policy.maxAttempts) {
+    return {
+      shouldRetry: false,
+      attemptNumber: input.attemptNumber,
+      retryAt: null,
+      payload: input.payload,
+    };
+  }
+
+  const payload =
+    typeof input.payload === 'object' && input.payload !== null && !Array.isArray(input.payload)
+      ? { ...(input.payload as Record<string, unknown>), _webhookRetry: { attemptNumber: nextAttemptNumber } }
+      : { _webhookRetry: { attemptNumber: nextAttemptNumber } };
+
+  return {
+    shouldRetry: true,
+    attemptNumber: nextAttemptNumber,
+    retryAt: new Date(calculateNextRetryTime(input.attemptNumber, policy, input.now)),
+    payload,
+  };
 }
 
 /** Return true if another delivery attempt should be made. */

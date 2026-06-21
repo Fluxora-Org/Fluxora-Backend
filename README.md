@@ -156,6 +156,18 @@ The test suite includes:
 2. **Input Validation**: Strict validation of all request parameters
 3. **Concurrent Operation Prevention**: Only one replay at a time
 4. **Transaction Safety**: Automatic rollback on errors
+5. **Webhook Delivery Logging**: Outbound webhook dispatch logs use the shared structured logger and include only stable identifiers (`deliveryId`, `eventType`, `attemptNumber`) plus `statusCode` when available. Webhook secrets, raw payloads, signatures, and endpoint URLs are excluded from log metadata.
+
+### Webhook Delivery Logging
+
+The class-based `WebhookDispatcher` imports the shared structured logger from `src/lib/logger.ts` and uses the same `(message, correlationId?, meta?)` signature as other services. Dispatch outcomes log only safe delivery metadata:
+
+- Success: `deliveryId`, `eventType`, `attemptNumber`, `statusCode`
+- Retryable HTTP failure: `deliveryId`, `eventType`, `attemptNumber`, `statusCode`
+- Permanent HTTP failure: `deliveryId`, `eventType`, `attemptNumber`, `statusCode`
+- Network failure: `deliveryId`, `eventType`, `attemptNumber`
+
+Target URLs, webhook secrets, signatures, and raw payloads are intentionally omitted from log records to avoid leaking credentials or signed delivery content.
 
 ### Production Recommendations
 

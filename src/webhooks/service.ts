@@ -17,7 +17,7 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, shouldRetry } from './retry.js';
+import { calculateNextRetryTime, scheduleWebhookOutboxRetry, shouldRetry } from './retry.js';
 import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
 
 interface OutboxRow {
@@ -136,7 +136,6 @@ export class WebhookService {
       deliveryId: delivery.deliveryId,
       eventId: event.id,
       eventType: event.type,
-      endpointUrl,
     });
 
     // Attempt immediate delivery
@@ -159,7 +158,8 @@ export class WebhookService {
     const correlationId = getCorrelationId();
     logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
       deliveryId: delivery.deliveryId,
-      attempt: attemptNumber,
+      eventType: delivery.eventType,
+      attemptNumber,
       maxAttempts: this.policy.maxAttempts,
     });
 
@@ -191,8 +191,9 @@ export class WebhookService {
 
         logger.info('Webhook delivered successfully', undefined, {
           deliveryId: delivery.deliveryId,
+          eventType: delivery.eventType,
           statusCode: response.status,
-          attempt: attemptNumber,
+          attemptNumber,
         });
         webhookDeliveriesTotal.inc({ outcome: 'success' });
       } else {
@@ -203,17 +204,17 @@ export class WebhookService {
 
           logger.warn('Webhook delivery failed, will retry', undefined, {
             deliveryId: delivery.deliveryId,
+            eventType: delivery.eventType,
             statusCode: response.status,
-            attempt: attemptNumber,
-            nextRetryAt: new Date(attempt.nextRetryAt).toISOString(),
+            attemptNumber,
           });
         } else {
           delivery.status = 'permanent_failure';
           logger.error('Webhook delivery failed permanently', undefined, {
             deliveryId: delivery.deliveryId,
+            eventType: delivery.eventType,
             statusCode: response.status,
-            attempt: attemptNumber,
-            maxAttempts: this.policy.maxAttempts,
+            attemptNumber,
           });
         }
 
@@ -232,9 +233,8 @@ export class WebhookService {
 
         logger.warn('Webhook delivery failed with error, will retry', undefined, {
           deliveryId: delivery.deliveryId,
-          error: errorMessage,
-          attempt: attemptNumber,
-          nextRetryAt: new Date(attempt.nextRetryAt).toISOString(),
+          eventType: delivery.eventType,
+          attemptNumber,
         });
       } else {
         attempt.error = errorMessage;
@@ -242,9 +242,8 @@ export class WebhookService {
 
         logger.error('Webhook delivery failed permanently with error', undefined, {
           deliveryId: delivery.deliveryId,
-          error: errorMessage,
-          attempt: attemptNumber,
-          maxAttempts: this.policy.maxAttempts,
+          eventType: delivery.eventType,
+          attemptNumber,
         });
       }
 

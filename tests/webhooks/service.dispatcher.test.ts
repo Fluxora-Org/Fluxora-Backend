@@ -173,7 +173,10 @@ describe('WebhookDispatcher outbox polling', () => {
     const poll = dispatcher.pollOnce();
     const stopped = dispatcher.stop();
 
-    await Promise.resolve();
+    for (let i = 0; i < 10 && !releaseFetch; i += 1) {
+      await Promise.resolve();
+    }
+    expect(releaseFetch).toBeDefined();
     expect(client.release).not.toHaveBeenCalled();
     releaseFetch?.();
 

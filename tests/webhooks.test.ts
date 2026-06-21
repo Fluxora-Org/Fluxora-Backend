@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WebhookService } from '../src/webhooks/service.js';
 import { webhookDeliveryStore } from '../src/webhooks/store.js';
 import { webhookDispatcher } from '../src/webhooks/dispatcher.js';
+import { logger } from '../src/lib/logger.js';
 import { 
   calculateNextRetryTime, 
   shouldRetry, 
@@ -38,6 +39,7 @@ describe('WebhookService', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
+    vi.restoreAllMocks();
   });
 
   it('queues a webhook delivery', async () => {
@@ -263,6 +265,7 @@ describe('Enhanced Webhook Features', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
+    vi.restoreAllMocks();
   });
 
   describe('WebhookDispatcher', () => {
@@ -341,6 +344,29 @@ describe('Enhanced Webhook Features', () => {
 
       const isValid = await webhookDispatcher.validateEndpoint('https://example.com/webhook');
       expect(isValid).toBe(true);
+    });
+
+    it('dispatches webhook without throwing and logs successful delivery', async () => {
+      const payload = JSON.stringify({ test: 'data' });
+      const infoSpy = vi.spyOn(logger, 'info');
+
+      global.fetch = async () => new Response(null, { status: 200 });
+
+      const result = await webhookDispatcher.dispatch({
+        url: 'https://example.com/webhook',
+        secret: 'secret123',
+        payload,
+        deliveryId: 'deliv_123',
+        eventType: 'stream.created',
+      });
+
+      expect(result.success).toBe(true);
+      expect(infoSpy).toHaveBeenCalledWith('Webhook delivered successfully', undefined, expect.objectContaining({
+        deliveryId: 'deliv_123',
+        statusCode: 200,
+        attemptNumber: 1,
+      }));
+      infoSpy.mockRestore();
     });
   });
 

@@ -160,11 +160,13 @@ export class WebhookDeliveryStore {
     
     for (const priority of priorities) {
       const items = this.outboxPriorityQueue.get(priority) || [];
-      const ready = items.filter(item => item.scheduledFor <= now && item.attempts < item.maxAttempts);
+      const ready = items
+        .filter(item => item.scheduledFor <= now && item.attempts < item.maxAttempts)
+        .sort((a, b) => a.scheduledFor - b.scheduledFor);
       readyItems.push(...ready);
     }
     
-    return readyItems.sort((a, b) => a.scheduledFor - b.scheduledFor);
+    return readyItems;
   }
 
   /**
