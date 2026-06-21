@@ -37,7 +37,7 @@ import type { Server } from 'http';
 import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
-import type { ContractEventStore } from '../indexer/store.js';
+import { STALE_CURSOR_ERROR_CODE, StaleCursorError, type ContractEventStore } from '../indexer/store.js';
 import { SSE_STREAM_UPDATE_EVENT, sseEventBus } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
@@ -774,7 +774,20 @@ export class StreamHub extends EventEmitter {
         ...(cursor !== undefined ? { afterEventId: cursor } : {}),
         limit: pageSize,
       };
-      const result = await this.eventStore.getEvents(pageFilter);
+      let result: Awaited<ReturnType<ContractEventStore['getEvents']>>;
+      try {
+        result = await this.eventStore.getEvents(pageFilter);
+      } catch (err) {
+        if (err instanceof StaleCursorError) {
+          this.sendError(
+            ws,
+            STALE_CURSOR_ERROR_CODE,
+            'Replay cursor no longer exists; resync from fromLedger',
+          );
+          return;
+        }
+        throw err;
+      }
 
       for (const event of result.events) {
         if (ws.readyState !== WebSocket.OPEN) return;

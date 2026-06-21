@@ -82,6 +82,7 @@ import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
+import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 import {
   eventMatchesStreamId,
@@ -1042,6 +1043,22 @@ streamsRouter.get(
             pagesRead++;
           } while (cursor !== undefined && !cleanedUp && pagesRead < SSE_REPLAY_MAX_PAGES);
         } catch (err) {
+          if (err instanceof StaleCursorError) {
+            writeSse(
+              `event: error\ndata: ${JSON.stringify({
+                code: STALE_CURSOR_ERROR_CODE,
+                message: 'Replay cursor no longer exists; resync from fromLedger',
+              })}\n\n`,
+            );
+            warn('SSE replay cursor is stale', {
+              afterEventId: err.afterEventId,
+              requestId,
+            });
+            res.end();
+            cleanup('stale_cursor');
+            return;
+          }
+
           warn('Failed to replay SSE events from store', {
             error: err instanceof Error ? err.message : String(err),
             requestId,
@@ -1074,5 +1091,3 @@ streamsRouter.get(
 );
 
 export function _resetStreams(): void {}
-
-
