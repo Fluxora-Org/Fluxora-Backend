@@ -4,6 +4,10 @@ import { ReplayRequest } from '../types';
 
 export const indexerRouter = Router();
 
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
 /**
  * POST /internal/indexer/events/replay
  * 
@@ -40,10 +44,10 @@ indexerRouter.post('/internal/indexer/events/replay', async (req: Request, res: 
       message: 'Replay started',
       status: indexerService.getReplayProgress(),
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Failed to start replay:', error);
     res.status(400).json({
-      error: error.message || 'Failed to start replay',
+      error: errorMessage(error, 'Failed to start replay'),
     });
   }
 });
@@ -65,11 +69,11 @@ indexerRouter.post('/internal/indexer/events/replay', async (req: Request, res: 
  *   "ledger": number (optional)
  * }
  */
-indexerRouter.get('/internal/indexer/status', (req: Request, res: Response) => {
+indexerRouter.get('/internal/indexer/status', async (req: Request, res: Response) => {
   try {
-    const progress = indexerService.getReplayProgress();
+    const progress = await indexerService.getReplayProgressSnapshot();
     res.status(200).json(progress);
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Failed to get status:', error);
     res.status(500).json({
       error: 'Failed to get indexer status',

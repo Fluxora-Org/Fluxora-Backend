@@ -40,6 +40,7 @@ pnpm run migrate
 This creates:
 - `historical_events` table (source data)
 - `contract_events` table (replay destination)
+- `replay_cursors` table (durable replay checkpoints)
 - Optimized indexes for replay queries
 
 ## 🏃 Running the Service
@@ -101,9 +102,29 @@ Response:
   "estimatedCompletion": "2026-05-28T15:30:00.000Z",
   "startedAt": "2026-05-28T15:00:00.000Z",
   "contractId": "contract-abc-123",
-  "ledger": 1
+  "ledger": 1,
+  "status": "running",
+  "replayCursorId": "2d2f5f54-6d9b-4d5c-97bc-62f8877af83a",
+  "currentOffset": 750,
+  "lastCommittedEventId": "evt-750",
+  "lastCommittedBlockHeight": 1750,
+  "updatedAt": "2026-05-28T15:15:00.000Z"
 }
 ```
+
+`GET /internal/indexer/status` first returns the in-memory active replay state.
+If the process restarted and memory is empty, it falls back to the latest
+incomplete `replay_cursors` checkpoint so operators can see the offset that the
+next replay call will resume from.
+
+### Replay Checkpoints
+
+Replay progress is persisted in `replay_cursors` after every committed batch.
+`last_committed_offset`, `last_committed_event_id`, and
+`last_committed_block_height` are updated in the same transaction as the batch
+insert into `contract_events`, so the checkpoint never advances past committed
+rows. Completed replays set `status = 'completed'` and `completed_at`; incomplete
+rows remain `status = 'running'` and are used for crash-safe resume.
 
 ## 🧪 Testing
 

@@ -173,10 +173,38 @@ describe('ReplayCursorRepository', () => {
   it('advanceOffset issues parameterized UPDATE', async () => {
     const client = makeClient(async () => ({ rows: [] }));
     const repo = new ReplayCursorRepository();
-    await repo.advanceOffset(client, 'cursor-abc', 250);
+    await repo.advanceOffset(client, 'cursor-abc', 250, {
+      event_id: 'evt-250',
+      block_height: 5250,
+    });
     expect(client.query).toHaveBeenCalledWith(
       expect.stringContaining('UPDATE replay_cursors'),
-      [250, 'cursor-abc'],
+      [250, 'evt-250', 5250, 'cursor-abc'],
+    );
+  });
+
+  it('findLatestIncomplete returns the newest running checkpoint', async () => {
+    const checkpoint = {
+      id: 'checkpoint-1',
+      contract_id: 'c1',
+      ledger: 5,
+      from_block: null,
+      to_block: null,
+      total_rows: 10,
+      last_committed_offset: 4,
+      last_committed_event_id: 'evt-4',
+      last_committed_block_height: 104,
+      status: 'running' as const,
+      started_at: new Date(),
+      updated_at: new Date(),
+      completed_at: null,
+    };
+    const client = makeClient(async () => ({ rows: [checkpoint] }));
+    const repo = new ReplayCursorRepository();
+    const cursor = await repo.findLatestIncomplete(client);
+    expect(cursor?.id).toBe('checkpoint-1');
+    expect(client.query).toHaveBeenCalledWith(
+      expect.stringContaining("status = 'running'"),
     );
   });
 
@@ -185,7 +213,7 @@ describe('ReplayCursorRepository', () => {
     const repo = new ReplayCursorRepository();
     await repo.markCompleted(client, 'cursor-abc');
     expect(client.query).toHaveBeenCalledWith(
-      expect.stringContaining('completed_at = now()'),
+      expect.stringContaining("status = 'completed'"),
       ['cursor-abc'],
     );
   });
@@ -235,7 +263,7 @@ describe('IndexerService — max-range guard', () => {
   it('allows a range exactly at the limit', async () => {
     // Set up zero-event replay so it exits immediately
     const cursorRepo = makeCursorRepo({
-      create: vi.fn(async (_c, cid, ledger, fb, tb, total) => ({
+      create: vi.fn(async (_c, cid, ledger, fb, tb, _total) => ({
         id: 'c1',
         contract_id: cid,
         ledger,
@@ -406,8 +434,20 @@ describe('IndexerService — per-batch commits', () => {
 
     // advanceOffset called with correct increments
     expect(cursorRepo.advanceOffset).toHaveBeenCalledTimes(2);
-    expect(cursorRepo.advanceOffset).toHaveBeenNthCalledWith(1, batch1Client, 'cursor-1', 2);
-    expect(cursorRepo.advanceOffset).toHaveBeenNthCalledWith(2, batch2Client, 'cursor-1', 4);
+    expect(cursorRepo.advanceOffset).toHaveBeenNthCalledWith(
+      1,
+      batch1Client,
+      'cursor-1',
+      2,
+      expect.objectContaining({ event_id: 'e2', block_height: 200 }),
+    );
+    expect(cursorRepo.advanceOffset).toHaveBeenNthCalledWith(
+      2,
+      batch2Client,
+      'cursor-1',
+      4,
+      expect.objectContaining({ event_id: 'e4', block_height: 400 }),
+    );
 
     // Cursor marked complete
     expect(cursorRepo.markCompleted).toHaveBeenCalledWith(expect.anything(), 'cursor-1');
@@ -496,7 +536,12 @@ describe('IndexerService — crash-resume semantics', () => {
     expect(cursorRepo.create).not.toHaveBeenCalled();
 
     // Should advance from offset 2 to offset 4
-    expect(cursorRepo.advanceOffset).toHaveBeenCalledWith(batchClient, 'cursor-resumed', 4);
+    expect(cursorRepo.advanceOffset).toHaveBeenCalledWith(
+      batchClient,
+      'cursor-resumed',
+      4,
+      expect.objectContaining({ event_id: 'e4', block_height: 400 }),
+    );
 
     // Only 1 batch was processed (events e3, e4)
     expect(batchClient.query).toHaveBeenCalledWith('BEGIN');
@@ -529,9 +574,7 @@ describe('IndexerService — crash-resume semantics', () => {
     });
 
     // This batch client throws during INSERT
-    let callCount = 0;
     const failingBatchClient = makeClient(async (sql) => {
-      callCount++;
       if (sql.trim() === 'BEGIN') return { rows: [] };
       if (sql.includes('FROM historical_events')) return { rows: [makeEvent('e1'), makeEvent('e2')] };
       if (sql.includes('INSERT INTO contract_events')) throw new Error('simulated DB failure');
@@ -881,5 +924,46 @@ describe('IndexerService — getReplayProgress', () => {
   it('returns isReplaying: false when idle', () => {
     const svc = makeService(makePool(), makeCursorRepo());
     expect(svc.getReplayProgress().isReplaying).toBe(false);
+  });
+
+  it('returns the latest durable checkpoint when memory state is idle', async () => {
+    const checkpoint = {
+      id: 'cursor-after-restart',
+      contract_id: 'contract-after-restart',
+      ledger: 42,
+      from_block: null,
+      to_block: null,
+      total_rows: 10,
+      last_committed_offset: 6,
+      last_committed_event_id: 'evt-6',
+      last_committed_block_height: 9006,
+      status: 'running' as const,
+      started_at: new Date('2026-06-20T10:00:00.000Z'),
+      updated_at: new Date('2026-06-20T10:05:00.000Z'),
+      completed_at: null,
+    };
+    const cursorClient = makeClient(async () => ({ rows: [checkpoint] }));
+    const cursorRepo = makeCursorRepo({
+      findLatestIncomplete: vi.fn(async () => checkpoint),
+    });
+    const svc = makeService(makePool(cursorClient), cursorRepo);
+
+    const progress = await svc.getReplayProgressSnapshot();
+
+    expect(progress).toMatchObject({
+      isReplaying: true,
+      rowsReplayed: 6,
+      rowsRemaining: 4,
+      totalRows: 10,
+      contractId: 'contract-after-restart',
+      ledger: 42,
+      status: 'running',
+      replayCursorId: 'cursor-after-restart',
+      currentOffset: 6,
+      lastCommittedEventId: 'evt-6',
+      lastCommittedBlockHeight: 9006,
+    });
+    expect(cursorRepo.findLatestIncomplete).toHaveBeenCalledWith(cursorClient);
+    expect(cursorClient.release).toHaveBeenCalled();
   });
 });

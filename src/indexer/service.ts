@@ -73,6 +73,7 @@ class ReplayState {
     totalRows: 0,
     estimatedCompletion: null,
     startedAt: null,
+    status: undefined,
   };
 
   getState(): ReplayProgress {
@@ -97,13 +98,21 @@ class ReplayState {
       ledger,
       replayCursorId,
       currentOffset: resumeFromOffset,
+      status: 'running',
     };
   }
 
-  updateProgress(rowsProcessed: number, newOffset: number): void {
+  updateProgress(
+    rowsProcessed: number,
+    newOffset: number,
+    lastCommittedEvent: ContractEvent,
+  ): void {
     this.state.rowsReplayed += rowsProcessed;
     this.state.rowsRemaining = Math.max(0, this.state.totalRows - this.state.rowsReplayed);
     this.state.currentOffset = newOffset;
+    this.state.lastCommittedEventId = lastCommittedEvent.event_id;
+    this.state.lastCommittedBlockHeight = lastCommittedEvent.block_height;
+    this.state.updatedAt = new Date();
 
     if (this.state.startedAt && this.state.rowsReplayed > 0) {
       const elapsed = Date.now() - this.state.startedAt.getTime();
@@ -116,6 +125,12 @@ class ReplayState {
   endReplay(): void {
     this.state.isReplaying = false;
     this.state.estimatedCompletion = null;
+  }
+
+  completeReplay(): void {
+    this.state.status = 'completed';
+    this.state.updatedAt = new Date();
+    this.endReplay();
   }
 }
 
@@ -142,14 +157,34 @@ export class ReplayCursorRepository {
   ): Promise<ReplayCursor | null> {
     const result = await client.query<ReplayCursor>(
       `SELECT id, contract_id, ledger, from_block, to_block,
-              total_rows, last_committed_offset, started_at, completed_at
+              total_rows, last_committed_offset, last_committed_event_id,
+              last_committed_block_height, status, started_at, updated_at, completed_at
          FROM replay_cursors
         WHERE contract_id = $1
           AND ledger      = $2
           AND completed_at IS NULL
+          AND status      = 'running'
         ORDER BY started_at DESC
         LIMIT 1`,
       [contractId, ledger],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  /**
+   * Find the most recent incomplete checkpoint, regardless of contract/ledger.
+   * Used by the status endpoint after a process restart, when in-memory state is empty.
+   */
+  async findLatestIncomplete(client: PoolClient): Promise<ReplayCursor | null> {
+    const result = await client.query<ReplayCursor>(
+      `SELECT id, contract_id, ledger, from_block, to_block,
+              total_rows, last_committed_offset, last_committed_event_id,
+              last_committed_block_height, status, started_at, updated_at, completed_at
+         FROM replay_cursors
+        WHERE completed_at IS NULL
+          AND status = 'running'
+        ORDER BY updated_at DESC, started_at DESC
+        LIMIT 1`,
     );
     return result.rows[0] ?? null;
   }
@@ -170,7 +205,8 @@ export class ReplayCursorRepository {
          (contract_id, ledger, from_block, to_block, total_rows, last_committed_offset)
        VALUES ($1, $2, $3, $4, $5, 0)
        RETURNING id, contract_id, ledger, from_block, to_block,
-                 total_rows, last_committed_offset, started_at, completed_at`,
+                 total_rows, last_committed_offset, last_committed_event_id,
+                 last_committed_block_height, status, started_at, updated_at, completed_at`,
       [contractId, ledger, fromBlock ?? null, toBlock ?? null, totalRows],
     );
     return result.rows[0]!;
@@ -185,12 +221,17 @@ export class ReplayCursorRepository {
     client: PoolClient,
     cursorId: string,
     newOffset: number,
+    lastCommittedEvent: Pick<ContractEvent, 'event_id' | 'block_height'>,
   ): Promise<void> {
     await client.query(
       `UPDATE replay_cursors
-          SET last_committed_offset = $1
-        WHERE id = $2`,
-      [newOffset, cursorId],
+          SET last_committed_offset = $1,
+              last_committed_event_id = $2,
+              last_committed_block_height = $3,
+              status = 'running',
+              updated_at = now()
+        WHERE id = $4`,
+      [newOffset, lastCommittedEvent.event_id, lastCommittedEvent.block_height, cursorId],
     );
   }
 
@@ -200,11 +241,34 @@ export class ReplayCursorRepository {
   async markCompleted(client: PoolClient, cursorId: string): Promise<void> {
     await client.query(
       `UPDATE replay_cursors
-          SET completed_at = now()
+          SET status = 'completed',
+              completed_at = now(),
+              updated_at = now()
         WHERE id = $1`,
       [cursorId],
     );
   }
+}
+
+function progressFromCursor(cursor: ReplayCursor): ReplayProgress {
+  const rowsReplayed = Math.min(cursor.last_committed_offset, cursor.total_rows);
+  const status = cursor.status ?? (cursor.completed_at ? 'completed' : 'running');
+  return {
+    isReplaying: status === 'running' && cursor.completed_at === null,
+    rowsReplayed,
+    rowsRemaining: Math.max(0, cursor.total_rows - rowsReplayed),
+    totalRows: cursor.total_rows,
+    estimatedCompletion: null,
+    startedAt: cursor.started_at,
+    contractId: cursor.contract_id,
+    ledger: cursor.ledger,
+    status,
+    replayCursorId: cursor.id,
+    currentOffset: cursor.last_committed_offset,
+    lastCommittedEventId: cursor.last_committed_event_id ?? null,
+    lastCommittedBlockHeight: cursor.last_committed_block_height ?? null,
+    updatedAt: cursor.updated_at ?? cursor.started_at,
+  };
 }
 
 // ── IndexerService ─────────────────────────────────────────────────────────────
@@ -307,7 +371,7 @@ export class IndexerService {
       if (totalRows === 0) {
         // Nothing to replay — mark complete and return.
         await this.completeCursor(cursor.id);
-        replayState.endReplay();
+        replayState.completeReplay();
         return;
       }
 
@@ -322,7 +386,6 @@ export class IndexerService {
 
       let offset = cursor.last_committed_offset;
       let batchIndex = 0;
-      let lastBatchRowCount = 0;
 
       // 5. Per-batch loop — each iteration uses a fresh connection.
       while (offset < totalRows) {
@@ -350,10 +413,16 @@ export class IndexerService {
         const newOffset = offset + batchResult.rowsFetched;
         offset = newOffset;
         batchIndex++;
-        lastBatchRowCount = batchResult.rowsFetched;
 
         // Update in-memory progress.
-        replayState.updateProgress(batchResult.rowsFetched, newOffset);
+        if (!batchResult.lastCommittedEvent) {
+          throw new Error('Replay checkpoint missing last committed event');
+        }
+        replayState.updateProgress(
+          batchResult.rowsFetched,
+          newOffset,
+          batchResult.lastCommittedEvent,
+        );
 
         // Compute rows/sec for the gauge.
         const elapsedSec = (Date.now() - replayStart) / 1_000;
@@ -387,7 +456,7 @@ export class IndexerService {
 
       // 6. Mark cursor as complete and record duration.
       await this.completeCursor(cursor.id);
-      replayState.endReplay();
+      replayState.completeReplay();
 
       const durationSec = (Date.now() - replayStart) / 1_000;
       indexerReplayDurationSeconds.observe(
@@ -475,8 +544,8 @@ export class IndexerService {
     cursorId: string,
     request: ReplayRequest,
     offset: number,
-    batchIndex: number,
-  ): Promise<{ rowsFetched: number }> {
+    _batchIndex: number,
+  ): Promise<{ rowsFetched: number; lastCommittedEvent?: ContractEvent }> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -493,10 +562,11 @@ export class IndexerService {
       // Advance the cursor offset inside the same transaction as the INSERT
       // so the two operations are always atomic.
       const newOffset = offset + events.length;
-      await this.cursorRepo.advanceOffset(client, cursorId, newOffset);
+      const lastCommittedEvent = events[events.length - 1]!;
+      await this.cursorRepo.advanceOffset(client, cursorId, newOffset, lastCommittedEvent);
 
       await client.query('COMMIT');
-      return { rowsFetched: events.length };
+      return { rowsFetched: events.length, lastCommittedEvent };
     } catch (error) {
       // Roll back the partial batch — already-committed batches are untouched.
       try {
@@ -695,6 +765,26 @@ export class IndexerService {
    */
   getReplayProgress(): ReplayProgress {
     return replayState.getState();
+  }
+
+  /**
+   * Get replay progress for operators. Active in-memory state is returned
+   * first; otherwise the latest incomplete DB checkpoint is exposed so a
+   * restarted process can report where it will resume.
+   */
+  async getReplayProgressSnapshot(): Promise<ReplayProgress> {
+    const memoryState = this.getReplayProgress();
+    if (memoryState.isReplaying) {
+      return memoryState;
+    }
+
+    const client = await this.pool.connect();
+    try {
+      const cursor = await this.cursorRepo.findLatestIncomplete(client);
+      return cursor ? progressFromCursor(cursor) : memoryState;
+    } finally {
+      client.release();
+    }
   }
 }
 
