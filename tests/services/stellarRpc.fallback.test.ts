@@ -11,6 +11,12 @@ import {
   InMemoryRpcFallbackCache,
   type RpcFallbackCache,
 } from '../../src/redis/rpcFallbackCache.js';
+import {
+  deRegisterRpcMetrics,
+  rpcFallbackCacheEarlyRefreshesTotal,
+  rpcFallbackCacheHitsTotal,
+  rpcFallbackCacheMissesTotal,
+} from '../../src/metrics/rpcMetrics.js';
 
 function makeClient(fn: () => Promise<{ sequence: number }>): RawRpcClient {
   return { getLatestLedger: fn };
@@ -23,6 +29,7 @@ describe('StellarRpcService fallback cache', () => {
   });
 
   afterEach(() => {
+    deRegisterRpcMetrics();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -173,5 +180,75 @@ describe('StellarRpcService fallback cache', () => {
     expect(res.status).toBe(200);
     expect(res.headers['x-rpc-cache']).toBe('stale');
     expect(res.body).toEqual({ sequence: 500 });
+  });
+
+  it('stores cache metadata while preserving value reads', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    const svc = new StellarRpcService(
+      () => makeClient(vi.fn(async () => ({ sequence: 600 }))),
+      { fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+    );
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 600 });
+
+    await expect(cache.get('getLatestLedger')).resolves.toEqual({ sequence: 600 });
+    const entry = await cache.getEntry<{ sequence: number }>('getLatestLedger');
+    expect(entry?.value).toEqual({ sequence: 600 });
+    expect(entry?.writtenAt).toBe(Date.now());
+    expect(entry?.expiresAt).toBe(Date.now() + 60_000);
+    expect(entry?.ttlSeconds).toBe(60);
+    expect(entry?.refreshDurationMs).toBeGreaterThanOrEqual(1);
+  });
+
+  it('serves a CLOSED-cache hit and starts one probabilistic early refresh', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    await cache.setEntry(
+      'getLatestLedger',
+      { sequence: 700 },
+      60,
+      [],
+      { nowMs: Date.now() - 59_500, refreshDurationMs: 1_000 },
+    );
+    let resolver: ((value: { sequence: number }) => void) | undefined;
+    const getLatestLedger = vi.fn(() => new Promise<{ sequence: number }>((resolve) => {
+      resolver = resolve;
+    }));
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(Number.EPSILON);
+    const svc = new StellarRpcService(
+      () => makeClient(getLatestLedger),
+      { fallbackCache: cache, fallbackCacheTtlSeconds: 60, fallbackCacheEarlyExpiryBeta: 1 },
+    );
+
+    const first = await svc.getLatestLedger();
+    const second = await svc.getLatestLedger();
+
+    expect(first).toEqual({ sequence: 700 });
+    expect(second).toEqual({ sequence: 700 });
+    expect(getLatestLedger).toHaveBeenCalledTimes(1);
+
+    resolver?.({ sequence: 701 });
+    await vi.runAllTimersAsync();
+
+    await expect(cache.get('getLatestLedger')).resolves.toEqual({ sequence: 701 });
+    const hits = await rpcFallbackCacheHitsTotal.get();
+    expect(hits.values[0]?.value).toBe(2);
+    const refreshes = await rpcFallbackCacheEarlyRefreshesTotal.get();
+    expect(refreshes.values[0]?.value).toBe(1);
+    randomSpy.mockRestore();
+  });
+
+  it('records CLOSED-cache misses before the first live RPC fill', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+    const getLatestLedger = vi.fn(async () => ({ sequence: 800 }));
+    const svc = new StellarRpcService(
+      () => makeClient(getLatestLedger),
+      { fallbackCache: cache, fallbackCacheTtlSeconds: 60, fallbackCacheEarlyExpiryBeta: 1 },
+    );
+
+    await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 800 });
+
+    const misses = await rpcFallbackCacheMissesTotal.get();
+    expect(misses.values[0]?.labels).toEqual({ operation: 'getLatestLedger' });
+    expect(misses.values[0]?.value).toBe(1);
   });
 });
