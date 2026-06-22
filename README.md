@@ -295,6 +295,16 @@ Outbound webhook retries use two Redis-backed per-consumer controls:
 
 To ensure per-stream consumers always observe events in chain order, Fluxora guarantees a deterministic tiebreaker for webhook outbox deliveries. Items sharing the exact same `scheduledFor` timestamp are processed sequentially by applying a secondary sort on their `ledger` sequence (extracted from the JSON payload) and a tertiary sort on the `eventId`. This causal ordering is maintained securely across memory queues (`WebhookDeliveryStore`) and persistent database reads (`PostgreSQL webhook_outbox` query path), even when large sets of identical timestamps occur.
 
+## Indexer Stall State and Recovery
+
+The service health checks monitor indexer freshness to ensure downstream clients do not receive dangerously stale chain state. If the sync lag exceeds the configured threshold (`DEFAULT_INDEXER_STALL_THRESHOLD_MS`), the system latches an `isStalled` flag and degrades `/health/ready`.
+Even if the indexer catches back up, **the stall flag remains latched** to alert operators of the transient instability. Operators can acknowledge and reset this flag via an admin endpoint:
+```bash
+curl -X POST http://localhost:3000/api/admin/indexer/stall/clear \
+  -H "Authorization: Bearer <ADMIN_API_KEY>"
+```
+The endpoint returns `409 Conflict` if the indexer is still actively lagging behind the freshness threshold. Successful resets emit an `INDEXER_STALL_CLEARED` audit log.
+
 ## 📝 License
 
 MIT
