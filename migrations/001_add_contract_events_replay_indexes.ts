@@ -1,4 +1,26 @@
-import { PoolClient } from 'pg';
+import type { MigrationBuilder } from 'node-pg-migrate';
+import type { PoolClient } from 'pg';
+
+type MigrationTarget = MigrationBuilder | PoolClient;
+
+function isMigrationBuilder(target: MigrationTarget): target is MigrationBuilder {
+  return typeof (target as MigrationBuilder).sql === 'function';
+}
+
+async function runSql(target: MigrationTarget, sql: string): Promise<void> {
+  if (isMigrationBuilder(target)) {
+    target.sql(sql);
+    return;
+  }
+
+  await target.query(sql);
+}
+
+function runOutsideTransaction(target: MigrationTarget): void {
+  if (isMigrationBuilder(target)) {
+    target.noTransaction();
+  }
+}
 
 /**
  * Migration: Add indexes for optimized contract event replay
@@ -13,46 +35,44 @@ import { PoolClient } from 'pg';
  * - Supporting the ORDER BY block_height, event_id pattern used in batched fetches
  */
 
-export async function up(client: PoolClient): Promise<void> {
-  console.log('Creating contract_events replay indexes...');
+export async function up(pgm: MigrationTarget): Promise<void> {
+  // CREATE INDEX CONCURRENTLY is forbidden inside a PostgreSQL transaction.
+  runOutsideTransaction(pgm);
 
   // Composite index for general replay queries
-  await client.query(`
+  await runSql(pgm, `
     CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_contract_ledger
     ON contract_events (contract_id, ledger, block_height, event_id);
   `);
 
   // Partial index for unprocessed events (ingested_at IS NULL)
   // This is useful for tracking replay progress and identifying incomplete ingestions
-  await client.query(`
+  await runSql(pgm, `
     CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_pending_ingestion
     ON contract_events (contract_id, ledger, block_height)
     WHERE ingested_at IS NULL;
   `);
 
   // Index on historical_events for efficient batch fetching during replay
-  await client.query(`
+  await runSql(pgm, `
     CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_historical_events_replay
     ON historical_events (contract_id, ledger, block_height, event_id);
   `);
-
-  console.log('Indexes created successfully');
 }
 
-export async function down(client: PoolClient): Promise<void> {
-  console.log('Dropping contract_events replay indexes...');
+export async function down(pgm: MigrationTarget): Promise<void> {
+  // DROP INDEX CONCURRENTLY is forbidden inside a PostgreSQL transaction.
+  runOutsideTransaction(pgm);
 
-  await client.query(`
+  await runSql(pgm, `
     DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_contract_ledger;
   `);
 
-  await client.query(`
+  await runSql(pgm, `
     DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_pending_ingestion;
   `);
 
-  await client.query(`
+  await runSql(pgm, `
     DROP INDEX CONCURRENTLY IF EXISTS idx_historical_events_replay;
   `);
-
-  console.log('Indexes dropped successfully');
 }

@@ -52,6 +52,7 @@ vi.mock('pg', async (importOriginal) => {
 
 import { checkPendingMigrations, PendingMigrationsError } from '../src/db/migrate.js'
 import * as fsModule from 'fs'
+import * as replayIndexMigration from '../migrations/001_add_contract_events_replay_indexes.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -197,5 +198,51 @@ describe('checkPendingMigrations', () => {
 
     await expect(checkPendingMigrations()).rejects.toThrow('query error')
     expect(pgClientMocks.end).toHaveBeenCalled()
+  })
+})
+
+describe('contract event replay index migration', () => {
+  function makeMigrationBuilder() {
+    return {
+      noTransaction: vi.fn(),
+      sql: vi.fn(),
+    } as unknown as import('node-pg-migrate').MigrationBuilder
+  }
+
+  it('creates replay indexes concurrently and preserves the pending-ingestion predicate', async () => {
+    const pgm = makeMigrationBuilder()
+
+    await replayIndexMigration.up(pgm)
+
+    expect(pgm.noTransaction).toHaveBeenCalledOnce()
+    const sql = (pgm.sql as ReturnType<typeof vi.fn>).mock.calls.map(([statement]) => String(statement)).join('\n')
+    expect(sql).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_contract_ledger')
+    expect(sql).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_pending_ingestion')
+    expect(sql).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_historical_events_replay')
+    expect(sql).toContain('WHERE ingested_at IS NULL')
+  })
+
+  it('drops replay indexes concurrently and remains idempotent', async () => {
+    const pgm = makeMigrationBuilder()
+
+    await replayIndexMigration.down(pgm)
+
+    expect(pgm.noTransaction).toHaveBeenCalledOnce()
+    const sql = (pgm.sql as ReturnType<typeof vi.fn>).mock.calls.map(([statement]) => String(statement)).join('\n')
+    expect(sql).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_contract_ledger')
+    expect(sql).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_pending_ingestion')
+    expect(sql).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_historical_events_replay')
+  })
+
+  it('remains compatible with the legacy PoolClient migration runner', async () => {
+    const client = {
+      query: vi.fn().mockResolvedValue({ rows: [] }),
+    } as unknown as import('pg').PoolClient
+
+    await replayIndexMigration.up(client)
+
+    const sql = (client.query as ReturnType<typeof vi.fn>).mock.calls.map(([statement]) => String(statement)).join('\n')
+    expect(sql).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_contract_ledger')
+    expect(sql).toContain('WHERE ingested_at IS NULL')
   })
 })
