@@ -71,4 +71,19 @@ describe('ContractEventStore stale cursor handling', () => {
     expect(queries[1]?.values).toEqual([100, 'e1']);
     expect(queries[2]?.sql).toContain('event_id > $2');
   });
+
+  it('keeps Postgres insert idempotency compatible with partitioned keys', async () => {
+    let insertSql = '';
+    const store = new PostgresContractEventStore({
+      query: async <T>(sql: string) => {
+        insertSql = sql;
+        return { rows: [{ event_id: 'e1' }] as T[], rowCount: 1 };
+      },
+    });
+
+    await store.insertMany([makeRecord('e1', 100)]);
+
+    expect(insertSql).toContain('ON CONFLICT DO NOTHING');
+    expect(insertSql).not.toContain('ON CONFLICT (event_id)');
+  });
 });

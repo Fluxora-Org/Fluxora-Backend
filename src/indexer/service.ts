@@ -222,7 +222,7 @@ export class ReplayCursorRepository {
  * for each batch:
  *   acquire connection
  *   BEGIN
- *     INSERT … ON CONFLICT (event_id) DO NOTHING   ← idempotent
+ *     INSERT … ON CONFLICT DO NOTHING             ← idempotent
  *     UPDATE replay_cursors SET last_committed_offset = …  ← atomic with data
  *   COMMIT
  *   release connection
@@ -233,7 +233,7 @@ export class ReplayCursorRepository {
  * The cursor offset is updated inside the same transaction as the batch
  * INSERT.  After a crash, a re-run reads `last_committed_offset` from the
  * `replay_cursors` table and resumes from exactly that point.  Because every
- * INSERT uses `ON CONFLICT (event_id) DO NOTHING`, rows from any partially
+ * INSERT uses `ON CONFLICT DO NOTHING`, rows from any partially
  * replayed batch that was rolled back will simply be re-inserted on the next
  * attempt without producing duplicates.
  *
@@ -322,7 +322,6 @@ export class IndexerService {
 
       let offset = cursor.last_committed_offset;
       let batchIndex = 0;
-      let lastBatchRowCount = 0;
 
       // 5. Per-batch loop — each iteration uses a fresh connection.
       while (offset < totalRows) {
@@ -350,7 +349,6 @@ export class IndexerService {
         const newOffset = offset + batchResult.rowsFetched;
         offset = newOffset;
         batchIndex++;
-        lastBatchRowCount = batchResult.rowsFetched;
 
         // Update in-memory progress.
         replayState.updateProgress(batchResult.rowsFetched, newOffset);
@@ -475,7 +473,7 @@ export class IndexerService {
     cursorId: string,
     request: ReplayRequest,
     offset: number,
-    batchIndex: number,
+    _batchIndex: number,
   ): Promise<{ rowsFetched: number }> {
     const client = await this.pool.connect();
     try {
@@ -645,8 +643,8 @@ export class IndexerService {
   /**
    * Batch INSERT events into `contract_events` using a multi-row VALUES list.
    *
-   * `ON CONFLICT (event_id) DO NOTHING` ensures idempotency: re-running a
-   * partially completed replay never produces duplicate rows.
+   * `ON CONFLICT DO NOTHING` keeps idempotency compatible with both the
+   * legacy `event_id` key and the partitioned `(ledger, event_id)` key.
    * Uses positional parameters — no user values are string-interpolated.
    */
   private async batchInsertEvents(
@@ -684,7 +682,7 @@ export class IndexerService {
         block_height,
         transaction_hash
       ) VALUES ${valuePlaceholders.join(', ')}
-      ON CONFLICT (event_id) DO NOTHING
+      ON CONFLICT DO NOTHING
     `;
 
     await client.query(query, values);

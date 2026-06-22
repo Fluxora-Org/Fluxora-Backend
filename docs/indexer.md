@@ -8,6 +8,8 @@ The contract event indexer provides efficient replay of historical blockchain ev
 
 - **Batch Insert Processing**: Events are inserted in configurable batches to minimize database round-trips
 - **Optimized Indexes**: Composite and partial indexes for fast replay queries
+- **Ledger Partitions**: `contract_events` is range-partitioned by ledger for bounded replay scans and cheaper maintenance
+- **Retention Guardrails**: Partition retention defaults to dry-run and requires explicit confirmation before detach/drop
 - **Progress Tracking**: Real-time progress monitoring with estimated completion times
 - **Duplicate Handling**: Automatic deduplication using `ON CONFLICT DO NOTHING`
 - **Transaction Safety**: Full ACID compliance with automatic rollback on errors
@@ -165,21 +167,42 @@ Destination table for replayed events.
 
 ```sql
 CREATE TABLE contract_events (
-  event_id VARCHAR(255) PRIMARY KEY,
+  event_id VARCHAR(255) NOT NULL,
   contract_id VARCHAR(255) NOT NULL,
   ledger INTEGER NOT NULL,
-  event_type VARCHAR(100) NOT NULL,
-  event_data JSONB NOT NULL,
-  block_height BIGINT NOT NULL,
-  transaction_hash VARCHAR(255) NOT NULL,
+  event_type VARCHAR(100),
+  event_data JSONB,
+  block_height BIGINT,
+  transaction_hash VARCHAR(255),
+  topic TEXT,
+  tx_hash TEXT,
+  tx_index INTEGER,
+  operation_index INTEGER,
+  event_index INTEGER,
+  payload JSONB,
+  happened_at TIMESTAMPTZ,
+  ledger_hash TEXT,
   ingested_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+  ingestion_state TEXT GENERATED ALWAYS AS (
+    CASE WHEN ingested_at IS NULL THEN 'pending' ELSE 'ingested' END
+  ) STORED,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (ledger, event_id)
+) PARTITION BY RANGE (ledger);
 ```
+
+`ingested_at` is the ingestion lifecycle marker:
+
+- `NULL` means the event is pending downstream ingestion.
+- A timestamp means the event has been ingested.
+- The lifecycle trigger prevents updates that clear `ingested_at` or move it to an earlier timestamp.
+- `ingestion_state` is generated from `ingested_at` so operators can filter `pending` versus `ingested` without duplicating state.
+
+Fresh databases create `contract_events` as a ledger range-partitioned table with a default partition. Existing non-partitioned databases receive a `contract_events_partitioned` shadow table and the `ensure_contract_events_partition(start_ledger, end_ledger)` helper so operators can backfill in batches and swap during a controlled maintenance window.
 
 ### Indexes
 
-The following indexes are created by migration `001_add_contract_events_replay_indexes`:
+The following indexes are created on the parent table and by the partition helper on each range partition:
 
 #### 1. Composite Index for Replay Queries
 ```sql
@@ -220,6 +243,32 @@ ON historical_events (contract_id, ledger, block_height, event_id);
 **Purpose**: Speeds up batch fetching from the source table during replay operations.
 
 **Note**: All indexes are created with `CONCURRENTLY` to avoid locking the table during index creation.
+
+### Partition Operations
+
+Create the next ledger partition before a replay enters that range:
+
+```sql
+SELECT ensure_contract_events_partition(1000000, 1100000);
+```
+
+Recommended rotation:
+
+1. Keep a default partition so unexpected ledger ranges do not fail ingestion.
+2. Create the next range partition before replay jobs cross the boundary.
+3. Backfill legacy rows into `contract_events_partitioned` in ledger windows, then swap names in a maintenance window.
+4. Run retention in dry-run mode first, review the partition list, then detach old partitions after backup verification.
+
+Retention is provided by `enforceContractEventsRetention()` from `src/scripts/db-ops.ts`. It defaults to dry-run:
+
+```typescript
+await enforceContractEventsRetention({
+  databaseUrl: process.env.DATABASE_URL!,
+  retainLedgers: 500000,
+});
+```
+
+Live detach requires `dryRun: false` and `confirm: true`. Permanent drop additionally requires `backupConfirmed: true`; detach is preferred for routine operations because it preserves the partition table for S3 backup or manual re-attachment.
 
 ## Performance Characteristics
 
@@ -335,6 +384,7 @@ pnpm run migrate
 This will:
 1. Create the initial schema (tables)
 2. Add replay optimization indexes
+3. Install contract event partition helpers and retention guardrails
 
 ### Production Checklist
 
@@ -379,7 +429,7 @@ WHERE contract_id = 'contract-abc-123' AND ledger = 1;
 1. Reduce `REPLAY_BATCH_SIZE`
 2. Add more database resources (CPU, memory)
 3. Run replay during off-peak hours
-4. Consider partitioning large replays by block range
+4. Create the next ledger partition before large replays cross a range boundary
 
 ### High Memory Usage
 
@@ -397,7 +447,8 @@ WHERE contract_id = 'contract-abc-123' AND ledger = 1;
 **Solutions**:
 1. Run `ANALYZE contract_events;` to update statistics
 2. Check index usage with `EXPLAIN ANALYZE`
-3. Consider vacuuming the table: `VACUUM ANALYZE contract_events;`
+3. Run `VACUUM ANALYZE contract_events;` or target the affected ledger partition
+4. Verify old partitions are detached or dropped according to the retention policy
 
 ### Concurrent Replay Error
 

@@ -11,6 +11,12 @@ import { PoolClient } from 'pg';
  * - Reducing table scan time for contract_id + ledger lookups
  * - Enabling efficient identification of events pending ingestion
  * - Supporting the ORDER BY block_height, event_id pattern used in batched fetches
+ *
+ * Note: fresh schemas create contract_events as a partitioned table. PostgreSQL
+ * does not allow CREATE INDEX CONCURRENTLY directly on a partitioned parent, so
+ * these parent indexes intentionally use regular CREATE INDEX IF NOT EXISTS.
+ * Per-partition creation/rotation is handled by
+ * ensure_contract_events_partition() in migration 003.
  */
 
 export async function up(client: PoolClient): Promise<void> {
@@ -18,21 +24,21 @@ export async function up(client: PoolClient): Promise<void> {
 
   // Composite index for general replay queries
   await client.query(`
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_contract_ledger
+    CREATE INDEX IF NOT EXISTS idx_contract_events_contract_ledger
     ON contract_events (contract_id, ledger, block_height, event_id);
   `);
 
   // Partial index for unprocessed events (ingested_at IS NULL)
   // This is useful for tracking replay progress and identifying incomplete ingestions
   await client.query(`
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_pending_ingestion
+    CREATE INDEX IF NOT EXISTS idx_contract_events_pending_ingestion
     ON contract_events (contract_id, ledger, block_height)
     WHERE ingested_at IS NULL;
   `);
 
   // Index on historical_events for efficient batch fetching during replay
   await client.query(`
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_historical_events_replay
+    CREATE INDEX IF NOT EXISTS idx_historical_events_replay
     ON historical_events (contract_id, ledger, block_height, event_id);
   `);
 
@@ -43,15 +49,15 @@ export async function down(client: PoolClient): Promise<void> {
   console.log('Dropping contract_events replay indexes...');
 
   await client.query(`
-    DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_contract_ledger;
+    DROP INDEX IF EXISTS idx_contract_events_contract_ledger;
   `);
 
   await client.query(`
-    DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_pending_ingestion;
+    DROP INDEX IF EXISTS idx_contract_events_pending_ingestion;
   `);
 
   await client.query(`
-    DROP INDEX CONCURRENTLY IF EXISTS idx_historical_events_replay;
+    DROP INDEX IF EXISTS idx_historical_events_replay;
   `);
 
   console.log('Indexes dropped successfully');

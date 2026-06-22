@@ -41,31 +41,47 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
   pgm.createIndex('streams', 'contract_id');
   pgm.createIndex('streams', 'created_at');
 
-  // Contract events table for the indexer service
-  pgm.createTable('contract_events', {
-    event_id: { type: 'text', primaryKey: true },
-    ledger: { type: 'integer', notNull: true },
-    contract_id: { type: 'text', notNull: true },
-    topic: { type: 'text', notNull: true },
-    tx_hash: { type: 'text', notNull: true },
-    tx_index: { type: 'integer', notNull: true },
-    operation_index: { type: 'integer', notNull: true },
-    event_index: { type: 'integer', notNull: true },
-    payload: { type: 'jsonb', notNull: true },
-    happened_at: { type: 'timestamp with time zone', notNull: true },
-    ingested_at: {
-      type: 'timestamp with time zone',
-      notNull: true,
-      default: pgm.func('current_timestamp'),
-    },
-  });
+  // Contract events table for the indexer service. Keep this in sync with
+  // migrations/000_initial_schema.ts: the table is partitioned by ledger and
+  // includes nullable columns for both legacy replay rows and typed indexer rows.
+  pgm.sql(`
+    CREATE TABLE IF NOT EXISTS contract_events (
+      event_id VARCHAR(255) NOT NULL,
+      contract_id VARCHAR(255) NOT NULL,
+      ledger INTEGER NOT NULL CHECK (ledger >= 0),
+      event_type VARCHAR(100),
+      event_data JSONB,
+      block_height BIGINT,
+      transaction_hash VARCHAR(255),
+      topic TEXT,
+      tx_hash TEXT,
+      tx_index INTEGER,
+      operation_index INTEGER,
+      event_index INTEGER,
+      payload JSONB,
+      happened_at TIMESTAMPTZ,
+      ledger_hash TEXT,
+      ingested_at TIMESTAMPTZ,
+      ingestion_state TEXT GENERATED ALWAYS AS (
+        CASE WHEN ingested_at IS NULL THEN 'pending' ELSE 'ingested' END
+      ) STORED,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+      PRIMARY KEY (ledger, event_id)
+    ) PARTITION BY RANGE (ledger);
 
-  pgm.createIndex('contract_events', 'contract_id');
-  pgm.createIndex('contract_events', 'tx_hash');
-  pgm.createIndex('contract_events', 'happened_at');
+    CREATE TABLE IF NOT EXISTS contract_events_default
+      PARTITION OF contract_events DEFAULT;
+
+    CREATE INDEX IF NOT EXISTS idx_contract_events_contract_id
+      ON contract_events (contract_id);
+    CREATE INDEX IF NOT EXISTS idx_contract_events_tx_hash
+      ON contract_events (tx_hash);
+    CREATE INDEX IF NOT EXISTS idx_contract_events_happened_at
+      ON contract_events (happened_at);
+  `);
 }
 
 export async function down(pgm: MigrationBuilder): Promise<void> {
-  pgm.dropTable('contract_events');
+  pgm.sql('DROP TABLE IF EXISTS contract_events CASCADE;');
   pgm.dropTable('streams');
 }

@@ -39,8 +39,9 @@ pnpm run migrate
 
 This creates:
 - `historical_events` table (source data)
-- `contract_events` table (replay destination)
-- Optimized indexes for replay queries
+- `contract_events` table (ledger-partitioned replay destination)
+- Optimized parent and per-partition indexes for replay queries
+- Partition helper routines and guarded retention operations
 
 ## 🏃 Running the Service
 
@@ -141,6 +142,16 @@ The test suite includes:
 | `DATABASE_URL` | - | PostgreSQL connection string (required) |
 | `REPLAY_BATCH_SIZE` | 1000 | Number of events per batch insert |
 | `PORT` | 3000 | HTTP server port |
+
+### Contract Event Retention
+
+`contract_events` is partitioned by ledger. Create upcoming partitions with:
+
+```sql
+SELECT ensure_contract_events_partition(1000000, 1100000);
+```
+
+Retention is exposed through `enforceContractEventsRetention()` from `src/scripts/db-ops.ts`. It defaults to dry-run, live detach requires `confirm: true`, and destructive drop also requires `backupConfirmed: true`.
 
 ### Batch Size Tuning
 

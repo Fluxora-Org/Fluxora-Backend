@@ -207,7 +207,7 @@ export class PostgresContractEventStore implements ContractEventStore {
         tx_index, operation_index, event_index, payload, happened_at, ledger_hash
       )
       VALUES ${placeholders.join(', ')}
-      ON CONFLICT (event_id) DO NOTHING
+      ON CONFLICT DO NOTHING
       RETURNING event_id
     `;
 

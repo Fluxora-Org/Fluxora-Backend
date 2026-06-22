@@ -25,6 +25,14 @@ import { pipeline } from 'stream/promises'
 import { promisify } from 'util'
 import { PassThrough, Readable } from 'stream'
 
+export {
+  enforceContractEventsRetention,
+  type ContractEventsRetentionMode,
+  type ContractEventsRetentionOptions,
+  type ContractEventsRetentionPartition,
+  type ContractEventsRetentionResult,
+} from './contract-events-retention.js'
+
 const execFileAsync = promisify(execFile)
 
 // ── Result type ───────────────────────────────────────────────────────────────

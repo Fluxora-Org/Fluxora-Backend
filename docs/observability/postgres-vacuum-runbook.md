@@ -149,6 +149,17 @@ ALTER TABLE streams SET (
 
 Apply the same settings to `contract_events`, `audit_logs`, and `webhook_outbox` as needed.
 
+For `contract_events`, prefer targeting the hot ledger partition when the parent
+table is partitioned:
+
+```sql
+VACUUM ANALYZE contract_events_ledger_1000000_1100000;
+```
+
+If bloat is concentrated in old closed ranges, run the retention helper in
+dry-run mode first and detach old partitions only after backup verification.
+Permanent drops require an explicit backup confirmation in the ops helper.
+
 ### 5. Check current autovacuum settings for a table
 
 ```sql
@@ -156,6 +167,31 @@ SELECT relname, reloptions
 FROM pg_class
 WHERE relname IN ('streams', 'contract_events', 'audit_logs', 'webhook_outbox');
 ```
+
+### 6. Review contract event partitions
+
+```sql
+SELECT
+  child.relname AS partition_name,
+  pg_get_expr(child.relpartbound, child.oid) AS bounds,
+  child.reltuples::bigint AS estimated_rows
+FROM pg_inherits
+JOIN pg_class parent ON parent.oid = pg_inherits.inhparent
+JOIN pg_class child ON child.oid = pg_inherits.inhrelid
+WHERE parent.relname = 'contract_events'
+ORDER BY partition_name;
+```
+
+Create the next partition before replay crosses a ledger boundary:
+
+```sql
+SELECT ensure_contract_events_partition(1100000, 1200000);
+```
+
+Use `enforceContractEventsRetention()` from `src/scripts/db-ops.ts` for
+retention. The default is dry-run/off; live detach requires `confirm: true`.
+Use `mode: "drop"` only after S3 or snapshot backup verification and
+`backupConfirmed: true`.
 
 ---
 

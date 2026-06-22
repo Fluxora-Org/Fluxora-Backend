@@ -235,7 +235,7 @@ describe('IndexerService — max-range guard', () => {
   it('allows a range exactly at the limit', async () => {
     // Set up zero-event replay so it exits immediately
     const cursorRepo = makeCursorRepo({
-      create: vi.fn(async (_c, cid, ledger, fb, tb, total) => ({
+      create: vi.fn(async (_c, cid, ledger, fb, tb) => ({
         id: 'c1',
         contract_id: cid,
         ledger,
@@ -529,9 +529,7 @@ describe('IndexerService — crash-resume semantics', () => {
     });
 
     // This batch client throws during INSERT
-    let callCount = 0;
     const failingBatchClient = makeClient(async (sql) => {
-      callCount++;
       if (sql.trim() === 'BEGIN') return { rows: [] };
       if (sql.includes('FROM historical_events')) return { rows: [makeEvent('e1'), makeEvent('e2')] };
       if (sql.includes('INSERT INTO contract_events')) throw new Error('simulated DB failure');
@@ -587,7 +585,7 @@ describe('IndexerService — crash-resume semantics', () => {
     // Every INSERT must carry ON CONFLICT DO NOTHING
     expect(insertSqls.length).toBeGreaterThan(0);
     for (const sql of insertSqls) {
-      expect(sql).toContain('ON CONFLICT (event_id) DO NOTHING');
+      expect(sql).toContain('ON CONFLICT DO NOTHING');
     }
   });
 });
