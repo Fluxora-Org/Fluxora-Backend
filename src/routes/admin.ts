@@ -9,6 +9,7 @@ import {
 } from '../state/adminState.js';
 import { createApiKey, rotateApiKey, revokeApiKey, listApiKeys } from '../lib/apiKey.js';
 import { recordAuditEvent, recordAuditEventToDb } from '../lib/auditLog.js';
+import { asyncHandler } from '../middleware/errorHandler.js';
 import { getStreamHub } from '../ws/hub.js';
 
 export const adminRouter = Router();
@@ -167,7 +168,7 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
       closeCode: 4000,
       closeReason: 'admin-forced-disconnect',
     });
-  } catch (err) {
+  } catch {
     res.status(503).json({
       error: 'Unable to persist audit log entry. Try again later.',
       disconnectedCount,
@@ -188,9 +189,9 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
  * GET /api/admin/api-keys
  * Lists all API key records (hashes only — raw keys are never returned).
  */
-adminRouter.get('/api-keys', (_req, res) => {
-  res.json({ apiKeys: listApiKeys() });
-});
+adminRouter.get('/api-keys', asyncHandler(async (_req, res) => {
+  res.json({ apiKeys: await listApiKeys() });
+}));
 
 /**
  * POST /api/admin/api-keys
@@ -198,15 +199,15 @@ adminRouter.get('/api-keys', (_req, res) => {
  *
  * Body: { "name": "my-service" }
  */
-adminRouter.post('/api-keys', (req, res) => {
+adminRouter.post('/api-keys', asyncHandler(async (req, res) => {
   const { name } = req.body ?? {};
   if (!name || typeof name !== 'string') {
     res.status(400).json({ error: 'name (string) is required.' });
     return;
   }
   try {
-    const created = createApiKey(name);
-    recordAuditEvent(
+    const created = await createApiKey(name);
+    await recordAuditEventToDb(
       'API_KEY_CREATED',
       'api_key',
       created.id,
@@ -220,17 +221,17 @@ adminRouter.post('/api-keys', (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
   }
-});
+}));
 
 /**
  * POST /api/admin/api-keys/:id/rotate
  * Issues a new raw key for an existing key record. The old key is immediately
  * invalidated. The new raw key is returned exactly once.
  */
-adminRouter.post('/api-keys/:id/rotate', (req, res) => {
+adminRouter.post('/api-keys/:id/rotate', asyncHandler(async (req, res) => {
   try {
-    const rotated = rotateApiKey(req.params.id);
-    recordAuditEvent(
+    const rotated = await rotateApiKey(req.params.id);
+    await recordAuditEventToDb(
       'API_KEY_ROTATED',
       'api_key',
       rotated.id,
@@ -246,16 +247,16 @@ adminRouter.post('/api-keys/:id/rotate', (req, res) => {
     const status = msg.includes('not found') ? 404 : 400;
     res.status(status).json({ error: msg });
   }
-});
+}));
 
 /**
  * DELETE /api/admin/api-keys/:id
  * Revokes an API key. Revoked keys cannot authenticate requests.
  */
-adminRouter.delete('/api-keys/:id', (req, res) => {
+adminRouter.delete('/api-keys/:id', asyncHandler(async (req, res) => {
   try {
-    revokeApiKey(req.params.id);
-    recordAuditEvent(
+    await revokeApiKey(req.params.id);
+    await recordAuditEventToDb(
       'API_KEY_REVOKED',
       'api_key',
       req.params.id,
@@ -267,4 +268,4 @@ adminRouter.delete('/api-keys/:id', (req, res) => {
     const status = msg.includes('not found') ? 404 : 400;
     res.status(status).json({ error: msg });
   }
-});
+}));

@@ -50,3 +50,30 @@ Security notes:
 - `POST /api/admin/api-keys`
 - `POST /api/admin/api-keys/:id/rotate`
 - `DELETE /api/admin/api-keys/:id`
+
+## API key management
+
+### `POST /api/admin/api-keys`
+
+Creates a DB-backed API key record and returns the raw key once:
+
+```json
+{
+  "id": "ck...",
+  "name": "service-a",
+  "key": "flx_...",
+  "prefix": "flx_1234",
+  "createdAt": "2026-06-22T00:00:00.000Z"
+}
+```
+
+Security behavior:
+
+- The raw key is never stored and is not returned by list responses.
+- Stored hashes use a per-key salt plus `API_KEY_PEPPER`.
+- Validation uses an indexed peppered `lookup_hash` before constant-time comparison on the candidate row.
+- `API_KEY_CREATED`, `API_KEY_ROTATED`, and `API_KEY_REVOKED` are written to `audit_logs`.
+
+### `GET /api/admin/api-keys`
+
+Lists records for operators. Responses include `id`, `name`, `keyHash`, `prefix`, timestamps, and `active`, but never include raw keys, salts, or lookup hashes.

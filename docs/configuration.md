@@ -10,6 +10,7 @@ Secret values are never included in validation messages.
 | --- | --- | --- |
 | `DATABASE_URL` | URL | PostgreSQL connection string. |
 | `JWT_SECRET` | string | Minimum 32 characters. Used to sign API JWTs. |
+| `API_KEY_PEPPER` | string | Minimum 32 characters. Required in production for DB-backed API key hashing. |
 | `INDEXER_WORKER_TOKEN` | string | Minimum 32 characters. Required by internal indexer routes. |
 
 ## Optional variables and defaults
@@ -34,6 +35,7 @@ Secret values are never included in validation messages.
 | `STELLAR_RPC_RETRY_DELAY` | integer ms | `1000` |
 | `JWT_EXPIRES_IN` | string | `24h` |
 | `API_KEYS` | comma-separated string | Empty, except `test-api-key` in tests |
+| `API_KEY_PEPPER` | string | unset outside production |
 | `ADMIN_API_KEY` | string | unset |
 | `MAX_REQUEST_SIZE` | bytes string, supports `b`, `kb`, `mb`, `gb` | `1mb` |
 | `MAX_JSON_DEPTH` | integer, 1-1000 | `20` |
@@ -83,3 +85,9 @@ Secret values are never included in validation messages.
 | `FLUXORA_SHUTDOWN` | boolean | unset; internal graceful shutdown flag |
 
 Booleans accept `true`, `false`, `1`, and `0`.
+
+## API key storage
+
+Admin-created API keys are stored in PostgreSQL in the `api_keys` table. The raw key is returned once during create/rotate and is never persisted. Stored rows contain a per-key salt, a peppered HMAC key hash, and a peppered `lookup_hash` derived from the display prefix so validation can use the `api_keys_active_lookup_hash_idx` index instead of scanning every key.
+
+`API_KEY_PEPPER` must be a deployment secret of at least 32 characters. It is required in production and is treated as a secret in configuration validation messages.

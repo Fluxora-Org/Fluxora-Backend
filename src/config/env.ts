@@ -3,7 +3,6 @@ import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from '.
 import {
   getPinnedAddressNetwork,
   isValidStellarContractAddress,
-  STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
   type PinnedStellarAddressKind,
   type PinnedStellarNetwork,
@@ -27,6 +26,7 @@ const SECRET_ENV_NAMES = new Set([
   'ADMIN_API_TOKEN',
   'ADMIN_API_KEY',
   'API_KEYS',
+  'API_KEY_PEPPER',
   'FLUXORA_WEBHOOK_SECRET',
   'FLUXORA_WEBHOOK_SECRET_PREVIOUS',
 ]);
@@ -204,6 +204,10 @@ export const EnvSchema = z.object({
   ),
   JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
   API_KEYS: z.string().optional(),
+  API_KEY_PEPPER: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional(),
+  ),
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
   ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
@@ -289,6 +293,14 @@ export const EnvSchema = z.object({
     });
   }
 
+  if (env.NODE_ENV === 'production' && env.API_KEY_PEPPER === undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['API_KEY_PEPPER'],
+      message: 'API_KEY_PEPPER is required in production',
+    });
+  }
+
   validatePinnedAddress(ctx, stellarNetwork, 'contract', 'STELLAR_CONTRACT_ADDRESS', env.STELLAR_CONTRACT_ADDRESS);
   validatePinnedAddress(ctx, stellarNetwork, 'token', 'STELLAR_TOKEN_ADDRESS', env.STELLAR_TOKEN_ADDRESS);
 });
@@ -331,6 +343,7 @@ export interface Config {
   pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
+  apiKeyPepper?: string | undefined;
   indexerWorkerToken: string;
 
   maxRequestSizeBytes: number;
@@ -475,6 +488,7 @@ function toConfig(env: ParsedEnv): Config {
       .split(',')
       .map((key) => key.trim())
       .filter((key) => key.length > 0),
+    apiKeyPepper: env.API_KEY_PEPPER,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
 
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,

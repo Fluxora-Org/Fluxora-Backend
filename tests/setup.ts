@@ -19,6 +19,8 @@ process.env.DATABASE_URL =
   process.env.DATABASE_URL ?? 'postgresql://localhost/fluxora_test';
 process.env.JWT_SECRET =
   process.env.JWT_SECRET ?? 'a-very-long-secret-key-for-testing-only-12345';
+process.env.API_KEY_PEPPER =
+  process.env.API_KEY_PEPPER ?? 'api-key-pepper-for-testing-only-123456';
 process.env.INDEXER_WORKER_TOKEN =
   process.env.INDEXER_WORKER_TOKEN ?? 'indexer-worker-token-for-testing-only-12345';
 process.env.STELLAR_NETWORK = process.env.STELLAR_NETWORK ?? 'testnet';

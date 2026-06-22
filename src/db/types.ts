@@ -179,8 +179,17 @@ export interface ApiKeyRecord {
   createdAt: string;
   /** ISO-8601 last-rotated timestamp, or null if never rotated */
   rotatedAt: string | null;
+  /** ISO-8601 revocation timestamp, or null if still usable */
+  revokedAt: string | null;
   /** Whether the key is still active */
   active: boolean;
+}
+
+export interface ApiKeyStoredRecord extends ApiKeyRecord {
+  /** Per-key random salt used by the stored key hash */
+  keySalt: string;
+  /** Pepper-keyed lookup hash used for indexed validation */
+  lookupHash: string;
 }
 
 /**

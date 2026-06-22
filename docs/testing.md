@@ -22,7 +22,7 @@ Administrative and operational endpoints require credentials depending on their 
 
 To ensure deterministic behavior and prevent test-to-test side effects, in-process state is initialized and purged in `beforeEach`/`afterEach` hooks:
 - **Pause & Reindex State**: Cleared using `_resetForTest()` from `src/state/adminState.ts`.
-- **API Key Records**: Cleared using `_resetApiKeyStoreForTest()` from `src/lib/apiKey.ts`.
+- **API Key Records**: Route/unit suites inject a repository test double and clear it with `_resetApiKeyStoreForTest()` from `src/lib/apiKey.ts`; production records live in PostgreSQL.
 - **DLQ Entries**: Cleared using `_resetDlq()` from `src/routes/dlq.ts`.
 
 ## Supertest Integration
@@ -37,6 +37,8 @@ const res = await request(app)
   .get('/api/admin/pause')
   .set('Authorization', `Bearer \${process.env.ADMIN_API_KEY}`);
 ```
+
+`admin.apiKeys.test.ts` mounts `adminRouter` in a small Express app and mocks the API-key repository. This keeps the API-key route suite focused on DB-backed hashing, audit behavior, and response shape even when unrelated application-level modules have baseline failures.
 
 ---
 

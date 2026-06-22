@@ -1,116 +1,189 @@
 import { createId } from '@paralleldrive/cuid2';
-import { createHash, timingSafeEqual } from 'crypto';
-import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import type { ApiKeyCreated, ApiKeyRecord, ApiKeyStoredRecord } from '../db/types.js';
+import { apiKeyRepository } from '../db/repositories/apiKeyRepository.js';
 
-// ---------------------------------------------------------------------------
-// In-memory store (replace with DB-backed store when persistence is needed)
-// ---------------------------------------------------------------------------
-const store = new Map<string, ApiKeyRecord>();
+const API_KEY_PREFIX = 'flx_';
+const RAW_KEY_BYTES = 32;
+const DISPLAY_PREFIX_LENGTH = 8;
+const SALT_BYTES = 16;
+const HMAC_ALGORITHM = 'sha256';
+const TEST_PEPPER = 'test-api-key-pepper-for-deterministic-unit-tests';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+export interface ApiKeyStore {
+  create(input: {
+    id: string;
+    name: string;
+    keyHash: string;
+    keySalt: string;
+    lookupHash: string;
+    prefix: string;
+    createdAt: string;
+    rotatedAt: string | null;
+  }): Promise<ApiKeyRecord>;
+  findById(id: string): Promise<ApiKeyRecord | undefined>;
+  findActiveByLookupHash(lookupHash: string): Promise<ApiKeyStoredRecord[]>;
+  list(): Promise<ApiKeyRecord[]>;
+  rotate(id: string, input: {
+    keyHash: string;
+    keySalt: string;
+    lookupHash: string;
+    prefix: string;
+    rotatedAt: string;
+  }): Promise<ApiKeyRecord | undefined>;
+  revoke(id: string, revokedAt: string): Promise<ApiKeyRecord | undefined>;
+  deleteAllForTest(): Promise<void>;
+}
 
-function sha256hex(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
+let store: ApiKeyStore = apiKeyRepository;
+
+function hmacHex(pepper: string, ...parts: string[]): string {
+  const hmac = createHmac(HMAC_ALGORITHM, pepper);
+  for (const part of parts) {
+    hmac.update(part);
+    hmac.update('\0');
+  }
+  return hmac.digest('hex');
+}
+
+function resolvePepper(): string {
+  const pepper = process.env.API_KEY_PEPPER;
+  if (pepper && pepper.length >= 32) return pepper;
+  if (process.env.NODE_ENV === 'test') return TEST_PEPPER;
+  throw new Error('API_KEY_PEPPER must be at least 32 characters');
 }
 
 function generateRawKey(): string {
-  // 32 random bytes → 64-char hex string
-  const { randomBytes } = require('crypto') as typeof import('crypto');
-  return `flx_${randomBytes(32).toString('hex')}`;
+  return `${API_KEY_PREFIX}${randomBytes(RAW_KEY_BYTES).toString('hex')}`;
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+function generateSalt(): string {
+  return randomBytes(SALT_BYTES).toString('hex');
+}
 
 /**
- * Creates a new API key. Returns the record plus the raw key (shown once).
+ * Build the salted, peppered credential hash stored in Postgres.
+ *
+ * The per-row salt prevents equal raw keys from producing equal stored hashes.
+ * The server-side pepper keeps leaked DB rows from being directly reusable for
+ * offline precomputation unless the deployment secret is also compromised.
  */
-export function createApiKey(name: string): ApiKeyCreated {
+export function hashApiKeyForStorage(rawKey: string, salt: string, pepper = resolvePepper()): string {
+  return hmacHex(pepper, 'api-key:v1:storage', salt, rawKey);
+}
+
+/**
+ * Build the indexed lookup hash from the short display prefix.
+ *
+ * Validation uses this value to fetch a tiny candidate set instead of scanning
+ * all active keys. The DB index stores a pepper-keyed hash, not the raw lookup
+ * material, so it does not expose the whole credential or the pepper.
+ */
+export function hashApiKeyLookupPrefix(prefix: string, pepper = resolvePepper()): string {
+  return hmacHex(pepper, 'api-key:v1:lookup', prefix);
+}
+
+function deriveKeyMaterial(rawKey: string): { keyHash: string; keySalt: string; lookupHash: string; prefix: string } {
+  const keySalt = generateSalt();
+  const prefix = rawKey.slice(0, DISPLAY_PREFIX_LENGTH);
+  return {
+    keyHash: hashApiKeyForStorage(rawKey, keySalt),
+    keySalt,
+    lookupHash: hashApiKeyLookupPrefix(prefix),
+    prefix,
+  };
+}
+
+function isConstantTimeEqualHex(a: string, b: string): boolean {
+  try {
+    const aBuf = Buffer.from(a, 'hex');
+    const bBuf = Buffer.from(b, 'hex');
+    return aBuf.length === bBuf.length && timingSafeEqual(aBuf, bBuf);
+  } catch {
+    return false;
+  }
+}
+
+function assertValidName(name: string): string {
   if (!name || typeof name !== 'string' || !name.trim()) {
     throw new Error('name is required');
   }
+  return name.trim();
+}
 
-  const raw = generateRawKey();
-  const id = createId();
-  const now = new Date().toISOString();
+export function setApiKeyStoreForTest(nextStore: ApiKeyStore): void {
+  store = nextStore;
+}
 
-  const record: ApiKeyRecord = {
-    id,
-    name: name.trim(),
-    keyHash: sha256hex(raw),
-    prefix: raw.slice(0, 8),
-    createdAt: now,
-    rotatedAt: null,
-    active: true,
-  };
-
-  store.set(id, record);
-
-  return { id, name: record.name, key: raw, prefix: record.prefix, createdAt: now };
+export function resetApiKeyStore(): void {
+  store = apiKeyRepository;
 }
 
 /**
- * Rotates an existing key: invalidates the old hash and issues a new raw key.
- * Returns the new raw key (shown once).
+ * Creates a new API key. Returns the record plus the raw key, shown once.
  */
-export function rotateApiKey(id: string): ApiKeyCreated {
-  const record = store.get(id);
-  if (!record) throw new Error(`API key not found: ${id}`);
-  if (!record.active) throw new Error(`API key is revoked: ${id}`);
+export async function createApiKey(name: string): Promise<ApiKeyCreated> {
+  const trimmedName = assertValidName(name);
+  const raw = generateRawKey();
+  const id = createId();
+  const now = new Date().toISOString();
+  const material = deriveKeyMaterial(raw);
+
+  const record = await store.create({
+    id,
+    name: trimmedName,
+    ...material,
+    createdAt: now,
+    rotatedAt: null,
+  });
+
+  return { id: record.id, name: record.name, key: raw, prefix: record.prefix, createdAt: record.createdAt };
+}
+
+/**
+ * Rotates an existing key and immediately invalidates the old raw key.
+ */
+export async function rotateApiKey(id: string): Promise<ApiKeyCreated> {
+  const existing = await store.findById(id);
+  if (!existing) throw new Error(`API key not found: ${id}`);
+  if (!existing.active) throw new Error(`API key is revoked: ${id}`);
 
   const raw = generateRawKey();
   const now = new Date().toISOString();
+  const material = deriveKeyMaterial(raw);
+  const rotated = await store.rotate(id, { ...material, rotatedAt: now });
+  if (!rotated) throw new Error(`API key is revoked: ${id}`);
 
-  const updated: ApiKeyRecord = {
-    ...record,
-    keyHash: sha256hex(raw),
-    prefix: raw.slice(0, 8),
-    rotatedAt: now,
-  };
-
-  store.set(id, updated);
-
-  return { id, name: record.name, key: raw, prefix: updated.prefix, createdAt: record.createdAt };
+  return { id, name: rotated.name, key: raw, prefix: rotated.prefix, createdAt: rotated.createdAt };
 }
 
 /**
  * Revokes an API key so it can no longer authenticate requests.
  */
-export function revokeApiKey(id: string): void {
-  const record = store.get(id);
+export async function revokeApiKey(id: string): Promise<void> {
+  const record = await store.revoke(id, new Date().toISOString());
   if (!record) throw new Error(`API key not found: ${id}`);
-
-  store.set(id, { ...record, active: false });
 }
 
 /**
- * Returns all stored key records (hashes only — raw keys are never stored).
+ * Returns all stored key records. Raw keys, salts, and lookup hashes are never returned.
  */
-export function listApiKeys(): ApiKeyRecord[] {
-  return Array.from(store.values());
+export async function listApiKeys(): Promise<ApiKeyRecord[]> {
+  return store.list();
 }
 
 /**
- * Validates a raw API key against the stored hashes using constant-time comparison.
+ * Validates a raw API key via indexed lookup plus constant-time candidate comparison.
  */
-export function isValidApiKey(rawKey: string): boolean {
+export async function isValidApiKey(rawKey: string): Promise<boolean> {
   if (!rawKey) return false;
 
-  const hash = sha256hex(rawKey);
-  const hashBuf = Buffer.from(hash, 'hex');
-
-  for (const record of store.values()) {
-    if (!record.active) continue;
-    try {
-      const storedBuf = Buffer.from(record.keyHash, 'hex');
-      if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
-        return true;
-      }
-    } catch {
-      // length mismatch — skip
+  const prefix = rawKey.slice(0, DISPLAY_PREFIX_LENGTH);
+  const candidates = await store.findActiveByLookupHash(hashApiKeyLookupPrefix(prefix));
+  for (const record of candidates) {
+    const candidateHash = hashApiKeyForStorage(rawKey, record.keySalt);
+    if (isConstantTimeEqualHex(record.keyHash, candidateHash)) {
+      return true;
     }
   }
 
@@ -128,7 +201,7 @@ export function getApiKeyFromRequest(
   return key;
 }
 
-/** Exposed for tests only — clears the in-memory store. */
-export function _resetApiKeyStoreForTest(): void {
-  store.clear();
+/** Exposed for tests only. */
+export async function _resetApiKeyStoreForTest(): Promise<void> {
+  await store.deleteAllForTest();
 }
