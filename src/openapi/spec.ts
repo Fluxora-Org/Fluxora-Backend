@@ -28,21 +28,28 @@ const StellarAddress = registry.register(
 
 const StreamStatus = registry.register(
   'StreamStatus',
-  z.enum(['scheduled', 'active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' }),
+  z.enum(['active', 'paused', 'completed', 'cancelled']).openapi({
+    example: 'active',
+    description: 'Persisted stream status values accepted by the streams table.',
+  }),
 );
 
 const StreamObject = registry.register(
   'Stream',
   z.object({
     id: z.string().openapi({ example: 'stream-abc123' }),
-    sender: StellarAddress,
-    recipient: StellarAddress,
-    depositAmount: DecimalString,
-    ratePerSecond: DecimalString,
-    startTime: z.number().int().openapi({ example: 1700000000 }),
-    endTime: z.number().int().openapi({ example: 0 }),
+    sender_address: StellarAddress,
+    recipient_address: StellarAddress,
+    amount: DecimalString,
+    streamed_amount: DecimalString.openapi({ example: '0.0000000' }),
+    remaining_amount: DecimalString,
+    rate_per_second: DecimalString,
+    start_time: z.number().int().openapi({ example: 1700000000 }),
+    end_time: z.number().int().nullable().openapi({ example: null }),
     status: StreamStatus,
-  }).openapi({ description: 'A treasury stream record' }),
+  }).openapi({
+    description: 'A persisted stream record matching the streams table and StreamRecord mapper.',
+  }),
 );
 
 const ResponseMeta = registry.register(
