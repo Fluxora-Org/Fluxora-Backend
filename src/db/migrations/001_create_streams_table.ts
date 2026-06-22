@@ -17,7 +17,7 @@
  * - All monetary amounts stored as TEXT (decimal strings) — never NUMERIC/FLOAT
  * - CHECK constraints enforce decimal-string format at the DB layer
  * - UNIQUE constraint on (transaction_hash, event_index) for idempotent ingestion
- * - Indexes cover all common filter/sort patterns
+ * - Composite indexes align with streamRepository filter+order patterns (see below)
  */
 export const up = `
 CREATE TABLE IF NOT EXISTS streams (
@@ -51,10 +51,16 @@ CREATE TABLE IF NOT EXISTS streams (
   CONSTRAINT streams_unique_event UNIQUE (transaction_hash, event_index)
 );
 
-CREATE INDEX IF NOT EXISTS idx_streams_status      ON streams (status);
-CREATE INDEX IF NOT EXISTS idx_streams_sender      ON streams (sender_address);
+-- Cursor pagination (findWithCursor): filter + ORDER BY id ASC
+CREATE INDEX IF NOT EXISTS idx_streams_status_id              ON streams (status, id);
+CREATE INDEX IF NOT EXISTS idx_streams_sender_id                ON streams (sender_address, id);
+CREATE INDEX IF NOT EXISTS idx_streams_contract_id              ON streams (contract_id, id);
+
+-- Offset pagination (find): status filter + ORDER BY created_at DESC
+CREATE INDEX IF NOT EXISTS idx_streams_status_created_at_desc   ON streams (status, created_at DESC);
+
+-- Standalone indexes for patterns not covered by composites above
 CREATE INDEX IF NOT EXISTS idx_streams_recipient   ON streams (recipient_address);
-CREATE INDEX IF NOT EXISTS idx_streams_contract    ON streams (contract_id);
 CREATE INDEX IF NOT EXISTS idx_streams_created_at  ON streams (created_at);
 CREATE INDEX IF NOT EXISTS idx_streams_start_time  ON streams (start_time);
 CREATE INDEX IF NOT EXISTS idx_streams_end_time    ON streams (end_time);

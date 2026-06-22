@@ -41,6 +41,8 @@ This creates:
 - `historical_events` table (source data)
 - `contract_events` table (replay destination)
 - Optimized indexes for replay queries
+- Composite stream pagination indexes (`idx_streams_status_id`, `idx_streams_sender_id`,
+  `idx_streams_contract_id`, `idx_streams_status_created_at_desc`) — see [docs/STREAMS.md](docs/STREAMS.md)
 
 ## 🏃 Running the Service
 

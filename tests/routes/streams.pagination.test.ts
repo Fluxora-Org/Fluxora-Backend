@@ -279,6 +279,48 @@ describe('GET /api/streams — pagination', () => {
     );
   });
 
+  it('forwards status + sender multi-filter to the repository', async () => {
+    mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
+    const addr = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
+    await request(app).get(`/api/streams?status=active&sender=${addr}`).expect(200);
+    expect(mockFindWithCursor).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'active', sender_address: addr }),
+      20, undefined, false,
+    );
+  });
+
+  it('paginates filtered cursor pages using afterId from prior page', async () => {
+    mockFindWithCursor
+      .mockResolvedValueOnce({
+        streams: [makeRow('stream-b'), makeRow('stream-c')],
+        hasMore: true,
+      })
+      .mockResolvedValueOnce({
+        streams: [makeRow('stream-d')],
+        hasMore: false,
+      });
+
+    const page1 = await request(app).get('/api/streams?status=active&limit=2').expect(200);
+    expect(mockFindWithCursor).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ status: 'active' }),
+      2, undefined, false,
+    );
+
+    const cursor = page1.body.data.next_cursor as string;
+    await request(app)
+      .get(`/api/streams?status=active&limit=2&cursor=${encodeURIComponent(cursor)}`)
+      .expect(200);
+
+    expect(mockFindWithCursor).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ status: 'active' }),
+      2,
+      'stream-c',
+      false,
+    );
+  });
+
   // ── include_total ───────────────────────────────────────────────────────────
 
   it('passes includeTotal=true to repository when include_total=true', async () => {
