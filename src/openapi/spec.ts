@@ -14,7 +14,7 @@ extendZodWithOpenApi(z);
 
 export const registry = new OpenAPIRegistry();
 
-// ── Shared schemas ────────────────────────────────────────────────────────────
+// ?? Shared schemas ????????????????????????????????????????????????????????????
 
 const DecimalString = registry.register(
   'DecimalString',
@@ -23,7 +23,7 @@ const DecimalString = registry.register(
 
 const StellarAddress = registry.register(
   'StellarAddress',
-  z.string().openapi({ example: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN', description: 'Stellar public key (G…)' }),
+  z.string().openapi({ example: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN', description: 'Stellar public key (G.)' }),
 );
 
 const StreamStatus = registry.register(
@@ -67,7 +67,7 @@ const ErrorEnvelope = registry.register(
   }),
 );
 
-// ── Security schemes ──────────────────────────────────────────────────────────
+// ?? Security schemes ??????????????????????????????????????????????????????????
 
 registry.registerComponent('securitySchemes', 'bearerAuth', {
   type: 'http',
@@ -83,7 +83,7 @@ registry.registerComponent('securitySchemes', 'indexerWorkerToken', {
   description: 'Static shared secret for internal indexer worker endpoints',
 });
 
-// ── Reusable response helpers ─────────────────────────────────────────────────
+// ?? Reusable response helpers ?????????????????????????????????????????????????
 
 function successSchema<T extends z.ZodTypeAny>(dataSchema: T) {
   return z.object({ success: z.literal(true), data: dataSchema, meta: ResponseMeta });
@@ -102,7 +102,7 @@ const errorResponses = {
   '503': { description: 'Service unavailable', content: { 'application/json': { schema: ErrorEnvelope } } },
 } as const;
 
-// ── GET / ─────────────────────────────────────────────────────────────────────
+// ?? GET / ?????????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/',
@@ -116,7 +116,7 @@ registry.registerPath({
   },
 });
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// ?? Health ????????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/health',
@@ -167,7 +167,7 @@ registry.registerPath({
   },
 });
 
-// ── Streams ───────────────────────────────────────────────────────────────────
+// ?? Streams ???????????????????????????????????????????????????????????????????
 
 /**
  * Cursor semantics for GET /api/streams
@@ -176,7 +176,7 @@ registry.registerPath({
  *   Each cursor is an opaque base64url token. Internally it encodes a
  *   version-tagged JSON object `{ v: 1, lastId: "<stream-id>" }`, where
  *   `lastId` is the `id` of the last stream returned on the previous page.
- *   Clients MUST treat cursors as black boxes — the internal structure is
+ *   Clients MUST treat cursors as black boxes - the internal structure is
  *   not part of the public API and may change without notice. Do not
  *   construct or decode cursors manually.
  *
@@ -191,7 +191,7 @@ registry.registerPath({
  *   issued do not invalidate it, because the query uses a keyset condition
  *   (`id > lastId`). However, a cursor referencing a deleted or
  *   compacted stream id will simply skip to the next matching row without
- *   error — the client observes a gap, not a failure.
+ *   error - the client observes a gap, not a failure.
  *
  *   A structurally invalid cursor (wrong base64url encoding, missing version
  *   tag, or empty `lastId`) is rejected immediately with 400
@@ -208,7 +208,7 @@ registry.registerPath({
  *   2. If `has_more` is `true`, pass the returned `next_cursor` as the
  *      `cursor` parameter to fetch the next page.
  *   3. When `has_more` is `false`, `next_cursor` is `null` and you are on
- *      the last page — stop iterating.
+ *      the last page - stop iterating.
  */
 
 /** Cursor token schema with full semantics documented. */
@@ -266,20 +266,112 @@ const InvalidCursorError = z.object({
     'by omitting the `cursor` parameter.',
 });
 
+const ContractEventTopic = registry.register(
+  'ContractEventTopic',
+  z.enum([
+    'stream.created',
+    'stream.updated',
+    'stream.cancelled',
+    'stream.paused',
+    'stream.resumed',
+    'governance.proposed',
+    'governance.approved',
+    'governance.executed',
+    'governance.cancelled',
+    'factory.initialized',
+    'factory.policy_updated',
+    'factory.stream_created',
+  ]).openapi({
+    description:
+      'Known contract event topics accepted by the indexer ingest API. ' +
+      'Use the exact emitted topic string so replay filters and downstream webhooks can match events consistently.',
+    example: 'stream.created',
+  }),
+);
+
+const ContractEventPayload = z.record(z.string(), z.unknown()).openapi({
+  description:
+    'Topic-specific event payload decoded from the chain. ' +
+    'Amounts must remain decimal strings; consumers must validate topic-specific fields before arithmetic.',
+  example: {
+    streamId: 'stream-evt-001',
+    depositAmount: '100.0000000',
+    ratePerSecond: '0.0000001',
+  },
+});
+
+const ContractEvent = registry.register(
+  'ContractEvent',
+  z.object({
+    eventId: z.string().min(1).max(128).openapi({
+      description: 'Stable unique event ID used for idempotent ingest and duplicate detection.',
+      example: 'evt-001',
+    }),
+    ledger: z.number().int().nonnegative().openapi({
+      description: 'Stellar ledger sequence that emitted the event.',
+      example: 512345,
+    }),
+    contractId: z.string().min(1).max(128).openapi({
+      description: 'Soroban contract ID that emitted the event.',
+      example: 'CCONTRACT123',
+    }),
+    topic: ContractEventTopic,
+    txHash: z.string().min(1).max(128).openapi({
+      description: 'Transaction hash containing the contract event.',
+      example: 'tx-evt-001',
+    }),
+    txIndex: z.number().int().nonnegative().openapi({
+      description: 'Zero-based transaction index within the ledger.',
+      example: 0,
+    }),
+    operationIndex: z.number().int().nonnegative().openapi({
+      description: 'Zero-based operation index within the transaction.',
+      example: 0,
+    }),
+    eventIndex: z.number().int().nonnegative().openapi({
+      description: 'Zero-based event index within the operation or transaction event list.',
+      example: 0,
+    }),
+    payload: ContractEventPayload,
+    happenedAt: z.string().datetime().openapi({
+      description: 'ISO-8601 ledger close timestamp for the emitted event.',
+      example: '2026-03-26T12:00:00.000Z',
+    }),
+    ledgerHash: z.string().min(1).max(128).openapi({
+      description: 'Ledger hash used by the indexer to detect and suppress chain reorgs.',
+      example: 'hash-512345',
+    }),
+  }).strict().openapi({
+    description:
+      'Typed contract event ingest record. The HTTP shape is camelCase; the store maps fields to snake_case DB columns.',
+  }),
+);
+
+const ContractEventBatch = registry.register(
+  'ContractEventBatch',
+  z.object({
+    events: z.array(ContractEvent).min(1).max(100).openapi({
+      description: 'Atomic batch of contract events. Batches are capped at 100 events.',
+    }),
+  }).strict().openapi({
+    description: 'Request body for POST /internal/indexer/contract-events.',
+  }),
+);
+
 registry.registerPath({
   method: 'get', path: '/api/streams',
   summary: 'List streams (cursor-paginated)',
   description:
     '## Cursor Pagination\n\n' +
-    '**Encoding** — `next_cursor` is an opaque base64url token (`{ v: 1, lastId }` internally). ' +
+    '**Encoding** - `next_cursor` is an opaque base64url token (`{ v: 1, lastId }` internally). ' +
     'Never construct or decode it manually; the internal format may change.\n\n' +
-    '**Security** — Cursors do not contain raw database row ids or PII. ' +
+    '**Security** - Cursors do not contain raw database row ids or PII. ' +
     'The embedded `lastId` is the same application-level id that appears in list responses. ' +
     'Server-side ownership scoping is re-applied on every request.\n\n' +
-    '**Stability** — Cursors survive concurrent inserts (keyset semantics: `id > lastId`). ' +
+    '**Stability** - Cursors survive concurrent inserts (keyset semantics: `id > lastId`). ' +
     'Deleting the row referenced by a cursor does not cause an error; the next matching row is returned.\n\n' +
-    '**Ordering** — Pages are returned in ascending `id` order (deterministic lexicographic sort).\n\n' +
-    '**Invalid cursor** — A malformed or tampered cursor returns `400 VALIDATION_ERROR` with ' +
+    '**Ordering** - Pages are returned in ascending `id` order (deterministic lexicographic sort).\n\n' +
+    '**Invalid cursor** - A malformed or tampered cursor returns `400 VALIDATION_ERROR` with ' +
     '`message: "cursor must be a valid opaque pagination token"` before any database access. ' +
     'Discard the cursor and restart from page 1.',
   tags: ['streams'],
@@ -287,13 +379,13 @@ registry.registerPath({
     query: z.object({
       limit: z.string().optional().openapi({
         example: '20',
-        description: 'Page size (1–100, default 20).',
+        description: 'Page size (1-100, default 20).',
       }),
       cursor: z.string().optional().openapi({
         description:
-          'Opaque cursor from the previous page's `next_cursor`. ' +
+          "Opaque cursor from the previous page's `next_cursor`. " +
           'Omit to request the first page. ' +
-          'Treated as a black box — do not construct manually.',
+          'Treated as a black box - do not construct manually.',
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
       }),
       status: z.string().optional().openapi({ example: 'active' }),
@@ -372,7 +464,7 @@ registry.registerPath({
             lastPage: {
               summary: 'Last page (has_more=false, next_cursor=null)',
               description:
-                'When `has_more` is `false`, `next_cursor` is `null` — stop iterating. ' +
+                'When `has_more` is `false`, `next_cursor` is `null` - stop iterating. ' +
                 'The `streams` array may be empty if no rows remain after the cursor.',
               value: {
                 success: true,
@@ -401,13 +493,13 @@ registry.registerPath({
     },
     '400': {
       description:
-        'Validation error. Also returned for an invalid or expired cursor — ' +
+        'Validation error. Also returned for an invalid or expired cursor - ' +
         '`error.code` will be `"VALIDATION_ERROR"` and ' +
         '`error.message` will be `"cursor must be a valid opaque pagination token"`. ' +
         'Discard the cursor and restart pagination from page 1 (omit `cursor`).',
       content: {
         'application/json': {
-          schema: ErrorEnvelope,
+          schema: z.union([InvalidCursorError, ErrorEnvelope]),
           examples: {
             invalidCursor: {
               summary: 'Invalid or expired cursor',
@@ -472,7 +564,7 @@ registry.registerPath({
   tags: ['streams'],
   security: [{ bearerAuth: [] }],
   request: {
-    headers: z.object({ 'Idempotency-Key': z.string().openapi({ description: 'Unique key (1–128 chars) to prevent duplicate creation', example: 'my-key-001' }) }),
+    headers: z.object({ 'Idempotency-Key': z.string().openapi({ description: 'Unique key (1-128 chars) to prevent duplicate creation', example: 'my-key-001' }) }),
     body: {
       required: true,
       content: {
@@ -551,7 +643,7 @@ registry.registerPath({
   },
 });
 
-// ── Auth ──────────────────────────────────────────────────────────────────────
+// ?? Auth ??????????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'post', path: '/api/auth/session',
@@ -586,7 +678,7 @@ registry.registerPath({
   },
 });
 
-// ── Audit ─────────────────────────────────────────────────────────────────────
+// ?? Audit ?????????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/api/audit',
@@ -610,7 +702,7 @@ registry.registerPath({
   },
 });
 
-// ── Privacy ───────────────────────────────────────────────────────────────────
+// ?? Privacy ???????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/api/privacy/policy',
@@ -630,7 +722,7 @@ registry.registerPath({
   },
 });
 
-// ── Admin ─────────────────────────────────────────────────────────────────────
+// ?? Admin ?????????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/api/admin/status/read-only',
@@ -765,7 +857,7 @@ registry.registerPath({
   },
 });
 
-// ── DLQ ───────────────────────────────────────────────────────────────────────
+// ?? DLQ ???????????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/admin/dlq',
@@ -829,7 +921,7 @@ registry.registerPath({
   },
 });
 
-// ── Rate limits ───────────────────────────────────────────────────────────────
+// ?? Rate limits ???????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/api/rate-limits',
@@ -879,7 +971,7 @@ registry.registerPath({
   },
 });
 
-// ── Internal indexer ──────────────────────────────────────────────────────────
+// ?? Internal indexer ??????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'post', path: '/internal/indexer/contract-events',
@@ -891,14 +983,63 @@ registry.registerPath({
       required: true,
       content: {
         'application/json': {
-          schema: z.object({ events: z.array(z.record(z.string(), z.unknown())).max(100) }),
-          example: { events: [{ eventId: 'evt-001', ledger: 1000, contractId: 'C...', topic: 'stream.created', payload: {} }] },
+          schema: ContractEventBatch,
+          examples: {
+            streamCreated: {
+              summary: 'Stream created event',
+              value: {
+                events: [
+                  {
+                    eventId: 'evt-001',
+                    ledger: 512345,
+                    contractId: 'CCONTRACT123',
+                    topic: 'stream.created',
+                    txHash: 'tx-evt-001',
+                    txIndex: 0,
+                    operationIndex: 0,
+                    eventIndex: 0,
+                    payload: {
+                      streamId: 'stream-evt-001',
+                      depositAmount: '100.0000000',
+                      ratePerSecond: '0.0000001',
+                    },
+                    happenedAt: '2026-03-26T12:00:00.000Z',
+                    ledgerHash: 'hash-512345',
+                  },
+                ],
+              },
+            },
+            governanceExecuted: {
+              summary: 'Governance execution event',
+              value: {
+                events: [
+                  {
+                    eventId: 'evt-gov-001',
+                    ledger: 512346,
+                    contractId: 'CGOVERNANCE123',
+                    topic: 'governance.executed',
+                    txHash: 'tx-gov-001',
+                    txIndex: 1,
+                    operationIndex: 0,
+                    eventIndex: 2,
+                    payload: {
+                      proposalId: 42,
+                      target: 'CFACTORY123',
+                    },
+                    happenedAt: '2026-03-26T12:05:00.000Z',
+                    ledgerHash: 'hash-512346',
+                  },
+                ],
+              },
+            },
+          },
         },
       },
     },
   },
   responses: {
     '200': { description: 'Batch persisted', content: { 'application/json': { schema: successSchema(z.object({ outcome: z.string(), insertedCount: z.number(), duplicateCount: z.number(), insertedEventIds: z.array(z.string()), duplicateEventIds: z.array(z.string()) })) } } },
+    '400': errorResponses['400'],
     '401': errorResponses['401'],
     '409': errorResponses['409'],
     '413': { description: 'Payload too large', content: { 'application/json': { schema: ErrorEnvelope } } },
@@ -949,7 +1090,7 @@ registry.registerPath({
   },
 });
 
-// ── Webhooks ──────────────────────────────────────────────────────────────────
+// ?? Webhooks ??????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'post', path: '/internal/webhooks/receive',
@@ -983,7 +1124,7 @@ registry.registerPath({
   },
 });
 
-// ── Metrics ───────────────────────────────────────────────────────────────────
+// ?? Metrics ???????????????????????????????????????????????????????????????????
 
 registry.registerPath({
   method: 'get', path: '/metrics',
@@ -994,7 +1135,7 @@ registry.registerPath({
   },
 });
 
-// ── Generator ─────────────────────────────────────────────────────────────────
+// ?? Generator ?????????????????????????????????????????????????????????????????
 
 /**
  * Build and return the complete OpenAPI 3.1 document.

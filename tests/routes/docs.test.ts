@@ -7,7 +7,7 @@ beforeEach(() => {
   resetSpecCache();
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ?? Helpers ???????????????????????????????????????????????????????????????????
 
 /** Traverse a resolved $ref or inline schema in the components. */
 function resolveRef(spec: Record<string, unknown>, ref: string): Record<string, unknown> | undefined {
@@ -138,6 +138,50 @@ describe('GET /openapi.json', () => {
     expect(sec?.some((s) => 'indexerWorkerToken' in s)).toBe(true);
   });
 
+  it('documents a typed contract-event ingest schema', async () => {
+    const res = await request(app).get('/openapi.json');
+    const spec = res.body as Record<string, unknown>;
+    const route = (spec.paths as Record<string, unknown>)['/internal/indexer/contract-events'] as Record<string, unknown>;
+    const post = route.post as Record<string, unknown>;
+    const requestBody = post.requestBody as Record<string, unknown>;
+    const content = (requestBody.content as Record<string, unknown>)['application/json'] as Record<string, unknown>;
+    const batchSchema = content.schema as Record<string, unknown>;
+
+    expect(batchSchema.$ref).toBe('#/components/schemas/ContractEventBatch');
+
+    const resolvedBatch = resolveRef(spec, batchSchema.$ref as string);
+    const events = (resolvedBatch?.properties as Record<string, unknown>)?.events as Record<string, unknown>;
+    const eventItems = events.items as Record<string, unknown>;
+    expect(eventItems.$ref).toBe('#/components/schemas/ContractEvent');
+    expect(events.minItems).toBe(1);
+    expect(events.maxItems).toBe(100);
+
+    const eventSchema = resolveRef(spec, eventItems.$ref as string);
+    expect(eventSchema?.required).toEqual(
+      expect.arrayContaining([
+        'eventId',
+        'ledger',
+        'contractId',
+        'topic',
+        'txHash',
+        'txIndex',
+        'operationIndex',
+        'eventIndex',
+        'payload',
+        'happenedAt',
+        'ledgerHash',
+      ]),
+    );
+
+    const properties = eventSchema?.properties as Record<string, unknown>;
+    const topic = properties.topic as Record<string, unknown>;
+    expect(topic.$ref).toBe('#/components/schemas/ContractEventTopic');
+    const topicSchema = resolveRef(spec, topic.$ref as string);
+    expect(topicSchema?.enum).toEqual(expect.arrayContaining(['stream.created', 'governance.executed']));
+    expect((properties.ledger as Record<string, unknown>).minimum).toBe(0);
+    expect((properties.payload as Record<string, unknown>).type).toBe('object');
+  });
+
   it('includes error response schemas (400, 401, 404, 500)', async () => {
     const res = await request(app).get('/openapi.json');
     const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
@@ -178,9 +222,9 @@ describe('GET /openapi.json', () => {
     );
   });
 
-  // ── Cursor semantics documentation ───────────────────────────────────────────
+  // ?? Cursor semantics documentation ???????????????????????????????????????????
 
-  describe('GET /api/streams — cursor pagination documentation', () => {
+  describe('GET /api/streams - cursor pagination documentation', () => {
     async function getListOp() {
       const res = await request(app).get('/openapi.json');
       const spec = res.body as Record<string, unknown>;
@@ -189,7 +233,7 @@ describe('GET /openapi.json', () => {
       )?.get as Record<string, unknown>;
     }
 
-    // ── cursor param documentation ───────────────────────────────────────────
+    // ?? cursor param documentation ???????????????????????????????????????????
 
     it('documents the cursor query parameter', async () => {
       const op = await getListOp();
@@ -240,7 +284,7 @@ describe('GET /openapi.json', () => {
       expect((decoded['lastId'] as string).length).toBeGreaterThan(0);
     });
 
-    // ── operation-level description ────────────────────────────────────────────
+    // ?? operation-level description ????????????????????????????????????????????
 
     it('operation description mentions cursor encoding', async () => {
       const op = await getListOp();
@@ -278,7 +322,7 @@ describe('GET /openapi.json', () => {
       expect(desc.toLowerCase()).toMatch(/pii|ownership|scop|internal/);
     });
 
-    // ── 400 response ────────────────────────────────────────────────────────
+    // ?? 400 response ????????????????????????????????????????????????????????
 
     it('documents 400 response on the list operation', async () => {
       const op = await getListOp();
@@ -335,7 +379,7 @@ describe('GET /openapi.json', () => {
       expect(message).toBe('cursor must be a valid opaque pagination token');
     });
 
-    // ── 200 response examples ───────────────────────────────────────────────
+    // ?? 200 response examples ???????????????????????????????????????????????
 
     it('200 response has examples (not a single example)', async () => {
       const op = await getListOp();
@@ -430,7 +474,7 @@ describe('GET /openapi.json', () => {
       }
     });
 
-    // ── StreamCursorToken schema registration ───────────────────────────────
+    // ?? StreamCursorToken schema registration ???????????????????????????????
 
     it('registers StreamCursorToken in components/schemas', async () => {
       const res = await request(app).get('/openapi.json');
@@ -468,7 +512,7 @@ describe('GET /openapi.json', () => {
       expect(isNaN(Number(decoded['lastId']))).toBe(true);
     });
 
-    // ── StreamListPage schema ───────────────────────────────────────────────
+    // ?? StreamListPage schema ???????????????????????????????????????????????
 
     it('registers StreamListPage in components/schemas', async () => {
       const res = await request(app).get('/openapi.json');
@@ -490,7 +534,7 @@ describe('GET /openapi.json', () => {
       const schemas = (res.body?.components?.schemas ?? {}) as Record<string, unknown>;
       const schema = schemas['StreamListPage'] as Record<string, unknown>;
       const props = schema?.['properties'] as Record<string, unknown>;
-      // next_cursor may be an inline schema or a $ref — check anyOf/oneOf or direct
+      // next_cursor may be an inline schema or a $ref - check anyOf/oneOf or direct
       const nextCursorProp = props?.['next_cursor'] as Record<string, unknown>;
       const desc = (nextCursorProp?.['description'] ?? '') as string;
       expect(desc.toLowerCase()).toMatch(/null|last page/);
