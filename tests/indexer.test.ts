@@ -29,13 +29,20 @@ import {
   setIndexerIngestAuthToken,
 } from '../src/routes/indexer.js';
 import { toDecimalString } from '../src/indexer/types.js';
+import { initializeConfig } from '../src/config/env.js';
+import { generateToken } from '../src/lib/auth.js';
+import { Permission } from '../src/middleware/auth.js';
 
 const INDEXER_TOKEN = 'test-indexer-token';
 const INGEST_ENDPOINT = '/internal/indexer/contract-events';
 const REPLAY_ENDPOINT = '/internal/indexer/events';
+const REPLAY_JOB_ENDPOINT = '/internal/indexer/events/replay';
+const STATUS_ENDPOINT = '/internal/indexer/status';
 // Short aliases used by legacy describe blocks.
 const TOKEN = INDEXER_TOKEN;
 const ENDPOINT = INGEST_ENDPOINT;
+
+initializeConfig();
 
 function buildEvent(eventId: string, ledger = 512345, ledgerHash = `hash-${ledger}`) {
   return {
@@ -133,7 +140,7 @@ describe('Indexer worker contract event ingestion', () => {
   });
 });
 
-describe('Indexer HTTP — auth & validation', () => {
+describe('Indexer HTTP - auth & validation', () => {
   beforeEach(() => {
     resetIndexerState();
     setIndexerIngestAuthToken(TOKEN);
@@ -203,7 +210,7 @@ describe('Indexer HTTP — auth & validation', () => {
   });
 });
 
-describe('Indexer HTTP — dependency state & rate limit', () => {
+describe('Indexer HTTP - dependency state & rate limit', () => {
   beforeEach(() => {
     resetIndexerState();
     setIndexerIngestAuthToken(TOKEN);
@@ -232,11 +239,90 @@ describe('Indexer HTTP — dependency state & rate limit', () => {
   });
 });
 
+describe('Indexer replay management HTTP boundary', () => {
+  const replayToken = () =>
+    generateToken({
+      address: 'GINDEXER',
+      role: 'operator',
+      permissions: [Permission.INDEXER_REPLAY],
+    });
+
+  const viewerToken = () =>
+    generateToken({
+      address: 'GVIEWER',
+      role: 'viewer',
+      permissions: [Permission.STREAMS_READ],
+    });
+
+  beforeEach(() => {
+    resetIndexerState();
+  });
+
+  it('exposes status at the mounted single-prefix path with standard envelope', async () => {
+    const res = await request(app).get(STATUS_ENDPOINT).expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.isReplaying).toBe(false);
+    expect(res.body.meta.timestamp).toBeDefined();
+  });
+
+  it('does not expose the old doubled replay path', async () => {
+    await request(app)
+      .post('/internal/indexer/internal/indexer/events/replay')
+      .send({ contract_id: 'C1', ledger: 1 })
+      .expect(404);
+  });
+
+  it('rejects replay start without authentication', async () => {
+    const res = await request(app)
+      .post(REPLAY_JOB_ENDPOINT)
+      .send({ contract_id: 'C1', ledger: 1 })
+      .expect(401);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+  });
+
+  it('rejects replay start without INDEXER_REPLAY permission', async () => {
+    const res = await request(app)
+      .post(REPLAY_JOB_ENDPOINT)
+      .set('Authorization', `Bearer ${viewerToken()}`)
+      .send({ contract_id: 'C1', ledger: 1 })
+      .expect(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  it('rejects invalid replay request bodies with standard validation envelope', async () => {
+    const res = await request(app)
+      .post(REPLAY_JOB_ENDPOINT)
+      .set('Authorization', `Bearer ${replayToken()}`)
+      .send({ contract_id: 'C1', ledger: 1, from_block: 9, to_block: 2 })
+      .expect(400);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect(res.body.error.details[0].message).toMatch(/from_block/);
+  });
+
+  it('starts replay for callers with INDEXER_REPLAY permission', async () => {
+    const { indexerService } = await import('../src/indexer/service.js');
+    const original = indexerService.replayEvents.bind(indexerService);
+    indexerService.replayEvents = async () => {};
+    try {
+      const res = await request(app)
+        .post(REPLAY_JOB_ENDPOINT)
+        .set('Authorization', `Bearer ${replayToken()}`)
+        .send({ contract_id: 'C1', ledger: 1, from_block: 0, to_block: 2 })
+        .expect(202);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.message).toBe('Replay started');
+      expect(res.body.data.status).toBeDefined();
+    } finally {
+      indexerService.replayEvents = original;
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // InMemoryContractEventStore unit tests
 // ---------------------------------------------------------------------------
 
-describe('InMemoryContractEventStore — unit', () => {
+describe('InMemoryContractEventStore - unit', () => {
   let store: InMemoryContractEventStore;
 
   beforeEach(() => {
@@ -384,7 +470,7 @@ describe('InMemoryContractEventStore — unit', () => {
 // PostgresContractEventStore unit tests (mock client)
 // ---------------------------------------------------------------------------
 
-describe('PostgresContractEventStore — unit (mock client)', () => {
+describe('PostgresContractEventStore - unit (mock client)', () => {
   function makeMockClient(rows: unknown[] = []) {
     return {
       query: async <T>(_sql: string, _values?: unknown[]) => ({ rows: rows as T[], rowCount: rows.length }),
@@ -469,7 +555,7 @@ describe('toDecimalString()', () => {
   });
 });
 
-describe('GET /internal/indexer/events — replay endpoint', () => {
+describe('GET /internal/indexer/events - replay endpoint', () => {
   beforeEach(() => {
     resetIndexerState();
     setIndexerIngestAuthToken(INDEXER_TOKEN);
@@ -582,7 +668,7 @@ describe('GET /internal/indexer/events — replay endpoint', () => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /internal/indexer/events/replay — cursor-based replay endpoint
+// GET /internal/indexer/events/replay - cursor-based replay endpoint
 // ---------------------------------------------------------------------------
 
 const CURSOR_REPLAY_ENDPOINT = '/internal/indexer/events/replay';
@@ -617,7 +703,7 @@ function buildReplayEvent(eventId: string, ledger: number, ledgerHash = `hash-${
   };
 }
 
-describe('GET /internal/indexer/events/replay — cursor-based replay', () => {
+describe('GET /internal/indexer/events/replay - cursor-based replay', () => {
   beforeEach(() => {
     resetIndexerState();
     setIndexerIngestAuthToken(INDEXER_TOKEN);
@@ -726,7 +812,7 @@ describe('GET /internal/indexer/events/replay — cursor-based replay', () => {
       buildReplayEvent('e4', 400),
     ]).expect(200);
 
-    // afterEventId=e1 AND fromLedger=200 → e2, e3, e4
+    // afterEventId=e1 AND fromLedger=200 ? e2, e3, e4
     const res = await getReplay({ afterEventId: 'e1', fromLedger: 200 }).expect(200);
     expect(res.body.data.events.map((e: any) => e.eventId)).toEqual(['e2', 'e3', 'e4']);
   });

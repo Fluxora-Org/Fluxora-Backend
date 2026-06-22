@@ -3,6 +3,9 @@ import { db } from '../db/client';
 import { config } from '../config';
 import { ContractEvent, ReplayProgress, ReplayCursor, ReplayRequest } from '../types';
 import { logger } from '../lib/logger.js';
+import type { ContractEventRecord } from './types.js';
+import type { ContractEventStore } from './store.js';
+import { indexerEventsIngestedTotal, indexerLagSeconds } from '../metrics/businessMetrics.js';
 import {
   indexerReplayBatchesCommittedTotal,
   indexerReplayRowsCommittedTotal,
@@ -10,7 +13,62 @@ import {
   indexerReplayDurationSeconds,
 } from '../metrics/indexerMetrics.js';
 
-// ── Replay budget error ────────────────────────────────────────────────────────
+type ReplayCursorRow = ReplayCursor & pg.QueryResultRow;
+type ContractEventRow = ContractEvent & pg.QueryResultRow;
+
+const rolledBackLedgers = new Set<number>();
+
+export function markLedgerRolledBack(ledger: number): void {
+  rolledBackLedgers.add(ledger);
+}
+
+export function isLedgerRolledBack(ledger: number): boolean {
+  return rolledBackLedgers.has(ledger);
+}
+
+export function _resetRolledBackLedgers(): void {
+  rolledBackLedgers.clear();
+}
+
+export class IndexerIngestionService {
+  constructor(private readonly store: ContractEventStore) {}
+
+  async ingest(input: { events: ContractEventRecord[] }, _context: { actor?: string } = {}): Promise<{
+    outcome: 'persisted';
+    insertedCount: number;
+    duplicateCount: number;
+    insertedEventIds: string[];
+    duplicateEventIds: string[];
+  }> {
+    const result = await this.store.insertMany(input.events);
+    const insertedCount = result.insertedEventIds.length;
+
+    if (insertedCount > 0) {
+      indexerEventsIngestedTotal.inc(insertedCount);
+      const insertedIds = new Set(result.insertedEventIds);
+      const newest = input.events
+        .filter((event) => insertedIds.has(event.eventId))
+        .reduce<ContractEventRecord | null>(
+          (current, event) =>
+            current === null || Date.parse(event.happenedAt) > Date.parse(current.happenedAt) ? event : current,
+          null,
+        );
+      if (newest) {
+        indexerLagSeconds.set(Math.max(0, (Date.now() - Date.parse(newest.happenedAt)) / 1000));
+      }
+    }
+
+    return {
+      outcome: 'persisted',
+      insertedCount,
+      duplicateCount: result.duplicateEventIds.length,
+      insertedEventIds: result.insertedEventIds,
+      duplicateEventIds: result.duplicateEventIds,
+    };
+  }
+}
+
+// ?? Replay budget error ????????????????????????????????????????????????????????
 
 /**
  * Thrown when a replay run exceeds the configured wall-clock budget
@@ -27,13 +85,13 @@ export class ReplayBudgetExceededError extends Error {
   }
 }
 
-// ── In-memory concurrent-replay lock ──────────────────────────────────────────
+// ?? In-memory concurrent-replay lock ??????????????????????????????????????????
 
 /**
  * Lightweight in-memory flag that prevents two concurrent replay operations
  * from running at the same time on this process instance.
  *
- * All durable progress is stored in the `replay_cursors` DB table — this flag
+ * All durable progress is stored in the `replay_cursors` DB table - this flag
  * is intentionally reset to `false` on process restart so a crash-interrupted
  * replay can be resumed immediately.
  *
@@ -58,11 +116,11 @@ class ReplayLock {
 
 export const replayLock = new ReplayLock();
 
-// ── In-memory progress state (for low-latency /status polling) ────────────────
+// ?? In-memory progress state (for low-latency /status polling) ????????????????
 
 /**
  * In-memory replay progress state used exclusively for fast `/status` polling.
- * This state is ephemeral and is NOT relied upon for crash-resume durability —
+ * This state is ephemeral and is NOT relied upon for crash-resume durability -
  * that role belongs to the `replay_cursors` DB table.
  */
 class ReplayState {
@@ -121,12 +179,12 @@ class ReplayState {
 
 export const replayState = new ReplayState();
 
-// ── Cursor repository (DB operations) ─────────────────────────────────────────
+// ?? Cursor repository (DB operations) ?????????????????????????????????????????
 
 /**
  * DB operations for the `replay_cursors` table.
  *
- * All queries are fully parameterized — no user-supplied values are ever
+ * All queries are fully parameterized - no user-supplied values are ever
  * interpolated into SQL strings.
  */
 export class ReplayCursorRepository {
@@ -140,7 +198,7 @@ export class ReplayCursorRepository {
     contractId: string,
     ledger: number,
   ): Promise<ReplayCursor | null> {
-    const result = await client.query<ReplayCursor>(
+    const result = await client.query<ReplayCursorRow>(
       `SELECT id, contract_id, ledger, from_block, to_block,
               total_rows, last_committed_offset, started_at, completed_at
          FROM replay_cursors
@@ -165,7 +223,7 @@ export class ReplayCursorRepository {
     toBlock: number | undefined,
     totalRows: number,
   ): Promise<ReplayCursor> {
-    const result = await client.query<ReplayCursor>(
+    const result = await client.query<ReplayCursorRow>(
       `INSERT INTO replay_cursors
          (contract_id, ledger, from_block, to_block, total_rows, last_committed_offset)
        VALUES ($1, $2, $3, $4, $5, 0)
@@ -178,7 +236,7 @@ export class ReplayCursorRepository {
 
   /**
    * Advance the cursor offset.  Called inside the SAME transaction as the
-   * batch INSERT so the offset advance and the data commit are atomic — a crash
+   * batch INSERT so the offset advance and the data commit are atomic - a crash
    * between the two can never happen.
    */
   async advanceOffset(
@@ -207,7 +265,7 @@ export class ReplayCursorRepository {
   }
 }
 
-// ── IndexerService ─────────────────────────────────────────────────────────────
+// ?? IndexerService ?????????????????????????????????????????????????????????????
 
 /**
  * IndexerService handles contract event replay operations with per-batch
@@ -222,8 +280,8 @@ export class ReplayCursorRepository {
  * for each batch:
  *   acquire connection
  *   BEGIN
- *     INSERT … ON CONFLICT (event_id) DO NOTHING   ← idempotent
- *     UPDATE replay_cursors SET last_committed_offset = …  ← atomic with data
+ *     INSERT . ON CONFLICT (event_id) DO NOTHING   ? idempotent
+ *     UPDATE replay_cursors SET last_committed_offset = .  ? atomic with data
  *   COMMIT
  *   release connection
  * ```
@@ -239,7 +297,7 @@ export class ReplayCursorRepository {
  *
  * ## Security
  *
- * - All SQL queries use positional parameters ($1, $2 …) — no user-supplied
+ * - All SQL queries use positional parameters ($1, $2 .) - no user-supplied
  *   values are ever interpolated into query strings.
  * - The block range is validated and capped by `maxRangeBlocks` before any
  *   database work begins.
@@ -305,7 +363,7 @@ export class IndexerService {
       cursor = resolvedCursor;
 
       if (totalRows === 0) {
-        // Nothing to replay — mark complete and return.
+        // Nothing to replay - mark complete and return.
         await this.completeCursor(cursor.id);
         replayState.endReplay();
         return;
@@ -322,9 +380,8 @@ export class IndexerService {
 
       let offset = cursor.last_committed_offset;
       let batchIndex = 0;
-      let lastBatchRowCount = 0;
 
-      // 5. Per-batch loop — each iteration uses a fresh connection.
+      // 5. Per-batch loop - each iteration uses a fresh connection.
       while (offset < totalRows) {
         // Budget guard: abort if the wall-clock limit has been exceeded.
         if (this.replayBudgetMs > 0) {
@@ -343,14 +400,13 @@ export class IndexerService {
         );
 
         if (batchResult.rowsFetched === 0) {
-          // Source exhausted ahead of totalRows count — safe to stop.
+          // Source exhausted ahead of totalRows count - safe to stop.
           break;
         }
 
         const newOffset = offset + batchResult.rowsFetched;
         offset = newOffset;
         batchIndex++;
-        lastBatchRowCount = batchResult.rowsFetched;
 
         // Update in-memory progress.
         replayState.updateProgress(batchResult.rowsFetched, newOffset);
@@ -413,7 +469,7 @@ export class IndexerService {
     }
   }
 
-  // ── Private helpers ──────────────────────────────────────────────────────────
+  // ?? Private helpers ??????????????????????????????????????????????????????????
 
   /**
    * Look for an incomplete cursor that can be resumed; if none exists, count
@@ -446,7 +502,7 @@ export class IndexerService {
         return { cursor: existing, totalRows: existing.total_rows };
       }
 
-      // No existing cursor — count and create.
+      // No existing cursor - count and create.
       const totalRows = await this.countEventsToReplay(client, request);
       const cursor = await this.cursorRepo.create(
         client,
@@ -464,18 +520,18 @@ export class IndexerService {
 
   /**
    * Fetch one batch, insert into `contract_events`, and advance the DB cursor
-   * — all inside a single transaction on a fresh connection.
+   * - all inside a single transaction on a fresh connection.
    *
    * The connection is acquired at the start and released in the `finally`
    * block so it is never held across multiple batches.
    *
-   * @returns `{ rowsFetched }` — 0 means the source is exhausted.
+   * @returns `{ rowsFetched }` - 0 means the source is exhausted.
    */
   private async processBatch(
     cursorId: string,
     request: ReplayRequest,
     offset: number,
-    batchIndex: number,
+    _batchIndex: number,
   ): Promise<{ rowsFetched: number }> {
     const client = await this.pool.connect();
     try {
@@ -498,7 +554,7 @@ export class IndexerService {
       await client.query('COMMIT');
       return { rowsFetched: events.length };
     } catch (error) {
-      // Roll back the partial batch — already-committed batches are untouched.
+      // Roll back the partial batch - already-committed batches are untouched.
       try {
         await client.query('ROLLBACK');
       } catch {
@@ -525,7 +581,7 @@ export class IndexerService {
   /**
    * Validate replay request parameters.
    *
-   * All validation runs before any database access — bad parameters are
+   * All validation runs before any database access - bad parameters are
    * rejected cheaply and do not waste pool connections.
    *
    * @throws {Error} For any invalid parameter.
@@ -638,7 +694,7 @@ export class IndexerService {
     query += ` ORDER BY block_height ASC, event_id ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
 
-    const result = await client.query<ContractEvent>(query, params);
+    const result = await client.query<ContractEventRow>(query, params);
     return result.rows;
   }
 
@@ -647,7 +703,7 @@ export class IndexerService {
    *
    * `ON CONFLICT (event_id) DO NOTHING` ensures idempotency: re-running a
    * partially completed replay never produces duplicate rows.
-   * Uses positional parameters — no user values are string-interpolated.
+   * Uses positional parameters - no user values are string-interpolated.
    */
   private async batchInsertEvents(
     client: PoolClient,

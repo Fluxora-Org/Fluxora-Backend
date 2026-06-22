@@ -37,8 +37,8 @@ export interface RetrySchedule {
 }
 
 export interface WebhookOutboxRetryInput {
-  /** The actual consumer endpoint URL — used as the rate-limit key. */
-  consumerUrl?: string;
+  /** The actual consumer endpoint URL - used as the rate-limit key. */
+  consumerUrl: string;
   streamId: string;
   eventType: string;
   payload: unknown;
@@ -109,19 +109,19 @@ export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): numbe
  * Determine whether an HTTP status code should trigger a retry.
  *
  * Retryable classes (transient failures safe to retry):
- *   - `undefined`   — no status code, i.e. a network error or timeout
- *   - `408`         — Request Timeout
- *   - `425`         — Too Early
- *   - `429`         — Too Many Requests (rate-limited by consumer)
- *   - `500`         — Internal Server Error
- *   - `502`         — Bad Gateway
- *   - `503`         — Service Unavailable
- *   - `504`         — Gateway Timeout
+ *   - `undefined`   - no status code, i.e. a network error or timeout
+ *   - `408`         - Request Timeout
+ *   - `425`         - Too Early
+ *   - `429`         - Too Many Requests (rate-limited by consumer)
+ *   - `500`         - Internal Server Error
+ *   - `502`         - Bad Gateway
+ *   - `503`         - Service Unavailable
+ *   - `504`         - Gateway Timeout
  *
  * Non-retryable classes (permanent failures; retrying would waste resources
  * and could amplify load on a misconfigured or auth-rejecting consumer):
- *   - `4xx` auth/validation codes (400, 401, 403, 404, 422, …)
- *   - `2xx` / `3xx` — delivery succeeded or was redirected
+ *   - `4xx` auth/validation codes (400, 401, 403, 404, 422, .)
+ *   - `2xx` / `3xx` - delivery succeeded or was redirected
  *
  * The set is configurable via `policy.retryableStatusCodes` so operators can
  * tune it per-consumer without code changes.
@@ -132,62 +132,6 @@ export function isRetryableStatusCode(
 ): boolean {
   if (statusCode === undefined) return true;
   return policy.retryableStatusCodes.includes(statusCode);
-}
-
-/** Return the absolute timestamp for the next retry attempt. */
-export function calculateNextRetryTime(
-  attemptNumber: number,
-  policy: EnhancedRetryPolicy,
-  now: number = Date.now(),
-): number {
-  const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
-  return now + delayMs;
-}
-
-/** Generate retry metadata for every configured attempt. */
-export function generateRetrySchedule(
-  policy: EnhancedRetryPolicy,
-  now: number = Date.now(),
-): RetrySchedule[] {
-  return Array.from({ length: policy.maxAttempts }, (_, index) => {
-    const attemptNumber = index + 1;
-    const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
-
-    return {
-      attemptNumber,
-      delayMs,
-      retryAt: now + delayMs,
-    };
-  });
-}
-
-/** Attach retry metadata to an outbox payload and return the next retry time. */
-export function scheduleWebhookOutboxRetry(input: WebhookOutboxRetryInput): WebhookOutboxRetryPlan {
-  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
-  const nextAttemptNumber = input.attemptNumber + 1;
-
-  if (nextAttemptNumber > policy.maxAttempts) {
-    return {
-      shouldRetry: false,
-      attemptNumber: input.attemptNumber,
-      retryAt: null,
-      payload: input.payload,
-    };
-  }
-
-  const payload =
-    typeof input.payload === 'object' && input.payload !== null && !Array.isArray(input.payload)
-      ? { ...(input.payload as Record<string, unknown>), _webhookRetry: { attemptNumber: nextAttemptNumber } }
-      : { _webhookRetry: { attemptNumber: nextAttemptNumber } };
-
-  return {
-    shouldRetry: true,
-    attemptNumber: nextAttemptNumber,
-    retryAt: new Date(calculateNextRetryTime(input.attemptNumber, policy, input.now)),
-    payload,
-  };
-  const retryable = policy.retryableStatusCodes ?? DEFAULT_RETRY_POLICY.retryableStatusCodes;
-  return retryable.includes(statusCode);
 }
 
 /**
@@ -206,7 +150,7 @@ export function calculateNextRetryTime(
 }
 
 /**
- * Generate the full retry schedule for a policy — one entry per attempt.
+ * Generate the full retry schedule for a policy - one entry per attempt.
  */
 export function generateRetrySchedule(
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,

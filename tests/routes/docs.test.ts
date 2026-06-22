@@ -7,7 +7,7 @@ beforeEach(() => {
   resetSpecCache();
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ?? Helpers ???????????????????????????????????????????????????????????????????
 
 /** Traverse a resolved $ref or inline schema in the components. */
 function resolveRef(spec: Record<string, unknown>, ref: string): Record<string, unknown> | undefined {
@@ -95,6 +95,7 @@ describe('GET /openapi.json', () => {
     expect(paths['/internal/indexer/contract-events']).toBeDefined();
     expect(paths['/internal/indexer/events']).toBeDefined();
     expect(paths['/internal/indexer/events/replay']).toBeDefined();
+    expect(paths['/internal/indexer/status']).toBeDefined();
   });
 
   it('covers webhook routes', async () => {
@@ -138,6 +139,14 @@ describe('GET /openapi.json', () => {
     expect(sec?.some((s) => 'indexerWorkerToken' in s)).toBe(true);
   });
 
+  it('POST /internal/indexer/events/replay requires bearerAuth', async () => {
+    const res = await request(app).get('/openapi.json');
+    const route = (res.body.paths['/internal/indexer/events/replay'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const sec = route?.security as Array<Record<string, unknown>>;
+    expect(sec?.some((s) => 'bearerAuth' in s)).toBe(true);
+    expect(route?.responses).toMatchObject({ 202: expect.any(Object), 400: expect.any(Object), 401: expect.any(Object), 403: expect.any(Object) });
+  });
+
   it('includes error response schemas (400, 401, 404, 500)', async () => {
     const res = await request(app).get('/openapi.json');
     const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
@@ -178,9 +187,9 @@ describe('GET /openapi.json', () => {
     );
   });
 
-  // ── Cursor semantics documentation ───────────────────────────────────────────
+  // ?? Cursor semantics documentation ???????????????????????????????????????????
 
-  describe('GET /api/streams — cursor pagination documentation', () => {
+  describe('GET /api/streams - cursor pagination documentation', () => {
     async function getListOp() {
       const res = await request(app).get('/openapi.json');
       const spec = res.body as Record<string, unknown>;
@@ -189,7 +198,7 @@ describe('GET /openapi.json', () => {
       )?.get as Record<string, unknown>;
     }
 
-    // ── cursor param documentation ───────────────────────────────────────────
+    // ?? cursor param documentation ???????????????????????????????????????????
 
     it('documents the cursor query parameter', async () => {
       const op = await getListOp();
@@ -240,7 +249,7 @@ describe('GET /openapi.json', () => {
       expect((decoded['lastId'] as string).length).toBeGreaterThan(0);
     });
 
-    // ── operation-level description ────────────────────────────────────────────
+    // ?? operation-level description ????????????????????????????????????????????
 
     it('operation description mentions cursor encoding', async () => {
       const op = await getListOp();
@@ -278,7 +287,7 @@ describe('GET /openapi.json', () => {
       expect(desc.toLowerCase()).toMatch(/pii|ownership|scop|internal/);
     });
 
-    // ── 400 response ────────────────────────────────────────────────────────
+    // ?? 400 response ????????????????????????????????????????????????????????
 
     it('documents 400 response on the list operation', async () => {
       const op = await getListOp();
@@ -335,7 +344,7 @@ describe('GET /openapi.json', () => {
       expect(message).toBe('cursor must be a valid opaque pagination token');
     });
 
-    // ── 200 response examples ───────────────────────────────────────────────
+    // ?? 200 response examples ???????????????????????????????????????????????
 
     it('200 response has examples (not a single example)', async () => {
       const op = await getListOp();
@@ -430,7 +439,7 @@ describe('GET /openapi.json', () => {
       }
     });
 
-    // ── StreamCursorToken schema registration ───────────────────────────────
+    // ?? StreamCursorToken schema registration ???????????????????????????????
 
     it('registers StreamCursorToken in components/schemas', async () => {
       const res = await request(app).get('/openapi.json');
@@ -468,7 +477,7 @@ describe('GET /openapi.json', () => {
       expect(isNaN(Number(decoded['lastId']))).toBe(true);
     });
 
-    // ── StreamListPage schema ───────────────────────────────────────────────
+    // ?? StreamListPage schema ???????????????????????????????????????????????
 
     it('registers StreamListPage in components/schemas', async () => {
       const res = await request(app).get('/openapi.json');
@@ -490,7 +499,7 @@ describe('GET /openapi.json', () => {
       const schemas = (res.body?.components?.schemas ?? {}) as Record<string, unknown>;
       const schema = schemas['StreamListPage'] as Record<string, unknown>;
       const props = schema?.['properties'] as Record<string, unknown>;
-      // next_cursor may be an inline schema or a $ref — check anyOf/oneOf or direct
+      // next_cursor may be an inline schema or a $ref - check anyOf/oneOf or direct
       const nextCursorProp = props?.['next_cursor'] as Record<string, unknown>;
       const desc = (nextCursorProp?.['description'] ?? '') as string;
       expect(desc.toLowerCase()).toMatch(/null|last page/);
