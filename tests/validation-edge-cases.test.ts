@@ -24,7 +24,7 @@ import {
     validateJsonDepth,
     validateRequestSize,
 } from '../src/config/validation';
-import { StreamBatchCreateSchema } from '../src/validation/schemas';
+import { CreateStreamSchema, StreamBatchCreateSchema } from '../src/validation/schemas';
 
 const VALID_SENDER = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
 const VALID_RECIPIENT = 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR';
@@ -375,6 +375,47 @@ describe('Validation Edge Cases & Failure Modes', () => {
             if (oversized.success) return;
 
             expect(oversized.error.issues.some((issue) => issue.message.includes('Maximum of 100'))).toBe(true);
+        });
+
+        it('rejects decimal strings above the Stellar magnitude at the API boundary', () => {
+            const result = CreateStreamSchema.safeParse({
+                sender: VALID_SENDER,
+                recipient: VALID_RECIPIENT,
+                depositAmount: '9223372036854775808',
+            });
+
+            expect(result.success).toBe(false);
+            if (result.success) return;
+
+            expect(result.error.issues[0]?.path).toEqual(['depositAmount']);
+            expect(result.error.issues[0]?.message).toContain('maximum supported Stellar magnitude');
+        });
+
+        it('rejects decimal strings with more than Stellar precision fractional digits', () => {
+            const result = StreamBatchCreateSchema.safeParse({
+                streams: [
+                    makeBatchStream(0, { rate_per_second: '0.00000001' }),
+                ],
+            });
+
+            expect(result.success).toBe(false);
+            if (result.success) return;
+
+            expect(result.error.issues[0]?.path).toEqual(['streams', 0, 'rate_per_second']);
+            expect(result.error.issues[0]?.message).toContain('more than 7 fractional digits');
+        });
+
+        it('accepts maximum in-range Stellar magnitude and precision', () => {
+            const result = StreamBatchCreateSchema.safeParse({
+                streams: [
+                    makeBatchStream(0, {
+                        amount: '9223372036854775807.9999999',
+                        streamed_amount: '0.0000001',
+                    }),
+                ],
+            });
+
+            expect(result.success).toBe(true);
         });
     });
 

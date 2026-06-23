@@ -10,6 +10,7 @@
  * @module validation/schemas
  */
 import { z } from 'zod';
+import { MAX_DECIMAL_INTEGER_PART, STELLAR_DECIMALS } from '../serialization/decimal.js';
 
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
@@ -17,11 +18,33 @@ export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
 /** Regex for valid Stellar public keys: G followed by 55 base32 characters */
 export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 
-/** Reusable decimal-string field schema */
+function decimalParts(value: string): { integerPart: string; fractionalPart: string } {
+  const [integerPart = '', fractionalPart = ''] = value.replace(/^[+-]/, '').split('.');
+  return { integerPart, fractionalPart };
+}
+
+function hasIntegerPartWithinStellarBounds(value: string): boolean {
+  if (!DECIMAL_STRING_REGEX.test(value)) return true;
+  const { integerPart } = decimalParts(value);
+  return BigInt(integerPart) <= MAX_DECIMAL_INTEGER_PART;
+}
+
+function hasStellarFractionalPrecision(value: string): boolean {
+  if (!DECIMAL_STRING_REGEX.test(value)) return true;
+  const { fractionalPart } = decimalParts(value);
+  return fractionalPart.length <= STELLAR_DECIMALS;
+}
+
+/** Reusable decimal-string field schema bounded to Stellar amount representation. */
 function decimalStringField(fieldName: string) {
   return z
     .string({ error: `${fieldName} must be a decimal string, not a number` })
-    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
+    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`)
+    .refine(hasIntegerPartWithinStellarBounds, `${fieldName} exceeds maximum supported Stellar magnitude`)
+    .refine(
+      hasStellarFractionalPrecision,
+      `${fieldName} cannot have more than ${STELLAR_DECIMALS} fractional digits`,
+    );
 }
 
 /** Reusable Stellar public key field schema */
