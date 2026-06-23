@@ -45,6 +45,10 @@ function migrationNameFromFile(filename: string): string {
 
 /**
  * Read migration filenames from disk and return their canonical names.
+ *
+ * Only files whose names begin with one or more digits (node-pg-migrate's
+ * timestamp-prefix convention) are included.  This naturally excludes helper
+ * files in the migrations/ directory such as the `run.ts` tombstone.
  */
 function getMigrationNamesOnDisk(): string[] {
   if (!fs.existsSync(MIGRATIONS_DIR)) {
@@ -52,7 +56,7 @@ function getMigrationNamesOnDisk(): string[] {
   }
   return fs
     .readdirSync(MIGRATIONS_DIR)
-    .filter((f) => /\.(js|ts|mjs|cjs)$/.test(f))
+    .filter((f) => /^\d+.*\.(js|ts|mjs|cjs)$/.test(f))
     .sort()
     .map(migrationNameFromFile);
 }
@@ -163,4 +167,21 @@ export async function migrate(): Promise<void> {
  */
 export async function initializeMigrations(): Promise<void> {
   await migrate();
+}
+
+// ── CLI entry point ───────────────────────────────────────────────────────────
+// Run `pnpm run migrate` → `tsx src/db/migrate.ts`
+// The fileURLToPath / process.argv comparison works for both ESM and tsx.
+const isMain =
+  process.argv[1] === __filename ||
+  process.argv[1]?.endsWith('migrate.ts') ||
+  process.argv[1]?.endsWith('migrate.js');
+
+if (isMain) {
+  migrate()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      logError(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
 }

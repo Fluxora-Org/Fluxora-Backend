@@ -8,7 +8,6 @@ export const CHAIN_STREAM_STATUSES = [
 ] as const;
 
 export const API_STREAM_STATUSES = [
-  'scheduled',
   'active',
   'paused',
   'completed',
@@ -27,7 +26,7 @@ export type StreamStatusMapping = {
 
 const CHAIN_TO_API_STATUS: Record<ChainStreamStatus, Omit<StreamStatusMapping, 'chainStatus'>> = {
   pending: {
-    status: 'scheduled',
+    status: 'active',
     terminal: false,
   },
   active: {
@@ -79,7 +78,6 @@ export function mapChainStatusToApiStatus(
  * Terminal statuses (completed, cancelled) have no outgoing edges.
  */
 const VALID_API_TRANSITIONS: Partial<Record<ApiStreamStatus, readonly ApiStreamStatus[]>> = {
-  scheduled: ['active', 'cancelled'],
   active:    ['paused', 'completed', 'cancelled'],
   paused:    ['active', 'cancelled'],
   completed: [],

@@ -1,5 +1,5 @@
 import express from 'express';
-import { config } from './config';
+import { config } from './config/index.js';
 import { indexerRouter } from './routes/indexer';
 
 const app = express();
@@ -24,19 +24,23 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
   });
 });
 
-// Start server
-const server = app.listen(config.server.port, () => {
-  console.log(`Indexer service listening on port ${config.server.port}`);
-  console.log(`Replay batch size: ${config.indexer.replayBatchSize}`);
-});
+let server: any;
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
+if (process.env.NODE_ENV !== 'test') {
+  // Start server
+  server = app.listen(config.server.port, () => {
+    console.log(`Indexer service listening on port ${config.server.port}`);
+    console.log(`Replay batch size: ${config.indexer.replayBatchSize}`);
   });
-});
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    server.close(() => {
+      console.log('Server closed');
+      process.exit(0);
+    });
+  });
+}
 
 export { app };

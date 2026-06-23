@@ -4,6 +4,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import dns from 'node:dns';
+import net from 'node:net';
 import { logger } from '../lib/logger.js';
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -17,7 +19,6 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, scheduleWebhookOutboxRetry, shouldRetry } from './retry.js';
 import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
 import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
 import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
@@ -85,6 +86,90 @@ function isLoopbackHostname(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
 }
 
+// ── SSRF-guard IP range helpers ───────────────────────────────────────────────
+
+/**
+ * Returns true if the IPv4 address falls within any private, loopback,
+ * link-local, or otherwise reserved range that must never be reached by an
+ * outbound webhook delivery.
+ *
+ * Covered ranges (RFC 1918 / RFC 5735 / RFC 6598 and cloud metadata):
+ *   127.0.0.0/8    — loopback
+ *   10.0.0.0/8     — private class A
+ *   172.16.0.0/12  — private class B
+ *   192.168.0.0/16 — private class C
+ *   169.254.0.0/16 — link-local / cloud instance metadata (169.254.169.254)
+ *   0.0.0.0/8      — this-network
+ *   100.64.0.0/10  — CGNAT shared address space
+ *   240.0.0.0/4    — reserved (class E) + broadcast
+ */
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split('.').map((p) => parseInt(p, 10));
+  const [a, b] = parts as [number, number, number, number];
+  return (
+    a === 127 ||                                // 127.0.0.0/8  loopback
+    a === 10 ||                                 // 10.0.0.0/8   private
+    (a === 172 && b >= 16 && b <= 31) ||        // 172.16.0.0/12 private
+    (a === 192 && b === 168) ||                 // 192.168.0.0/16 private
+    (a === 169 && b === 254) ||                 // 169.254.0.0/16 link-local / metadata
+    a === 0 ||                                  // 0.0.0.0/8    this-network
+    (a === 100 && b >= 64 && b <= 127) ||       // 100.64.0.0/10 CGNAT
+    a >= 240                                    // 240.0.0.0/4  reserved + broadcast
+  );
+}
+
+/**
+ * Returns true if the IPv6 address falls within any private, loopback,
+ * link-local, or IPv4-mapped private range.
+ *
+ * Covered ranges:
+ *   ::1            — loopback
+ *   fc00::/7       — unique local (ULA)
+ *   fe80::/10      — link-local
+ *   ::ffff:0:0/96  — IPv4-mapped (delegates to isPrivateIpv4)
+ */
+function isPrivateIpv6(ip: string): boolean {
+  const lower = ip.toLowerCase();
+
+  if (lower === '::1' || lower === '::') return true;
+
+  // ULA: fc00::/7 — first group starts with fc or fd
+  if (lower.startsWith('fc') || lower.startsWith('fd')) return true;
+
+  // Link-local: fe80::/10 — first group starts with fe8x or fe9x or feax or febx
+  if (lower.startsWith('fe8') || lower.startsWith('fe9') ||
+      lower.startsWith('fea') || lower.startsWith('feb')) return true;
+
+  // IPv4-mapped: ::ffff:<v4>
+  if (lower.startsWith('::ffff:')) {
+    const v4part = lower.slice(7);
+    // Dotted-decimal form: ::ffff:127.0.0.1
+    if (net.isIPv4(v4part)) return isPrivateIpv4(v4part);
+    // Hex-group form: ::ffff:7f00:1  (two 16-bit hex groups → four octets)
+    const hexParts = v4part.split(':');
+    if (hexParts.length === 2) {
+      const hi = parseInt(hexParts[0]!, 16);
+      const lo = parseInt(hexParts[1]!, 16);
+      const reconstructed = [
+        (hi >> 8) & 0xff, hi & 0xff,
+        (lo >> 8) & 0xff, lo & 0xff,
+      ].join('.');
+      return isPrivateIpv4(reconstructed);
+    }
+  }
+
+  return false;
+}
+
+/** Returns true if ip (v4 or v6) is in any private or reserved range. */
+function isPrivateOrReservedIp(ip: string): boolean {
+  if (net.isIPv4(ip)) return isPrivateIpv4(ip);
+  if (net.isIPv6(ip)) return isPrivateIpv6(ip);
+  return true; // unrecognised format → fail-closed
+}
+
+// ── URL structural guard (synchronous) ───────────────────────────────────────
+
 function assertSafeWebhookEndpoint(endpointUrl: string): void {
   const url = new URL(endpointUrl);
 
@@ -98,6 +183,84 @@ function assertSafeWebhookEndpoint(endpointUrl: string): void {
 
   if (process.env.NODE_ENV === 'production' && url.protocol !== 'https:' && !isLoopbackHostname(url.hostname)) {
     throw new Error('Webhook endpoint must use https in production');
+  }
+
+  // Fast-fail on IP literals that are obviously private — avoids a DNS round
+  // trip for the most common mis-configuration cases.
+  // The URL parser retains brackets on IPv6 literals ([::1] → hostname '[::1]');
+  // strip them so net.isIPv6 recognises the address correctly.
+  const bareHostname = url.hostname.startsWith('[') && url.hostname.endsWith(']')
+    ? url.hostname.slice(1, -1)
+    : url.hostname;
+  if (net.isIPv4(bareHostname) && isPrivateIpv4(bareHostname)) {
+    throw new Error('Webhook endpoint must not target a private or reserved IPv4 address');
+  }
+  if (net.isIPv6(bareHostname) && isPrivateIpv6(bareHostname)) {
+    throw new Error('Webhook endpoint must not target a private or reserved IPv6 address');
+  }
+}
+
+// ── DNS-resolving SSRF guard (asynchronous, used at point of egress) ─────────
+
+/**
+ * Re-validates `endpointUrl` immediately before an outbound HTTP delivery to
+ * close the TOCTOU / DNS-rebinding window that exists between registration
+ * time and actual egress.
+ *
+ * Security contract:
+ *   1. Runs the synchronous structural checks from `assertSafeWebhookEndpoint`.
+ *   2. If the hostname is already a numeric IP literal, validates it directly.
+ *   3. Otherwise resolves both A and AAAA records via the system DNS and
+ *      validates every returned address against private / reserved ranges.
+ *   4. Treats DNS resolution failure as unsafe (fail-closed): if no IP can be
+ *      resolved the endpoint is blocked.
+ *
+ * Must be called inside `deliverRow` immediately before the outbound fetch so
+ * that the check and the network connection happen as close together in time
+ * as possible, minimising the DNS-rebinding window.
+ *
+ * On failure throws an Error — callers must route the row to the DLQ rather
+ * than scheduling a retry (the address will not become safe by retrying).
+ */
+async function assertSafeWebhookEndpointWithDns(endpointUrl: string): Promise<void> {
+  // Run the cheap synchronous structural checks first (credentials, protocol,
+  // obvious IP literals).  This also throws on private IP literals directly,
+  // so we never hit the DNS path for `http://127.0.0.1/…` style URLs.
+  assertSafeWebhookEndpoint(endpointUrl);
+
+  const rawHostname = new URL(endpointUrl).hostname;
+  // Strip IPv6 bracket notation ([::1] → ::1) kept by the URL parser so
+  // net.isIP recognises the address and skips the unnecessary DNS path.
+  const hostname = rawHostname.startsWith('[') && rawHostname.endsWith(']')
+    ? rawHostname.slice(1, -1)
+    : rawHostname;
+
+  // IP literals are already validated by the sync check above.
+  if (net.isIP(hostname) !== 0) return;
+
+  // Resolve the hostname using the DNS wire protocol (bypasses /etc/hosts to
+  // prevent host-file poisoning from trivially defeating the guard).
+  const resolvedIps: string[] = [];
+
+  await Promise.allSettled([
+    dns.promises.resolve4(hostname).then((addrs) => resolvedIps.push(...addrs)).catch(() => undefined),
+    dns.promises.resolve6(hostname).then((addrs) => resolvedIps.push(...addrs)).catch(() => undefined),
+  ]);
+
+  // Fail-closed: if DNS returned no addresses we cannot confirm the target is
+  // safe, so we block delivery.
+  if (resolvedIps.length === 0) {
+    throw new Error(
+      `Webhook endpoint hostname '${hostname}' could not be resolved via DNS; treating as unsafe`,
+    );
+  }
+
+  for (const ip of resolvedIps) {
+    if (isPrivateOrReservedIp(ip)) {
+      throw new Error(
+        `Webhook endpoint hostname '${hostname}' resolves to a private or reserved IP address; delivery blocked`,
+      );
+    }
   }
 }
 
@@ -593,7 +756,6 @@ export class WebhookDispatcher {
     const secret =
       typeof payloadObject['secret'] === 'string' ? payloadObject['secret'] : this.secret;
 
-    assertSafeWebhookEndpoint(endpointUrl);
     return { endpointUrl, secret };
   }
 
@@ -611,7 +773,7 @@ export class WebhookDispatcher {
           FROM webhook_outbox
           WHERE processed = false
             AND created_at <= NOW()
-          ORDER BY created_at ASC, id ASC
+          ORDER BY created_at ASC, COALESCE((payload->>'ledger')::numeric, 0) ASC, payload->>'id' ASC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         `,
@@ -638,10 +800,54 @@ export class WebhookDispatcher {
     }
   }
 
+  /**
+   * Deliver a single outbox row to the configured consumer endpoint.
+   *
+   * Security contract — SSRF re-validation at egress:
+   *   `resolveEndpoint` performs a fast synchronous structural check when the
+   *   row is first read from the DB.  `deliverRow` then calls
+   *   `assertSafeWebhookEndpointWithDns` a second time — at the point of
+   *   egress — to close the TOCTOU / DNS-rebinding window that exists between
+   *   the two calls.  If the check fails (private IP, DNS resolution failure,
+   *   or any reserved range) the row is immediately marked processed and
+   *   routed to the dead-letter queue.  It is NOT retried: a URL that targets
+   *   an internal address will not become safe on the next attempt.
+   */
   private async deliverRow(client: DbClient, row: OutboxRow): Promise<void> {
     const endpoint = this.resolveEndpoint(row);
     if (!endpoint) {
       logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, { outboxId: row.id });
+      return;
+    }
+
+    // Re-run the full async SSRF guard (DNS resolution + IP range check)
+    // immediately before egress to mitigate DNS rebinding and DB-tampering
+    // attacks on persisted outbox rows.
+    try {
+      await assertSafeWebhookEndpointWithDns(endpoint.endpointUrl);
+    } catch (ssrfErr) {
+      const reason = ssrfErr instanceof Error ? ssrfErr.message : String(ssrfErr);
+      logger.error(
+        'Webhook outbox row blocked by SSRF guard at delivery time; routing to DLQ',
+        undefined,
+        { outboxId: row.id, reason },
+      );
+      // Mark processed so the row is never re-polled.
+      await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
+      // Route to DLQ so operators can inspect and replay after fixing the endpoint.
+      const blockedDelivery: WebhookDelivery = {
+        id: `outbox_${row.id}`,
+        deliveryId: `outbox_${row.id}`,
+        eventId: row.stream_id,
+        eventType: row.event_type as WebhookEvent['type'],
+        endpointUrl: endpoint.endpointUrl,
+        status: 'permanent_failure',
+        attempts: [],
+        createdAt: new Date(row.created_at).getTime(),
+        updatedAt: Date.now(),
+        payload: JSON.stringify(normalizePayload(row.payload)),
+      };
+      enqueuePermanentFailureToDlq(blockedDelivery, `SSRF guard blocked delivery: ${reason}`);
       return;
     }
 

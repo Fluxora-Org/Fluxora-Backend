@@ -37,6 +37,40 @@ cp .env.example .env
 pnpm run migrate
 ```
 
+This executes `tsx src/db/migrate.ts`, which uses **node-pg-migrate** as the
+single migration runner.  All files in `migrations/` that begin with a numeric
+timestamp prefix are applied in ascending numeric order and recorded in the
+`pgmigrations` table.
+
+### Migration file naming convention
+
+```
+<timestamp>_<description>.ts
+```
+
+| Range | Purpose |
+|---|---|
+| `1000000000000 – 1000000000999` | Bootstrapping tables converted from the legacy PoolClient runner (`000_*`, `001_*`, `002_*`) |
+| `1774715131962 +` | Streams, audit, webhook-outbox, DLQ, and PII tables |
+| `20260601000000 +` | Calendar-style additions (pgcrypto, pagination indexes, …) |
+
+Files without a leading digit (e.g. `run.ts`) are ignored by the scanner and
+will never appear in the `pgmigrations` ledger.
+
+### Adding a new migration
+
+```bash
+# Pick the current Unix-ms timestamp as the prefix
+date +%s%3N   # e.g. 1750000000000
+
+# Create the file
+touch migrations/1750000000000_your_description.ts
+```
+
+Implement the `up(pgm: MigrationBuilder)` and `down(pgm: MigrationBuilder)`
+functions using the node-pg-migrate API.  The `run.ts` file in `migrations/` is
+a tombstone that exits with an error — do not use it directly.
+
 This creates:
 - `historical_events` table (source data)
 - `contract_events` table (replay destination)
@@ -290,6 +324,20 @@ Outbound webhook retries use two Redis-backed per-consumer controls:
 - **Circuit breaker** (`src/redis/webhookCircuitBreakerStore.ts`): shared `closed` → `open` → `half-open` state keyed by SHA-256 hash of the consumer URL. After `circuitBreakerThreshold` consecutive failures, deliveries are deferred until `circuitBreakerResetMs`, then a single cross-instance probe is allowed.
 
 `attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for details.
+
+## Webhook Causal Ordering Guarantee
+
+To ensure per-stream consumers always observe events in chain order, Fluxora guarantees a deterministic tiebreaker for webhook outbox deliveries. Items sharing the exact same `scheduledFor` timestamp are processed sequentially by applying a secondary sort on their `ledger` sequence (extracted from the JSON payload) and a tertiary sort on the `eventId`. This causal ordering is maintained securely across memory queues (`WebhookDeliveryStore`) and persistent database reads (`PostgreSQL webhook_outbox` query path), even when large sets of identical timestamps occur.
+
+## Indexer Stall State and Recovery
+
+The service health checks monitor indexer freshness to ensure downstream clients do not receive dangerously stale chain state. If the sync lag exceeds the configured threshold (`DEFAULT_INDEXER_STALL_THRESHOLD_MS`), the system latches an `isStalled` flag and degrades `/health/ready`.
+Even if the indexer catches back up, **the stall flag remains latched** to alert operators of the transient instability. Operators can acknowledge and reset this flag via an admin endpoint:
+```bash
+curl -X POST http://localhost:3000/api/admin/indexer/stall/clear \
+  -H "Authorization: Bearer <ADMIN_API_KEY>"
+```
+The endpoint returns `409 Conflict` if the indexer is still actively lagging behind the freshness threshold. Successful resets emit an `INDEXER_STALL_CLEARED` audit log.
 
 ## 📝 License
 

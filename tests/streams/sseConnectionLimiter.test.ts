@@ -1,4 +1,4 @@
-import { sseActiveConnectionsGauge } from '../../src/metrics/businessMetrics.js';
+import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
 import {
   DEFAULT_SSE_MAX_CONNECTIONS_PER_IP,
   DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS,
@@ -27,10 +27,12 @@ async function getActiveGaugeValue(): Promise<number> {
 describe('sseConnectionLimiter', () => {
   beforeEach(() => {
     _resetSseConnectionLimiter();
+    sseConnectionsRejectedTotal.reset();
   });
 
   afterEach(() => {
     _resetSseConnectionLimiter();
+    sseConnectionsRejectedTotal.reset();
   });
 
   it('resolves configured limits and falls back on invalid values', () => {
@@ -78,7 +80,7 @@ describe('sseConnectionLimiter', () => {
     expect(await getActiveGaugeValue()).toBe(0);
   });
 
-  it('rejects connections over the per-IP limit without incrementing counters', () => {
+  it('rejects connections over the per-IP limit without incrementing counters', async () => {
     const first = tryAcquireSseConnection('203.0.113.9', TEST_LIMITS);
     const second = tryAcquireSseConnection('203.0.113.9', TEST_LIMITS);
     const third = tryAcquireSseConnection('203.0.113.9', TEST_LIMITS);
@@ -92,9 +94,15 @@ describe('sseConnectionLimiter', () => {
     expect(third.retryAfterSeconds).toBe(TEST_LIMITS.retryAfterSeconds);
     expect(getActiveSseConnectionCount()).toBe(2);
     expect(getActiveSseConnectionCountForIp('203.0.113.9')).toBe(2);
+
+    // Verify rejection metric increments
+    const rejectedVal = await sseConnectionsRejectedTotal.get();
+    expect(rejectedVal.values).toHaveLength(1);
+    expect(rejectedVal.values[0]?.labels).toEqual({ reason: 'per_ip_limit' });
+    expect(rejectedVal.values[0]?.value).toBe(1);
   });
 
-  it('rejects connections over the global limit without incrementing counters', () => {
+  it('rejects connections over the global limit without incrementing counters', async () => {
     const limits: SseConnectionLimits = {
       ...TEST_LIMITS,
       maxConnectionsPerIp: 10,
@@ -114,5 +122,11 @@ describe('sseConnectionLimiter', () => {
     expect(third.retryAfterSeconds).toBe(limits.retryAfterSeconds);
     expect(getActiveSseConnectionCount()).toBe(2);
     expect(getActiveSseConnectionCountForIp('203.0.113.3')).toBe(0);
+
+    // Verify rejection metric increments
+    const rejectedVal = await sseConnectionsRejectedTotal.get();
+    expect(rejectedVal.values).toHaveLength(1);
+    expect(rejectedVal.values[0]?.labels).toEqual({ reason: 'global_limit' });
+    expect(rejectedVal.values[0]?.value).toBe(1);
   });
 });
