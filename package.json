@@ -54,7 +54,6 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@rolldown/binding-linux-x64-gnu": "^1.0.3",
     "@types/express": "^4.17.21",
     "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.10",
