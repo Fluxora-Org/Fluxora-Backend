@@ -21,8 +21,12 @@ process.env.JWT_SECRET =
   process.env.JWT_SECRET ?? 'a-very-long-secret-key-for-testing-only-12345';
 process.env.INDEXER_WORKER_TOKEN =
   process.env.INDEXER_WORKER_TOKEN ?? 'indexer-worker-token-for-testing-only-12345';
+process.env.API_KEY_PEPPER =
+  process.env.API_KEY_PEPPER ?? 'api-key-pepper-for-testing-only-0123456789abcdef';
 process.env.STELLAR_NETWORK = process.env.STELLAR_NETWORK ?? 'testnet';
 process.env.STELLAR_CONTRACT_ADDRESS =
   process.env.STELLAR_CONTRACT_ADDRESS ?? 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC';
 process.env.STELLAR_TOKEN_ADDRESS =
   process.env.STELLAR_TOKEN_ADDRESS ?? 'CBFFW3D5R2P3BQOS4P2AKFRHHBEVU234RWPK7QGR4LZQIFJGG5EFTAK6';
+process.env.PGCRYPTO_KEY =
+  process.env.PGCRYPTO_KEY ?? 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';

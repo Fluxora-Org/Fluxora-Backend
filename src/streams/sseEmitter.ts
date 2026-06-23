@@ -1,5 +1,9 @@
 import { EventEmitter } from 'node:events';
 import type { StreamEventRecord } from '../db/types.js';
+import {
+  sseLiveSubscribersGauge,
+  sseEventListenersGauge,
+} from '../metrics/businessMetrics.js';
 
 export const SSE_STREAM_UPDATE_EVENT = 'stream_update';
 
@@ -54,12 +58,14 @@ function isDispatchAttached(): boolean {
 function ensureDispatchAttached(): void {
   if (!isDispatchAttached()) {
     sseEventBus.on(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
+    sseEventListenersGauge.set(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT));
   }
 }
 
 function detachDispatchIfIdle(): void {
   if (totalLiveSubscriberCount() === 0) {
     sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
+    sseEventListenersGauge.set(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT));
   }
 }
 
@@ -83,6 +89,7 @@ export function subscribeToSseStream(
 
   subscribers.add(subscriber);
   ensureDispatchAttached();
+  sseLiveSubscribersGauge.set(totalLiveSubscriberCount());
 
   let unsubscribed = false;
   return () => {
@@ -97,6 +104,7 @@ export function subscribeToSseStream(
       liveSubscribersByStreamId.delete(streamId);
     }
     detachDispatchIfIdle();
+    sseLiveSubscribersGauge.set(totalLiveSubscriberCount());
   };
 }
 
@@ -110,6 +118,8 @@ export function getLiveSseSubscriberCount(streamId?: string): number {
 export function _resetSseSubscriptionsForTest(): void {
   liveSubscribersByStreamId.clear();
   sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
+  sseLiveSubscribersGauge.set(0);
+  sseEventListenersGauge.set(0);
 }
 
 /**

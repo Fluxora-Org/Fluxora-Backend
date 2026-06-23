@@ -41,11 +41,15 @@ describe('admin reindex routes', () => {
   });
 
   // 3. Successful Reindex Trigger
-  it('triggers a reindex operation with 202 when authenticated', async () => {
+  it('triggers a reindex operation with 202 envelope when authenticated', async () => {
     const res = await authed(request(app).post('/api/admin/reindex'));
     expect(res.status).toBe(202);
-    expect(res.body.message).toBe('Reindex started.');
-    expect(res.body.reindex.status).toBe('running');
+    expect(res.body).toHaveProperty('success', true);
+    expect(res.body).toHaveProperty('data');
+    expect(res.body).toHaveProperty('meta');
+    expect(res.body.data.message).toBe('Reindex started.');
+    expect(res.body.data.reindex.status).toBe('running');
+    expect(res.body.meta).toHaveProperty('timestamp');
   });
 
   // 4. Reindex While Pause Active
@@ -60,6 +64,7 @@ describe('admin reindex routes', () => {
     // Trigger reindex
     const res = await authed(request(app).post('/api/admin/reindex'));
     expect(res.status).toBe(202);
-    expect(res.body.reindex.status).toBe('running');
+    expect(res.body).toHaveProperty('success', true);
+    expect(res.body.data.reindex.status).toBe('running');
   });
 });
