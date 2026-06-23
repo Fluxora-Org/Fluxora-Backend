@@ -5,10 +5,10 @@ import {
 } from './status.js';
 
 describe('mapChainStatusToApiStatus', () => {
-  it('maps pending to scheduled non-terminal', () => {
+  it('maps pending to active non-terminal', () => {
     expect(mapChainStatusToApiStatus('pending')).toEqual({
       chainStatus: 'pending',
-      status: 'scheduled',
+      status: 'active',
       terminal: false,
     });
   });

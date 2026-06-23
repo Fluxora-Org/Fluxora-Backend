@@ -213,6 +213,79 @@ describe('authenticate', () => {
 
     expect(res.statusCode).toBe(401);
   });
+
+  // ── JWT verify histogram (issue #361) ──
+  /**
+   * prom-client Histogram `get()` emits bucket observations (which include
+   * `le`) alongside `_count` / `_sum` series (which carry only the metric's
+   * declared labels). We assert on the count series to confirm the label
+   * set is bounded to `outcome`.
+   */
+  function findJwtCountSeries(values: any[], outcome: string) {
+    return values.find(
+      (v) =>
+        v.metricName === 'fluxora_auth_jwt_verify_duration_seconds_count' &&
+        (v.labels as Record<string, string>).outcome === outcome,
+    );
+  }
+
+  it('records fluxora_auth_jwt_verify_duration_seconds with outcome=success on a valid verify', async () => {
+    const { authJwtVerifyDurationSeconds } = await import(
+      '../../../src/metrics/businessMetrics.js'
+    );
+    authJwtVerifyDurationSeconds.reset();
+
+    const payload = {
+      address: 'GABC...',
+      role: 'operator',
+      permissions: [Permission.STREAMS_READ],
+      jti: 'jti-hist-success',
+    };
+    (verifyToken as any).mockReturnValue(payload);
+    (isRevoked as any).mockResolvedValue(false);
+
+    const req = mockReq({ authHeader: 'Bearer valid-histogram-token' }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    const val = await authJwtVerifyDurationSeconds.get();
+    const success = findJwtCountSeries(val.values, 'success');
+    expect(success).toBeDefined();
+    expect(success?.value).toBeGreaterThanOrEqual(1);
+    // count series carries only { outcome }
+    expect(Object.keys(success!.labels)).toEqual(['outcome']);
+  });
+
+  it('records fluxora_auth_jwt_verify_duration_seconds with outcome=failure on verify throw', async () => {
+    const { authJwtVerifyDurationSeconds } = await import(
+      '../../../src/metrics/businessMetrics.js'
+    );
+    authJwtVerifyDurationSeconds.reset();
+
+    (verifyToken as any).mockImplementation(() => {
+      throw new Error('jwt malformed');
+    });
+
+    const req = mockReq({ authHeader: 'Bearer throw-token' }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    const val = await authJwtVerifyDurationSeconds.get();
+    const failure = findJwtCountSeries(val.values, 'failure');
+    expect(failure).toBeDefined();
+    expect(failure?.value).toBeGreaterThanOrEqual(1);
+    expect(Object.keys(failure!.labels)).toEqual(['outcome']);
+    // No token material leaked into any label across bucket/count/sum series
+    for (const v of val.values) {
+      for (const forbidden of ['jti', 'address', 'subject', 'kid']) {
+        expect((v.labels as Record<string, unknown>)[forbidden]).toBeUndefined();
+      }
+    }
+  });
 });
 
 describe('requireAuth', () => {

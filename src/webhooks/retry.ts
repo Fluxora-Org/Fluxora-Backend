@@ -25,6 +25,10 @@ export type JitterAlgorithm = 'full' | 'equal' | 'decorrelated';
 export interface EnhancedRetryPolicy extends WebhookRetryPolicy {
   backoffStrategy?: BackoffStrategy;
   jitterAlgorithm?: JitterAlgorithm;
+  /** Injected RNG for deterministic retry tests; should return a value in [0, 1]. */
+  random?: () => number;
+  /** Previous scheduled delay used by decorrelated jitter. */
+  previousDelayMs?: number;
   deadLetterAfterMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerResetMs?: number;
@@ -61,11 +65,13 @@ export interface WebhookOutboxRetryPlan {
 // ---------------------------------------------------------------------------
 
 /** Calculate raw backoff delay (before jitter) for a given attempt number. */
-export function calculateBackoffDelay(
-  attemptNumber: number,
-  policy: EnhancedRetryPolicy,
-): number {
-  const { backoffStrategy = 'exponential', initialBackoffMs, backoffMultiplier, maxBackoffMs } = policy;
+export function calculateBackoffDelay(attemptNumber: number, policy: EnhancedRetryPolicy): number {
+  const {
+    backoffStrategy = 'exponential',
+    initialBackoffMs,
+    backoffMultiplier,
+    maxBackoffMs,
+  } = policy;
 
   let baseDelay: number;
   switch (backoffStrategy) {
@@ -84,25 +90,34 @@ export function calculateBackoffDelay(
   return Math.min(baseDelay, maxBackoffMs);
 }
 
+function nextRandom(policy: EnhancedRetryPolicy): number {
+  const value = (policy.random ?? Math.random)();
+  return Math.min(1, Math.max(0, value));
+}
+
 /** Apply jitter to a delay value. */
 export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): number {
   const { jitterPercent = 10, jitterAlgorithm = 'full' } = policy;
-  const jitterRange = delayMs * (jitterPercent / 100);
+  if (jitterPercent === 0) return delayMs;
+
+  const random = nextRandom(policy);
 
   switch (jitterAlgorithm) {
     case 'equal': {
       const half = delayMs / 2;
-      return half + Math.random() * half;
+      return half + random * half;
     }
-    case 'decorrelated':
-      return Math.random() * delayMs * 3;
+    case 'decorrelated': {
+      const lower = policy.initialBackoffMs;
+      const previousDelay = policy.previousDelayMs ?? delayMs;
+      const upper = Math.min(policy.maxBackoffMs, Math.max(lower, previousDelay * 3));
+      return lower + random * (upper - lower);
+    }
     case 'full':
     default:
-      return Math.max(0, delayMs - jitterRange / 2 + Math.random() * jitterRange);
+      return random * delayMs;
   }
 }
-
-
 
 /** Determine if a status code is retryable with enhanced logic. */
 /**
@@ -128,67 +143,12 @@ export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): numbe
  */
 export function isRetryableStatusCode(
   statusCode: number | undefined,
-  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
+  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY
 ): boolean {
   if (statusCode === undefined) return true;
   return policy.retryableStatusCodes.includes(statusCode);
 }
 
-/** Return the absolute timestamp for the next retry attempt. */
-export function calculateNextRetryTime(
-  attemptNumber: number,
-  policy: EnhancedRetryPolicy,
-  now: number = Date.now(),
-): number {
-  const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
-  return now + delayMs;
-}
-
-/** Generate retry metadata for every configured attempt. */
-export function generateRetrySchedule(
-  policy: EnhancedRetryPolicy,
-  now: number = Date.now(),
-): RetrySchedule[] {
-  return Array.from({ length: policy.maxAttempts }, (_, index) => {
-    const attemptNumber = index + 1;
-    const delayMs = applyJitter(calculateBackoffDelay(attemptNumber, policy), policy);
-
-    return {
-      attemptNumber,
-      delayMs,
-      retryAt: now + delayMs,
-    };
-  });
-}
-
-/** Attach retry metadata to an outbox payload and return the next retry time. */
-export function scheduleWebhookOutboxRetry(input: WebhookOutboxRetryInput): WebhookOutboxRetryPlan {
-  const policy = input.policy ?? DEFAULT_RETRY_POLICY;
-  const nextAttemptNumber = input.attemptNumber + 1;
-
-  if (nextAttemptNumber > policy.maxAttempts) {
-    return {
-      shouldRetry: false,
-      attemptNumber: input.attemptNumber,
-      retryAt: null,
-      payload: input.payload,
-    };
-  }
-
-  const payload =
-    typeof input.payload === 'object' && input.payload !== null && !Array.isArray(input.payload)
-      ? { ...(input.payload as Record<string, unknown>), _webhookRetry: { attemptNumber: nextAttemptNumber } }
-      : { _webhookRetry: { attemptNumber: nextAttemptNumber } };
-
-  return {
-    shouldRetry: true,
-    attemptNumber: nextAttemptNumber,
-    retryAt: new Date(calculateNextRetryTime(input.attemptNumber, policy, input.now)),
-    payload,
-  };
-  const retryable = policy.retryableStatusCodes ?? DEFAULT_RETRY_POLICY.retryableStatusCodes;
-  return retryable.includes(statusCode);
-}
 
 /**
  * Calculate the absolute timestamp (ms since epoch) at which the next retry
@@ -197,7 +157,7 @@ export function scheduleWebhookOutboxRetry(input: WebhookOutboxRetryInput): Webh
 export function calculateNextRetryTime(
   attemptNumber: number,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  now: number = Date.now(),
+  now: number = Date.now()
 ): number {
   if (attemptNumber >= policy.maxAttempts) return 0;
   const raw = calculateBackoffDelay(attemptNumber, policy);
@@ -210,10 +170,15 @@ export function calculateNextRetryTime(
  */
 export function generateRetrySchedule(
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  now: number = Date.now(),
+  now: number = Date.now()
 ): RetrySchedule[] {
+  let previousDelayMs = policy.previousDelayMs;
+
   return Array.from({ length: policy.maxAttempts }, (_, i) => {
-    const delayMs = Math.round(applyJitter(calculateBackoffDelay(i, policy), policy));
+    const delayMs = Math.round(
+      applyJitter(calculateBackoffDelay(i, policy), { ...policy, previousDelayMs })
+    );
+    previousDelayMs = delayMs;
     return { attemptNumber: i + 1, delayMs, retryAt: now + delayMs };
   });
 }
@@ -223,7 +188,7 @@ export function shouldRetry(
   attempt: WebhookDeliveryAttempt,
   attemptNumber: number,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  consecutiveFailures: number = 0,
+  consecutiveFailures: number = 0
 ): boolean {
   if (attemptNumber >= policy.maxAttempts) return false;
 
@@ -240,7 +205,7 @@ export function shouldRetry(
 export function shouldSendToDLQ(
   attemptNumber: number,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  createdAt: number = Date.now(),
+  createdAt: number = Date.now()
 ): boolean {
   if (attemptNumber >= policy.maxAttempts) return true;
 
@@ -254,7 +219,7 @@ export function shouldSendToDLQ(
 /** Return the absolute timestamp at which the circuit breaker should reset. */
 export function calculateCircuitBreakerResetTime(
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  now: number = Date.now(),
+  now: number = Date.now()
 ): number {
   return policy.circuitBreakerResetMs ? now + policy.circuitBreakerResetMs : 0;
 }
@@ -269,7 +234,7 @@ export const HALF_OPEN_CONTENTION_DEFERRAL_MS = 1_000;
 export function resolveCircuitBreakerDeferral(
   breaker: Pick<WebhookCircuitBreakerCheckResult, 'state' | 'resetAt'>,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
-  now: number = Date.now(),
+  now: number = Date.now()
 ): Date {
   if (breaker.resetAt !== null && breaker.resetAt > now) {
     return new Date(breaker.resetAt);
@@ -284,9 +249,14 @@ export function resolveCircuitBreakerDeferral(
 /** Return true when a failed attempt should increment the circuit-breaker failure count. */
 export function countsTowardCircuitBreaker(
   attempt: WebhookDeliveryAttempt,
-  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
+  policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY
 ): boolean {
-  if (attempt.statusCode !== undefined && attempt.statusCode >= 200 && attempt.statusCode < 300 && !attempt.error) {
+  if (
+    attempt.statusCode !== undefined &&
+    attempt.statusCode >= 200 &&
+    attempt.statusCode < 300 &&
+    !attempt.error
+  ) {
     return false;
   }
   if (attempt.statusCode === undefined) return true;
@@ -304,7 +274,8 @@ export function formatRetryPolicy(policy: EnhancedRetryPolicy): string {
   if (policy.backoffStrategy) extras.push(`strategy=${policy.backoffStrategy}`);
   if (policy.jitterAlgorithm) extras.push(`jitter=${policy.jitterAlgorithm}`);
   if (policy.deadLetterAfterMs) extras.push(`dlq_after=${policy.deadLetterAfterMs}ms`);
-  if (policy.circuitBreakerThreshold) extras.push(`circuit_breaker=${policy.circuitBreakerThreshold}`);
+  if (policy.circuitBreakerThreshold)
+    extras.push(`circuit_breaker=${policy.circuitBreakerThreshold}`);
 
   return extras.length > 0 ? `${base}, ${extras.join(', ')}` : base;
 }
@@ -357,7 +328,7 @@ export async function checkWebhookDeliveryGate(
   consumerUrl: string,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
   deps: WebhookDeliveryGateDeps = {},
-  now: number = Date.now(),
+  now: number = Date.now()
 ): Promise<WebhookDeliveryGateResult> {
   const circuitBreakerStore = deps.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
 
@@ -396,7 +367,7 @@ export async function checkWebhookDeliveryGate(
 export async function attemptWebhookDeliveryWithRateLimit(
   input: WebhookOutboxRetryInput,
   deliver: () => Promise<WebhookDeliveryAttempt>,
-  deps: WebhookDeliveryGateDeps = {},
+  deps: WebhookDeliveryGateDeps = {}
 ): Promise<WebhookOutboxRetryPlan & { attempt?: WebhookDeliveryAttempt }> {
   const policy = input.policy ?? DEFAULT_RETRY_POLICY;
   const now = input.now ?? Date.now();
@@ -424,14 +395,14 @@ export async function attemptWebhookDeliveryWithRateLimit(
   if (success) {
     const breakerRecord = await circuitBreakerStore.recordSuccess(
       input.consumerUrl,
-      policy as CircuitBreakerPolicy,
+      policy as CircuitBreakerPolicy
     );
     consecutiveFailures = breakerRecord.consecutiveFailures;
   } else if (countsTowardCircuitBreaker(attempt, policy)) {
     const breakerRecord = await circuitBreakerStore.recordFailure(
       input.consumerUrl,
       policy as CircuitBreakerPolicy,
-      now,
+      now
     );
     consecutiveFailures = breakerRecord.consecutiveFailures;
   }

@@ -205,3 +205,72 @@ test('WebhookDeliveryStore: gets all deliveries', () => {
   assert.ok(all.some(d => d.id === 'delivery_1'));
   assert.ok(all.some(d => d.id === 'delivery_2'));
 });
+
+test('WebhookDeliveryStore: getReadyOutboxItems orders by scheduledFor, ledger, eventId', () => {
+  const store = new WebhookDeliveryStore();
+  const now = Date.now();
+
+  store.addToOutbox({
+    deliveryId: 'deliv_1',
+    eventId: 'event_C',
+    eventType: 'stream.created',
+    endpointUrl: 'https://example.com',
+    payload: JSON.stringify({ ledger: 100 }),
+    secret: 'sec',
+    priority: 'normal',
+    createdAt: now,
+    scheduledFor: now - 1000,
+    attempts: 0,
+    maxAttempts: 3,
+  });
+
+  store.addToOutbox({
+    deliveryId: 'deliv_2',
+    eventId: 'event_A',
+    eventType: 'stream.created',
+    endpointUrl: 'https://example.com',
+    payload: JSON.stringify({ data: { ledger: 100 } }),
+    secret: 'sec',
+    priority: 'normal',
+    createdAt: now,
+    scheduledFor: now - 1000,
+    attempts: 0,
+    maxAttempts: 3,
+  });
+
+  store.addToOutbox({
+    deliveryId: 'deliv_3',
+    eventId: 'event_B',
+    eventType: 'stream.created',
+    endpointUrl: 'https://example.com',
+    payload: JSON.stringify({ ledger: 50 }),
+    secret: 'sec',
+    priority: 'normal',
+    createdAt: now,
+    scheduledFor: now - 1000,
+    attempts: 0,
+    maxAttempts: 3,
+  });
+
+  store.addToOutbox({
+    deliveryId: 'deliv_4',
+    eventId: 'event_Z',
+    eventType: 'stream.created',
+    endpointUrl: 'https://example.com',
+    payload: '{}',
+    secret: 'sec',
+    priority: 'normal',
+    createdAt: now,
+    scheduledFor: now - 2000, // Should be first
+    attempts: 0,
+    maxAttempts: 3,
+  });
+
+  const ready = store.getReadyOutboxItems(now);
+  
+  assert.equal(ready.length, 4);
+  assert.equal(ready[0]?.deliveryId, 'deliv_4'); // earliest scheduledFor
+  assert.equal(ready[1]?.deliveryId, 'deliv_3'); // ledger 50
+  assert.equal(ready[2]?.deliveryId, 'deliv_2'); // ledger 100, event_A
+  assert.equal(ready[3]?.deliveryId, 'deliv_1'); // ledger 100, event_C
+});
