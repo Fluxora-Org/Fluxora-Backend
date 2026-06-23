@@ -97,6 +97,7 @@ describe('WebhookDispatcher outbox polling', () => {
 
     const select = client.queries.find(q => q.sql.includes('SELECT id, stream_id'));
     expect(select?.sql).toContain('FOR UPDATE SKIP LOCKED');
+    expect(select?.sql).toContain('ORDER BY created_at ASC, COALESCE((payload->>\'ledger\')::numeric, 0) ASC, payload->>\'id\' ASC, id ASC');
     expect(select?.params).toEqual([5]);
     expect(global.fetch).toHaveBeenCalledOnce();
     expect(client.queries).toEqual(
