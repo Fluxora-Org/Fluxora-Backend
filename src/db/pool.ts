@@ -72,6 +72,12 @@ export interface PoolConfig {
   /** SET LOCAL statement_timeout value in ms. 0 = disabled. */
   statementTimeoutMs: number;
   /**
+   * statement_timeout applied to replica connections (ms).
+   * Only used by createReplicaPool; ignored by createPool.
+   * Defaults to statementTimeoutMs when absent.
+   */
+  replicaStatementTimeoutMs?: number;
+  /**
    * Stable name for this pool instance, used as the `pool` label on Prometheus
    * gauges (db_pool_active, db_pool_idle, db_pool_waiting).
    * Must be a trusted, application-controlled string — never user input.

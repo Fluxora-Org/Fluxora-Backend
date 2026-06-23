@@ -171,6 +171,8 @@ export const EnvSchema = z.object({
   DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
   SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
   STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+  /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. */
+  REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
@@ -313,6 +315,8 @@ export interface Config {
   databaseIdleTimeout: number;
   slowQueryThresholdMs: number;
   statementTimeoutMs: number;
+  /** statement_timeout for replica connections (ms). Defaults to statementTimeoutMs. */
+  replicaStatementTimeoutMs: number;
 
   redisUrl: string;
   redisEnabled: boolean;
@@ -454,6 +458,7 @@ function toConfig(env: ParsedEnv): Config {
     databaseIdleTimeout: env.DB_IDLE_TIMEOUT,
     slowQueryThresholdMs: env.SLOW_QUERY_THRESHOLD_MS,
     statementTimeoutMs: env.STATEMENT_TIMEOUT_MS,
+    replicaStatementTimeoutMs: env.REPLICA_STATEMENT_TIMEOUT_MS ?? env.STATEMENT_TIMEOUT_MS,
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
