@@ -240,10 +240,14 @@ export const streamRepository = {
    *
    * This avoids hydrating and serialising the full stream row when callers
    * only need to know whether the stream exists and to derive cache headers.
+   *
+   * **Read routing:** This method routes through the read replica via `getReadPool()`
+   * to reduce load on the primary database. If no replica is configured or the
+   * replica is unhealthy, it falls back to the primary pool automatically.
    */
   async existsById(id: string): Promise<StreamExistenceRecord | undefined> {
     return timed('existsById', async () => {
-      const pool = getPool();
+      const pool = await getReadPool();
       const result = await query<Record<string, unknown>>(
         pool,
         'SELECT updated_at FROM streams WHERE id = $1',
