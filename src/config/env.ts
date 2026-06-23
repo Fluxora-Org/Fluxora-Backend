@@ -27,6 +27,7 @@ const SECRET_ENV_NAMES = new Set([
   'ADMIN_API_TOKEN',
   'ADMIN_API_KEY',
   'API_KEYS',
+  'API_KEY_PEPPER',
   'FLUXORA_WEBHOOK_SECRET',
   'FLUXORA_WEBHOOK_SECRET_PREVIOUS',
 ]);
@@ -204,6 +205,16 @@ export const EnvSchema = z.object({
   ),
   JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
   API_KEYS: z.string().optional(),
+  /**
+   * Server-side pepper mixed into every API-key hash. Keeping it out of the
+   * database means a leaked `api_keys` table cannot be brute-forced offline.
+   * Optional so non-API-key deployments still boot; required at runtime by the
+   * hashing helpers, which fail closed when it is absent.
+   */
+  API_KEY_PEPPER: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional(),
+  ),
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
   ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
@@ -331,6 +342,8 @@ export interface Config {
   pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
+  /** Server-side pepper for API-key hashing. Never logged. */
+  apiKeyPepper?: string | undefined;
   indexerWorkerToken: string;
 
   maxRequestSizeBytes: number;
@@ -475,6 +488,7 @@ function toConfig(env: ParsedEnv): Config {
       .split(',')
       .map((key) => key.trim())
       .filter((key) => key.length > 0),
+    apiKeyPepper: env.API_KEY_PEPPER,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
 
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,

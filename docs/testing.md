@@ -22,7 +22,7 @@ Administrative and operational endpoints require credentials depending on their 
 
 To ensure deterministic behavior and prevent test-to-test side effects, in-process state is initialized and purged in `beforeEach`/`afterEach` hooks:
 - **Pause & Reindex State**: Cleared using `_resetForTest()` from `src/state/adminState.ts`.
-- **API Key Records**: Cleared using `_resetApiKeyStoreForTest()` from `src/lib/apiKey.ts`.
+- **API Key Records**: Persisted in PostgreSQL via `apiKeyRepository`. Tests inject an in-memory fake of `src/db/repositories/apiKeyRepository.ts` (see `tests/lib/auth.test.ts`) and reset it in `beforeEach`.
 - **DLQ Entries**: Cleared using `_resetDlq()` from `src/routes/dlq.ts`.
 
 ## Supertest Integration
