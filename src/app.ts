@@ -175,6 +175,8 @@ async function wireWebhookCircuitBreakerStore(config: Config): Promise<void> {
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
+  const { trustProxy } = getRateLimitConfig(env);
+  app.set('trust proxy', trustProxy);
   const rateLimiter = createRateLimiter(env);
 
   startRuntimeMetrics();

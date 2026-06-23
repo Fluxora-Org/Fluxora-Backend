@@ -1,10 +1,30 @@
 import type { IncomingMessage } from 'node:http';
 import { logger } from '../lib/logger.js';
+import type { BanStore, BanCheckResult } from '../redis/banStore.js';
+import { createBanStore } from '../redis/banStore.js';
+import type { RedisClient } from '../redis/client.js';
 
-// In-memory state
+// In-memory state (non-ban state)
 const connectionCounts = new Map<string, number>();
 const rejectionHistory = new Map<string, number[]>(); // IP -> timestamps of rejections
-const activeBans = new Map<string, number>(); // IP -> expiry timestamp
+
+// Ban store (Redis-backed with local fallback)
+let banStore: BanStore = createBanStore();
+
+/**
+ * Configure the ban store (called during app bootstrap when Redis is available).
+ * Allows wiring Redis-backed HybridBanStore for durable/cluster-wide bans.
+ */
+export function setBanStore(store: BanStore): void {
+  banStore = store;
+}
+
+/**
+ * Get the current ban store (primarily for tests).
+ */
+export function getBanStore(): BanStore {
+  return banStore;
+}
 
 /**
  * Extracts the client IP address from the request, respecting X-Forwarded-For
@@ -33,18 +53,22 @@ export function getClientIp(req: IncomingMessage): string {
 /**
  * Checks if a new connection from the given IP should be allowed.
  * Returns an object indicating if allowed, and if not, the close code and reason.
+ * 
+ * Checks Redis-backed ban store first (with local cache), falls back to local enforcement.
  */
-export function checkLimiter(ip: string): { allowed: boolean; code?: number; reason?: string } {
+export async function checkLimiter(ip: string): Promise<{ allowed: boolean; code?: number; reason?: string }> {
   const now = Date.now();
   const maxConnections = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
 
-  // 1. Check if IP is currently banned
-  const banExpiry = activeBans.get(ip);
-  if (banExpiry) {
-    if (now < banExpiry) {
+  // 1. Check if IP is currently banned (Redis + local cache)
+  try {
+    const banResult: BanCheckResult = await banStore.isBanned(ip);
+    if (banResult.banned) {
       return { allowed: false, code: 4029, reason: 'IP banned due to abuse' };
     }
-    activeBans.delete(ip);
+  } catch {
+    // Redis failure — banStore falls back internally to local enforcement.
+    // We still proceed with connection count check below.
   }
 
   // 2. Check connection limit
@@ -59,6 +83,7 @@ export function checkLimiter(ip: string): { allowed: boolean; code?: number; rea
 
 /**
  * Records a rejection and checks if the IP should be banned for abuse.
+ * Now delegates ban creation to the configured BanStore (Redis + local).
  */
 function recordRejection(ip: string, now: number): void {
   const abuseThreshold = parseInt(process.env.WS_ABUSE_THRESHOLD || '5', 10);
@@ -72,9 +97,16 @@ function recordRejection(ip: string, now: number): void {
   rejectionHistory.set(ip, rejections);
 
   if (rejections.length > abuseThreshold) {
-    activeBans.set(ip, now + banTtl * 1000);
+    // Delegate to banStore (Redis-backed with TTL + local cache)
+    void banStore.ban({ ip, ttlSeconds: banTtl }).catch((err) => {
+      logger.error('Failed to persist ban to store', undefined, {
+        ip,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
     rejectionHistory.delete(ip);
-    logger.warn('IP banned for WebSocket abuse', undefined, { ip, banTtl });
+    // Note: actual audit log emitted inside BanStore implementations
   }
 }
 
@@ -99,9 +131,27 @@ export function untrackConnection(ip: string): void {
 
 /**
  * Resets all internal state (useful for tests).
+ * Also resets the ban store.
  */
 export function _resetLimiter(): void {
   connectionCounts.clear();
   rejectionHistory.clear();
-  activeBans.clear();
+  // Reset ban store state
+  if (banStore && typeof (banStore as any).close === 'function') {
+    void (banStore as any).close();
+  }
+  banStore = createBanStore();
+}
+
+/**
+ * Wire a Redis client into the ban store (called from app bootstrap).
+ * Creates a HybridBanStore wrapping RedisBanStore + InMemory fallback.
+ */
+export function wireRedisBanStore(redisClient: RedisClient): void {
+  const store = createBanStore(redisClient, (err, op) => {
+    logger.warn(`Redis ban store error on ${op}`, undefined, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+  setBanStore(store);
 }
