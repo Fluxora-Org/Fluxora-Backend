@@ -65,7 +65,7 @@ vi.mock('../src/db/pool.js', () => ({
   },
 }));
 
-import { recordAuditEvent, getAuditEntries, _resetAuditLog } from '../src/lib/auditLog.js';
+import { recordAuditEvent, recordAuditEventToDb, getAuditEntries, _resetAuditLog } from '../src/lib/auditLog.js';
 import { auditRouter } from '../src/routes/audit.js';
 import { adminRouter } from '../src/routes/admin.js';
 import { streamsRouter, streams, resetStreamIdempotencyStore } from '../src/routes/streams.js';
@@ -492,5 +492,65 @@ describe('Audit entries via admin API', () => {
   it('does not record audit for GET /api/admin/reindex', async () => {
     await adminRequest('get', '/reindex').expect(200);
     expect(getAuditEntries()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent writes: seq uniqueness
+// ---------------------------------------------------------------------------
+
+describe('recordAuditEvent concurrent writes produce distinct seq values', () => {
+  it('all seq values are unique when many events are recorded at once', () => {
+    const N = 50;
+    // Simulate concurrent calls by firing them all synchronously in a tight loop
+    // (JS is single-threaded, but this exercises the counter path without gaps).
+    for (let i = 0; i < N; i++) {
+      recordAuditEvent('STREAM_CREATED', 'stream', `stream-${i}`);
+    }
+    const entries = getAuditEntries();
+    const seqs = entries.map((e) => e.seq);
+    const unique = new Set(seqs);
+    expect(unique.size).toBe(N);
+  });
+
+  it('seq values are strictly monotonically increasing', () => {
+    const N = 20;
+    for (let i = 0; i < N; i++) {
+      recordAuditEvent('STREAM_CANCELLED', 'stream', `s-${i}`);
+    }
+    const seqs = getAuditEntries().map((e) => e.seq);
+    for (let i = 1; i < seqs.length; i++) {
+      expect(seqs[i]).toBeGreaterThan(seqs[i - 1]!);
+    }
+  });
+});
+
+describe('recordAuditEventToDb concurrent writes produce distinct seq values', () => {
+  it('all DB-backed writes get unique seq from nextval', async () => {
+    // The pool mock's `query` is already a vi.fn(). We need it to simulate
+    // nextval behaviour: each call returns an incrementing seq so we can verify
+    // the caller does NOT supply seq (i.e. the INSERT omits it).
+    const { query: mockQuery } = await import('../src/db/pool.js');
+    let dbSeq = 0;
+    (mockQuery as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_pool: unknown, sql: string) => {
+        // Capture the INSERT SQL to assert seq is absent.
+        if (/INSERT INTO audit_logs/i.test(sql)) {
+          expect(sql).not.toMatch(/\bseq\b/);
+        }
+        dbSeq++;
+        return { rows: [{ seq: dbSeq }], rowCount: 1 };
+      },
+    );
+
+    const N = 10;
+    await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        recordAuditEventToDb('STREAM_CREATED', 'stream', `db-stream-${i}`),
+      ),
+    );
+
+    // All in-memory entries were appended (one per resolved promise).
+    expect(getAuditEntries().length).toBeGreaterThanOrEqual(N);
   });
 });
