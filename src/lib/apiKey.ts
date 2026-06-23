@@ -2,6 +2,7 @@ import { createId } from '@paralleldrive/cuid2';
 import { createHash, timingSafeEqual } from 'crypto';
 import { z } from 'zod';
 import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 
 /**
  * Zod schema for the API key creation/rotation response.
@@ -111,9 +112,21 @@ export function listApiKeys(): ApiKeyRecord[] {
 
 /**
  * Validates a raw API key against the stored hashes using constant-time comparison.
+ *
+ * Latency is recorded in the `fluxora_auth_apikey_lookup_duration_seconds`
+ * histogram, labelled only by `outcome` (`success` | `failure`). No key id,
+ * prefix, raw key, or hash value is ever emitted as a metric label.
+ *
+ * Every code path calls `endTimer` exactly once before returning, so the
+ * histogram never observes a partial (timer-started but never-closed) sample.
  */
 export function isValidApiKey(rawKey: string): boolean {
-  if (!rawKey) return false;
+  const endTimer = authApiKeyLookupDurationSeconds.startTimer();
+
+  if (!rawKey) {
+    endTimer({ outcome: 'failure' });
+    return false;
+  }
 
   const hash = sha256hex(rawKey);
   const hashBuf = Buffer.from(hash, 'hex');
@@ -123,6 +136,7 @@ export function isValidApiKey(rawKey: string): boolean {
     try {
       const storedBuf = Buffer.from(record.keyHash, 'hex');
       if (storedBuf.length === hashBuf.length && timingSafeEqual(storedBuf, hashBuf)) {
+        endTimer({ outcome: 'success' });
         return true;
       }
     } catch {
@@ -130,6 +144,7 @@ export function isValidApiKey(rawKey: string): boolean {
     }
   }
 
+  endTimer({ outcome: 'failure' });
   return false;
 }
 

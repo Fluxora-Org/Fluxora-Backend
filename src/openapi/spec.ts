@@ -44,7 +44,7 @@ const StellarAddress = registry.register(
 
 const StreamStatus = registry.register(
   'StreamStatus',
-  z.enum(['scheduled', 'active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' }),
+  z.enum(['active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' }),
 );
 
 const StreamObject = registry.register(
@@ -54,10 +54,17 @@ const StreamObject = registry.register(
     sender: StellarAddress,
     recipient: StellarAddress,
     depositAmount: DecimalString,
+    streamedAmount: DecimalString,
+    remainingAmount: DecimalString,
     ratePerSecond: DecimalString,
     startTime: z.number().int().openapi({ example: 1700000000 }),
     endTime: z.number().int().openapi({ example: 0 }),
     status: StreamStatus,
+    contractId: z.string().openapi({ example: 'api-created' }),
+    transactionHash: z.string().openapi({ example: '0a1b2c3d4e...' }),
+    eventIndex: z.number().int().openapi({ example: 0 }),
+    createdAt: z.string().openapi({ example: '2026-01-01T00:00:00.000Z' }),
+    updatedAt: z.string().openapi({ example: '2026-01-01T00:00:00.000Z' }),
   }).openapi({ description: 'A treasury stream record' }),
 );
 
@@ -252,6 +259,7 @@ const StreamListPage = registry.register(
       description: 'True when additional pages exist. Fetch them by passing `next_cursor`.',
       example: true,
     }),
+    next_cursor: z.union([StreamCursorToken, z.null()]).openapi({
     next_cursor: StreamCursorToken.nullable().openapi({
       description:
         'Cursor to pass as `cursor` on the next request. ' +
@@ -307,9 +315,9 @@ registry.registerPath({
       }),
       cursor: z.string().optional().openapi({
         description:
-          'Opaque cursor from the previous page\u2019s `next_cursor`. ' +
-          'Omit to request the first page. ' +
-          'Treated as a black box — do not construct manually.',
+          "Opaque cursor from the previous page's `next_cursor`. " +
+          "Omit to request the first page. " +
+          "Treated as a black box — do not construct manually.",
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
       }),
       status: z.string().optional().openapi({ example: 'active' }),
@@ -347,7 +355,9 @@ registry.registerPath({
                       sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
                       recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
                       depositAmount: '1000000.0000000',
-                      ratePerSecond: '0.0000116',
+                        streamedAmount: '0.0000000',
+                        remainingAmount: '1000000.0000000',
+                        ratePerSecond: '0.0000116',
                       startTime: 1700000000,
                       endTime: 0,
                       status: 'active',
@@ -373,6 +383,8 @@ registry.registerPath({
                       sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
                       recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
                       depositAmount: '500000.0000000',
+                      streamedAmount: '0.0000000',
+                      remainingAmount: '500000.0000000',
                       ratePerSecond: '0.0000058',
                       startTime: 1700001000,
                       endTime: 0,
@@ -399,6 +411,8 @@ registry.registerPath({
                       sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
                       recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
                       depositAmount: '250000.0000000',
+                      streamedAmount: '0.0000000',
+                      remainingAmount: '250000.0000000',
                       ratePerSecond: '0.0000029',
                       startTime: 1700002000,
                       endTime: 1800000000,
@@ -653,7 +667,7 @@ registry.registerPath({
   summary: 'Read pause flags (no auth)',
   tags: ['admin'],
   responses: {
-    '200': { description: 'Pause flags', content: { 'application/json': { schema: z.object({ pauseFlags: z.record(z.string(), z.boolean()) }) } } },
+    '200': { description: 'Pause flags', content: { 'application/json': { schema: successSchema(z.object({ pauseFlags: z.record(z.string(), z.boolean()) })) } } },
   },
 });
 
@@ -663,7 +677,7 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'Admin status', content: { 'application/json': { schema: z.object({ pauseFlags: z.record(z.string(), z.boolean()), reindex: z.record(z.string(), z.unknown()) }) } } },
+    '200': { description: 'Admin status', content: { 'application/json': { schema: successSchema(z.object({ pauseFlags: z.record(z.string(), z.boolean()), reindex: z.record(z.string(), z.unknown()) })) } } },
     '401': errorResponses['401'],
   },
 });
@@ -674,7 +688,7 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'Pause flags', content: { 'application/json': { schema: z.record(z.string(), z.boolean()) } } },
+    '200': { description: 'Pause flags', content: { 'application/json': { schema: successSchema(z.record(z.string(), z.boolean())) } } },
     '401': errorResponses['401'],
   },
 });
@@ -699,7 +713,7 @@ registry.registerPath({
     },
   },
   responses: {
-    '200': { description: 'Updated pause flags', content: { 'application/json': { schema: z.object({ message: z.string(), pauseFlags: z.record(z.string(), z.boolean()) }) } } },
+    '200': { description: 'Updated pause flags', content: { 'application/json': { schema: successSchema(z.object({ message: z.string(), pauseFlags: z.record(z.string(), z.boolean()) })) } } },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '503': errorResponses['503'],
@@ -712,7 +726,7 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'Reindex state', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    '200': { description: 'Reindex state', content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } } },
     '401': errorResponses['401'],
   },
 });
@@ -723,9 +737,33 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '202': { description: 'Reindex started', content: { 'application/json': { schema: z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) }) } } },
+    '202': { description: 'Reindex started', content: { 'application/json': { schema: successSchema(z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) })) } } },
     '401': errorResponses['401'],
     '409': errorResponses['409'],
+  },
+});
+
+registry.registerPath({
+  method: 'post', path: '/api/admin/ws/disconnect',
+  summary: 'Disconnect WebSocket subscribers',
+  tags: ['admin'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: z.object({ stream_id: z.string().openapi({ example: 'stream-abc123' }) }),
+          example: { stream_id: 'stream-abc123' },
+        },
+      },
+    },
+  },
+  responses: {
+    '200': { description: 'WebSocket subscribers disconnected', content: { 'application/json': { schema: successSchema(z.object({ message: z.string(), stream_id: z.string(), disconnectedCount: z.number().int() })) } } },
+    '400': errorResponses['400'],
+    '401': errorResponses['401'],
+    '503': errorResponses['503'],
   },
 });
 
@@ -735,7 +773,7 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': { description: 'API key list', content: { 'application/json': { schema: z.object({ apiKeys: z.array(z.record(z.string(), z.unknown())) }) } } },
+    '200': { description: 'API key list', content: { 'application/json': { schema: successSchema(z.object({ apiKeys: z.array(z.record(z.string(), z.unknown())) })) } } },
     '401': errorResponses['401'],
   },
 });
@@ -897,9 +935,90 @@ registry.registerPath({
 
 // ── Internal indexer ──────────────────────────────────────────────────────────
 
+/**
+ * Known contract event topics — kept in sync with the on-chain Fluxora ABI.
+ * Any topic not in this list is rejected at the ingest boundary.
+ */
+const CONTRACT_EVENT_TOPICS = [
+  'stream.created',
+  'stream.updated',
+  'stream.cancelled',
+  'stream.completed',
+  'stream.funded',
+  'stream.withdrawn',
+] as const;
+
+/**
+ * Typed schema for a single ingest event.
+ *
+ * Security: `strictObject` rejects any keys not explicitly declared,
+ * preventing forged or malformed shapes from reaching the store.
+ */
+const ContractEventSchema = registry.register(
+  'ContractEventSchema',
+  z.strictObject({
+    eventId: z.string().min(1).openapi({
+      description: 'Application-level deduplication key for this event.',
+      example: 'evt-abc-001',
+    }),
+    ledger: z.number().int().nonnegative().openapi({
+      description: 'Stellar ledger sequence number in which the event was emitted.',
+      example: 512345,
+    }),
+    contractId: z.string().min(1).openapi({
+      description: 'Soroban contract address that emitted the event.',
+      example: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+    }),
+    topic: z.enum(CONTRACT_EVENT_TOPICS).openapi({
+      description: 'Semantic event type; constrained to known Fluxora contract topics.',
+      example: 'stream.created',
+    }),
+    txHash: z.string().min(1).openapi({
+      description: 'Hash of the transaction that emitted this event.',
+      example: 'a3f4b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3',
+    }),
+    txIndex: z.number().int().nonnegative().openapi({
+      description: 'Position of the transaction within the ledger.',
+      example: 0,
+    }),
+    operationIndex: z.number().int().nonnegative().openapi({
+      description: 'Position of the operation within the transaction.',
+      example: 0,
+    }),
+    eventIndex: z.number().int().nonnegative().openapi({
+      description: 'Position of this event within the operation.',
+      example: 0,
+    }),
+    payload: z.record(z.string(), z.unknown()).openapi({
+      description: 'Arbitrary chain-derived event data. Amount-like fields must be decimal strings.',
+      example: { streamId: 'stream-abc123', depositAmount: '1000000.0000000', ratePerSecond: '0.0000116' },
+    }),
+    happenedAt: z.string().min(1).openapi({
+      description: 'ISO-8601 close time of the ledger that included this event.',
+      example: '2026-01-01T00:00:00.000Z',
+    }),
+    ledgerHash: z.string().min(1).openapi({
+      description: 'Content hash of the ledger header, used for reorg detection.',
+      example: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+    }),
+  }).openapi({
+    description:
+      'A single contract event emitted on-chain. ' +
+      'The `topic` field is constrained to the Fluxora topic enum; ' +
+      'unknown topics are rejected. ' +
+      'Unknown top-level keys are also rejected to prevent forged event shapes.',
+  }),
+);
+
 registry.registerPath({
   method: 'post', path: '/internal/indexer/contract-events',
   summary: 'Ingest contract event batch',
+  description:
+    'Accepts a batch of up to 100 typed contract events and persists them atomically. ' +
+    'Each event must carry a known `topic` value from the Fluxora topic enum. ' +
+    'Unknown top-level fields are rejected. ' +
+    'Duplicate `eventId` values within a batch return 409. ' +
+    'Cross-batch duplicates are silently absorbed (idempotent re-delivery).',
   tags: ['indexer'],
   security: [{ indexerWorkerToken: [] }],
   request: {
@@ -907,16 +1026,126 @@ registry.registerPath({
       required: true,
       content: {
         'application/json': {
-          schema: z.object({ events: z.array(z.record(z.string(), z.unknown())).max(100) }),
-          example: { events: [{ eventId: 'evt-001', ledger: 1000, contractId: 'C...', topic: 'stream.created', payload: {} }] },
+          schema: z.object({
+            events: z.array(ContractEventSchema).min(1).max(100).openapi({
+              description: 'Array of 1-100 contract events to ingest.',
+            }),
+          }),
+          examples: {
+            streamCreated: {
+              summary: 'Single stream.created event',
+              value: {
+                events: [{
+                  eventId: 'evt-abc-001',
+                  ledger: 512345,
+                  contractId: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+                  topic: 'stream.created',
+                  txHash: 'a3f4b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3',
+                  txIndex: 0,
+                  operationIndex: 0,
+                  eventIndex: 0,
+                  payload: { streamId: 'stream-abc123', depositAmount: '1000000.0000000', ratePerSecond: '0.0000116' },
+                  happenedAt: '2026-01-01T00:00:00.000Z',
+                  ledgerHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+                }],
+              },
+            },
+            streamCancelled: {
+              summary: 'Single stream.cancelled event',
+              value: {
+                events: [{
+                  eventId: 'evt-abc-002',
+                  ledger: 512400,
+                  contractId: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+                  topic: 'stream.cancelled',
+                  txHash: 'b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5',
+                  txIndex: 1,
+                  operationIndex: 0,
+                  eventIndex: 0,
+                  payload: { streamId: 'stream-abc123', reason: 'sender_cancelled' },
+                  happenedAt: '2026-01-02T00:00:00.000Z',
+                  ledgerHash: 'b1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6b1b2',
+                }],
+              },
+            },
+          },
         },
       },
     },
   },
   responses: {
-    '200': { description: 'Batch persisted', content: { 'application/json': { schema: successSchema(z.object({ outcome: z.string(), insertedCount: z.number(), duplicateCount: z.number(), insertedEventIds: z.array(z.string()), duplicateEventIds: z.array(z.string()) })) } } },
+    '200': {
+      description: 'Batch persisted. Cross-batch duplicates are counted but do not cause errors.',
+      content: {
+        'application/json': {
+          schema: successSchema(z.object({
+            outcome: z.string().openapi({ example: 'persisted' }),
+            insertedCount: z.number().int().openapi({ example: 1 }),
+            duplicateCount: z.number().int().openapi({ example: 0 }),
+            insertedEventIds: z.array(z.string()).openapi({ example: ['evt-abc-001'] }),
+            duplicateEventIds: z.array(z.string()).openapi({ example: [] }),
+          })),
+          example: {
+            success: true,
+            data: {
+              outcome: 'persisted',
+              insertedCount: 1,
+              duplicateCount: 0,
+              insertedEventIds: ['evt-abc-001'],
+              duplicateEventIds: [],
+            },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
+      },
+    },
+    '400': {
+      description: 'Validation error — missing required fields, unknown topic, extra keys, or empty batch.',
+      content: {
+        'application/json': {
+          schema: ErrorEnvelope,
+          examples: {
+            unknownTopic: {
+              summary: 'Unknown topic value',
+              value: {
+                success: false,
+                error: {
+                  code: 'VALIDATION_ERROR',
+                  message: 'events.0.topic: Invalid enum value. Expected one of: stream.created | stream.updated | stream.cancelled | stream.completed | stream.funded | stream.withdrawn',
+                },
+              },
+            },
+            emptyBatch: {
+              summary: 'Empty events array',
+              value: {
+                success: false,
+                error: { code: 'VALIDATION_ERROR', message: 'events must not be empty' },
+              },
+            },
+            extraKeys: {
+              summary: 'Unknown extra field on event',
+              value: {
+                success: false,
+                error: { code: 'VALIDATION_ERROR', message: 'events.0: Unrecognized key(s) in object: \'unknownField\'' },
+              },
+            },
+          },
+        },
+      },
+    },
     '401': errorResponses['401'],
-    '409': errorResponses['409'],
+    '409': {
+      description: 'Intra-batch duplicate eventId.',
+      content: {
+        'application/json': {
+          schema: ErrorEnvelope,
+          example: {
+            success: false,
+            error: { code: 'CONFLICT', message: 'Duplicate eventId "evt-abc-001" within batch' },
+          },
+        },
+      },
+    },
     '413': { description: 'Payload too large', content: { 'application/json': { schema: ErrorEnvelope } } },
     '429': errorResponses['429'],
     '503': errorResponses['503'],

@@ -567,3 +567,246 @@ describe('GET /docs', () => {
     expect(res.text).toMatch(/swagger|openapi/i);
   });
 });
+
+// ── ContractEventSchema — OpenAPI spec tests ──────────────────────────────────
+
+describe('POST /internal/indexer/contract-events — ContractEventSchema spec', () => {
+  async function getIngestOp() {
+    const res = await request(app).get('/openapi.json');
+    const spec = res.body as Record<string, unknown>;
+    return (
+      (spec.paths as Record<string, unknown>)['/internal/indexer/contract-events'] as Record<string, unknown>
+    )?.post as Record<string, unknown>;
+  }
+
+  async function getSchemas() {
+    const res = await request(app).get('/openapi.json');
+    return (res.body?.components?.schemas ?? {}) as Record<string, unknown>;
+  }
+
+  // ── component registration ─────────────────────────────────────────────────
+
+  it('registers ContractEventSchema in components/schemas', async () => {
+    const schemas = await getSchemas();
+    expect(schemas['ContractEventSchema']).toBeDefined();
+  });
+
+  it('ContractEventSchema is an object type', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    expect(schema.type).toBe('object');
+  });
+
+  it('ContractEventSchema has a topic property with enum', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const props = schema.properties as Record<string, unknown>;
+    const topic = props?.topic as Record<string, unknown>;
+    expect(topic).toBeDefined();
+    const enumVals = topic.enum as string[];
+    expect(Array.isArray(enumVals)).toBe(true);
+    expect(enumVals).toContain('stream.created');
+    expect(enumVals).toContain('stream.updated');
+    expect(enumVals).toContain('stream.cancelled');
+    expect(enumVals).toContain('stream.completed');
+    expect(enumVals).toContain('stream.funded');
+    expect(enumVals).toContain('stream.withdrawn');
+  });
+
+  it('ContractEventSchema topic enum has exactly 6 values', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const props = schema.properties as Record<string, unknown>;
+    const topic = props?.topic as Record<string, unknown>;
+    expect((topic.enum as string[]).length).toBe(6);
+  });
+
+  it('ContractEventSchema has required eventId field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('eventId');
+  });
+
+  it('ContractEventSchema has required ledger field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('ledger');
+  });
+
+  it('ContractEventSchema has required topic field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('topic');
+  });
+
+  it('ContractEventSchema has required txHash field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('txHash');
+  });
+
+  it('ContractEventSchema has required eventIndex field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('eventIndex');
+  });
+
+  it('ContractEventSchema has required payload field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('payload');
+  });
+
+  it('ContractEventSchema has required happenedAt field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('happenedAt');
+  });
+
+  it('ContractEventSchema has required ledgerHash field', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const required = schema.required as string[];
+    expect(required).toContain('ledgerHash');
+  });
+
+  it('ContractEventSchema ledger property is integer type', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const props = schema.properties as Record<string, unknown>;
+    const ledger = props?.ledger as Record<string, unknown>;
+    expect(ledger.type).toBe('integer');
+  });
+
+  it('ContractEventSchema topic example is a known topic value', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const props = schema.properties as Record<string, unknown>;
+    const topic = props?.topic as Record<string, unknown>;
+    const knownTopics = ['stream.created', 'stream.updated', 'stream.cancelled', 'stream.completed', 'stream.funded', 'stream.withdrawn'];
+    expect(knownTopics).toContain(topic.example as string);
+  });
+
+  it('ContractEventSchema description mentions topic enum and unknown keys rejection', async () => {
+    const schemas = await getSchemas();
+    const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
+    const desc = (schema.description ?? '') as string;
+    expect(desc.toLowerCase()).toMatch(/topic/);
+    expect(desc.toLowerCase()).toMatch(/reject|unknown/);
+  });
+
+  // ── ingest route body schema ───────────────────────────────────────────────
+
+  it('ingest route request body uses a $ref to ContractEventSchema for array items', async () => {
+    const res = await request(app).get('/openapi.json');
+    const spec = res.body as Record<string, unknown>;
+    const op = (
+      (spec.paths as Record<string, unknown>)['/internal/indexer/contract-events'] as Record<string, unknown>
+    )?.post as Record<string, unknown>;
+    const body = op.requestBody as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const schema = content?.schema as Record<string, unknown>;
+    const props = schema?.properties as Record<string, unknown>;
+    const events = props?.events as Record<string, unknown>;
+    expect(events).toBeDefined();
+    // items must reference ContractEventSchema — either as $ref or as resolved schema with required/type
+    const items = events?.items as Record<string, unknown>;
+    expect(items).toBeDefined();
+    const isRef = '$ref' in items && (items['$ref'] as string).includes('ContractEventSchema');
+    const hasType = items.type === 'object';
+    expect(isRef || hasType).toBe(true);
+  });
+
+  it('ingest route body schema events field is an array', async () => {
+    const op = await getIngestOp();
+    const body = op.requestBody as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const schema = content?.schema as Record<string, unknown>;
+    const props = schema?.properties as Record<string, unknown>;
+    const events = props?.events as Record<string, unknown>;
+    expect(events?.type).toBe('array');
+  });
+
+  it('ingest route body has examples with streamCreated and streamCancelled', async () => {
+    const op = await getIngestOp();
+    const body = op.requestBody as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const examples = content?.examples as Record<string, unknown>;
+    expect(examples?.streamCreated).toBeDefined();
+    expect(examples?.streamCancelled).toBeDefined();
+  });
+
+  it('streamCreated example has topic stream.created', async () => {
+    const op = await getIngestOp();
+    const body = op.requestBody as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const examples = content?.examples as Record<string, unknown>;
+    const example = examples?.streamCreated as Record<string, unknown>;
+    const value = example?.value as Record<string, unknown>;
+    const events = value?.events as Array<Record<string, unknown>>;
+    expect(events?.[0]?.topic).toBe('stream.created');
+  });
+
+  it('streamCancelled example has topic stream.cancelled', async () => {
+    const op = await getIngestOp();
+    const body = op.requestBody as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const examples = content?.examples as Record<string, unknown>;
+    const example = examples?.streamCancelled as Record<string, unknown>;
+    const value = example?.value as Record<string, unknown>;
+    const events = value?.events as Array<Record<string, unknown>>;
+    expect(events?.[0]?.topic).toBe('stream.cancelled');
+  });
+
+  it('ingest route 200 response includes typed success schema', async () => {
+    const op = await getIngestOp();
+    const responses = op.responses as Record<string, unknown>;
+    const r200 = responses?.['200'] as Record<string, unknown>;
+    expect(r200).toBeDefined();
+    const content = (r200?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    expect(content?.schema).toBeDefined();
+  });
+
+  it('ingest route documents 400 response with error examples', async () => {
+    const op = await getIngestOp();
+    const responses = op.responses as Record<string, unknown>;
+    const r400 = responses?.['400'] as Record<string, unknown>;
+    expect(r400).toBeDefined();
+    const content = (r400?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const examples = content?.examples as Record<string, unknown>;
+    expect(examples?.unknownTopic).toBeDefined();
+    expect(examples?.emptyBatch).toBeDefined();
+    expect(examples?.extraKeys).toBeDefined();
+  });
+
+  it('ingest route documents 409 conflict for duplicate eventId', async () => {
+    const op = await getIngestOp();
+    const responses = op.responses as Record<string, unknown>;
+    expect(responses?.['409']).toBeDefined();
+  });
+
+  it('ingest route operation description mentions topic enum', async () => {
+    const op = await getIngestOp();
+    const desc = (op.description ?? '') as string;
+    expect(desc.toLowerCase()).toMatch(/topic/);
+  });
+
+  it('ingest route operation description mentions unknown fields rejection', async () => {
+    const op = await getIngestOp();
+    const desc = (op.description ?? '') as string;
+    expect(desc.toLowerCase()).toMatch(/unknown|reject/);
+  });
+
+  it('ingest route operation description mentions idempotent re-delivery', async () => {
+    const op = await getIngestOp();
+    const desc = (op.description ?? '') as string;
+    expect(desc.toLowerCase()).toMatch(/idempotent|duplicate/);
+  });
+});
