@@ -61,6 +61,31 @@ export const indexerLagSeconds =
     registers: [registry],
   });
 
+/**
+ * Total live SSE subscribers across all stream IDs.
+ * Updated on every subscribe/unsubscribe call.
+ */
+export const sseLiveSubscribersGauge =
+  (registry.getSingleMetric('fluxora_sse_live_subscribers') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_live_subscribers',
+    help: 'Total number of live SSE subscriber callbacks registered across all streams',
+    registers: [registry],
+  });
+
+/**
+ * Current EventEmitter listener count on SSE_STREAM_UPDATE_EVENT.
+ * Should be 0 (idle) or 1 (dispatcher attached). Spikes above 1 indicate a
+ * regression that reintroduces per-connection listeners.
+ */
+export const sseEventListenersGauge =
+  (registry.getSingleMetric('fluxora_sse_event_listeners') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_event_listeners',
+    help: 'Number of EventEmitter listeners on SSE_STREAM_UPDATE_EVENT (expected 0 or 1)',
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_streams_created_total');
@@ -70,4 +95,6 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
+  registry.removeSingleMetric('fluxora_sse_live_subscribers');
+  registry.removeSingleMetric('fluxora_sse_event_listeners');
 }
