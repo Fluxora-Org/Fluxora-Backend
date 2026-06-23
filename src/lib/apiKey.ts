@@ -1,6 +1,22 @@
 import { createId } from '@paralleldrive/cuid2';
 import { createHash, timingSafeEqual } from 'crypto';
+import { z } from 'zod';
 import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+
+/**
+ * Zod schema for the API key creation/rotation response.
+ *
+ * ⚠️  SECURITY: `key` is the plaintext API key shown **exactly once**.
+ * Clients must store it immediately — it is never returned again.
+ */
+export const ApiKeyCreatedSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** Raw key shown exactly once — store it immediately, it cannot be recovered. */
+  key: z.string(),
+  prefix: z.string(),
+  createdAt: z.string(),
+});
 
 // ---------------------------------------------------------------------------
 // In-memory store (replace with DB-backed store when persistence is needed)
