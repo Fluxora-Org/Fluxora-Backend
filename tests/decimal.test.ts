@@ -24,6 +24,8 @@ import {
   DecimalErrorCode,
   DECIMAL_STRING_PATTERN,
 } from '../src/serialization/decimal.js';
+import { decimalStringField } from '../src/validation/schemas.js';
+
 
 describe('Decimal String Serialization Policy', () => {
   describe('DECIMAL_STRING_PATTERN', () => {
@@ -565,3 +567,58 @@ describe('Decimal Error Classification', () => {
     expect(result.error?.code).toBe(DecimalErrorCode.EMPTY_VALUE);
   });
 });
+
+describe('decimalStringField validation limits', () => {
+  const schema = decimalStringField('amount');
+
+  it('should accept maximum safe in-range values', () => {
+    const maxVal = '9223372036854775807.9999999';
+    const result = schema.safeParse(maxVal);
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject integer part exceeding max magnitude', () => {
+    const overMax = '9223372036854775808';
+    const result = schema.safeParse(overMax);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('amount integer part exceeds maximum supported value');
+    }
+  });
+
+  it('should reject integer part exceeding max magnitude with decimals', () => {
+    const overMax = '9223372036854775808.0';
+    const result = schema.safeParse(overMax);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('amount integer part exceeds maximum supported value');
+    }
+  });
+
+  it('should accept 7 fractional digits (Stellar precision limit)', () => {
+    const result = schema.safeParse('100.1234567');
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject more than 7 fractional digits', () => {
+    const result = schema.safeParse('100.12345678');
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('amount exceeds maximum Stellar precision of 7 decimal places');
+    }
+  });
+
+  it('should reject tiny values exceeding precision limit', () => {
+    const result = schema.safeParse('0.00000001');
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('amount exceeds maximum Stellar precision of 7 decimal places');
+    }
+  });
+
+  it('should accept tiny values within precision limit', () => {
+    const result = schema.safeParse('0.0000001');
+    expect(result.success).toBe(true);
+  });
+});
+

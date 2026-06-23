@@ -5,10 +5,15 @@ import {
   checkLimiter, 
   trackConnection, 
   untrackConnection, 
-  _resetLimiter 
+  _resetLimiter,
+  setBanStore,
+  getBanStore,
+  wireRedisBanStore
 } from '../../../src/ws/connectionLimiter.js';
+import { InMemoryBanStore, createBanStore } from '../../../src/redis/banStore.js';
+import type { RedisClient } from '../../../src/redis/client.js';
 
-describe('connectionLimiter', () => {
+describe('connectionLimiter (Redis-backed bans)', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
@@ -64,79 +69,145 @@ describe('connectionLimiter', () => {
   describe('connection limiting', () => {
     const ip = '1.1.1.1';
 
-    it('allows connections up to the limit', () => {
+    it('allows connections up to the limit', async () => {
       // Limit is 2
-      expect(checkLimiter(ip).allowed).toBe(true);
+      expect((await checkLimiter(ip)).allowed).toBe(true);
       trackConnection(ip);
-      expect(checkLimiter(ip).allowed).toBe(true);
+      expect((await checkLimiter(ip)).allowed).toBe(true);
       trackConnection(ip);
       
-      const result = checkLimiter(ip);
+      const result = await checkLimiter(ip);
       expect(result.allowed).toBe(false);
       expect(result.code).toBe(4029);
       expect(result.reason).toBe('Too many connections');
     });
 
-    it('works correctly with IPv6 addresses', () => {
+    it('works correctly with IPv6 addresses', async () => {
       const ipv6 = '2001:db8::1';
-      expect(checkLimiter(ipv6).allowed).toBe(true);
+      expect((await checkLimiter(ipv6)).allowed).toBe(true);
       trackConnection(ipv6);
       trackConnection(ipv6);
-      expect(checkLimiter(ipv6).allowed).toBe(false);
-      expect(checkLimiter(ipv6).code).toBe(4029);
+      expect((await checkLimiter(ipv6)).allowed).toBe(false);
+      expect((await checkLimiter(ipv6)).code).toBe(4029);
     });
 
-    it('recovering connection count allows new connections', () => {
+    it('recovering connection count allows new connections', async () => {
       trackConnection(ip);
       trackConnection(ip);
-      expect(checkLimiter(ip).allowed).toBe(false);
+      expect((await checkLimiter(ip)).allowed).toBe(false);
 
       untrackConnection(ip);
-      expect(checkLimiter(ip).allowed).toBe(true);
+      expect((await checkLimiter(ip)).allowed).toBe(true);
     });
   });
 
-  describe('abuse banning', () => {
+  describe('abuse banning (Redis-backed)', () => {
     const ip = '2.2.2.2';
 
-    it('bans IP after exceeding abuse threshold rejections', () => {
+    it('bans IP after exceeding abuse threshold rejections', async () => {
       // Limit 2, Abuse threshold 2
       trackConnection(ip);
       trackConnection(ip);
 
       // Rejection 1
-      checkLimiter(ip); 
+      await checkLimiter(ip); 
       // Rejection 2
-      checkLimiter(ip);
+      await checkLimiter(ip);
       // Rejection 3 -> Trigger ban
-      checkLimiter(ip);
+      await checkLimiter(ip);
 
-      const result = checkLimiter(ip);
+      const result = await checkLimiter(ip);
       expect(result.allowed).toBe(false);
       expect(result.reason).toBe('IP banned due to abuse');
     });
 
-    it('ban expires after TTL', () => {
+    it('ban expires after TTL (local InMemoryBanStore)', async () => {
         vi.useFakeTimers();
         trackConnection(ip);
         trackConnection(ip);
         
         // Trigger ban
-        checkLimiter(ip);
-        checkLimiter(ip);
-        checkLimiter(ip);
+        await checkLimiter(ip);
+        await checkLimiter(ip);
+        await checkLimiter(ip);
         
-        expect(checkLimiter(ip).reason).toBe('IP banned due to abuse');
+        expect((await checkLimiter(ip)).reason).toBe('IP banned due to abuse');
         
         // Fast forward 61 seconds
         vi.advanceTimersByTime(61000);
         
         // Still rejected because of connection limit, but not because of ban
-        const result = checkLimiter(ip);
+        const result = await checkLimiter(ip);
         expect(result.allowed).toBe(false);
         expect(result.reason).toBe('Too many connections');
         
         vi.useRealTimers();
+    });
+
+    it('supports explicit InMemoryBanStore injection', async () => {
+      const memoryStore = new InMemoryBanStore();
+      setBanStore(memoryStore);
+
+      trackConnection(ip);
+      trackConnection(ip);
+      await checkLimiter(ip);
+      await checkLimiter(ip);
+      await checkLimiter(ip);
+
+      const result = await checkLimiter(ip);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('IP banned due to abuse');
+
+      // Verify ban persisted in memory store
+      const banCheck = await memoryStore.isBanned(ip);
+      expect(banCheck.banned).toBe(true);
+    });
+
+    it('Redis outage falls back to local enforcement (fail-safe)', async () => {
+      // Create a fake Redis client that always throws
+      const fakeRedis: RedisClient = {
+        async get() { throw new Error('Redis down'); },
+        async set() { throw new Error('Redis down'); },
+        async setNx() { return false; },
+        async del() { throw new Error('Redis down'); },
+        async exists() { return false; },
+        async close() {},
+        multi() { return { zadd() {return this;}, zremrangebyscore(){return this;}, zcard(){return this;}, pexpire(){return this;}, async exec() {return [];} } as any; },
+        async zcount() { return 0; }
+      };
+
+      const store = createBanStore(fakeRedis);
+      setBanStore(store);
+
+      trackConnection(ip);
+      trackConnection(ip);
+
+      // Should still be able to ban locally even if Redis throws
+      await checkLimiter(ip);
+      await checkLimiter(ip);
+      await checkLimiter(ip);
+
+      const result = await checkLimiter(ip);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('IP banned due to abuse');
+    });
+  });
+
+  describe('multi-instance simulation via shared BanStore', () => {
+    it('bans are visible across different limiter instances when using same store', async () => {
+      const sharedStore = new InMemoryBanStore();
+      setBanStore(sharedStore);
+
+      // Simulate instance A banning
+      await sharedStore.ban({ ip: '10.0.0.1', ttlSeconds: 3600 });
+
+      // Instance B (new limiter state) should still see the ban
+      _resetLimiter(); // clears local state but keeps shared store
+      setBanStore(sharedStore);
+
+      const result = await checkLimiter('10.0.0.1');
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('IP banned due to abuse');
     });
   });
 });
