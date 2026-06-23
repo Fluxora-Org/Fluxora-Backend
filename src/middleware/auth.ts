@@ -15,6 +15,7 @@ export enum Permission {
   DLQ_READ = 'dlq:read',
   DLQ_REPLAY = 'dlq:replay',
   DLQ_DELETE = 'dlq:delete',
+  DLQ_CONSUMER_RESUME = 'dlq:consumer:resume',
   AUDIT_READ = 'audit:read',
   AUDIT_WRITE = 'audit:write',
 }
@@ -27,6 +28,7 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
     Permission.DLQ_READ,
     Permission.DLQ_REPLAY,
     Permission.DLQ_DELETE,
+    Permission.DLQ_CONSUMER_RESUME,
     Permission.AUDIT_READ,
   ],
   viewer: [Permission.STREAMS_READ],

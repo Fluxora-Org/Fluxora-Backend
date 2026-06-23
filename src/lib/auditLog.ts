@@ -30,7 +30,7 @@
 import { logger } from './logger.js';
 import { getPool, query } from '../db/pool.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.
