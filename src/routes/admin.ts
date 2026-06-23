@@ -11,6 +11,7 @@ import { createApiKey, rotateApiKey, revokeApiKey, listApiKeys } from '../lib/ap
 import { recordAuditEvent, recordAuditEventToDb } from '../lib/auditLog.js';
 import { getStreamHub } from '../ws/hub.js';
 import { successResponse, errorResponse } from '../utils/response.js';
+import { clearIndexerStall, ActiveStallError } from '../indexer/stall.js';
 
 export const adminRouter = Router();
 
@@ -177,6 +178,25 @@ adminRouter.post('/reindex', async (_req, res) => {
       requestId
     )
   );
+});
+
+/**
+ * POST /api/admin/indexer/stall/clear
+ * Clears a latched indexer stall flag. Refuses to clear if the underlying
+ * lag is still violating the freshness threshold.
+ */
+adminRouter.post('/indexer/stall/clear', (req, res) => {
+  try {
+    clearIndexerStall();
+    recordAuditEvent('INDEXER_STALL_CLEARED', 'indexer', 'system', req.correlationId);
+    res.json({ message: 'Indexer stall flag cleared successfully.' });
+  } catch (err) {
+    if (err instanceof ActiveStallError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
+    throw err;
+  }
 });
 
 /**
