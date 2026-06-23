@@ -28,7 +28,7 @@ const StellarAddress = registry.register(
 
 const StreamStatus = registry.register(
   'StreamStatus',
-  z.enum(['scheduled', 'active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' }),
+  z.enum(['active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' }),
 );
 
 const StreamObject = registry.register(
@@ -38,10 +38,17 @@ const StreamObject = registry.register(
     sender: StellarAddress,
     recipient: StellarAddress,
     depositAmount: DecimalString,
+    streamedAmount: DecimalString,
+    remainingAmount: DecimalString,
     ratePerSecond: DecimalString,
     startTime: z.number().int().openapi({ example: 1700000000 }),
     endTime: z.number().int().openapi({ example: 0 }),
     status: StreamStatus,
+    contractId: z.string().openapi({ example: 'api-created' }),
+    transactionHash: z.string().openapi({ example: '0a1b2c3d4e...' }),
+    eventIndex: z.number().int().openapi({ example: 0 }),
+    createdAt: z.string().openapi({ example: '2026-01-01T00:00:00.000Z' }),
+    updatedAt: z.string().openapi({ example: '2026-01-01T00:00:00.000Z' }),
   }).openapi({ description: 'A treasury stream record' }),
 );
 
@@ -331,7 +338,9 @@ registry.registerPath({
                       sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
                       recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
                       depositAmount: '1000000.0000000',
-                      ratePerSecond: '0.0000116',
+                        streamedAmount: '0.0000000',
+                        remainingAmount: '1000000.0000000',
+                        ratePerSecond: '0.0000116',
                       startTime: 1700000000,
                       endTime: 0,
                       status: 'active',
@@ -357,6 +366,8 @@ registry.registerPath({
                       sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
                       recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
                       depositAmount: '500000.0000000',
+                      streamedAmount: '0.0000000',
+                      remainingAmount: '500000.0000000',
                       ratePerSecond: '0.0000058',
                       startTime: 1700001000,
                       endTime: 0,
@@ -383,6 +394,8 @@ registry.registerPath({
                       sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
                       recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
                       depositAmount: '250000.0000000',
+                      streamedAmount: '0.0000000',
+                      remainingAmount: '250000.0000000',
                       ratePerSecond: '0.0000029',
                       startTime: 1700002000,
                       endTime: 1800000000,

@@ -9,7 +9,7 @@ assert.deepEqual(
   mapChainStatusToApiStatus('pending'),
   {
     chainStatus: 'pending',
-    status: 'scheduled',
+    status: 'active',
     terminal: false,
   },
 );
