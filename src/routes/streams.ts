@@ -51,6 +51,7 @@
 import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
+import { loadConfig } from '../config/env.js';
 import {
   compareDecimalStringToZero,
   validateDecimalString,
@@ -100,7 +101,6 @@ import {
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
-
 export const streamsRouter = Router();
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -111,6 +111,8 @@ export interface Stream {
   sender: string;
   recipient: string;
   depositAmount: string;
+  streamedAmount: string;
+  remainingAmount: string;
   ratePerSecond: string;
   startTime: number;
   endTime: number;
@@ -132,7 +134,6 @@ type NormalizedCreateInput = {
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
 const NO_STORE_STREAM_HEADERS = 'private, no-store';
-const SSE_HEARTBEAT_INTERVAL_MS = 30_000;
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -198,6 +199,8 @@ function toApiStream(record: StreamRecord): Stream {
     sender:        record.sender_address,
     recipient:     record.recipient_address,
     depositAmount: record.amount,
+    streamedAmount: record.streamed_amount,
+    remainingAmount: record.remaining_amount,
     ratePerSecond: record.rate_per_second,
     startTime:     record.start_time,
     endTime:       record.end_time,
@@ -348,10 +351,9 @@ function wrapDbError(err: unknown): never {
 
 // ── API status state machine ──────────────────────────────────────────────────
 
-type ApiStreamStatus = 'scheduled' | 'active' | 'paused' | 'completed' | 'cancelled';
+type ApiStreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
 
 const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
-  scheduled:  ['active', 'cancelled'],
   active:     ['paused', 'completed', 'cancelled'],
   paused:     ['active', 'cancelled'],
   completed:  [],
@@ -745,9 +747,9 @@ streamsRouter.patch(
       throw notFound('Stream', '');
     }
 
-    const validStatuses: ApiStreamStatus[] = ['scheduled', 'active', 'paused', 'completed', 'cancelled'];
+    const validStatuses: ApiStreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
     if (typeof newStatus !== 'string' || !validStatuses.includes(newStatus as ApiStreamStatus)) {
-      throw validationError('status must be one of: scheduled, active, paused, completed, cancelled');
+      throw validationError('status must be one of: active, paused, completed, cancelled');
     }
 
     let record;
@@ -770,8 +772,7 @@ streamsRouter.patch(
 
     let updated;
     try {
-      // 'scheduled' is an API-only concept; map to 'active' in DB
-      const dbStatus = newStatus === 'scheduled' ? 'active' : newStatus as StreamStatus;
+      const dbStatus = newStatus as StreamStatus;
       updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId ?? '');
     } catch (err) {
       wrapDbError(err);
@@ -975,12 +976,13 @@ streamsRouter.get(
     // Send connection ok comment + retry hint so browser EventSource knows the
     // reconnect interval (ms). This is the SSE-spec mechanism for communicating
     // the backoff to the client.
-    if (!writeSse(': ok\n\nretry: 5000\n\n')) return;
+    const sseConfig = loadConfig();
+    if (!writeSse(`: ok\n\nretry: ${sseConfig.sseRetryMs}\n\n`)) return;
 
     // Periodic heartbeat to prevent proxies and load balancers from closing the connection.
     heartbeatInterval = setInterval(() => {
       writeSse(': heartbeat\n\n');
-    }, SSE_HEARTBEAT_INTERVAL_MS);
+    }, sseConfig.sseHeartbeatIntervalMs);
     heartbeatInterval.unref?.();
 
     // Bound long-lived SSE streams. Browser EventSource clients reconnect automatically.
