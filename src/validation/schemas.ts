@@ -195,6 +195,92 @@ export function parseBody<T>(
   return { success: false, issues: result.error.issues };
 }
 
+/**
+ * Known contract event topics emitted by the Fluxora smart-contract.
+ *
+ * @see ContractEventSchema
+ */
+export const CONTRACT_EVENT_TOPICS = [
+  'stream.created',
+  'stream.updated',
+  'stream.cancelled',
+  'stream.completed',
+  'stream.funded',
+  'stream.withdrawn',
+] as const;
+
+export type ContractEventTopic = (typeof CONTRACT_EVENT_TOPICS)[number];
+
+/**
+ * Typed schema for a single contract event delivered to
+ * POST /internal/indexer/contract-events.
+ *
+ * @remarks
+ * - `topic` is constrained to the {@link CONTRACT_EVENT_TOPICS} enum so
+ *   unrecognised topics are rejected at the ingest boundary.
+ * - `payload` must be an object (not a primitive, array, or null) to prevent
+ *   ingesting structurally malformed chain data.
+ * - `strictObject` is used intentionally: unknown extra keys on the top-level
+ *   event are rejected, preventing forged or malformed event shapes from
+ *   reaching the store. `payload` is kept open so contract-specific fields
+ *   can evolve without breaking the ingest schema.
+ */
+export const ContractEventSchema = z.strictObject({
+  /** Application-level deduplication key for this event. */
+  eventId: z.string().min(1, 'eventId must be a non-empty string'),
+  /** Stellar ledger sequence number in which the event was emitted. */
+  ledger: z.number().int().nonnegative('ledger must be a non-negative integer'),
+  /** Soroban contract address that emitted the event. */
+  contractId: z.string().min(1, 'contractId must be a non-empty string'),
+  /** Semantic event type; must be one of the known Fluxora contract topics. */
+  topic: z.enum(CONTRACT_EVENT_TOPICS),
+  /** Hash of the transaction that emitted this event. */
+  txHash: z.string().min(1, 'txHash must be a non-empty string'),
+  /** Position of the transaction within the ledger. */
+  txIndex: z.number().int().nonnegative('txIndex must be a non-negative integer'),
+  /** Position of the operation within the transaction. */
+  operationIndex: z.number().int().nonnegative('operationIndex must be a non-negative integer'),
+  /** Position of the event within the operation. */
+  eventIndex: z.number().int().nonnegative('eventIndex must be a non-negative integer'),
+  /** Arbitrary chain-derived event data; amount-like fields must be decimal strings. */
+  payload: z.record(z.string(), z.unknown()).refine(
+    (v) => typeof v === 'object' && v !== null && !Array.isArray(v),
+    'payload must be a non-null object',
+  ),
+  /** ISO-8601 close time of the ledger that included this event. */
+  happenedAt: z.string().min(1, 'happenedAt must be a non-empty string'),
+  /** Content hash of the ledger header — used for reorg detection. */
+  ledgerHash: z.string().min(1, 'ledgerHash must be a non-empty string'),
+});
+
+export type ContractEventInput = z.infer<typeof ContractEventSchema>;
+
+/**
+ * Batch wrapper for POST /internal/indexer/contract-events.
+ * Rejects duplicate eventIds within a single batch at validation time.
+ */
+export const ContractEventBatchSchema = z
+  .object({
+    events: z.array(ContractEventSchema).min(1, 'events must not be empty').max(100, 'events must not exceed 100 per batch'),
+  })
+  .superRefine((batch, ctx) => {
+    const seen = new Map<string, number>();
+    batch.events.forEach((event, index) => {
+      const prior = seen.get(event.eventId);
+      if (prior !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['events', index, 'eventId'],
+          message: `Duplicate eventId "${event.eventId}" at index ${index}; first seen at index ${prior}`,
+        });
+        return;
+      }
+      seen.set(event.eventId, index);
+    });
+  });
+
+export type ContractEventBatchInput = z.infer<typeof ContractEventBatchSchema>;
+
 /** Format Zod issues into a flat error array for API responses */
 export function formatZodIssues(issues: z.ZodIssue[]): Array<{ field: string; message: string }> {
   return issues.map((issue) => ({

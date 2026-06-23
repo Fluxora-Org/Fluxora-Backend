@@ -248,6 +248,10 @@ export const EnvSchema = z.object({
   SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
   SSE_MAX_CONNECTION_DURATION_MS: integerEnv('SSE_MAX_CONNECTION_DURATION_MS', 1, 86_400_000).default(30 * 60 * 1000),
   SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
+  /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
+  SSE_RETRY_MS: integerEnv('SSE_RETRY_MS', 100, 300_000).default(5000),
+  /** Interval in milliseconds between SSE heartbeat comments per connection. */
+  SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
   INDEXER_ENABLED: booleanEnv().default(false),
   WORKER_ENABLED: booleanEnv().default(false),
   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
@@ -363,6 +367,10 @@ export interface Config {
   sseMaxGlobalConnections: number;
   sseMaxConnectionDurationMs: number;
   sseRetryAfterSeconds: number;
+  /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
+  sseRetryMs: number;
+  /** Interval in milliseconds between per-connection SSE heartbeat comments. */
+  sseHeartbeatIntervalMs: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
   indexerStallThresholdMs: number;
@@ -507,6 +515,8 @@ function toConfig(env: ParsedEnv): Config {
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
     sseMaxConnectionDurationMs: env.SSE_MAX_CONNECTION_DURATION_MS,
     sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
+    sseRetryMs: env.SSE_RETRY_MS,
+    sseHeartbeatIntervalMs: env.SSE_HEARTBEAT_INTERVAL_MS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
