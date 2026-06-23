@@ -773,7 +773,7 @@ export class WebhookDispatcher {
           FROM webhook_outbox
           WHERE processed = false
             AND created_at <= NOW()
-          ORDER BY created_at ASC, id ASC
+          ORDER BY created_at ASC, COALESCE((payload->>'ledger')::numeric, 0) ASC, payload->>'id' ASC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         `,

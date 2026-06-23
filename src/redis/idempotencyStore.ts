@@ -28,6 +28,8 @@
  */
 
 import type { RedisClient } from './client.js';
+import { logger as defaultLogger } from '../logging/logger.js';
+import { correlationStore } from '../tracing/middleware.js';
 
 export const IDEMPOTENCY_KEY_PREFIX = 'fluxora:idempotency:';
 
@@ -70,20 +72,30 @@ export interface RedisIdempotencyStoreOptions {
    * Idempotency-Key values are never passed to this callback.
    */
   onStateChange?: (healthy: boolean) => void;
+
+  /**
+   * Structured logger instance. Defaults to the application's shared logger.
+   * Pass a mock or custom logger in tests or when custom log routing is needed.
+   * When omitted, logs are emitted through the default structured logger
+   * (JSON lines with automatic PII redaction).
+   */
+  logger?: typeof defaultLogger;
 }
 
 export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   private readonly onStateChange?: (healthy: boolean) => void;
+  private readonly logger: typeof defaultLogger;
 
   /**
    * @param client  The Redis client to use for storage.
-   * @param options Optional callbacks for health-state reporting.
+   * @param options Optional callbacks for health-state reporting and logger injection.
    */
   constructor(
     private readonly client: RedisClient,
     options?: RedisIdempotencyStoreOptions,
   ) {
     this.onStateChange = options?.onStateChange;
+    this.logger = options?.logger ?? defaultLogger;
   }
 
   private buildKey(key: string): string {
@@ -98,7 +110,9 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       return JSON.parse(raw) as IdempotentEntry<T>;
     } catch (err) {
       this.onStateChange?.(false);
-      console.warn('[IdempotencyStore] Redis get failed — degrading to pass-through', {
+      this.logger.warn('Idempotency store: Redis get failed — degrading to pass-through', {
+        operation: 'get',
+        correlationId: correlationStore.getStore(),
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -112,7 +126,9 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       this.onStateChange?.(true);
     } catch (err) {
       this.onStateChange?.(false);
-      console.warn('[IdempotencyStore] Redis set failed — idempotency not persisted', {
+      this.logger.warn('Idempotency store: Redis set failed — idempotency not persisted', {
+        operation: 'set',
+        correlationId: correlationStore.getStore(),
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });
