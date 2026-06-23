@@ -291,6 +291,10 @@ Outbound webhook retries use two Redis-backed per-consumer controls:
 
 `attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for details.
 
+## Webhook Causal Ordering Guarantee
+
+To ensure per-stream consumers always observe events in chain order, Fluxora guarantees a deterministic tiebreaker for webhook outbox deliveries. Items sharing the exact same `scheduledFor` timestamp are processed sequentially by applying a secondary sort on their `ledger` sequence (extracted from the JSON payload) and a tertiary sort on the `eventId`. This causal ordering is maintained securely across memory queues (`WebhookDeliveryStore`) and persistent database reads (`PostgreSQL webhook_outbox` query path), even when large sets of identical timestamps occur.
+
 ## 📝 License
 
 MIT
