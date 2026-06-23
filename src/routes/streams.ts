@@ -51,6 +51,7 @@
 import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
+import { loadConfig } from '../config/env.js';
 import {
   compareDecimalStringToZero,
   validateDecimalString,
@@ -100,7 +101,6 @@ import {
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
-
 export const streamsRouter = Router();
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -134,7 +134,6 @@ type NormalizedCreateInput = {
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
 const NO_STORE_STREAM_HEADERS = 'private, no-store';
-const SSE_HEARTBEAT_INTERVAL_MS = 30_000;
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -978,12 +977,13 @@ streamsRouter.get(
     // Send connection ok comment + retry hint so browser EventSource knows the
     // reconnect interval (ms). This is the SSE-spec mechanism for communicating
     // the backoff to the client.
-    if (!writeSse(': ok\n\nretry: 5000\n\n')) return;
+    const sseConfig = loadConfig();
+    if (!writeSse(`: ok\n\nretry: ${sseConfig.sseRetryMs}\n\n`)) return;
 
     // Periodic heartbeat to prevent proxies and load balancers from closing the connection.
     heartbeatInterval = setInterval(() => {
       writeSse(': heartbeat\n\n');
-    }, SSE_HEARTBEAT_INTERVAL_MS);
+    }, sseConfig.sseHeartbeatIntervalMs);
     heartbeatInterval.unref?.();
 
     // Bound long-lived SSE streams. Browser EventSource clients reconnect automatically.
