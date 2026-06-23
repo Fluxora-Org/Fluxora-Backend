@@ -31,6 +31,8 @@ interface OutboxRow {
   event_type: string;
   payload: unknown;
   created_at: Date | string;
+  attempt_count: number;
+  next_attempt_at: Date | string;
 }
 
 interface DbClient {
@@ -607,11 +609,12 @@ export class WebhookDispatcher {
       await client.query('BEGIN');
       const result = await client.query<OutboxRow>(
         `
-          SELECT id, stream_id, event_type, payload, created_at
+          SELECT id, stream_id, event_type, payload, created_at,
+                 attempt_count, next_attempt_at
           FROM webhook_outbox
           WHERE processed = false
-            AND created_at <= NOW()
-          ORDER BY created_at ASC, id ASC
+            AND next_attempt_at <= NOW()
+          ORDER BY next_attempt_at ASC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         `,
@@ -681,17 +684,20 @@ export class WebhookDispatcher {
       },
     );
 
-    await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
-
+    // --- Durable retry: persist checkpoint before marking processed ---
     if (!result.attempt) {
+      // Gate blocked (circuit breaker / rate limit): update next_attempt_at in-place
       if (result.shouldRetry && result.retryAt) {
         await client.query(
-          `
-            INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
-            VALUES ($1, $2, $3::jsonb, $4, false)
-          `,
-          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt],
+          `UPDATE webhook_outbox
+              SET next_attempt_at = $1,
+                  attempt_count   = attempt_count + 1
+            WHERE id = $2`,
+          [result.retryAt, row.id],
         );
+      } else {
+        // Exhausted without an attempt — mark processed (DLQ route below)
+        await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
       }
       return;
     }
@@ -711,21 +717,27 @@ export class WebhookDispatcher {
       delivery.status = 'permanent_failure';
     }
 
-    if (delivery.status === 'delivered' || delivery.status === 'permanent_failure') {
-      return;
+    if (delivery.status === 'pending' && result.shouldRetry && result.retryAt) {
+      // Persist retry checkpoint — row stays unprocessed, poller picks it up after next_attempt_at
+      await client.query(
+        `UPDATE webhook_outbox
+            SET next_attempt_at = $1,
+                attempt_count   = $2,
+                payload         = $3::jsonb
+          WHERE id = $4`,
+        [result.retryAt, attemptNumber, JSON.stringify(result.payload), row.id],
+      );
+    } else {
+      // Delivered or permanent failure — mark done
+      await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
     }
 
-    if (!result.shouldRetry || !result.retryAt) {
-      return;
+    if (delivery.status === 'permanent_failure') {
+      const failureReason = attempt.error
+        ? `${attempt.error} after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`
+        : `HTTP ${attempt.statusCode} after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`;
+      enqueuePermanentFailureToDlq(delivery, failureReason);
     }
-
-    await client.query(
-      `
-        INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
-        VALUES ($1, $2, $3::jsonb, $4, false)
-      `,
-      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt],
-    );
   }
 }
 
