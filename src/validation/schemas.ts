@@ -10,6 +10,7 @@
  * @module validation/schemas
  */
 import { z } from 'zod';
+import { MAX_DECIMAL_INTEGER_PART, STELLAR_DECIMALS } from '../serialization/decimal.js';
 
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
@@ -17,11 +18,54 @@ export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
 /** Regex for valid Stellar public keys: G followed by 55 base32 characters */
 export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 
-/** Reusable decimal-string field schema */
-function decimalStringField(fieldName: string) {
+/**
+ * Reusable decimal-string field schema.
+ * Validates decimal format, and enforces magnitude and precision bounds:
+ * - Magnitude: The integer part must not exceed MAX_DECIMAL_INTEGER_PART (int64 max).
+ * - Precision: The fractional part must not exceed STELLAR_DECIMALS (7 decimal places).
+ *
+ * @param fieldName - The name of the field, used in validation error messages.
+ * @returns A Zod string schema with regex and magnitude/precision refinements.
+ */
+export function decimalStringField(fieldName: string) {
   return z
     .string({ error: `${fieldName} must be a decimal string, not a number` })
-    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
+    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`)
+    .refine(
+      (val) => {
+        // Enforce magnitude limits by validating the integer part against MAX_DECIMAL_INTEGER_PART
+        const dotIndex = val.indexOf('.');
+        const integerPart = dotIndex === -1 ? val : val.slice(0, dotIndex);
+        const absIntegerPart = integerPart.replace(/^[+-]/, '');
+        try {
+          if (BigInt(absIntegerPart) > MAX_DECIMAL_INTEGER_PART) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+        return true;
+      },
+      {
+        message: `${fieldName} integer part exceeds maximum supported value`,
+      }
+    )
+    .refine(
+      (val) => {
+        // Enforce precision limits by checking that the fractional part has at most STELLAR_DECIMALS places
+        const dotIndex = val.indexOf('.');
+        if (dotIndex !== -1) {
+          const decimalPart = val.slice(dotIndex + 1);
+          if (decimalPart.length > STELLAR_DECIMALS) {
+            return false;
+          }
+        }
+        return true;
+      },
+      {
+        message: `${fieldName} exceeds maximum Stellar precision of ${STELLAR_DECIMALS} decimal places`,
+      }
+    );
 }
 
 /** Reusable Stellar public key field schema */
@@ -150,6 +194,92 @@ export function parseBody<T>(
   if (result.success) return { success: true, data: result.data };
   return { success: false, issues: result.error.issues };
 }
+
+/**
+ * Known contract event topics emitted by the Fluxora smart-contract.
+ *
+ * @see ContractEventSchema
+ */
+export const CONTRACT_EVENT_TOPICS = [
+  'stream.created',
+  'stream.updated',
+  'stream.cancelled',
+  'stream.completed',
+  'stream.funded',
+  'stream.withdrawn',
+] as const;
+
+export type ContractEventTopic = (typeof CONTRACT_EVENT_TOPICS)[number];
+
+/**
+ * Typed schema for a single contract event delivered to
+ * POST /internal/indexer/contract-events.
+ *
+ * @remarks
+ * - `topic` is constrained to the {@link CONTRACT_EVENT_TOPICS} enum so
+ *   unrecognised topics are rejected at the ingest boundary.
+ * - `payload` must be an object (not a primitive, array, or null) to prevent
+ *   ingesting structurally malformed chain data.
+ * - `strictObject` is used intentionally: unknown extra keys on the top-level
+ *   event are rejected, preventing forged or malformed event shapes from
+ *   reaching the store. `payload` is kept open so contract-specific fields
+ *   can evolve without breaking the ingest schema.
+ */
+export const ContractEventSchema = z.strictObject({
+  /** Application-level deduplication key for this event. */
+  eventId: z.string().min(1, 'eventId must be a non-empty string'),
+  /** Stellar ledger sequence number in which the event was emitted. */
+  ledger: z.number().int().nonnegative('ledger must be a non-negative integer'),
+  /** Soroban contract address that emitted the event. */
+  contractId: z.string().min(1, 'contractId must be a non-empty string'),
+  /** Semantic event type; must be one of the known Fluxora contract topics. */
+  topic: z.enum(CONTRACT_EVENT_TOPICS),
+  /** Hash of the transaction that emitted this event. */
+  txHash: z.string().min(1, 'txHash must be a non-empty string'),
+  /** Position of the transaction within the ledger. */
+  txIndex: z.number().int().nonnegative('txIndex must be a non-negative integer'),
+  /** Position of the operation within the transaction. */
+  operationIndex: z.number().int().nonnegative('operationIndex must be a non-negative integer'),
+  /** Position of the event within the operation. */
+  eventIndex: z.number().int().nonnegative('eventIndex must be a non-negative integer'),
+  /** Arbitrary chain-derived event data; amount-like fields must be decimal strings. */
+  payload: z.record(z.string(), z.unknown()).refine(
+    (v) => typeof v === 'object' && v !== null && !Array.isArray(v),
+    'payload must be a non-null object',
+  ),
+  /** ISO-8601 close time of the ledger that included this event. */
+  happenedAt: z.string().min(1, 'happenedAt must be a non-empty string'),
+  /** Content hash of the ledger header — used for reorg detection. */
+  ledgerHash: z.string().min(1, 'ledgerHash must be a non-empty string'),
+});
+
+export type ContractEventInput = z.infer<typeof ContractEventSchema>;
+
+/**
+ * Batch wrapper for POST /internal/indexer/contract-events.
+ * Rejects duplicate eventIds within a single batch at validation time.
+ */
+export const ContractEventBatchSchema = z
+  .object({
+    events: z.array(ContractEventSchema).min(1, 'events must not be empty').max(100, 'events must not exceed 100 per batch'),
+  })
+  .superRefine((batch, ctx) => {
+    const seen = new Map<string, number>();
+    batch.events.forEach((event, index) => {
+      const prior = seen.get(event.eventId);
+      if (prior !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['events', index, 'eventId'],
+          message: `Duplicate eventId "${event.eventId}" at index ${index}; first seen at index ${prior}`,
+        });
+        return;
+      }
+      seen.set(event.eventId, index);
+    });
+  });
+
+export type ContractEventBatchInput = z.infer<typeof ContractEventBatchSchema>;
 
 /** Format Zod issues into a flat error array for API responses */
 export function formatZodIssues(issues: z.ZodIssue[]): Array<{ field: string; message: string }> {

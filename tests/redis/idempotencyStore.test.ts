@@ -24,6 +24,7 @@ import {
   IDEMPOTENCY_KEY_PREFIX,
   type IdempotentEntry,
 } from '../../src/redis/idempotencyStore.js';
+import { logger } from '../../src/logging/logger.js';
 import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -102,31 +103,39 @@ describe('RedisIdempotencyStore', () => {
 
   it('returns null and logs a warning when Redis get throws', async () => {
     fake.throwOnNext('get');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const result = await store.get('key-err');
     expect(result).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[IdempotencyStore]'),
-      expect.objectContaining({ keyLength: expect.any(Number) }),
+      expect.stringContaining('Idempotency store'),
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: expect.any(Number),
+        error: expect.any(String),
+      }),
     );
     warnSpy.mockRestore();
   });
 
   it('silently no-ops and logs a warning when Redis set throws', async () => {
     fake.throwOnNext('set');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     // Should not throw
     await expect(store.set('key-err', makeEntry(), 60)).resolves.toBeUndefined();
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[IdempotencyStore]'),
-      expect.objectContaining({ keyLength: expect.any(Number) }),
+      expect.stringContaining('Idempotency store'),
+      expect.objectContaining({
+        operation: 'set',
+        keyLength: expect.any(Number),
+        error: expect.any(String),
+      }),
     );
     warnSpy.mockRestore();
   });
 
   it('subsequent get after a failed set returns null (no partial state)', async () => {
     fake.throwOnNext('set');
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.set('key-partial', makeEntry(), 60);
     const result = await store.get('key-partial');
     expect(result).toBeNull();
@@ -136,7 +145,7 @@ describe('RedisIdempotencyStore', () => {
   it('get still works after a previous set failure', async () => {
     // First set fails
     fake.throwOnNext('set');
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.set('key-recover', makeEntry({ requestFingerprint: 'fp-fail' }), 60);
 
     // Second set succeeds
@@ -230,7 +239,7 @@ describe('RedisIdempotencyStore — onStateChange', () => {
 
   it('calls onStateChange(false) when Redis get throws', async () => {
     fake.throwOnNext('get');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.get('key-err');
     expect(stateChanges).toContain(false);
     warnSpy.mockRestore();
@@ -238,7 +247,7 @@ describe('RedisIdempotencyStore — onStateChange', () => {
 
   it('calls onStateChange(false) when Redis set throws', async () => {
     fake.throwOnNext('set');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.set('key-err', makeEntry(), 60);
     expect(stateChanges).toContain(false);
     warnSpy.mockRestore();
@@ -246,7 +255,7 @@ describe('RedisIdempotencyStore — onStateChange', () => {
 
   it('recovers: onStateChange(true) fires on the next successful operation after a failure', async () => {
     fake.throwOnNext('get');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.get('key-fail'); // error → false
     warnSpy.mockRestore();
     await store.get('key-ok');   // success → true
@@ -260,6 +269,58 @@ describe('RedisIdempotencyStore — onStateChange', () => {
     await plainStore.get('k');
     // No assertion needed — absence of throw is sufficient
   });
+});
+
+// ── Logger injection ──────────────────────────────────────────────────────────
+
+describe('RedisIdempotencyStore — structured logger', () => {
+  let fake: FakeRedisClient;
+
+  beforeEach(() => {
+    fake = new FakeRedisClient();
+  });
+
+  it('calls logger.warn (not console.warn) on Redis get failure', async () => {
+    const loggerWarnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new RedisIdempotencyStore(fake);
+    fake.throwOnNext('get');
+
+    await store.get('key-err');
+
+    expect(loggerWarnSpy).toHaveBeenCalled();
+    expect(consoleWarnSpy).not.toHaveBeenCalled();
+    loggerWarnSpy.mockRestore();
+    consoleWarnSpy.mockRestore();
+  });
+
+  it('calls logger.warn (not console.warn) on Redis set failure', async () => {
+    const loggerWarnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new RedisIdempotencyStore(fake);
+    fake.throwOnNext('set');
+
+    await store.set('key-err', makeEntry(), 60);
+
+    expect(loggerWarnSpy).toHaveBeenCalled();
+    expect(consoleWarnSpy).not.toHaveBeenCalled();
+    loggerWarnSpy.mockRestore();
+    consoleWarnSpy.mockRestore();
+  });
+
+  it('uses the injected logger when provided via options', async () => {
+    const mockLogger = { warn: vi.fn() };
+    const store = new RedisIdempotencyStore(fake, { logger: mockLogger as unknown as typeof logger });
+    fake.throwOnNext('get');
+
+    await store.get('key-err');
+
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Idempotency store'),
+      expect.objectContaining({ operation: 'get' }),
+    );
+  });
+
 });
 
 // ── RedisIdempotencyStore.close() ─────────────────────────────────────────────

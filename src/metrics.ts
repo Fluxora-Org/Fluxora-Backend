@@ -52,3 +52,31 @@ export const rateLimitRedisErrorsTotal = new Counter({
   labelNames: ['operation'] as const,
   registers: [registry],
 });
+
+/**
+ * Total Redis errors in dedup operations (has/add).
+ * Labels: operation ('has' | 'add').
+ * No eventId/streamId labels — bounded cardinality, zero PII.
+ */
+export const dedupRedisErrorsTotal =
+  (registry.getSingleMetric('dedup_redis_errors_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'dedup_redis_errors_total',
+    help: 'Total Redis errors in dedup has/add operations',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Total times HybridDedupCache fell back to in-memory because Redis was degraded.
+ * Labels: operation ('has' | 'add').
+ * No eventId/streamId labels — bounded cardinality, zero PII.
+ */
+export const dedupRedisFallbackTotal =
+  (registry.getSingleMetric('dedup_redis_fallback_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'dedup_redis_fallback_total',
+    help: 'Total HybridDedupCache fallback activations when Redis is degraded',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });

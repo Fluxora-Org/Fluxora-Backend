@@ -8,6 +8,8 @@
  */
 
 import type { RedisClient } from './client.js';
+import { dedupRedisErrorsTotal, dedupRedisFallbackTotal } from '../metrics.js';
+import { logger } from '../logging/logger.js';
 
 export const DEDUP_KEY_PREFIX = 'fluxora:dedup:';
 
@@ -20,6 +22,21 @@ export interface DedupCache {
 
 const DEDUP_TTL_SECONDS = 86400;
 const DEDUP_CACHE_MAX = 10_000;
+const FALLBACK_LOG_THROTTLE_MS = 5_000;
+
+let lastFallbackLog = 0;
+
+function logFallback(operation: string, streamId: string, eventId: string): void {
+  const now = Date.now();
+  if (now - lastFallbackLog >= FALLBACK_LOG_THROTTLE_MS) {
+    lastFallbackLog = now;
+    logger.debug('dedup:fallback', { operation, streamId, eventId });
+  }
+}
+
+export function __resetDedupForTest(): void {
+  lastFallbackLog = 0;
+}
 
 export class InMemoryDedupCache implements DedupCache {
     private readonly seen = new Map<string, true>();
@@ -62,6 +79,7 @@ export class RedisDedupCache implements DedupCache {
         try {
             return await this.client.exists(this.buildKey(streamId, eventId));
         } catch {
+            dedupRedisErrorsTotal.inc({ operation: 'has' });
             return false;
         }
     }
@@ -73,7 +91,9 @@ export class RedisDedupCache implements DedupCache {
                 '1',
                 { ex: this.ttlSeconds }
             );
-        } catch {}
+        } catch {
+            dedupRedisErrorsTotal.inc({ operation: 'add' });
+        }
     }
 
     async clear(): Promise<void> {}
@@ -102,6 +122,8 @@ export class HybridDedupCache implements DedupCache {
             }
             return this.fallback.has(streamId, eventId);
         } catch {
+            dedupRedisFallbackTotal.inc({ operation: 'has' });
+            logFallback('has', streamId, eventId);
             return this.fallback.has(streamId, eventId);
         }
     }
@@ -110,7 +132,10 @@ export class HybridDedupCache implements DedupCache {
         if (this.useRedis) {
             try {
                 await this.primary.add(streamId, eventId);
-            } catch {}
+            } catch {
+                dedupRedisFallbackTotal.inc({ operation: 'add' });
+                logFallback('add', streamId, eventId);
+            }
         }
         await this.fallback.add(streamId, eventId);
     }
