@@ -533,6 +533,43 @@ export async function traceWebhookDispatch<T>(
 }
 
 /**
+ * Wrap one Server-Sent Events fan-out in a tracing span.
+ *
+ * The span uses bounded attributes only: stream ID, event ID, and subscriber
+ * count. Per-subscriber IDs are intentionally omitted to avoid high-cardinality
+ * trace data.
+ */
+export function traceSseDispatch<T>(
+  streamId: string,
+  eventId: string,
+  subscriberCount: number,
+  correlationId: string | undefined,
+  fn: () => T,
+): T {
+  const tracer = getTracer();
+  const span = tracer.startSpan({
+    traceId: correlationId || getCorrelationIdFromContext(),
+    serviceName: 'fluxora-api',
+    tags: {
+      'span.name': 'sse.dispatch',
+      'sse.stream_id': streamId,
+      'sse.event_id': eventId,
+      'sse.subscriber_count': subscriberCount,
+    },
+  });
+
+  try {
+    const result = fn();
+    tracer.endSpan(span, 'ok');
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    tracer.endSpan(span, 'error', message);
+    throw err;
+  }
+}
+
+/**
  * Record a WebSocket broadcast event on the active OTel span (if any).
  * Does not create a new span — attaches an event to the current context.
  */
@@ -626,4 +663,3 @@ export function enrichActiveSpanWithStream(
     // ignore active span errors
   }
 }
-

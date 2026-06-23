@@ -133,6 +133,12 @@ const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
 const NO_STORE_STREAM_HEADERS = 'private, no-store';
 const SSE_HEARTBEAT_INTERVAL_MS = 30_000;
+const SAFE_SSE_CORRELATION_ID = /^[\x21-\x7E]{1,200}$/;
+
+function formatSseCorrelationComment(correlationId: string | undefined): string {
+  if (!correlationId || !SAFE_SSE_CORRELATION_ID.test(correlationId)) return '';
+  return `: correlation-id ${correlationId}\n`;
+}
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -1028,6 +1034,7 @@ streamsRouter.get(
                 const written = writeSse(
                   `id: ${event.eventId}\n` +
                   `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+                  formatSseCorrelationComment(req.correlationId) +
                   `data: ${JSON.stringify({
                     type: 'stream_update',
                     streamId: id,
@@ -1073,15 +1080,17 @@ streamsRouter.get(
     // 6. Subscribe to Real-Time Updates.
     const listener = (event: StreamUpdateEvent) => {
       if (event.streamId === id) {
+        const eventCorrelationId = req.correlationId || event.correlationId;
         writeSse(
           `id: ${event.eventId}\n` +
           `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+          formatSseCorrelationComment(eventCorrelationId) +
           `data: ${JSON.stringify({
             type: 'stream_update',
             streamId: event.streamId,
             eventId: event.eventId,
             payload: event.payload,
-            correlationId: req.correlationId || event.correlationId,
+            correlationId: eventCorrelationId,
           })}\n\n`,
         );
       }

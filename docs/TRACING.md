@@ -23,6 +23,16 @@ The tracing system tracks:
 5. **Stream State Transitions** — Status changes and audit context
 6. **Error Classifications** — Categorized errors (database, auth, api, validation, unknown)
 
+### SSE Fan-out Dispatch
+
+Live Server-Sent Events delivery is traced with a bounded `sse.dispatch` span for each emitted stream update. The span records:
+
+- `sse.stream_id`
+- `sse.event_id`
+- `sse.subscriber_count`
+
+Per-subscriber identifiers are intentionally not recorded to avoid high-cardinality trace data. The SSE frame also includes a comment line in the form `: correlation-id <id>` before the `data:` line so clients and operators can correlate a delivered event with request logs without changing the JSON event payload.
+
 ### Observable Guarantees
 
 - **Request correlation**: Every request is linked to a unique correlation ID from X-Correlation-ID header

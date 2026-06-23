@@ -444,9 +444,16 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
 
   it('streams live events via sseEventBus', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+    const correlationId = '11111111-1111-4111-8111-111111111111';
 
     const resPromise = new Promise<string>((resolve) => {
-      const req = http.get(`http://127.0.0.1:${port}/api/streams/stream-123/events`, (res) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/streams/stream-123/events',
+        agent: false,
+        headers: { 'x-correlation-id': correlationId },
+      }, (res) => {
         let data = '';
         res.on('data', (chunk) => {
           data += chunk.toString();
@@ -469,6 +476,7 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     const output = await resPromise;
     expect(output).toContain('id: evt-live-001');
     expect(output).toContain('event: stream_update');
+    expect(output).toContain(`: correlation-id ${correlationId}`);
     expect(output).toContain('cancelled');
   });
 

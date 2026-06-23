@@ -19,6 +19,7 @@ import {
   initializeTracer,
   getTracer,
   resetTracer,
+  traceSseDispatch,
 } from '../../src/tracing/hooks.js';
 import {
   SpanBuffer,
@@ -26,10 +27,21 @@ import {
   ErrorClassifier,
   createBuiltInHooks,
 } from '../../src/tracing/builtin.js';
+import {
+  _resetSseSubscriptionsForTest,
+  SSE_STREAM_UPDATE_EVENT,
+  sseEventBus,
+  subscribeToSseStream,
+} from '../../src/streams/sseEmitter.js';
 
 describe('Distributed Tracing Hooks', () => {
   beforeEach(() => {
     resetTracer();
+  });
+
+  afterEach(() => {
+    _resetSseSubscriptionsForTest();
+    sseEventBus.removeAllListeners(SSE_STREAM_UPDATE_EVENT);
   });
 
   describe('Tracer creation and configuration', () => {
@@ -126,6 +138,90 @@ describe('Distributed Tracing Hooks', () => {
 
       tracer.endSpan(span, 'ok');
       expect(span.endTimeMs).toBeUndefined(); // Not recorded
+    });
+
+    it('wraps SSE fan-out in a bounded dispatch span', () => {
+      const onSpanEnd = vi.fn();
+      initializeTracer({
+        enabled: true,
+        hooks: { onSpanEnd },
+      });
+
+      const result = traceSseDispatch('stream-123', 'evt-123', 3, 'corr-123', () => 'delivered');
+
+      expect(result).toBe('delivered');
+      expect(onSpanEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'ok',
+          context: expect.objectContaining({
+            traceId: 'corr-123',
+            tags: expect.objectContaining({
+              'span.name': 'sse.dispatch',
+              'sse.stream_id': 'stream-123',
+              'sse.event_id': 'evt-123',
+              'sse.subscriber_count': 3,
+            }),
+          }),
+        })
+      );
+    });
+
+    it('closes the SSE dispatch span when fan-out throws', () => {
+      const onSpanEnd = vi.fn();
+      initializeTracer({
+        enabled: true,
+        hooks: { onSpanEnd },
+      });
+
+      expect(() =>
+        traceSseDispatch('stream-123', 'evt-err', 1, 'corr-err', () => {
+          throw new Error('subscriber write failed');
+        })
+      ).toThrow('subscriber write failed');
+
+      expect(onSpanEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'error',
+          statusMessage: 'subscriber write failed',
+        })
+      );
+    });
+
+    it('emits an SSE dispatch span from the shared event bus fan-out', () => {
+      const onSpanEnd = vi.fn();
+      const subscriber = vi.fn();
+      initializeTracer({
+        enabled: true,
+        hooks: { onSpanEnd },
+      });
+
+      const unsubscribe = subscribeToSseStream('stream-123', subscriber);
+      sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, {
+        streamId: 'stream-123',
+        eventId: 'evt-bus',
+        payload: { status: 'active' },
+        correlationId: 'corr-bus',
+      });
+
+      expect(subscriber).toHaveBeenCalledWith(
+        expect.objectContaining({ eventId: 'evt-bus' })
+      );
+      expect(onSpanEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'ok',
+          context: expect.objectContaining({
+            traceId: 'corr-bus',
+            tags: expect.objectContaining({
+              'span.name': 'sse.dispatch',
+              'sse.stream_id': 'stream-123',
+              'sse.event_id': 'evt-bus',
+              'sse.subscriber_count': 1,
+            }),
+          }),
+        })
+      );
+
+      unsubscribe();
     });
   });
 
