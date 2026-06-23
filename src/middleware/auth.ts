@@ -4,6 +4,7 @@ import { ApiErrorCode } from './errorHandler.js';
 import { warn, info, debug } from '../utils/logger.js';
 import { z } from 'zod';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
+import { authJwtVerifyDurationSeconds } from '../metrics/businessMetrics.js';
 
 export enum Permission {
   STREAMS_READ = 'streams:read',
@@ -15,6 +16,7 @@ export enum Permission {
   DLQ_READ = 'dlq:read',
   DLQ_REPLAY = 'dlq:replay',
   DLQ_DELETE = 'dlq:delete',
+  DLQ_CONSUMER_RESUME = 'dlq:consumer:resume',
   AUDIT_READ = 'audit:read',
   AUDIT_WRITE = 'audit:write',
 }
@@ -27,6 +29,7 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
     Permission.DLQ_READ,
     Permission.DLQ_REPLAY,
     Permission.DLQ_DELETE,
+    Permission.DLQ_CONSUMER_RESUME,
     Permission.AUDIT_READ,
   ],
   viewer: [Permission.STREAMS_READ],
@@ -70,8 +73,21 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
   }
 
   try {
-    // 1. Verify signature and expiry (cryptographic check)
-    const payload = verifyToken(token) as unknown;
+    // 1. Verify signature and expiry (cryptographic check).
+    // Record latency around the verify call so p50/p95/p99 latency and the
+    // outcome split are observable from Prometheus. The outcome label is the
+    // ONLY label emitted; no token, jti, address, or subject is recorded.
+    const endJwtVerifyTimer = authJwtVerifyDurationSeconds.startTimer();
+    let jwtVerifyOutcome: 'success' | 'failure' = 'success';
+    let payload: unknown;
+    try {
+      payload = verifyToken(token) as unknown;
+    } catch (verifyErr) {
+      jwtVerifyOutcome = 'failure';
+      throw verifyErr;
+    } finally {
+      endJwtVerifyTimer({ outcome: jwtVerifyOutcome });
+    }
 
     // 2. Check revocation list (immediate invalidation check)
     const jti = (payload as any)?.jti;

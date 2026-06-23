@@ -24,7 +24,7 @@ import {
     validateJsonDepth,
     validateRequestSize,
 } from '../src/config/validation';
-import { StreamBatchCreateSchema } from '../src/validation/schemas';
+import { CreateStreamSchema, StreamBatchCreateSchema } from '../src/validation/schemas';
 
 const VALID_SENDER = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
 const VALID_RECIPIENT = 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR';
@@ -584,4 +584,33 @@ describe('Validation Edge Cases & Failure Modes', () => {
             }
         });
     });
+
+    describe('Zod Schema decimalStringField limits', () => {
+        it('rejects depositAmount with integer part exceeding max magnitude', () => {
+            const result = CreateStreamSchema.safeParse({
+                sender: VALID_SENDER,
+                recipient: VALID_RECIPIENT,
+                depositAmount: '9223372036854775808',
+                ratePerSecond: '100',
+            });
+            expect(result.success).toBe(false);
+            if (!result.success) {
+                expect(result.error.issues[0].message).toContain('depositAmount integer part exceeds maximum supported value');
+            }
+        });
+
+        it('rejects ratePerSecond with more than 7 decimal places', () => {
+            const result = CreateStreamSchema.safeParse({
+                sender: VALID_SENDER,
+                recipient: VALID_RECIPIENT,
+                depositAmount: '1000',
+                ratePerSecond: '0.00000001',
+            });
+            expect(result.success).toBe(false);
+            if (!result.success) {
+                expect(result.error.issues[0].message).toContain('ratePerSecond exceeds maximum Stellar precision of 7 decimal places');
+            }
+        });
+    });
 });
+
