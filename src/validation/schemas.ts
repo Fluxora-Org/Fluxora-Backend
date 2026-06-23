@@ -10,6 +10,7 @@
  * @module validation/schemas
  */
 import { z } from 'zod';
+import { MAX_DECIMAL_INTEGER_PART, STELLAR_DECIMALS } from '../serialization/decimal.js';
 
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
@@ -17,11 +18,54 @@ export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
 /** Regex for valid Stellar public keys: G followed by 55 base32 characters */
 export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 
-/** Reusable decimal-string field schema */
-function decimalStringField(fieldName: string) {
+/**
+ * Reusable decimal-string field schema.
+ * Validates decimal format, and enforces magnitude and precision bounds:
+ * - Magnitude: The integer part must not exceed MAX_DECIMAL_INTEGER_PART (int64 max).
+ * - Precision: The fractional part must not exceed STELLAR_DECIMALS (7 decimal places).
+ *
+ * @param fieldName - The name of the field, used in validation error messages.
+ * @returns A Zod string schema with regex and magnitude/precision refinements.
+ */
+export function decimalStringField(fieldName: string) {
   return z
     .string({ error: `${fieldName} must be a decimal string, not a number` })
-    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`);
+    .regex(DECIMAL_STRING_REGEX, `${fieldName} must be a valid decimal string (e.g. "100", "0.0000116")`)
+    .refine(
+      (val) => {
+        // Enforce magnitude limits by validating the integer part against MAX_DECIMAL_INTEGER_PART
+        const dotIndex = val.indexOf('.');
+        const integerPart = dotIndex === -1 ? val : val.slice(0, dotIndex);
+        const absIntegerPart = integerPart.replace(/^[+-]/, '');
+        try {
+          if (BigInt(absIntegerPart) > MAX_DECIMAL_INTEGER_PART) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+        return true;
+      },
+      {
+        message: `${fieldName} integer part exceeds maximum supported value`,
+      }
+    )
+    .refine(
+      (val) => {
+        // Enforce precision limits by checking that the fractional part has at most STELLAR_DECIMALS places
+        const dotIndex = val.indexOf('.');
+        if (dotIndex !== -1) {
+          const decimalPart = val.slice(dotIndex + 1);
+          if (decimalPart.length > STELLAR_DECIMALS) {
+            return false;
+          }
+        }
+        return true;
+      },
+      {
+        message: `${fieldName} exceeds maximum Stellar precision of ${STELLAR_DECIMALS} decimal places`,
+      }
+    );
 }
 
 /** Reusable Stellar public key field schema */
