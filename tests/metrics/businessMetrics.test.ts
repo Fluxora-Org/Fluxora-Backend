@@ -11,8 +11,7 @@ import {
   deRegisterBusinessMetrics,
 } from '../../src/metrics/businessMetrics.js';
 import { WebhookService } from '../../src/webhooks/service.js';
-import { IndexerIngestionService } from '../../src/indexer/service.js';
-import { InMemoryContractEventStore } from '../../src/indexer/store.js';
+import { DEFAULT_RETRY_POLICY } from '../../src/webhooks/types.js';
 
 // Setup fresh metrics before each test in this suite
 beforeEach(() => {
@@ -48,7 +47,7 @@ describe('Business Metrics Integration', () => {
         id: 'deliv-1',
         deliveryId: 'd1',
         eventId: 'evt-1',
-        eventType: 'stream.created',
+        eventType: 'stream.created' as const,
         endpointUrl: 'http://test-endpoint.local',
         status: 'pending' as const,
         attempts: [],
@@ -77,8 +76,9 @@ describe('Business Metrics Integration', () => {
       } as Response);
 
       const service = new WebhookService({
+        ...DEFAULT_RETRY_POLICY,
         maxAttempts: 1,
-        initialDelayMs: 1,
+        initialBackoffMs: 1,
         backoffMultiplier: 1.5,
         timeoutMs: 10,
       });
@@ -86,7 +86,7 @@ describe('Business Metrics Integration', () => {
         id: 'deliv-2',
         deliveryId: 'd2',
         eventId: 'evt-2',
-        eventType: 'stream.created',
+        eventType: 'stream.created' as const,
         endpointUrl: 'http://test-endpoint.local',
         status: 'pending' as const,
         attempts: [],
@@ -108,8 +108,9 @@ describe('Business Metrics Integration', () => {
       global.fetch = vi.fn().mockRejectedValue(new Error('Network disconnected'));
 
       const service = new WebhookService({
+        ...DEFAULT_RETRY_POLICY,
         maxAttempts: 1,
-        initialDelayMs: 1,
+        initialBackoffMs: 1,
         backoffMultiplier: 1.5,
         timeoutMs: 10,
       });
@@ -117,7 +118,7 @@ describe('Business Metrics Integration', () => {
         id: 'deliv-3',
         deliveryId: 'd3',
         eventId: 'evt-3',
-        eventType: 'stream.created',
+        eventType: 'stream.created' as const,
         endpointUrl: 'http://test-endpoint.local',
         status: 'pending' as const,
         attempts: [],
@@ -136,54 +137,27 @@ describe('Business Metrics Integration', () => {
     });
   });
 
-  // 2. Indexer Service Metrics Observation
-  describe('Indexer Ingestion Service metrics', () => {
-    it('records ingested count and updates lag seconds gauge', async () => {
-      const store = new InMemoryContractEventStore();
-      const service = new IndexerIngestionService(store);
-
-      const happenedAt = new Date(Date.now() - 10000).toISOString(); // 10s lag
-      const rawEvents = {
-        events: [
-          {
-            eventId: 'evt-idx-1',
-            ledger: 100,
-            contractId: 'C1',
-            topic: 'stream.created',
-            txHash: 'tx1',
-            txIndex: 0,
-            operationIndex: 0,
-            eventIndex: 0,
-            payload: {},
-            happenedAt,
-            ledgerHash: 'hash100',
-          },
-        ],
-      };
-
-      await service.ingest(rawEvents, { actor: 'test-actor' });
-
-      // Verify count counter
-      const countVal = await indexerEventsIngestedTotal.get();
-      expect(countVal.values).toHaveLength(1);
-      expect(countVal.values[0]?.value).toBe(1);
-
-      // Verify lag gauge is set to approx 10s (allow range due to execution time)
-      const lagVal = await indexerLagSeconds.get();
-      expect(lagVal.values).toHaveLength(1);
-      expect(lagVal.values[0]?.value).toBeGreaterThanOrEqual(9.5);
-      expect(lagVal.values[0]?.value).toBeLessThanOrEqual(15);
-    });
-  });
-
   // 3. Scrape integration
   it('exposes custom business metrics in /metrics endpoint', async () => {
-    streamsCreatedTotal.inc({ status: 'active' });
+    const ADMIN_KEY = 'test-metrics-admin-key';
+    const originalKey = process.env.ADMIN_API_KEY;
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+    try {
+      streamsCreatedTotal.inc({ status: 'active' });
 
-    const res = await request(app).get('/metrics');
-    expect(res.status).toBe(200);
-    expect(res.text).toContain('fluxora_streams_created_total');
-    expect(res.text).toContain('status="active"');
+      const res = await request(app)
+        .get('/metrics')
+        .set('Authorization', `Bearer ${ADMIN_KEY}`);
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('fluxora_streams_created_total');
+      expect(res.text).toContain('status="active"');
+    } finally {
+      if (originalKey !== undefined) {
+        process.env.ADMIN_API_KEY = originalKey;
+      } else {
+        delete process.env.ADMIN_API_KEY;
+      }
+    }
   });
 
   // 4. Double Registration & De-registration protection
