@@ -1,39 +1,34 @@
-import assert from 'node:assert/strict';
-
+import { describe, it, expect } from 'vitest';
 import {
   defaultChainStatusForStartTime,
   mapChainStatusToApiStatus,
 } from './status.js';
 
-assert.deepEqual(
-  mapChainStatusToApiStatus('pending'),
-  {
-    chainStatus: 'pending',
-    status: 'scheduled',
-    terminal: false,
-  },
-);
+describe('mapChainStatusToApiStatus', () => {
+  it('maps pending to scheduled non-terminal', () => {
+    expect(mapChainStatusToApiStatus('pending')).toEqual({
+      chainStatus: 'pending',
+      status: 'scheduled',
+      terminal: false,
+    });
+  });
 
-assert.deepEqual(
-  mapChainStatusToApiStatus('depleted'),
-  {
-    chainStatus: 'depleted',
-    status: 'completed',
-    terminal: true,
-    statusReason: 'depleted',
-  },
-);
+  it('maps depleted to completed terminal with reason', () => {
+    expect(mapChainStatusToApiStatus('depleted')).toEqual({
+      chainStatus: 'depleted',
+      status: 'completed',
+      terminal: true,
+      statusReason: 'depleted',
+    });
+  });
+});
 
-assert.equal(
-  defaultChainStatusForStartTime(2_000_000_000, 1_900_000_000),
-  'pending',
-);
+describe('defaultChainStatusForStartTime', () => {
+  it('returns pending for future start time', () => {
+    expect(defaultChainStatusForStartTime(2_000_000_000, 1_900_000_000)).toBe('pending');
+  });
 
-assert.equal(
-  defaultChainStatusForStartTime(1_800_000_000, 1_900_000_000),
-  'active',
-);
-
-console.log('Stream status mapping assertions passed.');
-
-test('placeholder', () => { expect(true).toBe(true); });
+  it('returns active for past start time', () => {
+    expect(defaultChainStatusForStartTime(1_800_000_000, 1_900_000_000)).toBe('active');
+  });
+});
