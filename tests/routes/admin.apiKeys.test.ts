@@ -111,37 +111,58 @@ describe('admin API key routes', () => {
   });
 
   // 3. authenticated API-key creation
-  it('creates an API key with 201 when authenticated', async () => {
+  it('creates an API key with 201 envelope when authenticated', async () => {
     const res = await authed(
       request(app).post('/api/admin/api-keys').send({ name: 'service-a' }),
     );
     expect(res.status).toBe(201);
-    expect(res.body).toHaveProperty('id');
-    expect(res.body.name).toBe('service-a');
-    expect(res.body).toHaveProperty('key'); // Raw key should be returned
-    expect(res.body.key).toMatch(/^flx_/);
+    expect(res.body).toHaveProperty('success', true);
+    expect(res.body).toHaveProperty('data');
+    expect(res.body).toHaveProperty('meta');
+    expect(res.body.data).toHaveProperty('id');
+    expect(res.body.data.name).toBe('service-a');
+    expect(res.body.data).toHaveProperty('key'); // Raw key should be returned
+    expect(res.body.data.key).toMatch(/^flx_/);
+    expect(res.body.meta).toHaveProperty('timestamp');
     // Create is audited durably.
     expect(recordAuditEventToDb).toHaveBeenCalledWith(
-      'API_KEY_CREATED', 'api_key', res.body.id, expect.anything(), expect.any(Object),
+      'API_KEY_CREATED', 'api_key', res.body.data.id, expect.anything(), expect.any(Object),
     );
   });
 
-  it('rejects creation when name is missing or invalid with 400', async () => {
-    const res = await authed(request(app).post('/api/admin/api-keys').send({}));
+  it('rejects creation when name is missing or invalid with 400 error envelope', async () => {
+    const res = await authed(
+      request(app)
+        .post('/api/admin/api-keys')
+        .send({})
+    );
     expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('success', false);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body.error).toHaveProperty('code');
+    expect(res.body.error).toHaveProperty('message');
   });
 
   // 4. authenticated API-key listing
-  it('lists API keys when authenticated', async () => {
-    await authed(request(app).post('/api/admin/api-keys').send({ name: 'service-a' }));
+  it('lists API keys in envelope when authenticated', async () => {
+    // First seed a key
+    await authed(
+      request(app)
+        .post('/api/admin/api-keys')
+        .send({ name: 'service-a' })
+    );
 
     const res = await authed(request(app).get('/api/admin/api-keys'));
     expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('apiKeys');
-    expect(res.body.apiKeys).toHaveLength(1);
-    expect(res.body.apiKeys[0].name).toBe('service-a');
-    expect(res.body.apiKeys[0]).not.toHaveProperty('key'); // Raw key must never be listed
-    expect(res.body.apiKeys[0]).toHaveProperty('keyHash');
+    expect(res.body).toHaveProperty('success', true);
+    expect(res.body).toHaveProperty('data');
+    expect(res.body).toHaveProperty('meta');
+    expect(res.body.data).toHaveProperty('apiKeys');
+    expect(res.body.data.apiKeys).toHaveLength(1);
+    expect(res.body.data.apiKeys[0].name).toBe('service-a');
+    expect(res.body.data.apiKeys[0]).not.toHaveProperty('key'); // Raw key must never be listed
+    expect(res.body.data.apiKeys[0]).toHaveProperty('keyHash');
+    expect(res.body.meta).toHaveProperty('timestamp');
   });
 
   // 5. rotation invalidates the old key and returns a new one
@@ -149,12 +170,12 @@ describe('admin API key routes', () => {
     const createRes = await authed(
       request(app).post('/api/admin/api-keys').send({ name: 'service-a' }),
     );
-    const { id, key: oldKey } = createRes.body;
+    const { id, key: oldKey } = createRes.body.data;
 
     const rotateRes = await authed(request(app).post(`/api/admin/api-keys/${id}/rotate`));
     expect(rotateRes.status).toBe(200);
-    expect(rotateRes.body.key).toMatch(/^flx_/);
-    expect(rotateRes.body.key).not.toBe(oldKey);
+    expect(rotateRes.body.data.key).toMatch(/^flx_/);
+    expect(rotateRes.body.data.key).not.toBe(oldKey);
     expect(recordAuditEventToDb).toHaveBeenCalledWith(
       'API_KEY_ROTATED', 'api_key', id, expect.anything(), expect.any(Object),
     );
@@ -166,26 +187,33 @@ describe('admin API key routes', () => {
   });
 
   // 6. authenticated API-key revocation
-  it('revokes an API key with 204 when authenticated', async () => {
+  it('revokes an API key with 204 no-content when authenticated', async () => {
     const createRes = await authed(
       request(app).post('/api/admin/api-keys').send({ name: 'service-a' }),
     );
-    const keyId = createRes.body.id;
+    const keyId = createRes.body.data.id;
 
     const deleteRes = await authed(request(app).delete(`/api/admin/api-keys/${keyId}`));
     expect(deleteRes.status).toBe(204);
+    expect(deleteRes.body).toEqual({}); // 204 should have empty body
     expect(recordAuditEventToDb).toHaveBeenCalledWith(
       'API_KEY_REVOKED', 'api_key', keyId, expect.anything(), expect.any(Object),
     );
 
     // Verify it is deactivated in listing
     const listRes = await authed(request(app).get('/api/admin/api-keys'));
-    expect(listRes.body.apiKeys[0].active).toBe(false);
+    expect(listRes.body.data.apiKeys[0].active).toBe(false);
   });
 
-  it('returns 404 when revoking non-existent API key', async () => {
-    const res = await authed(request(app).delete('/api/admin/api-keys/does-not-exist'));
+  it('returns 404 error envelope when revoking non-existent API key', async () => {
+    const res = await authed(
+      request(app).delete('/api/admin/api-keys/does-not-exist')
+    );
     expect(res.status).toBe(404);
+    expect(res.body).toHaveProperty('success', false);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body.error).toHaveProperty('code');
+    expect(res.body.error.code).toBe('NOT_FOUND');
   });
 
   // 7. duplicate API-key name handling
@@ -199,11 +227,11 @@ describe('admin API key routes', () => {
       request(app).post('/api/admin/api-keys').send({ name: 'service-a' }),
     );
     expect(res2.status).toBe(201);
-    expect(res2.body.id).not.toBe(res1.body.id);
+    expect(res2.body.data.id).not.toBe(res1.body.data.id);
 
     const listRes = await authed(request(app).get('/api/admin/api-keys'));
-    expect(listRes.body.apiKeys).toHaveLength(2);
-    expect(listRes.body.apiKeys[0].name).toBe('service-a');
-    expect(listRes.body.apiKeys[1].name).toBe('service-a');
+    expect(listRes.body.data.apiKeys).toHaveLength(2);
+    expect(listRes.body.data.apiKeys[0].name).toBe('service-a');
+    expect(listRes.body.data.apiKeys[1].name).toBe('service-a');
   });
 });

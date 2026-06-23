@@ -1,16 +1,20 @@
-# Fluxora Integration Testing: Admin Routes
+# Testing Guide
 
-This document provides a concise overview of the integration test suites covering the administrative route surface in `src/routes/admin.ts` and the Dead-Letter Queue (DLQ) surface in `src/routes/dlq.ts`.
+## Test Runner
 
-## Structure
+The project uses **Vitest** as its single test runner. Previously the repository
+had a mix of Jest and Vitest configurations, which meant some Vitest-only specs
+were never executed under CI. All test files now use Vitest imports or globals.
 
-Admin integration tests are divided into isolated vitest suites under `tests/routes/`:
-- `admin.pause.test.ts`: Toggling operational pause flags and read-only status.
-- `admin.reindex.test.ts`: Triggering and checking background reindexing.
-- `admin.apiKeys.test.ts`: Creating, listing, and revoking API keys.
-- `admin.dlq.test.ts`: Standard operator access to the Dead-Letter Queue.
+### Rationale
 
-## Authentication Patterns
+-   **Single source of truth** — one runner, one config, one coverage provider.
+-   **v8 coverage** — Vitest's built-in `@vitest/coverage-v8` produces
+    `lcov.info` output that Codecov consumes directly.
+-   **ESM-native** — Vitest handles TypeScript and ESM without ts-jest or
+    separate transformers.
+-   **Performance** — Vitest re-uses Vite's transform pipeline, making
+    incremental test runs significantly faster.
 
 Administrative and operational endpoints require credentials depending on their mounting context:
 1. **General Admin Endpoints (`/api/admin/*`)**:
@@ -65,47 +69,66 @@ E2E tests live in `tests/e2e/` and exercise the full stack: HTTP → Express →
 
 The test mocks the DB layer automatically when `DATABASE_URL` is not set:
 
-```bash
-pnpm test tests/e2e/streams.e2e.test.ts
-```
-
-### Running locally against a real database
+## Running Tests
 
 ```bash
-# Start PostgreSQL (e.g. via Docker Compose)
-docker-compose up -d postgres
+# Run all tests once
+pnpm test
 
-# Run migrations
-DATABASE_URL=postgres://fluxora:fluxora@localhost:5432/fluxora pnpm run build && node dist/db/migrate.js
+# Run with coverage (generates ./coverage/lcov.info)
+pnpm run test:coverage
 
-# Run e2e tests
-DATABASE_URL=postgres://fluxora:fluxora@localhost:5432/fluxora pnpm test tests/e2e/streams.e2e.test.ts
+# Watch mode for development
+pnpm run test:watch
+
+# Run a single test file
+pnpm vitest run tests/routes/admin.test.ts
+
+# Run tests matching a pattern
+pnpm vitest run --reporter=verbose tests/routes/
 ```
 
-### Nightly CI workflow
+## Coverage
 
-`.github/workflows/e2e.yml` runs automatically at **02:00 UTC** every night (and can be triggered manually via `workflow_dispatch`).
+Coverage is configured in `vitest.config.ts` with the v8 provider:
 
-It:
-1. Spins up a `postgres:16` service container.
-2. Injects secrets from GitHub repository secrets (see table below).
-3. Runs database migrations.
-4. Executes `pnpm vitest run tests/e2e` with `VITEST_RETRY=1` to tolerate transient testnet RPC timeouts.
+-   **Source**: `src/**/*.ts` (excluding `src/index.ts`)
+-   **Output**: `./coverage/` (includes `lcov.info` for Codecov)
+-   **Thresholds**: 80% across lines, functions, branches, and statements
 
-### Required GitHub Secrets
+## Test File Locations
 
-| Secret | Description |
+| Location | Contents |
 |---|---|
-| `E2E_DB_PASSWORD` | Password for the ephemeral PostgreSQL service container |
-| `E2E_HORIZON_URL` | Stellar Horizon endpoint, e.g. `https://horizon-testnet.stellar.org` |
-| `E2E_NETWORK_PASSPHRASE` | Stellar network passphrase, e.g. `Test SDF Network ; September 2015` |
-| `E2E_JWT_SECRET` | HS256 secret used to sign test JWTs |
+| `tests/` | Unit and integration tests |
+| `tests/routes/` | HTTP route handler tests |
+| `tests/e2e/` | End-to-end tests (require PostgreSQL) |
+| `tests/unit/` | Pure unit tests |
+| `src/*.test.ts` | Co-located unit tests alongside source |
+| `tests/security/` | Security-focused tests (SQL injection, etc.) |
 
-> Secrets are never echoed in logs. `DATABASE_URL` is constructed from `E2E_DB_PASSWORD` inside the workflow and is not stored as a separate secret.
+## Test Setup
 
-### Security notes
+`tests/setup.ts` runs before every test file. It sets safe environment defaults
+for test mode:
 
-- Secrets are injected only into the e2e workflow job; they are not available to PR builds from forks.
-- The workflow uses `timeout-minutes: 30` to prevent runaway jobs from consuming CI minutes.
-- `VITEST_RETRY=1` retries each test once on failure to handle testnet flakiness without masking real bugs (a second failure is still reported).
+-   `NODE_ENV=test`
+-   `RATE_LIMIT_ENABLED=false`
+-   `REDIS_ENABLED=false` (tests use in-memory fakes)
+-   `DATABASE_URL` defaults to a local non-production URL
+-   `JWT_SECRET` and `INDEXER_WORKER_TOKEN` use test-only values
 
+No test file connects to a real database, Redis, or RPC endpoint unless it
+explicitly sets up those services.
+
+## CI Pipeline
+
+The CI workflow (`.github/workflows/ci.yml`) runs `pnpm test:coverage` which
+executes Vitest with coverage. The resulting `./coverage/lcov.info` is uploaded
+to Codecov.
+
+## Security Notes
+
+-   Test setup does not load production secrets.
+-   Coverage artifacts contain only code paths, not environment values.
+-   CI uses `pnpm audit` for dependency vulnerability scanning.

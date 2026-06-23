@@ -108,9 +108,17 @@ describe('API Key Management', () => {
     initializeConfig();
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     fakeRepo.reset();
     vi.clearAllMocks();
+    // Reset the API key lookup histogram so existing tests don't leak
+    // observations into history-aware assertions in the histogram suite.
+    const mod = await import('../../src/metrics/businessMetrics.js');
+    try {
+      mod.authApiKeyLookupDurationSeconds.reset();
+    } catch {
+      // Metric may not be registered yet on first test run; safe to ignore.
+    }
   });
 
   describe('createApiKey', () => {
@@ -190,6 +198,67 @@ describe('API Key Management', () => {
       expect(await isValidApiKey(keyA)).toBe(true);
       // A forged key with the same prefix but a different body is still rejected.
       expect(await isValidApiKey(keyA.slice(0, 8) + 'deadbeef'.repeat(7))).toBe(false);
+    });
+  });
+
+  // ── API key lookup histogram (issue #361) ──
+  describe('fluxora_auth_apikey_lookup_duration_seconds histogram', () => {
+    let histogram: typeof import('../../src/metrics/businessMetrics.js').authApiKeyLookupDurationSeconds;
+
+    beforeEach(async () => {
+      const mod = await import('../../src/metrics/businessMetrics.js');
+      histogram = mod.authApiKeyLookupDurationSeconds;
+      histogram.reset();
+    });
+
+    /**
+     * Helper: prom-client Histogram `get()` exposes bucket observations
+     * (which include `le`) alongside `_count` / `_sum` series (which carry
+     * only the metric's declared labels). We assert on the count series to
+     * confirm the label set is bounded to `outcome`.
+     */
+    function findCountSeries(values: any[], outcome: string) {
+      return values.find(
+        (v) =>
+          v.metricName === 'fluxora_auth_apikey_lookup_duration_seconds_count' &&
+          (v.labels as Record<string, string>).outcome === outcome,
+      );
+    }
+
+    it('records outcome=success for a valid key (count series labels limited to outcome)', async () => {
+      const { key } = createApiKey('svc');
+      expect(isValidApiKey(key)).toBe(true);
+
+      const val = await histogram.get();
+      const success = findCountSeries(val.values, 'success');
+      expect(success).toBeDefined();
+      expect(success?.value).toBeGreaterThanOrEqual(1);
+      expect(Object.keys(success!.labels)).toEqual(['outcome']);
+    });
+
+    it('records outcome=failure for an unknown key (no credential leak via labels)', async () => {
+      createApiKey('svc');
+      expect(isValidApiKey('flx_unknown')).toBe(false);
+
+      const val = await histogram.get();
+      const failure = findCountSeries(val.values, 'failure');
+      expect(failure).toBeDefined();
+      expect(failure?.value).toBeGreaterThanOrEqual(1);
+      // No credential material ever appears in any labels (bucket or otherwise)
+      for (const v of val.values) {
+        for (const forbidden of ['keyId', 'prefix', 'keyHash', 'rawKey', 'address']) {
+          expect((v.labels as Record<string, unknown>)[forbidden]).toBeUndefined();
+        }
+      }
+    });
+
+    it('records outcome=failure for an empty string input (early-return path still observed)', async () => {
+      expect(isValidApiKey('')).toBe(false);
+
+      const val = await histogram.get();
+      const failure = findCountSeries(val.values, 'failure');
+      expect(failure).toBeDefined();
+      expect(failure?.value).toBeGreaterThanOrEqual(1);
     });
   });
 

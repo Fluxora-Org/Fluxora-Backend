@@ -76,3 +76,10 @@ indexerRouter.get('/internal/indexer/status', (req: Request, res: Response) => {
     });
   }
 });
+
+export function getIndexerHealth(): any {
+  return {
+    status: 'healthy',
+    isReplaying: indexerService.getReplayProgress().isReplaying,
+  };
+}

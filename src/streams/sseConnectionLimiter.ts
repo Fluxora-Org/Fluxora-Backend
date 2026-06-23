@@ -1,4 +1,4 @@
-import { sseActiveConnectionsGauge } from '../metrics/businessMetrics.js';
+import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP = 10;
 export const DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS = 1000;
@@ -129,6 +129,7 @@ export function tryAcquireSseConnection(
   const activeConnectionsForIp = activeConnectionsByIp.get(normalizedIp) ?? 0;
 
   if (activeConnectionsForIp >= limits.maxConnectionsPerIp) {
+    sseConnectionsRejectedTotal.inc({ reason: 'per_ip_limit' });
     return {
       ok: false,
       reason: 'per_ip_limit',
@@ -141,6 +142,7 @@ export function tryAcquireSseConnection(
   }
 
   if (activeConnections >= limits.maxGlobalConnections) {
+    sseConnectionsRejectedTotal.inc({ reason: 'global_limit' });
     return {
       ok: false,
       reason: 'global_limit',

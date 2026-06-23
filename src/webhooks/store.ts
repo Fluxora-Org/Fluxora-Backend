@@ -140,6 +140,12 @@ export class WebhookDeliveryStore {
 
   /**
    * Get items from outbox that are ready for processing
+   *
+   * Ordering guarantee:
+   * Returns items ordered by `scheduledFor` (ASC). For items sharing the same
+   * scheduled timestamp, applies a deterministic secondary sort by `ledger` (ASC)
+   * extracted from the JSON payload, and a tertiary sort by `eventId` (ASC).
+   * This ensures per-stream consumers always observe events in chain order.
    */
   getReadyOutboxItems(now: number = Date.now()): OutboxItem[] {
     const readyItems: OutboxItem[] = [];
@@ -151,7 +157,34 @@ export class WebhookDeliveryStore {
       const items = this.outboxPriorityQueue.get(priority) || [];
       const ready = items
         .filter(item => item.scheduledFor <= now && item.attempts < item.maxAttempts)
-        .sort((a, b) => a.scheduledFor - b.scheduledFor);
+        .sort((a, b) => {
+          if (a.scheduledFor !== b.scheduledFor) {
+            return a.scheduledFor - b.scheduledFor;
+          }
+          
+          let ledgerA = 0;
+          let ledgerB = 0;
+          try {
+            const payloadA = JSON.parse(a.payload);
+            ledgerA = typeof payloadA?.ledger === 'number' ? payloadA.ledger :
+                      typeof payloadA?.data?.ledger === 'number' ? payloadA.data.ledger : 0;
+          } catch {}
+          try {
+            const payloadB = JSON.parse(b.payload);
+            ledgerB = typeof payloadB?.ledger === 'number' ? payloadB.ledger :
+                      typeof payloadB?.data?.ledger === 'number' ? payloadB.data.ledger : 0;
+          } catch {}
+          
+          if (ledgerA !== ledgerB) {
+            return ledgerA - ledgerB;
+          }
+          
+          if (a.eventId !== b.eventId) {
+            return a.eventId < b.eventId ? -1 : 1;
+          }
+          
+          return 0;
+        });
       readyItems.push(...ready);
     }
     

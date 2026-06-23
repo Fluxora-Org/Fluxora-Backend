@@ -19,10 +19,27 @@
 
 import { createId } from '@paralleldrive/cuid2';
 import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import { z } from 'zod';
 import { getConfig } from '../config/env.js';
 import { apiKeyRepository } from '../db/repositories/apiKeyRepository.js';
 import { recordAuditEventToDb } from './auditLog.js';
 import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
+
+/**
+ * Zod schema for the API key creation/rotation response.
+ *
+ * ⚠️  SECURITY: `key` is the plaintext API key shown **exactly once**.
+ * Clients must store it immediately — it is never returned again.
+ */
+export const ApiKeyCreatedSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** Raw key shown exactly once — store it immediately, it cannot be recovered. */
+  key: z.string(),
+  prefix: z.string(),
+  createdAt: z.string(),
+});
 
 const KEY_PREFIX = 'flx_';
 /** Number of leading characters used as the indexed lookup prefix. */
@@ -191,10 +208,21 @@ export async function listApiKeys(): Promise<ApiKeyRecord[]> {
  * performs a constant-time comparison against each candidate's salted/peppered
  * hash. Returns `true` on the first match.
  *
+ * Latency is recorded in the `fluxora_auth_apikey_lookup_duration_seconds`
+ * histogram, labelled only by `outcome` (`success` | `failure`). No key id,
+ * prefix, raw key, or hash value is ever emitted as a metric label. Every code
+ * path calls `endTimer` exactly once before returning, so the histogram never
+ * observes a partial (timer-started but never-closed) sample.
+ *
  * @param rawKey - The raw key presented by the caller.
  */
 export async function isValidApiKey(rawKey: string): Promise<boolean> {
-  if (!rawKey || typeof rawKey !== 'string') return false;
+  const endTimer = authApiKeyLookupDurationSeconds.startTimer();
+
+  if (!rawKey || typeof rawKey !== 'string') {
+    endTimer({ outcome: 'failure' });
+    return false;
+  }
 
   const prefix = rawKey.slice(0, PREFIX_LENGTH);
   const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
@@ -207,6 +235,7 @@ export async function isValidApiKey(rawKey: string): Promise<boolean> {
       matched = true;
     }
   }
+  endTimer({ outcome: matched ? 'success' : 'failure' });
   return matched;
 }
 
