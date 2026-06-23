@@ -170,3 +170,95 @@ See the platform-specific guides:
 
 - [Datadog](integrations/datadog.md) — Agent log pipeline, JSON parsing, attribute remapping
 - [Elastic / ECS](integrations/elastic.md) — Filebeat config, ECS field mapping, index template
+
+---
+
+## Authentication Latency Histograms
+
+Auth runs on every protected request path. When the JWT verifier, revocation-store lookup, or API-key store becomes a bottleneck, these histograms give a distribution view (p50/p95/p99) and a split by success/failure — without leaking credential material.
+
+### Metrics
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `fluxora_auth_jwt_verify_duration_seconds` | Histogram | `outcome` (`success` \| `failure`) | Time spent in `verifyToken()` (the cryptographic verify only — does NOT include revocation check or schema parse). Recorded by `src/middleware/auth.ts`. |
+| `fluxora_auth_apikey_lookup_duration_seconds` | Histogram | `outcome` (`success` \| `failure`) | Time spent in API-key lookups. Recorded by `src/lib/apiKey.ts::isValidApiKey` and `src/middleware/adminAuth.ts::requireAdminAuth`. |
+
+### Bucket layout
+
+The bucket boundaries are intentionally bounded and tuned for each call site:
+
+```text
+fluxora_auth_jwt_verify_duration_seconds:        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1
+fluxora_auth_apikey_lookup_duration_seconds:     0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05
+```
+
+Range rationale:
+
+- JWT verify buckets span 1 ms → 1 s. The measurement covers `verifyToken()` alone; the trailing revocation-check and schema-parse steps are intentionally excluded so an `outcome=success` observation reflects only successful cryptographic verification. A 401 caused by a downstream revocation hit or token-schema mismatch will appear as `outcome=success` on this histogram and is observable separately through the HTTP error-rate counter.
+- API-key lookup buckets span 100 µs → 50 ms because the in-memory store does a SHA-256 + `timingSafeEqual`, but a future DB-backed store (tracked separately) would shift the distribution to the millisecond range.
+
+### Security & label-cardinality guarantees
+
+The label set is intentionally restricted to a single `outcome` label. The metrics must **never** carry credential material. The following labels are forbidden both now and in future iterations:
+
+- `jti`, `kid`, `sub`, `subject`
+- `keyId`, `prefix`, `keyHash`, raw-key substrings
+- `address` / account ids derived from the token
+- `userId` / `principalId`
+
+Tests in `tests/metrics/businessMetrics.test.ts` explicitly assert the label set is `{ outcome: 'success' }` or `{ outcome: 'failure' }` only.
+
+### PromQL examples
+
+**p99 JWT verify latency**
+
+```promql
+histogram_quantile(
+  0.99,
+  rate(fluxora_auth_jwt_verify_duration_seconds_bucket[5m])
+)
+```
+
+**p99 API-key lookup latency**
+
+```promql
+histogram_quantile(
+  0.99,
+  rate(fluxora_auth_apikey_lookup_duration_seconds_bucket[5m])
+)
+```
+
+**Auth failure rate (any path) per second**
+
+```promql
+sum(rate(
+  fluxora_auth_jwt_verify_duration_seconds_count{outcome="failure"}[5m]
+))
++
+sum(rate(
+  fluxora_auth_apikey_lookup_duration_seconds_count{outcome="failure"}[5m]
+))
+```
+
+**Alert: JWT verify p99 > 250 ms for 5 minutes**
+
+```promql
+histogram_quantile(
+  0.99,
+  rate(fluxora_auth_jwt_verify_duration_seconds_bucket[5m])
+) > 0.25
+```
+
+### Thresholding strategy
+
+- **Latency p99 > 250 ms (JWT)**: indicates the revocation-store lookup is slow or the cryptographic step is being starved; pair with `redis_pending_commands` and CPU pressure signals.
+- **Latency p99 > 20 ms (API key, in-memory)**: useful as a canary when a DB-backed store is introduced, since lookups should remain single-digit milliseconds.
+- **Failure rate sustained > 5%**: indicates a misconfiguration in token issuance, key rotation, or upstream auth provider outage.
+
+### Affected source files
+
+- `src/metrics/businessMetrics.ts` — histogram definitions
+- `src/middleware/auth.ts` — JWT verify timer
+- `src/lib/apiKey.ts` — `isValidApiKey` timer
+- `src/middleware/adminAuth.ts` — admin env-var key check timer
