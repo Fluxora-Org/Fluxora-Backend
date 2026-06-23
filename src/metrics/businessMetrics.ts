@@ -114,6 +114,18 @@ export const indexerLagSeconds =
   });
 
 /**
+ * Total live SSE subscribers across all stream IDs.
+ * Updated on every subscribe/unsubscribe call.
+ */
+export const sseLiveSubscribersGauge =
+  (registry.getSingleMetric('fluxora_sse_live_subscribers') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_live_subscribers',
+    help: 'Total number of live SSE subscriber callbacks registered across all streams',
+    registers: [registry],
+  });
+
+/**
  * Webhook Dead-Letter Queue (DLQ) depth gauge.
  *
  * Tracks the number of webhook deliveries that have failed permanently and are queued for
@@ -128,6 +140,19 @@ export const webhookDlqItemsGauge =
   new Gauge({
     name: 'fluxora_webhook_dlq_items',
     help: 'Number of webhook deliveries in the dead-letter queue (permanently failed)',
+    registers: [registry],
+  });
+
+/**
+ * Current EventEmitter listener count on SSE_STREAM_UPDATE_EVENT.
+ * Should be 0 (idle) or 1 (dispatcher attached). Spikes above 1 indicate a
+ * regression that reintroduces per-connection listeners.
+ */
+export const sseEventListenersGauge =
+  (registry.getSingleMetric('fluxora_sse_event_listeners') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_event_listeners',
+    help: 'Number of EventEmitter listeners on SSE_STREAM_UPDATE_EVENT (expected 0 or 1)',
     registers: [registry],
   });
 
@@ -199,4 +224,6 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_webhook_outbox_pending_items');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
+  registry.removeSingleMetric('fluxora_sse_live_subscribers');
+  registry.removeSingleMetric('fluxora_sse_event_listeners');
 }
