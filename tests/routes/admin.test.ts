@@ -43,119 +43,152 @@ describe('admin routes', () => {
   it('allows unauthenticated read-only status checks', async () => {
     const res = await request(app).get('/api/admin/status/read-only');
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({
-      pauseFlags: {
-        streamCreation: false,
-        ingestion: false,
-      },
+    expect(res.body).toHaveProperty('success', true);
+    expect(res.body).toHaveProperty('data');
+    expect(res.body).toHaveProperty('meta');
+    expect(res.body.data.pauseFlags).toEqual({
+      streamCreation: false,
+      ingestion: false,
     });
+    expect(res.body.meta).toHaveProperty('timestamp');
   });
 
   // ── GET /api/admin/status ──────────────────────────────────
 
   describe('GET /api/admin/status', () => {
-    it('returns pause flags and reindex state', async () => {
+    it('returns pause flags and reindex state in envelope', async () => {
       const res = await authed(request(app).get('/api/admin/status'));
       expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('pauseFlags');
-      expect(res.body).toHaveProperty('reindex');
-      expect(res.body.pauseFlags.streamCreation).toBe(false);
-      expect(res.body.pauseFlags.ingestion).toBe(false);
-      expect(res.body.reindex.status).toBe('idle');
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body).toHaveProperty('data');
+      expect(res.body).toHaveProperty('meta');
+      expect(res.body.data).toHaveProperty('pauseFlags');
+      expect(res.body.data).toHaveProperty('reindex');
+      expect(res.body.data.pauseFlags.streamCreation).toBe(false);
+      expect(res.body.data.pauseFlags.ingestion).toBe(false);
+      expect(res.body.data.reindex.status).toBe('idle');
+      expect(res.body.meta).toHaveProperty('timestamp');
     });
   });
 
   // ── GET /api/admin/pause ───────────────────────────────────
 
   describe('GET /api/admin/pause', () => {
-    it('returns current pause flags', async () => {
+    it('returns current pause flags in envelope', async () => {
       const res = await authed(request(app).get('/api/admin/pause'));
       expect(res.status).toBe(200);
-      expect(res.body).toEqual({ streamCreation: false, ingestion: false });
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body).toHaveProperty('data');
+      expect(res.body).toHaveProperty('meta');
+      expect(res.body.data).toEqual({ streamCreation: false, ingestion: false });
+      expect(res.body.meta).toHaveProperty('timestamp');
     });
   });
 
   // ── PUT /api/admin/pause ───────────────────────────────────
 
   describe('PUT /api/admin/pause', () => {
-    it('updates streamCreation flag', async () => {
+    it('updates streamCreation flag in envelope', async () => {
       const res = await authed(
         request(app).put('/api/admin/pause').send({ streamCreation: true }),
       );
       expect(res.status).toBe(200);
-      expect(res.body.pauseFlags.streamCreation).toBe(true);
-      expect(res.body.pauseFlags.ingestion).toBe(false);
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body).toHaveProperty('data');
+      expect(res.body).toHaveProperty('meta');
+      expect(res.body.data.pauseFlags.streamCreation).toBe(true);
+      expect(res.body.data.pauseFlags.ingestion).toBe(false);
+      expect(res.body.meta).toHaveProperty('timestamp');
     });
 
-    it('updates ingestion flag', async () => {
+    it('updates ingestion flag in envelope', async () => {
       const res = await authed(
         request(app).put('/api/admin/pause').send({ ingestion: true }),
       );
       expect(res.status).toBe(200);
-      expect(res.body.pauseFlags.ingestion).toBe(true);
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body.data.pauseFlags.ingestion).toBe(true);
     });
 
-    it('updates both flags at once', async () => {
+    it('updates both flags at once in envelope', async () => {
       const res = await authed(
         request(app)
           .put('/api/admin/pause')
           .send({ streamCreation: true, ingestion: true }),
       );
       expect(res.status).toBe(200);
-      expect(res.body.pauseFlags.streamCreation).toBe(true);
-      expect(res.body.pauseFlags.ingestion).toBe(true);
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body.data.pauseFlags.streamCreation).toBe(true);
+      expect(res.body.data.pauseFlags.ingestion).toBe(true);
     });
 
-    it('returns 400 when body is empty', async () => {
+    it('returns 400 error envelope when body is empty', async () => {
       const res = await authed(
         request(app).put('/api/admin/pause').send({}),
       );
       expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/at least one of/i);
+      expect(res.body).toHaveProperty('success', false);
+      expect(res.body).toHaveProperty('error');
+      expect(res.body.error).toHaveProperty('code');
+      expect(res.body.error).toHaveProperty('message');
+      expect(res.body.error.message).toMatch(/at least one of/i);
     });
 
-    it('returns 400 when streamCreation is not boolean', async () => {
+    it('returns 400 error envelope when streamCreation is not boolean', async () => {
       const res = await authed(
         request(app).put('/api/admin/pause').send({ streamCreation: 'yes' }),
       );
       expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/boolean/i);
+      expect(res.body).toHaveProperty('success', false);
+      expect(res.body.error.message).toMatch(/boolean/i);
     });
 
-    it('returns 400 when ingestion is not boolean', async () => {
+    it('returns 400 error envelope when ingestion is not boolean', async () => {
       const res = await authed(
         request(app).put('/api/admin/pause').send({ ingestion: 42 }),
       );
       expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/boolean/i);
+      expect(res.body).toHaveProperty('success', false);
+      expect(res.body.error.message).toMatch(/boolean/i);
     });
   });
 
   // ── GET /api/admin/reindex ─────────────────────────────────
 
   describe('GET /api/admin/reindex', () => {
-    it('returns idle reindex state by default', async () => {
+    it('returns idle reindex state in envelope', async () => {
       const res = await authed(request(app).get('/api/admin/reindex'));
       expect(res.status).toBe(200);
-      expect(res.body.status).toBe('idle');
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body).toHaveProperty('data');
+      expect(res.body).toHaveProperty('meta');
+      expect(res.body.data.status).toBe('idle');
+      expect(res.body.meta).toHaveProperty('timestamp');
     });
   });
 
   // ── POST /api/admin/reindex ────────────────────────────────
 
   describe('POST /api/admin/reindex', () => {
-    it('starts a reindex and returns 202', async () => {
+    it('starts a reindex and returns 202 in envelope', async () => {
       const res = await authed(request(app).post('/api/admin/reindex'));
       expect(res.status).toBe(202);
-      expect(res.body.message).toMatch(/started/i);
-      expect(res.body.reindex.status).toBe('running');
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body).toHaveProperty('data');
+      expect(res.body).toHaveProperty('meta');
+      expect(res.body.data.message).toMatch(/started/i);
+      expect(res.body.data.reindex.status).toBe('running');
+      expect(res.body.meta).toHaveProperty('timestamp');
     });
 
-    it('returns 409 when a reindex is already running', async () => {
+    it('returns 409 error envelope when a reindex is already running', async () => {
       await authed(request(app).post('/api/admin/reindex'));
       const res = await authed(request(app).post('/api/admin/reindex'));
       expect(res.status).toBe(409);
-      expect(res.body.error).toMatch(/already in progress/i);
+      expect(res.body).toHaveProperty('success', false);
+      expect(res.body).toHaveProperty('error');
+      expect(res.body.error).toHaveProperty('code');
+      expect(res.body.error.message).toMatch(/already in progress/i);
     });
 
     it('reindex completes in the background', async () => {
@@ -166,8 +199,9 @@ describe('admin routes', () => {
 
       const res = await authed(request(app).get('/api/admin/reindex'));
       expect(res.status).toBe(200);
-      expect(res.body.status).toBe('completed');
-      expect(res.body.processedItems).toBe(5);
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body.data.status).toBe('completed');
+      expect(res.body.data.processedItems).toBe(5);
     });
   });
 });
