@@ -17,6 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { logger } from '../../src/logging/logger.js';
 import {
   RedisIdempotencyStore,
   NoOpIdempotencyStore,
@@ -102,7 +103,7 @@ describe('RedisIdempotencyStore', () => {
 
   it('returns null and logs a warning when Redis get throws', async () => {
     fake.throwOnNext('get');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const result = await store.get('key-err');
     expect(result).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
@@ -114,7 +115,7 @@ describe('RedisIdempotencyStore', () => {
 
   it('silently no-ops and logs a warning when Redis set throws', async () => {
     fake.throwOnNext('set');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     // Should not throw
     await expect(store.set('key-err', makeEntry(), 60)).resolves.toBeUndefined();
     expect(warnSpy).toHaveBeenCalledWith(
@@ -126,7 +127,7 @@ describe('RedisIdempotencyStore', () => {
 
   it('subsequent get after a failed set returns null (no partial state)', async () => {
     fake.throwOnNext('set');
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.set('key-partial', makeEntry(), 60);
     const result = await store.get('key-partial');
     expect(result).toBeNull();
@@ -136,7 +137,7 @@ describe('RedisIdempotencyStore', () => {
   it('get still works after a previous set failure', async () => {
     // First set fails
     fake.throwOnNext('set');
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.set('key-recover', makeEntry({ requestFingerprint: 'fp-fail' }), 60);
 
     // Second set succeeds
@@ -230,7 +231,7 @@ describe('RedisIdempotencyStore — onStateChange', () => {
 
   it('calls onStateChange(false) when Redis get throws', async () => {
     fake.throwOnNext('get');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.get('key-err');
     expect(stateChanges).toContain(false);
     warnSpy.mockRestore();
@@ -238,7 +239,7 @@ describe('RedisIdempotencyStore — onStateChange', () => {
 
   it('calls onStateChange(false) when Redis set throws', async () => {
     fake.throwOnNext('set');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.set('key-err', makeEntry(), 60);
     expect(stateChanges).toContain(false);
     warnSpy.mockRestore();
@@ -246,7 +247,7 @@ describe('RedisIdempotencyStore — onStateChange', () => {
 
   it('recovers: onStateChange(true) fires on the next successful operation after a failure', async () => {
     fake.throwOnNext('get');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     await store.get('key-fail'); // error → false
     warnSpy.mockRestore();
     await store.get('key-ok');   // success → true

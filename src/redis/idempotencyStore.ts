@@ -27,6 +27,7 @@
  * @module redis/idempotencyStore
  */
 
+import { logger } from '../logging/logger.js';
 import type { RedisClient } from './client.js';
 
 export const IDEMPOTENCY_KEY_PREFIX = 'fluxora:idempotency:';
@@ -98,7 +99,7 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       return JSON.parse(raw) as IdempotentEntry<T>;
     } catch (err) {
       this.onStateChange?.(false);
-      console.warn('[IdempotencyStore] Redis get failed — degrading to pass-through', {
+      logger.warn('[IdempotencyStore] Redis get failed — degrading to pass-through', {
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -112,7 +113,7 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       this.onStateChange?.(true);
     } catch (err) {
       this.onStateChange?.(false);
-      console.warn('[IdempotencyStore] Redis set failed — idempotency not persisted', {
+      logger.warn('[IdempotencyStore] Redis set failed — idempotency not persisted', {
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });
