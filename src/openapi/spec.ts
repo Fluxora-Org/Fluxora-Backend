@@ -292,10 +292,9 @@ registry.registerPath({
       }),
       cursor: z.string().optional().openapi({
         description:
-          'Opaque cursor from the previous page\'s `next_cursor`. ' +
-          'Opaque cursor from the previous page's `next_cursor`. ' +
-          'Omit to request the first page. ' +
-          'Treated as a black box — do not construct manually.',
+          "Opaque cursor from the previous page's `next_cursor`. " +
+          "Omit to request the first page. " +
+          "Treated as a black box — do not construct manually.",
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
       }),
       status: z.string().optional().openapi({ example: 'active' }),
