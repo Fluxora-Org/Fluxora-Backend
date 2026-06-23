@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import express from 'express';
 import { requireAdminAuth } from '../../src/middleware/adminAuth.js';
+import { authApiKeyLookupDurationSeconds } from '../../src/metrics/businessMetrics.js';
 
 function buildApp() {
   const app = express();
@@ -86,5 +87,71 @@ describe('requireAdminAuth middleware', () => {
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true });
+  });
+
+  // ── API key lookup histogram (issue #361) ──
+  describe('fluxora_auth_apikey_lookup_duration_seconds histogram', () => {
+    beforeEach(() => {
+      authApiKeyLookupDurationSeconds.reset();
+    });
+
+    /**
+     * prom-client Histogram `get()` emits bucket observations (which include
+     * `le`) alongside `_count` / `_sum` series (which carry only the metric's
+     * declared labels). We assert on the count series to confirm the label
+     * set is bounded to `outcome`.
+     */
+    function findApiKeyCountSeries(values: any[], outcome: string) {
+      return values.find(
+        (v) =>
+          v.metricName === 'fluxora_auth_apikey_lookup_duration_seconds_count' &&
+          (v.labels as Record<string, string>).outcome === outcome,
+      );
+    }
+
+    it('records outcome=success for a correct admin token (count series labels limited to outcome)', async () => {
+      process.env.ADMIN_API_KEY = ADMIN_KEY;
+      await request(buildApp())
+        .get('/protected')
+        .set('Authorization', `Bearer ${ADMIN_KEY}`)
+        .expect(200);
+
+      const val = await authApiKeyLookupDurationSeconds.get();
+      const success = findApiKeyCountSeries(val.values, 'success');
+      expect(success).toBeDefined();
+      expect(success?.value).toBeGreaterThanOrEqual(1);
+      expect(Object.keys(success!.labels)).toEqual(['outcome']);
+    });
+
+    it('records outcome=failure for an incorrect admin token', async () => {
+      process.env.ADMIN_API_KEY = ADMIN_KEY;
+      await request(buildApp())
+        .get('/protected')
+        .set('Authorization', 'Bearer wrong-key')
+        .expect(403);
+
+      const val = await authApiKeyLookupDurationSeconds.get();
+      const failure = findApiKeyCountSeries(val.values, 'failure');
+      expect(failure).toBeDefined();
+      expect(failure?.value).toBeGreaterThanOrEqual(1);
+    });
+
+    it('records outcome=failure when ADMIN_API_KEY is not configured (still observable, no credential leak)', async () => {
+      delete process.env.ADMIN_API_KEY;
+      await request(buildApp())
+        .get('/protected')
+        .set('Authorization', `Bearer ${ADMIN_KEY}`)
+        .expect(503);
+
+      const val = await authApiKeyLookupDurationSeconds.get();
+      const failure = findApiKeyCountSeries(val.values, 'failure');
+      expect(failure).toBeDefined();
+      expect(failure?.value).toBeGreaterThanOrEqual(1);
+      for (const v of val.values) {
+        for (const forbidden of ['keyId', 'prefix', 'token']) {
+          expect((v.labels as Record<string, unknown>)[forbidden]).toBeUndefined();
+        }
+      }
+    });
   });
 });

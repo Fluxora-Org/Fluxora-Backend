@@ -11,6 +11,8 @@ import {
   webhookDlqItemsGauge,
   webhookOutboxPendingItemsGauge,
   syncWebhookMetrics,
+  authJwtVerifyDurationSeconds,
+  authApiKeyLookupDurationSeconds,
   deRegisterBusinessMetrics,
 } from '../../src/metrics/businessMetrics.js';
 import { WebhookService } from '../../src/webhooks/service.js';
@@ -29,6 +31,8 @@ beforeEach(() => {
     indexerLagSeconds.reset();
     webhookDlqItemsGauge.reset();
     webhookOutboxPendingItemsGauge.reset();
+    authJwtVerifyDurationSeconds.reset();
+    authApiKeyLookupDurationSeconds.reset();
   } catch {
     // no-op if already de-registered
   }
@@ -387,5 +391,112 @@ describe('Business Metrics Integration', () => {
     const outboxMetricData = webhookOutboxPendingItemsGauge.get();
     expect(outboxMetricData.values).toHaveLength(1);
     expect(outboxMetricData.values[0]?.labels).toEqual({}); // No labels at all
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Issue #361 — auth-latency histograms
+// ───────────────────────────────────────────────────────────────────────────────
+describe('Auth Latency Histograms (issue #361)', () => {
+  describe('fluxora_auth_jwt_verify_duration_seconds', () => {
+    it('registers the histogram on the Prometheus registry', () => {
+      expect(
+        registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds'),
+      ).toBe(authJwtVerifyDurationSeconds);
+    });
+
+    it('declares outcome as the only label (no high-cardinality labels)', () => {
+      const metric = registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
+      // prom-client exposes labelNames as a readonly string[]
+      expect(metric?.labelNames).toEqual(['outcome']);
+    });
+
+    it('uses bounded bucket boundaries for auth latency', () => {
+      // Every bucket must be > 0 and strictly increasing
+      const upperBounds = (authJwtVerifyDurationSeconds as any).upperBounds as number[];
+      for (let i = 0; i < upperBounds.length; i++) {
+        expect(upperBounds[i]).toBeGreaterThan(0);
+        if (i > 0) {
+          expect(upperBounds[i]).toBeGreaterThan(upperBounds[i - 1]);
+        }
+      }
+      // Cover sub-millisecond through roughly 1 second for JWT verify
+      expect(upperBounds[0]).toBeLessThanOrEqual(0.001);
+      expect(upperBounds[upperBounds.length - 1]).toBeGreaterThanOrEqual(1);
+    });
+
+    it('records an outcome=success observation and only emits the outcome label', () => {
+      authJwtVerifyDurationSeconds.reset();
+      authJwtVerifyDurationSeconds.observe({ outcome: 'success' }, 0.012);
+
+      // Verify via /metrics endpoint
+      return request(app)
+        .get('/metrics')
+        .expect(200)
+        .then((res) => {
+          expect(res.text).toContain('fluxora_auth_jwt_verify_duration_seconds');
+          expect(res.text).toContain('outcome="success"');
+        });
+    });
+  });
+
+  describe('fluxora_auth_apikey_lookup_duration_seconds', () => {
+    it('registers the histogram on the Prometheus registry', () => {
+      expect(
+        registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds'),
+      ).toBe(authApiKeyLookupDurationSeconds);
+    });
+
+    it('declares outcome as the only label (no high-cardinality labels)', () => {
+      const metric = registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds');
+      expect(metric?.labelNames).toEqual(['outcome']);
+    });
+
+    it('uses bounded bucket boundaries for in-memory hash-compare latency', () => {
+      const upperBounds = (authApiKeyLookupDurationSeconds as any).upperBounds as number[];
+      for (let i = 0; i < upperBounds.length; i++) {
+        expect(upperBounds[i]).toBeGreaterThan(0);
+        if (i > 0) {
+          expect(upperBounds[i]).toBeGreaterThan(upperBounds[i - 1]);
+        }
+      }
+      // Bucket range is skewed sub-millisecond through 50 ms for hash compare
+      expect(upperBounds[0]).toBeLessThanOrEqual(0.0001);
+      expect(upperBounds[upperBounds.length - 1]).toBeGreaterThanOrEqual(0.05);
+    });
+
+    it('records an outcome=failure observation and only emits the outcome label', async () => {
+      authApiKeyLookupDurationSeconds.reset();
+      authApiKeyLookupDurationSeconds.observe({ outcome: 'failure' }, 0.0005);
+
+      const val = await authApiKeyLookupDurationSeconds.get();
+      // Only one labelled series, and the labels are exactly { outcome }
+      expect(val.values.some((v) => v.labels.outcome === 'failure' && v.value === 1)).toBe(true);
+      for (const v of val.values) {
+        expect(Object.keys(v.labels)).toEqual(['outcome']);
+      }
+    });
+
+    it('emits no credential material as labels (security guarantee)', async () => {
+      authApiKeyLookupDurationSeconds.reset();
+      // Observe with the only permitted label set
+      authApiKeyLookupDurationSeconds.observe({ outcome: 'success' }, 0.001);
+
+      const val = await authApiKeyLookupDurationSeconds.get();
+      const forbidden = ['keyId', 'key_id', 'prefix', 'principal', 'jti', 'address', 'subject'];
+      for (const v of val.values) {
+        for (const f of forbidden) {
+          expect((v.labels as Record<string, unknown>)[f]).toBeUndefined();
+        }
+      }
+    });
+  });
+
+  describe('de-registration', () => {
+    it('removes both auth histograms from the registry', () => {
+      deRegisterBusinessMetrics();
+      expect(registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds')).toBeUndefined();
+      expect(registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds')).toBeUndefined();
+    });
   });
 });
