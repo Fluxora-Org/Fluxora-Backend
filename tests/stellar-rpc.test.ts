@@ -1,4 +1,4 @@
-import { vi as jest, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   StellarRpcService,
   CircuitBreaker,

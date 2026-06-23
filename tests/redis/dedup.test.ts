@@ -6,6 +6,7 @@
  *   - RedisDedupCache with mocked client
  *   - HybridDedupCache fallback behavior
  *   - Edge cases: empty inputs, max capacity, Redis failure modes
+ *   - Metrics emission on Redis failures and fallback activations
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -13,9 +14,13 @@ import {
     InMemoryDedupCache,
     RedisDedupCache,
     HybridDedupCache,
+    __resetDedupForTest,
     type DedupCache,
 } from '../../src/redis/dedup.js';
 import type { RedisClient } from '../../src/redis/client.js';
+import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
+import { dedupRedisErrorsTotal, dedupRedisFallbackTotal, registry } from '../../src/metrics.js';
+import { logger } from '../../src/logging/logger.js';
 
 const mockRedisClient = (overrides: Partial<RedisClient> = {}): RedisClient => ({
     get: vi.fn().mockResolvedValue(null),
@@ -132,6 +137,42 @@ describe('RedisDedupCache', () => {
     });
 });
 
+describe('RedisDedupCache – metrics', () => {
+    let client: FakeRedisClient;
+    let cache: RedisDedupCache;
+
+    beforeEach(() => {
+        registry.removeSingleMetric('dedup_redis_errors_total');
+        registry.removeSingleMetric('dedup_redis_fallback_total');
+        client = new FakeRedisClient();
+        cache = new RedisDedupCache(client);
+    });
+
+    afterEach(() => {
+        client.reset();
+    });
+
+    it('increments error counter on has() failure', async () => {
+        __resetDedupForTest();
+        const incSpy = vi.spyOn(dedupRedisErrorsTotal, 'inc');
+        client.throwOnNext('exists');
+
+        await cache.has('s1', 'e1');
+
+        expect(incSpy).toHaveBeenCalledWith({ operation: 'has' });
+    });
+
+    it('increments error counter on add() failure', async () => {
+        __resetDedupForTest();
+        const incSpy = vi.spyOn(dedupRedisErrorsTotal, 'inc');
+        client.throwOnNext('set');
+
+        await cache.add('s1', 'e1');
+
+        expect(incSpy).toHaveBeenCalledWith({ operation: 'add' });
+    });
+});
+
 describe('HybridDedupCache', () => {
     let primary: DedupCache;
     let fallback: InMemoryDedupCache;
@@ -229,6 +270,38 @@ describe('HybridDedupCache', () => {
         it('falls back to in-memory when Redis add throws', async () => {
             await hybrid.add('stream-1', 'evt-1');
             await expect(fallback.has('stream-1', 'evt-1')).resolves.toBe(true);
+        });
+
+        it('increments fallback counter on Redis has failure', async () => {
+            __resetDedupForTest();
+            registry.removeSingleMetric('dedup_redis_fallback_total');
+            const incSpy = vi.spyOn(dedupRedisFallbackTotal, 'inc');
+            const debugSpy = vi.spyOn(logger, 'debug');
+
+            await hybrid.has('stream-1', 'evt-1');
+
+            expect(incSpy).toHaveBeenCalledWith({ operation: 'has' });
+            expect(debugSpy).toHaveBeenCalledWith('dedup:fallback', {
+                operation: 'has',
+                streamId: 'stream-1',
+                eventId: 'evt-1',
+            });
+        });
+
+        it('increments fallback counter on Redis add failure', async () => {
+            __resetDedupForTest();
+            registry.removeSingleMetric('dedup_redis_fallback_total');
+            const incSpy = vi.spyOn(dedupRedisFallbackTotal, 'inc');
+            const debugSpy = vi.spyOn(logger, 'debug');
+
+            await hybrid.add('stream-1', 'evt-1');
+
+            expect(incSpy).toHaveBeenCalledWith({ operation: 'add' });
+            expect(debugSpy).toHaveBeenCalledWith('dedup:fallback', {
+                operation: 'add',
+                streamId: 'stream-1',
+                eventId: 'evt-1',
+            });
         });
     });
 });
