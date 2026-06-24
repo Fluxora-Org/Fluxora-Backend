@@ -27,6 +27,13 @@ import type { PoolConfig } from './pool.js';
 
 const { Pool } = pg;
 
+function envInt(name: string, fallback: number): number {
+  const v = process.env[name];
+  if (!v) return fallback;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 // ── Internal state ────────────────────────────────────────────────────────────
 
 let _replicaPool: pg.Pool | null = null;
@@ -52,6 +59,13 @@ function safeHostname(connectionString: string): string {
  * Build a PoolConfig for the read replica.
  * Inherits pool size / timeout settings from the primary config but uses
  * DATABASE_REPLICA_URL as the connection string.
+ *
+ * Replica-specific knobs (override primary defaults):
+ *   REPLICA_STATEMENT_TIMEOUT_MS — per-query timeout (default 30 000 ms).
+ *     Higher than primary because replica reads are often long analytical queries.
+ *     Set to 0 to disable. Cannot be overridden by client-supplied SQL.
+ *   REPLICA_QUEUE_LIMIT — max queued connection requests before fast-fail
+ *     (default 25). Keeps replica saturation observable separately from primary.
  */
 export function resolveReplicaPoolConfig(): PoolConfig | null {
   const replicaUrl = process.env['DATABASE_REPLICA_URL'];
@@ -63,13 +77,25 @@ export function resolveReplicaPoolConfig(): PoolConfig | null {
   return {
     ...primaryCfg,
     connectionString: replicaUrl,
+    statementTimeoutMs: envInt('REPLICA_STATEMENT_TIMEOUT_MS', 30_000),
+    queueLimit: envInt('REPLICA_QUEUE_LIMIT', 25),
+    poolName: 'replica',
   };
 }
 
 /**
  * Create a pg.Pool for the read replica.
- * Sets `default_transaction_read_only = on` on every new connection so that
- * accidental INSERT/UPDATE/DELETE statements are rejected by PostgreSQL.
+ *
+ * On every new connection:
+ *   - Sets `default_transaction_read_only = on` to prevent accidental writes.
+ *   - Sets `statement_timeout` (from cfg.statementTimeoutMs) so long analytical
+ *     reads are aborted rather than blocking indefinitely. The value is set at
+ *     the session level via a server-side SET command — it cannot be overridden
+ *     by client-supplied SQL parameters.
+ *
+ * A `_queueLimit` property is stamped on the pool so callers using the shared
+ * `query()` helper fast-fail when the waiting queue is full, keeping replica
+ * saturation observable separately from the primary pool.
  */
 export function createReplicaPool(config?: PoolConfig): pg.Pool {
   const cfg = config ?? resolveReplicaPoolConfig()!;
@@ -81,13 +107,18 @@ export function createReplicaPool(config?: PoolConfig): pg.Pool {
     idleTimeoutMillis: cfg.idleTimeoutMillis,
   });
 
-  // Enforce read-only mode on every physical connection to prevent
-  // writes from accidentally reaching the replica.
+  // Store queueLimit on the pool instance (same pattern as primary pool).
+  (pool as pg.Pool & { _queueLimit?: number })._queueLimit = cfg.queueLimit;
+
   pool.on('connect', (client: pg.PoolClient) => {
-    client.query('SET default_transaction_read_only = on').catch((err: Error) => {
-      logger.error('Failed to set read-only mode on replica connection', undefined, {
-        error: err.message,
-      });
+    // Set read-only mode first, then statement_timeout.
+    const readOnlyQ = client.query('SET default_transaction_read_only = on');
+    const timeoutQ = cfg.statementTimeoutMs > 0
+      ? client.query('SET statement_timeout = $1', [cfg.statementTimeoutMs])
+      : Promise.resolve();
+
+    Promise.all([readOnlyQ, timeoutQ]).catch((err: Error) => {
+      logger.error('Failed to configure replica connection', undefined, { error: err.message });
     });
   });
 

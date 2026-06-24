@@ -171,6 +171,10 @@ export const EnvSchema = z.object({
   DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
   SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
   STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+  /** statement_timeout for replica pool queries (ms). Higher default than primary for long reporting reads. 0 = disabled. */
+  REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).default(30000),
+  /** Max requests allowed to queue on the replica pool before fast-failing. */
+  REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(25),
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
@@ -313,6 +317,10 @@ export interface Config {
   databaseIdleTimeout: number;
   slowQueryThresholdMs: number;
   statementTimeoutMs: number;
+  /** statement_timeout for the read-replica pool (ms). 0 = disabled. */
+  replicaStatementTimeoutMs: number;
+  /** Max queued requests on the replica pool before fast-failing. */
+  replicaQueueLimit: number;
 
   redisUrl: string;
   redisEnabled: boolean;
@@ -454,6 +462,8 @@ function toConfig(env: ParsedEnv): Config {
     databaseIdleTimeout: env.DB_IDLE_TIMEOUT,
     slowQueryThresholdMs: env.SLOW_QUERY_THRESHOLD_MS,
     statementTimeoutMs: env.STATEMENT_TIMEOUT_MS,
+    replicaStatementTimeoutMs: env.REPLICA_STATEMENT_TIMEOUT_MS,
+    replicaQueueLimit: env.REPLICA_QUEUE_LIMIT,
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
