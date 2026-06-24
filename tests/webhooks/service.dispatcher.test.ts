@@ -182,3 +182,132 @@ describe('WebhookDispatcher outbox polling', () => {
     expect(client.queries.some(q => q.sql.includes('COMMIT'))).toBe(true);
   });
 });
+
+// ── Exponential backoff on repeated DB failures ───────────────────────────────
+
+describe('WebhookDispatcher batch backoff', () => {
+  beforeEach(() => {
+    vi.spyOn(Math, 'random').mockReturnValue(0); // jitter lower-bound: factor × 0.75
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  /**
+   * Returns a pool whose first `failCount` connect calls produce a client that
+   * throws on every query (simulating Postgres being unavailable), and
+   * subsequent calls return a healthy client with an empty outbox.
+   */
+  function makeFlakyPool(failCount: number) {
+    let calls = 0;
+    return {
+      connect: vi.fn(async () => {
+        calls++;
+        if (calls <= failCount) {
+          return {
+            query: vi.fn(async () => { throw new Error('DB unavailable'); }),
+            release: vi.fn(),
+          };
+        }
+        return {
+          query: vi.fn(async (sql: string) => {
+            if (sql.includes('SELECT id, stream_id')) return { rows: [] };
+            return { rows: [] };
+          }),
+          release: vi.fn(),
+        };
+      }),
+    };
+  }
+
+  function makeBackoffDispatcher(opts: { maxBatchBackoffMs?: number; failCount?: number } = {}) {
+    return new WebhookDispatcher({
+      endpointUrl: 'https://consumer.example/webhooks',
+      secret: 'secret',
+      pollIntervalMs: 1_000,
+      maxBatchBackoffMs: opts.maxBatchBackoffMs ?? 60_000,
+      batchSize: 5,
+      policy,
+      pool: makeFlakyPool(opts.failCount ?? 999) as unknown as import('../../src/webhooks/service.js').WebhookDispatcherOptions['pool'],
+    });
+  }
+
+  async function runPoll(d: WebhookDispatcher) {
+    const p = d.pollOnce();
+    await vi.runAllTimersAsync();
+    await p;
+  }
+
+  it('increments consecutive failure counter and sets backoff after first failure', async () => {
+    const d = makeBackoffDispatcher();
+    await runPoll(d);
+    expect(d.getConsecutiveBatchFailures()).toBe(1);
+    expect(d.getBatchBackoffMs()).toBeGreaterThan(0);
+  });
+
+  it('backoff increases (non-decreasing) across consecutive failures', async () => {
+    const d = makeBackoffDispatcher();
+    const backoffs: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      await runPoll(d);
+      backoffs.push(d.getBatchBackoffMs());
+    }
+    for (let i = 1; i < backoffs.length; i++) {
+      expect(backoffs[i]).toBeGreaterThanOrEqual(backoffs[i - 1]!);
+    }
+  });
+
+  it('caps backoff at maxBatchBackoffMs', async () => {
+    const d = makeBackoffDispatcher({ maxBatchBackoffMs: 3_000 });
+    for (let i = 0; i < 20; i++) await runPoll(d);
+    expect(d.getBatchBackoffMs()).toBeLessThanOrEqual(3_000);
+  });
+
+  it('resets failure counter and backoff to 0 on first successful batch', async () => {
+    // Run two full poll cycles using start() so each cycle is a separate
+    // setInterval tick — not subject to the pollOnce() idempotency guard.
+    vi.useRealTimers();
+
+    const pool = makeFlakyPool(1);
+    const d = new WebhookDispatcher({
+      endpointUrl: 'https://consumer.example/webhooks',
+      secret: 'secret',
+      pollIntervalMs: 20,
+      maxBatchBackoffMs: 10,
+      batchSize: 5,
+      policy,
+      pool: pool as unknown as import('../../src/webhooks/service.js').WebhookDispatcherOptions['pool'],
+    });
+    global.fetch = vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+
+    d.start();
+
+    // Wait long enough for at least two poll cycles (20ms interval + 10ms max backoff)
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    await d.stop();
+
+    expect(d.getConsecutiveBatchFailures()).toBe(0);
+    expect(d.getBatchBackoffMs()).toBe(0);
+  });
+
+  it('respects stopped flag: does not deliver after stop() during backoff', async () => {
+    const d = makeBackoffDispatcher();
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    // Trigger a failure to set backoff
+    await runPoll(d);
+    expect(d.getBatchBackoffMs()).toBeGreaterThan(0);
+
+    await d.stop();
+
+    // A subsequent poll should no-op because stopped=true
+    const p = d.pollOnce();
+    await vi.runAllTimersAsync();
+    await p;
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+

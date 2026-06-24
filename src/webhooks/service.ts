@@ -18,7 +18,7 @@ import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
 import { calculateNextRetryTime, shouldRetry } from './retry.js';
-import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
+import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds, webhookBatchFailuresTotal, webhookBatchBackoffMs } from '../metrics/businessMetrics.js';
 
 interface OutboxRow {
   id: string;
@@ -42,6 +42,7 @@ export interface WebhookDispatcherOptions {
   secret?: string;
   pollIntervalMs?: number;
   batchSize?: number;
+  maxBatchBackoffMs?: number;
   pool?: DbPool;
   policy?: WebhookRetryPolicy;
 }
@@ -353,12 +354,17 @@ export class WebhookDispatcher {
   private readonly secret?: string;
   private readonly pollIntervalMs: number;
   private readonly batchSize: number;
+  private readonly maxBatchBackoffMs: number;
   private readonly pool: DbPool;
   private readonly policy: WebhookRetryPolicy;
   private readonly service: WebhookService;
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
   private inFlight: Promise<void> | null = null;
+  /** Consecutive processBatch failures; reset to 0 on first success. */
+  private consecutiveBatchFailures = 0;
+  /** Current backoff delay in ms (0 = no backoff). */
+  private currentBatchBackoffMs = 0;
 
   constructor(options: WebhookDispatcherOptions = {}) {
     this.endpointUrl = options.endpointUrl ?? process.env.WEBHOOK_URL;
@@ -366,6 +372,9 @@ export class WebhookDispatcher {
     this.pollIntervalMs =
       options.pollIntervalMs ?? parsePositiveInteger(process.env.WEBHOOK_POLL_INTERVAL_MS, 10_000);
     this.batchSize = options.batchSize ?? parsePositiveInteger(process.env.WEBHOOK_BATCH_SIZE, 10);
+    this.maxBatchBackoffMs =
+      options.maxBatchBackoffMs ??
+      parsePositiveInteger(process.env.WEBHOOK_BATCH_MAX_BACKOFF_MS, 60_000);
     this.pool = options.pool ?? (getPool() as unknown as DbPool);
     this.policy = options.policy ?? DEFAULT_RETRY_POLICY;
     this.service = new WebhookService(this.policy);
@@ -430,9 +439,24 @@ export class WebhookDispatcher {
     return { endpointUrl, secret };
   }
 
+  /**
+   * Execute one poll cycle against the webhook outbox.
+   *
+   * On consecutive database failures the method applies exponential back-off
+   * with ±25 % jitter before returning, so the poll loop slows down
+   * automatically when Postgres is degraded.  The back-off is capped at
+   * `maxBatchBackoffMs` (default 60 s) and resets to zero on the first
+   * successful batch.
+   */
   private async processBatch(): Promise<void> {
     const endpoint = this.endpointUrl && this.secret;
     if (!endpoint) return;
+
+    // Apply backoff delay accumulated from previous failures before querying.
+    if (this.currentBatchBackoffMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, this.currentBatchBackoffMs));
+      if (this.stopped) return;
+    }
 
     const client = await this.pool.connect();
 
@@ -453,6 +477,8 @@ export class WebhookDispatcher {
 
       if (result.rows.length === 0) {
         await client.query('COMMIT');
+        // Empty batch still counts as success — reset backoff.
+        this.resetBatchBackoff();
         return;
       }
 
@@ -461,14 +487,67 @@ export class WebhookDispatcher {
       }
 
       await client.query('COMMIT');
+      // Successful batch — reset backoff.
+      this.resetBatchBackoff();
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       logger.error('Webhook outbox dispatcher batch failed', undefined, {
         error: error instanceof Error ? error.message : String(error),
       });
+      this.recordBatchFailure();
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Compute and store the next backoff value using full-jitter exponential
+   * back-off: `min(cap, base * 2^n) * uniform(0.75, 1.25)`.
+   *
+   * The minimum base is `pollIntervalMs` so the first back-off is at least one
+   * normal poll interval.  The maximum is `maxBatchBackoffMs` (bounded, so the
+   * loop always eventually drains the outbox once Postgres recovers).
+   */
+  private recordBatchFailure(): void {
+    this.consecutiveBatchFailures++;
+    webhookBatchFailuresTotal.inc();
+
+    const base = this.pollIntervalMs;
+    const exponent = Math.min(this.consecutiveBatchFailures - 1, 30); // cap exponent to avoid overflow
+    const uncapped = base * Math.pow(2, exponent);
+    const capped = Math.min(uncapped, this.maxBatchBackoffMs);
+    // ±25 % jitter
+    const jitter = capped * (0.75 + Math.random() * 0.5);
+    this.currentBatchBackoffMs = Math.round(jitter);
+
+    webhookBatchBackoffMs.set(this.currentBatchBackoffMs);
+
+    logger.warn('Webhook batch backoff applied', undefined, {
+      consecutiveFailures: this.consecutiveBatchFailures,
+      backoffMs: this.currentBatchBackoffMs,
+      maxBackoffMs: this.maxBatchBackoffMs,
+    });
+  }
+
+  private resetBatchBackoff(): void {
+    if (this.consecutiveBatchFailures > 0) {
+      logger.info('Webhook batch backoff reset after successful poll', undefined, {
+        previousConsecutiveFailures: this.consecutiveBatchFailures,
+      });
+    }
+    this.consecutiveBatchFailures = 0;
+    this.currentBatchBackoffMs = 0;
+    webhookBatchBackoffMs.set(0);
+  }
+
+  /** Expose backoff state for tests and health endpoints. */
+  getBatchBackoffMs(): number {
+    return this.currentBatchBackoffMs;
+  }
+
+  /** Expose consecutive failure count for tests. */
+  getConsecutiveBatchFailures(): number {
+    return this.consecutiveBatchFailures;
   }
 
   private async deliverRow(client: DbClient, row: OutboxRow): Promise<void> {

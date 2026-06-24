@@ -166,6 +166,9 @@ export const EnvSchema = z.object({
   FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
   WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
   WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+  WEBHOOK_BATCH_MAX_BACKOFF_MS: integerEnv('WEBHOOK_BATCH_MAX_BACKOFF_MS', 1000).default(60000),
+
+  REPLICA_LAG_THRESHOLD_MS: integerEnv('REPLICA_LAG_THRESHOLD_MS', 0).default(5000),
 
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
   ENABLE_RATE_LIMIT: booleanEnv().optional(),
@@ -244,6 +247,8 @@ export interface Config {
   webhookSecretPrevious?: string | undefined;
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
+  webhookBatchMaxBackoffMs: number;
+  replicaLagThresholdMs: number;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -370,6 +375,8 @@ function toConfig(env: ParsedEnv): Config {
     webhookSecretPrevious: env.WEBHOOK_SECRET_PREVIOUS,
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
+    webhookBatchMaxBackoffMs: env.WEBHOOK_BATCH_MAX_BACKOFF_MS,
+    replicaLagThresholdMs: env.REPLICA_LAG_THRESHOLD_MS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
