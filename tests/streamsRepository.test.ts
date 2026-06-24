@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
 // ── Mock the pool module before importing the repository ─────────────────────
 const mockQuery = vi.fn();
+const mockGetReadPool = vi.fn();
 vi.mock('../src/db/pool.js', () => ({
   getPool:           vi.fn(() => ({})),
   query:             (...args: unknown[]) => mockQuery(...args),
@@ -18,6 +19,10 @@ vi.mock('../src/db/pool.js', () => ({
   DuplicateEntryError: class DuplicateEntryError extends Error {
     constructor(d?: string) { super(d ?? 'duplicate'); this.name = 'DuplicateEntryError'; }
   },
+}));
+
+vi.mock('../src/db/replicaPool.js', () => ({
+  getReadPool: (...args: unknown[]) => mockGetReadPool(...args),
 }));
 
 import { streamRepository } from '../src/db/repositories/streamRepository.js';
@@ -183,6 +188,70 @@ describe('streamRepository', () => {
       queryReturnsEmpty();
       const record = await streamRepository.getByEvent('deadbeef', 99);
       expect(record).toBeUndefined();
+    });
+  });
+
+  // ── existsById ───────────────────────────────────────────────────────────────
+
+  describe('existsById', () => {
+    it('returns existence record when stream exists', async () => {
+      const mockPool = {};
+      mockGetReadPool.mockResolvedValue(mockPool);
+      mockQuery.mockResolvedValueOnce({ rows: [{ updated_at: new Date('2024-01-01T00:00:00Z') }] });
+
+      const result = await streamRepository.existsById('stream-abc');
+
+      expect(result).toBeDefined();
+      expect(result!.updated_at).toBe('2024-01-01T00:00:00.000Z');
+      expect(mockGetReadPool).toHaveBeenCalled();
+      expect(mockQuery).toHaveBeenCalledWith(
+        mockPool,
+        'SELECT updated_at FROM streams WHERE id = $1',
+        ['stream-abc'],
+      );
+    });
+
+    it('returns undefined when stream does not exist', async () => {
+      const mockPool = {};
+      mockGetReadPool.mockResolvedValue(mockPool);
+      queryReturnsEmpty();
+
+      const result = await streamRepository.existsById('nonexistent');
+
+      expect(result).toBeUndefined();
+      expect(mockGetReadPool).toHaveBeenCalled();
+    });
+
+    it('uses read pool via getReadPool', async () => {
+      const mockPool = {};
+      mockGetReadPool.mockResolvedValue(mockPool);
+      mockQuery.mockResolvedValueOnce({ rows: [{ updated_at: new Date() }] });
+
+      await streamRepository.existsById('stream-abc');
+
+      expect(mockGetReadPool).toHaveBeenCalled();
+    });
+
+    it('propagates errors from read pool', async () => {
+      mockGetReadPool.mockRejectedValue(new Error('replica connection failed'));
+
+      await expect(streamRepository.existsById('stream-abc')).rejects.toThrow('replica connection failed');
+    });
+
+    it('falls back to primary pool when replica is unavailable (via getReadPool)', async () => {
+      const mockPrimaryPool = { isPrimary: true };
+      mockGetReadPool.mockResolvedValue(mockPrimaryPool);
+      mockQuery.mockResolvedValueOnce({ rows: [{ updated_at: new Date('2024-01-01T00:00:00Z') }] });
+
+      const result = await streamRepository.existsById('stream-abc');
+
+      expect(result).toBeDefined();
+      expect(mockGetReadPool).toHaveBeenCalled();
+      expect(mockQuery).toHaveBeenCalledWith(
+        mockPrimaryPool,
+        'SELECT updated_at FROM streams WHERE id = $1',
+        ['stream-abc'],
+      );
     });
   });
 

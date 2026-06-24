@@ -93,9 +93,21 @@ function createCacheEnvelope<T>(
   };
 }
 
-function parseCachedValue<T>(raw: string): T {
-  const parsed = JSON.parse(raw) as unknown;
-  return isCacheEnvelope<T>(parsed) ? parsed.value : parsed as T;
+function parseCachedValue<T>(raw: string, key: string): T | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isCacheEnvelope<T>(parsed) ? parsed.value : parsed as T;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      logger.warn('Corrupt entry in RPC fallback cache', undefined, {
+        event: 'rpc_fallback_cache_corrupt_entry',
+        key,
+        error: err.message,
+      });
+      return null;
+    }
+    throw err;
+  }
 }
 
 function parseCacheEntry<T>(raw: string): RpcFallbackCacheEntry<T> | null {
@@ -113,23 +125,43 @@ function parseCacheEntry<T>(raw: string): RpcFallbackCacheEntry<T> | null {
 }
 
 export class RedisRpcFallbackCache implements RpcFallbackCache {
+  private _corruptEntriesTotal = 0;
+
+  get corruptEntriesTotal(): number {
+    return this._corruptEntriesTotal;
+  }
+
   constructor(private readonly client: RedisClient) {}
 
   async get<T>(operation: string, cacheParts: readonly string[] = []): Promise<T | null> {
     const key = buildCacheKey(operation, cacheParts);
 
+    let raw: string | null;
     try {
-      const raw = await this.client.get(key);
-      if (raw === null) return null;
-      return parseCachedValue<T>(raw);
+      raw = await this.client.get(key);
     } catch (err) {
       logger.warn('Stellar RPC fallback cache read failed', undefined, {
         event: 'rpc_fallback_cache_read_failed',
         operation,
         error: err instanceof Error ? err.message : String(err),
       });
+      throw err;
+    }
+
+    if (raw === null || raw === undefined) return null;
+
+    const parsed = parseCachedValue<T>(raw, key);
+    if (parsed === null) {
+      this._corruptEntriesTotal++;
+      await this.client.del(key);
+      logger.warn('Removed corrupt entry from RPC fallback cache', undefined, {
+        event: 'rpc_fallback_cache_corrupt_entry_removed',
+        key,
+      });
       return null;
     }
+
+    return parsed;
   }
 
   async getEntry<T>(
@@ -222,7 +254,7 @@ export class InMemoryRpcFallbackCache implements RpcFallbackCache {
       return null;
     }
 
-    return parseCachedValue<T>(entry.value);
+    return parseCachedValue<T>(entry.value, key);
   }
 
   async getEntry<T>(

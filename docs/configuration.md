@@ -34,6 +34,7 @@ Secret values are never included in validation messages.
 | `STELLAR_RPC_RETRY_DELAY` | integer ms | `1000` |
 | `JWT_EXPIRES_IN` | string | `24h` |
 | `API_KEYS` | comma-separated string | Empty, except `test-api-key` in tests |
+| `API_KEY_PEPPER` | string, min 32 chars | unset — required at runtime to mint/validate API keys (see [auth.md](./auth.md#api-keys)). Never logged. |
 | `ADMIN_API_KEY` | string | unset |
 | `MAX_REQUEST_SIZE` | bytes string, supports `b`, `kb`, `mb`, `gb` | `1mb` |
 | `MAX_JSON_DEPTH` | integer, 1-1000 | `20` |

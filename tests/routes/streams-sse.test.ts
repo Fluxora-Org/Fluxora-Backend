@@ -676,6 +676,69 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
     expect(output).toContain('retry: 5000');
   });
 
+  it('uses SSE_RETRY_MS env var for the retry directive value', async () => {
+    process.env.SSE_RETRY_MS = '9999';
+    try {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+      const output = await new Promise<string>((resolve, reject) => {
+        const req = http.get(`http://127.0.0.1:${port}/api/streams/stream-123/events`, (res) => {
+          let data = '';
+          const timeout = setTimeout(() => req.destroy(new Error('timeout')), 1000);
+          res.on('data', (chunk) => {
+            data += chunk.toString();
+            if (data.includes('retry:')) {
+              clearTimeout(timeout);
+              req.destroy();
+              resolve(data);
+            }
+          });
+          res.on('error', reject);
+        });
+        req.on('error', reject);
+      });
+
+      expect(output).toContain('retry: 9999');
+    } finally {
+      delete process.env.SSE_RETRY_MS;
+    }
+  });
+
+  it('emits a heartbeat comment on the configured interval', async () => {
+    process.env.SSE_HEARTBEAT_INTERVAL_MS = '150';
+    try {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+      const output = await new Promise<string>((resolve, reject) => {
+        let resolved = false;
+        const req = http.get(`http://127.0.0.1:${port}/api/streams/stream-123/events`, (res) => {
+          let data = '';
+          const timeout = setTimeout(() => reject(new Error('timeout waiting for heartbeat')), 2000);
+          res.on('data', (chunk) => {
+            data += chunk.toString();
+            if (data.includes(': heartbeat') && !resolved) {
+              resolved = true;
+              clearTimeout(timeout);
+              req.destroy();
+              resolve(data);
+            }
+          });
+          res.on('error', () => { if (!resolved) reject(new Error('response error')); });
+        });
+        req.on('error', () => { if (!resolved) reject(new Error('request error')); });
+      });
+
+      expect(output).toContain(': heartbeat\n\n');
+      // Heartbeat must contain no event data — just the SSE comment field.
+      const heartbeatLines = output
+        .split('\n')
+        .filter((line) => line.startsWith(': heartbeat'));
+      expect(heartbeatLines.every((line) => line === ': heartbeat')).toBe(true);
+    } finally {
+      delete process.env.SSE_HEARTBEAT_INTERVAL_MS;
+    }
+  });
+
   it('ignores malformed Last-Event-ID (whitespace-only)', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 

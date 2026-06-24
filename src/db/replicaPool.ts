@@ -60,19 +60,35 @@ export function resolveReplicaPoolConfig(): PoolConfig | null {
   }
 
   const primaryCfg = resolvePoolConfig();
+  const raw = process.env['REPLICA_STATEMENT_TIMEOUT_MS'];
+  const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
+  const replicaStatementTimeoutMs = Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : primaryCfg.statementTimeoutMs;
+
   return {
     ...primaryCfg,
     connectionString: replicaUrl,
+    replicaStatementTimeoutMs,
   };
 }
 
 /**
  * Create a pg.Pool for the read replica.
- * Sets `default_transaction_read_only = on` on every new connection so that
- * accidental INSERT/UPDATE/DELETE statements are rejected by PostgreSQL.
+ *
+ * On every new physical connection the hook atomically sets:
+ *   1. `default_transaction_read_only = on`  — prevents accidental writes.
+ *   2. `statement_timeout = <ms>`            — bounds runaway SELECTs.
+ *
+ * Both are applied in a single `client.query` call so they either both succeed
+ * or both fail (the connection is destroyed on error, preventing a half-configured
+ * client from entering the pool).
+ *
+ * @param config - Pool configuration. Uses resolveReplicaPoolConfig() when omitted.
  */
 export function createReplicaPool(config?: PoolConfig): pg.Pool {
   const cfg = config ?? resolveReplicaPoolConfig()!;
+  const timeoutMs = cfg.replicaStatementTimeoutMs ?? cfg.statementTimeoutMs;
   const pool = new Pool({
     connectionString: cfg.connectionString,
     min: cfg.min,
@@ -81,11 +97,15 @@ export function createReplicaPool(config?: PoolConfig): pg.Pool {
     idleTimeoutMillis: cfg.idleTimeoutMillis,
   });
 
-  // Enforce read-only mode on every physical connection to prevent
-  // writes from accidentally reaching the replica.
   pool.on('connect', (client: pg.PoolClient) => {
-    client.query('SET default_transaction_read_only = on').catch((err: Error) => {
-      logger.error('Failed to set read-only mode on replica connection', undefined, {
+    // Issue both SETs in one round-trip so the connection is either fully
+    // configured or rejected — no partial state can enter the pool.
+    const sql = timeoutMs > 0
+      ? `SET default_transaction_read_only = on; SET statement_timeout = ${timeoutMs}`
+      : 'SET default_transaction_read_only = on';
+
+    client.query(sql).catch((err: Error) => {
+      logger.error('Failed to configure replica connection', undefined, {
         error: err.message,
       });
     });
