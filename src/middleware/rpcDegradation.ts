@@ -20,7 +20,11 @@
  */
 
 import type { Request, Response, NextFunction } from 'express';
-import type { StellarRpcService } from '../services/stellar-rpc.js';
+import {
+  getRpcRequestCacheStatus,
+  runWithRpcRequestMetadata,
+  type StellarRpcService,
+} from '../services/stellar-rpc.js';
 import { logger } from '../lib/logger.js';
 
 export const STALE_WARNING = '199 fluxora-backend "Stellar RPC unavailable - data may be stale"';
@@ -42,50 +46,60 @@ export function createRpcDegradationMiddleware(
   let lastLoggedState: string | undefined;
 
   return function rpcDegradationMiddleware(req: Request, res: Response, next: NextFunction): void {
-    const svc = getService();
-    const snapshot = svc.getDegradationSnapshot();
-    const { circuitState, degraded } = snapshot;
+    runWithRpcRequestMetadata(() => {
+      const originalWriteHead = res.writeHead.bind(res);
+      res.writeHead = ((...args: Parameters<Response['writeHead']>) => {
+        if (getRpcRequestCacheStatus() === 'stale' && !res.headersSent) {
+          res.setHeader('X-RPC-Cache', 'stale');
+        }
+        return originalWriteHead(...args);
+      }) as Response['writeHead'];
 
-    res.setHeader('X-Degradation-State', circuitState);
+      const svc = getService();
+      const snapshot = svc.getDegradationSnapshot();
+      const { circuitState, degraded } = snapshot;
 
-    if (circuitState !== lastLoggedState) {
-      logger.warn('RPC degradation state changed', undefined, {
-        event: 'rpc_degradation_transition',
-        previousState: lastLoggedState ?? 'INIT',
-        currentState: circuitState,
-        failureCount: snapshot.failureCount,
-      });
-      lastLoggedState = circuitState;
-    }
+      res.setHeader('X-Degradation-State', circuitState);
 
-    if (!degraded) {
-      return next();
-    }
-
-    // Degraded path: reads are allowed with a staleness warning.
-    if (READ_METHODS.has(req.method)) {
-      res.setHeader('Warning', STALE_WARNING);
-      return next();
-    }
-
-    // Writes are blocked while the circuit is tripped.
-    logger.warn('Write request rejected due to RPC degradation', undefined, {
-      event: 'rpc_degradation_write_blocked',
-      method: req.method,
-      path: req.originalUrl,
-      circuitState,
-    });
-
-    res.status(503).json({
-      error: {
-        code: 'SERVICE_UNAVAILABLE',
-        message: DEGRADED_WRITE_MESSAGE,
-        degradation: {
-          circuitState,
+      if (circuitState !== lastLoggedState) {
+        logger.warn('RPC degradation state changed', undefined, {
+          event: 'rpc_degradation_transition',
+          previousState: lastLoggedState ?? 'INIT',
+          currentState: circuitState,
           failureCount: snapshot.failureCount,
-          openedAt: snapshot.openedAt,
+        });
+        lastLoggedState = circuitState;
+      }
+
+      if (!degraded) {
+        return next();
+      }
+
+      // Degraded path: reads are allowed with a staleness warning.
+      if (READ_METHODS.has(req.method)) {
+        res.setHeader('Warning', STALE_WARNING);
+        return next();
+      }
+
+      // Writes are blocked while the circuit is tripped.
+      logger.warn('Write request rejected due to RPC degradation', undefined, {
+        event: 'rpc_degradation_write_blocked',
+        method: req.method,
+        path: req.originalUrl,
+        circuitState,
+      });
+
+      res.status(503).json({
+        error: {
+          code: 'SERVICE_UNAVAILABLE',
+          message: DEGRADED_WRITE_MESSAGE,
+          degradation: {
+            circuitState,
+            failureCount: snapshot.failureCount,
+            openedAt: snapshot.openedAt,
+          },
         },
-      },
+      });
     });
   };
 }

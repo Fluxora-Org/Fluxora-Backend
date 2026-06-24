@@ -12,6 +12,9 @@ import { streamRepository } from "../db/repositories/streamRepository.js";
 import { CreateStreamInput, StreamStatus } from "../db/types.js";
 import { info, warn, error as logError, debug } from "../utils/logger.js";
 import { getStreamHub } from "../ws/hub.js";
+import { enrichActiveSpanWithStream } from "../tracing/hooks.js";
+import { deriveStreamId } from "../streams/sseEmitter.js";
+
 
 /**
  * Raw event types from Stellar Soroban RPC
@@ -94,10 +97,12 @@ export const streamEventService = {
 
     try {
       // Generate deterministic stream ID from chain data
-      const streamId = generateStreamId(
+      const streamId = deriveStreamId(
         event.transactionHash,
         event.eventIndex,
       );
+
+      enrichActiveSpanWithStream(streamId, event.sender, event.recipient);
 
       // Transform event to database input
       const input: CreateStreamInput = {
@@ -176,6 +181,7 @@ export const streamEventService = {
     });
 
     try {
+      enrichActiveSpanWithStream(event.streamId);
       // Get current stream state
       const existing = await streamRepository.getById(event.streamId);
 
@@ -192,6 +198,8 @@ export const streamEventService = {
           error: `Stream not found: ${event.streamId}`,
         };
       }
+
+      enrichActiveSpanWithStream(event.streamId, existing.sender_address, existing.recipient_address);
 
       // Update stream with new values
       const update = {
@@ -273,6 +281,7 @@ export const streamEventService = {
     });
 
     try {
+      enrichActiveSpanWithStream(event.streamId);
       const updatedStream = await streamRepository.updateStream(
         event.streamId,
         { status: "cancelled" },
@@ -377,12 +386,5 @@ export const streamEventService = {
   },
 };
 
-/**
- * Generate a deterministic stream ID from transaction hash and event index
- *
- * Format: stream-{txHash}-{eventIndex}
- * This ensures the same event always produces the same ID
- */
-function generateStreamId(transactionHash: string, eventIndex: number): string {
-  return `stream-${transactionHash}-${eventIndex}`;
-}
+
+

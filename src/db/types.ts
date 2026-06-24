@@ -163,17 +163,30 @@ export type ValidTransitions = typeof STREAM_INVARIANTS.validTransitions;
 // ─── API Key Management ───────────────────────────────────────────────────────
 
 /**
- * A stored API key record. The raw key is never persisted — only its SHA-256
- * hex digest is stored so a database breach does not expose live credentials.
+ * A stored API key record. The raw key is never persisted — only a salted,
+ * peppered keyed digest is stored, so a database breach does not expose live
+ * credentials and the stored hashes are not precomputable via rainbow tables.
+ *
+ * @see {@link ../../lib/apiKey} for the hashing/lookup implementation.
  */
 export interface ApiKeyRecord {
   /** Stable opaque identifier (cuid2) */
   id: string;
   /** Human-readable label supplied at creation time */
   name: string;
-  /** SHA-256 hex digest of the raw key */
+  /**
+   * Hex digest of `HMAC-SHA256(pepper, salt || rawKey)`. The server-side pepper
+   * is supplied via the `API_KEY_PEPPER` env var and is never stored alongside
+   * this value, so the digest cannot be brute-forced from the database alone.
+   */
   keyHash: string;
-  /** Key prefix (first 8 chars) for display / lookup without exposing the full key */
+  /** Per-key random salt (hex) mixed into {@link keyHash} before hashing. */
+  salt: string;
+  /**
+   * Key prefix (first 8 chars of the raw key). Stored as an indexed lookup key
+   * so validation can fetch candidate rows in O(log n) instead of scanning the
+   * whole table. The prefix is a tiny, non-secret fraction of the full key.
+   */
   prefix: string;
   /** ISO-8601 creation timestamp */
   createdAt: string;
@@ -181,6 +194,8 @@ export interface ApiKeyRecord {
   rotatedAt: string | null;
   /** Whether the key is still active */
   active: boolean;
+  /** Scopes/permissions granted to this API key (e.g., 'streams:read', 'streams:write') */
+  scopes: string[];
 }
 
 /**

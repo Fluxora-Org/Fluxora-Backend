@@ -2,6 +2,10 @@ import type { Request, Response, NextFunction } from 'express';
 import { DecimalSerializationError } from '../serialization/decimal.js';
 import { SerializationLogger, error as logError } from '../utils/logger.js';
 import { errorResponse } from '../utils/response.js';
+import { QueryTimeoutError } from '../db/pool.js';
+import { ApiError } from '../errors.js';
+
+export { ApiError } from '../errors.js';
 
 export interface ApiErrorResponse {
   success: false;
@@ -18,20 +22,11 @@ export enum ApiErrorCode {
   PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
   TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
+  REQUEST_TIMEOUT = 'REQUEST_TIMEOUT',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
-}
-
-export class ApiError extends Error {
-  constructor(
-    public readonly code: ApiErrorCode,
-    message: string,
-    public readonly statusCode: number = 500,
-    public readonly details?: unknown,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
+  UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
+  GATEWAY_TIMEOUT = 'GATEWAY_TIMEOUT',
 }
 
 /**
@@ -44,6 +39,13 @@ export function errorHandler(
   _next: NextFunction
 ): void {
   const requestId = req.id ?? (res.locals['requestId'] as string | undefined);
+
+  if (err instanceof QueryTimeoutError) {
+    res.status(504).json(
+      errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
+    );
+    return;
+  }
 
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
@@ -60,9 +62,17 @@ export function errorHandler(
 
   if (err instanceof ApiError) {
     logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
-    res.status(err.statusCode).json(
-      errorResponse(err.code, err.message, err.details, requestId)
-    );
+
+    if (err.expose) {
+      res.status(err.statusCode).json(
+        errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
+      );
+    } else {
+      res.status(err.statusCode).json({
+        success: false,
+        message: 'Internal server error',
+      });
+    }
     return;
   }
 
@@ -98,14 +108,10 @@ export function errorHandler(
     requestId,
   });
 
-  res.status(500).json(
-    errorResponse(
-      ApiErrorCode.INTERNAL_ERROR,
-      'An unexpected error occurred. Please try again later.',
-      undefined,
-      requestId
-    )
-  );
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+  });
 }
 
 /** Async handler wrapper */
@@ -147,4 +153,12 @@ export function payloadTooLarge(message: string, details?: unknown): ApiError {
 
 export function tooManyRequests(message: string, details?: unknown): ApiError {
   return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
+}
+
+export function requestTimeout(message: string): ApiError {
+  return new ApiError(ApiErrorCode.REQUEST_TIMEOUT, message, 408);
+}
+
+export function gatewayTimeout(message: string): ApiError {
+  return new ApiError(ApiErrorCode.GATEWAY_TIMEOUT, message, 504);
 }

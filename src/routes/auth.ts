@@ -5,6 +5,8 @@ import { validationError, unauthorized, asyncHandler } from '../middleware/error
 import { info } from '../utils/logger.js';
 import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
+import { revoke } from '../redis/jwtRevocationStore.js';
+import { Permission, requirePermission } from '../middleware/auth.js';
 
 export const authRouter = Router();
 
@@ -30,7 +32,7 @@ const SessionRequestSchema = z.object({
  *   post:
  *     summary: Create a new session (get JWT)
  *     description: |
- *       Issues a JWT for a dashboard client. 
+ *       Issues a JWT for a dashboard client.
  *       If OIDC is configured and an ID token is provided, uses OIDC exchange.
  *       Otherwise, falls back to the static shared-secret path.
  *     tags:
@@ -118,3 +120,95 @@ authRouter.post(
   })
 );
 
+// ── Revocation endpoint ──
+
+const RevokeRequestSchema = z.object({
+  jti: z.string().min(1, 'jti is required'),
+  exp: z.coerce.number().int().positive('exp is required'),
+  ttl: z.coerce.number().int().positive().optional(),
+});
+
+/**
+ * @openapi
+ * /api/auth/revoke:
+ *   post:
+ *     summary: Revoke a JWT by its jti claim
+ *     description: |
+ *       Admin-only endpoint to immediately invalidate a JWT before its natural expiry.
+ *       Adds the jti to the Redis-backed revocation list. The stored TTL is
+ *       derived from the token exp claim (`max(0, exp - now)`) so revocation
+ *       covers the full remaining token lifetime without storing past expiry.
+ *     tags:
+ *       - auth
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               jti:
+ *                 type: string
+ *                 description: JWT ID (jti) claim to revoke
+ *               exp:
+ *                 type: integer
+ *                 description: JWT exp claim as a Unix timestamp in seconds
+ *               ttl:
+ *                 type: integer
+ *                 description: Optional caller TTL. It is validated, then bounded by exp.
+ *     responses:
+ *       200:
+ *         description: Token revoked successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 jti:
+ *                   type: string
+ *                 ttl:
+ *                   type: integer
+ *       400:
+ *         description: Invalid input
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden — admin permission required
+ */
+authRouter.post(
+  '/revoke',
+  requirePermission(Permission.ADMIN_PAUSE), // Admin-only: any admin permission suffices
+  asyncHandler(async (req: Request, res: Response) => {
+    const result = RevokeRequestSchema.safeParse(req.body);
+    const requestId = req.id ?? req.correlationId;
+
+    if (!result.success) {
+      throw validationError('Invalid revocation request', result.error.format());
+    }
+
+    const { jti, exp, ttl } = result.data;
+
+    const revocation = await revoke(jti, { exp, ttl });
+
+    const revokedBy = (req.user as { address?: string } | undefined)?.address;
+
+    info('JWT revoked via admin endpoint', {
+      jti,
+      ttlSeconds: revocation.ttlSeconds,
+      revoked: revocation.revoked,
+      revokedBy,
+      requestId,
+    });
+
+    res.json({
+      success: true,
+      jti,
+      revoked: revocation.revoked,
+      ttl: revocation.ttlSeconds,
+    });
+  })
+);

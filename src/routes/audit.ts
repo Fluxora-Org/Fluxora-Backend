@@ -15,10 +15,11 @@
 import { Router } from 'express';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { successResponse } from '../utils/response.js';
+import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 
 export const auditRouter = Router();
 
-auditRouter.get('/', (req, res) => {
+auditRouter.get('/', authenticate, requireAuth, requirePermission(Permission.AUDIT_READ), (req, res) => {
   const requestId = req.id;
   const entries = getAuditEntries();
   res.json(successResponse({ entries, total: entries.length }, requestId));

@@ -23,6 +23,8 @@ import { AsyncLocalStorage } from 'async_hooks';
 import type { Request, Response, NextFunction } from 'express';
 import { getTracer } from './hooks.js';
 import { Span, type SpanContext } from './hooks.js';
+import { trace } from '@opentelemetry/api';
+
 
 /**
  * AsyncLocalStorage for propagating correlationId through async boundaries.
@@ -58,6 +60,61 @@ export interface RequestTraceContext {
  * Usage:
  *   app.use(tracingMiddleware(config));
  */
+/**
+ * Helper to extract stream_id from request headers, body, query, parameters, or path segments.
+ */
+export function extractStreamId(req: Request): string | undefined {
+  const fromHeader = req.headers['x-stream-id'] || req.headers['stream-id'] || req.headers['fluxora-stream-id'];
+  if (fromHeader && typeof fromHeader === 'string') return fromHeader;
+
+  const fromBody = req.body?.stream_id || req.body?.streamId || req.body?.id;
+  if (fromBody && typeof fromBody === 'string') return fromBody;
+
+  const fromQuery = req.query?.stream_id || req.query?.streamId || req.query?.id;
+  if (fromQuery && typeof fromQuery === 'string') return fromQuery;
+
+  const fromParams = req.params?.id || req.params?.streamId;
+  if (fromParams && typeof fromParams === 'string') return fromParams;
+
+  const match = req.path.match(/^\/api\/streams\/([^/]+)/);
+  if (match && match[1] && match[1] !== 'rate-limits' && match[1] !== 'health') {
+    return match[1];
+  }
+  return undefined;
+}
+
+/**
+ * Helper to extract sender_address from request headers, body, or query.
+ */
+export function extractSenderAddress(req: Request): string | undefined {
+  const fromHeader = req.headers['x-sender-address'] || req.headers['sender-address'] || req.headers['x-sender'];
+  if (fromHeader && typeof fromHeader === 'string') return fromHeader;
+
+  const fromBody = req.body?.sender_address || req.body?.senderAddress || req.body?.sender;
+  if (fromBody && typeof fromBody === 'string') return fromBody;
+
+  const fromQuery = req.query?.sender_address || req.query?.senderAddress || req.query?.sender;
+  if (fromQuery && typeof fromQuery === 'string') return fromQuery;
+
+  return undefined;
+}
+
+/**
+ * Helper to extract recipient_address from request headers, body, or query.
+ */
+export function extractRecipientAddress(req: Request): string | undefined {
+  const fromHeader = req.headers['x-recipient-address'] || req.headers['recipient-address'] || req.headers['x-recipient'];
+  if (fromHeader && typeof fromHeader === 'string') return fromHeader;
+
+  const fromBody = req.body?.recipient_address || req.body?.recipientAddress || req.body?.recipient;
+  if (fromBody && typeof fromBody === 'string') return fromBody;
+
+  const fromQuery = req.query?.recipient_address || req.query?.recipientAddress || req.query?.recipient;
+  if (fromQuery && typeof fromQuery === 'string') return fromQuery;
+
+  return undefined;
+}
+
 export function tracingMiddleware(
   config?: { enabled?: boolean; sampleRate?: number },
 ): (req: Request, res: Response, next: NextFunction) => void {
@@ -93,11 +150,38 @@ export function tracingMiddleware(
             'otel.enabled': shouldSample,
           },
         };
+
+        const streamId = extractStreamId(req);
+        const sender = extractSenderAddress(req);
+        const recipient = extractRecipientAddress(req);
+
+        if (streamId !== undefined) {
+          startContext.tags!['fluxora.stream_id'] = streamId;
+        }
+        if (sender !== undefined) {
+          startContext.tags!['fluxora.sender'] = sender;
+        }
+        if (recipient !== undefined) {
+          startContext.tags!['fluxora.recipient'] = recipient;
+        }
+
         const userId = extractUserId(req);
         if (userId !== undefined) {
           startContext.userId = userId;
         }
         const span = tracer.startSpan(startContext);
+
+        // Try to attach attributes to active OTel span immediately if it exists
+        try {
+          const activeSpan = trace.getActiveSpan();
+          if (activeSpan) {
+            if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
+            if (sender) activeSpan.setAttribute('fluxora.sender', sender);
+            if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+          }
+        } catch {
+          // ignore OTel errors
+        }
 
         // Attach span to request locals for access by routes
         if (!res.locals) {
@@ -112,6 +196,28 @@ export function tracingMiddleware(
         // Record response and finalize span
         res.on('finish', () => {
           const durationMs = Date.now() - startTimeMs;
+
+          // Re-extract in case they were added dynamically during request execution
+          const finalStreamId = extractStreamId(req);
+          const finalSender = extractSenderAddress(req);
+          const finalRecipient = extractRecipientAddress(req);
+
+          try {
+            const activeSpan = trace.getActiveSpan();
+            if (activeSpan) {
+              if (finalStreamId) activeSpan.setAttribute('fluxora.stream_id', finalStreamId);
+              if (finalSender) activeSpan.setAttribute('fluxora.sender', finalSender);
+              if (finalRecipient) activeSpan.setAttribute('fluxora.recipient', finalRecipient);
+            }
+          } catch {
+            // ignore
+          }
+
+          if (span.context.tags) {
+            if (finalStreamId) span.context.tags['fluxora.stream_id'] = finalStreamId;
+            if (finalSender) span.context.tags['fluxora.sender'] = finalSender;
+            if (finalRecipient) span.context.tags['fluxora.recipient'] = finalRecipient;
+          }
 
           tracer.recordEvent(span, 'http.response', {
             statusCode: res.statusCode,

@@ -9,13 +9,14 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],
-      exclude: ['src/index.ts', 'src/redis/client.ts'],
+      exclude: ['src/index.ts'],
       thresholds: {
         lines: 80,
         functions: 80,
         branches: 80,
         statements: 80,
       },
+      reporter: ['text', 'lcov'],
     },
   },
 });

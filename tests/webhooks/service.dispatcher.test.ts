@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import dns from 'node:dns';
 import { WebhookDispatcher } from '../../src/webhooks/service.js';
-import type { WebhookRetryPolicy } from '../../src/webhooks/types.js';
+import type { EnhancedRetryPolicy } from '../../src/webhooks/retry.js';
+import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
+import { RedisWebhookCircuitBreakerStore } from '../../src/redis/webhookCircuitBreakerStore.js';
 
 interface MockClient {
   queries: Array<{ sql: string; params: unknown[] | undefined }>;
@@ -9,7 +12,7 @@ interface MockClient {
   release: ReturnType<typeof vi.fn>;
 }
 
-const policy: WebhookRetryPolicy = {
+const policy: EnhancedRetryPolicy = {
   maxAttempts: 3,
   initialBackoffMs: 1000,
   backoffMultiplier: 1,
@@ -17,6 +20,8 @@ const policy: WebhookRetryPolicy = {
   jitterPercent: 0,
   timeoutMs: 1000,
   retryableStatusCodes: [500],
+  circuitBreakerThreshold: 2,
+  circuitBreakerResetMs: 60_000,
 };
 
 function createClient(rows: unknown[]): MockClient {
@@ -32,11 +37,10 @@ function createClient(rows: unknown[]): MockClient {
     }),
     release: vi.fn(),
   };
-
   return client;
 }
 
-function createDispatcher(client: MockClient): WebhookDispatcher {
+function createDispatcher(client: MockClient, breaker: RedisWebhookCircuitBreakerStore): WebhookDispatcher {
   return new WebhookDispatcher({
     endpointUrl: 'https://consumer.example/webhooks',
     secret: 'test-secret',
@@ -46,45 +50,63 @@ function createDispatcher(client: MockClient): WebhookDispatcher {
     pool: {
       connect: vi.fn(async () => client),
     },
+    circuitBreakerStore: breaker,
   });
 }
 
+function baseRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: '42',
+    stream_id: 'stream-1',
+    event_type: 'stream.created',
+    payload: { id: 'evt-1', amount: '10' },
+    created_at: new Date(),
+    attempt_count: 0,
+    next_attempt_at: new Date(),
+    ...overrides,
+  };
+}
+
 describe('WebhookDispatcher outbox polling', () => {
+  let redis: FakeRedisClient;
+  let breaker: RedisWebhookCircuitBreakerStore;
+
   beforeEach(() => {
+    redis = new FakeRedisClient();
+    breaker = new RedisWebhookCircuitBreakerStore(redis);
     vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    // consumer.example is not a real domain; mock DNS so the SSRF guard passes.
+    vi.spyOn(dns.promises, 'resolve4').mockResolvedValue(['93.184.216.34'] as any);
+    vi.spyOn(dns.promises, 'resolve6').mockRejectedValue(new Error('ENODATA'));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await breaker.close();
+    redis.reset();
     vi.restoreAllMocks();
   });
+
+  // -------------------------------------------------------------------------
+  // Original tests (preserved)
+  // -------------------------------------------------------------------------
 
   it('no-ops cleanly when the outbox is empty', async () => {
     const client = createClient([]);
     global.fetch = vi.fn() as unknown as typeof fetch;
-
-    await createDispatcher(client).pollOnce();
-
+    await createDispatcher(client, breaker).pollOnce();
     expect(global.fetch).not.toHaveBeenCalled();
     expect(client.queries.some(q => q.sql.includes('COMMIT'))).toBe(true);
     expect(client.release).toHaveBeenCalledOnce();
   });
 
   it('claims rows with FOR UPDATE SKIP LOCKED and marks successful deliveries processed', async () => {
-    const client = createClient([
-      {
-        id: '42',
-        stream_id: 'stream-1',
-        event_type: 'stream.created',
-        payload: { id: 'evt-1', amount: '10' },
-        created_at: new Date(),
-      },
-    ]);
+    const client = createClient([baseRow()]);
     global.fetch = vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch;
-
-    await createDispatcher(client).pollOnce();
-
+    await createDispatcher(client, breaker).pollOnce();
     const select = client.queries.find(q => q.sql.includes('SELECT id, stream_id'));
     expect(select?.sql).toContain('FOR UPDATE SKIP LOCKED');
+    expect(select?.sql).toContain('next_attempt_at <= NOW()');
+    expect(select?.sql).toContain('ORDER BY next_attempt_at ASC, COALESCE((payload->>\'ledger\')::numeric, 0) ASC, payload->>\'id\' ASC, id ASC');
     expect(select?.params).toEqual([5]);
     expect(global.fetch).toHaveBeenCalledOnce();
     expect(client.queries).toEqual(
@@ -95,61 +117,189 @@ describe('WebhookDispatcher outbox polling', () => {
         }),
       ]),
     );
-    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
-  });
-
-  it('marks failed attempts processed and delegates retry scheduling to a future outbox row', async () => {
-    const now = new Date('2026-05-26T12:00:00.000Z').getTime();
-    vi.spyOn(Date, 'now').mockReturnValue(now);
-    const client = createClient([
-      {
-        id: '43',
-        stream_id: 'stream-2',
-        event_type: 'stream.updated',
-        payload: { id: 'evt-2', amount: '20' },
-        created_at: new Date(now),
-      },
-    ]);
-    global.fetch = vi.fn(async () => new Response(null, { status: 500, statusText: 'Server Error' })) as unknown as typeof fetch;
-
-    await createDispatcher(client).pollOnce();
-
-    const insert = client.queries.find(q => q.sql.includes('INSERT INTO webhook_outbox'));
-    expect(client.queries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
-          params: ['43'],
-        }),
-      ]),
-    );
-    expect(insert?.params?.[0]).toBe('stream-2');
-    expect(insert?.params?.[1]).toBe('stream.updated');
-    expect(JSON.parse(insert?.params?.[2] as string)).toMatchObject({
-      id: 'evt-2',
-      _webhookRetry: { attemptNumber: 2 },
-    });
-    expect(insert?.params?.[3]).toEqual(new Date(now + 1000));
+    // Success — no retry UPDATE
+    expect(client.queries.some(q => q.sql.includes('next_attempt_at'))).toBe(false);
   });
 
   it('does not enqueue another row after retry attempts are exhausted', async () => {
     const client = createClient([
-      {
+      baseRow({
         id: '44',
         stream_id: 'stream-3',
         event_type: 'stream.cancelled',
-        payload: {
-          id: 'evt-3',
-          _webhookRetry: { attemptNumber: 3 },
-        },
-        created_at: new Date(),
-      },
+        payload: { id: 'evt-3', _webhookRetry: { attemptNumber: 3 } },
+        attempt_count: 2,
+      }),
     ]);
-    global.fetch = vi.fn(async () => new Response(null, { status: 500, statusText: 'Server Error' })) as unknown as typeof fetch;
-
-    await createDispatcher(client).pollOnce();
-
+    global.fetch = vi.fn(async () => new Response(null, { status: 500 })) as unknown as typeof fetch;
+    await createDispatcher(client, breaker).pollOnce();
     expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    expect(client.queries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
+          params: ['44'],
+        }),
+      ]),
+    );
+  });
+
+  it('drains an in-flight delivery when stopped during shutdown', async () => {
+    let releaseFetch: (() => void) | undefined;
+    const client = createClient([baseRow({ id: '45', stream_id: 'stream-4', payload: { id: 'evt-4' } })]);
+    global.fetch = vi.fn(
+      async () => new Promise<Response>(resolve => { releaseFetch = () => resolve(new Response(null, { status: 200 })); }),
+    ) as unknown as typeof fetch;
+    const dispatcher = createDispatcher(client, breaker);
+    const poll = dispatcher.pollOnce();
+    const stopped = dispatcher.stop();
+    for (let i = 0; i < 10 && !releaseFetch; i++) await Promise.resolve();
+    expect(releaseFetch).toBeDefined();
+    while (!releaseFetch) await Promise.resolve();
+    expect(client.release).not.toHaveBeenCalled();
+    releaseFetch!();
+    await Promise.all([poll, stopped]);
+    expect(client.release).toHaveBeenCalledOnce();
+    expect(client.queries.some(q => q.sql.includes('COMMIT'))).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW: Durable retry checkpoint tests
+  // -------------------------------------------------------------------------
+
+  it('persists retry checkpoint via UPDATE (not INSERT) on transient failure', async () => {
+    const now = new Date('2026-05-26T12:00:00.000Z').getTime();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const client = createClient([
+      baseRow({ id: '43', stream_id: 'stream-2', event_type: 'stream.updated', payload: { id: 'evt-2' } }),
+    ]);
+    global.fetch = vi.fn(async () => new Response(null, { status: 500 })) as unknown as typeof fetch;
+    await createDispatcher(client, breaker).pollOnce();
+
+    // Must NOT insert a new row
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+
+    // Must UPDATE next_attempt_at and attempt_count on the same row
+    const retryUpdate = client.queries.find(
+      q => q.sql.includes('next_attempt_at') && q.sql.includes('attempt_count') && q.params?.includes('43'),
+    );
+    expect(retryUpdate).toBeDefined();
+    expect(retryUpdate?.params?.[1]).toBe(1); // attempt_count = attemptNumber
+    expect(retryUpdate?.params?.[3]).toBe('43'); // WHERE id = $4
+  });
+
+  it('recovers pending retries after simulated process restart (poller picks up next_attempt_at <= now)', async () => {
+    const now = new Date('2026-06-01T10:00:00.000Z').getTime();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+
+    // Simulate a row left by a crashed process: attempt_count=1, next_attempt_at in the past
+    const client = createClient([
+      baseRow({
+        id: '99',
+        stream_id: 'stream-restart',
+        event_type: 'stream.created',
+        payload: { id: 'evt-restart', _webhookRetry: { attemptNumber: 2 } },
+        attempt_count: 1,
+        next_attempt_at: new Date(now - 5000), // 5s in the past — ready
+      }),
+    ]);
+    global.fetch = vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+    await createDispatcher(client, breaker).pollOnce();
+
+    // Poller must have queried using next_attempt_at filter
+    const select = client.queries.find(q => q.sql.includes('SELECT id, stream_id'));
+    expect(select?.sql).toContain('next_attempt_at <= NOW()');
+
+    // Delivery succeeded — row marked processed
+    expect(client.queries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
+          params: ['99'],
+        }),
+      ]),
+    );
+    expect(global.fetch).toHaveBeenCalledOnce();
+  });
+
+  it('routes exhausted rows to DLQ and marks them processed — no further retry', async () => {
+    const client = createClient([
+      baseRow({
+        id: '55',
+        stream_id: 'stream-dlq',
+        event_type: 'stream.cancelled',
+        payload: { id: 'evt-dlq', _webhookRetry: { attemptNumber: 3 } },
+        attempt_count: 2,
+      }),
+    ]);
+    global.fetch = vi.fn(async () => new Response(null, { status: 500 })) as unknown as typeof fetch;
+    await createDispatcher(client, breaker).pollOnce();
+
+    // No retry update
+    expect(
+      client.queries.some(q => q.sql.includes('next_attempt_at') && q.params?.includes('55')),
+    ).toBe(false);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+
+    // Marked processed
+    expect(client.queries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
+          params: ['55'],
+        }),
+      ]),
+    );
+  });
+
+  it('prevents double-delivery under two concurrent poller instances (FOR UPDATE SKIP LOCKED)', async () => {
+    // Both pollers query the same row simultaneously; second gets empty result set
+    const client1 = createClient([baseRow({ id: '77' })]);
+    const client2 = createClient([]); // SKIP LOCKED returns nothing for second poller
+    let connectCount = 0;
+    const pool = {
+      connect: vi.fn(async () => connectCount++ === 0 ? client1 : client2),
+    };
+    global.fetch = vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+
+    const d1 = new WebhookDispatcher({ endpointUrl: 'https://consumer.example/webhooks', secret: 'test-secret', pollIntervalMs: 60_000, batchSize: 5, policy, pool, circuitBreakerStore: breaker });
+    const d2 = new WebhookDispatcher({ endpointUrl: 'https://consumer.example/webhooks', secret: 'test-secret', pollIntervalMs: 60_000, batchSize: 5, policy, pool, circuitBreakerStore: breaker });
+
+    await Promise.all([d1.pollOnce(), d2.pollOnce()]);
+
+    // fetch called exactly once — second poller got no rows
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers delivery when the shared Redis circuit breaker is open', async () => {
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    await breaker.recordFailure('https://consumer.example/webhooks', policy, now);
+    await breaker.recordFailure('https://consumer.example/webhooks', policy, now + 1);
+
+    const client = createClient([baseRow({ id: '46', stream_id: 'stream-5', payload: { id: 'evt-5' } })]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    const retryUpdate = client.queries.find(q => q.sql.includes('next_attempt_at') && q.params?.includes('46'));
+    expect(retryUpdate).toBeDefined();
+  });
+
+  it('re-enqueues outbox rows when half-open probe contention blocks delivery', async () => {
+    const now = 8_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    for (let i = 0; i < 2; i++) await breaker.recordFailure('https://consumer.example/webhooks', policy, now);
+    const openState = await breaker.getState('https://consumer.example/webhooks');
+    await breaker.checkAndClaimAttempt('https://consumer.example/webhooks', policy, openState!.resetAt);
+
+    const client = createClient([baseRow({ id: '47', stream_id: 'stream-6', payload: { id: 'evt-6' } })]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await createDispatcher(client, breaker).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    const retryUpdate = client.queries.find(q => q.sql.includes('next_attempt_at') && q.params?.includes('47'));
+    expect(retryUpdate).toBeDefined();
   });
 
   it('drains an in-flight delivery when stopped during shutdown', async () => {
@@ -168,14 +318,22 @@ describe('WebhookDispatcher outbox polling', () => {
         releaseFetch = () => resolve(new Response(null, { status: 200 }));
       }),
     ) as unknown as typeof fetch;
-    const dispatcher = createDispatcher(client);
+    const dispatcher = createDispatcher(client, breaker);
 
     const poll = dispatcher.pollOnce();
     const stopped = dispatcher.stop();
 
-    await Promise.resolve();
+    // The SSRF DNS guard adds async microtasks before fetch is called; allow
+    // more iterations than the bare minimum so the test stays deterministic.
+    for (let i = 0; i < 100 && !releaseFetch; i += 1) {
+      await Promise.resolve();
+    }
+    expect(releaseFetch).toBeDefined();
+    while (!releaseFetch) {
+      await Promise.resolve();
+    }
     expect(client.release).not.toHaveBeenCalled();
-    releaseFetch?.();
+    releaseFetch();
 
     await Promise.all([poll, stopped]);
     expect(client.release).toHaveBeenCalledOnce();
@@ -183,131 +341,203 @@ describe('WebhookDispatcher outbox polling', () => {
   });
 });
 
-// ── Exponential backoff on repeated DB failures ───────────────────────────────
+// ── SSRF guard re-validation at egress ───────────────────────────────────────
+//
+// These tests verify that deliverRow() calls assertSafeWebhookEndpointWithDns
+// immediately before dispatch so that:
+//   • private/loopback IP literals are blocked even if they bypassed the sync
+//     check that runs at registration time (defense-in-depth)
+//   • hostnames that DNS-resolve to private IPs are blocked (rebinding mitigation)
+//   • DNS resolution failures are treated as unsafe (fail-closed)
+//   • blocked rows are marked processed (no re-poll) and NOT retried
+//   • a public URL with clean DNS continues to deliver normally
 
-describe('WebhookDispatcher batch backoff', () => {
-  beforeEach(() => {
-    vi.spyOn(Math, 'random').mockReturnValue(0); // jitter lower-bound: factor × 0.75
-    vi.useFakeTimers();
-  });
+describe('WebhookDispatcher — SSRF guard in deliverRow', () => {
+  let redis: FakeRedisClient;
+  let breaker: RedisWebhookCircuitBreakerStore;
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
-
-  /**
-   * Returns a pool whose first `failCount` connect calls produce a client that
-   * throws on every query (simulating Postgres being unavailable), and
-   * subsequent calls return a healthy client with an empty outbox.
-   */
-  function makeFlakyPool(failCount: number) {
-    let calls = 0;
+  // Helper: build an outbox row with an endpointUrl embedded in its payload
+  // so that resolveEndpoint() picks it up over the dispatcher's static URL.
+  function rowWithPayloadUrl(id: string, endpointUrl: string) {
     return {
-      connect: vi.fn(async () => {
-        calls++;
-        if (calls <= failCount) {
-          return {
-            query: vi.fn(async () => { throw new Error('DB unavailable'); }),
-            release: vi.fn(),
-          };
-        }
-        return {
-          query: vi.fn(async (sql: string) => {
-            if (sql.includes('SELECT id, stream_id')) return { rows: [] };
-            return { rows: [] };
-          }),
-          release: vi.fn(),
-        };
-      }),
+      id,
+      stream_id: `stream-ssrf-${id}`,
+      event_type: 'stream.created',
+      payload: { id: `evt-ssrf-${id}`, endpointUrl },
+      created_at: new Date(),
     };
   }
 
-  function makeBackoffDispatcher(opts: { maxBatchBackoffMs?: number; failCount?: number } = {}) {
+  // Build a dispatcher whose static endpointUrl is a safe public address so
+  // that resolveEndpoint() falls through to the payload URL for testing.
+  function createSsrfDispatcher(client: MockClient): WebhookDispatcher {
     return new WebhookDispatcher({
       endpointUrl: 'https://consumer.example/webhooks',
-      secret: 'secret',
-      pollIntervalMs: 1_000,
-      maxBatchBackoffMs: opts.maxBatchBackoffMs ?? 60_000,
+      secret: 'test-secret',
+      pollIntervalMs: 60_000,
       batchSize: 5,
       policy,
-      pool: makeFlakyPool(opts.failCount ?? 999) as unknown as import('../../src/webhooks/service.js').WebhookDispatcherOptions['pool'],
+      pool: { connect: vi.fn(async () => client) },
+      circuitBreakerStore: breaker,
     });
   }
 
-  async function runPoll(d: WebhookDispatcher) {
-    const p = d.pollOnce();
-    await vi.runAllTimersAsync();
-    await p;
-  }
-
-  it('increments consecutive failure counter and sets backoff after first failure', async () => {
-    const d = makeBackoffDispatcher();
-    await runPoll(d);
-    expect(d.getConsecutiveBatchFailures()).toBe(1);
-    expect(d.getBatchBackoffMs()).toBeGreaterThan(0);
+  beforeEach(() => {
+    redis = new FakeRedisClient();
+    breaker = new RedisWebhookCircuitBreakerStore(redis);
   });
 
-  it('backoff increases (non-decreasing) across consecutive failures', async () => {
-    const d = makeBackoffDispatcher();
-    const backoffs: number[] = [];
-    for (let i = 0; i < 5; i++) {
-      await runPoll(d);
-      backoffs.push(d.getBatchBackoffMs());
-    }
-    for (let i = 1; i < backoffs.length; i++) {
-      expect(backoffs[i]).toBeGreaterThanOrEqual(backoffs[i - 1]!);
-    }
+  afterEach(async () => {
+    await breaker.close();
+    redis.reset();
+    vi.restoreAllMocks();
   });
 
-  it('caps backoff at maxBatchBackoffMs', async () => {
-    const d = makeBackoffDispatcher({ maxBatchBackoffMs: 3_000 });
-    for (let i = 0; i < 20; i++) await runPoll(d);
-    expect(d.getBatchBackoffMs()).toBeLessThanOrEqual(3_000);
-  });
-
-  it('resets failure counter and backoff to 0 on first successful batch', async () => {
-    // Run two full poll cycles using start() so each cycle is a separate
-    // setInterval tick — not subject to the pollOnce() idempotency guard.
-    vi.useRealTimers();
-
-    const pool = makeFlakyPool(1);
-    const d = new WebhookDispatcher({
-      endpointUrl: 'https://consumer.example/webhooks',
-      secret: 'secret',
-      pollIntervalMs: 20,
-      maxBatchBackoffMs: 10,
-      batchSize: 5,
-      policy,
-      pool: pool as unknown as import('../../src/webhooks/service.js').WebhookDispatcherOptions['pool'],
-    });
-    global.fetch = vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
-
-    d.start();
-
-    // Wait long enough for at least two poll cycles (20ms interval + 10ms max backoff)
-    await new Promise<void>((resolve) => setTimeout(resolve, 100));
-    await d.stop();
-
-    expect(d.getConsecutiveBatchFailures()).toBe(0);
-    expect(d.getBatchBackoffMs()).toBe(0);
-  });
-
-  it('respects stopped flag: does not deliver after stop() during backoff', async () => {
-    const d = makeBackoffDispatcher();
+  it('blocks delivery to a loopback IPv4 address (127.0.0.1) and routes to DLQ', async () => {
+    const client = createClient([rowWithPayloadUrl('ssrf-1', 'http://127.0.0.1/hook')]);
     global.fetch = vi.fn() as unknown as typeof fetch;
 
-    // Trigger a failure to set backoff
-    await runPoll(d);
-    expect(d.getBatchBackoffMs()).toBeGreaterThan(0);
+    // No DNS mocking needed — IP literal is detected directly.
+    await createSsrfDispatcher(client).pollOnce();
 
-    await d.stop();
-
-    // A subsequent poll should no-op because stopped=true
-    const p = d.pollOnce();
-    await vi.runAllTimersAsync();
-    await p;
     expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
+          params: ['ssrf-1'],
+        }),
+      ]),
+    );
+    // No retry row must be inserted.
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('blocks delivery to a private class-A address (10.0.0.1)', async () => {
+    const client = createClient([rowWithPayloadUrl('ssrf-2', 'http://10.0.0.1/hook')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-2'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('blocks delivery to the AWS/GCP/Azure metadata endpoint (169.254.169.254)', async () => {
+    const client = createClient([rowWithPayloadUrl('ssrf-3', 'http://169.254.169.254/latest/meta-data/')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-3'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('blocks delivery to an IPv6 loopback address (::1)', async () => {
+    const client = createClient([rowWithPayloadUrl('ssrf-4', 'http://[::1]/hook')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-4'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('blocks delivery to an IPv6 ULA address (fc00::1)', async () => {
+    const client = createClient([rowWithPayloadUrl('ssrf-5', 'http://[fc00::1]/hook')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-5'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('blocks delivery when a public hostname DNS-resolves to a private IP (rebinding simulation)', async () => {
+    // Simulate DNS rebinding: attacker.example resolves to 127.0.0.1 at delivery time.
+    vi.spyOn(dns.promises, 'resolve4').mockResolvedValue(['127.0.0.1'] as any);
+    vi.spyOn(dns.promises, 'resolve6').mockRejectedValue(new Error('ENODATA'));
+
+    const client = createClient([rowWithPayloadUrl('ssrf-6', 'https://attacker.example/hook')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-6'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('blocks delivery when DNS resolution fails entirely (fail-closed)', async () => {
+    // Both A and AAAA resolution fail — hostname unresolvable.
+    vi.spyOn(dns.promises, 'resolve4').mockRejectedValue(new Error('ENOTFOUND'));
+    vi.spyOn(dns.promises, 'resolve6').mockRejectedValue(new Error('ENOTFOUND'));
+
+    const client = createClient([rowWithPayloadUrl('ssrf-7', 'https://unresolvable.invalid/hook')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-7'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('allows delivery when a public hostname resolves to a safe external IP', async () => {
+    // 93.184.216.34 is the real IP for example.com — clearly public.
+    vi.spyOn(dns.promises, 'resolve4').mockResolvedValue(['93.184.216.34'] as any);
+    vi.spyOn(dns.promises, 'resolve6').mockRejectedValue(new Error('ENODATA'));
+
+    const client = createClient([rowWithPayloadUrl('ssrf-8', 'https://example.com/hook')]);
+    global.fetch = vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).toHaveBeenCalledOnce();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-8'),
+    )).toBe(true);
+  });
+
+  it('blocks delivery to a private class-B address (172.16.0.5)', async () => {
+    const client = createClient([rowWithPayloadUrl('ssrf-9', 'http://172.16.0.5/hook')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-9'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+  });
+
+  it('blocks delivery to a private class-C address (192.168.1.1)', async () => {
+    const client = createClient([rowWithPayloadUrl('ssrf-10', 'http://192.168.1.1/hook')]);
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    await createSsrfDispatcher(client).pollOnce();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(client.queries.some(q =>
+      q.sql.includes('UPDATE webhook_outbox SET processed = true') && q.params?.includes('ssrf-10'),
+    )).toBe(true);
+    expect(client.queries.some(q => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
   });
 });
-

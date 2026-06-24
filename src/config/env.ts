@@ -1,6 +1,19 @@
 import { z } from 'zod';
 import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
+import {
+  getPinnedAddressNetwork,
+  isValidStellarContractAddress,
+  STELLAR_CONTRACT_ALLOWLIST,
+  STELLAR_NETWORK_PASSPHRASES,
+  type PinnedStellarAddressKind,
+  type PinnedStellarNetwork,
+} from './stellarContracts.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
+export {
+  STELLAR_CONTRACT_ALLOWLIST,
+  STELLAR_NETWORK_PASSPHRASES,
+  isValidStellarContractAddress,
+} from './stellarContracts.js';
 
 type NodeEnv = 'development' | 'staging' | 'production' | 'test';
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -14,6 +27,7 @@ const SECRET_ENV_NAMES = new Set([
   'ADMIN_API_TOKEN',
   'ADMIN_API_KEY',
   'API_KEYS',
+  'API_KEY_PEPPER',
   'FLUXORA_WEBHOOK_SECRET',
   'FLUXORA_WEBHOOK_SECRET_PREVIOUS',
 ]);
@@ -112,20 +126,68 @@ function optionalString(name: string) {
   );
 }
 
+function requiredStellarContractAddress(name: string) {
+  return z
+    .string()
+    .trim()
+    .min(1, `${name} is required`)
+    .regex(/^C[A-Z2-7]{55}$/, `${name} must be a Stellar contract StrKey beginning with C`)
+    .refine(isValidStellarContractAddress, `${name} must be a valid Stellar contract StrKey`);
+}
+
+function resolvedStellarNetwork(env: { NODE_ENV: NodeEnv; STELLAR_NETWORK?: PinnedStellarNetwork }): PinnedStellarNetwork {
+  return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
+}
+
+function validatePinnedAddress(
+  ctx: z.RefinementCtx,
+  network: PinnedStellarNetwork,
+  kind: PinnedStellarAddressKind,
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  address: string,
+): void {
+  const pinnedNetwork = getPinnedAddressNetwork(kind, address);
+
+  if (pinnedNetwork === network) return;
+
+  ctx.addIssue({
+    code: 'custom',
+    path: [path],
+    message:
+      pinnedNetwork === null
+        ? `${path} is not in the known-good ${network} ${kind} address allowlist`
+        : `${path} is pinned for ${pinnedNetwork} but STELLAR_NETWORK resolves to ${network}`,
+  });
+}
+
 export const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'staging', 'production', 'test']).default('development'),
   PORT: integerEnv('PORT', 1, 65535).default(3000),
 
   DATABASE_URL: urlString('DATABASE_URL'),
+  DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
   DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
   DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
   DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
   DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
+  SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
+  STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+  /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. */
+  REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
+  REDIS_MODE: z.enum(['standalone', 'sentinel', 'cluster']).default('standalone'),
+  // Comma-separated list of sentinel nodes: host:port,host:port
+  REDIS_SENTINEL_HOSTS: optionalString('REDIS_SENTINEL_HOSTS'),
+  // Sentinel master name (required when REDIS_MODE=sentinel)
+  REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
+  // Comma-separated list of cluster nodes: host:port,host:port
+  REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
 
   STELLAR_NETWORK: z.enum(['testnet', 'mainnet']).optional(),
+  STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
+  STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
   HORIZON_URL: optionalUrlString('HORIZON_URL'),
   HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
   CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
@@ -135,8 +197,26 @@ export const EnvSchema = z.object({
   STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
 
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+  PGCRYPTO_KEY: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional(),
+  ),
+  PGCRYPTO_KEY_PREVIOUS: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY_PREVIOUS must be at least 32 characters').optional(),
+  ),
   JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
   API_KEYS: z.string().optional(),
+  /**
+   * Server-side pepper mixed into every API-key hash. Keeping it out of the
+   * database means a leaked `api_keys` table cannot be brute-forced offline.
+   * Optional so non-API-key deployments still boot; required at runtime by the
+   * hashing helpers, which fail closed when it is absent.
+   */
+  API_KEY_PEPPER: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional(),
+  ),
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
   ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
@@ -166,9 +246,9 @@ export const EnvSchema = z.object({
   FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
   WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
   WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
-  WEBHOOK_BATCH_MAX_BACKOFF_MS: integerEnv('WEBHOOK_BATCH_MAX_BACKOFF_MS', 1000).default(60000),
-
-  REPLICA_LAG_THRESHOLD_MS: integerEnv('REPLICA_LAG_THRESHOLD_MS', 0).default(5000),
+  WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
+  WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv('WEBHOOK_CIRCUIT_BREAKER_THRESHOLD', 0, 1000).default(0),
+  WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(300_000),
 
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
   ENABLE_RATE_LIMIT: booleanEnv().optional(),
@@ -177,6 +257,14 @@ export const EnvSchema = z.object({
   REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
   ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
   WS_AUTH_REQUIRED: booleanEnv().default(false),
+  SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+  SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
+  SSE_MAX_CONNECTION_DURATION_MS: integerEnv('SSE_MAX_CONNECTION_DURATION_MS', 1, 86_400_000).default(30 * 60 * 1000),
+  SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
+  /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
+  SSE_RETRY_MS: integerEnv('SSE_RETRY_MS', 100, 300_000).default(5000),
+  /** Interval in milliseconds between SSE heartbeat comments per connection. */
+  SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
   INDEXER_ENABLED: booleanEnv().default(false),
   WORKER_ENABLED: booleanEnv().default(false),
   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
@@ -187,6 +275,8 @@ export const EnvSchema = z.object({
   RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
   RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
   RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+  IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
+
   RATE_LIMIT_ENABLED: booleanEnv().default(true),
   RATE_LIMIT_IP_WINDOW_MS: integerEnv('RATE_LIMIT_IP_WINDOW_MS', 1).optional(),
   RATE_LIMIT_IP_MAX: integerEnv('RATE_LIMIT_IP_MAX', 1).optional(),
@@ -198,8 +288,27 @@ export const EnvSchema = z.object({
   RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
   AWS_REGION: optionalString('AWS_REGION'),
   AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
+
+  // S3 Backup Retention Configuration
+  S3_BACKUP_BUCKET: optionalString('S3_BACKUP_BUCKET'),
+  S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
+
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
-}).passthrough();
+}).passthrough().superRefine((env, ctx) => {
+  const stellarNetwork = resolvedStellarNetwork(env);
+  const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
+
+  if (env.HORIZON_NETWORK_PASSPHRASE !== undefined && env.HORIZON_NETWORK_PASSPHRASE !== expectedPassphrase) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['HORIZON_NETWORK_PASSPHRASE'],
+      message: `HORIZON_NETWORK_PASSPHRASE must match ${stellarNetwork} passphrase`,
+    });
+  }
+
+  validatePinnedAddress(ctx, stellarNetwork, 'contract', 'STELLAR_CONTRACT_ADDRESS', env.STELLAR_CONTRACT_ADDRESS);
+  validatePinnedAddress(ctx, stellarNetwork, 'token', 'STELLAR_TOKEN_ADDRESS', env.STELLAR_TOKEN_ADDRESS);
+});
 
 type ParsedEnv = z.infer<typeof EnvSchema>;
 
@@ -212,13 +321,24 @@ export interface Config {
   apiVersion: string;
 
   databaseUrl: string;
+  /** Optional read-replica connection string. When set, SELECT queries on
+   *  streams are routed through a dedicated replica pool. */
+  databaseReplicaUrl?: string | undefined;
   databasePoolMin: number;
   databasePoolMax: number;
   databaseConnectionTimeout: number;
   databaseIdleTimeout: number;
+  slowQueryThresholdMs: number;
+  statementTimeoutMs: number;
+  /** statement_timeout for replica connections (ms). Defaults to statementTimeoutMs. */
+  replicaStatementTimeoutMs: number;
 
   redisUrl: string;
   redisEnabled: boolean;
+  redisMode: 'standalone' | 'sentinel' | 'cluster';
+  redisSentinelHosts?: string | undefined;
+  redisSentinelName?: string | undefined;
+  redisClusterNodes?: string | undefined;
 
   stellarNetwork: StellarNetwork;
   horizonUrl: string;
@@ -226,8 +346,12 @@ export interface Config {
   contractAddresses: ContractAddresses;
 
   jwtSecret: string;
+  pgcryptoKey?: string | undefined;
+  pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
+  /** Server-side pepper for API-key hashing. Never logged. */
+  apiKeyPepper?: string | undefined;
   indexerWorkerToken: string;
 
   maxRequestSizeBytes: number;
@@ -247,20 +371,32 @@ export interface Config {
   webhookSecretPrevious?: string | undefined;
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
-  webhookBatchMaxBackoffMs: number;
-  replicaLagThresholdMs: number;
+  webhookRetryRps: number;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
+  idempotencyTtlSeconds: number;
   requirePartnerAuth: boolean;
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  sseMaxConnectionsPerIp: number;
+  sseMaxGlobalConnections: number;
+  sseMaxConnectionDurationMs: number;
+  sseRetryAfterSeconds: number;
+  /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
+  sseRetryMs: number;
+  /** Interval in milliseconds between per-connection SSE heartbeat comments. */
+  sseHeartbeatIntervalMs: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
+
+  // S3 Backup Retention
+  s3BackupBucket?: string | undefined;
+  s3BackupPrefix?: string | undefined;
 }
 
 export class ConfigError extends Error {
@@ -310,20 +446,19 @@ function parseEnv(env: NodeJS.ProcessEnv): ParsedEnv {
 }
 
 function resolveNetwork(env: ParsedEnv): StellarNetwork {
-  return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
+  return resolvedStellarNetwork(env);
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
-  const defaults = STELLAR_NETWORKS[network];
-  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? defaults.streamingContractAddress;
-
-  if (env.NODE_ENV === 'production' && streaming.includes('PLACEHOLDER')) {
-    throw new EnvironmentError([
-      'CONTRACT_ADDRESS_STREAMING: must be set to a real contract address in production',
-    ]);
+  if (network !== 'testnet' && network !== 'mainnet') {
+    throw new EnvironmentError(`STELLAR_NETWORK: ${network} is not supported for pinned contract configuration`);
   }
 
-  return { streaming };
+  return {
+    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    contract: env.STELLAR_CONTRACT_ADDRESS,
+    token: env.STELLAR_TOKEN_ADDRESS,
+  };
 }
 
 function toConfig(env: ParsedEnv): Config {
@@ -337,13 +472,21 @@ function toConfig(env: ParsedEnv): Config {
     apiVersion: '0.1.0',
 
     databaseUrl: env.DATABASE_URL,
+    databaseReplicaUrl: env.DATABASE_REPLICA_URL,
     databasePoolMin: env.DB_POOL_MIN,
     databasePoolMax: env.DB_POOL_MAX,
     databaseConnectionTimeout: env.DB_CONNECTION_TIMEOUT,
     databaseIdleTimeout: env.DB_IDLE_TIMEOUT,
+    slowQueryThresholdMs: env.SLOW_QUERY_THRESHOLD_MS,
+    statementTimeoutMs: env.STATEMENT_TIMEOUT_MS,
+    replicaStatementTimeoutMs: env.REPLICA_STATEMENT_TIMEOUT_MS ?? env.STATEMENT_TIMEOUT_MS,
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
+    redisMode: env.REDIS_MODE,
+    redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
+    redisSentinelName: env.REDIS_SENTINEL_NAME,
+    redisClusterNodes: env.REDIS_CLUSTER_NODES,
 
     stellarNetwork,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
@@ -351,11 +494,14 @@ function toConfig(env: ParsedEnv): Config {
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
 
     jwtSecret: env.JWT_SECRET,
+    pgcryptoKey: env.PGCRYPTO_KEY,
+    pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
     jwtExpiresIn: env.JWT_EXPIRES_IN,
     apiKeys: (env.API_KEYS ?? (env.NODE_ENV === 'test' ? 'test-api-key' : ''))
       .split(',')
       .map((key) => key.trim())
       .filter((key) => key.length > 0),
+    apiKeyPepper: env.API_KEY_PEPPER,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
 
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
@@ -375,20 +521,29 @@ function toConfig(env: ParsedEnv): Config {
     webhookSecretPrevious: env.WEBHOOK_SECRET_PREVIOUS,
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
-    webhookBatchMaxBackoffMs: env.WEBHOOK_BATCH_MAX_BACKOFF_MS,
-    replicaLagThresholdMs: env.REPLICA_LAG_THRESHOLD_MS,
+    webhookRetryRps: env.WEBHOOK_RETRY_RPS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
+    idempotencyTtlSeconds: env.IDEMPOTENCY_TTL_SECONDS,
     requirePartnerAuth: env.REQUIRE_PARTNER_AUTH,
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
+    sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
+    sseMaxConnectionDurationMs: env.SSE_MAX_CONNECTION_DURATION_MS,
+    sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
+    sseRetryMs: env.SSE_RETRY_MS,
+    sseHeartbeatIntervalMs: env.SSE_HEARTBEAT_INTERVAL_MS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
+
+    s3BackupBucket: env.S3_BACKUP_BUCKET,
+    s3BackupPrefix: env.S3_BACKUP_PREFIX,
   };
 }
 

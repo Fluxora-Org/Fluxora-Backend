@@ -1,184 +1,207 @@
 /**
- * Replica pool with replication-lag health checking and automatic failover.
+ * Read-replica PostgreSQL connection pool for Fluxora Backend.
  *
- * Reads are routed to the replica when it is healthy (lag ≤ threshold).
- * When lag exceeds `REPLICA_LAG_THRESHOLD_MS`, reads fall back to the primary
- * and the replica is re-evaluated on the next health check.
+ * Provides a lazily-initialised pg.Pool that connects to a read-replica
+ * database when `DATABASE_REPLICA_URL` is set. If the env var is missing
+ * or the replica fails its initial health-check, all read queries
+ * transparently fall back to the primary pool.
  *
- * The failover is fully reversible: once the replica catches up the router
- * returns reads to it without any manual intervention.
+ * Usage:
+ *   import { getReadPool } from '../db/replicaPool.js';
+ *   const pool = await getReadPool();
+ *   const result = await query(pool, 'SELECT …');
  *
- * @module replicaPool
+ * Security notes:
+ *   - The replica pool is configured with `default_transaction_read_only = on`
+ *     at the session level to prevent accidental writes.
+ *   - Connection strings are never logged; only the hostname is included
+ *     in diagnostic messages.
+ *
+ * @module db/replicaPool
  */
 
-import type pg from 'pg';
+import pg from 'pg';
 import { logger } from '../lib/logger.js';
-import { replicaLagMs, replicaFailoversTotal } from '../metrics/businessMetrics.js';
+import { getPool, createPool, resolvePoolConfig } from './pool.js';
+import type { PoolConfig } from './pool.js';
 
-export interface ReplicaPoolOptions {
-  /** Read-replica pg.Pool instance (may be null when no replica is configured). */
-  replicaPool: pg.Pool | null;
-  /** Primary pg.Pool instance used for writes and as a read fallback. */
-  primaryPool: pg.Pool;
-  /** Lag threshold in milliseconds; reads fall over to primary above this value. */
-  lagThresholdMs: number;
-}
+const { Pool } = pg;
 
-export interface ReplicaHealthResult {
-  /** Whether the replica is healthy and lag is below threshold. */
-  healthy: boolean;
-  /** Replication lag in milliseconds, or -1 when the probe could not complete. */
-  lagMs: number;
-  /** Human-readable reason when healthy is false. */
-  reason?: string;
-}
+// ── Internal state ────────────────────────────────────────────────────────────
+
+let _replicaPool: pg.Pool | null = null;
+let _replicaHealthy = false;
+let _healthCheckDone = false;
 
 /**
- * Probe the replica's replication lag and return a health verdict.
- *
- * Runs two lightweight queries:
- *   1. `pg_last_xact_replay_timestamp()` — time of the last replayed WAL record.
- *   2. `NOW()` — current time on the replica (avoids clock-skew from the app server).
- *
- * The difference is the replication lag.  If either query throws, or the
- * replica has never replayed any WAL (cold standby), the probe returns
- * `healthy: false` without throwing so callers can fall back gracefully.
- *
- * @param replica - A connected pg.PoolClient obtained from the replica pool.
- * @param lagThresholdMs - Maximum acceptable lag in milliseconds.
+ * Extract hostname from a connection string for safe logging.
+ * Never log the full URL — it may contain credentials.
  */
-export async function checkReplicaHealth(
-  replica: pg.PoolClient,
-  lagThresholdMs: number,
-): Promise<ReplicaHealthResult> {
+function safeHostname(connectionString: string): string {
   try {
-    const result = await replica.query<{ lag_ms: string | null }>(
-      `SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp())) * 1000 AS lag_ms`,
-    );
-
-    const raw = result.rows[0]?.lag_ms;
-
-    // NULL means the replica has never replayed any WAL — treat as unavailable.
-    if (raw === null || raw === undefined) {
-      replicaLagMs.set(-1);
-      return { healthy: false, lagMs: -1, reason: 'replica has not yet replayed any WAL' };
-    }
-
-    const lag = Math.round(Number(raw));
-    replicaLagMs.set(lag);
-
-    if (lag > lagThresholdMs) {
-      return {
-        healthy: false,
-        lagMs: lag,
-        reason: `replication lag ${lag}ms exceeds threshold ${lagThresholdMs}ms`,
-      };
-    }
-
-    return { healthy: true, lagMs: lag };
-  } catch (err) {
-    replicaLagMs.set(-1);
-    return {
-      healthy: false,
-      lagMs: -1,
-      reason: `lag probe failed: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    const url = new URL(connectionString);
+    return url.hostname || 'unknown';
+  } catch {
+    return 'unknown';
   }
 }
 
+// ── Pool creation ─────────────────────────────────────────────────────────────
+
 /**
- * A pool router that transparently falls over stale replica reads to the primary.
- *
- * ### Usage
- * ```ts
- * const router = new ReplicaRouter({
- *   primaryPool,
- *   replicaPool,
- *   lagThresholdMs: config.replicaLagThresholdMs,
- * });
- *
- * // Returns replica pool when healthy, primary pool otherwise.
- * const pool = await router.getReadPool();
- * ```
+ * Build a PoolConfig for the read replica.
+ * Inherits pool size / timeout settings from the primary config but uses
+ * DATABASE_REPLICA_URL as the connection string.
  */
-export class ReplicaRouter {
-  private readonly primary: pg.Pool;
-  private readonly replica: pg.Pool | null;
-  private readonly lagThresholdMs: number;
-  /** true while replica lag is below threshold */
-  private replicaHealthy = true;
-
-  constructor(options: ReplicaPoolOptions) {
-    this.primary = options.primaryPool;
-    this.replica = options.replicaPool;
-    this.lagThresholdMs = options.lagThresholdMs;
+export function resolveReplicaPoolConfig(): PoolConfig | null {
+  const replicaUrl = process.env['DATABASE_REPLICA_URL'];
+  if (!replicaUrl) {
+    return null;
   }
 
-  /**
-   * Return the pool that should serve the next read query.
-   *
-   * Acquires a temporary client from the replica to run the lag probe, then
-   * releases it immediately so it does not consume a long-lived connection.
-   * Falls back to the primary when:
-   *  - no replica is configured, or
-   *  - the lag probe reports lag above threshold, or
-   *  - the probe itself throws (network error, replica down, etc.).
-   */
-  async getReadPool(): Promise<pg.Pool> {
-    if (!this.replica) return this.primary;
+  const primaryCfg = resolvePoolConfig();
+  const raw = process.env['REPLICA_STATEMENT_TIMEOUT_MS'];
+  const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
+  const replicaStatementTimeoutMs = Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : primaryCfg.statementTimeoutMs;
 
-    let client: pg.PoolClient | undefined;
-    try {
-      client = await this.replica.connect();
-      const health = await checkReplicaHealth(client, this.lagThresholdMs);
+  return {
+    ...primaryCfg,
+    connectionString: replicaUrl,
+    replicaStatementTimeoutMs,
+  };
+}
 
-      if (health.healthy) {
-        if (!this.replicaHealthy) {
-          // Replica recovered — log and flip state.
-          logger.info('Read replica recovered; resuming replica reads', undefined, {
-            lagMs: health.lagMs,
-            thresholdMs: this.lagThresholdMs,
-          });
-          this.replicaHealthy = true;
-        }
-        return this.replica;
-      }
+/**
+ * Create a pg.Pool for the read replica.
+ *
+ * On every new physical connection the hook atomically sets:
+ *   1. `default_transaction_read_only = on`  — prevents accidental writes.
+ *   2. `statement_timeout = <ms>`            — bounds runaway SELECTs.
+ *
+ * Both are applied in a single `client.query` call so they either both succeed
+ * or both fail (the connection is destroyed on error, preventing a half-configured
+ * client from entering the pool).
+ *
+ * @param config - Pool configuration. Uses resolveReplicaPoolConfig() when omitted.
+ */
+export function createReplicaPool(config?: PoolConfig): pg.Pool {
+  const cfg = config ?? resolveReplicaPoolConfig()!;
+  const timeoutMs = cfg.replicaStatementTimeoutMs ?? cfg.statementTimeoutMs;
+  const pool = new Pool({
+    connectionString: cfg.connectionString,
+    min: cfg.min,
+    max: cfg.max,
+    connectionTimeoutMillis: cfg.connectionTimeoutMillis,
+    idleTimeoutMillis: cfg.idleTimeoutMillis,
+  });
 
-      // Replica is lagging or unavailable.
-      if (this.replicaHealthy) {
-        // First breach — log, count, and flip state.
-        logger.warn('Read replica lag exceeds threshold; failing over to primary', undefined, {
-          lagMs: health.lagMs,
-          thresholdMs: this.lagThresholdMs,
-          reason: health.reason,
-        });
-        replicaFailoversTotal.inc();
-        this.replicaHealthy = false;
-      } else {
-        // Sustained lag — periodic alert without double-counting the counter.
-        logger.warn('Read replica still lagging; reads remain on primary', undefined, {
-          lagMs: health.lagMs,
-          thresholdMs: this.lagThresholdMs,
-          reason: health.reason,
-        });
-      }
-    } catch (err) {
-      logger.warn('Replica health check threw unexpectedly; using primary', undefined, {
-        error: err instanceof Error ? err.message : String(err),
+  pool.on('connect', (client: pg.PoolClient) => {
+    // Issue both SETs in one round-trip so the connection is either fully
+    // configured or rejected — no partial state can enter the pool.
+    const sql = timeoutMs > 0
+      ? `SET default_transaction_read_only = on; SET statement_timeout = ${timeoutMs}`
+      : 'SET default_transaction_read_only = on';
+
+    client.query(sql).catch((err: Error) => {
+      logger.error('Failed to configure replica connection', undefined, {
+        error: err.message,
       });
-      if (this.replicaHealthy) {
-        replicaFailoversTotal.inc();
-        this.replicaHealthy = false;
-      }
-    } finally {
-      client?.release();
-    }
+    });
+  });
 
-    return this.primary;
+  pool.on('error', (err: Error) => {
+    logger.error('Replica pool error', undefined, {
+      error: err.message,
+      host: safeHostname(cfg.connectionString),
+    });
+  });
+
+  return pool;
+}
+
+// ── Health check ──────────────────────────────────────────────────────────────
+
+/**
+ * Run a lightweight health-check query (`SELECT 1`) against the replica pool.
+ * Returns `true` when the replica is reachable, `false` otherwise.
+ *
+ * The check is deliberately simple — it validates TCP connectivity and basic
+ * query execution rather than replication lag (which depends on deployment
+ * topology and is better monitored externally).
+ */
+export async function checkReplicaHealth(pool: pg.Pool): Promise<boolean> {
+  try {
+    await pool.query('SELECT 1');
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn('Replica health-check failed — falling back to primary', undefined, {
+      error: message,
+    });
+    return false;
+  }
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Return a pg.Pool suitable for read (SELECT) queries.
+ *
+ * On the first call the function will:
+ *   1. Check whether `DATABASE_REPLICA_URL` is defined.
+ *   2. If yes, create a replica pool and run a health-check.
+ *   3. If the replica is healthy, return it for all subsequent calls.
+ *   4. Otherwise, fall back to the primary pool.
+ *
+ * Once resolved the decision is cached — the function becomes synchronous
+ * on subsequent calls (returns the cached pool immediately via a resolved
+ * promise).
+ */
+export async function getReadPool(): Promise<pg.Pool> {
+  // Fast path: already resolved.
+  if (_healthCheckDone) {
+    return _replicaHealthy && _replicaPool ? _replicaPool : getPool();
   }
 
-  /** Expose current failover state (useful for health endpoints and tests). */
-  isReplicaHealthy(): boolean {
-    return this.replicaHealthy;
+  const cfg = resolveReplicaPoolConfig();
+  if (!cfg) {
+    logger.info('DATABASE_REPLICA_URL not set — reads will use the primary pool');
+    _healthCheckDone = true;
+    _replicaHealthy = false;
+    return getPool();
   }
+
+  _replicaPool = createReplicaPool(cfg);
+  _replicaHealthy = await checkReplicaHealth(_replicaPool);
+  _healthCheckDone = true;
+
+  if (_replicaHealthy) {
+    logger.info('Read-replica pool initialised', undefined, {
+      host: safeHostname(cfg.connectionString),
+    });
+    return _replicaPool;
+  }
+
+  // Replica unreachable — close its pool and fall back.
+  await _replicaPool.end().catch(() => {});
+  _replicaPool = null;
+  return getPool();
+}
+
+// ── Test helpers ──────────────────────────────────────────────────────────────
+
+/** Reset internal state (for tests only). */
+export function resetReplicaPool(): void {
+  _replicaPool = null;
+  _replicaHealthy = false;
+  _healthCheckDone = false;
+}
+
+/** Replace the singleton replica pool (for tests only). */
+export function setReplicaPool(pool: pg.Pool | null, healthy = true): void {
+  _replicaPool = pool;
+  _replicaHealthy = healthy;
+  _healthCheckDone = true;
 }
