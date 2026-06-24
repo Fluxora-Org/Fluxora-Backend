@@ -435,6 +435,14 @@ export class IndexerService {
       );
 
       if (existing) {
+        // Ensure progress row exists (e.g. for legacy cursors during transition)
+        await client.query(
+          `INSERT INTO indexer_replay_progress (last_committed_cursor, total, status)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (last_committed_cursor) DO UPDATE
+              SET status = 'in-progress', updated_at = now()`,
+          [existing.id, existing.total_rows, 'in-progress'],
+        );
         logger.info('replay_resuming', undefined, {
           event: 'replay_resuming',
           contract_id: request.contract_id,
@@ -456,6 +464,15 @@ export class IndexerService {
         request.to_block,
         totalRows,
       );
+
+      // Initialize progress checkpoint in the database.
+      await client.query(
+        `INSERT INTO indexer_replay_progress (last_committed_cursor, total, status)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (last_committed_cursor) DO NOTHING`,
+        [cursor.id, totalRows, 'in-progress'],
+      );
+
       return { cursor, totalRows };
     } finally {
       client.release();
@@ -495,6 +512,14 @@ export class IndexerService {
       const newOffset = offset + events.length;
       await this.cursorRepo.advanceOffset(client, cursorId, newOffset);
 
+      // Update the progress checkpoint atomic with the batch commit.
+      await client.query(
+        `UPDATE indexer_replay_progress
+            SET updated_at = now()
+          WHERE last_committed_cursor = $1`,
+        [cursorId],
+      );
+
       await client.query('COMMIT');
       return { rowsFetched: events.length };
     } catch (error) {
@@ -516,7 +541,22 @@ export class IndexerService {
   private async completeCursor(cursorId: string): Promise<void> {
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
       await this.cursorRepo.markCompleted(client, cursorId);
+      await client.query(
+        `UPDATE indexer_replay_progress
+            SET status = $1, updated_at = now()
+          WHERE last_committed_cursor = $2`,
+        ['completed', cursorId],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      throw error;
     } finally {
       client.release();
     }
@@ -691,6 +731,105 @@ export class IndexerService {
   }
 
   /**
+   * Scan the checkpoint table on startup to detect any incomplete replay
+   * (status = 'in-progress') and resume it asynchronously.
+   *
+   * This facilitates automatic crash recovery when the server restarts.
+   */
+  async resumeIncompleteReplay(): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(`
+        SELECT p.last_committed_cursor, c.contract_id, c.ledger, c.from_block, c.to_block
+          FROM indexer_replay_progress p
+          JOIN replay_cursors c ON p.last_committed_cursor = c.id
+         WHERE p.status = 'in-progress'
+         ORDER BY p.started_at DESC
+         LIMIT 1
+      `);
+
+      if (result.rows.length === 0) {
+        logger.info('No incomplete replays found to resume.');
+        return;
+      }
+
+      const row = result.rows[0];
+      const request: ReplayRequest = {
+        contract_id: row.contract_id,
+        ledger: row.ledger,
+        from_block: row.from_block ?? undefined,
+        to_block: row.to_block ?? undefined,
+      };
+
+      logger.info('Resuming incomplete replay from checkpoint', undefined, {
+        event: 'replay_resume_startup',
+        contract_id: request.contract_id,
+        ledger: request.ledger,
+        cursor_id: row.last_committed_cursor,
+      });
+
+      // Start the replay asynchronously so we do not block startup.
+      this.replayEvents(request).catch((err) => {
+        logger.error('Resumed replay failed', err, {
+          contract_id: request.contract_id,
+          ledger: request.ledger,
+        });
+      });
+    } catch (err) {
+      logger.error('Failed to check for incomplete replays on startup', err as Error);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Get current replay progress, checking both in-memory state and the database checkpoint.
+   *
+   * If a replay is active in-memory, returns the active in-memory progress.
+   * Otherwise, queries the database for the most recent replay progress and returns it.
+   */
+  async getReplayProgressExtended(): Promise<ReplayProgress> {
+    const inMemory = this.getReplayProgress();
+    if (inMemory.isReplaying) {
+      return inMemory;
+    }
+
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(`
+        SELECT p.status, p.total, p.started_at, p.updated_at,
+               c.contract_id, c.ledger, c.id as cursor_id, c.last_committed_offset
+          FROM indexer_replay_progress p
+          JOIN replay_cursors c ON p.last_committed_cursor = c.id
+         ORDER BY p.updated_at DESC
+         LIMIT 1
+      `);
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        return {
+          isReplaying: row.status === 'in-progress',
+          rowsReplayed: row.last_committed_offset,
+          rowsRemaining: Math.max(0, row.total - row.last_committed_offset),
+          totalRows: row.total,
+          estimatedCompletion: null,
+          startedAt: row.started_at,
+          contractId: row.contract_id,
+          ledger: row.ledger,
+          replayCursorId: row.cursor_id,
+          currentOffset: row.last_committed_offset,
+          status: row.status,
+        };
+      }
+    } catch (err) {
+      logger.error('Failed to fetch replay progress from database', err as Error);
+    } finally {
+      client.release();
+    }
+
+    return inMemory;
+  }
+
+  /**
    * Get current replay progress (in-memory snapshot for fast polling).
    */
   getReplayProgress(): ReplayProgress {
@@ -699,3 +838,4 @@ export class IndexerService {
 }
 
 export const indexerService = new IndexerService();
+

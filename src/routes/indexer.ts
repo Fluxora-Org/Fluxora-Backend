@@ -65,9 +65,9 @@ indexerRouter.post('/internal/indexer/events/replay', async (req: Request, res: 
  *   "ledger": number (optional)
  * }
  */
-indexerRouter.get('/internal/indexer/status', (req: Request, res: Response) => {
+indexerRouter.get('/internal/indexer/status', async (req: Request, res: Response) => {
   try {
-    const progress = indexerService.getReplayProgress();
+    const progress = await indexerService.getReplayProgressExtended();
     res.status(200).json(progress);
   } catch (error: any) {
     console.error('Failed to get status:', error);
