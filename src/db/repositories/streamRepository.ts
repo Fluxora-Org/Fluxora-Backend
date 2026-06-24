@@ -354,7 +354,25 @@ export const streamRepository = {
     });
   },
 
-  /** Offset-based paginated list. */
+  /**
+   * Offset-based paginated list.
+   *
+   * **Ordering guarantee**: rows are sorted by `created_at DESC, id DESC`.
+   * Because `created_at` defaults to `NOW()` and is not unique (multiple
+   * streams inserted in the same transaction or millisecond share the same
+   * timestamp), the secondary `id DESC` tiebreaker makes the composite key
+   * unique.  PostgreSQL can then produce a deterministic, stable order across
+   * OFFSET pages, preventing duplicate or skipped rows when ties straddle a
+   * page boundary.
+   *
+   * The composite index `idx_streams_created_at_id_desc` (added by migration
+   * `20260624000000_streams_created_at_id_tiebreaker_index.ts`) covers this
+   * ordering efficiently.
+   *
+   * Security: the ORDER BY clause references fixed column names only — no
+   * client input is interpolated — satisfying the SQL-injection-safety
+   * requirement.  LIMIT and OFFSET are passed as bound parameters (`$n`).
+   */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
       const pool = await getReadPool();
@@ -399,7 +417,7 @@ export const streamRepository = {
         query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
           [...params, pagination.limit, pagination.offset],
         ),
       ]);

@@ -385,7 +385,14 @@ paths:
             type: string
       responses:
         '200':
-          description: Cursor-paginated list of streams
+          description: |
+            Cursor-paginated list of streams.
+
+            **Ordering guarantee**: results are always returned in `created_at DESC, id DESC`
+            order. Because `id` is the primary key (unique), the composite key is unique and
+            the ordering is deterministic — even when multiple streams share the same
+            `created_at` timestamp (e.g. batch inserts). Clients can rely on a stable,
+            consistent page ordering across all requests.
           content:
             application/json:
               schema:
