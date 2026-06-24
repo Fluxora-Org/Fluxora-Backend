@@ -115,9 +115,55 @@ export function getLiveSseSubscriberCount(streamId?: string): number {
   return totalLiveSubscriberCount();
 }
 
+// ── Shutdown drain ────────────────────────────────────────────────────────────
+
+/**
+ * Callbacks registered by active SSE response handlers. Each callback
+ * writes the SSE retry directive and closes the response.
+ */
+const sseShutdownCallbacks = new Set<() => void>();
+
+/**
+ * Register a shutdown callback for an active SSE response.
+ * The returned deregister function must be called when the connection closes
+ * normally so the Set does not grow unboundedly.
+ *
+ * @param fn - Callback that writes `retry: 0` and ends the response.
+ * @returns Deregister function.
+ */
+export function registerSseShutdownCallback(fn: () => void): () => void {
+  sseShutdownCallbacks.add(fn);
+  return () => sseShutdownCallbacks.delete(fn);
+}
+
+/**
+ * Drain all open SSE connections on shutdown.
+ *
+ * Sends a final `retry: 0` directive so browser EventSource clients do not
+ * immediately reconnect, then ends each response. Detaches the dispatch
+ * listener and resets subscriber state.
+ */
+export function drainSseEventBus(): void {
+  for (const cb of Array.from(sseShutdownCallbacks)) {
+    try {
+      cb();
+    } catch {
+      // Isolate a single failing response from the rest of the drain.
+    }
+  }
+  sseShutdownCallbacks.clear();
+
+  // Tear down the shared dispatcher so no further events are fanned out.
+  liveSubscribersByStreamId.clear();
+  sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
+  sseLiveSubscribersGauge.set(0);
+  sseEventListenersGauge.set(0);
+}
+
 export function _resetSseSubscriptionsForTest(): void {
   liveSubscribersByStreamId.clear();
   sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
+  sseShutdownCallbacks.clear();
   sseLiveSubscribersGauge.set(0);
   sseEventListenersGauge.set(0);
 }

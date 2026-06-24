@@ -37,6 +37,9 @@ import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
+import { drainSseEventBus } from './streams/sseEmitter.js';
+import { requestStopReplay } from './indexer/service.js';
+import { quitAllRedisClients } from './redis/client.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createDeprecationMiddleware } from './middleware/deprecation.js';
 import { routeDeprecations } from './config/deprecations.js';
@@ -183,6 +186,14 @@ export function createApp(options: AppOptions = {}): Express {
   addShutdownHook(() => {
     stopRuntimeMetrics();
   });
+
+  // Shutdown hook ordering (runs after server.close() drains HTTP):
+  //   1. Drain SSE — close open event-stream responses with retry:0.
+  //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
+  //   3. Quit Redis — close all tracked Redis sockets.
+  addShutdownHook(() => drainSseEventBus());
+  addShutdownHook(() => requestStopReplay());
+  addShutdownHook(() => quitAllRedisClients());
 
   // Expose the limiter on app.locals so index.ts can register a shutdown hook
   app.locals.rateLimiter = rateLimiter;

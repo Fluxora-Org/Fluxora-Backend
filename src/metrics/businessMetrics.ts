@@ -211,6 +211,22 @@ export function syncWebhookMetrics(store: {
   webhookOutboxPendingItemsGauge.set(Math.max(0, metrics.outboxItems));
 }
 
+/**
+ * Counter for failed WebSocket token authentication attempts, labeled by failure reason.
+ *
+ * @security
+ * - Labels are a fixed enum (`MISSING_TOKEN` | `INVALID_TOKEN` | `AUTH_NOT_CONFIGURED`)
+ *   to prevent cardinality blowup. No token material is ever included.
+ */
+export const wsAuthFailureTotal =
+  (registry.getSingleMetric('fluxora_ws_auth_failure_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_ws_auth_failure_total',
+    help: 'Total failed WebSocket token authentication attempts, labeled by failure reason',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
@@ -226,4 +242,5 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
   registry.removeSingleMetric('fluxora_sse_live_subscribers');
   registry.removeSingleMetric('fluxora_sse_event_listeners');
+  registry.removeSingleMetric('fluxora_ws_auth_failure_total');
 }

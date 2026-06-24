@@ -1,6 +1,7 @@
 import express from 'express';
 import { config } from './config/index.js';
 import { indexerRouter } from './routes/indexer';
+import { gracefulShutdown } from './shutdown.js';
 
 const app = express();
 
@@ -33,14 +34,10 @@ if (process.env.NODE_ENV !== 'test') {
     console.log(`Replay batch size: ${config.indexer.replayBatchSize}`);
   });
 
-  // Graceful shutdown
-  process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully...');
-    server.close(() => {
-      console.log('Server closed');
-      process.exit(0);
-    });
-  });
+  // Delegate to the single graceful-shutdown path so all registered hooks
+  // (SSE drain, indexer stop, Redis quit, DB pool close) run on SIGTERM.
+  process.on('SIGTERM', () => void gracefulShutdown(server, 'SIGTERM'));
+  process.on('SIGINT', () => void gracefulShutdown(server, 'SIGINT'));
 }
 
 export { app };

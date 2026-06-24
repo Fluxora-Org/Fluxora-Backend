@@ -58,6 +58,24 @@ class ReplayLock {
 
 export const replayLock = new ReplayLock();
 
+// ── Graceful stop signal ───────────────────────────────────────────────────────
+
+let _stopRequested = false;
+
+/**
+ * Request that an in-progress replay stops at the next safe batch boundary.
+ * Already-committed batches remain durable; a re-run resumes from the last
+ * committed cursor offset.
+ */
+export function requestStopReplay(): void {
+  _stopRequested = true;
+}
+
+/** Reset stop flag — for testing only. */
+export function _resetStopReplay(): void {
+  _stopRequested = false;
+}
+
 // ── In-memory progress state (for low-latency /status polling) ────────────────
 
 /**
@@ -326,6 +344,18 @@ export class IndexerService {
 
       // 5. Per-batch loop — each iteration uses a fresh connection.
       while (offset < totalRows) {
+        // Stop-requested guard: honour a shutdown signal at a safe batch boundary.
+        if (_stopRequested) {
+          logger.warn('replay_stopped_by_shutdown', undefined, {
+            event: 'replay_stopped_by_shutdown',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            offset,
+          });
+          break;
+        }
+
         // Budget guard: abort if the wall-clock limit has been exceeded.
         if (this.replayBudgetMs > 0) {
           const elapsed = Date.now() - replayStart;

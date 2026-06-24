@@ -90,6 +90,7 @@ import {
   eventMatchesStreamId,
   SSE_STREAM_UPDATE_EVENT,
   subscribeToSseStream,
+  registerSseShutdownCallback,
 } from '../streams/sseEmitter.js';
 import {
   resolveSseConnectionLimits,
@@ -1099,6 +1100,25 @@ streamsRouter.get(
     };
 
     unsubscribeLiveUpdates = subscribeToSseStream(id, listener);
+
+    // Register a shutdown drain callback so drainSseEventBus() can close this
+    // response cleanly with a retry:0 directive instead of an abrupt socket close.
+    const deregisterShutdown = registerSseShutdownCallback(() => {
+      try {
+        if (!res.writableEnded && !res.destroyed) {
+          res.write('retry: 0\n\n');
+          res.end();
+        }
+      } catch {
+        // Best-effort — the socket may already be gone.
+      }
+      cleanup('shutdown_drain');
+    });
+    const origUnsubscribe = unsubscribeLiveUpdates;
+    unsubscribeLiveUpdates = () => {
+      origUnsubscribe();
+      deregisterShutdown();
+    };
   }),
 );
 
