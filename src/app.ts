@@ -34,6 +34,7 @@ import {
   BODY_LIMIT_BYTES,
 } from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
+import { requireJsonContentType } from './middleware/contentType.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
@@ -209,6 +210,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
+  app.use('/api', requireJsonContentType);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   // Correlation ID must be first so all subsequent middleware/routes have req.correlationId.
   app.use(correlationIdMiddleware);
