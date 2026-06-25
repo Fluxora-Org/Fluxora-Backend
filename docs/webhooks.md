@@ -101,3 +101,63 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 Webhook requests are signed with the configured secret and include delivery metadata headers. Production endpoints must use HTTPS unless they target loopback for local deployments. URLs with embedded credentials are rejected.
 
 Consumers must treat webhook delivery as at-least-once: verify the signature, deduplicate by `x-fluxora-delivery-id`, and make handlers idempotent.
+
+## SSRF Protection
+
+All webhook target URLs are validated before any network call to prevent Server-Side Request Forgery (SSRF) attacks. This protection is applied in both the `WebhookDispatcher` class and the `dispatchWebhook` helper function.
+
+### Blocked IP ranges
+
+The SSRF guard blocks the following IP address ranges:
+
+- **Loopback addresses**: `127.0.0.0/8`, `::1` (including `localhost`)
+- **Link-local addresses**: `169.254.0.0/16` (includes AWS metadata endpoint `169.254.169.254`), `fe80::/10`
+- **Private networks**: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7` (IPv6 unique local)
+- **Reserved ranges**: `0.0.0.0/8`, `240.0.0.0/4`, `224.0.0.0/4` (multicast)
+- **IPv4-mapped IPv6 loopback**: `::ffff:127.0.0.0/8`
+
+### Protocol requirements
+
+- **HTTPS required by default**: All webhook URLs must use HTTPS unless explicitly configured otherwise
+- **HTTP/HTTPS only**: Other protocols (FTP, etc.) are rejected
+
+### DNS rebinding protection
+
+The guard resolves hostnames to IP addresses and validates each resolved IP against the blocked ranges. This prevents DNS rebinding attacks where an attacker might initially point a hostname to a public IP, then change it to a private IP after validation.
+
+### Host allowlist (optional)
+
+The `WEBHOOK_ALLOWED_HOSTS` environment variable can be set to restrict webhook delivery to specific hosts:
+
+```bash
+WEBHOOK_ALLOWED_HOSTS=api.example.com,*.trusted.com
+```
+
+- Supports exact hostnames: `api.example.com`
+- Supports wildcard subdomains: `*.trusted.com` matches `sub.trusted.com` and `trusted.com`
+- When not configured, all non-blocked hosts are allowed
+- Blocked IP ranges are always rejected, even if in the allowlist
+
+### Request timeout
+
+All webhook fetches enforce a timeout (default 30 seconds) to prevent slow-loris attacks and hanging requests. The timeout is applied via `AbortController` in both the class-based dispatcher and the helper function.
+
+### Configuration
+
+Add to your environment configuration:
+
+```bash
+# Optional: Restrict webhook delivery to specific hosts
+WEBHOOK_ALLOWED_HOSTS=api.example.com,*.trusted.com
+```
+
+### Error handling
+
+SSRF validation failures are logged without exposing the full URL for security. The validation fails closed: any ambiguous or unresolvable target is rejected with a `WebhookTargetValidationError`.
+
+### Implementation details
+
+- Validation function: `validateWebhookTarget(url, options)` in `src/webhooks/ssrfGuard.ts`
+- Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
+- Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
+- DNS resolution: Uses Node.js `dns.promises.lookup()`

@@ -533,6 +533,71 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 
   /internal/indexer/events/replay:
+    post:
+      summary: Trigger historical contract-event DB replay
+      operationId: startIndexerReplay
+      tags:
+        - Internal
+      security:
+        - BearerAuth: []
+      description: |
+        Enqueues a historical backfill of `contract_events` from `historical_events`
+        for a given contract and ledger. The operation runs asynchronously; poll
+        `GET /internal/indexer/status` for progress.
+
+        Requires the `indexer:replay` permission. Triggers an expensive DB scan —
+        kept off the public CORS allowlist and behind the shared rate limiter.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - contract_id
+                - ledger
+              properties:
+                contract_id:
+                  type: string
+                  minLength: 1
+                  description: Contract identifier to replay events for.
+                ledger:
+                  type: integer
+                  minimum: 0
+                  description: Ledger number to replay.
+                from_block:
+                  type: integer
+                  minimum: 0
+                  description: Optional lower bound block height (inclusive).
+                to_block:
+                  type: integer
+                  minimum: 0
+                  description: Optional upper bound block height (inclusive). Must be >= from_block.
+      responses:
+        '202':
+          description: Replay accepted and running asynchronously
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: Validation error (invalid body)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Insufficient permissions (indexer:replay required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     get:
       summary: Cursor-based event replay from the event store
       operationId: replayIndexerEvents
@@ -618,6 +683,37 @@ paths:
                 $ref: '#/components/schemas/EventReplayResponse'
         '401':
           description: Missing or invalid internal worker credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/indexer/status:
+    get:
+      summary: Get current replay progress
+      operationId: getIndexerStatus
+      tags:
+        - Internal
+      security:
+        - BearerAuth: []
+      description: |
+        Returns the in-memory snapshot of the current (or last completed) DB replay run.
+        Requires the `indexer:replay` permission.
+      responses:
+        '200':
+          description: Replay progress snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Insufficient permissions (indexer:replay required)
           content:
             application/json:
               schema:

@@ -443,7 +443,7 @@ describe('streamRepository', () => {
       expect(result.streams.map(s => s.id)).toEqual(['stream-z', 'stream-m', 'stream-a']);
       // Confirm the SELECT SQL contains the tiebreaker ordering
       const selectCall = mockQuery.mock.calls.find(
-        ([, sql]: [unknown, string]) => typeof sql === 'string' && sql.includes('ORDER BY'),
+        (call: any[]) => typeof call[1] === 'string' && call[1].includes('ORDER BY'),
       );
       expect(selectCall).toBeDefined();
       expect(selectCall![1]).toMatch(/ORDER BY created_at DESC, id DESC/);

@@ -267,8 +267,34 @@ export function getRedisClientFactory(): RedisClientFactory {
   return factory;
 }
 
+/** All clients created via {@link createRedisClient}. Used for shutdown drain. */
+const _activeClients = new Set<RedisClient>();
+
 export async function createRedisClient(config: RedisConfig): Promise<RedisClient> {
-  return factory.createClient(config);
+  const client = await factory.createClient(config);
+  _activeClients.add(client);
+  return client;
+}
+
+/**
+ * Quit all Redis clients that were created via {@link createRedisClient}.
+ * Called during graceful shutdown to close sockets cleanly.
+ */
+export async function quitAllRedisClients(): Promise<void> {
+  const clients = Array.from(_activeClients);
+  _activeClients.clear();
+  await Promise.all(
+    clients.map((c) =>
+      c.close().catch((err: unknown) => {
+        logger.warn('redis:quit_error', { error: (err as Error).message });
+      }),
+    ),
+  );
+}
+
+/** Reset the active-client registry — for testing only. */
+export function _resetRedisClientRegistry(): void {
+  _activeClients.clear();
 }
 
 // ---------------------------------------------------------------------------
