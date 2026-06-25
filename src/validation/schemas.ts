@@ -168,6 +168,43 @@ export const ListStreamsQuerySchema = z.object({
 });
 
 /**
+ * Schema for POST /internal/indexer/events/replay body.
+ *
+ * Validates the parameters required to trigger a historical contract-event
+ * replay. These endpoints trigger expensive DB backfills — the schema
+ * enforces sane ranges to prevent absurd workloads from reaching the service.
+ *
+ * Rules:
+ * - contract_id: non-empty string
+ * - ledger: non-negative integer
+ * - from_block / to_block: optional non-negative integers where from <= to
+ */
+export const ReplayRequestSchema = z
+  .object({
+    contract_id: z
+      .string({ error: 'contract_id must be a string' })
+      .min(1, 'contract_id must be a non-empty string'),
+    ledger: nonNegativeIntegerField('ledger'),
+    from_block: nonNegativeIntegerField('from_block').optional(),
+    to_block: nonNegativeIntegerField('to_block').optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (
+      data.from_block !== undefined &&
+      data.to_block !== undefined &&
+      data.from_block > data.to_block
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['from_block'],
+        message: 'from_block must be less than or equal to to_block',
+      });
+    }
+  });
+
+export type ReplayRequestInput = z.infer<typeof ReplayRequestSchema>;
+
+/**
  * Schema for DLQ list query parameters.
  */
 export const DlqListQuerySchema = z.object({

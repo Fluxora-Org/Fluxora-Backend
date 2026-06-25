@@ -883,3 +883,214 @@ describe('IndexerService — getReplayProgress', () => {
     expect(svc.getReplayProgress().isReplaying).toBe(false);
   });
 });
+
+// ── Progress checkpointing and recovery ───────────────────────────────────────
+
+describe('IndexerService — progress checkpointing', () => {
+  it('initializes, updates, and completes the checkpoint in the database', async () => {
+    const queries: { sql: string; params?: unknown[] } = [];
+    const client = makeClient(async (sql, params) => {
+      queries.push({ sql, params });
+      if (sql.includes('COUNT')) return { rows: [{ count: '2' }] };
+      if (sql.includes('FROM historical_events')) return { rows: [makeEvent('e1'), makeEvent('e2')] };
+      return { rows: [] };
+    });
+
+    const cursorRepo = makeCursorRepo({
+      create: vi.fn(async (_c, cid, ledger) => ({
+        id: 'checkpoint-cursor-1',
+        contract_id: cid,
+        ledger,
+        from_block: null,
+        to_block: null,
+        total_rows: 2,
+        last_committed_offset: 0,
+        started_at: new Date(),
+        completed_at: null,
+      })),
+    });
+
+    const pool = makePool(client, client, client);
+    const svc = makeService(pool, cursorRepo, { batchSize: 2 });
+
+    await svc.replayEvents(REQUEST);
+
+    // Verify checkpoint initialization (INSERT)
+    const initQuery = queries.find(q => q.sql.includes('INSERT INTO indexer_replay_progress'));
+    expect(initQuery).toBeDefined();
+    expect(initQuery?.params).toEqual(['checkpoint-cursor-1', 2, 'in-progress']);
+
+    // Verify checkpoint batch update (UPDATE inside processBatch)
+    const updateQuery = queries.find(q => q.sql.includes('UPDATE indexer_replay_progress') && q.sql.includes('updated_at = now()') && !q.sql.includes('status'));
+    expect(updateQuery).toBeDefined();
+    expect(updateQuery?.params).toEqual(['checkpoint-cursor-1']);
+
+    // Verify checkpoint completion (UPDATE inside completeCursor)
+    const completeQuery = queries.find(q => q.sql.includes('UPDATE indexer_replay_progress') && q.sql.includes('status = $1'));
+    expect(completeQuery).toBeDefined();
+    expect(completeQuery?.params).toEqual(['completed', 'checkpoint-cursor-1']);
+  });
+
+  it('rolls back checkpoint updates if a batch transaction fails', async () => {
+    const queries: { sql: string }[] = [];
+    const client = makeClient(async (sql) => {
+      queries.push({ sql });
+      if (sql.includes('COUNT')) return { rows: [{ count: '2' }] };
+      if (sql.includes('FROM historical_events')) return { rows: [makeEvent('e1'), makeEvent('e2')] };
+      if (sql.includes('INSERT INTO contract_events')) throw new Error('simulated DB failure');
+      return { rows: [] };
+    });
+
+    const cursorRepo = makeCursorRepo({
+      create: vi.fn(async (_c, cid, ledger) => ({
+        id: 'checkpoint-cursor-fail',
+        contract_id: cid,
+        ledger,
+        from_block: null,
+        to_block: null,
+        total_rows: 2,
+        last_committed_offset: 0,
+        started_at: new Date(),
+        completed_at: null,
+      })),
+    });
+
+    const pool = makePool(client, client);
+    const svc = makeService(pool, cursorRepo, { batchSize: 2 });
+
+    await expect(svc.replayEvents(REQUEST)).rejects.toThrow('simulated DB failure');
+
+    // Verify ROLLBACK was called
+    const hasRollback = queries.some(q => q.sql === 'ROLLBACK');
+    expect(hasRollback).toBe(true);
+
+    // Verify no checkpoint update occurred for this batch since it failed before commit
+    const hasUpdate = queries.some(q => q.sql.includes('UPDATE indexer_replay_progress') && !q.sql.includes('status'));
+    expect(hasUpdate).toBe(false);
+  });
+});
+
+describe('IndexerService — startup auto-resume', () => {
+  it('detects incomplete replay and triggers replayEvents asynchronously', async () => {
+    const client = makeClient(async (sql) => {
+      if (sql.includes('indexer_replay_progress') && sql.includes('status = \'in-progress\'')) {
+        return {
+          rows: [
+            {
+              last_committed_cursor: 'cursor-resumed-123',
+              contract_id: 'resumed-contract',
+              ledger: 5,
+              from_block: 100,
+              to_block: 200,
+            },
+          ],
+        };
+      }
+      return { rows: [] };
+    });
+
+    const pool = makePool(client);
+    const svc = makeService(pool, makeCursorRepo());
+
+    // Spy on replayEvents to verify it gets triggered
+    const replayEventsSpy = vi.spyOn(svc, 'replayEvents').mockResolvedValue(undefined);
+
+    await svc.resumeIncompleteReplay();
+
+    expect(replayEventsSpy).toHaveBeenCalledWith({
+      contract_id: 'resumed-contract',
+      ledger: 5,
+      from_block: 100,
+      to_block: 200,
+    });
+  });
+
+  it('does nothing on startup if no incomplete replays are found', async () => {
+    const client = makeClient(async (sql) => {
+      if (sql.includes('indexer_replay_progress') && sql.includes('status = \'in-progress\'')) {
+        return { rows: [] };
+      }
+      return { rows: [] };
+    });
+
+    const pool = makePool(client);
+    const svc = makeService(pool, makeCursorRepo());
+    const replayEventsSpy = vi.spyOn(svc, 'replayEvents');
+
+    await svc.resumeIncompleteReplay();
+
+    expect(replayEventsSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('IndexerService — getReplayProgressExtended', () => {
+  it('returns in-memory progress if replay is currently active', async () => {
+    const pool = makePool();
+    const svc = makeService(pool, makeCursorRepo());
+
+    // Force active in-memory state
+    replayState.startReplay(100, 'contract-active', 2, 'cursor-active', 10);
+
+    const progress = await svc.getReplayProgressExtended();
+    expect(progress.isReplaying).toBe(true);
+    expect(progress.contractId).toBe('contract-active');
+    expect(progress.totalRows).toBe(100);
+    expect(progress.rowsReplayed).toBe(10);
+
+    // Reset the singleton state to avoid polluting subsequent tests
+    replayState.endReplay();
+    (replayState as any).state = {
+      isReplaying: false,
+      rowsReplayed: 0,
+      rowsRemaining: 0,
+      totalRows: 0,
+      estimatedCompletion: null,
+      startedAt: null,
+    };
+  });
+
+  it('queries database and returns checkpoint progress if in-memory is idle', async () => {
+    const client = makeClient(async (sql) => {
+      if (sql.includes('indexer_replay_progress')) {
+        return {
+          rows: [
+            {
+              status: 'completed',
+              total: 500,
+              started_at: new Date('2026-06-24T00:00:00.000Z'),
+              updated_at: new Date('2026-06-24T01:00:00.000Z'),
+              contract_id: 'contract-completed',
+              ledger: 10,
+              cursor_id: 'cursor-completed-uuid',
+              last_committed_offset: 500,
+            },
+          ],
+        };
+      }
+      return { rows: [] };
+    });
+
+    const pool = makePool(client);
+    const svc = makeService(pool, makeCursorRepo());
+
+    const progress = await svc.getReplayProgressExtended();
+    expect(progress.isReplaying).toBe(false);
+    expect(progress.status).toBe('completed');
+    expect(progress.contractId).toBe('contract-completed');
+    expect(progress.totalRows).toBe(500);
+    expect(progress.rowsReplayed).toBe(500);
+    expect(progress.rowsRemaining).toBe(0);
+    expect(progress.replayCursorId).toBe('cursor-completed-uuid');
+  });
+
+  it('returns idle in-memory progress if database query returns no rows', async () => {
+    const client = makeClient(async () => ({ rows: [] }));
+    const pool = makePool(client);
+    const svc = makeService(pool, makeCursorRepo());
+
+    const progress = await svc.getReplayProgressExtended();
+    expect(progress.isReplaying).toBe(false);
+    expect(progress.totalRows).toBe(0);
+  });
+});
+

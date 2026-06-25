@@ -259,7 +259,6 @@ const StreamListPage = registry.register(
       description: 'True when additional pages exist. Fetch them by passing `next_cursor`.',
       example: true,
     }),
-    next_cursor: z.union([StreamCursorToken, z.null()]).openapi({
     next_cursor: StreamCursorToken.nullable().openapi({
       description:
         'Cursor to pass as `cursor` on the next request. ' +

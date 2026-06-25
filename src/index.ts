@@ -1,6 +1,8 @@
 import express from 'express';
 import { config } from './config/index.js';
 import { indexerRouter } from './routes/indexer';
+import { gracefulShutdown } from './shutdown.js';
+import { indexerService } from './indexer/service.js';
 
 const app = express();
 
@@ -31,16 +33,17 @@ if (process.env.NODE_ENV !== 'test') {
   server = app.listen(config.server.port, () => {
     console.log(`Indexer service listening on port ${config.server.port}`);
     console.log(`Replay batch size: ${config.indexer.replayBatchSize}`);
-  });
 
-  // Graceful shutdown
-  process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully...');
-    server.close(() => {
-      console.log('Server closed');
-      process.exit(0);
+    // Auto-resume any incomplete replays from the database checkpoint
+    indexerService.resumeIncompleteReplay().catch((err) => {
+      console.error('Failed to resume incomplete replays on startup:', err);
     });
   });
+
+  // Delegate to the single graceful-shutdown path so all registered hooks
+  // (SSE drain, indexer stop, Redis quit, DB pool close) run on SIGTERM.
+  process.on('SIGTERM', () => void gracefulShutdown(server, 'SIGTERM'));
+  process.on('SIGINT', () => void gracefulShutdown(server, 'SIGINT'));
 }
 
 export { app };
