@@ -83,23 +83,55 @@ registry.registerComponent('securitySchemes', 'indexerWorkerToken', {
   description: 'Static shared secret for internal indexer worker endpoints',
 });
 
+// ── Common response headers ───────────────────────────────────────────────────
+
+/**
+ * X-Request-ID is set on every response (success, error, and body-less 204).
+ * Its value is the correlation ID resolved by the correlationId middleware and
+ * is identical to the `requestId` field in the JSON envelope when a body is
+ * present.  Clients, proxies, and gateways can use it to tie any response back
+ * to a server-side trace without parsing the body.
+ */
+registry.registerComponent('headers', 'XRequestId', {
+  description:
+    'Opaque request identifier that matches the correlation ID attached to server-side log lines. ' +
+    'Present on every response including body-less 204 responses. ' +
+    'When a JSON envelope is returned its value equals `meta.requestId` (success) or `error.requestId` (error).',
+  schema: { type: 'string', format: 'uuid', example: '123e4567-e89b-12d3-a456-426614174000' },
+  required: true,
+});
+
+/** Reusable headers object referencing the common X-Request-ID component. */
+const commonResponseHeaders = {
+  'X-Request-ID': { $ref: '#/components/headers/XRequestId' },
+} as const;
+
 // ── Reusable response helpers ─────────────────────────────────────────────────
 
 function successSchema<T extends z.ZodTypeAny>(dataSchema: T) {
   return z.object({ success: z.literal(true), data: dataSchema, meta: ResponseMeta });
 }
 
+/** Wraps a successSchema in a full 200-response object with common headers. */
+function successResponse200<T extends z.ZodTypeAny>(dataSchema: T, description = 'Success') {
+  return {
+    description,
+    headers: commonResponseHeaders,
+    content: { 'application/json': { schema: successSchema(dataSchema) } },
+  };
+}
+
 const errorResponses = {
-  '400': { description: 'Validation error', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '401': { description: 'Unauthorized', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '403': { description: 'Forbidden', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '404': { description: 'Not found', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '408': { description: 'Request timeout', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '409': { description: 'Conflict', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '422': { description: 'Unprocessable entity', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '429': { description: 'Too many requests', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '500': { description: 'Internal server error', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '503': { description: 'Service unavailable', content: { 'application/json': { schema: ErrorEnvelope } } },
+  '400': { description: 'Validation error', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '401': { description: 'Unauthorized', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '403': { description: 'Forbidden', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '404': { description: 'Not found', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '408': { description: 'Request timeout', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '409': { description: 'Conflict', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '422': { description: 'Unprocessable entity', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '429': { description: 'Too many requests', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '500': { description: 'Internal server error', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '503': { description: 'Service unavailable', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
 } as const;
 
 // ── GET / ─────────────────────────────────────────────────────────────────────
@@ -291,7 +323,7 @@ registry.registerPath({
       }),
       cursor: z.string().optional().openapi({
         description:
-          'Opaque cursor from the previous page's `next_cursor`. ' +
+          'Opaque cursor from the previous page\'s `next_cursor`. ' +
           'Omit to request the first page. ' +
           'Treated as a black box — do not construct manually.',
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',

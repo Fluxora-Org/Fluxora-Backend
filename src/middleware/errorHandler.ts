@@ -3,6 +3,7 @@ import { DecimalSerializationError } from '../serialization/decimal.js';
 import { SerializationLogger, error as logError } from '../utils/logger.js';
 import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
+import { REQUEST_ID_HEADER } from './correlationId.js';
 
 export interface ApiErrorResponse {
   success: false;
@@ -47,7 +48,13 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  const requestId = req.id ?? (res.locals['requestId'] as string | undefined);
+  const requestId = req.correlationId ?? req.id ?? (res.locals['requestId'] as string | undefined);
+
+  // Ensure X-Request-ID is present even if correlationId middleware ran before
+  // the route that set it, or if something cleared it.
+  if (requestId && !res.headersSent) {
+    res.setHeader(REQUEST_ID_HEADER, requestId);
+  }
 
   if (err instanceof QueryTimeoutError) {
     res.status(504).json(

@@ -100,6 +100,7 @@ describe('admin API key routes', () => {
       request(app).delete(`/api/admin/api-keys/${keyId}`)
     );
     expect(deleteRes.status).toBe(204);
+    expect(deleteRes.headers['x-request-id']).toBeTruthy();
 
     // Verify it is deactivated in listing
     const listRes = await authed(request(app).get('/api/admin/api-keys'));

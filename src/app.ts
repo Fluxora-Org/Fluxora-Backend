@@ -207,9 +207,10 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
-  app.use(express.json({ limit: BODY_LIMIT_BYTES }));
-  // Correlation ID must be first so all subsequent middleware/routes have req.correlationId.
+  // Correlation ID must run before express.json() so req.correlationId is available
+  // even when JSON parsing throws and the error handler fires immediately.
   app.use(correlationIdMiddleware);
+  app.use(express.json({ limit: BODY_LIMIT_BYTES }));
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
@@ -261,7 +262,7 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   app.use((req: Request, res: Response) => {
-    const requestId = req.id;
+    const requestId = req.correlationId ?? req.id;
     res.status(404).json(
       errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
     );

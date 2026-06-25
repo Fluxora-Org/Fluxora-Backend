@@ -26,6 +26,7 @@ vi.mock('../src/ws/messageHandler', () => ({
 import {
   correlationIdMiddleware,
   CORRELATION_ID_HEADER,
+  REQUEST_ID_HEADER,
   isValidCorrelationId,
   MAX_CORRELATION_ID_LENGTH,
 } from '../src/middleware/correlationId';
@@ -150,6 +151,42 @@ describe('correlationId middleware', () => {
         .set('Idempotency-Key', 'correlation-id-post-test')
         .send({ sender: 'A', recipient: 'B', depositAmount: '100', ratePerSecond: '1', startTime: 0 });
       expect(res.headers[CORRELATION_ID_HEADER]).toBeDefined();
+    });
+  });
+
+  describe('X-Request-ID header', () => {
+    it('sets X-Request-ID on a success (200) response', async () => {
+      const res = await request(app).get('/health');
+      expect(res.headers[REQUEST_ID_HEADER]).toBeDefined();
+      expect(typeof res.headers[REQUEST_ID_HEADER]).toBe('string');
+    });
+
+    it('X-Request-ID matches x-correlation-id on success responses', async () => {
+      const res = await request(app).get('/');
+      expect(res.headers[REQUEST_ID_HEADER]).toBe(res.headers[CORRELATION_ID_HEADER]);
+    });
+
+    it('X-Request-ID matches provided x-correlation-id when valid', async () => {
+      const clientId = 'aaaaaaaa-bbbb-4bbb-8bbb-cccccccccccc';
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, clientId);
+      expect(res.headers[REQUEST_ID_HEADER]).toBe(clientId);
+      expect(res.headers[REQUEST_ID_HEADER]).toBe(res.headers[CORRELATION_ID_HEADER]);
+    });
+
+    it('X-Request-ID is a valid UUID when inbound header is rejected', async () => {
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, 'bad-id');
+      expect(isValidCorrelationId(res.headers[REQUEST_ID_HEADER] as string)).toBe(true);
+    });
+
+    it('middleware sets X-Request-ID synchronously via setHeader', () => {
+      const req = { headers: {} } as any;
+      const setHeader = vi.fn();
+      const res = { setHeader } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(setHeader).toHaveBeenCalledWith(REQUEST_ID_HEADER, req.correlationId);
+        expect(setHeader).toHaveBeenCalledWith(CORRELATION_ID_HEADER, req.correlationId);
+      });
     });
   });
 });
