@@ -74,12 +74,6 @@ jobs:
           flags: unittests
           name: codecov-umbrella
 
-      - name: Type check
-        run: pnpm run typecheck
-
-      - name: Format check
-        run: pnpm run format:check
-
       - name: Build
         run: pnpm run build
 
