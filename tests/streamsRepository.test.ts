@@ -204,6 +204,83 @@ describe('streamRepository', () => {
       expect(record!.start_time).toBe(1700000000);
       expect(record!.end_time).toBe(1800000000);
     });
+
+    it('uses streamSelectColumns (not SELECT *) so addresses are decrypted', async () => {
+      const { streamSelectColumns } = await import('../src/db/queries/streams.js');
+      const selectColsMock = vi.mocked(streamSelectColumns);
+      selectColsMock.mockClear();
+
+      queryReturnsRows([makeRow()]);
+      await streamRepository.getById('stream-x');
+
+      // streamSelectColumns must have been called — meaning the query uses the
+      // decryption fragments instead of a bare SELECT *
+      expect(selectColsMock).toHaveBeenCalled();
+    });
+
+    it('passes current key as $2 and no previous key when rotation is inactive', async () => {
+      queryReturnsRows([makeRow()]);
+      await streamRepository.getById('stream-x');
+
+      // params[0] = id, params[1] = current key (no third param when no previous key)
+      const call = mockQuery.mock.calls.at(-1) as [unknown, string, unknown[]];
+      const params = call[2];
+      expect(params).toHaveLength(2);
+      expect(params[1]).toBe('test-key-32-bytes-padding-xxxxxx');
+    });
+
+    it('appends previous key as $3 when key rotation is active', async () => {
+      const { getConfig } = await import('../src/config/env.js');
+      vi.mocked(getConfig).mockReturnValueOnce({
+        pgcryptoKey: 'current-key-32-bytes-padding-xxx',
+        pgcryptoKeyPrevious: 'previous-key-32-bytes-padding-xx',
+      } as ReturnType<typeof getConfig>);
+
+      queryReturnsRows([makeRow()]);
+      await streamRepository.getById('stream-x');
+
+      const call = mockQuery.mock.calls.at(-1) as [unknown, string, unknown[]];
+      const params = call[2];
+      expect(params).toHaveLength(3);
+      expect(params[1]).toBe('current-key-32-bytes-padding-xxx');
+      expect(params[2]).toBe('previous-key-32-bytes-padding-xx');
+    });
+
+    it('returns the same decrypted address as findWithCursor for the same row', async () => {
+      // Both paths should map the row identically — the decryption happens in
+      // SQL, so the row returned to rowToRecord is already plaintext in both cases.
+      const decryptedRow = makeRow({
+        sender_address:    'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+      });
+
+      // getById call
+      queryReturnsRows([decryptedRow]);
+      const byId = await streamRepository.getById(decryptedRow['id'] as string);
+
+      // findWithCursor call (data query only — no count)
+      queryReturnsRows([decryptedRow]);
+      const cursor = await streamRepository.findWithCursor({}, 1);
+
+      expect(byId!.sender_address).toBe(cursor.streams[0]!.sender_address);
+      expect(byId!.recipient_address).toBe(cursor.streams[0]!.recipient_address);
+    });
+
+    it('throws when encryption is disabled (no PGCRYPTO_KEY configured)', async () => {
+      // When pgcryptoKey is absent the repository must fail closed — it cannot
+      // silently return ciphertext as if it were a valid Stellar address.
+      const { getConfig } = await import('../src/config/env.js');
+      vi.mocked(getConfig).mockReturnValueOnce({
+        pgcryptoKey: undefined,
+        pgcryptoKeyPrevious: undefined,
+      } as unknown as ReturnType<typeof getConfig>);
+
+      await expect(streamRepository.getById('stream-x')).rejects.toThrow(
+        'PGCRYPTO_KEY is required to encrypt and decrypt stream PII',
+      );
+      // The DB must not have been queried — no key means no query
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
   });
 
   // ── getByEvent ──────────────────────────────────────────────────────────────

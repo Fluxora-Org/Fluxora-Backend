@@ -7,23 +7,20 @@
  *   upsertStream uses INSERT … ON CONFLICT DO NOTHING so the same
  *   (transaction_hash, event_index) pair is safe to submit multiple times.
  *
- * Decimal-string invariant:
- *   Amount columns are stored and returned as TEXT.  No numeric coercion
- *   is performed here — callers own that responsibility.
+ * Decimal-string amounts:
+ *   All monetary fields (amount, streamed_amount, remaining_amount,
+ *   rate_per_second) are stored and returned as TEXT.  The repository never
+ *   converts them to numbers, preserving full precision across the
+ *   chain → DB → API boundary.
  *
- * Transactional operations
- * ------------------------
- * `transactionalUpsertStream` and `transactionalUpdateStream` wrap the stream
- * write, an audit_logs row, and an optional webhook_outbox row inside a single
- * SQLite transaction.  If any step fails the entire transaction is rolled back,
- * guaranteeing that the three tables are always in sync.
- *
- * Decimal-string amounts
- * ----------------------
- * All monetary fields (amount, streamed_amount, remaining_amount,
- * rate_per_second) are stored and returned as TEXT.  The repository never
- * converts them to numbers, preserving full precision across the
- * chain → DB → API boundary.
+ * PII encryption:
+ *   sender_address and recipient_address are stored encrypted via pgcrypto
+ *   (pgp_sym_encrypt with AES-256).  Every read path uses streamSelectColumns()
+ *   to emit decrypt_stream_address() SQL fragments so addresses are decrypted
+ *   inside PostgreSQL before the row reaches application code.  Encryption
+ *   keys are resolved from config via resolvePgcryptoKeys() and are never
+ *   logged or included in error messages.  Key rotation is supported via an
+ *   optional PGCRYPTO_KEY_PREVIOUS.
  *
  * @module db/repositories/streamRepository
  */
@@ -228,12 +225,36 @@ export const streamRepository = {
     });
   },
 
-  /** Fetch a single stream by its primary key. */
+  /**
+   * Fetch a single stream by its primary key.
+   *
+   * Uses {@link streamSelectColumns} with the resolved pgcrypto keyset so that
+   * `sender_address` and `recipient_address` are decrypted by the database
+   * before the row reaches the application layer.  This matches the decryption
+   * contract honoured by every other read path (`getByEvent`, `findWithCursor`,
+   * `find`).
+   *
+   * **Parameter layout** (built dynamically):
+   * - `$1`  — stream id
+   * - `$2`  — current encryption key (always present when pgcrypto is enabled)
+   * - `$3`  — previous encryption key (optional; omitted when key rotation is not active)
+   *
+   * **Security**: keys are sourced exclusively from {@link resolvePgcryptoKeys}
+   * and are never logged or included in error messages.
+   */
   async getById(id: string): Promise<StreamRecord | undefined> {
     enrichActiveSpanWithStream(id);
     return timed('getById', async () => {
       const pool = await getReadPool();
-      const result = await query<Record<string, unknown>>(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
+      const keySet = resolvePgcryptoKeys();
+      const params: unknown[] = [id, keySet.current];
+      const previousKeyIndex = keySet.previous ? params.length + 1 : undefined;
+      if (keySet.previous) params.push(keySet.previous);
+      const result = await query<Record<string, unknown>>(
+        pool,
+        `SELECT ${streamSelectColumns(2, previousKeyIndex)} FROM streams WHERE id = $1`,
+        params,
+      );
       if (result.rows[0]) {
         const record = rowToRecord(result.rows[0]);
         enrichActiveSpanWithStream(record.id, record.sender_address, record.recipient_address);
