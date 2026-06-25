@@ -4,8 +4,6 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import dns from 'node:dns';
-import net from 'node:net';
 import { logger } from '../lib/logger.js';
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -15,13 +13,29 @@ import type {
   WebhookDelivery,
   WebhookDeliveryAttempt,
   WebhookRetryPolicy,
+  DLQReasonCode,
 } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
-import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
-import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
+import {
+  calculateNextRetryTime,
+  scheduleWebhookOutboxRetry,
+  shouldRetry,
+  isRetryableStatusCode,
+  checkWebhookDeliveryGate,
+  attemptWebhookDeliveryWithRateLimit,
+  countsTowardCircuitBreaker,
+  type EnhancedRetryPolicy,
+} from './retry.js';
+import {
+  webhookDeliveriesTotal,
+  webhookDeliveryDurationSeconds,
+} from '../metrics/businessMetrics.js';
+import type {
+  WebhookCircuitBreakerStore,
+  CircuitBreakerPolicy,
+} from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import type { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
 import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
@@ -32,8 +46,6 @@ interface OutboxRow {
   event_type: string;
   payload: unknown;
   created_at: Date | string;
-  attempt_count: number;
-  next_attempt_at: Date | string;
 }
 
 interface DbClient {
@@ -79,7 +91,9 @@ function resolveWebhookRetryPolicy(override?: EnhancedRetryPolicy): EnhancedRetr
   const resetMs = parsePositiveInteger(process.env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS, 300_000);
   return {
     ...DEFAULT_RETRY_POLICY,
-    ...(threshold > 0 ? { circuitBreakerThreshold: threshold, circuitBreakerResetMs: resetMs } : {}),
+    ...(threshold > 0
+      ? { circuitBreakerThreshold: threshold, circuitBreakerResetMs: resetMs }
+      : {}),
     ...override,
   };
 }
@@ -87,90 +101,6 @@ function resolveWebhookRetryPolicy(override?: EnhancedRetryPolicy): EnhancedRetr
 function isLoopbackHostname(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
 }
-
-// ── SSRF-guard IP range helpers ───────────────────────────────────────────────
-
-/**
- * Returns true if the IPv4 address falls within any private, loopback,
- * link-local, or otherwise reserved range that must never be reached by an
- * outbound webhook delivery.
- *
- * Covered ranges (RFC 1918 / RFC 5735 / RFC 6598 and cloud metadata):
- *   127.0.0.0/8    — loopback
- *   10.0.0.0/8     — private class A
- *   172.16.0.0/12  — private class B
- *   192.168.0.0/16 — private class C
- *   169.254.0.0/16 — link-local / cloud instance metadata (169.254.169.254)
- *   0.0.0.0/8      — this-network
- *   100.64.0.0/10  — CGNAT shared address space
- *   240.0.0.0/4    — reserved (class E) + broadcast
- */
-function isPrivateIpv4(ip: string): boolean {
-  const parts = ip.split('.').map((p) => parseInt(p, 10));
-  const [a, b] = parts as [number, number, number, number];
-  return (
-    a === 127 ||                                // 127.0.0.0/8  loopback
-    a === 10 ||                                 // 10.0.0.0/8   private
-    (a === 172 && b >= 16 && b <= 31) ||        // 172.16.0.0/12 private
-    (a === 192 && b === 168) ||                 // 192.168.0.0/16 private
-    (a === 169 && b === 254) ||                 // 169.254.0.0/16 link-local / metadata
-    a === 0 ||                                  // 0.0.0.0/8    this-network
-    (a === 100 && b >= 64 && b <= 127) ||       // 100.64.0.0/10 CGNAT
-    a >= 240                                    // 240.0.0.0/4  reserved + broadcast
-  );
-}
-
-/**
- * Returns true if the IPv6 address falls within any private, loopback,
- * link-local, or IPv4-mapped private range.
- *
- * Covered ranges:
- *   ::1            — loopback
- *   fc00::/7       — unique local (ULA)
- *   fe80::/10      — link-local
- *   ::ffff:0:0/96  — IPv4-mapped (delegates to isPrivateIpv4)
- */
-function isPrivateIpv6(ip: string): boolean {
-  const lower = ip.toLowerCase();
-
-  if (lower === '::1' || lower === '::') return true;
-
-  // ULA: fc00::/7 — first group starts with fc or fd
-  if (lower.startsWith('fc') || lower.startsWith('fd')) return true;
-
-  // Link-local: fe80::/10 — first group starts with fe8x or fe9x or feax or febx
-  if (lower.startsWith('fe8') || lower.startsWith('fe9') ||
-      lower.startsWith('fea') || lower.startsWith('feb')) return true;
-
-  // IPv4-mapped: ::ffff:<v4>
-  if (lower.startsWith('::ffff:')) {
-    const v4part = lower.slice(7);
-    // Dotted-decimal form: ::ffff:127.0.0.1
-    if (net.isIPv4(v4part)) return isPrivateIpv4(v4part);
-    // Hex-group form: ::ffff:7f00:1  (two 16-bit hex groups → four octets)
-    const hexParts = v4part.split(':');
-    if (hexParts.length === 2) {
-      const hi = parseInt(hexParts[0]!, 16);
-      const lo = parseInt(hexParts[1]!, 16);
-      const reconstructed = [
-        (hi >> 8) & 0xff, hi & 0xff,
-        (lo >> 8) & 0xff, lo & 0xff,
-      ].join('.');
-      return isPrivateIpv4(reconstructed);
-    }
-  }
-
-  return false;
-}
-
-/** Returns true if ip (v4 or v6) is in any private or reserved range. */
-function isPrivateOrReservedIp(ip: string): boolean {
-  if (net.isIPv4(ip)) return isPrivateIpv4(ip);
-  if (net.isIPv6(ip)) return isPrivateIpv6(ip);
-  return true; // unrecognised format → fail-closed
-}
-
-// ── URL structural guard (synchronous) ───────────────────────────────────────
 
 function assertSafeWebhookEndpoint(endpointUrl: string): void {
   const url = new URL(endpointUrl);
@@ -183,86 +113,12 @@ function assertSafeWebhookEndpoint(endpointUrl: string): void {
     throw new Error('Webhook endpoint must use http or https');
   }
 
-  if (process.env.NODE_ENV === 'production' && url.protocol !== 'https:' && !isLoopbackHostname(url.hostname)) {
+  if (
+    process.env.NODE_ENV === 'production' &&
+    url.protocol !== 'https:' &&
+    !isLoopbackHostname(url.hostname)
+  ) {
     throw new Error('Webhook endpoint must use https in production');
-  }
-
-  // Fast-fail on IP literals that are obviously private — avoids a DNS round
-  // trip for the most common mis-configuration cases.
-  // The URL parser retains brackets on IPv6 literals ([::1] → hostname '[::1]');
-  // strip them so net.isIPv6 recognises the address correctly.
-  const bareHostname = url.hostname.startsWith('[') && url.hostname.endsWith(']')
-    ? url.hostname.slice(1, -1)
-    : url.hostname;
-  if (net.isIPv4(bareHostname) && isPrivateIpv4(bareHostname)) {
-    throw new Error('Webhook endpoint must not target a private or reserved IPv4 address');
-  }
-  if (net.isIPv6(bareHostname) && isPrivateIpv6(bareHostname)) {
-    throw new Error('Webhook endpoint must not target a private or reserved IPv6 address');
-  }
-}
-
-// ── DNS-resolving SSRF guard (asynchronous, used at point of egress) ─────────
-
-/**
- * Re-validates `endpointUrl` immediately before an outbound HTTP delivery to
- * close the TOCTOU / DNS-rebinding window that exists between registration
- * time and actual egress.
- *
- * Security contract:
- *   1. Runs the synchronous structural checks from `assertSafeWebhookEndpoint`.
- *   2. If the hostname is already a numeric IP literal, validates it directly.
- *   3. Otherwise resolves both A and AAAA records via the system DNS and
- *      validates every returned address against private / reserved ranges.
- *   4. Treats DNS resolution failure as unsafe (fail-closed): if no IP can be
- *      resolved the endpoint is blocked.
- *
- * Must be called inside `deliverRow` immediately before the outbound fetch so
- * that the check and the network connection happen as close together in time
- * as possible, minimising the DNS-rebinding window.
- *
- * On failure throws an Error — callers must route the row to the DLQ rather
- * than scheduling a retry (the address will not become safe by retrying).
- */
-async function assertSafeWebhookEndpointWithDns(endpointUrl: string): Promise<void> {
-  // Run the cheap synchronous structural checks first (credentials, protocol,
-  // obvious IP literals).  This also throws on private IP literals directly,
-  // so we never hit the DNS path for `http://127.0.0.1/…` style URLs.
-  assertSafeWebhookEndpoint(endpointUrl);
-
-  const rawHostname = new URL(endpointUrl).hostname;
-  // Strip IPv6 bracket notation ([::1] → ::1) kept by the URL parser so
-  // net.isIP recognises the address and skips the unnecessary DNS path.
-  const hostname = rawHostname.startsWith('[') && rawHostname.endsWith(']')
-    ? rawHostname.slice(1, -1)
-    : rawHostname;
-
-  // IP literals are already validated by the sync check above.
-  if (net.isIP(hostname) !== 0) return;
-
-  // Resolve the hostname using the DNS wire protocol (bypasses /etc/hosts to
-  // prevent host-file poisoning from trivially defeating the guard).
-  const resolvedIps: string[] = [];
-
-  await Promise.allSettled([
-    dns.promises.resolve4(hostname).then((addrs) => resolvedIps.push(...addrs)).catch(() => undefined),
-    dns.promises.resolve6(hostname).then((addrs) => resolvedIps.push(...addrs)).catch(() => undefined),
-  ]);
-
-  // Fail-closed: if DNS returned no addresses we cannot confirm the target is
-  // safe, so we block delivery.
-  if (resolvedIps.length === 0) {
-    throw new Error(
-      `Webhook endpoint hostname '${hostname}' could not be resolved via DNS; treating as unsafe`,
-    );
-  }
-
-  for (const ip of resolvedIps) {
-    if (isPrivateOrReservedIp(ip)) {
-      throw new Error(
-        `Webhook endpoint hostname '${hostname}' resolves to a private or reserved IP address; delivery blocked`,
-      );
-    }
   }
 }
 
@@ -291,6 +147,7 @@ function extractAttemptNumber(payload: unknown): number {
 function enqueuePermanentFailureToDlq(
   delivery: WebhookDelivery,
   failureReason: string,
+  reasonCode: DLQReasonCode = 'other'
 ): string | undefined {
   const alreadyQueued = webhookDeliveryStore
     .getDeadLetterQueueItems()
@@ -303,7 +160,129 @@ function enqueuePermanentFailureToDlq(
     return undefined;
   }
 
-  return webhookDeliveryStore.addToDeadLetterQueue(delivery, failureReason);
+  return webhookDeliveryStore.addToDeadLetterQueue(delivery, failureReason, reasonCode);
+}
+
+/**
+ * Validate a webhook payload for structural integrity.
+ *
+ * A payload is considered structurally invalid if:
+ * - It is a non-empty string that fails to parse as JSON (unless it's a simple string)
+ * - It is excessively large (>10MB to prevent resource exhaustion)
+ * - It appears to be binary garbage (contains non-UTF8 characters)
+ *
+ * @throws {string} Error message describing the validation failure, if the payload is poisoned
+ */
+function validateWebhookPayload(payload: unknown): void {
+  // Check if payload is oversized (potential DoS vector)
+  if (typeof payload === 'string' && payload.length > 10 * 1024 * 1024) {
+    throw 'Payload exceeds maximum size of 10MB (likely garbage or DoS attempt)';
+  }
+
+  // If it's a string, verify it's valid JSON or a reasonable simple string
+  if (typeof payload === 'string') {
+    // Try to parse as JSON first
+    try {
+      JSON.parse(payload);
+      // Successfully parsed - this is valid JSON
+      return;
+    } catch {
+      // Failed to parse. Check if this looks like an attempt at JSON (starts with { or [)
+      const trimmed = payload.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        // Looks like JSON but failed to parse - definitely poison
+        throw `Payload starts with JSON marker but is not valid JSON`;
+      }
+
+      // If it's not JSON-like, check if it's binary garbage
+      // Allow simple strings but reject if any character is outside printable ASCII range
+      if (payload.length > 1000) {
+        // Check if the first 100 chars contain any non-printable characters
+        let hasNonPrintable = false;
+        const checkStr = payload.substring(0, 100);
+        for (let i = 0; i < checkStr.length; i++) {
+          const code = checkStr.charCodeAt(i);
+          // Allow printable ASCII (0x20-0x7E) and common whitespace (0x09, 0x0A, 0x0D)
+          if (
+            !((code >= 0x20 && code <= 0x7e) || code === 0x09 || code === 0x0a || code === 0x0d)
+          ) {
+            hasNonPrintable = true;
+            break;
+          }
+        }
+        if (hasNonPrintable) {
+          throw 'Payload appears to be binary garbage (non-UTF8 characters detected)';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Validate a webhook endpoint URL for structural integrity.
+ *
+ * A URL is considered invalid (poison) if:
+ * - It cannot be parsed as a valid URL
+ * - It uses an unsupported protocol (not http/https)
+ * - It includes credentials (security risk)
+ *
+ * @throws {string} Error message describing the validation failure
+ */
+function validateWebhookUrl(endpointUrl: string): void {
+  let url: URL;
+  try {
+    url = new URL(endpointUrl);
+  } catch {
+    throw `Webhook endpoint URL is unparseable: ${endpointUrl}`;
+  }
+
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw `Webhook endpoint must use http or https, got: ${url.protocol}`;
+  }
+
+  if (url.username || url.password) {
+    throw 'Webhook endpoint must not include credentials in URL';
+  }
+}
+
+/**
+ * Classify a delivery failure as "poison" (deterministic/non-retryable).
+ *
+ * A failure is poison if it will deterministically recur on every retry:
+ * - Structurally invalid payload
+ * - Unparseable endpoint URL
+ * - Non-retryable HTTP status code (4xx except rate-limiting codes)
+ *
+ * Returns a DLQReasonCode to distinguish poison from exhausted retries.
+ */
+function classifyPoisonFailure(
+  payload: unknown,
+  endpointUrl: string,
+  statusCode: number | undefined,
+  policy: EnhancedRetryPolicy
+): DLQReasonCode | null {
+  // Check for structurally invalid payload
+  try {
+    validateWebhookPayload(payload);
+  } catch {
+    return 'poison';
+  }
+
+  // Check for unparseable URL
+  try {
+    validateWebhookUrl(endpointUrl);
+  } catch {
+    return 'poison';
+  }
+
+  // Check for non-retryable status codes (4xx except rate-limiting)
+  if (statusCode !== undefined && !isRetryableStatusCode(statusCode, policy)) {
+    if (statusCode >= 400 && statusCode < 500) {
+      return 'poison';
+    }
+  }
+
+  return null;
 }
 
 export class WebhookService {
@@ -312,7 +291,7 @@ export class WebhookService {
 
   constructor(
     policy: EnhancedRetryPolicy = resolveWebhookRetryPolicy(),
-    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore(),
+    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore()
   ) {
     this.policy = policy;
     this.circuitBreakerStore = circuitBreakerStore;
@@ -324,7 +303,7 @@ export class WebhookService {
   async queueDelivery(
     event: WebhookEvent,
     endpointUrl: string,
-    secret: string,
+    secret: string
   ): Promise<WebhookDelivery> {
     const deliveryId = `deliv_${randomUUID()}`;
     const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -377,17 +356,21 @@ export class WebhookService {
   async runDeliveryAttempt(
     delivery: WebhookDelivery,
     secret: string,
-    timestamp?: string,
+    timestamp?: string
   ): Promise<WebhookDeliveryAttempt> {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
     const correlationId = getCorrelationId();
-    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
-      deliveryId: delivery.deliveryId,
-      eventType: delivery.eventType,
-      attemptNumber,
-      maxAttempts: this.policy.maxAttempts,
-    });
+    logger.info(
+      'Attempting webhook delivery',
+      correlationId !== 'unknown' ? correlationId : undefined,
+      {
+        deliveryId: delivery.deliveryId,
+        eventType: delivery.eventType,
+        attemptNumber,
+        maxAttempts: this.policy.maxAttempts,
+      }
+    );
 
     const signature = computeWebhookSignature(secret, ts, delivery.payload);
     const attempt: WebhookDeliveryAttempt = {
@@ -404,7 +387,7 @@ export class WebhookService {
         delivery.eventType,
         ts,
         signature,
-        correlationId,
+        correlationId
       );
       attempt.statusCode = response.status;
 
@@ -485,7 +468,7 @@ export class WebhookService {
 
   private async recordBreakerOutcome(
     endpointUrl: string,
-    attempt: WebhookDeliveryAttempt,
+    attempt: WebhookDeliveryAttempt
   ): Promise<number> {
     const success =
       attempt.statusCode !== undefined &&
@@ -496,7 +479,7 @@ export class WebhookService {
     if (success) {
       const record = await this.circuitBreakerStore.recordSuccess(
         endpointUrl,
-        this.policy as CircuitBreakerPolicy,
+        this.policy as CircuitBreakerPolicy
       );
       return record.consecutiveFailures;
     }
@@ -509,7 +492,7 @@ export class WebhookService {
     const record = await this.circuitBreakerStore.recordFailure(
       endpointUrl,
       this.policy as CircuitBreakerPolicy,
-      Date.now(),
+      Date.now()
     );
     return record.consecutiveFailures;
   }
@@ -520,17 +503,21 @@ export class WebhookService {
   async attemptDelivery(
     delivery: WebhookDelivery,
     secret: string,
-    timestamp?: string,
+    timestamp?: string
   ): Promise<void> {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
 
     const correlationId = getCorrelationId();
-    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
-      deliveryId: delivery.deliveryId,
-      attempt: attemptNumber,
-      maxAttempts: this.policy.maxAttempts,
-    });
+    logger.info(
+      'Attempting webhook delivery',
+      correlationId !== 'unknown' ? correlationId : undefined,
+      {
+        deliveryId: delivery.deliveryId,
+        attempt: attemptNumber,
+        maxAttempts: this.policy.maxAttempts,
+      }
+    );
 
     const attempt = await this.runDeliveryAttempt(delivery, secret, ts);
     const consecutiveFailures = await this.recordBreakerOutcome(delivery.endpointUrl, attempt);
@@ -578,7 +565,7 @@ export class WebhookService {
     eventType: string,
     timestamp: string,
     signature: string,
-    correlationId?: string,
+    correlationId?: string
   ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
@@ -707,7 +694,9 @@ export class WebhookDispatcher {
     if (!this.stopped) return;
 
     if (!this.endpointUrl || !this.secret) {
-      logger.warn('Webhook outbox dispatcher disabled; WEBHOOK_URL and WEBHOOK_SECRET are required');
+      logger.warn(
+        'Webhook outbox dispatcher disabled; WEBHOOK_URL and WEBHOOK_SECRET are required'
+      );
       return;
     }
 
@@ -750,14 +739,16 @@ export class WebhookDispatcher {
     if (!this.endpointUrl || !this.secret) return null;
 
     const payload = normalizePayload(row.payload);
-    const payloadObject = typeof payload === 'object' && payload !== null
-      ? payload as Record<string, unknown>
-      : {};
+    const payloadObject =
+      typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
     const endpointUrl =
-      typeof payloadObject['endpointUrl'] === 'string' ? payloadObject['endpointUrl'] : this.endpointUrl;
+      typeof payloadObject['endpointUrl'] === 'string'
+        ? payloadObject['endpointUrl']
+        : this.endpointUrl;
     const secret =
       typeof payloadObject['secret'] === 'string' ? payloadObject['secret'] : this.secret;
 
+    assertSafeWebhookEndpoint(endpointUrl);
     return { endpointUrl, secret };
   }
 
@@ -771,16 +762,15 @@ export class WebhookDispatcher {
       await client.query('BEGIN');
       const result = await client.query<OutboxRow>(
         `
-          SELECT id, stream_id, event_type, payload, created_at,
-                 attempt_count, next_attempt_at
+          SELECT id, stream_id, event_type, payload, created_at
           FROM webhook_outbox
           WHERE processed = false
-            AND next_attempt_at <= NOW()
-          ORDER BY next_attempt_at ASC, COALESCE((payload->>'ledger')::numeric, 0) ASC, payload->>'id' ASC, id ASC
+            AND created_at <= NOW()
+          ORDER BY created_at ASC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         `,
-        [this.batchSize],
+        [this.batchSize]
       );
 
       if (result.rows.length === 0) {
@@ -803,42 +793,55 @@ export class WebhookDispatcher {
     }
   }
 
-  /**
-   * Deliver a single outbox row to the configured consumer endpoint.
-   *
-   * Security contract — SSRF re-validation at egress:
-   *   `resolveEndpoint` performs a fast synchronous structural check when the
-   *   row is first read from the DB.  `deliverRow` then calls
-   *   `assertSafeWebhookEndpointWithDns` a second time — at the point of
-   *   egress — to close the TOCTOU / DNS-rebinding window that exists between
-   *   the two calls.  If the check fails (private IP, DNS resolution failure,
-   *   or any reserved range) the row is immediately marked processed and
-   *   routed to the dead-letter queue.  It is NOT retried: a URL that targets
-   *   an internal address will not become safe on the next attempt.
-   */
   private async deliverRow(client: DbClient, row: OutboxRow): Promise<void> {
     const endpoint = this.resolveEndpoint(row);
     if (!endpoint) {
-      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, { outboxId: row.id });
+      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, {
+        outboxId: row.id,
+      });
       return;
     }
 
-    // Re-run the full async SSRF guard (DNS resolution + IP range check)
-    // immediately before egress to mitigate DNS rebinding and DB-tampering
-    // attacks on persisted outbox rows.
+    const payload = normalizePayload(row.payload);
+    const payloadString = JSON.stringify(payload);
+    const attemptNumber = extractAttemptNumber(payload);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // POISON DETECTION: Check for structurally invalid or unparseable data
+    // ─────────────────────────────────────────────────────────────────────
+    let poisonReason: DLQReasonCode | null = null;
+
     try {
-      await assertSafeWebhookEndpointWithDns(endpoint.endpointUrl);
-    } catch (ssrfErr) {
-      const reason = ssrfErr instanceof Error ? ssrfErr.message : String(ssrfErr);
-      logger.error(
-        'Webhook outbox row blocked by SSRF guard at delivery time; routing to DLQ',
-        undefined,
-        { outboxId: row.id, reason },
-      );
-      // Mark processed so the row is never re-polled.
-      await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
-      // Route to DLQ so operators can inspect and replay after fixing the endpoint.
-      const blockedDelivery: WebhookDelivery = {
+      validateWebhookPayload(payload);
+    } catch (error) {
+      poisonReason = 'poison';
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.error('Webhook payload is structurally invalid (poison)', undefined, {
+        outboxId: row.id,
+        streamId: row.stream_id,
+        error: errorMsg,
+      });
+    }
+
+    // Check URL validity on first attempt to fail fast on unparseable URLs
+    if (!poisonReason && attemptNumber === 1) {
+      try {
+        validateWebhookUrl(endpoint.endpointUrl);
+      } catch (error) {
+        poisonReason = 'poison';
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        logger.error('Webhook endpoint URL is unparseable (poison)', undefined, {
+          outboxId: row.id,
+          streamId: row.stream_id,
+          url: endpoint.endpointUrl,
+          error: errorMsg,
+        });
+      }
+    }
+
+    // Fast-track poison to DLQ without retrying
+    if (poisonReason) {
+      const delivery: WebhookDelivery = {
         id: `outbox_${row.id}`,
         deliveryId: `outbox_${row.id}`,
         eventId: row.stream_id,
@@ -848,15 +851,19 @@ export class WebhookDispatcher {
         attempts: [],
         createdAt: new Date(row.created_at).getTime(),
         updatedAt: Date.now(),
-        payload: JSON.stringify(normalizePayload(row.payload)),
+        payload: payloadString,
       };
-      enqueuePermanentFailureToDlq(blockedDelivery, `SSRF guard blocked delivery: ${reason}`);
+
+      enqueuePermanentFailureToDlq(
+        delivery,
+        'Webhook payload or endpoint is structurally invalid and non-retryable',
+        poisonReason
+      );
+
+      await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
       return;
     }
 
-    const payload = normalizePayload(row.payload);
-    const payloadString = JSON.stringify(payload);
-    const attemptNumber = extractAttemptNumber(payload);
     const delivery: WebhookDelivery = {
       id: `outbox_${row.id}`,
       deliveryId: `outbox_${row.id}`,
@@ -887,30 +894,61 @@ export class WebhookDispatcher {
         circuitBreakerStore: this.circuitBreakerStore,
         rateLimiter: this.rateLimiter,
         rateLimitConfig: this.rateLimitConfig,
-      },
+      }
     );
 
-    // --- Durable retry: persist checkpoint before marking processed ---
+    await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
+
     if (!result.attempt) {
-      // Gate blocked (circuit breaker / rate limit): update next_attempt_at in-place
       if (result.shouldRetry && result.retryAt) {
         await client.query(
-          `UPDATE webhook_outbox
-              SET next_attempt_at = $1,
-                  attempt_count   = attempt_count + 1
-            WHERE id = $2`,
-          [result.retryAt, row.id],
+          `
+            INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
+            VALUES ($1, $2, $3::jsonb, $4, false)
+          `,
+          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt]
         );
-      } else {
-        // Exhausted without an attempt — mark processed (DLQ route below)
-        await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
       }
       return;
     }
 
     const attempt = result.attempt;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // POISON DETECTION: Check for non-retryable status codes after first attempt
+    // ─────────────────────────────────────────────────────────────────────
+    const failureReasonCode = classifyPoisonFailure(
+      payload,
+      endpoint.endpointUrl,
+      attempt.statusCode,
+      this.policy
+    );
+
+    if (failureReasonCode === 'poison') {
+      delivery.status = 'permanent_failure';
+      delivery.attempts.push(attempt);
+
+      logger.error('Webhook delivery detected as poison (non-retryable failure)', undefined, {
+        deliveryId: delivery.deliveryId,
+        statusCode: attempt.statusCode,
+        error: attempt.error,
+        attemptNumber,
+      });
+
+      enqueuePermanentFailureToDlq(
+        delivery,
+        attempt.error
+          ? `Poison detected: ${attempt.error}`
+          : `Poison detected: non-retryable status ${attempt.statusCode}`,
+        'poison'
+      );
+
+      return;
+    }
+
     if (result.shouldRetry) {
-      attempt.nextRetryAt = result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
+      attempt.nextRetryAt =
+        result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
       delivery.status = 'pending';
     } else if (
       attempt.statusCode !== undefined &&
@@ -923,27 +961,21 @@ export class WebhookDispatcher {
       delivery.status = 'permanent_failure';
     }
 
-    if (delivery.status === 'pending' && result.shouldRetry && result.retryAt) {
-      // Persist retry checkpoint — row stays unprocessed, poller picks it up after next_attempt_at
-      await client.query(
-        `UPDATE webhook_outbox
-            SET next_attempt_at = $1,
-                attempt_count   = $2,
-                payload         = $3::jsonb
-          WHERE id = $4`,
-        [result.retryAt, attemptNumber, JSON.stringify(result.payload), row.id],
-      );
-    } else {
-      // Delivered or permanent failure — mark done
-      await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
+    if (delivery.status === 'delivered' || delivery.status === 'permanent_failure') {
+      return;
     }
 
-    if (delivery.status === 'permanent_failure') {
-      const failureReason = attempt.error
-        ? `${attempt.error} after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`
-        : `HTTP ${attempt.statusCode} after ${attemptNumber} attempt${attemptNumber === 1 ? '' : 's'}`;
-      enqueuePermanentFailureToDlq(delivery, failureReason);
+    if (!result.shouldRetry || !result.retryAt) {
+      return;
     }
+
+    await client.query(
+      `
+        INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
+        VALUES ($1, $2, $3::jsonb, $4, false)
+      `,
+      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt]
+    );
   }
 }
 
