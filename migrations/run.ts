@@ -1,38 +1,23 @@
-import { db } from '../src/db/client';
-import * as migration000 from './000_initial_schema';
-import * as migration001 from './001_add_contract_events_replay_indexes';
-import * as migration002 from './002_create_replay_cursors';
+/**
+ * @deprecated
+ *
+ * This file previously ran a hand-rolled PoolClient-based migration loop.
+ * It has been superseded by `src/db/migrate.ts` which uses node-pg-migrate
+ * as the single migration runner for all files in this directory.
+ *
+ * The package.json `migrate` script now points directly at
+ * `src/db/migrate.ts`; this file is kept only as a tombstone so that any
+ * CI/CD or developer scripts that still reference it receive a clear error
+ * instead of silently applying nothing.
+ *
+ * Run migrations with:
+ *   pnpm run migrate
+ * which executes:
+ *   tsx src/db/migrate.ts
+ */
 
-const migrations = [
-  { name: '000_initial_schema', module: migration000 },
-  { name: '001_add_contract_events_replay_indexes', module: migration001 },
-  { name: '002_create_replay_cursors', module: migration002 },
-];
-
-
-async function runMigrations() {
-  const client = await db.getClient();
-  
-  try {
-    console.log('Starting migrations...');
-    
-    for (const migration of migrations) {
-      console.log(`\nRunning migration: ${migration.name}`);
-      await migration.module.up(client);
-      console.log(`✓ Migration ${migration.name} completed`);
-    }
-    
-    console.log('\n✓ All migrations completed successfully');
-  } catch (error) {
-    console.error('Migration failed:', error);
-    throw error;
-  } finally {
-    client.release();
-    await db.close();
-  }
-}
-
-runMigrations().catch((error) => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+console.error(
+  '[migrations/run.ts] This runner is no longer active.\n' +
+  'Use `pnpm run migrate` (→ src/db/migrate.ts) to apply migrations.\n',
+);
+process.exit(1);

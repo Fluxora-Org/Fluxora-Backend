@@ -37,6 +37,7 @@ export function generateToken(payload: UserPayload): string {
         'dlq:read',
         'dlq:replay',
         'dlq:delete',
+        'dlq:consumer:resume',
         'audit:read',
       ];
     } else {

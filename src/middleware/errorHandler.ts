@@ -4,6 +4,9 @@ import { SerializationLogger, error as logError } from '../utils/logger.js';
 import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
+import { ApiError } from '../errors.js';
+
+export { ApiError } from '../errors.js';
 
 export interface ApiErrorResponse {
   success: false;
@@ -24,19 +27,8 @@ export enum ApiErrorCode {
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
   UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
+  UNSUPPORTED_MEDIA_TYPE = 'UNSUPPORTED_MEDIA_TYPE',
   GATEWAY_TIMEOUT = 'GATEWAY_TIMEOUT',
-}
-
-export class ApiError extends Error {
-  constructor(
-    public readonly code: ApiErrorCode,
-    message: string,
-    public readonly statusCode: number = 500,
-    public readonly details?: unknown,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
 }
 
 /**
@@ -78,9 +70,17 @@ export function errorHandler(
 
   if (err instanceof ApiError) {
     logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
-    res.status(err.statusCode).json(
-      errorResponse(err.code, err.message, err.details, requestId)
-    );
+
+    if (err.expose) {
+      res.status(err.statusCode).json(
+        errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
+      );
+    } else {
+      res.status(err.statusCode).json({
+        success: false,
+        message: 'Internal server error',
+      });
+    }
     return;
   }
 
@@ -116,14 +116,10 @@ export function errorHandler(
     requestId,
   });
 
-  res.status(500).json(
-    errorResponse(
-      ApiErrorCode.INTERNAL_ERROR,
-      'An unexpected error occurred. Please try again later.',
-      undefined,
-      requestId
-    )
-  );
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+  });
 }
 
 /** Async handler wrapper */

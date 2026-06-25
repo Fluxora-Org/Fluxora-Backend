@@ -27,6 +27,7 @@ const SECRET_ENV_NAMES = new Set([
   'ADMIN_API_TOKEN',
   'ADMIN_API_KEY',
   'API_KEYS',
+  'API_KEY_PEPPER',
   'FLUXORA_WEBHOOK_SECRET',
   'FLUXORA_WEBHOOK_SECRET_PREVIOUS',
 ]);
@@ -171,6 +172,10 @@ export const EnvSchema = z.object({
   DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
   SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
   STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+  /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. 0 = disabled. */
+  REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
+  /** Max requests allowed to queue on the replica pool before fast-failing. */
+  REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(25),
 
   REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
   REDIS_ENABLED: booleanEnv().default(true),
@@ -204,6 +209,16 @@ export const EnvSchema = z.object({
   ),
   JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
   API_KEYS: z.string().optional(),
+  /**
+   * Server-side pepper mixed into every API-key hash. Keeping it out of the
+   * database means a leaked `api_keys` table cannot be brute-forced offline.
+   * Optional so non-API-key deployments still boot; required at runtime by the
+   * hashing helpers, which fail closed when it is absent.
+   */
+  API_KEY_PEPPER: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional(),
+  ),
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
   ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
@@ -236,6 +251,7 @@ export const EnvSchema = z.object({
   WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
   WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv('WEBHOOK_CIRCUIT_BREAKER_THRESHOLD', 0, 1000).default(0),
   WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(300_000),
+  WEBHOOK_ALLOWED_HOSTS: optionalString('WEBHOOK_ALLOWED_HOSTS'),
 
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
   ENABLE_RATE_LIMIT: booleanEnv().optional(),
@@ -248,6 +264,10 @@ export const EnvSchema = z.object({
   SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
   SSE_MAX_CONNECTION_DURATION_MS: integerEnv('SSE_MAX_CONNECTION_DURATION_MS', 1, 86_400_000).default(30 * 60 * 1000),
   SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
+  /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
+  SSE_RETRY_MS: integerEnv('SSE_RETRY_MS', 100, 300_000).default(5000),
+  /** Interval in milliseconds between SSE heartbeat comments per connection. */
+  SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
   INDEXER_ENABLED: booleanEnv().default(false),
   WORKER_ENABLED: booleanEnv().default(false),
   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
@@ -313,6 +333,10 @@ export interface Config {
   databaseIdleTimeout: number;
   slowQueryThresholdMs: number;
   statementTimeoutMs: number;
+  /** statement_timeout for replica connections (ms). Defaults to statementTimeoutMs. 0 = disabled. */
+  replicaStatementTimeoutMs: number;
+  /** Max queued requests on the replica pool before fast-failing. */
+  replicaQueueLimit: number;
 
   redisUrl: string;
   redisEnabled: boolean;
@@ -331,6 +355,8 @@ export interface Config {
   pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
+  /** Server-side pepper for API-key hashing. Never logged. */
+  apiKeyPepper?: string | undefined;
   indexerWorkerToken: string;
 
   maxRequestSizeBytes: number;
@@ -351,6 +377,7 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
+  webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -363,6 +390,10 @@ export interface Config {
   sseMaxGlobalConnections: number;
   sseMaxConnectionDurationMs: number;
   sseRetryAfterSeconds: number;
+  /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
+  sseRetryMs: number;
+  /** Interval in milliseconds between per-connection SSE heartbeat comments. */
+  sseHeartbeatIntervalMs: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
   indexerStallThresholdMs: number;
@@ -454,6 +485,8 @@ function toConfig(env: ParsedEnv): Config {
     databaseIdleTimeout: env.DB_IDLE_TIMEOUT,
     slowQueryThresholdMs: env.SLOW_QUERY_THRESHOLD_MS,
     statementTimeoutMs: env.STATEMENT_TIMEOUT_MS,
+    replicaStatementTimeoutMs: env.REPLICA_STATEMENT_TIMEOUT_MS ?? env.STATEMENT_TIMEOUT_MS,
+    replicaQueueLimit: env.REPLICA_QUEUE_LIMIT,
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
@@ -475,6 +508,7 @@ function toConfig(env: ParsedEnv): Config {
       .split(',')
       .map((key) => key.trim())
       .filter((key) => key.length > 0),
+    apiKeyPepper: env.API_KEY_PEPPER,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
 
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
@@ -495,6 +529,9 @@ function toConfig(env: ParsedEnv): Config {
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
     webhookRetryRps: env.WEBHOOK_RETRY_RPS,
+    webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
+      : undefined,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
@@ -507,6 +544,8 @@ function toConfig(env: ParsedEnv): Config {
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
     sseMaxConnectionDurationMs: env.SSE_MAX_CONNECTION_DURATION_MS,
     sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
+    sseRetryMs: env.SSE_RETRY_MS,
+    sseHeartbeatIntervalMs: env.SSE_HEARTBEAT_INTERVAL_MS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,

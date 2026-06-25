@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
 // ── Mock the pool module before importing the repository ─────────────────────
 const mockQuery = vi.fn();
+const mockGetReadPool = vi.fn();
 vi.mock('../src/db/pool.js', () => ({
   getPool:           vi.fn(() => ({})),
   query:             (...args: unknown[]) => mockQuery(...args),
@@ -18,6 +19,41 @@ vi.mock('../src/db/pool.js', () => ({
   DuplicateEntryError: class DuplicateEntryError extends Error {
     constructor(d?: string) { super(d ?? 'duplicate'); this.name = 'DuplicateEntryError'; }
   },
+}));
+
+vi.mock('../src/db/replicaPool.js', () => ({
+  getReadPool: (...args: unknown[]) => mockGetReadPool(...args),
+}));
+
+vi.mock('../src/config/env.js', () => ({
+  getConfig: vi.fn(() => ({ pgcryptoKey: 'test-key-32-bytes-padding-xxxxxx', pgcryptoKeyPrevious: undefined })),
+  initializeConfig: vi.fn(),
+}));
+
+vi.mock('../src/pii/pgcryptoEncryption.js', () => ({
+  computeAddressHashes: vi.fn(() => ({ current: 'hash', previous: undefined })),
+}));
+
+vi.mock('../src/tracing/hooks.js', () => ({
+  enrichActiveSpanWithStream: vi.fn(),
+}));
+
+vi.mock('../src/db/queries/streams.js', () => ({
+  encryptAddressValue: vi.fn((col: number) => `$${col}`),
+  streamSelectColumns: vi.fn(() => '*'),
+  senderAddressFilterCondition: vi.fn((f: number) => `sender_address = $${f}`),
+  recipientAddressFilterCondition: vi.fn((f: number) => `recipient_address = $${f}`),
+}));
+
+vi.mock('../src/metrics/dbMetrics.js', () => ({
+  dbQueryDurationSeconds: { startTimer: vi.fn(() => vi.fn()) },
+}));
+
+vi.mock('../src/utils/logger.js', () => ({
+  info: vi.fn(),
+  debug: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
 }));
 
 import { streamRepository } from '../src/db/repositories/streamRepository.js';
@@ -186,6 +222,70 @@ describe('streamRepository', () => {
     });
   });
 
+  // ── existsById ───────────────────────────────────────────────────────────────
+
+  describe('existsById', () => {
+    it('returns existence record when stream exists', async () => {
+      const mockPool = {};
+      mockGetReadPool.mockResolvedValue(mockPool);
+      mockQuery.mockResolvedValueOnce({ rows: [{ updated_at: new Date('2024-01-01T00:00:00Z') }] });
+
+      const result = await streamRepository.existsById('stream-abc');
+
+      expect(result).toBeDefined();
+      expect(result!.updated_at).toBe('2024-01-01T00:00:00.000Z');
+      expect(mockGetReadPool).toHaveBeenCalled();
+      expect(mockQuery).toHaveBeenCalledWith(
+        mockPool,
+        'SELECT updated_at FROM streams WHERE id = $1',
+        ['stream-abc'],
+      );
+    });
+
+    it('returns undefined when stream does not exist', async () => {
+      const mockPool = {};
+      mockGetReadPool.mockResolvedValue(mockPool);
+      queryReturnsEmpty();
+
+      const result = await streamRepository.existsById('nonexistent');
+
+      expect(result).toBeUndefined();
+      expect(mockGetReadPool).toHaveBeenCalled();
+    });
+
+    it('uses read pool via getReadPool', async () => {
+      const mockPool = {};
+      mockGetReadPool.mockResolvedValue(mockPool);
+      mockQuery.mockResolvedValueOnce({ rows: [{ updated_at: new Date() }] });
+
+      await streamRepository.existsById('stream-abc');
+
+      expect(mockGetReadPool).toHaveBeenCalled();
+    });
+
+    it('propagates errors from read pool', async () => {
+      mockGetReadPool.mockRejectedValue(new Error('replica connection failed'));
+
+      await expect(streamRepository.existsById('stream-abc')).rejects.toThrow('replica connection failed');
+    });
+
+    it('falls back to primary pool when replica is unavailable (via getReadPool)', async () => {
+      const mockPrimaryPool = { isPrimary: true };
+      mockGetReadPool.mockResolvedValue(mockPrimaryPool);
+      mockQuery.mockResolvedValueOnce({ rows: [{ updated_at: new Date('2024-01-01T00:00:00Z') }] });
+
+      const result = await streamRepository.existsById('stream-abc');
+
+      expect(result).toBeDefined();
+      expect(mockGetReadPool).toHaveBeenCalled();
+      expect(mockQuery).toHaveBeenCalledWith(
+        mockPrimaryPool,
+        'SELECT updated_at FROM streams WHERE id = $1',
+        ['stream-abc'],
+      );
+    });
+  });
+
   // ── updateStream ────────────────────────────────────────────────────────────
 
   describe('updateStream', () => {
@@ -311,6 +411,103 @@ describe('streamRepository', () => {
       expect(counts.paused).toBe(2);
       expect(counts.cancelled).toBe(1);
       expect(counts.completed).toBe(0);
+    });
+  });
+
+  // ── find (offset pagination) ────────────────────────────────────────────────
+
+  describe('find', () => {
+    /**
+     * Helper that builds a row with a caller-controlled `created_at` so we can
+     * simulate multiple rows sharing the exact same timestamp (the tied-
+     * timestamp scenario that triggered this fix).
+     */
+    function makeRowAt(id: string, createdAt: Date): Record<string, unknown> {
+      return makeRow({ id, created_at: createdAt, updated_at: createdAt });
+    }
+
+    it('returns streams ordered by created_at DESC, id DESC (ORDER BY tiebreaker)', async () => {
+      const sharedTs = new Date('2024-06-01T12:00:00.000Z');
+      // DB returns rows already in the expected order (repo maps them as-is)
+      const rows = [
+        makeRowAt('stream-z', sharedTs),
+        makeRowAt('stream-m', sharedTs),
+        makeRowAt('stream-a', sharedTs),
+      ];
+      // find() issues two parallel queries: COUNT(*) then SELECT
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '3' }] }); // COUNT
+      mockQuery.mockResolvedValueOnce({ rows });                    // SELECT
+
+      const result = await streamRepository.find({}, { limit: 10, offset: 0 });
+
+      expect(result.streams.map(s => s.id)).toEqual(['stream-z', 'stream-m', 'stream-a']);
+      // Confirm the SELECT SQL contains the tiebreaker ordering
+      const selectCall = mockQuery.mock.calls.find(
+        (call: any[]) => typeof call[1] === 'string' && call[1].includes('ORDER BY'),
+      );
+      expect(selectCall).toBeDefined();
+      expect(selectCall![1]).toMatch(/ORDER BY created_at DESC, id DESC/);
+    });
+
+    it('no rows skipped or duplicated across pages when timestamps are tied', async () => {
+      // Six rows all with the same created_at; page size = 3
+      const ts = new Date('2024-06-01T00:00:00.000Z');
+      const allIds = ['s6', 's5', 's4', 's3', 's2', 's1']; // DESC id order
+      const page1Rows = allIds.slice(0, 3).map(id => makeRowAt(id, ts));
+      const page2Rows = allIds.slice(3, 6).map(id => makeRowAt(id, ts));
+
+      // Page 1
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '6' }] });
+      mockQuery.mockResolvedValueOnce({ rows: page1Rows });
+      const page1 = await streamRepository.find({}, { limit: 3, offset: 0 });
+
+      // Page 2
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '6' }] });
+      mockQuery.mockResolvedValueOnce({ rows: page2Rows });
+      const page2 = await streamRepository.find({}, { limit: 3, offset: 3 });
+
+      const page1Ids = page1.streams.map(s => s.id);
+      const page2Ids = page2.streams.map(s => s.id);
+
+      // No duplicates across pages
+      const overlap = page1Ids.filter(id => page2Ids.includes(id));
+      expect(overlap).toHaveLength(0);
+      // Together they cover all 6 rows exactly once
+      expect([...page1Ids, ...page2Ids].sort()).toEqual([...allIds].sort());
+    });
+
+    it('computes hasMore correctly for a partial last page', async () => {
+      const ts = new Date('2024-06-01T00:00:00.000Z');
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '5' }] });
+      mockQuery.mockResolvedValueOnce({ rows: [makeRowAt('s5', ts), makeRowAt('s4', ts)] });
+
+      const result = await streamRepository.find({}, { limit: 3, offset: 3 });
+
+      // 3 + 2 = 5 = total → no more pages
+      expect(result.hasMore).toBe(false);
+      expect(result.total).toBe(5);
+    });
+
+    it('computes hasMore=true when more rows remain', async () => {
+      const ts = new Date('2024-06-01T00:00:00.000Z');
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '10' }] });
+      mockQuery.mockResolvedValueOnce({ rows: [makeRowAt('s10', ts), makeRowAt('s9', ts), makeRowAt('s8', ts)] });
+
+      const result = await streamRepository.find({}, { limit: 3, offset: 0 });
+
+      // 0 + 3 = 3 < 10 → more pages
+      expect(result.hasMore).toBe(true);
+    });
+
+    it('returns empty streams and hasMore=false for an empty table', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '0' }] });
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      const result = await streamRepository.find({}, { limit: 20, offset: 0 });
+
+      expect(result.streams).toHaveLength(0);
+      expect(result.hasMore).toBe(false);
+      expect(result.total).toBe(0);
     });
   });
 

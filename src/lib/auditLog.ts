@@ -30,7 +30,7 @@
 import { logger } from './logger.js';
 import { getPool, query } from '../db/pool.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.
@@ -140,16 +140,19 @@ export function buildAuditEntry(
  * Write a pre-built AuditEntry to the `audit_logs` table using the supplied
  * DB connection (which must already be inside a transaction).
  *
+ * seq is omitted from the INSERT so the column default (nextval('audit_seq'))
+ * is used — this guarantees uniqueness under concurrent writes without any
+ * application-level coordination.
+ *
  * Throws on DB error so the caller's transaction rolls back atomically.
  * Also mirrors the entry into the in-memory log for GET /api/audit.
  */
 export function writeAuditEntryToDb(db: AuditDbConnection, entry: AuditEntry): void {
   db.prepare(
     `INSERT INTO audit_logs
-       (seq, timestamp, action, resource_type, resource_id, correlation_id, meta)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+       (timestamp, action, resource_type, resource_id, correlation_id, meta)
+     VALUES (?, ?, ?, ?, ?, ?)`
   ).run(
-    entry.seq,
     entry.timestamp,
     entry.action,
     entry.resourceType,
@@ -166,6 +169,9 @@ export function writeAuditEntryToDb(db: AuditDbConnection, entry: AuditEntry): v
  * Build and persist an audit entry using the shared Postgres pool.
  * Intended for non-transactional admin actions that still need durable audit
  * logging in the `audit_logs` table.
+ *
+ * seq is intentionally omitted from the INSERT — the column default
+ * (nextval('audit_seq')) ensures concurrent callers never collide.
  */
 export async function recordAuditEventToDb(
   action: AuditAction,
@@ -179,10 +185,9 @@ export async function recordAuditEventToDb(
   await query(
     getPool(),
     `INSERT INTO audit_logs
-       (seq, timestamp, action, resource_type, resource_id, correlation_id, meta)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+       (timestamp, action, resource_type, resource_id, correlation_id, meta)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [
-      entry.seq,
       entry.timestamp,
       entry.action,
       entry.resourceType,
