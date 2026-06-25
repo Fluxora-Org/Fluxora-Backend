@@ -18,7 +18,8 @@ import {
   jsonDepthMiddleware,
   requestTimeoutMiddleware,
 } from '../src/middleware/requestProtection.js';
-import { ApiError, ApiErrorCode, errorHandler } from '../src/middleware/errorHandler.js';
+import { ApiError } from '../src/errors.js';
+import { ApiErrorCode, errorHandler } from '../src/middleware/errorHandler.js';
 
 function buildApp() {
   const app = express();

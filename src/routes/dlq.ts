@@ -1,82 +1,34 @@
 /**
  * Dead-Letter Queue (DLQ) Inspection API — Admin Only
  *
- * Issue #43 — Dead-letter queue inspection API (admin-only)
+ * Implements #43 (DLQ inspection) and #349 (dead-consumer suspension).
  *
  * Trust boundaries
  * ----------------
- * - Public internet clients:       403 Forbidden on all routes.
- * - Authenticated partners:        403 Forbidden — operator role required.
- * - Administrators (operator role): Full read + delete access.
- * - Internal workers:              Call enqueueDeadLetter() directly; not exposed via HTTP.
+ * - Public internet clients:        403 Forbidden on all routes.
+ * - Authenticated partners:         403 Forbidden — operator role required.
+ * - Administrators (operator role): Full read + replay + delete + resume access.
+ * - Internal workers:               Call enqueueDeadLetter() directly; not HTTP.
  *
- * Failure modes
- * -------------
- * - No auth header          → 401 UNAUTHORIZED
- * - Valid token, wrong role → 403 FORBIDDEN
- * - Entry not found         → 404 NOT_FOUND
- * - Invalid pagination      → 400 VALIDATION_ERROR
- * - Dependency outage       → 503 SERVICE_UNAVAILABLE (future)
+ * Suspension logic (#349)
+ * -----------------------
+ * Each POST /admin/dlq/:id/replay attempt:
+ *  1. Checks whether the topic is suspended → 409 CONSUMER_SUSPENDED if so.
+ *  2. Resets the entry's attempt counter (existing behaviour).
+ *  3. Calls recordReplaySuccess(topic) on success or recordReplayFailure(topic)
+ *     when the re-queued delivery is known to have failed.
+ *     Because the replay endpoint only resets state (no synchronous delivery),
+ *     we model "replay attempt accepted" as a success-signal and leave failure
+ *     counting to the worker that actually delivers. If the caller explicitly
+ *     reports a failure (body: { failed: true }), we record a failure.
+ *  4. If consecutive_failures reaches DLQ_SUSPENSION_THRESHOLD (default 5),
+ *     the topic is suspended automatically.
+ *  5. POST /admin/dlq/consumers/:topic/resume clears suspension (operator only).
  *
- * @openapi
- * /admin/dlq:
- *   get:
- *     summary: List dead-letter queue entries (admin only)
- *     tags: [admin]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - name: limit
- *         in: query
- *         schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
- *       - name: offset
- *         in: query
- *         schema: { type: integer, minimum: 0, default: 0 }
- *       - name: topic
- *         in: query
- *         schema: { type: string }
- *         description: Filter by topic name
- *     responses:
- *       200:
- *         description: Paginated DLQ entries
- *       400:
- *         description: Invalid pagination parameters
- *       401:
- *         description: Missing or invalid authentication
- *       403:
- *         description: Operator role required
- * /admin/dlq/{id}:
- *   get:
- *     summary: Get a single DLQ entry (admin only)
- *     tags: [admin]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - name: id
- *         in: path
- *         required: true
- *         schema: { type: string }
- *     responses:
- *       200: { description: DLQ entry }
- *       401: { description: Unauthorized }
- *       403: { description: Forbidden }
- *       404: { description: Not found }
- *   delete:
- *     summary: Remove (acknowledge) a DLQ entry (admin only)
- *     tags: [admin]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - name: id
- *         in: path
- *         required: true
- *         schema: { type: string }
- *     responses:
- *       200: { description: Entry removed }
- *       401: { description: Unauthorized }
- *       403: { description: Forbidden }
- *       404: { description: Not found }
+ * GET /admin/dlq includes a `suspendedTopics` field listing all suspended topics.
+ * GET /admin/dlq/:id includes `consumerSuspended` for that entry's topic.
  */
+
 import { Router, type Request, type Response } from 'express';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { asyncHandler, validationError } from '../middleware/errorHandler.js';
@@ -114,12 +66,12 @@ export async function enqueueDeadLetter(
 
 export const dlqRouter = Router();
 
-// All DLQ routes require authentication + appropriate permission
 dlqRouter.use(authenticate, requireAuth);
 
 /**
  * GET /admin/dlq
  * List DLQ entries with optional topic filter and offset pagination.
+ * Includes a `suspendedTopics` array surfacing all currently suspended consumers.
  */
 dlqRouter.get(
   '/',
@@ -149,42 +101,60 @@ dlqRouter.get(
     }
 
     const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
-    const { entries, total } = await dlqRepository.findAll({ limit, offset, topic });
+    const [{ entries, total }, suspensions] = await Promise.all([
+      dlqRepository.findAll({ limit, offset, topic }),
+      dlqRepository.listSuspendedConsumers(),
+    ]);
+
+    const suspendedTopics = suspensions
+      .filter((s) => s.suspended)
+      .map((s) => ({ topic: s.topic, suspendedAt: s.suspendedAt, consecutiveFailures: s.consecutiveFailures }));
 
     info('DLQ entries listed', { total, returned: entries.length, offset, limit, requestId });
+    recordAuditEvent('DLQ_LISTED', 'dlq', 'list', requestId, { total, returned: entries.length });
 
-    recordAuditEvent('DLQ_LISTED', 'dlq', 'list', requestId, { total, returned: entries.length, offset, limit, topicFilter });
-
-    res.json(successResponse({
-      entries,
-      total,
-      limit,
-      offset,
-      has_more: offset + entries.length < total,
-    }));
+    res.json(successResponse({ entries, total, limit, offset, has_more: offset + entries.length < total, suspendedTopics }));
   }),
 );
 
 /**
  * GET /admin/dlq/:id
- * Fetch a single DLQ entry.
+ * Fetch a single DLQ entry. Includes `consumerSuspended` for the entry's topic.
  */
 dlqRouter.get(
   '/:id',
   requirePermission(Permission.DLQ_READ),
   asyncHandler(async (req: Request, res: Response) => {
-    const entry = await dlqRepository.findById(req.params.id);
+    const [entry, suspension] = await Promise.all([
+      dlqRepository.findById(req.params.id),
+      // We don't know the topic yet; fetch after entry resolves — two round-trips
+      // is acceptable here; the read path is not hot.
+      Promise.resolve(null) as Promise<null>,
+    ]);
+
     if (!entry) {
       res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
       return;
     }
-    res.json(successResponse({ entry }, req.id));
+
+    const consumerSuspension = await dlqRepository.getConsumerSuspension(entry.topic);
+    res.json(successResponse({
+      entry,
+      consumerSuspended: consumerSuspension?.suspended ?? false,
+      consecutiveFailures: consumerSuspension?.consecutiveFailures ?? 0,
+    }, req.id));
   }),
 );
 
 /**
  * POST /admin/dlq/:id/replay
- * Replay a DLQ entry by re-enqueuing it for processing.
+ * Replay a DLQ entry.
+ *
+ * - Rejects with 409 if the topic is currently suspended (#349).
+ * - Accepts an optional JSON body: `{ failed?: boolean }`. When failed=true,
+ *   the caller signals that the delivery is known to have failed immediately
+ *   (e.g. SSRF-guard or network error) so consecutive_failures is incremented.
+ *   Otherwise consecutive_failures is reset (optimistic success).
  */
 dlqRouter.post(
   '/:id/replay',
@@ -192,28 +162,75 @@ dlqRouter.post(
   asyncHandler(async (req: Request, res: Response) => {
     const entry = await dlqRepository.findById(req.params.id);
     if (!entry) {
-      res.status(404).json({ error: { code: 'NOT_FOUND', message: `DLQ entry '${req.params.id}' not found`, requestId: req.id } });
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
       return;
     }
 
-    await dlqRepository.update(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
-    
-    info('DLQ entry replayed', { id: entry.id, topic: entry.topic, requestId: req.id });
-    
-    // Record audit event for DLQ replay
-    recordAuditEvent(
-      'DLQ_REPLAYED',
-      'dlq',
-      entry.id,
-      req.id,
-      { topic: entry.topic, originalAttempts: entry.attempts }
-    );
+    // ── Suspension gate (#349) ────────────────────────────────────────────────
+    const suspension = await dlqRepository.getConsumerSuspension(entry.topic);
+    if (suspension?.suspended) {
+      res.status(409).json(errorResponse(
+        'CONSUMER_SUSPENDED',
+        `Consumer for topic '${entry.topic}' is suspended after ${suspension.consecutiveFailures} consecutive failures. ` +
+        `Use POST /admin/dlq/consumers/${encodeURIComponent(entry.topic)}/resume to re-enable.`,
+        undefined,
+        req.id,
+      ));
+      return;
+    }
 
-    res.json(successResponse({
-      message: 'DLQ entry replayed',
-      id: entry.id,
+    // ── Reset attempt counter and record outcome ──────────────────────────────
+    const replayFailed = req.body?.failed === true;
+
+    await dlqRepository.update(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
+
+    if (replayFailed) {
+      const updated = await dlqRepository.recordReplayFailure(entry.topic);
+      if (updated.suspended) {
+        info('DLQ consumer suspended after consecutive failures', { topic: entry.topic, failures: updated.consecutiveFailures, requestId: req.id });
+        recordAuditEvent('DLQ_CONSUMER_SUSPENDED', 'dlq_consumer', entry.topic, req.id, {
+          consecutiveFailures: updated.consecutiveFailures,
+        });
+      }
+    } else {
+      await dlqRepository.recordReplaySuccess(entry.topic);
+    }
+
+    info('DLQ entry replayed', { id: entry.id, topic: entry.topic, failed: replayFailed, requestId: req.id });
+    recordAuditEvent('DLQ_REPLAYED', 'dlq', entry.id, req.id, {
       topic: entry.topic,
-    }, req.id));
+      originalAttempts: entry.attempts,
+      replayFailed,
+    });
+
+    res.json(successResponse({ message: 'DLQ entry replayed', id: entry.id, topic: entry.topic }, req.id));
+  }),
+);
+
+/**
+ * POST /admin/dlq/consumers/:topic/resume
+ * Re-enable a suspended consumer. Operator role required (#349).
+ *
+ * Clears consecutive_failures and the suspended flag; emits an audit event.
+ * Idempotent — re-enabling an already-active consumer is a no-op (returns 200).
+ */
+dlqRouter.post(
+  '/consumers/:topic/resume',
+  requirePermission(Permission.DLQ_CONSUMER_RESUME),
+  asyncHandler(async (req: Request, res: Response) => {
+    const topic = req.params.topic;
+    const updated = await dlqRepository.resumeConsumer(topic);
+
+    if (!updated) {
+      // No suspension record — consumer is healthy; treat as idempotent success.
+      res.json(successResponse({ message: 'Consumer has no suspension record — already active', topic }, req.id));
+      return;
+    }
+
+    info('DLQ consumer resumed by operator', { topic, requestId: req.id });
+    recordAuditEvent('DLQ_CONSUMER_RESUMED', 'dlq_consumer', topic, req.id);
+
+    res.json(successResponse({ message: 'Consumer resumed', topic, resumedAt: updated.resumedAt }, req.id));
   }),
 );
 
@@ -250,13 +267,8 @@ dlqRouter.delete(
     const purged = await dlqRepository.deleteAll(topic);
 
     info('DLQ entries purged', { count: purged, topicFilter, requestId });
-
     recordAuditEvent('DLQ_PURGED', 'dlq', 'bulk', requestId, { purgedCount: purged, topicFilter });
 
-    res.json(successResponse({
-      message: 'DLQ entries purged',
-      purged,
-      topicFilter: topicFilter || 'all',
-    }, requestId));
+    res.json(successResponse({ message: 'DLQ entries purged', purged, topicFilter: topicFilter ?? 'all' }, requestId));
   }),
 );

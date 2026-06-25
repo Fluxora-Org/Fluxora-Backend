@@ -11,7 +11,7 @@
  */
 
 import http from 'node:http';
-import { vi as jest } from 'vitest';
+import { vi } from 'vitest';
 import request from 'supertest';
 import { app } from '../src/app.js';
 import {

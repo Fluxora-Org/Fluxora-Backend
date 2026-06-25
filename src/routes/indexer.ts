@@ -251,6 +251,7 @@ export function resetIndexerState(): void {
 export function getIndexerHealth() {
   return {
     ...indexerIngestionService.getHealthSnapshot(),
+    isReplaying: indexerService.getReplayProgress().isReplaying,
     authHeader: INDEXER_AUTH_HEADER,
     maxBatchSize: INDEXER_MAX_EVENTS_PER_BATCH,
     rateLimit: {

@@ -50,7 +50,7 @@ describe('rate-limit headers on allowed responses', () => {
   it('sets X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset on first request', async () => {
     const { app } = makeApp(10);
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', '1.2.3.4');
 
     expect(res.status).not.toBe(429);
@@ -62,7 +62,7 @@ describe('rate-limit headers on allowed responses', () => {
   it('all three quota headers pass RateLimitHeadersSchema validation', async () => {
     const { app } = makeApp(10);
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', '1.2.3.5');
 
     const parse = RateLimitHeadersSchema.safeParse(res.headers);
@@ -73,7 +73,7 @@ describe('rate-limit headers on allowed responses', () => {
     const { app } = makeApp(10);
     const before = Math.floor(Date.now() / 1000);
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', '1.2.3.6');
 
     const reset = parseInt(res.headers['x-ratelimit-reset'] as string, 10);
@@ -88,7 +88,7 @@ describe('rate-limit headers on allowed responses', () => {
 
     for (let i = 1; i <= 4; i++) {
       const res = await request(app)
-        .get('/api/streams')
+        .get('/api/test-limit')
         .set('x-forwarded-for', ip);
       const remaining = parseInt(res.headers['x-ratelimit-remaining'] as string, 10);
       expect(remaining).toBe(5 - i);
@@ -99,7 +99,7 @@ describe('rate-limit headers on allowed responses', () => {
     const { app } = makeApp(10);
     const nowSeconds = Math.floor(Date.now() / 1000);
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', '1.2.3.8');
 
     const reset = parseInt(res.headers['x-ratelimit-reset'] as string, 10);
@@ -109,7 +109,7 @@ describe('rate-limit headers on allowed responses', () => {
   it('does not set Retry-After on allowed responses', async () => {
     const { app } = makeApp(10);
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', '1.2.3.9');
 
     expect(res.headers['retry-after']).toBeUndefined();
@@ -127,11 +127,11 @@ describe('rate-limit headers on 429 responses', () => {
     const ip = '2.2.2.1';
 
     for (let i = 0; i <= limit; i++) {
-      await request(app).get('/api/streams').set('x-forwarded-for', ip);
+      await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
     }
 
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', ip);
 
     expect(res.status).toBe(429);
@@ -146,11 +146,11 @@ describe('rate-limit headers on 429 responses', () => {
     const { app } = makeApp(limit);
     const ip = '2.2.2.2';
 
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
 
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', ip);
 
     expect(res.status).toBe(429);
@@ -163,11 +163,11 @@ describe('rate-limit headers on 429 responses', () => {
     const { app } = makeApp(limit);
     const ip = '2.2.2.3';
 
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
 
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', ip);
 
     const retryAfter = parseInt(res.headers['retry-after'] as string, 10);
@@ -180,12 +180,12 @@ describe('rate-limit headers on 429 responses', () => {
     const { app } = makeApp(limit);
     const ip = '2.2.2.4';
 
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
 
     const beforeSeconds = Math.floor(Date.now() / 1000);
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', ip);
 
     const reset = parseInt(res.headers['x-ratelimit-reset'] as string, 10);
@@ -199,11 +199,11 @@ describe('rate-limit headers on 429 responses', () => {
     const { app } = makeApp(limit);
     const ip = '2.2.2.5';
 
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
-    await request(app).get('/api/streams').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
+    await request(app).get('/api/test-limit').set('x-forwarded-for', ip);
 
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', ip);
 
     expect(res.body.error.code).toBe('RATE_LIMIT_EXCEEDED');
@@ -223,7 +223,7 @@ describe('header values sourced from store, not estimated', () => {
 
     const beforeMs = Date.now();
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test-limit')
       .set('x-forwarded-for', ip);
     const afterMs = Date.now();
 
@@ -244,8 +244,8 @@ describe('concurrent requests use independent counters per client', () => {
     const { app } = makeApp(5);
 
     const [r1, r2] = await Promise.all([
-      request(app).get('/api/streams').set('x-forwarded-for', '4.4.4.1'),
-      request(app).get('/api/streams').set('x-forwarded-for', '4.4.4.2'),
+      request(app).get('/api/test-limit').set('x-forwarded-for', '4.4.4.1'),
+      request(app).get('/api/test-limit').set('x-forwarded-for', '4.4.4.2'),
     ]);
 
     expect(r1.headers['x-ratelimit-remaining']).toBe('4');
@@ -258,7 +258,7 @@ describe('concurrent requests use independent counters per client', () => {
 
     const responses = await Promise.all(
       Array.from({ length: 5 }, () =>
-        request(app).get('/api/streams').set('x-forwarded-for', ip),
+        request(app).get('/api/test-limit').set('x-forwarded-for', ip),
       ),
     );
 
