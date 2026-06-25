@@ -42,8 +42,10 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
   );
 
   // Replay destination table — events written by the indexer replay service.
-  // A richer schema (topic, tx_hash, payload, etc.) is layered on by
-  // 1774715131962_streams-table.ts which runs afterward.
+  // A richer schema (topic, tx_hash, payload, ledger_hash, etc.) is layered on
+  // by 1774715131962_streams-table.ts which runs afterward.
+  // ledger_hash is nullable here so legacy rows without it remain valid; the
+  // forward migration 20260624000000_add_ledger_hash.ts backfills deployed DBs.
   pgm.createTable(
     'contract_events',
     {
@@ -54,6 +56,8 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
       event_data:       { type: 'jsonb',     notNull: true },
       block_height:     { type: 'bigint',    notNull: true },
       transaction_hash: { type: 'text',      notNull: true },
+      // Hash of the Stellar ledger header; used for reorg detection.
+      ledger_hash:      { type: 'text',      notNull: false },
       ingested_at:      { type: 'timestamp' },
       created_at:       { type: 'timestamp', default: pgm.func('current_timestamp') },
     },

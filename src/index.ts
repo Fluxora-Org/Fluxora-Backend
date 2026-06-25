@@ -2,6 +2,7 @@ import express from 'express';
 import { config } from './config/index.js';
 import { indexerRouter } from './routes/indexer';
 import { gracefulShutdown } from './shutdown.js';
+import { indexerService } from './indexer/service.js';
 
 const app = express();
 
@@ -32,6 +33,11 @@ if (process.env.NODE_ENV !== 'test') {
   server = app.listen(config.server.port, () => {
     console.log(`Indexer service listening on port ${config.server.port}`);
     console.log(`Replay batch size: ${config.indexer.replayBatchSize}`);
+
+    // Auto-resume any incomplete replays from the database checkpoint
+    indexerService.resumeIncompleteReplay().catch((err) => {
+      console.error('Failed to resume incomplete replays on startup:', err);
+    });
   });
 
   // Delegate to the single graceful-shutdown path so all registered hooks

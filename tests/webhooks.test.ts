@@ -17,6 +17,7 @@ import {
   verifyWebhookSignature,
 } from '../src/webhooks/signature.js';
 import { recordAuditEvent, getAuditEntries, _resetAuditLog } from '../src/lib/auditLog.js';
+import { validateWebhookTarget, WebhookTargetValidationError } from '../src/webhooks/ssrfGuard.js';
 
 // Mock fetch for testing
 const originalFetch = global.fetch;
@@ -742,6 +743,272 @@ describe('Enhanced Webhook Features', () => {
       expect(result.cleaned).toBe(1);
       expect(result.errors).toHaveLength(0);
       expect(webhookDeliveryStore.getAll()).toHaveLength(0);
+    });
+  });
+
+  describe('SSRF Guard', () => {
+    it('rejects loopback addresses', async () => {
+      await expect(validateWebhookTarget('http://127.0.0.1/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      await expect(validateWebhookTarget('http://127.0.0.1:8080/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      await expect(validateWebhookTarget('http://localhost/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects IPv6 loopback', async () => {
+      await expect(validateWebhookTarget('http://[::1]/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects link-local addresses (AWS metadata range)', async () => {
+      await expect(validateWebhookTarget('http://169.254.169.254/latest/meta-data/')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      await expect(validateWebhookTarget('http://169.254.1.1/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects private IP ranges', async () => {
+      // 10.0.0.0/8
+      await expect(validateWebhookTarget('http://10.0.0.5/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      // 172.16.0.0/12
+      await expect(validateWebhookTarget('http://172.16.0.1/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      await expect(validateWebhookTarget('http://172.31.255.255/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      // 192.168.0.0/16
+      await expect(validateWebhookTarget('http://192.168.1.1/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects non-HTTPS URLs by default', async () => {
+      await expect(validateWebhookTarget('http://example.com/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      await expect(validateWebhookTarget('http://api.example.com/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('accepts valid public HTTPS URLs', async () => {
+      await expect(validateWebhookTarget('https://8.8.8.8/webhook')).resolves.not.toThrow();
+      await expect(validateWebhookTarget('https://1.1.1.1/hook')).resolves.not.toThrow();
+    });
+
+    it('accepts HTTP URLs when requireHttps is false', async () => {
+      await expect(
+        validateWebhookTarget('http://8.8.8.8/webhook', { requireHttps: false })
+      ).resolves.not.toThrow();
+    });
+
+    it('rejects invalid URL formats', async () => {
+      await expect(validateWebhookTarget('not-a-url')).rejects.toThrow(WebhookTargetValidationError);
+      await expect(validateWebhookTarget('ftp://example.com/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects multicast addresses', async () => {
+      await expect(validateWebhookTarget('http://224.0.0.1/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects reserved IP ranges', async () => {
+      await expect(validateWebhookTarget('http://0.0.0.0/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      await expect(validateWebhookTarget('http://240.0.0.1/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects IPv4-mapped IPv6 loopback', async () => {
+      await expect(validateWebhookTarget('http://[::ffff:127.0.0.1]/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects IPv6 link-local addresses', async () => {
+      await expect(validateWebhookTarget('http://[fe80::1]/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('rejects IPv6 unique local (private) addresses', async () => {
+      await expect(validateWebhookTarget('http://[fc00::1]/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+      await expect(validateWebhookTarget('http://[fd00::1]/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('respects allowlist when configured', async () => {
+      // Allowlist applies to all targets (hostnames and IPs)
+      // When allowlist is set, only those hosts are allowed
+      const allowlist = ['api.example.com', '*.trusted.com'];
+      
+      // Direct IP not in allowlist should be rejected
+      await expect(
+        validateWebhookTarget('https://8.8.8.8/webhook', { allowlist })
+      ).rejects.toThrow(WebhookTargetValidationError);
+      
+      // Direct IP in allowlist should be allowed
+      await expect(
+        validateWebhookTarget('https://8.8.8.8/webhook', { allowlist: ['8.8.8.8'] })
+      ).resolves.not.toThrow();
+    });
+
+    it('allows all hosts when allowlist is empty', async () => {
+      await expect(
+        validateWebhookTarget('https://8.8.8.8/webhook', { allowlist: [] })
+      ).resolves.not.toThrow();
+      
+      await expect(
+        validateWebhookTarget('https://1.1.1.1/webhook', { allowlist: undefined })
+      ).resolves.not.toThrow();
+    });
+
+    it('rejects blocked IPs even in allowlist', async () => {
+      const allowlist = ['localhost', 'internal.local'];
+      
+      await expect(
+        validateWebhookTarget('http://localhost/webhook', { allowlist, requireHttps: false })
+      ).rejects.toThrow(WebhookTargetValidationError);
+    });
+
+    it('handles DNS resolution failures', async () => {
+      // Mock DNS lookup to fail
+      vi.doMock('dns', () => ({
+        promises: {
+          lookup: vi.fn().mockRejectedValue(new Error('ENOTFOUND')),
+        },
+      }));
+
+      await expect(validateWebhookTarget('https://nonexistent.example.com/webhook')).rejects.toThrow(
+        WebhookTargetValidationError
+      );
+    });
+
+    it('validates direct IP addresses', async () => {
+      await expect(validateWebhookTarget('https://8.8.8.8/webhook')).resolves.not.toThrow();
+      await expect(validateWebhookTarget('https://1.1.1.1/webhook')).resolves.not.toThrow();
+    });
+  });
+
+  describe('dispatchWebhook SSRF Protection', () => {
+    it('rejects webhook delivery to blocked IP addresses', async () => {
+      const { dispatchWebhook } = await import('../src/webhooks/dispatcher.js');
+      
+      await expect(
+        dispatchWebhook({
+          url: 'http://127.0.0.1/webhook',
+          secret: 'secret123',
+          event: 'test.event',
+          payload: { test: 'data' },
+        })
+      ).rejects.toThrow(WebhookTargetValidationError);
+    });
+
+    it('rejects webhook delivery to AWS metadata endpoint', async () => {
+      const { dispatchWebhook } = await import('../src/webhooks/dispatcher.js');
+      
+      await expect(
+        dispatchWebhook({
+          url: 'http://169.254.169.254/latest/meta-data/',
+          secret: 'secret123',
+          event: 'test.event',
+          payload: { test: 'data' },
+        })
+      ).rejects.toThrow(WebhookTargetValidationError);
+    });
+
+    it('rejects webhook delivery to private IP', async () => {
+      const { dispatchWebhook } = await import('../src/webhooks/dispatcher.js');
+      
+      await expect(
+        dispatchWebhook({
+          url: 'http://192.168.1.1/webhook',
+          secret: 'secret123',
+          event: 'test.event',
+          payload: { test: 'data' },
+        })
+      ).rejects.toThrow(WebhookTargetValidationError);
+    });
+
+    it('allows webhook delivery to valid public HTTPS endpoint', async () => {
+      const { dispatchWebhook } = await import('../src/webhooks/dispatcher.js');
+      
+      global.fetch = vi.fn(() => Promise.resolve(new Response(null, { status: 200 }))) as any;
+      
+      await expect(
+        dispatchWebhook({
+          url: 'https://8.8.8.8/webhook',
+          secret: 'secret123',
+          event: 'test.event',
+          payload: { test: 'data' },
+        })
+      ).resolves.not.toThrow();
+      
+      global.fetch = originalFetch;
+    });
+  });
+
+  describe('WebhookDispatcher SSRF Protection', () => {
+    it('rejects dispatch to blocked IP addresses', async () => {
+      const result = await webhookDispatcher.dispatch({
+        url: 'https://127.0.0.1/webhook',
+        secret: 'secret123',
+        payload: '{"test": "data"}',
+        deliveryId: 'deliv_123',
+        eventType: 'stream.created',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.shouldRetry).toBe(false);
+      expect(result.error).toContain('Blocked');
+    });
+
+    it('rejects dispatch to private IP ranges', async () => {
+      const result = await webhookDispatcher.dispatch({
+        url: 'https://10.0.0.5/webhook',
+        secret: 'secret123',
+        payload: '{"test": "data"}',
+        deliveryId: 'deliv_123',
+        eventType: 'stream.created',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.shouldRetry).toBe(false);
+      expect(result.error).toContain('Blocked');
+    });
+
+    it('allows dispatch to valid public HTTPS endpoints', async () => {
+      global.fetch = vi.fn(() => Promise.resolve(new Response(null, { status: 200 }))) as any;
+
+      const result = await webhookDispatcher.dispatch({
+        url: 'https://8.8.8.8/webhook',
+        secret: 'secret123',
+        payload: '{"test": "data"}',
+        deliveryId: 'deliv_123',
+        eventType: 'stream.created',
+      });
+
+      expect(result.success).toBe(true);
+      
+      global.fetch = originalFetch;
     });
   });
 });

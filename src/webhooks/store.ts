@@ -3,7 +3,7 @@
  * In production, this would be backed by a database like PostgreSQL
  */
 
-import type { WebhookDelivery, WebhookDeliveryStatus } from './types.js';
+import type { WebhookDelivery, WebhookDeliveryStatus, DLQReasonCode } from './types.js';
 import { logger } from '../lib/logger.js';
 
 export interface DeadLetterQueueItem {
@@ -15,6 +15,7 @@ export interface DeadLetterQueueItem {
   payload: string;
   originalDelivery: WebhookDelivery;
   failureReason: string;
+  reasonCode: DLQReasonCode;
   createdAt: number;
   processedAt?: number;
 }
@@ -33,7 +34,6 @@ export interface OutboxItem {
   attempts: number;
   maxAttempts: number;
 }
-
 
 export class WebhookDeliveryStore {
   // Main delivery storage
@@ -63,7 +63,7 @@ export class WebhookDeliveryStore {
     this.deliveries.set(delivery.id, delivery);
     this.deliveryIdIndex.set(delivery.deliveryId, delivery.id);
     this.metrics.totalDeliveries++;
-    
+
     logger.debug('Webhook delivery stored', undefined, {
       deliveryId: delivery.deliveryId,
       status: delivery.status,
@@ -116,78 +116,45 @@ export class WebhookDeliveryStore {
   addToOutbox(item: Omit<OutboxItem, 'id'>): string {
     const id = `outbox_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const outboxItem: OutboxItem = { ...item, id };
-    
+
     this.outbox.set(id, outboxItem);
-    
+
     // Add to priority queue
     const priority = outboxItem.priority;
     if (!this.outboxPriorityQueue.has(priority)) {
       this.outboxPriorityQueue.set(priority, []);
     }
     this.outboxPriorityQueue.get(priority)!.push(outboxItem);
-    
+
     this.metrics.outboxItems++;
-    
+
     logger.info('Item added to webhook outbox', undefined, {
       outboxId: id,
       deliveryId: item.deliveryId,
       priority,
       scheduledFor: new Date(item.scheduledFor).toISOString(),
     });
-    
+
     return id;
   }
 
   /**
    * Get items from outbox that are ready for processing
-   *
-   * Ordering guarantee:
-   * Returns items ordered by `scheduledFor` (ASC). For items sharing the same
-   * scheduled timestamp, applies a deterministic secondary sort by `ledger` (ASC)
-   * extracted from the JSON payload, and a tertiary sort by `eventId` (ASC).
-   * This ensures per-stream consumers always observe events in chain order.
    */
   getReadyOutboxItems(now: number = Date.now()): OutboxItem[] {
     const readyItems: OutboxItem[] = [];
-    
+
     // Process by priority: high -> normal -> low
     const priorities = ['high', 'normal', 'low'];
-    
+
     for (const priority of priorities) {
       const items = this.outboxPriorityQueue.get(priority) || [];
       const ready = items
-        .filter(item => item.scheduledFor <= now && item.attempts < item.maxAttempts)
-        .sort((a, b) => {
-          if (a.scheduledFor !== b.scheduledFor) {
-            return a.scheduledFor - b.scheduledFor;
-          }
-          
-          let ledgerA = 0;
-          let ledgerB = 0;
-          try {
-            const payloadA = JSON.parse(a.payload);
-            ledgerA = typeof payloadA?.ledger === 'number' ? payloadA.ledger :
-                      typeof payloadA?.data?.ledger === 'number' ? payloadA.data.ledger : 0;
-          } catch {}
-          try {
-            const payloadB = JSON.parse(b.payload);
-            ledgerB = typeof payloadB?.ledger === 'number' ? payloadB.ledger :
-                      typeof payloadB?.data?.ledger === 'number' ? payloadB.data.ledger : 0;
-          } catch {}
-          
-          if (ledgerA !== ledgerB) {
-            return ledgerA - ledgerB;
-          }
-          
-          if (a.eventId !== b.eventId) {
-            return a.eventId < b.eventId ? -1 : 1;
-          }
-          
-          return 0;
-        });
+        .filter((item) => item.scheduledFor <= now && item.attempts < item.maxAttempts)
+        .sort((a, b) => a.scheduledFor - b.scheduledFor);
       readyItems.push(...ready);
     }
-    
+
     return readyItems;
   }
 
@@ -197,18 +164,18 @@ export class WebhookDeliveryStore {
   removeFromOutbox(id: string): boolean {
     const item = this.outbox.get(id);
     if (!item) return false;
-    
+
     this.outbox.delete(id);
-    
+
     // Remove from priority queue
     const priorityItems = this.outboxPriorityQueue.get(item.priority);
     if (priorityItems) {
-      const index = priorityItems.findIndex(i => i.id === id);
+      const index = priorityItems.findIndex((i) => i.id === id);
       if (index !== -1) {
         priorityItems.splice(index, 1);
       }
     }
-    
+
     this.metrics.outboxItems--;
     return true;
   }
@@ -226,9 +193,13 @@ export class WebhookDeliveryStore {
   /**
    * Add failed delivery to dead-letter queue
    */
-  addToDeadLetterQueue(delivery: WebhookDelivery, failureReason: string): string {
+  addToDeadLetterQueue(
+    delivery: WebhookDelivery,
+    failureReason: string,
+    reasonCode: DLQReasonCode = 'other'
+  ): string {
     const id = `dlq_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+
     const dlqItem: DeadLetterQueueItem = {
       id,
       deliveryId: delivery.deliveryId,
@@ -238,19 +209,21 @@ export class WebhookDeliveryStore {
       payload: delivery.payload,
       originalDelivery: delivery,
       failureReason,
+      reasonCode,
       createdAt: Date.now(),
     };
-    
+
     this.deadLetterQueue.set(id, dlqItem);
     this.metrics.dlqItems++;
-    
+
     logger.error('Webhook delivery moved to dead-letter queue', undefined, {
       dlqId: id,
       deliveryId: delivery.deliveryId,
       failureReason,
+      reasonCode,
       attemptCount: delivery.attempts.length,
     });
-    
+
     return id;
   }
 
@@ -268,17 +241,17 @@ export class WebhookDeliveryStore {
   processDeadLetterQueueItem(id: string, processedAt: number = Date.now()): boolean {
     const item = this.deadLetterQueue.get(id);
     if (!item) return false;
-    
+
     item.processedAt = processedAt;
     this.deadLetterQueue.delete(id);
     this.metrics.dlqItems--;
-    
+
     logger.info('Dead-letter queue item processed', undefined, {
       dlqId: id,
       deliveryId: item.deliveryId,
       processedAt: new Date(processedAt).toISOString(),
     });
-    
+
     return true;
   }
 
@@ -384,7 +357,7 @@ export class WebhookDeliveryStore {
     this.outbox.clear();
     this.outboxPriorityQueue.clear();
     this.deadLetterQueue.clear();
-    
+
     this.metrics = {
       totalDeliveries: 0,
       successfulDeliveries: 0,
