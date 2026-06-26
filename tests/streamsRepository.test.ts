@@ -56,7 +56,7 @@ vi.mock('../src/utils/logger.js', () => ({
   error: vi.fn(),
 }));
 
-import { streamRepository } from '../src/db/repositories/streamRepository.js';
+import { streamRepository, MAX_PAGE_SIZE } from '../src/db/repositories/streamRepository.js';
 import type { CreateStreamInput, UpdateStreamInput } from '../src/db/types.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -599,6 +599,85 @@ describe('streamRepository', () => {
     it('propagates unexpected DB errors from upsertStream', async () => {
       mockQuery.mockRejectedValueOnce(new Error('syntax error'));
       await expect(streamRepository.upsertStream(makeInput())).rejects.toThrow('syntax error');
+    });
+  });
+
+  // ── MAX_PAGE_SIZE limit clamping ──────────────────────────────────────────────
+
+  describe('MAX_PAGE_SIZE limit clamping', () => {
+    it('exports MAX_PAGE_SIZE as 100', () => {
+      expect(MAX_PAGE_SIZE).toBe(100);
+    });
+
+    describe('findWithCursor', () => {
+      it('clamps limit above MAX_PAGE_SIZE to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        // Return exactly MAX_PAGE_SIZE rows (hasMore = false when result <= effectiveLimit)
+        const rows = Array.from({ length: MAX_PAGE_SIZE }, (_, i) =>
+          makeRow({ id: `stream-${i}`, transaction_hash: TX_HASH, event_index: i }),
+        );
+        mockQuery.mockResolvedValue({ rows });
+
+        const result = await streamRepository.findWithCursor({}, 9999);
+        // Should never return more than MAX_PAGE_SIZE streams
+        expect(result.streams.length).toBeLessThanOrEqual(MAX_PAGE_SIZE);
+      });
+
+      it('does not clamp limit equal to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        // Return fewer rows than limit+1 so hasMore is false
+        const rows = [makeRow()];
+        mockQuery.mockResolvedValue({ rows });
+
+        const result = await streamRepository.findWithCursor({}, MAX_PAGE_SIZE);
+        expect(result.streams.length).toBe(1);
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('does not clamp limit below MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        const rows = Array.from({ length: 5 }, (_, i) =>
+          makeRow({ id: `stream-${i}`, transaction_hash: TX_HASH, event_index: i }),
+        );
+        mockQuery.mockResolvedValue({ rows });
+
+        const result = await streamRepository.findWithCursor({}, 10);
+        expect(result.streams.length).toBe(5);
+        expect(result.hasMore).toBe(false);
+      });
+    });
+
+    describe('find', () => {
+      it('clamps pagination.limit above MAX_PAGE_SIZE to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        mockQuery
+          .mockResolvedValueOnce({ rows: [{ count: '500' }] }) // count query
+          .mockResolvedValueOnce({ rows: [makeRow()] });        // data query
+
+        const result = await streamRepository.find({}, { limit: 9999, offset: 0 });
+        // Returned limit in result should be clamped
+        expect(result.limit).toBe(MAX_PAGE_SIZE);
+      });
+
+      it('does not clamp pagination.limit equal to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        mockQuery
+          .mockResolvedValueOnce({ rows: [{ count: '1' }] })
+          .mockResolvedValueOnce({ rows: [makeRow()] });
+
+        const result = await streamRepository.find({}, { limit: MAX_PAGE_SIZE, offset: 0 });
+        expect(result.limit).toBe(MAX_PAGE_SIZE);
+      });
+
+      it('does not clamp pagination.limit below MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        mockQuery
+          .mockResolvedValueOnce({ rows: [{ count: '1' }] })
+          .mockResolvedValueOnce({ rows: [makeRow()] });
+
+        const result = await streamRepository.find({}, { limit: 10, offset: 0 });
+        expect(result.limit).toBe(10);
+      });
     });
   });
 });
