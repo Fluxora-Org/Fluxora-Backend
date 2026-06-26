@@ -4,6 +4,9 @@ import {
   sseLiveSubscribersGauge,
   sseEventListenersGauge,
 } from '../metrics/businessMetrics.js';
+import type { Config } from '../config/env.js';
+import { loadConfig } from '../config/env.js';
+import { logger } from '../lib/logger.js';
 
 export const SSE_STREAM_UPDATE_EVENT = 'stream_update';
 
@@ -25,6 +28,44 @@ export interface LiveSseStreamUpdateEvent {
 export type SseStreamSubscriber = (event: LiveSseStreamUpdateEvent) => void;
 
 const liveSubscribersByStreamId = new Map<string, Set<SseStreamSubscriber>>();
+
+interface TimeoutableShutdownCallback {
+  fn: () => void;
+  timeoutMs: number;
+}
+
+/** Counts SSE connections that were force-closed during shutdown due to timeout. */
+let forceClosedSseConnections = 0;
+
+function timeoutPromise<T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(errorMessage));
+    }, ms);
+
+    promise
+      .then((result) => {
+        clearTimeout(timeoutId);
+        resolve(result);
+      })
+      .catch((err) => {
+        clearTimeout(timeoutId);
+        reject(err);
+      });
+  });
+}
+
+export function _injectForceClosedSseConnectionsForTest(): void {
+  forceClosedSseConnections = 0;
+}
+
+export function getForceClosedSseConnections(): number {
+  return forceClosedSseConnections;
+}
+
+export function resetForceClosedSseConnectionsCount(): void {
+  forceClosedSseConnections = 0;
+}
 
 function totalLiveSubscriberCount(): number {
   let total = 0;
@@ -121,7 +162,7 @@ export function getLiveSseSubscriberCount(streamId?: string): number {
  * Callbacks registered by active SSE response handlers. Each callback
  * writes the SSE retry directive and closes the response.
  */
-const sseShutdownCallbacks = new Set<() => void>();
+const sseShutdownCallbacks = new Set<TimeoutableShutdownCallback>();
 
 /**
  * Register a shutdown callback for an active SSE response.
@@ -129,11 +170,22 @@ const sseShutdownCallbacks = new Set<() => void>();
  * normally so the Set does not grow unboundedly.
  *
  * @param fn - Callback that writes `retry: 0` and ends the response.
+ * @param timeoutMs - Per-stream timeout in milliseconds before force-closing.
  * @returns Deregister function.
  */
-export function registerSseShutdownCallback(fn: () => void): () => void {
-  sseShutdownCallbacks.add(fn);
-  return () => sseShutdownCallbacks.delete(fn);
+export function registerSseShutdownCallback(
+  fn: () => void,
+  timeoutMs = 5000,
+): () => void {
+  sseShutdownCallbacks.add({ fn, timeoutMs });
+  return () => {
+    for (const cb of sseShutdownCallbacks) {
+      if (cb.fn === fn) {
+        sseShutdownCallbacks.delete(cb);
+        break;
+      }
+    }
+  };
 }
 
 /**
@@ -143,21 +195,49 @@ export function registerSseShutdownCallback(fn: () => void): () => void {
  * immediately reconnect, then ends each response. Detaches the dispatch
  * listener and resets subscriber state.
  */
-export function drainSseEventBus(): void {
-  for (const cb of Array.from(sseShutdownCallbacks)) {
-    try {
-      cb();
-    } catch {
-      // Isolate a single failing response from the rest of the drain.
-    }
-  }
+export function drainSseEventBus(timeoutMs?: number): Promise<void> {
+  const callbacksToProcess = Array.from(sseShutdownCallbacks);
   sseShutdownCallbacks.clear();
 
-  // Tear down the shared dispatcher so no further events are fanned out.
-  liveSubscribersByStreamId.clear();
-  sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
-  sseLiveSubscribersGauge.set(0);
-  sseEventListenersGauge.set(0);
+  // Run shutdown callbacks concurrently with per-stream timeouts
+  const drainPromises = callbacksToProcess.map((cb) => {
+    const effectiveTimeout = timeoutMs ?? cb.timeoutMs;
+    
+    return new Promise<void>((resolve) => {
+      const timeoutId = setTimeout(() => {
+        logger.warn('SSE drain callback timed out', undefined, {
+          error: `Timeout exceeded after ${effectiveTimeout} ms`,
+          timeoutMs: effectiveTimeout,
+        });
+        forceClosedSseConnections++;
+        resolve();
+      }, effectiveTimeout);
+
+      try {
+        const result = cb.fn();
+        if (result && typeof result === 'object' && 'then' in result) {
+          (result as Promise<void>).then(() => clearTimeout(timeoutId), () => clearTimeout(timeoutId));
+        } else {
+          clearTimeout(timeoutId);
+          resolve();
+        }
+      } catch (err) {
+        clearTimeout(timeoutId);
+        logger.error('SSE drain callback failed', undefined, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        resolve();
+      }
+    });
+  });
+
+  return Promise.all(drainPromises).then(() => {
+    // Tear down the shared dispatcher so no further events are fanned out.
+    liveSubscribersByStreamId.clear();
+    sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
+    sseLiveSubscribersGauge.set(0);
+    sseEventListenersGauge.set(0);
+  });
 }
 
 export function _resetSseSubscriptionsForTest(): void {

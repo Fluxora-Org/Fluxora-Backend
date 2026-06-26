@@ -361,6 +361,8 @@ import {
   drainSseEventBus,
   registerSseShutdownCallback,
   _resetSseSubscriptionsForTest,
+  getForceClosedSseConnections,
+  resetForceClosedSseConnectionsCount,
 } from '../src/streams/sseEmitter.js';
 import {
   requestStopReplay,
@@ -378,52 +380,54 @@ import {
 
 describe('#336 SSE drain hook', () => {
   beforeEach(() => {
+    _resetShutdownState();
     _resetSseSubscriptionsForTest();
   });
 
   afterEach(() => {
+    _resetShutdownState();
     _resetSseSubscriptionsForTest();
   });
 
-  it('drainSseEventBus() calls all registered shutdown callbacks', () => {
+  it('drainSseEventBus() calls all registered shutdown callbacks', async () => {
     const cb1 = vi.fn();
     const cb2 = vi.fn();
     registerSseShutdownCallback(cb1);
     registerSseShutdownCallback(cb2);
 
-    drainSseEventBus();
+    await drainSseEventBus();
 
     expect(cb1).toHaveBeenCalledTimes(1);
     expect(cb2).toHaveBeenCalledTimes(1);
   });
 
-  it('drainSseEventBus() clears callbacks so a second call is a no-op', () => {
+  it('drainSseEventBus() clears callbacks so a second call is a no-op', async () => {
     const cb = vi.fn();
     registerSseShutdownCallback(cb);
 
-    drainSseEventBus();
-    drainSseEventBus();
+    await drainSseEventBus();
+    await drainSseEventBus();
 
     expect(cb).toHaveBeenCalledTimes(1);
   });
 
-  it('deregister function removes the callback before drain', () => {
+  it('deregister function removes the callback before drain', async () => {
     const cb = vi.fn();
     const deregister = registerSseShutdownCallback(cb);
     deregister();
 
-    drainSseEventBus();
+    await drainSseEventBus();
 
     expect(cb).not.toHaveBeenCalled();
   });
 
-  it('drain isolates a throwing callback and still calls remaining ones', () => {
+  it('drain isolates a throwing callback and still calls remaining ones', async () => {
     const bad = vi.fn(() => { throw new Error('boom'); });
     const good = vi.fn();
     registerSseShutdownCallback(bad);
     registerSseShutdownCallback(good);
 
-    expect(() => drainSseEventBus()).not.toThrow();
+    await expect(drainSseEventBus()).resolves.toBeUndefined();
     expect(good).toHaveBeenCalledTimes(1);
   });
 
@@ -438,6 +442,22 @@ describe('#336 SSE drain hook', () => {
     await gracefulShutdown(server, 'SIGTERM', 5_000);
 
     expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('drainSseEventBus() logs and counts force-closed connections', async () => {
+    const slowCallback = vi.fn(() => {
+      return new Promise<void>((resolve) => setTimeout(resolve, 1000));
+    });
+    const fastCallback = vi.fn();
+    registerSseShutdownCallback(slowCallback, 100);
+    registerSseShutdownCallback(fastCallback, 100);
+
+    resetForceClosedSseConnectionsCount();
+    await drainSseEventBus(200);
+
+    expect(slowCallback).not.toHaveBeenCalled();
+    expect(fastCallback).toHaveBeenCalledTimes(1);
+    expect(getForceClosedSseConnections()).toBe(1);
   });
 });
 

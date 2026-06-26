@@ -272,6 +272,8 @@ export const EnvSchema = z.object({
   WORKER_ENABLED: booleanEnv().default(false),
   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
   INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
+  /** Milliseconds to wait per SSE stream before force-closing during shutdown drain. */
+  SSE_DRAIN_TIMEOUT_MS: integerEnv('SSE_DRAIN_TIMEOUT_MS', 1000).default(5000),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
   ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
   RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
