@@ -10,6 +10,7 @@
  *  - Rate-limit headers on allowed and rejected requests (supertest)
  */
 
+import express from 'express';
 import request from 'supertest';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createApp } from '../../src/app.js';
@@ -82,6 +83,14 @@ describe('SlidingWindowStore with FakeRedisClient', () => {
     await expect(store.increment('key', 60_000, 100)).rejects.toThrow('SlidingWindowStore is closed');
     await expect(store.getCount('key', 60_000)).rejects.toThrow('SlidingWindowStore is closed');
   });
+
+  it('throws when a pipeline command fails', async () => {
+    // Inject a simulated pipeline failure for ZCARD (which runs at index 2 in the pipeline)
+    client.throwOnNext('zcard', 'Simulated ZCARD failure');
+    
+    // The SlidingWindowStore should surface the pipeline error rather than reading undefined
+    await expect(store.increment('key', 60_000, 100)).rejects.toThrow('Redis pipeline command at index 2 failed: Simulated ZCARD failure');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -105,6 +114,25 @@ describe('HybridStore', () => {
     const result = await hybrid.increment('key', 60_000, 100);
     expect(hybrid.usingFallback).toBe(true);
     expect(result.count).toBe(1);
+    expect(errors).toContain('increment');
+  });
+
+  it('delegates to fallback when SlidingWindowStore pipeline partially fails', async () => {
+    const client = new FakeRedisClient();
+    const primary = new SlidingWindowStore(client);
+    const fallback = new InMemoryStore();
+    const errors: string[] = [];
+    const hybrid = new HybridStore(primary, fallback, (err, op) => {
+      errors.push(op);
+    });
+
+    // Inject a partial pipeline error
+    client.throwOnNext('zcard', 'Simulated ZCARD failure');
+    
+    // HybridStore should catch the surfaced pipeline error and delegate
+    const result = await hybrid.increment('key', 60_000, 100);
+    expect(hybrid.usingFallback).toBe(true);
+    expect(result.count).toBe(1); // the fallback limit starts counting at 1
     expect(errors).toContain('increment');
   });
 
@@ -226,11 +254,12 @@ describe('Rate-limit headers via supertest', () => {
       { REDIS_ENABLED: 'false', RATE_LIMIT_ENABLED: 'true', RATE_LIMIT_IP_MAX: '10' },
       store,
     );
-    const app = createApp({ env: { REDIS_ENABLED: 'false', RATE_LIMIT_ENABLED: 'true', RATE_LIMIT_IP_MAX: '10' } });
-    app.locals.rateLimiter = limiter;
+    const app = express();
+    app.use(limiter);
+    app.get('/api/test', (req, res) => res.json({ ok: true }));
 
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test')
       .set('x-forwarded-for', '10.0.0.1');
 
     expect(res.headers['x-ratelimit-limit']).toBeDefined();
@@ -239,7 +268,6 @@ describe('Rate-limit headers via supertest', () => {
   });
 
   it('returns 429 with Retry-After when limit is exceeded', async () => {
-    // Use a store pre-loaded with a count at the limit
     const store = new InMemoryStore();
     const limit = 2;
 
@@ -253,22 +281,17 @@ describe('Rate-limit headers via supertest', () => {
       store,
     );
 
-    const app = createApp({
-      env: {
-        REDIS_ENABLED: 'false',
-        RATE_LIMIT_ENABLED: 'true',
-        RATE_LIMIT_IP_MAX: String(limit),
-      },
-    });
-    app.locals.rateLimiter = limiter;
+    const app = express();
+    app.use(limiter);
+    app.get('/api/test', (req, res) => res.json({ ok: true }));
 
     // Exhaust the limit
     for (let i = 0; i <= limit; i++) {
-      await request(app).get('/api/streams').set('x-forwarded-for', '10.0.0.2');
+      await request(app).get('/api/test').set('x-forwarded-for', '10.0.0.2');
     }
 
     const res = await request(app)
-      .get('/api/streams')
+      .get('/api/test')
       .set('x-forwarded-for', '10.0.0.2');
 
     expect(res.status).toBe(429);
@@ -283,15 +306,13 @@ describe('Rate-limit headers via supertest', () => {
 
 describe('Shutdown hook', () => {
   it('limiter.close() calls store.close()', async () => {
-    const closeSpy = vi.fn().mockResolvedValue(undefined);
-    const mockStore: RateLimitStore = {
-      async increment() { return { count: 1, resetAt: Date.now() + 60_000 }; },
-      async getCount() { return { count: 0, resetAt: Date.now() + 60_000 }; },
-      close: closeSpy,
+    const store: RateLimitStore = {
+      increment: vi.fn(),
+      getCount: vi.fn(),
+      close: vi.fn().mockResolvedValue(undefined),
     };
-
-    const limiter = createRateLimiter({ REDIS_ENABLED: 'false' }, mockStore);
+    const limiter = createRateLimiter({ REDIS_ENABLED: 'false' }, store);
     await limiter.close();
-    expect(closeSpy).toHaveBeenCalledOnce();
+    expect(store.close).toHaveBeenCalledTimes(1);
   });
 });

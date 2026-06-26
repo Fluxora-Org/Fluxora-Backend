@@ -131,6 +131,24 @@ export class SlidingWindowStore implements RateLimitStore {
             .pexpire(redisKey, windowMs)
             .exec();
 
+        if (!results) {
+            throw new Error('Redis sliding-window pipeline failed to execute');
+        }
+
+        for (let i = 0; i < results.length; i++) {
+            const [err] = results[i] as [Error | null, unknown];
+            if (err) {
+                /**
+                 * Failure semantics:
+                 * On any partial pipeline failure, we immediately throw an error.
+                 * This surfaces a clear error, preventing us from silently reading an undefined ZCARD.
+                 * The HybridStore wrapper catches this error and delegates to the fallback InMemoryStore,
+                 * thereby maintaining availability while properly enforcing a degraded local limit.
+                 */
+                throw new Error(`Redis pipeline command at index ${i} failed: ${err.message}`);
+            }
+        }
+
         // ZCARD result is at index 2
         const zcardResult = results[2];
         const count = zcardResult && zcardResult[1] != null ? (zcardResult[1] as number) : 0;
