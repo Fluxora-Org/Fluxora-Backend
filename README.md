@@ -177,6 +177,9 @@ The test suite includes:
 | `DATABASE_URL` | - | PostgreSQL connection string (required) |
 | `REPLAY_BATCH_SIZE` | 1000 | Number of events per batch insert |
 | `PORT` | 3000 | HTTP server port |
+| `API_KEYS` | - | Comma-separated list of valid API keys |
+| `API_KEY_PEPPER` | - | Server-side pepper for API key hashing (**Required if API_KEYS is configured**) |
+
 
 ### Batch Size Tuning
 
