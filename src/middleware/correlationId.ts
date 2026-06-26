@@ -20,8 +20,17 @@ import { randomUUID } from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { correlationStore } from '../tracing/middleware.js';
 
+
 /** Canonical header name used for correlation IDs throughout the service. */
 export const CORRELATION_ID_HEADER = 'x-correlation-id';
+
+/**
+ * Standard request-identity header echoed on every response so that clients,
+ * proxies, and body-less responses (e.g. 204) can be correlated with server
+ * logs without parsing a JSON envelope.  Its value is always identical to the
+ * resolved `x-correlation-id`.
+ */
+export const REQUEST_ID_HEADER = 'x-request-id';
 
 export const MAX_CORRELATION_ID_LENGTH = 36;
 
@@ -55,6 +64,7 @@ export function correlationIdMiddleware(req: Request, res: Response, next: NextF
   correlationStore.run(correlationId, () => {
     req.correlationId = correlationId;
     res.setHeader(CORRELATION_ID_HEADER, correlationId);
+    res.setHeader(REQUEST_ID_HEADER, correlationId);
     next();
   });
 }

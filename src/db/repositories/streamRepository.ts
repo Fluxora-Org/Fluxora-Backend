@@ -7,23 +7,20 @@
  *   upsertStream uses INSERT … ON CONFLICT DO NOTHING so the same
  *   (transaction_hash, event_index) pair is safe to submit multiple times.
  *
- * Decimal-string invariant:
- *   Amount columns are stored and returned as TEXT.  No numeric coercion
- *   is performed here — callers own that responsibility.
+ * Decimal-string amounts:
+ *   All monetary fields (amount, streamed_amount, remaining_amount,
+ *   rate_per_second) are stored and returned as TEXT.  The repository never
+ *   converts them to numbers, preserving full precision across the
+ *   chain → DB → API boundary.
  *
- * Transactional operations
- * ------------------------
- * `transactionalUpsertStream` and `transactionalUpdateStream` wrap the stream
- * write, an audit_logs row, and an optional webhook_outbox row inside a single
- * SQLite transaction.  If any step fails the entire transaction is rolled back,
- * guaranteeing that the three tables are always in sync.
- *
- * Decimal-string amounts
- * ----------------------
- * All monetary fields (amount, streamed_amount, remaining_amount,
- * rate_per_second) are stored and returned as TEXT.  The repository never
- * converts them to numbers, preserving full precision across the
- * chain → DB → API boundary.
+ * PII encryption:
+ *   sender_address and recipient_address are stored encrypted via pgcrypto
+ *   (pgp_sym_encrypt with AES-256).  Every read path uses streamSelectColumns()
+ *   to emit decrypt_stream_address() SQL fragments so addresses are decrypted
+ *   inside PostgreSQL before the row reaches application code.  Encryption
+ *   keys are resolved from config via resolvePgcryptoKeys() and are never
+ *   logged or included in error messages.  Key rotation is supported via an
+ *   optional PGCRYPTO_KEY_PREVIOUS.
  *
  * @module db/repositories/streamRepository
  */
@@ -228,12 +225,36 @@ export const streamRepository = {
     });
   },
 
-  /** Fetch a single stream by its primary key. */
+  /**
+   * Fetch a single stream by its primary key.
+   *
+   * Uses {@link streamSelectColumns} with the resolved pgcrypto keyset so that
+   * `sender_address` and `recipient_address` are decrypted by the database
+   * before the row reaches the application layer.  This matches the decryption
+   * contract honoured by every other read path (`getByEvent`, `findWithCursor`,
+   * `find`).
+   *
+   * **Parameter layout** (built dynamically):
+   * - `$1`  — stream id
+   * - `$2`  — current encryption key (always present when pgcrypto is enabled)
+   * - `$3`  — previous encryption key (optional; omitted when key rotation is not active)
+   *
+   * **Security**: keys are sourced exclusively from {@link resolvePgcryptoKeys}
+   * and are never logged or included in error messages.
+   */
   async getById(id: string): Promise<StreamRecord | undefined> {
     enrichActiveSpanWithStream(id);
     return timed('getById', async () => {
       const pool = await getReadPool();
-      const result = await query<Record<string, unknown>>(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
+      const keySet = resolvePgcryptoKeys();
+      const params: unknown[] = [id, keySet.current];
+      const previousKeyIndex = keySet.previous ? params.length + 1 : undefined;
+      if (keySet.previous) params.push(keySet.previous);
+      const result = await query<Record<string, unknown>>(
+        pool,
+        `SELECT ${streamSelectColumns(2, previousKeyIndex)} FROM streams WHERE id = $1`,
+        params,
+      );
       if (result.rows[0]) {
         const record = rowToRecord(result.rows[0]);
         enrichActiveSpanWithStream(record.id, record.sender_address, record.recipient_address);
@@ -248,10 +269,14 @@ export const streamRepository = {
    *
    * This avoids hydrating and serialising the full stream row when callers
    * only need to know whether the stream exists and to derive cache headers.
+   *
+   * **Read routing:** This method routes through the read replica via `getReadPool()`
+   * to reduce load on the primary database. If no replica is configured or the
+   * replica is unhealthy, it falls back to the primary pool automatically.
    */
   async existsById(id: string): Promise<StreamExistenceRecord | undefined> {
     return timed('existsById', async () => {
-      const pool = getPool();
+      const pool = await getReadPool();
       const result = await query<Record<string, unknown>>(
         pool,
         'SELECT updated_at FROM streams WHERE id = $1',
@@ -350,7 +375,25 @@ export const streamRepository = {
     });
   },
 
-  /** Offset-based paginated list. */
+  /**
+   * Offset-based paginated list.
+   *
+   * **Ordering guarantee**: rows are sorted by `created_at DESC, id DESC`.
+   * Because `created_at` defaults to `NOW()` and is not unique (multiple
+   * streams inserted in the same transaction or millisecond share the same
+   * timestamp), the secondary `id DESC` tiebreaker makes the composite key
+   * unique.  PostgreSQL can then produce a deterministic, stable order across
+   * OFFSET pages, preventing duplicate or skipped rows when ties straddle a
+   * page boundary.
+   *
+   * The composite index `idx_streams_created_at_id_desc` (added by migration
+   * `20260624000000_streams_created_at_id_tiebreaker_index.ts`) covers this
+   * ordering efficiently.
+   *
+   * Security: the ORDER BY clause references fixed column names only — no
+   * client input is interpolated — satisfying the SQL-injection-safety
+   * requirement.  LIMIT and OFFSET are passed as bound parameters (`$n`).
+   */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
       const pool = await getReadPool();
@@ -395,7 +438,7 @@ export const streamRepository = {
         query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
           [...params, pagination.limit, pagination.offset],
         ),
       ]);

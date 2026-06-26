@@ -13,14 +13,29 @@ import type {
   WebhookDelivery,
   WebhookDeliveryAttempt,
   WebhookRetryPolicy,
+  DLQReasonCode,
 } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, scheduleWebhookOutboxRetry, shouldRetry } from './retry.js';
-import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
-import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
-import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
+import {
+  calculateNextRetryTime,
+  scheduleWebhookOutboxRetry,
+  shouldRetry,
+  isRetryableStatusCode,
+  checkWebhookDeliveryGate,
+  attemptWebhookDeliveryWithRateLimit,
+  countsTowardCircuitBreaker,
+  type EnhancedRetryPolicy,
+} from './retry.js';
+import {
+  webhookDeliveriesTotal,
+  webhookDeliveryDurationSeconds,
+} from '../metrics/businessMetrics.js';
+import type {
+  WebhookCircuitBreakerStore,
+  CircuitBreakerPolicy,
+} from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import type { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
 import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
@@ -47,6 +62,7 @@ export interface WebhookDispatcherOptions {
   secret?: string;
   pollIntervalMs?: number;
   batchSize?: number;
+  maxBatchBackoffMs?: number;
   pool?: DbPool;
   policy?: EnhancedRetryPolicy;
   circuitBreakerStore?: WebhookCircuitBreakerStore;
@@ -76,7 +92,9 @@ function resolveWebhookRetryPolicy(override?: EnhancedRetryPolicy): EnhancedRetr
   const resetMs = parsePositiveInteger(process.env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS, 300_000);
   return {
     ...DEFAULT_RETRY_POLICY,
-    ...(threshold > 0 ? { circuitBreakerThreshold: threshold, circuitBreakerResetMs: resetMs } : {}),
+    ...(threshold > 0
+      ? { circuitBreakerThreshold: threshold, circuitBreakerResetMs: resetMs }
+      : {}),
     ...override,
   };
 }
@@ -96,7 +114,11 @@ function assertSafeWebhookEndpoint(endpointUrl: string): void {
     throw new Error('Webhook endpoint must use http or https');
   }
 
-  if (process.env.NODE_ENV === 'production' && url.protocol !== 'https:' && !isLoopbackHostname(url.hostname)) {
+  if (
+    process.env.NODE_ENV === 'production' &&
+    url.protocol !== 'https:' &&
+    !isLoopbackHostname(url.hostname)
+  ) {
     throw new Error('Webhook endpoint must use https in production');
   }
 }
@@ -126,6 +148,7 @@ function extractAttemptNumber(payload: unknown): number {
 function enqueuePermanentFailureToDlq(
   delivery: WebhookDelivery,
   failureReason: string,
+  reasonCode: DLQReasonCode = 'other'
 ): string | undefined {
   const alreadyQueued = webhookDeliveryStore
     .getDeadLetterQueueItems()
@@ -138,7 +161,129 @@ function enqueuePermanentFailureToDlq(
     return undefined;
   }
 
-  return webhookDeliveryStore.addToDeadLetterQueue(delivery, failureReason);
+  return webhookDeliveryStore.addToDeadLetterQueue(delivery, failureReason, reasonCode);
+}
+
+/**
+ * Validate a webhook payload for structural integrity.
+ *
+ * A payload is considered structurally invalid if:
+ * - It is a non-empty string that fails to parse as JSON (unless it's a simple string)
+ * - It is excessively large (>10MB to prevent resource exhaustion)
+ * - It appears to be binary garbage (contains non-UTF8 characters)
+ *
+ * @throws {string} Error message describing the validation failure, if the payload is poisoned
+ */
+function validateWebhookPayload(payload: unknown): void {
+  // Check if payload is oversized (potential DoS vector)
+  if (typeof payload === 'string' && payload.length > 10 * 1024 * 1024) {
+    throw 'Payload exceeds maximum size of 10MB (likely garbage or DoS attempt)';
+  }
+
+  // If it's a string, verify it's valid JSON or a reasonable simple string
+  if (typeof payload === 'string') {
+    // Try to parse as JSON first
+    try {
+      JSON.parse(payload);
+      // Successfully parsed - this is valid JSON
+      return;
+    } catch {
+      // Failed to parse. Check if this looks like an attempt at JSON (starts with { or [)
+      const trimmed = payload.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        // Looks like JSON but failed to parse - definitely poison
+        throw `Payload starts with JSON marker but is not valid JSON`;
+      }
+
+      // If it's not JSON-like, check if it's binary garbage
+      // Allow simple strings but reject if any character is outside printable ASCII range
+      if (payload.length > 1000) {
+        // Check if the first 100 chars contain any non-printable characters
+        let hasNonPrintable = false;
+        const checkStr = payload.substring(0, 100);
+        for (let i = 0; i < checkStr.length; i++) {
+          const code = checkStr.charCodeAt(i);
+          // Allow printable ASCII (0x20-0x7E) and common whitespace (0x09, 0x0A, 0x0D)
+          if (
+            !((code >= 0x20 && code <= 0x7e) || code === 0x09 || code === 0x0a || code === 0x0d)
+          ) {
+            hasNonPrintable = true;
+            break;
+          }
+        }
+        if (hasNonPrintable) {
+          throw 'Payload appears to be binary garbage (non-UTF8 characters detected)';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Validate a webhook endpoint URL for structural integrity.
+ *
+ * A URL is considered invalid (poison) if:
+ * - It cannot be parsed as a valid URL
+ * - It uses an unsupported protocol (not http/https)
+ * - It includes credentials (security risk)
+ *
+ * @throws {string} Error message describing the validation failure
+ */
+function validateWebhookUrl(endpointUrl: string): void {
+  let url: URL;
+  try {
+    url = new URL(endpointUrl);
+  } catch {
+    throw `Webhook endpoint URL is unparseable: ${endpointUrl}`;
+  }
+
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw `Webhook endpoint must use http or https, got: ${url.protocol}`;
+  }
+
+  if (url.username || url.password) {
+    throw 'Webhook endpoint must not include credentials in URL';
+  }
+}
+
+/**
+ * Classify a delivery failure as "poison" (deterministic/non-retryable).
+ *
+ * A failure is poison if it will deterministically recur on every retry:
+ * - Structurally invalid payload
+ * - Unparseable endpoint URL
+ * - Non-retryable HTTP status code (4xx except rate-limiting codes)
+ *
+ * Returns a DLQReasonCode to distinguish poison from exhausted retries.
+ */
+function classifyPoisonFailure(
+  payload: unknown,
+  endpointUrl: string,
+  statusCode: number | undefined,
+  policy: EnhancedRetryPolicy
+): DLQReasonCode | null {
+  // Check for structurally invalid payload
+  try {
+    validateWebhookPayload(payload);
+  } catch {
+    return 'poison';
+  }
+
+  // Check for unparseable URL
+  try {
+    validateWebhookUrl(endpointUrl);
+  } catch {
+    return 'poison';
+  }
+
+  // Check for non-retryable status codes (4xx except rate-limiting)
+  if (statusCode !== undefined && !isRetryableStatusCode(statusCode, policy)) {
+    if (statusCode >= 400 && statusCode < 500) {
+      return 'poison';
+    }
+  }
+
+  return null;
 }
 
 export class WebhookService {
@@ -147,7 +292,7 @@ export class WebhookService {
 
   constructor(
     policy: EnhancedRetryPolicy = resolveWebhookRetryPolicy(),
-    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore(),
+    circuitBreakerStore: WebhookCircuitBreakerStore = getWebhookCircuitBreakerStore()
   ) {
     this.policy = policy;
     this.circuitBreakerStore = circuitBreakerStore;
@@ -159,7 +304,7 @@ export class WebhookService {
   async queueDelivery(
     event: WebhookEvent,
     endpointUrl: string,
-    secret: string,
+    secret: string
   ): Promise<WebhookDelivery> {
     const deliveryId = `deliv_${randomUUID()}`;
     const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -212,17 +357,21 @@ export class WebhookService {
   async runDeliveryAttempt(
     delivery: WebhookDelivery,
     secret: string,
-    timestamp?: string,
+    timestamp?: string
   ): Promise<WebhookDeliveryAttempt> {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
     const correlationId = getCorrelationId();
-    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
-      deliveryId: delivery.deliveryId,
-      eventType: delivery.eventType,
-      attemptNumber,
-      maxAttempts: this.policy.maxAttempts,
-    });
+    logger.info(
+      'Attempting webhook delivery',
+      correlationId !== 'unknown' ? correlationId : undefined,
+      {
+        deliveryId: delivery.deliveryId,
+        eventType: delivery.eventType,
+        attemptNumber,
+        maxAttempts: this.policy.maxAttempts,
+      }
+    );
 
     const signature = computeWebhookSignature(secret, ts, delivery.payload);
     const attempt: WebhookDeliveryAttempt = {
@@ -239,7 +388,7 @@ export class WebhookService {
         delivery.eventType,
         ts,
         signature,
-        correlationId,
+        correlationId
       );
       attempt.statusCode = response.status;
 
@@ -320,7 +469,7 @@ export class WebhookService {
 
   private async recordBreakerOutcome(
     endpointUrl: string,
-    attempt: WebhookDeliveryAttempt,
+    attempt: WebhookDeliveryAttempt
   ): Promise<number> {
     const success =
       attempt.statusCode !== undefined &&
@@ -331,7 +480,7 @@ export class WebhookService {
     if (success) {
       const record = await this.circuitBreakerStore.recordSuccess(
         endpointUrl,
-        this.policy as CircuitBreakerPolicy,
+        this.policy as CircuitBreakerPolicy
       );
       return record.consecutiveFailures;
     }
@@ -344,7 +493,7 @@ export class WebhookService {
     const record = await this.circuitBreakerStore.recordFailure(
       endpointUrl,
       this.policy as CircuitBreakerPolicy,
-      Date.now(),
+      Date.now()
     );
     return record.consecutiveFailures;
   }
@@ -355,17 +504,21 @@ export class WebhookService {
   async attemptDelivery(
     delivery: WebhookDelivery,
     secret: string,
-    timestamp?: string,
+    timestamp?: string
   ): Promise<void> {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
 
     const correlationId = getCorrelationId();
-    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
-      deliveryId: delivery.deliveryId,
-      attempt: attemptNumber,
-      maxAttempts: this.policy.maxAttempts,
-    });
+    logger.info(
+      'Attempting webhook delivery',
+      correlationId !== 'unknown' ? correlationId : undefined,
+      {
+        deliveryId: delivery.deliveryId,
+        attempt: attemptNumber,
+        maxAttempts: this.policy.maxAttempts,
+      }
+    );
 
     const attempt = await this.runDeliveryAttempt(delivery, secret, ts);
     const consecutiveFailures = await this.recordBreakerOutcome(delivery.endpointUrl, attempt);
@@ -413,7 +566,7 @@ export class WebhookService {
     eventType: string,
     timestamp: string,
     signature: string,
-    correlationId?: string,
+    correlationId?: string
   ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
@@ -511,6 +664,7 @@ export class WebhookDispatcher {
   private readonly secret?: string;
   private readonly pollIntervalMs: number;
   private readonly batchSize: number;
+  private readonly maxBatchBackoffMs: number;
   private readonly pool: DbPool;
   private readonly policy: EnhancedRetryPolicy;
   private readonly service: WebhookService;
@@ -520,6 +674,10 @@ export class WebhookDispatcher {
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
   private inFlight: Promise<void> | null = null;
+  /** Consecutive processBatch failures; reset to 0 on first success. */
+  private consecutiveBatchFailures = 0;
+  /** Current backoff delay in ms (0 = no backoff). */
+  private currentBatchBackoffMs = 0;
 
   constructor(options: WebhookDispatcherOptions = {}) {
     this.endpointUrl = options.endpointUrl ?? process.env.WEBHOOK_URL;
@@ -527,6 +685,9 @@ export class WebhookDispatcher {
     this.pollIntervalMs =
       options.pollIntervalMs ?? parsePositiveInteger(process.env.WEBHOOK_POLL_INTERVAL_MS, 10_000);
     this.batchSize = options.batchSize ?? parsePositiveInteger(process.env.WEBHOOK_BATCH_SIZE, 10);
+    this.maxBatchBackoffMs =
+      options.maxBatchBackoffMs ??
+      parsePositiveInteger(process.env.WEBHOOK_BATCH_MAX_BACKOFF_MS, 60_000);
     this.pool = options.pool ?? (getPool() as unknown as DbPool);
     this.policy = resolveWebhookRetryPolicy(options.policy);
     this.circuitBreakerStore = options.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
@@ -542,7 +703,9 @@ export class WebhookDispatcher {
     if (!this.stopped) return;
 
     if (!this.endpointUrl || !this.secret) {
-      logger.warn('Webhook outbox dispatcher disabled; WEBHOOK_URL and WEBHOOK_SECRET are required');
+      logger.warn(
+        'Webhook outbox dispatcher disabled; WEBHOOK_URL and WEBHOOK_SECRET are required'
+      );
       return;
     }
 
@@ -585,11 +748,12 @@ export class WebhookDispatcher {
     if (!this.endpointUrl || !this.secret) return null;
 
     const payload = normalizePayload(row.payload);
-    const payloadObject = typeof payload === 'object' && payload !== null
-      ? payload as Record<string, unknown>
-      : {};
+    const payloadObject =
+      typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
     const endpointUrl =
-      typeof payloadObject['endpointUrl'] === 'string' ? payloadObject['endpointUrl'] : this.endpointUrl;
+      typeof payloadObject['endpointUrl'] === 'string'
+        ? payloadObject['endpointUrl']
+        : this.endpointUrl;
     const secret =
       typeof payloadObject['secret'] === 'string' ? payloadObject['secret'] : this.secret;
 
@@ -597,9 +761,24 @@ export class WebhookDispatcher {
     return { endpointUrl, secret };
   }
 
+  /**
+   * Execute one poll cycle against the webhook outbox.
+   *
+   * On consecutive database failures the method applies exponential back-off
+   * with ±25 % jitter before returning, so the poll loop slows down
+   * automatically when Postgres is degraded.  The back-off is capped at
+   * `maxBatchBackoffMs` (default 60 s) and resets to zero on the first
+   * successful batch.
+   */
   private async processBatch(): Promise<void> {
     const endpoint = this.endpointUrl && this.secret;
     if (!endpoint) return;
+
+    // Apply backoff delay accumulated from previous failures before querying.
+    if (this.currentBatchBackoffMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, this.currentBatchBackoffMs));
+      if (this.stopped) return;
+    }
 
     const client = await this.pool.connect();
 
@@ -611,15 +790,17 @@ export class WebhookDispatcher {
           FROM webhook_outbox
           WHERE processed = false
             AND created_at <= NOW()
-          ORDER BY created_at ASC, COALESCE((payload->>'ledger')::numeric, 0) ASC, payload->>'id' ASC, id ASC
+          ORDER BY created_at ASC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         `,
-        [this.batchSize],
+        [this.batchSize]
       );
 
       if (result.rows.length === 0) {
         await client.query('COMMIT');
+        // Empty batch still counts as success — reset backoff.
+        this.resetBatchBackoff();
         return;
       }
 
@@ -628,11 +809,14 @@ export class WebhookDispatcher {
       }
 
       await client.query('COMMIT');
+      // Successful batch — reset backoff.
+      this.resetBatchBackoff();
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       logger.error('Webhook outbox dispatcher batch failed', undefined, {
         error: error instanceof Error ? error.message : String(error),
       });
+      this.recordBatchFailure();
     } finally {
       client.release();
     }
@@ -641,13 +825,74 @@ export class WebhookDispatcher {
   private async deliverRow(client: DbClient, row: OutboxRow): Promise<void> {
     const endpoint = this.resolveEndpoint(row);
     if (!endpoint) {
-      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, { outboxId: row.id });
+      logger.warn('Webhook outbox row skipped; no endpoint configured', undefined, {
+        outboxId: row.id,
+      });
       return;
     }
 
     const payload = normalizePayload(row.payload);
     const payloadString = JSON.stringify(payload);
     const attemptNumber = extractAttemptNumber(payload);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // POISON DETECTION: Check for structurally invalid or unparseable data
+    // ─────────────────────────────────────────────────────────────────────
+    let poisonReason: DLQReasonCode | null = null;
+
+    try {
+      validateWebhookPayload(payload);
+    } catch (error) {
+      poisonReason = 'poison';
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.error('Webhook payload is structurally invalid (poison)', undefined, {
+        outboxId: row.id,
+        streamId: row.stream_id,
+        error: errorMsg,
+      });
+    }
+
+    // Check URL validity on first attempt to fail fast on unparseable URLs
+    if (!poisonReason && attemptNumber === 1) {
+      try {
+        validateWebhookUrl(endpoint.endpointUrl);
+      } catch (error) {
+        poisonReason = 'poison';
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        logger.error('Webhook endpoint URL is unparseable (poison)', undefined, {
+          outboxId: row.id,
+          streamId: row.stream_id,
+          url: endpoint.endpointUrl,
+          error: errorMsg,
+        });
+      }
+    }
+
+    // Fast-track poison to DLQ without retrying
+    if (poisonReason) {
+      const delivery: WebhookDelivery = {
+        id: `outbox_${row.id}`,
+        deliveryId: `outbox_${row.id}`,
+        eventId: row.stream_id,
+        eventType: row.event_type as WebhookEvent['type'],
+        endpointUrl: endpoint.endpointUrl,
+        status: 'permanent_failure',
+        attempts: [],
+        createdAt: new Date(row.created_at).getTime(),
+        updatedAt: Date.now(),
+        payload: payloadString,
+      };
+
+      enqueuePermanentFailureToDlq(
+        delivery,
+        'Webhook payload or endpoint is structurally invalid and non-retryable',
+        poisonReason
+      );
+
+      await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
+      return;
+    }
+
     const delivery: WebhookDelivery = {
       id: `outbox_${row.id}`,
       deliveryId: `outbox_${row.id}`,
@@ -678,7 +923,7 @@ export class WebhookDispatcher {
         circuitBreakerStore: this.circuitBreakerStore,
         rateLimiter: this.rateLimiter,
         rateLimitConfig: this.rateLimitConfig,
-      },
+      }
     );
 
     await client.query('UPDATE webhook_outbox SET processed = true WHERE id = $1', [row.id]);
@@ -690,15 +935,49 @@ export class WebhookDispatcher {
             INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
             VALUES ($1, $2, $3::jsonb, $4, false)
           `,
-          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt],
+          [row.stream_id, row.event_type, JSON.stringify(payload), result.retryAt]
         );
       }
       return;
     }
 
     const attempt = result.attempt;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // POISON DETECTION: Check for non-retryable status codes after first attempt
+    // ─────────────────────────────────────────────────────────────────────
+    const failureReasonCode = classifyPoisonFailure(
+      payload,
+      endpoint.endpointUrl,
+      attempt.statusCode,
+      this.policy
+    );
+
+    if (failureReasonCode === 'poison') {
+      delivery.status = 'permanent_failure';
+      delivery.attempts.push(attempt);
+
+      logger.error('Webhook delivery detected as poison (non-retryable failure)', undefined, {
+        deliveryId: delivery.deliveryId,
+        statusCode: attempt.statusCode,
+        error: attempt.error,
+        attemptNumber,
+      });
+
+      enqueuePermanentFailureToDlq(
+        delivery,
+        attempt.error
+          ? `Poison detected: ${attempt.error}`
+          : `Poison detected: non-retryable status ${attempt.statusCode}`,
+        'poison'
+      );
+
+      return;
+    }
+
     if (result.shouldRetry) {
-      attempt.nextRetryAt = result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
+      attempt.nextRetryAt =
+        result.retryAt?.getTime() ?? calculateNextRetryTime(attemptNumber, this.policy);
       delivery.status = 'pending';
     } else if (
       attempt.statusCode !== undefined &&
@@ -724,8 +1003,34 @@ export class WebhookDispatcher {
         INSERT INTO webhook_outbox (stream_id, event_type, payload, created_at, processed)
         VALUES ($1, $2, $3::jsonb, $4, false)
       `,
-      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt],
+      [row.stream_id, row.event_type, JSON.stringify(result.payload), result.retryAt]
     );
+  }
+
+  /**
+   * Reset the dispatcher batch back-off after a successful (or empty) batch.
+   * Clears the consecutive-failure counter and the accumulated delay so the
+   * poll loop returns to its normal cadence immediately.
+   */
+  private resetBatchBackoff(): void {
+    this.consecutiveBatchFailures = 0;
+    this.currentBatchBackoffMs = 0;
+  }
+
+  /**
+   * Record a failed batch and grow the back-off delay exponentially with
+   * ±25 % jitter, capped at `maxBatchBackoffMs`. The poll loop applies the
+   * resulting delay before the next query so a degraded Postgres is not
+   * hammered.
+   */
+  private recordBatchFailure(): void {
+    this.consecutiveBatchFailures += 1;
+    // Exponential base: pollInterval * 2^(failures-1), capped at the max.
+    const base = this.pollIntervalMs * Math.pow(2, this.consecutiveBatchFailures - 1);
+    const capped = Math.min(base, this.maxBatchBackoffMs);
+    // ±25 % jitter to avoid thundering-herd retries.
+    const jitter = capped * (Math.random() * 0.5 - 0.25);
+    this.currentBatchBackoffMs = Math.max(0, Math.round(capped + jitter));
   }
 }
 

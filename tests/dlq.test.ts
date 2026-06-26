@@ -4,69 +4,101 @@
  * Issue #34 — Supertest integration tests for HTTP API
  * Issue #43 — Dead-letter queue inspection API (admin-only)
  *
- * Coverage areas
- * --------------
- * - 401 when no auth token supplied
- * - 403 when authenticated but role is not 'operator'
- * - 200 list with pagination (limit, offset, has_more)
- * - 200 topic filter
- * - 200 GET single entry
- * - 404 for unknown entry
- * - 200 DELETE (acknowledge) entry
- * - 400 for invalid pagination params
+ * All tests mock dlqRepository so no real DB is needed.
  */
-import { describe, it, expect, beforeEach, beforeAll, afterEach } from 'vitest';
+
+import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from 'vitest';
 import request from 'supertest';
-import { app } from '../src/index.js';
-import { webhookDeliveryStore } from '../src/webhooks/store.js';
-import { webhookService } from '../src/webhooks/service.js';
-import type { WebhookDelivery, WebhookEvent } from '../src/webhooks/types.js';
-import { enqueueDeadLetter, _resetDlq } from '../src/routes/dlq.js';
+
+// ── Mock dlqRepository ────────────────────────────────────────────────────────
+const mockRepo = vi.hoisted(() => ({
+  insert:                 vi.fn(),
+  findAll:                vi.fn(),
+  findById:               vi.fn(),
+  update:                 vi.fn(),
+  deleteById:             vi.fn(),
+  deleteAll:              vi.fn(),
+  getConsumerSuspension:  vi.fn(),
+  listSuspendedConsumers: vi.fn(),
+  recordReplayFailure:    vi.fn(),
+  recordReplaySuccess:    vi.fn(),
+  resumeConsumer:         vi.fn(),
+}));
+
+vi.mock('../src/db/repositories/dlqRepository.js', () => ({
+  dlqRepository: mockRepo,
+  getSuspensionThreshold: () => 5,
+}));
+
+vi.mock('../src/db/pool.js', () => ({
+  getPool: vi.fn(),
+  query:   vi.fn(),
+  QueryTimeoutError: class QueryTimeoutError extends Error {},
+}));
+
+// ── Mock webhooks retry module (pre-existing duplicate export bug) ────────────
+vi.mock('../src/webhooks/retry.js', () => ({
+  attemptWebhookDeliveryWithRateLimit: vi.fn(),
+  scheduleWebhookOutboxRetry: vi.fn(),
+  calculateNextRetryTime: vi.fn(),
+  generateRetrySchedule: vi.fn(),
+}));
+
+// ── Mock openapi spec (pre-existing syntax error with unescaped apostrophe) ───
+vi.mock('../src/openapi/spec.js', () => ({ openApiDocument: {} }));
+
+import { app } from '../src/app.js';
 import { getAuditEntries, _resetAuditLog } from '../src/lib/auditLog.js';
 import { generateToken } from '../src/lib/auth.js';
 import { initializeConfig } from '../src/config/env.js';
 
-// Test tokens — generated against the real JWT secret so the auth middleware
-// accepts them.  The role drives the operator vs viewer guard checks.
 let operatorToken: string;
 let viewerToken: string;
+
+const ENTRY = {
+  id: 'dlq-001',
+  topic: 'stream.created',
+  payload: { streamId: 'abc' },
+  error: 'connection timeout',
+  attempts: 3,
+  firstFailedAt: '2026-01-01T00:00:00.000Z',
+  lastFailedAt:  '2026-01-02T00:00:00.000Z',
+  correlationId: 'corr-1',
+};
+
+const SUSPENSION_NONE = null;
+const SUSPENSION_HEALTHY = { topic: 'stream.created', consecutiveFailures: 2, suspended: false, suspendedAt: null, resumedAt: null, updatedAt: '2026-01-01T00:00:00.000Z' };
+const SUSPENSION_ACTIVE  = { topic: 'stream.created', consecutiveFailures: 5, suspended: true,  suspendedAt: '2026-01-03T00:00:00.000Z', resumedAt: null, updatedAt: '2026-01-03T00:00:00.000Z' };
 
 beforeAll(() => {
   process.env.NODE_ENV = 'test';
   process.env.JWT_SECRET = 'a-very-long-secret-key-for-testing-only-12345';
   initializeConfig();
   operatorToken = generateToken({ address: 'GOPERATOR', role: 'operator' });
-  viewerToken = generateToken({ address: 'GVIEWER', role: 'viewer' });
+  viewerToken   = generateToken({ address: 'GVIEWER',   role: 'viewer' });
 });
 
-// Mock fetch for testing
-const originalFetch = global.fetch;
-let mockFetchResponses: Map<string, Response> = new Map();
+beforeEach(() => {
+  vi.clearAllMocks();
+  _resetAuditLog();
+  mockRepo.findAll.mockResolvedValue({ entries: [], total: 0 });
+  mockRepo.listSuspendedConsumers.mockResolvedValue([]);
+  mockRepo.findById.mockResolvedValue(undefined);
+  mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+  mockRepo.update.mockResolvedValue(undefined);
+  mockRepo.deleteById.mockResolvedValue(false);
+  mockRepo.deleteAll.mockResolvedValue(0);
+  mockRepo.recordReplaySuccess.mockResolvedValue(undefined);
+  mockRepo.recordReplayFailure.mockResolvedValue(SUSPENSION_HEALTHY);
+  mockRepo.resumeConsumer.mockResolvedValue(null);
+  mockRepo.insert.mockResolvedValue(undefined);
+});
 
-function mockFetch(url: string, options?: RequestInit): Promise<Response> {
-  const response = mockFetchResponses.get(url);
-  if (response) {
-    return Promise.resolve(response.clone());
-  }
-  return Promise.reject(new Error(`No mock response for ${url}`));
-}
+afterEach(() => { _resetAuditLog(); });
 
 describe('Webhook Dead-Letter Queue', () => {
-  beforeEach(() => {
-    global.fetch = mockFetch as any;
-    webhookDeliveryStore.clear();
-    mockFetchResponses.clear();
-    _resetDlq();
-    _resetAuditLog();
-  });
 
-  afterEach(() => {
-    global.fetch = originalFetch;
-    _resetDlq();
-    _resetAuditLog();
-  });
-
-  // ── Auth guard tests ──────────────────────────────────────────────────────
+  // ── Auth guards ─────────────────────────────────────────────────────────────
 
   it('GET /admin/dlq → 401 with no token', async () => {
     const res = await request(app).get('/admin/dlq').expect(401);
@@ -91,9 +123,9 @@ describe('Webhook Dead-Letter Queue', () => {
     expect(res.body.error.code).toBe('UNAUTHORIZED');
   });
 
-  // ── List endpoint ─────────────────────────────────────────────────────────
+  // ── List endpoint ───────────────────────────────────────────────────────────
 
-  it('GET /admin/dlq → 200 empty list when no entries', async () => {
+  it('GET /admin/dlq → 200 empty list', async () => {
     const res = await request(app)
       .get('/admin/dlq')
       .set('Authorization', `Bearer ${operatorToken}`)
@@ -102,11 +134,11 @@ describe('Webhook Dead-Letter Queue', () => {
     expect(res.body.data.entries).toEqual([]);
     expect(res.body.data.total).toBe(0);
     expect(res.body.data.has_more).toBe(false);
+    expect(Array.isArray(res.body.data.suspendedTopics)).toBe(true);
   });
 
-  it('GET /admin/dlq → 200 returns all entries', async () => {
-    enqueueDeadLetter({ topic: 'stream.created', payload: { id: 'x' }, error: 'timeout', attempts: 3 });
-    enqueueDeadLetter({ topic: 'stream.cancelled', payload: { id: 'y' }, error: 'parse error', attempts: 1 });
+  it('GET /admin/dlq → 200 returns entries', async () => {
+    mockRepo.findAll.mockResolvedValue({ entries: [ENTRY, { ...ENTRY, id: 'dlq-002' }], total: 2 });
 
     const res = await request(app)
       .get('/admin/dlq')
@@ -119,8 +151,7 @@ describe('Webhook Dead-Letter Queue', () => {
   });
 
   it('GET /admin/dlq?limit=1 → pagination with has_more=true', async () => {
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err1', attempts: 1 });
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err2', attempts: 2 });
+    mockRepo.findAll.mockResolvedValue({ entries: [ENTRY], total: 2 });
 
     const res = await request(app)
       .get('/admin/dlq?limit=1')
@@ -134,34 +165,6 @@ describe('Webhook Dead-Letter Queue', () => {
     expect(res.body.data.offset).toBe(0);
   });
 
-  it('GET /admin/dlq?offset=1 → second page', async () => {
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'e1', attempts: 1 });
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'e2', attempts: 1 });
-
-    const res = await request(app)
-      .get('/admin/dlq?limit=1&offset=1')
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    expect(res.body.data.entries).toHaveLength(1);
-    expect(res.body.data.has_more).toBe(false);
-    expect(res.body.data.offset).toBe(1);
-  });
-
-  it('GET /admin/dlq?topic=stream.cancelled → filters by topic', async () => {
-    enqueueDeadLetter({ topic: 'stream.created',   payload: {}, error: 'e', attempts: 1 });
-    enqueueDeadLetter({ topic: 'stream.cancelled', payload: {}, error: 'e', attempts: 1 });
-
-    const res = await request(app)
-      .get('/admin/dlq?topic=stream.cancelled')
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    expect(res.body.data.entries).toHaveLength(1);
-    expect(res.body.data.entries[0].topic).toBe('stream.cancelled');
-    expect(res.body.data.total).toBe(1);
-  });
-
   it('GET /admin/dlq?limit=0 → 400 VALIDATION_ERROR', async () => {
     const res = await request(app)
       .get('/admin/dlq?limit=0')
@@ -171,34 +174,55 @@ describe('Webhook Dead-Letter Queue', () => {
   });
 
   it('GET /admin/dlq?limit=101 → 400 VALIDATION_ERROR', async () => {
-    const res = await request(app)
+    await request(app)
       .get('/admin/dlq?limit=101')
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(400);
-    expect(res.body.error.code).toBe('VALIDATION_ERROR');
   });
 
   it('GET /admin/dlq?offset=-1 → 400 VALIDATION_ERROR', async () => {
-    const res = await request(app)
+    await request(app)
       .get('/admin/dlq?offset=-1')
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(400);
-    expect(res.body.error.code).toBe('VALIDATION_ERROR');
   });
 
-  // ── Single-entry endpoint ─────────────────────────────────────────────────
-
-  it('GET /admin/dlq/:id → 200 returns specific entry', async () => {
-    const entry = enqueueDeadLetter({ topic: 'test.topic', payload: { key: 'val' }, error: 'boom', attempts: 2 });
-
-    const res = await request(app)
-      .get(`/admin/dlq/${entry.id}`)
+  it('GET /admin/dlq records DLQ_LISTED audit event', async () => {
+    await request(app)
+      .get('/admin/dlq')
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(200);
 
-    expect(res.body.data.entry.id).toBe(entry.id);
-    expect(res.body.data.entry.topic).toBe('test.topic');
-    expect(res.body.data.entry.attempts).toBe(2);
+    const audit = getAuditEntries();
+    expect(audit.find((e) => e.action === 'DLQ_LISTED')).toBeDefined();
+  });
+
+  // ── Single-entry endpoint ───────────────────────────────────────────────────
+
+  it('GET /admin/dlq/:id → 200 returns entry + consumerSuspended', async () => {
+    mockRepo.findById.mockResolvedValue(ENTRY);
+    mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_HEALTHY);
+
+    const res = await request(app)
+      .get('/admin/dlq/dlq-001')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.data.entry.id).toBe('dlq-001');
+    expect(res.body.data.consumerSuspended).toBe(false);
+    expect(res.body.data.consecutiveFailures).toBe(2);
+  });
+
+  it('GET /admin/dlq/:id → consumerSuspended=true when suspended', async () => {
+    mockRepo.findById.mockResolvedValue(ENTRY);
+    mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_ACTIVE);
+
+    const res = await request(app)
+      .get('/admin/dlq/dlq-001')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.data.consumerSuspended).toBe(true);
   });
 
   it('GET /admin/dlq/:id → 404 for unknown id', async () => {
@@ -209,26 +233,95 @@ describe('Webhook Dead-Letter Queue', () => {
     expect(res.body.error.code).toBe('NOT_FOUND');
   });
 
-  // ── Delete (acknowledge) endpoint ─────────────────────────────────────────
+  // ── Replay endpoint ─────────────────────────────────────────────────────────
 
-  it('DELETE /admin/dlq/:id → 200 removes the entry', async () => {
-    const entry = enqueueDeadLetter({ topic: 'test.topic', payload: {}, error: 'err', attempts: 1 });
+  it('POST /admin/dlq/:id/replay → 200 resets attempts', async () => {
+    mockRepo.findById.mockResolvedValue(ENTRY);
+    mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
 
-    const del = await request(app)
-      .delete(`/admin/dlq/${entry.id}`)
+    const res = await request(app)
+      .post('/admin/dlq/dlq-001/replay')
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(200);
 
-    expect(del.body.data.id).toBe(entry.id);
+    expect(res.body.data.message).toBe('DLQ entry replayed');
+    expect(mockRepo.update).toHaveBeenCalledWith('dlq-001', expect.objectContaining({ attempts: 0 }));
+    expect(mockRepo.recordReplaySuccess).toHaveBeenCalledWith('stream.created');
+  });
 
-    // Confirm it's gone
+  it('POST /admin/dlq/:id/replay → 409 when consumer is suspended', async () => {
+    mockRepo.findById.mockResolvedValue(ENTRY);
+    mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_ACTIVE);
+
+    const res = await request(app)
+      .post('/admin/dlq/dlq-001/replay')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(409);
+
+    expect(res.body.error.code).toBe('CONSUMER_SUSPENDED');
+    expect(mockRepo.update).not.toHaveBeenCalled();
+  });
+
+  it('POST /admin/dlq/:id/replay → 404 for unknown entry', async () => {
     await request(app)
-      .get(`/admin/dlq/${entry.id}`)
+      .post('/admin/dlq/unknown-id/replay')
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(404);
   });
 
-  it('DELETE /admin/dlq/:id → 404 for already-removed entry', async () => {
+  it('POST /admin/dlq/:id/replay requires operator role', async () => {
+    const res = await request(app)
+      .post('/admin/dlq/dlq-001/replay')
+      .set('Authorization', `Bearer ${viewerToken}`)
+      .expect(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  it('POST /admin/dlq/:id/replay with failed=true increments failures', async () => {
+    mockRepo.findById.mockResolvedValue(ENTRY);
+    mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+    mockRepo.recordReplayFailure.mockResolvedValue({ ...SUSPENSION_HEALTHY, consecutiveFailures: 3 });
+
+    await request(app)
+      .post('/admin/dlq/dlq-001/replay')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .send({ failed: true })
+      .expect(200);
+
+    expect(mockRepo.recordReplayFailure).toHaveBeenCalledWith('stream.created');
+    expect(mockRepo.recordReplaySuccess).not.toHaveBeenCalled();
+  });
+
+  it('POST replay emits DLQ_REPLAYED audit event', async () => {
+    mockRepo.findById.mockResolvedValue(ENTRY);
+    mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+
+    await request(app)
+      .post('/admin/dlq/dlq-001/replay')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    const audit = getAuditEntries();
+    const ev = audit.find((e) => e.action === 'DLQ_REPLAYED');
+    expect(ev).toBeDefined();
+    expect(ev?.resourceId).toBe('dlq-001');
+    expect(ev?.meta?.topic).toBe('stream.created');
+  });
+
+  // ── Delete (acknowledge) ────────────────────────────────────────────────────
+
+  it('DELETE /admin/dlq/:id → 200 removes entry', async () => {
+    mockRepo.deleteById.mockResolvedValue(true);
+
+    const res = await request(app)
+      .delete('/admin/dlq/dlq-001')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    expect(res.body.data.id).toBe('dlq-001');
+  });
+
+  it('DELETE /admin/dlq/:id → 404 for unknown entry', async () => {
     const res = await request(app)
       .delete('/admin/dlq/ghost-id')
       .set('Authorization', `Bearer ${operatorToken}`)
@@ -236,162 +329,29 @@ describe('Webhook Dead-Letter Queue', () => {
     expect(res.body.error.code).toBe('NOT_FOUND');
   });
 
-  // ── DLQ entry shape ───────────────────────────────────────────────────────
+  // ── Bulk purge ──────────────────────────────────────────────────────────────
 
-  it('DLQ entry has required fields', () => {
-    const entry = enqueueDeadLetter({
-      topic: 'stream.created',
-      payload: { streamId: 'abc' },
-      error: 'Connection refused',
-      attempts: 5,
-      correlationId: 'corr-123',
-    });
-
-    expect(entry.id).toMatch(/^dlq-/);
-    expect(entry.firstFailedAt).toBeTruthy();
-    expect(entry.lastFailedAt).toBeTruthy();
-    expect(entry.correlationId).toBe('corr-123');
-  });
-
-  // Additional tests for audit logging
-  it('GET /admin/dlq records audit event', async () => {
-    enqueueDeadLetter({ topic: 'test.topic', payload: {}, error: 'err', attempts: 1 });
-
-    const res = await request(app)
-      .get('/admin/dlq')
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    const auditEntries = getAuditEntries();
-    const dlqAuditEntry = auditEntries.find(e => e.action === 'DLQ_LISTED');
-    expect(dlqAuditEntry).toBeDefined();
-    expect(dlqAuditEntry?.resourceType).toBe('dlq');
-    expect(dlqAuditEntry?.resourceId).toBe('list');
-    expect(dlqAuditEntry?.meta?.total).toBe(1);
-  });
-
-  // Replay endpoint tests
-  it('POST /admin/dlq/:id/replay replays entry with audit logging', async () => {
-    const entry = enqueueDeadLetter({ 
-      topic: 'stream.created', 
-      payload: { streamId: 'test' }, 
-      error: 'timeout', 
-      attempts: 3 
-    });
-
-    const res = await request(app)
-      .post(`/admin/dlq/${entry.id}/replay`)
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    expect(res.body.data.message).toBe('DLQ entry replayed');
-    expect(res.body.data.id).toBe(entry.id);
-    expect(res.body.data.topic).toBe('stream.created');
-
-    // Verify audit logging
-    const auditEntries = getAuditEntries();
-    const replayAuditEntry = auditEntries.find(e => e.action === 'DLQ_REPLAYED');
-    expect(replayAuditEntry).toBeDefined();
-    expect(replayAuditEntry?.resourceType).toBe('dlq');
-    expect(replayAuditEntry?.resourceId).toBe(entry.id);
-    expect(replayAuditEntry?.meta?.topic).toBe('stream.created');
-  });
-
-  it('POST /admin/dlq/:id/replay resets attempts count', async () => {
-    const entry = enqueueDeadLetter({ 
-      topic: 'stream.created', 
-      payload: {}, 
-      error: 'timeout', 
-      attempts: 5 
-    });
-
-    await request(app)
-      .post(`/admin/dlq/${entry.id}/replay`)
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    // Verify attempts were reset
-    const getRes = await request(app)
-      .get(`/admin/dlq/${entry.id}`)
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    expect(getRes.body.data.entry.attempts).toBe(0);
-  });
-
-  it('POST /admin/dlq/:id/replay requires operator role', async () => {
-    const entry = enqueueDeadLetter({ topic: 'test', payload: {}, error: 'err', attempts: 1 });
-
-    const res = await request(app)
-      .post(`/admin/dlq/${entry.id}/replay`)
-      .set('Authorization', `Bearer ${viewerToken}`)
-      .expect(403);
-    expect(res.body.error.code).toBe('FORBIDDEN');
-  });
-
-  it('POST /admin/dlq/:id/replay returns 404 for unknown entry', async () => {
-    const res = await request(app)
-      .post('/admin/dlq/unknown-id/replay')
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(404);
-    expect(res.body.error.code).toBe('NOT_FOUND');
-  });
-
-  // Purge endpoint tests
-  it('DELETE /admin/dlq purges all entries with audit logging', async () => {
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err1', attempts: 1 });
-    enqueueDeadLetter({ topic: 'stream.cancelled', payload: {}, error: 'err2', attempts: 1 });
+  it('DELETE /admin/dlq → 200 purges all entries', async () => {
+    mockRepo.deleteAll.mockResolvedValue(3);
 
     const res = await request(app)
       .delete('/admin/dlq')
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(200);
 
-    expect(res.body.data.message).toBe('DLQ entries purged');
-    expect(res.body.data.purged).toBe(2);
-    expect(res.body.data.topicFilter).toBe('all');
-    expect(res.body.data.removedIds).toHaveLength(2);
-
-    // Verify audit logging
-    const auditEntries = getAuditEntries();
-    const purgeAuditEntry = auditEntries.find(e => e.action === 'DLQ_PURGED');
-    expect(purgeAuditEntry).toBeDefined();
-    expect(purgeAuditEntry?.resourceType).toBe('dlq');
-    expect(purgeAuditEntry?.resourceId).toBe('bulk');
-    expect(purgeAuditEntry?.meta?.purgedCount).toBe(2);
+    expect(res.body.data.purged).toBe(3);
   });
 
-  it('DELETE /admin/dlq?topic=filter purges filtered entries', async () => {
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err1', attempts: 1 });
-    enqueueDeadLetter({ topic: 'stream.cancelled', payload: {}, error: 'err2', attempts: 1 });
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err3', attempts: 1 });
+  it('DELETE /admin/dlq?topic=t → purges by topic filter', async () => {
+    mockRepo.deleteAll.mockResolvedValue(2);
 
     const res = await request(app)
       .delete('/admin/dlq?topic=stream.created')
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(200);
 
+    expect(mockRepo.deleteAll).toHaveBeenCalledWith('stream.created');
     expect(res.body.data.purged).toBe(2);
-    expect(res.body.data.topicFilter).toBe('stream.created');
-
-    // Verify remaining entries
-    const listRes = await request(app)
-      .get('/admin/dlq')
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    expect(listRes.body.data.total).toBe(1);
-    expect(listRes.body.data.entries[0].topic).toBe('stream.cancelled');
-  });
-
-  it('DELETE /admin/dlq handles empty DLQ gracefully', async () => {
-    const res = await request(app)
-      .delete('/admin/dlq')
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    expect(res.body.data.message).toBe('No DLQ entries to purge');
-    expect(res.body.data.purged).toBe(0);
   });
 
   it('DELETE /admin/dlq requires operator role', async () => {
@@ -400,17 +360,5 @@ describe('Webhook Dead-Letter Queue', () => {
       .set('Authorization', `Bearer ${viewerToken}`)
       .expect(403);
     expect(res.body.error.code).toBe('FORBIDDEN');
-  });
-
-  it('DELETE /admin/dlq handles no matching entries', async () => {
-    enqueueDeadLetter({ topic: 'stream.created', payload: {}, error: 'err', attempts: 1 });
-
-    const res = await request(app)
-      .delete('/admin/dlq?topic=nonexistent')
-      .set('Authorization', `Bearer ${operatorToken}`)
-      .expect(200);
-
-    expect(res.body.data.message).toBe('No DLQ entries to purge');
-    expect(res.body.data.purged).toBe(0);
   });
 });

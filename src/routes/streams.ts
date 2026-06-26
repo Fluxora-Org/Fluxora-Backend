@@ -57,8 +57,8 @@ import {
   validateDecimalString,
   validateAmountFields,
 } from '../serialization/decimal.js';
+import { ApiError } from '../errors.js';
 import {
-  ApiError,
   ApiErrorCode,
   notFound,
   validationError,
@@ -69,7 +69,7 @@ import {
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
+import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
@@ -90,6 +90,7 @@ import {
   eventMatchesStreamId,
   SSE_STREAM_UPDATE_EVENT,
   subscribeToSseStream,
+  registerSseShutdownCallback,
 } from '../streams/sseEmitter.js';
 import {
   resolveSseConnectionLimits,
@@ -412,6 +413,8 @@ export function enforceStreamScope(req: Request, res: Response, next: NextFuncti
  */
 streamsRouter.get(
   '/',
+  authenticateApiKey,
+  requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = req.id as string | undefined;
 
@@ -524,6 +527,8 @@ streamsRouter.head(
  */
 streamsRouter.get(
   '/:id',
+  authenticateApiKey,
+  requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.id;
@@ -563,6 +568,8 @@ streamsRouter.post(
   '/',
   authenticate,
   requireAuth,
+  authenticateApiKey,
+  requireScope('streams:write'),
   requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = req.id;
@@ -690,6 +697,8 @@ streamsRouter.delete(
   '/:id',
   authenticate,
   requireAuth,
+  authenticateApiKey,
+  requireScope('streams:write'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.id;
@@ -793,6 +802,8 @@ streamsRouter.patch(
  */
 streamsRouter.get(
   '/:id/events',
+  authenticateApiKey,
+  requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.id;
@@ -834,7 +845,6 @@ streamsRouter.get(
     const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
 
     if (!connectionAttempt.ok) {
-      sseConnectionsRejectedTotal.inc({ reason: connectionAttempt.reason });
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
       warn('SSE connection rejected by limiter', {
         id,
@@ -1090,6 +1100,25 @@ streamsRouter.get(
     };
 
     unsubscribeLiveUpdates = subscribeToSseStream(id, listener);
+
+    // Register a shutdown drain callback so drainSseEventBus() can close this
+    // response cleanly with a retry:0 directive instead of an abrupt socket close.
+    const deregisterShutdown = registerSseShutdownCallback(() => {
+      try {
+        if (!res.writableEnded && !res.destroyed) {
+          res.write('retry: 0\n\n');
+          res.end();
+        }
+      } catch {
+        // Best-effort — the socket may already be gone.
+      }
+      cleanup('shutdown_drain');
+    });
+    const origUnsubscribe = unsubscribeLiveUpdates;
+    unsubscribeLiveUpdates = () => {
+      origUnsubscribe();
+      deregisterShutdown();
+    };
   }),
 );
 

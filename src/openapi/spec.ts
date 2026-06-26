@@ -9,8 +9,24 @@ import {
   OpenApiGeneratorV31,
   extendZodWithOpenApi,
 } from '@asteasolutions/zod-to-openapi';
+import { ApiKeyCreatedSchema as _ApiKeyCreatedBase } from '../lib/apiKey.js';
 
 extendZodWithOpenApi(z);
+
+/**
+ * OpenAPI-annotated version of ApiKeyCreatedSchema.
+ * ⚠️  SECURITY: `key` is the plaintext API key shown **exactly once**.
+ */
+const ApiKeyCreatedSchema = _ApiKeyCreatedBase.extend({
+  id: z.string().openapi({ example: 'ck1abc123', description: 'Stable opaque key identifier (cuid2)' }),
+  name: z.string().openapi({ example: 'my-service', description: 'Human-readable label supplied at creation time' }),
+  key: z.string().openapi({
+    example: 'flx_a1b2c3d4...',
+    description: '⚠️ Sensitive – plaintext API key. Returned only at creation/rotation. Store immediately; it will never be shown again.',
+  }),
+  prefix: z.string().openapi({ example: 'flx_a1b2', description: 'First 8 characters of the key for display/lookup' }),
+  createdAt: z.string().openapi({ example: '2026-06-23T14:00:00.000Z', description: 'ISO-8601 creation timestamp' }),
+});
 
 export const registry = new OpenAPIRegistry();
 
@@ -90,23 +106,55 @@ registry.registerComponent('securitySchemes', 'indexerWorkerToken', {
   description: 'Static shared secret for internal indexer worker endpoints',
 });
 
+// ── Common response headers ───────────────────────────────────────────────────
+
+/**
+ * X-Request-ID is set on every response (success, error, and body-less 204).
+ * Its value is the correlation ID resolved by the correlationId middleware and
+ * is identical to the `requestId` field in the JSON envelope when a body is
+ * present.  Clients, proxies, and gateways can use it to tie any response back
+ * to a server-side trace without parsing the body.
+ */
+registry.registerComponent('headers', 'XRequestId', {
+  description:
+    'Opaque request identifier that matches the correlation ID attached to server-side log lines. ' +
+    'Present on every response including body-less 204 responses. ' +
+    'When a JSON envelope is returned its value equals `meta.requestId` (success) or `error.requestId` (error).',
+  schema: { type: 'string', format: 'uuid', example: '123e4567-e89b-12d3-a456-426614174000' },
+  required: true,
+});
+
+/** Reusable headers object referencing the common X-Request-ID component. */
+const commonResponseHeaders = {
+  'X-Request-ID': { $ref: '#/components/headers/XRequestId' },
+} as const;
+
 // ── Reusable response helpers ─────────────────────────────────────────────────
 
 function successSchema<T extends z.ZodTypeAny>(dataSchema: T) {
   return z.object({ success: z.literal(true), data: dataSchema, meta: ResponseMeta });
 }
 
+/** Wraps a successSchema in a full 200-response object with common headers. */
+function successResponse200<T extends z.ZodTypeAny>(dataSchema: T, description = 'Success') {
+  return {
+    description,
+    headers: commonResponseHeaders,
+    content: { 'application/json': { schema: successSchema(dataSchema) } },
+  };
+}
+
 const errorResponses = {
-  '400': { description: 'Validation error', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '401': { description: 'Unauthorized', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '403': { description: 'Forbidden', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '404': { description: 'Not found', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '408': { description: 'Request timeout', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '409': { description: 'Conflict', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '422': { description: 'Unprocessable entity', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '429': { description: 'Too many requests', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '500': { description: 'Internal server error', content: { 'application/json': { schema: ErrorEnvelope } } },
-  '503': { description: 'Service unavailable', content: { 'application/json': { schema: ErrorEnvelope } } },
+  '400': { description: 'Validation error', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '401': { description: 'Unauthorized', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '403': { description: 'Forbidden', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '404': { description: 'Not found', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '408': { description: 'Request timeout', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '409': { description: 'Conflict', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '422': { description: 'Unprocessable entity', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '429': { description: 'Too many requests', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '500': { description: 'Internal server error', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
+  '503': { description: 'Service unavailable', headers: commonResponseHeaders, content: { 'application/json': { schema: ErrorEnvelope } } },
 } as const;
 
 // ── GET / ─────────────────────────────────────────────────────────────────────
@@ -243,7 +291,6 @@ const StreamListPage = registry.register(
       description: 'True when additional pages exist. Fetch them by passing `next_cursor`.',
       example: true,
     }),
-    next_cursor: z.union([StreamCursorToken, z.null()]).openapi({
     next_cursor: StreamCursorToken.nullable().openapi({
       description:
         'Cursor to pass as `cursor` on the next request. ' +
@@ -771,7 +818,7 @@ registry.registerPath({
     body: { required: true, content: { 'application/json': { schema: z.object({ name: z.string().openapi({ example: 'my-service' }) }) } } },
   },
   responses: {
-    '201': { description: 'API key created (raw key returned once)', content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } } },
+    '201': { description: 'API key created (raw key returned once)', content: { 'application/json': { schema: ApiKeyCreatedSchema } } },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
   },
@@ -784,7 +831,7 @@ registry.registerPath({
   security: [{ bearerAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
   responses: {
-    '200': { description: 'New raw key returned once', content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } } },
+    '200': { description: 'New raw key returned once', content: { 'application/json': { schema: ApiKeyCreatedSchema } } },
     '401': errorResponses['401'],
     '404': errorResponses['404'],
   },

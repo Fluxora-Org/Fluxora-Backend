@@ -113,6 +113,120 @@ export const indexerLagSeconds =
     registers: [registry],
   });
 
+/**
+ * Total live SSE subscribers across all stream IDs.
+ * Updated on every subscribe/unsubscribe call.
+ */
+export const sseLiveSubscribersGauge =
+  (registry.getSingleMetric('fluxora_sse_live_subscribers') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_live_subscribers',
+    help: 'Total number of live SSE subscriber callbacks registered across all streams',
+    registers: [registry],
+  });
+
+/**
+ * Webhook Dead-Letter Queue (DLQ) depth gauge.
+ *
+ * Tracks the number of webhook deliveries that have failed permanently and are queued for
+ * manual review/processing. High values indicate delivery failures are accumulating.
+ *
+ * Suggested alert threshold: > 100 items (or adjusted based on your SLA)
+ *
+ * @see https://github.com/Fluxora-Org/Fluxora-Backend/docs/webhooks.md for DLQ documentation
+ */
+export const webhookDlqItemsGauge =
+  (registry.getSingleMetric('fluxora_webhook_dlq_items') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_webhook_dlq_items',
+    help: 'Number of webhook deliveries in the dead-letter queue (permanently failed)',
+    registers: [registry],
+  });
+
+/**
+ * Current EventEmitter listener count on SSE_STREAM_UPDATE_EVENT.
+ * Should be 0 (idle) or 1 (dispatcher attached). Spikes above 1 indicate a
+ * regression that reintroduces per-connection listeners.
+ */
+export const sseEventListenersGauge =
+  (registry.getSingleMetric('fluxora_sse_event_listeners') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_event_listeners',
+    help: 'Number of EventEmitter listeners on SSE_STREAM_UPDATE_EVENT (expected 0 or 1)',
+    registers: [registry],
+  });
+
+/**
+ * Webhook outbox backlog gauge.
+ *
+ * Tracks the number of webhook deliveries pending in the outbox (waiting to be sent or retried).
+ * This gauge helps detect when the delivery pipeline is stalled or backed up.
+ *
+ * High values may indicate:
+ * - External endpoint is slow or unresponsive
+ * - Network issues or connectivity problems
+ * - The delivery processor is not running or is stuck
+ *
+ * Suggested alert threshold: > 1000 items (or adjusted based on your expected throughput)
+ *
+ * @see https://github.com/Fluxora-Org/Fluxora-Backend/docs/webhooks.md for outbox documentation
+ */
+export const webhookOutboxPendingItemsGauge =
+  (registry.getSingleMetric('fluxora_webhook_outbox_pending_items') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_webhook_outbox_pending_items',
+    help: 'Number of webhook deliveries pending in the outbox (awaiting delivery or retry)',
+    registers: [registry],
+  });
+
+/**
+ * Sync webhook metrics (DLQ depth and outbox backlog) from the store into Prometheus gauges.
+ *
+ * This function should be called periodically (via scheduled task) or on each `/metrics` scrape.
+ * It reads the current state from the webhook delivery store and updates the gauges.
+ *
+ * @param store - WebhookDeliveryStore instance to read metrics from
+ *
+ * @example
+ * // Call on each metrics scrape
+ * app.get('/metrics', (req, res) => {
+ *   syncWebhookMetrics(webhookDeliveryStore);
+ *   // ... return metrics
+ * });
+ *
+ * @see webhookDlqItemsGauge
+ * @see webhookOutboxPendingItemsGauge
+ */
+export function syncWebhookMetrics(store: {
+  getMetrics(): {
+    totalDeliveries: number;
+    successfulDeliveries: number;
+    failedDeliveries: number;
+    dlqItems: number;
+    outboxItems: number;
+  };
+}): void {
+  const metrics = store.getMetrics();
+  webhookDlqItemsGauge.set(Math.max(0, metrics.dlqItems));
+  webhookOutboxPendingItemsGauge.set(Math.max(0, metrics.outboxItems));
+}
+
+/**
+ * Counter for failed WebSocket token authentication attempts, labeled by failure reason.
+ *
+ * @security
+ * - Labels are a fixed enum (`MISSING_TOKEN` | `INVALID_TOKEN` | `AUTH_NOT_CONFIGURED`)
+ *   to prevent cardinality blowup. No token material is ever included.
+ */
+export const wsAuthFailureTotal =
+  (registry.getSingleMetric('fluxora_ws_auth_failure_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_ws_auth_failure_total',
+    help: 'Total failed WebSocket token authentication attempts, labeled by failure reason',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
@@ -122,6 +236,11 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_connections_rejected_total');
   registry.removeSingleMetric('fluxora_webhook_deliveries_total');
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
+  registry.removeSingleMetric('fluxora_webhook_dlq_items');
+  registry.removeSingleMetric('fluxora_webhook_outbox_pending_items');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
+  registry.removeSingleMetric('fluxora_sse_live_subscribers');
+  registry.removeSingleMetric('fluxora_sse_event_listeners');
+  registry.removeSingleMetric('fluxora_ws_auth_failure_total');
 }

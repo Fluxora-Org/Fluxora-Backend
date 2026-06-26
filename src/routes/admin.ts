@@ -283,18 +283,21 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
  * GET /api/admin/api-keys
  * Lists all API key records (hashes only — raw keys are never returned).
  */
-adminRouter.get('/api-keys', (_req, res) => {
+adminRouter.get('/api-keys', async (_req, res) => {
   const requestId = _req.id ?? _req.correlationId;
-  res.json(successResponse({ apiKeys: listApiKeys() }, requestId));
+  res.json(successResponse({ apiKeys: await listApiKeys() }, requestId));
 });
 
 /**
  * POST /api/admin/api-keys
  * Creates a new API key. The raw key is returned exactly once.
  *
+ * The create/rotate/revoke handlers delegate audit logging to the apiKey
+ * library so every key mutation is recorded durably, regardless of caller.
+ *
  * Body: { "name": "my-service" }
  */
-adminRouter.post('/api-keys', (req, res) => {
+adminRouter.post('/api-keys', async (req, res) => {
   const requestId = req.id ?? req.correlationId;
   const { name } = req.body ?? {};
   if (!name || typeof name !== 'string') {
@@ -309,17 +312,7 @@ adminRouter.post('/api-keys', (req, res) => {
     return;
   }
   try {
-    const created = createApiKey(name);
-    recordAuditEvent(
-      'API_KEY_CREATED',
-      'api_key',
-      created.id,
-      requestId,
-      {
-        prefix: created.prefix,
-        name: created.name,
-      },
-    );
+    const created = await createApiKey(name, req.correlationId);
     res.status(201).json(successResponse(created, requestId));
   } catch (err) {
     res.status(400).json(
@@ -338,20 +331,10 @@ adminRouter.post('/api-keys', (req, res) => {
  * Issues a new raw key for an existing key record. The old key is immediately
  * invalidated. The new raw key is returned exactly once.
  */
-adminRouter.post('/api-keys/:id/rotate', (req, res) => {
+adminRouter.post('/api-keys/:id/rotate', async (req, res) => {
   const requestId = req.id ?? req.correlationId;
   try {
-    const rotated = rotateApiKey(req.params.id);
-    recordAuditEvent(
-      'API_KEY_ROTATED',
-      'api_key',
-      rotated.id,
-      requestId,
-      {
-        prefix: rotated.prefix,
-        name: rotated.name,
-      },
-    );
+    const rotated = await rotateApiKey(req.params.id, req.correlationId);
     res.json(successResponse(rotated, requestId));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -365,16 +348,10 @@ adminRouter.post('/api-keys/:id/rotate', (req, res) => {
  * DELETE /api/admin/api-keys/:id
  * Revokes an API key. Revoked keys cannot authenticate requests.
  */
-adminRouter.delete('/api-keys/:id', (req, res) => {
+adminRouter.delete('/api-keys/:id', async (req, res) => {
   const requestId = req.id ?? req.correlationId;
   try {
-    revokeApiKey(req.params.id);
-    recordAuditEvent(
-      'API_KEY_REVOKED',
-      'api_key',
-      req.params.id,
-      requestId,
-    );
+    await revokeApiKey(req.params.id, req.correlationId);
     res.status(204).send();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

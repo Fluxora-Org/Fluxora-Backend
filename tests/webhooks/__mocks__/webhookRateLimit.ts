@@ -1,3 +1,4 @@
+import { vi, type Mocked } from 'vitest';
 import { RedisClient } from '../redis/client.js';
 import { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
 
@@ -8,14 +9,13 @@ import { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.j
  * @returns {WebhookRateLimiter}
  */
 export function setupRateLimiter(
-    mockRedisClient: jest.Mocked<RedisClient>, 
+    mockRedisClient: Mocked<RedisClient>, 
     rateLimit: number, 
     windowMs: number
 ): WebhookRateLimiter {
-    // Mocking the checkLimit method to simulate Redis interaction
     const mockRateLimiter = {
-        checkLimit: jest.fn(),
-        recordFailure: jest.fn(),
+        checkLimit: vi.fn(),
+        recordFailure: vi.fn(),
     } as unknown as WebhookRateLimiter;
 
     mockRateLimiter.checkLimit.mockResolvedValue({ canAttempt: true, retryAfterMs: null });

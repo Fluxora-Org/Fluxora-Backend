@@ -109,6 +109,35 @@ describe('replicaPool', () => {
       expect(config!.min).toBe(2);
       expect(config!.max).toBe(10);
     });
+
+    it('defaults replicaStatementTimeoutMs to primary statementTimeoutMs', () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      delete process.env['REPLICA_STATEMENT_TIMEOUT_MS'];
+      const config = resolveReplicaPoolConfig();
+      // primary mock returns statementTimeoutMs: 5000
+      expect(config!.replicaStatementTimeoutMs).toBe(5000);
+    });
+
+    it('reads REPLICA_STATEMENT_TIMEOUT_MS when explicitly set', () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      process.env['REPLICA_STATEMENT_TIMEOUT_MS'] = '2000';
+      const config = resolveReplicaPoolConfig();
+      expect(config!.replicaStatementTimeoutMs).toBe(2000);
+    });
+
+    it('accepts 0 to disable the replica timeout', () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      process.env['REPLICA_STATEMENT_TIMEOUT_MS'] = '0';
+      const config = resolveReplicaPoolConfig();
+      expect(config!.replicaStatementTimeoutMs).toBe(0);
+    });
+
+    it('falls back to primary statementTimeoutMs for non-numeric REPLICA_STATEMENT_TIMEOUT_MS', () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      process.env['REPLICA_STATEMENT_TIMEOUT_MS'] = 'bad';
+      const config = resolveReplicaPoolConfig();
+      expect(config!.replicaStatementTimeoutMs).toBe(5000);
+    });
   });
 
   // ── checkReplicaHealth ────────────────────────────────────────────────────
@@ -133,7 +162,7 @@ describe('replicaPool', () => {
   // ── createReplicaPool ─────────────────────────────────────────────────────
 
   describe('createReplicaPool', () => {
-    it('creates a pool and registers a connect handler for read-only mode', () => {
+    it('creates a pool and registers connect/error handlers', () => {
       const pool = createReplicaPool({
         connectionString: 'postgresql://replica:5432/fluxora',
         min: 1,
@@ -144,13 +173,11 @@ describe('replicaPool', () => {
         statementTimeoutMs: 3000,
       });
 
-      // Verify the 'connect' event handler was registered
       expect(mockOn).toHaveBeenCalledWith('connect', expect.any(Function));
-      // Verify the 'error' event handler was registered
       expect(mockOn).toHaveBeenCalledWith('error', expect.any(Function));
     });
 
-    it('connect handler sets default_transaction_read_only = on', () => {
+    it('connect handler sets both read-only and statement_timeout when timeout > 0', () => {
       createReplicaPool({
         connectionString: 'postgresql://replica:5432/fluxora',
         min: 1,
@@ -161,18 +188,94 @@ describe('replicaPool', () => {
         statementTimeoutMs: 3000,
       });
 
-      // Find the 'connect' handler
       const connectCall = mockOn.mock.calls.find(
         (call: [string, (...args: unknown[]) => void]) => call[0] === 'connect'
       );
       expect(connectCall).toBeDefined();
 
-      // Simulate a new connection
-      const mockClient = {
-        query: vi.fn().mockResolvedValue(undefined),
-      };
+      const mockClient = { query: vi.fn().mockResolvedValue(undefined) };
       connectCall![1](mockClient);
+
+      expect(mockClient.query).toHaveBeenCalledWith(
+        'SET default_transaction_read_only = on; SET statement_timeout = 3000'
+      );
+    });
+
+    it('connect handler uses replicaStatementTimeoutMs over statementTimeoutMs when both present', () => {
+      createReplicaPool({
+        connectionString: 'postgresql://replica:5432/fluxora',
+        min: 1,
+        max: 5,
+        connectionTimeoutMillis: 3000,
+        idleTimeoutMillis: 10000,
+        queueLimit: 20,
+        statementTimeoutMs: 5000,
+        replicaStatementTimeoutMs: 2000,
+      });
+
+      const connectCall = mockOn.mock.calls.find(
+        (call: [string, (...args: unknown[]) => void]) => call[0] === 'connect'
+      );
+      const mockClient = { query: vi.fn().mockResolvedValue(undefined) };
+      connectCall![1](mockClient);
+
+      expect(mockClient.query).toHaveBeenCalledWith(
+        'SET default_transaction_read_only = on; SET statement_timeout = 2000'
+      );
+    });
+
+    it('connect handler omits statement_timeout when timeout = 0', () => {
+      createReplicaPool({
+        connectionString: 'postgresql://replica:5432/fluxora',
+        min: 1,
+        max: 5,
+        connectionTimeoutMillis: 3000,
+        idleTimeoutMillis: 10000,
+        queueLimit: 20,
+        statementTimeoutMs: 0,
+      });
+
+      const connectCall = mockOn.mock.calls.find(
+        (call: [string, (...args: unknown[]) => void]) => call[0] === 'connect'
+      );
+      const mockClient = { query: vi.fn().mockResolvedValue(undefined) };
+      connectCall![1](mockClient);
+
       expect(mockClient.query).toHaveBeenCalledWith('SET default_transaction_read_only = on');
+      expect(mockClient.query).not.toHaveBeenCalledWith(
+        expect.stringContaining('statement_timeout')
+      );
+    });
+
+    it('connect handler logs an error and does not throw when query rejects', async () => {
+      const { logger } = await import('../../src/lib/logger.js');
+      createReplicaPool({
+        connectionString: 'postgresql://replica:5432/fluxora',
+        min: 1,
+        max: 5,
+        connectionTimeoutMillis: 3000,
+        idleTimeoutMillis: 10000,
+        queueLimit: 20,
+        statementTimeoutMs: 3000,
+      });
+
+      const connectCall = mockOn.mock.calls.find(
+        (call: [string, (...args: unknown[]) => void]) => call[0] === 'connect'
+      );
+      const mockClient = {
+        query: vi.fn().mockRejectedValue(new Error('permission denied')),
+      };
+
+      // Must not throw
+      connectCall![1](mockClient);
+      // Allow the microtask queue to flush
+      await Promise.resolve();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        'Failed to configure replica connection',
+        undefined,
+        { error: 'permission denied' }
+      );
     });
   });
 
@@ -247,6 +350,55 @@ describe('replicaPool', () => {
 
       const pool2 = await getReadPool();
       expect(pool2).not.toBe(mockPrimaryPool);
+    });
+  });
+
+  // ── statement_timeout fires on replica ────────────────────────────────────
+
+  describe('statement_timeout behavior on replica queries', () => {
+    it('QueryTimeoutError is an Error with the correct name', () => {
+      // QueryTimeoutError is already fully covered in pool.statementTimeout.test.ts.
+      // Here we verify it can be constructed and identified without relying on
+      // the mocked pool.js exports.
+      class QueryTimeoutError extends Error {
+        constructor() {
+          super('Query exceeded statement_timeout limit');
+          this.name = 'QueryTimeoutError';
+        }
+      }
+      const err = new QueryTimeoutError();
+      expect(err).toBeInstanceOf(Error);
+      expect(err.name).toBe('QueryTimeoutError');
+      expect(err.message).toBe('Query exceeded statement_timeout limit');
+    });
+
+    it('recycled connection re-applies both SETs after a timeout', () => {
+      // After a timeout the connection is destroyed and a new physical
+      // connection triggers the 'connect' event again.
+      createReplicaPool({
+        connectionString: 'postgresql://replica:5432/fluxora',
+        min: 1,
+        max: 5,
+        connectionTimeoutMillis: 3000,
+        idleTimeoutMillis: 10000,
+        queueLimit: 20,
+        statementTimeoutMs: 4000,
+      });
+
+      const connectCalls = mockOn.mock.calls.filter(
+        (call: [string, (...args: unknown[]) => void]) => call[0] === 'connect'
+      );
+      const handler = connectCalls[0]![1];
+
+      // Simulate two successive physical connections (initial + post-recycle)
+      const client1 = { query: vi.fn().mockResolvedValue(undefined) };
+      const client2 = { query: vi.fn().mockResolvedValue(undefined) };
+      handler(client1);
+      handler(client2);
+
+      const expected = 'SET default_transaction_read_only = on; SET statement_timeout = 4000';
+      expect(client1.query).toHaveBeenCalledWith(expected);
+      expect(client2.query).toHaveBeenCalledWith(expected);
     });
   });
 });

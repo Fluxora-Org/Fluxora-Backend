@@ -11,7 +11,7 @@
  */
 
 import http from 'node:http';
-import { vi as jest } from 'vitest';
+import { vi } from 'vitest';
 import request from 'supertest';
 import { app } from '../src/app.js';
 import {
@@ -352,5 +352,202 @@ describe('Graceful Shutdown Integration', () => {
     await gracefulShutdown(server, 'SIGTERM', 5_000);
     
     expect(results).toEqual(['sync', 'async']);
+  });
+});
+
+// ─── #336 subsystem shutdown hooks ───────────────────────────────────────────
+
+import {
+  drainSseEventBus,
+  registerSseShutdownCallback,
+  _resetSseSubscriptionsForTest,
+} from '../src/streams/sseEmitter.js';
+import {
+  requestStopReplay,
+  _resetStopReplay,
+  replayLock,
+} from '../src/indexer/service.js';
+import {
+  quitAllRedisClients,
+  _resetRedisClientRegistry,
+  setRedisClientFactory,
+  getRedisClientFactory,
+  type RedisClient,
+  type RedisConfig,
+} from '../src/redis/client.js';
+
+describe('#336 SSE drain hook', () => {
+  beforeEach(() => {
+    _resetSseSubscriptionsForTest();
+  });
+
+  afterEach(() => {
+    _resetSseSubscriptionsForTest();
+  });
+
+  it('drainSseEventBus() calls all registered shutdown callbacks', () => {
+    const cb1 = vi.fn();
+    const cb2 = vi.fn();
+    registerSseShutdownCallback(cb1);
+    registerSseShutdownCallback(cb2);
+
+    drainSseEventBus();
+
+    expect(cb1).toHaveBeenCalledTimes(1);
+    expect(cb2).toHaveBeenCalledTimes(1);
+  });
+
+  it('drainSseEventBus() clears callbacks so a second call is a no-op', () => {
+    const cb = vi.fn();
+    registerSseShutdownCallback(cb);
+
+    drainSseEventBus();
+    drainSseEventBus();
+
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('deregister function removes the callback before drain', () => {
+    const cb = vi.fn();
+    const deregister = registerSseShutdownCallback(cb);
+    deregister();
+
+    drainSseEventBus();
+
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('drain isolates a throwing callback and still calls remaining ones', () => {
+    const bad = vi.fn(() => { throw new Error('boom'); });
+    const good = vi.fn();
+    registerSseShutdownCallback(bad);
+    registerSseShutdownCallback(good);
+
+    expect(() => drainSseEventBus()).not.toThrow();
+    expect(good).toHaveBeenCalledTimes(1);
+  });
+
+  it('is invoked by gracefulShutdown() via addShutdownHook', async () => {
+    _resetShutdownState();
+    const cb = vi.fn();
+    registerSseShutdownCallback(cb);
+    addShutdownHook(() => drainSseEventBus());
+
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('#336 indexer stop hook', () => {
+  afterEach(() => {
+    _resetStopReplay();
+  });
+
+  it('requestStopReplay() is invoked by a registered shutdown hook', async () => {
+    _resetShutdownState();
+    const stopped = vi.fn(() => requestStopReplay());
+    addShutdownHook(stopped);
+
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(stopped).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('#336 Redis quit hook', () => {
+  const originalFactory = getRedisClientFactory();
+
+  afterEach(() => {
+    setRedisClientFactory(originalFactory);
+    _resetRedisClientRegistry();
+  });
+
+  it('quitAllRedisClients() calls close() on every tracked client', async () => {
+    const close1 = vi.fn().mockResolvedValue(undefined);
+    const close2 = vi.fn().mockResolvedValue(undefined);
+
+    // Inject a fake factory that returns stub clients
+    let callCount = 0;
+    setRedisClientFactory({
+      async createClient(): Promise<RedisClient> {
+        callCount++;
+        const stub: RedisClient = {
+          async get() { return null; },
+          async set() {},
+          async setNx() { return false; },
+          async del() {},
+          async exists() { return false; },
+          close: callCount === 1 ? close1 : close2,
+          multi() { return null as any; },
+          async zcount() { return 0; },
+        };
+        return stub;
+      },
+    });
+
+    // Import createRedisClient after factory is set
+    const { createRedisClient } = await import('../src/redis/client.js');
+    const cfg: RedisConfig = { url: 'redis://localhost:6379', enabled: true };
+    await createRedisClient(cfg);
+    await createRedisClient(cfg);
+
+    await quitAllRedisClients();
+
+    expect(close1).toHaveBeenCalledTimes(1);
+    expect(close2).toHaveBeenCalledTimes(1);
+  });
+
+  it('quitAllRedisClients() is idempotent — second call is a no-op', async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+    setRedisClientFactory({
+      async createClient(): Promise<RedisClient> {
+        return {
+          async get() { return null; },
+          async set() {},
+          async setNx() { return false; },
+          async del() {},
+          async exists() { return false; },
+          close,
+          multi() { return null as any; },
+          async zcount() { return 0; },
+        };
+      },
+    });
+
+    const { createRedisClient } = await import('../src/redis/client.js');
+    await createRedisClient({ url: 'redis://localhost:6379', enabled: true });
+
+    await quitAllRedisClients();
+    await quitAllRedisClients();
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('quitAllRedisClients() swallows per-client close errors', async () => {
+    const close = vi.fn().mockRejectedValue(new Error('network gone'));
+    setRedisClientFactory({
+      async createClient(): Promise<RedisClient> {
+        return {
+          async get() { return null; },
+          async set() {},
+          async setNx() { return false; },
+          async del() {},
+          async exists() { return false; },
+          close,
+          multi() { return null as any; },
+          async zcount() { return 0; },
+        };
+      },
+    });
+
+    const { createRedisClient } = await import('../src/redis/client.js');
+    await createRedisClient({ url: 'redis://localhost:6379', enabled: true });
+
+    await expect(quitAllRedisClients()).resolves.toBeUndefined();
   });
 });

@@ -498,6 +498,58 @@ describe('GET /openapi.json', () => {
   });
 });
 
+// ── API key 201 schema ────────────────────────────────────────────────────────
+
+describe('POST /api/admin/api-keys — 201 response schema', () => {
+  /** Resolve $ref paths like "#/components/schemas/Foo" within the spec */
+  function resolveSchema(spec: Record<string, unknown>, schemaOrRef: Record<string, unknown>): Record<string, unknown> {
+    if ('$ref' in schemaOrRef) {
+      const parts = (schemaOrRef['$ref'] as string).replace('#/', '').split('/');
+      let node: unknown = spec;
+      for (const p of parts) node = (node as Record<string, unknown>)[p];
+      return node as Record<string, unknown>;
+    }
+    return schemaOrRef;
+  }
+
+  async function get201Schema() {
+    const res = await request(app).get('/openapi.json');
+    const spec = res.body as Record<string, unknown>;
+    const createOp = ((spec.paths as Record<string, unknown>)['/api/admin/api-keys'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const raw = (((createOp?.responses as Record<string, unknown>)?.['201'] as Record<string, unknown>)?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    return resolveSchema(spec, (raw?.schema ?? {}) as Record<string, unknown>);
+  }
+
+  it('201 response schema enumerates all required fields', async () => {
+    const schema = await get201Schema();
+    const props = schema['properties'] as Record<string, unknown>;
+    expect(props).toBeDefined();
+    expect(props['id']).toBeDefined();
+    expect(props['name']).toBeDefined();
+    expect(props['key']).toBeDefined();
+    expect(props['prefix']).toBeDefined();
+    expect(props['createdAt']).toBeDefined();
+  });
+
+  it('key field description flags it as sensitive and one-time', async () => {
+    const schema = await get201Schema();
+    const props = schema['properties'] as Record<string, unknown>;
+    const keyDesc = ((props['key'] as Record<string, unknown>)?.['description'] ?? '') as string;
+    expect(keyDesc.toLowerCase()).toMatch(/sensitive|one.time|once|never.*again|shown.*once/i);
+  });
+
+  it('204 revoke response is documented on DELETE /api/admin/api-keys/{id}', async () => {
+    const res = await request(app).get('/openapi.json');
+    const spec = res.body as Record<string, unknown>;
+    const deleteOp = ((spec.paths as Record<string, unknown>)['/api/admin/api-keys/{id}'] as Record<string, unknown>)?.delete as Record<string, unknown>;
+    const r204 = (deleteOp?.responses as Record<string, unknown>)?.['204'] as Record<string, unknown>;
+    expect(r204).toBeDefined();
+    expect(r204['description']).toBeTruthy();
+    // Per OpenAPI 3.1 a 204 must NOT include a content body
+    expect(r204['content']).toBeUndefined();
+  });
+});
+
 describe('GET /docs', () => {
   it('redirects /docs to /docs/', async () => {
     const res = await request(app).get('/docs');

@@ -9,8 +9,10 @@ import {
 import { createRpcDegradationMiddleware } from '../../src/middleware/rpcDegradation.js';
 import {
   InMemoryRpcFallbackCache,
+  RedisRpcFallbackCache,
   type RpcFallbackCache,
 } from '../../src/redis/rpcFallbackCache.js';
+import type { RedisClient } from '../../src/redis/client.js';
 import {
   deRegisterRpcMetrics,
   rpcFallbackCacheEarlyRefreshesTotal,
@@ -250,5 +252,68 @@ describe('StellarRpcService fallback cache', () => {
     const misses = await rpcFallbackCacheMissesTotal.get();
     expect(misses.values[0]?.labels).toEqual({ operation: 'getLatestLedger' });
     expect(misses.values[0]?.value).toBe(1);
+  });
+});
+
+describe('corrupt cache entries', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns null and deletes key and increments counter for empty string value', async () => {
+    const fakeRedis: RedisClient = {
+      get: vi.fn().mockResolvedValue(''),
+      set: vi.fn(),
+      setNx: vi.fn(),
+      del: vi.fn(),
+      exists: vi.fn(),
+      close: vi.fn(),
+      multi: vi.fn(),
+      zcount: vi.fn(),
+    };
+    const cache = new RedisRpcFallbackCache(fakeRedis);
+
+    const result = await cache.get('testOp');
+
+    expect(result).toBeNull();
+    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(cache.corruptEntriesTotal).toBe(1);
+  });
+
+  it('returns null and deletes key and increments counter for truncated JSON', async () => {
+    const fakeRedis: RedisClient = {
+      get: vi.fn().mockResolvedValue('{"key":'),
+      set: vi.fn(),
+      setNx: vi.fn(),
+      del: vi.fn(),
+      exists: vi.fn(),
+      close: vi.fn(),
+      multi: vi.fn(),
+      zcount: vi.fn(),
+    };
+    const cache = new RedisRpcFallbackCache(fakeRedis);
+
+    const result = await cache.get('testOp');
+
+    expect(result).toBeNull();
+    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(cache.corruptEntriesTotal).toBe(1);
+  });
+
+  it('does not swallow Redis transport errors', async () => {
+    const fakeRedis: RedisClient = {
+      get: vi.fn().mockRejectedValue(new Error('ECONNREFUSED')),
+      set: vi.fn(),
+      setNx: vi.fn(),
+      del: vi.fn(),
+      exists: vi.fn(),
+      close: vi.fn(),
+      multi: vi.fn(),
+      zcount: vi.fn(),
+    };
+    const cache = new RedisRpcFallbackCache(fakeRedis);
+
+    await expect(cache.get('testOp')).rejects.toThrow('ECONNREFUSED');
+    expect(cache.corruptEntriesTotal).toBe(0);
   });
 });
