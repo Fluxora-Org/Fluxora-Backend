@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "test:coverage:ci": "pnpm test:coverage && node scripts/check-webhooks-coverage.mjs",
     "test:watch": "vitest",
     "dev": "ts-node src/index.ts",
     "start": "node dist/src/index.js",

@@ -67,6 +67,10 @@ jobs:
           REPLAY_BATCH_SIZE: 100
         run: pnpm test:coverage
 
+      - name: Check webhooks coverage gate
+        if: always()
+        run: node scripts/check-webhooks-coverage.mjs
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
