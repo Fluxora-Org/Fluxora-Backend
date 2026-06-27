@@ -256,6 +256,7 @@ export const EnvSchema = z.object({
     byteSizeToNumber,
     z.number().int('WEBHOOK_MAX_RESPONSE_BYTES must resolve to whole bytes').positive('WEBHOOK_MAX_RESPONSE_BYTES must be positive'),
   ).default(64 * 1024),
+  WEBHOOK_DNS_TIMEOUT_MS: integerEnv('WEBHOOK_DNS_TIMEOUT_MS', 1).default(2000),
 
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
   ENABLE_RATE_LIMIT: booleanEnv().optional(),
@@ -392,6 +393,7 @@ export interface Config {
   webhookRetryRps: number;
   webhookAllowedHosts: string[] | undefined;
   webhookMaxResponseBytes: number;
+  webhookDnsTimeoutMs: number;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -547,6 +549,7 @@ function toConfig(env: ParsedEnv): Config {
       ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
       : undefined,
     webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
+    webhookDnsTimeoutMs: env.WEBHOOK_DNS_TIMEOUT_MS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
