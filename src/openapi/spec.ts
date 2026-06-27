@@ -1590,17 +1590,35 @@ registry.registerPath({
   security: [{ indexerWorkerToken: [] }],
   request: {
     query: z.object({
-      fromLedger: z.string().optional(),
-      toledger: z.string().optional(),
-      contractId: z.string().optional(),
-      topic: z.string().optional(),
-      limit: z.string().optional().openapi({ example: '100' }),
-      offset: z.string().optional().openapi({ example: '0' }),
+      fromLedger: z.string().optional().openapi({
+        description: 'Only return events at or after this ledger (inclusive lower bound). Non-negative integer.',
+        example: '510000',
+      }),
+      toledger: z.string().optional().openapi({
+        description: 'Only return events at or before this ledger (inclusive upper bound). Non-negative integer.',
+        example: '520000',
+      }),
+      contractId: z.string().optional().openapi({
+        description: 'Filter events by Soroban contract address.',
+        example: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+      }),
+      topic: z.string().optional().openapi({
+        description: 'Filter events by topic. One of: stream.created | stream.updated | stream.cancelled | stream.completed | stream.funded | stream.withdrawn.',
+        example: 'stream.created',
+      }),
+      limit: z.string().optional().openapi({
+        description: 'Maximum events to return (1–1000, default 100).',
+        example: '100',
+      }),
+      offset: z.string().optional().openapi({
+        description: 'Number of events to skip before returning results. Non-negative integer. Default 0.',
+        example: '0',
+      }),
     }),
   },
   responses: {
     '200': {
-      description: 'Event list',
+      description: 'Offset-paginated event list ordered by `ledger` ASC, `eventId` ASC.',
       content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
     },
     '401': errorResponses['401'],
@@ -1615,20 +1633,34 @@ registry.registerPath({
   security: [{ indexerWorkerToken: [] }],
   request: {
     query: z.object({
-      afterEventId: z
-        .string()
-        .optional()
-        .openapi({ description: 'Exclusive cursor; omit to start from beginning' }),
-      fromLedger: z.string().optional(),
-      toledger: z.string().optional(),
-      contractId: z.string().optional(),
-      topic: z.string().optional(),
-      limit: z.string().optional().openapi({ example: '100' }),
+      afterEventId: z.string().optional().openapi({
+        description: 'Exclusive cursor: only return events with an eventId strictly after this value in canonical (ledger ASC, eventId ASC) order. Omit to start from the beginning.',
+      }),
+      fromLedger: z.string().optional().openapi({
+        description: 'Only return events at or after this ledger (inclusive lower bound). Non-negative integer.',
+        example: '510000',
+      }),
+      toledger: z.string().optional().openapi({
+        description: 'Only return events at or before this ledger (inclusive upper bound). Non-negative integer.',
+        example: '520000',
+      }),
+      contractId: z.string().optional().openapi({
+        description: 'Filter events by Soroban contract address.',
+        example: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+      }),
+      topic: z.string().optional().openapi({
+        description: 'Filter events by topic. One of: stream.created | stream.updated | stream.cancelled | stream.completed | stream.funded | stream.withdrawn.',
+        example: 'stream.created',
+      }),
+      limit: z.string().optional().openapi({
+        description: 'Maximum events to return (1–1000, default 100).',
+        example: '100',
+      }),
     }),
   },
   responses: {
     '200': {
-      description: 'Cursor-paginated event page',
+      description: 'Cursor-paginated event page ordered by `ledger` ASC, `eventId` ASC.',
       content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
     },
     '401': errorResponses['401'],
