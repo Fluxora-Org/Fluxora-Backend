@@ -459,6 +459,7 @@ export async function dropOldPartitions(
   }
   
   return {
-    droppedPartitions,      message: `Dropped ${droppedPartitions.length} old partitions for ${parentTable}`
+    droppedPartitions,
+    message: `Dropped ${droppedPartitions.length} old partitions for ${parentTable}`
   };
 }

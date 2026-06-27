@@ -19,6 +19,16 @@ export const RPC_FALLBACK_CACHE_PREFIX = 'rpc:cache::';
 const SAFE_OPERATION = /^[A-Za-z0-9._-]+$/;
 const RPC_FALLBACK_CACHE_ENVELOPE_VERSION = 1;
 
+/**
+ * Key format version.
+ *
+ * Security: cache keys must be collision-resistant across distinct
+ * (operation, cacheParts[]) tuples. Never rely on delimiter-joined raw
+ * inputs because two different tuples could be made to map to the same
+ * joined string.
+ */
+const RPC_FALLBACK_CACHE_KEY_VERSION = 2;
+
 export interface RpcFallbackCacheEntry<T> {
   value: T;
   writtenAt: number;
@@ -53,19 +63,43 @@ export function hashCachePart(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function encodeCacheKeyPart(part: string): string {
+  // Enforce an allow-list for untrusted inputs.
+  if (!SAFE_OPERATION.test(part)) {
+    throw new Error('RPC fallback cache key part contains unsafe characters');
+  }
+
+  // Hash each part so key construction cannot be influenced by delimiter
+  // sequences or by part boundaries.
+  return hashCachePart(part);
+}
+
+/**
+ * Builds a collision-resistant cache key.
+ *
+ * We keep the SAFE_OPERATION allow-list check, but we additionally hash each
+ * cache-part (and also the operation name) before concatenation.
+ *
+ * Why: delimiter-joined raw strings can be made to collide via different
+ * (operation, parts[]) tuples.
+ *
+ * Key format stays stable for SAFE operations by including explicit versions.
+ */
 function buildCacheKey(operation: string, cacheParts: readonly string[] = []): string {
   if (!SAFE_OPERATION.test(operation)) {
     throw new Error('RPC fallback cache operation contains unsafe characters');
   }
 
-  for (const part of cacheParts) {
-    if (!SAFE_OPERATION.test(part)) {
-      throw new Error('RPC fallback cache key part contains unsafe characters');
-    }
-  }
+  const encodedOperation = encodeCacheKeyPart(operation);
+  const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
-  return `${RPC_FALLBACK_CACHE_PREFIX}${[operation, ...cacheParts].join('::')}`;
+  // Key format versioning:
+  // - Prevent collisions between different tuple shapes by hashing each part.
+  // - Include key-version to allow future format upgrades.
+  return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
 }
+
+
 
 function isCacheEnvelope<T>(value: unknown): value is RpcFallbackCacheEnvelope<T> {
   return typeof value === 'object'

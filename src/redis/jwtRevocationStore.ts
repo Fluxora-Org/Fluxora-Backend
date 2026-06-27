@@ -156,6 +156,8 @@ function resolveRevocationTtl(input: number | JwtRevocationOptions | undefined):
  * - Never passes a zero/negative TTL to Redis (resolveRevocationTtl returns
  *   null for already-expired tokens, and revoke() short-circuits on null)
  * - Logs revocation for audit trail
+ * - On Redis error (connection failed, timeout): throws the error
+ *   (caller must handle retry/fallback logic — see isRevoked for fail-closed behavior)
  */
 export async function revoke(
   jti: string,

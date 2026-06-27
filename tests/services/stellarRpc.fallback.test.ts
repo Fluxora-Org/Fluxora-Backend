@@ -256,6 +256,50 @@ describe('StellarRpcService fallback cache', () => {
   });
 });
 
+describe('rpcFallbackCache key collisions', () => {
+  it('does not collide distinct (operation, parts[]) tuples', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+
+    // These two tuples would collide under a naive delimiter-join strategy.
+    // With the collision-resistant builder, they must map to distinct keys.
+
+    // Build a tuple-pair that would collide under a naive delimiter-join
+    // (operation/parts treated as raw, unescaped string segments).
+
+
+
+
+    const operation1 = 'getLatestLedger';
+    const parts1 = ['a', 'b'];
+
+    const operation2 = 'getLatestLedger::a';
+    const parts2 = ['b'];
+
+    // Ensure safe inputs (avoid relying on delimiter-forging characters).
+    expect(() => cache.setEntry(operation1, { v: 1 }, 60, parts1)).not.toThrow();
+    expect(() => cache.setEntry(operation2, { v: 2 }, 60, parts2)).not.toThrow();
+
+    await cache.setEntry(operation1, { v: 1 }, 60, parts1);
+    await cache.setEntry(operation2, { v: 2 }, 60, parts2);
+
+    await expect(cache.get<{ v: number }>(operation1, parts1)).resolves.toEqual({ v: 1 });
+    await expect(cache.get<{ v: number }>(operation2, parts2)).resolves.toEqual({ v: 2 });
+
+    // Cross-tuple reads must miss.
+    await expect(cache.get<{ v: number }>(operation1, parts2)).resolves.toBeNull();
+    await expect(cache.get<{ v: number }>(operation2, parts1)).resolves.toBeNull();
+  });
+
+  it('rejects unsafe key parts under SAFE_OPERATION', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+
+    // ':' is not allowed by SAFE_OPERATION
+    await expect(cache.setEntry('getLatestLedger', { v: 1 }, 60, ['bad:part'])).rejects.toThrow(
+      /unsafe characters/i,
+    );
+  });
+});
+
 describe('corrupt cache entries', () => {
   afterEach(() => {
     vi.restoreAllMocks();
