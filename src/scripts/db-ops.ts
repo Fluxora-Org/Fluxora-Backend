@@ -398,3 +398,68 @@ export async function restoreDatabase(
     return { success: false, message: 'Restore failed', error: errorMsg }
   }
 }
+
+// ── dropOldPartitions ─────────────────────────────────────────────────────────
+
+/**
+ * Retention policy: Detach and drop old partitions for a given partitioned table.
+ * Defaults to a dry run.
+ * 
+ * @param pool           PostgreSQL pg.Pool instance
+ * @param parentTable    Name of the parent partitioned table (e.g. 'contract_events')
+ * @param olderThanDays  Drop partitions containing data strictly older than this many days
+ * @param dryRun         If true, only returns what would be dropped (default: true)
+ */
+export async function dropOldPartitions(
+  pool: import('pg').Pool,
+  parentTable: string,
+  olderThanDays: number,
+  dryRun = true
+): Promise<{ droppedPartitions: string[]; message: string }> {
+  const query = \`
+    SELECT
+      c.relname AS partition_name,
+      pg_get_expr(c.relpartbound, c.oid) AS partition_bound
+    FROM pg_inherits i
+    JOIN pg_class c ON c.oid = i.inhrelid
+    JOIN pg_class p ON p.oid = i.inhparent
+    WHERE p.relname = $1
+  \`;
+  
+  const res = await pool.query(query, [parentTable]);
+  const droppedPartitions: string[] = [];
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
+  
+  for (const row of res.rows) {
+    const pName = row.partition_name;
+    const pBound = row.partition_bound;
+    
+    if (pBound === 'DEFAULT') continue;
+    
+    // Bounds typically look like: FOR VALUES FROM ('2023-01-01 00:00:00+00') TO ('2023-02-01 00:00:00+00')
+    const toMatch = pBound.match(/TO \\('([^']+)'\\)/);
+    if (toMatch && toMatch[1]) {
+      const toDate = new Date(toMatch[1]);
+      if (toDate < cutoffDate) {
+        if (!dryRun) {
+          // Explicitly require admin role or let it fail if insufficient perms.
+          await pool.query(\`DROP TABLE IF EXISTS \${pName}\`);
+        }
+        droppedPartitions.push(pName);
+      }
+    }
+  }
+  
+  if (dryRun) {
+    return {
+      droppedPartitions,
+      message: \`[DRY RUN] Would drop \${droppedPartitions.length} old partitions for \${parentTable}\`
+    };
+  }
+  
+  return {
+    droppedPartitions,
+    message: \`Dropped \${droppedPartitions.length} old partitions for \${parentTable}\`
+  };
+}
