@@ -44,7 +44,7 @@ export const pgLastAutovacuumAgeSeconds =
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-const VACUUM_STATS_SQL = \`
+const VACUUM_STATS_SQL = `
   WITH RECURSIVE tables AS (
     SELECT oid, relname AS root_table, relname AS table_name
     FROM pg_class
@@ -63,7 +63,7 @@ const VACUUM_STATS_SQL = \`
   FROM tables t
   JOIN pg_stat_user_tables s ON s.relid = t.oid
   GROUP BY t.root_table
-\`;
+`;
 
 
 interface VacuumRow {

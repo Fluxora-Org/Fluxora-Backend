@@ -416,7 +416,7 @@ export async function dropOldPartitions(
   olderThanDays: number,
   dryRun = true
 ): Promise<{ droppedPartitions: string[]; message: string }> {
-  const query = \`
+  const query = `
     SELECT
       c.relname AS partition_name,
       pg_get_expr(c.relpartbound, c.oid) AS partition_bound
@@ -424,7 +424,7 @@ export async function dropOldPartitions(
     JOIN pg_class c ON c.oid = i.inhrelid
     JOIN pg_class p ON p.oid = i.inhparent
     WHERE p.relname = $1
-  \`;
+  `;
   
   const res = await pool.query(query, [parentTable]);
   const droppedPartitions: string[] = [];
@@ -444,7 +444,7 @@ export async function dropOldPartitions(
       if (toDate < cutoffDate) {
         if (!dryRun) {
           // Explicitly require admin role or let it fail if insufficient perms.
-          await pool.query(\`DROP TABLE IF EXISTS \${pName}\`);
+          await pool.query(`DROP TABLE IF EXISTS ${pName}`);
         }
         droppedPartitions.push(pName);
       }
@@ -454,12 +454,12 @@ export async function dropOldPartitions(
   if (dryRun) {
     return {
       droppedPartitions,
-      message: \`[DRY RUN] Would drop \${droppedPartitions.length} old partitions for \${parentTable}\`
+      message: `[DRY RUN] Would drop ${droppedPartitions.length} old partitions for ${parentTable}`
     };
   }
   
   return {
     droppedPartitions,
-    message: \`Dropped \${droppedPartitions.length} old partitions for \${parentTable}\`
+    message: `Dropped ${droppedPartitions.length} old partitions for ${parentTable}`
   };
 }
