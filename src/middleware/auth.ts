@@ -244,37 +244,57 @@ export function requirePermission(permission: Permission) {
 }
 
 /**
- * Require that the API key includes a specific scope.
- * Used for API key-based authentication (not JWT).
- * Must be used after the API key is authenticated and attached to req.
+ * Require that the principal includes a specific scope.
+ * Used for both API key and JWT authentication.
+ * Must be used after authentication middleware is mounted.
  * 
- * @param requiredScope - The scope required (e.g., 'streams:read', 'streams:write')
+ * @param requiredScopes - The scopes required (e.g., 'streams:read', 'streams:write')
  * @returns Middleware function that enforces the scope
  */
 export function requireScope(...requiredScopes: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const requestId = req.id ?? req.correlationId;
 
-    // Check if API key scopes are attached to the request
-    const keyScopes: string[] = (req as any).keyScopes ?? [];
+    const isApiKeyAuth = (req as any).keyId !== undefined;
+    const isJwtAuth = req.user !== undefined;
 
-    if (!Array.isArray(keyScopes) || keyScopes.length === 0) {
-      warn('Scope check failed: no API key scopes found', { path: req.path, requestId });
-      res.status(403).json({
+    if (!isApiKeyAuth && !isJwtAuth) {
+      warn('Scope check failed: no authenticated principal', { path: req.path, requestId });
+      res.status(401).json({
         error: {
-          code: ApiErrorCode.FORBIDDEN,
-          message: 'API key does not have required scopes',
+          code: ApiErrorCode.UNAUTHORIZED,
+          message: 'Authentication required to access this resource',
           requestId,
         },
       });
       return;
     }
 
-    // Check if the key has at least one of the required scopes
-    const hasRequiredScope = requiredScopes.some(scope => keyScopes.includes(scope));
+    // Check scopes based on auth type
+    let scopes: string[] = [];
+    if (isApiKeyAuth) {
+      scopes = (req as any).keyScopes ?? [];
+    } else if (isJwtAuth) {
+      scopes = (req.user as any).permissions ?? [];
+    }
+
+    if (!Array.isArray(scopes) || scopes.length === 0) {
+      warn('Scope check failed: no scopes found on principal', { path: req.path, requestId });
+      res.status(403).json({
+        error: {
+          code: ApiErrorCode.FORBIDDEN,
+          message: 'Principal does not have required scopes',
+          requestId,
+        },
+      });
+      return;
+    }
+
+    // Check if the principal has at least one of the required scopes
+    const hasRequiredScope = requiredScopes.some(scope => scopes.includes(scope));
 
     if (!hasRequiredScope) {
-      warn('Insufficient scopes', { required: requiredScopes, have: keyScopes, path: req.path, requestId });
+      warn('Insufficient scopes', { required: requiredScopes, have: scopes, path: req.path, requestId });
       res.status(403).json({
         error: {
           code: ApiErrorCode.FORBIDDEN,
