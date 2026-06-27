@@ -33,6 +33,7 @@ import {
 import { correlationStore, getCorrelationId } from '../src/tracing/middleware';
 import { StreamHub } from '../src/ws/hub';
 import { webhookDispatcher } from '../src/webhooks/dispatcher';
+import { logger } from '../src/lib/logger.js';
 
 function createCorrelationIdTestApp() {
   const app = express();
@@ -50,6 +51,10 @@ function createCorrelationIdTestApp() {
 const app = createCorrelationIdTestApp();
 
 describe('correlationId middleware', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   describe('ID generation', () => {
     it('generates a correlation ID when none is provided', async () => {
       const res = await request(app).get('/health');
@@ -84,10 +89,18 @@ describe('correlationId middleware', () => {
       expect(res.headers[CORRELATION_ID_HEADER]).toBe(clientId);
     });
 
-    it('trims whitespace from incoming header', async () => {
-      const clientId = '  22222222-2222-4222-8222-222222222222  ';
-      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, clientId);
-      expect(res.headers[CORRELATION_ID_HEADER]).toBe('22222222-2222-4222-8222-222222222222');
+    it('rejects whitespace-padded values exceeding max raw length', () => {
+      // Raw length (incl. whitespace) > 36 → rejected by raw-length gate before trim.
+      // Uses direct middleware call because supertest/Express may trim HTTP headers.
+      const padded = '  22222222-2222-4222-8222-222222222222  ';
+      const req = { headers: { [CORRELATION_ID_HEADER]: padded } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(padded);
+        expect(req.correlationId).not.toBe('22222222-2222-4222-8222-222222222222');
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
     });
 
     it('generates a new ID when incoming header is an empty string', async () => {
@@ -111,12 +124,93 @@ describe('correlationId middleware', () => {
       expect(isValidCorrelationId(id)).toBe(true);
     });
 
-    it('rejects oversized inbound correlation IDs', () => {
+    it('rejects oversized inbound correlation IDs at unit level', () => {
       const oversized = '1'.repeat(MAX_CORRELATION_ID_LENGTH + 1);
       expect(isValidCorrelationId(oversized)).toBe(false);
     });
 
-    it('regenerates control-character-bearing inbound IDs', () => {
+    it('rejects oversized raw value via middleware (raw length > 36)', async () => {
+      const oversized = '1'.repeat(MAX_CORRELATION_ID_LENGTH + 1);
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, oversized);
+      const id = res.headers[CORRELATION_ID_HEADER] as string;
+      expect(id).not.toBe(oversized);
+      expect(isValidCorrelationId(id)).toBe(true);
+    });
+
+    it('rejects control-character-bearing inbound within 36-char limit (charset reject)', () => {
+      // Raw length is exactly 36 so raw-length gate passes; charset gate catches the \t.
+      const withTab = '11111111-1111-4111-\t111-111111111111';
+      const req = { headers: { [CORRELATION_ID_HEADER]: withTab } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(withTab);
+        expect(req.correlationId).not.toContain('\t');
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
+    });
+
+    it('rejects control-character-only inbound', () => {
+      const ctrlOnly = '\x00\x01\x02';
+      const req = { headers: { [CORRELATION_ID_HEADER]: ctrlOnly } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(ctrlOnly);
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
+    });
+
+    it('rejection logs the fact but never the raw value (oversized)', () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      const oversized = '1'.repeat(MAX_CORRELATION_ID_LENGTH + 1);
+      const req = { headers: { [CORRELATION_ID_HEADER]: oversized } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(warnSpy).toHaveBeenCalledWith(
+          'Correlation ID rejected (oversized raw length), generating new ID',
+        );
+      });
+    });
+
+    it('rejection logs the fact but never the raw value (invalid format)', () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      const malformed = 'not-a-valid-uuid';
+      const req = { headers: { [CORRELATION_ID_HEADER]: malformed } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(warnSpy).toHaveBeenCalledWith(
+          'Correlation ID rejected (invalid format), generating new ID',
+        );
+      });
+    });
+
+    it('does not log a warning for missing or empty headers', () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      // Missing header
+      const req1 = { headers: {} } as any;
+      const res1 = { setHeader: vi.fn() } as any;
+      correlationIdMiddleware(req1, res1, () => {
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(isValidCorrelationId(req1.correlationId)).toBe(true);
+      });
+
+      // Empty header
+      const req2 = { headers: { [CORRELATION_ID_HEADER]: '' } } as any;
+      const res2 = { setHeader: vi.fn() } as any;
+      correlationIdMiddleware(req2, res2, () => {
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(isValidCorrelationId(req2.correlationId)).toBe(true);
+      });
+    });
+
+    it('regenerates oversized control-character-bearing inbound IDs', () => {
+      // Raw length > 36: caught by the raw-length gate.
       const maliciousId = '11111111-1111-4111-8111-111111111111\nlog=forged';
       const req = { headers: { [CORRELATION_ID_HEADER]: maliciousId } } as any;
       const res = { setHeader: vi.fn() } as any;
