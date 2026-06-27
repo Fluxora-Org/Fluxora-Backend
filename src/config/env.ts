@@ -311,6 +311,15 @@ export const EnvSchema = z.object({
 
   validatePinnedAddress(ctx, stellarNetwork, 'contract', 'STELLAR_CONTRACT_ADDRESS', env.STELLAR_CONTRACT_ADDRESS);
   validatePinnedAddress(ctx, stellarNetwork, 'token', 'STELLAR_TOKEN_ADDRESS', env.STELLAR_TOKEN_ADDRESS);
+
+  const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
+  if (hasApiKeys && env.API_KEY_PEPPER === undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['API_KEY_PEPPER'],
+      message: 'API_KEY_PEPPER is required when API_KEYS is configured',
+    });
+  }
 });
 
 type ParsedEnv = z.infer<typeof EnvSchema>;

@@ -108,3 +108,45 @@ describe('stellar environment pinning', () => {
   });
 });
 
+describe('API key and pepper validation', () => {
+  const originalEnv = process.env;
+
+  afterEach(() => {
+    process.env = originalEnv;
+    vi.resetModules();
+  });
+
+  it('allows startup when neither API_KEYS nor API_KEY_PEPPER are configured', async () => {
+    setBaseEnv();
+    delete process.env.API_KEYS;
+    delete process.env.API_KEY_PEPPER;
+
+    const { loadConfig } = await loadEnvModule();
+    expect(() => loadConfig()).not.toThrow();
+  });
+
+  it('allows startup when API_KEYS is empty and API_KEY_PEPPER is missing', async () => {
+    setBaseEnv({ API_KEYS: '' });
+    delete process.env.API_KEY_PEPPER;
+
+    const { loadConfig } = await loadEnvModule();
+    expect(() => loadConfig()).not.toThrow();
+  });
+
+  it('allows startup when both API_KEYS and API_KEY_PEPPER are configured', async () => {
+    setBaseEnv({
+      API_KEYS: 'key1,key2',
+      API_KEY_PEPPER: 'a-very-long-pepper-key-for-testing-only-123',
+    });
+
+    const { loadConfig } = await loadEnvModule();
+    expect(() => loadConfig()).not.toThrow();
+  });
+
+  it('halts startup when API_KEYS is configured but API_KEY_PEPPER is missing', async () => {
+    setBaseEnv({ API_KEYS: 'key1,key2' });
+    delete process.env.API_KEY_PEPPER;
+
+    await expect(loadEnvModule()).rejects.toThrow('API_KEY_PEPPER is required when API_KEYS is configured');
+  });
+});

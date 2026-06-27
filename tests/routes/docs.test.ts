@@ -10,7 +10,10 @@ beforeEach(() => {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Traverse a resolved $ref or inline schema in the components. */
-function resolveRef(spec: Record<string, unknown>, ref: string): Record<string, unknown> | undefined {
+function resolveRef(
+  spec: Record<string, unknown>,
+  ref: string
+): Record<string, unknown> | undefined {
   // ref format: '#/components/schemas/Foo'
   const parts = ref.replace('#/', '').split('/');
   let node: unknown = spec;
@@ -125,7 +128,10 @@ describe('GET /openapi.json', () => {
 
   it('POST /api/streams requires bearerAuth security', async () => {
     const res = await request(app).get('/openapi.json');
-    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<
+      string,
+      unknown
+    >;
     expect(postStreams?.security).toBeDefined();
     const sec = postStreams.security as Array<Record<string, unknown>>;
     expect(sec.some((s) => 'bearerAuth' in s)).toBe(true);
@@ -133,14 +139,18 @@ describe('GET /openapi.json', () => {
 
   it('POST /internal/indexer/contract-events requires indexerWorkerToken', async () => {
     const res = await request(app).get('/openapi.json');
-    const route = (res.body.paths['/internal/indexer/contract-events'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const route = (res.body.paths['/internal/indexer/contract-events'] as Record<string, unknown>)
+      ?.post as Record<string, unknown>;
     const sec = route?.security as Array<Record<string, unknown>>;
     expect(sec?.some((s) => 'indexerWorkerToken' in s)).toBe(true);
   });
 
   it('includes error response schemas (400, 401, 404, 500)', async () => {
     const res = await request(app).get('/openapi.json');
-    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<
+      string,
+      unknown
+    >;
     const responses = postStreams?.responses as Record<string, unknown>;
     expect(responses?.['400']).toBeDefined();
     expect(responses?.['401']).toBeDefined();
@@ -148,9 +158,15 @@ describe('GET /openapi.json', () => {
 
   it('includes example payloads for POST /api/streams', async () => {
     const res = await request(app).get('/openapi.json');
-    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<string, unknown>;
+    const postStreams = (res.body.paths['/api/streams'] as Record<string, unknown>)?.post as Record<
+      string,
+      unknown
+    >;
     const body = postStreams?.requestBody as Record<string, unknown>;
-    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     expect(content?.example).toBeDefined();
   });
 
@@ -174,7 +190,7 @@ describe('GET /openapi.json', () => {
     const res2 = await request(app).get('/openapi.json');
     expect(res1.body.info.version).toBe(res2.body.info.version);
     expect(Object.keys(res1.body.paths as object).length).toBe(
-      Object.keys(res2.body.paths as object).length,
+      Object.keys(res2.body.paths as object).length
     );
   });
 
@@ -184,9 +200,8 @@ describe('GET /openapi.json', () => {
     async function getListOp() {
       const res = await request(app).get('/openapi.json');
       const spec = res.body as Record<string, unknown>;
-      return (
-        (spec.paths as Record<string, unknown>)['/api/streams'] as Record<string, unknown>
-      )?.get as Record<string, unknown>;
+      return ((spec.paths as Record<string, unknown>)['/api/streams'] as Record<string, unknown>)
+        ?.get as Record<string, unknown>;
     }
 
     // ── cursor param documentation ───────────────────────────────────────────
@@ -204,7 +219,9 @@ describe('GET /openapi.json', () => {
       const params = op.parameters as Array<Record<string, unknown>>;
       const cursorParam = params?.find((p) => p['name'] === 'cursor');
       const schema = cursorParam?.['schema'] as Record<string, unknown>;
-      const description: string = (schema?.['description'] ?? cursorParam?.['description'] ?? '') as string;
+      const description: string = (schema?.['description'] ??
+        cursorParam?.['description'] ??
+        '') as string;
       expect(description.toLowerCase()).toMatch(/opaque/);
     });
 
@@ -234,7 +251,10 @@ describe('GET /openapi.json', () => {
       const cursorParam = params?.find((p) => p['name'] === 'cursor');
       const schema = cursorParam?.['schema'] as Record<string, unknown>;
       const example = schema?.['example'] as string;
-      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<string, unknown>;
+      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<
+        string,
+        unknown
+      >;
       expect(decoded['v']).toBe(1);
       expect(typeof decoded['lastId']).toBe('string');
       expect((decoded['lastId'] as string).length).toBeGreaterThan(0);
@@ -306,7 +326,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r400 = responses?.['400'] as Record<string, unknown>;
-      const content = (r400?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r400?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown> | undefined;
       expect(examples?.['invalidCursor']).toBeDefined();
     });
@@ -315,7 +337,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r400 = responses?.['400'] as Record<string, unknown>;
-      const content = (r400?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r400?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const example = examples?.['invalidCursor'] as Record<string, unknown>;
       const value = example?.['value'] as Record<string, unknown>;
@@ -326,7 +350,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r400 = responses?.['400'] as Record<string, unknown>;
-      const content = (r400?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r400?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const example = examples?.['invalidCursor'] as Record<string, unknown>;
       const value = example?.['value'] as Record<string, unknown>;
@@ -341,7 +367,9 @@ describe('GET /openapi.json', () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
       const r200 = responses?.['200'] as Record<string, unknown>;
-      const content = (r200?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (r200?.['content'] as Record<string, unknown>)?.[
+        'application/json'
+      ] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown> | undefined;
       expect(examples).toBeDefined();
     });
@@ -349,7 +377,9 @@ describe('GET /openapi.json', () => {
     it('200 response has firstPage example', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       expect(examples?.['firstPage']).toBeDefined();
     });
@@ -357,7 +387,9 @@ describe('GET /openapi.json', () => {
     it('200 response has nextPage example', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       expect(examples?.['nextPage']).toBeDefined();
     });
@@ -365,7 +397,9 @@ describe('GET /openapi.json', () => {
     it('200 response has lastPage example', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       expect(examples?.['lastPage']).toBeDefined();
     });
@@ -373,10 +407,15 @@ describe('GET /openapi.json', () => {
     it('firstPage example has has_more=true and non-null next_cursor', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const firstPage = examples?.['firstPage'] as Record<string, unknown>;
-      const data = ((firstPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (firstPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       expect(data?.['has_more']).toBe(true);
       expect(data?.['next_cursor']).not.toBeNull();
       expect(typeof data?.['next_cursor']).toBe('string');
@@ -385,12 +424,20 @@ describe('GET /openapi.json', () => {
     it('firstPage example next_cursor decodes to a valid v:1 cursor', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const firstPage = examples?.['firstPage'] as Record<string, unknown>;
-      const data = ((firstPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (firstPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       const token = data?.['next_cursor'] as string;
-      const decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8')) as Record<string, unknown>;
+      const decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8')) as Record<
+        string,
+        unknown
+      >;
       expect(decoded['v']).toBe(1);
       expect(typeof decoded['lastId']).toBe('string');
     });
@@ -398,10 +445,15 @@ describe('GET /openapi.json', () => {
     it('nextPage example has has_more=true and non-null next_cursor', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const nextPage = examples?.['nextPage'] as Record<string, unknown>;
-      const data = ((nextPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (nextPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       expect(data?.['has_more']).toBe(true);
       expect(data?.['next_cursor']).not.toBeNull();
     });
@@ -409,10 +461,15 @@ describe('GET /openapi.json', () => {
     it('lastPage example has has_more=false and next_cursor=null', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       const lastPage = examples?.['lastPage'] as Record<string, unknown>;
-      const data = ((lastPage?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+      const data = (lastPage?.['value'] as Record<string, unknown>)?.['data'] as Record<
+        string,
+        unknown
+      >;
       expect(data?.['has_more']).toBe(false);
       expect(data?.['next_cursor']).toBeNull();
     });
@@ -420,11 +477,16 @@ describe('GET /openapi.json', () => {
     it('each page example contains a non-empty streams array', async () => {
       const op = await getListOp();
       const responses = op['responses'] as Record<string, unknown>;
-      const content = ((responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+      const content = (
+        (responses?.['200'] as Record<string, unknown>)?.['content'] as Record<string, unknown>
+      )?.['application/json'] as Record<string, unknown>;
       const examples = content?.['examples'] as Record<string, unknown>;
       for (const key of ['firstPage', 'nextPage', 'lastPage']) {
         const ex = examples?.[key] as Record<string, unknown>;
-        const data = ((ex?.['value'] as Record<string, unknown>)?.['data']) as Record<string, unknown>;
+        const data = (ex?.['value'] as Record<string, unknown>)?.['data'] as Record<
+          string,
+          unknown
+        >;
         expect(Array.isArray(data?.['streams'])).toBe(true);
         expect((data?.['streams'] as unknown[]).length).toBeGreaterThan(0);
       }
@@ -462,7 +524,10 @@ describe('GET /openapi.json', () => {
       const schema = schemas['StreamCursorToken'] as Record<string, unknown>;
       const example = schema?.['example'] as string;
       // The decoded payload should contain a stream-id (string), not a raw integer id
-      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<string, unknown>;
+      const decoded = JSON.parse(Buffer.from(example, 'base64url').toString('utf8')) as Record<
+        string,
+        unknown
+      >;
       expect(typeof decoded['lastId']).toBe('string');
       // lastId must not be a plain number string that could enumerate internal rows
       expect(isNaN(Number(decoded['lastId']))).toBe(true);
@@ -481,7 +546,8 @@ describe('GET /openapi.json', () => {
       const schemas = (res.body?.components?.schemas ?? {}) as Record<string, unknown>;
       const schema = schemas['StreamListPage'] as Record<string, unknown>;
       const props = schema?.['properties'] as Record<string, unknown>;
-      const hasMorDesc = ((props?.['has_more'] as Record<string, unknown>)?.['description'] ?? '') as string;
+      const hasMorDesc = ((props?.['has_more'] as Record<string, unknown>)?.['description'] ??
+        '') as string;
       expect(hasMorDesc.toLowerCase()).toMatch(/page|more/);
     });
 
@@ -490,9 +556,12 @@ describe('GET /openapi.json', () => {
       const schemas = (res.body?.components?.schemas ?? {}) as Record<string, unknown>;
       const schema = schemas['StreamListPage'] as Record<string, unknown>;
       const props = schema?.['properties'] as Record<string, unknown>;
-      // next_cursor may be an inline schema or a $ref — check anyOf/oneOf or direct
-      const nextCursorProp = props?.['next_cursor'] as Record<string, unknown>;
-      const desc = (nextCursorProp?.['description'] ?? '') as string;
+      // next_cursor may be an inline schema or a $ref — check anyOf/oneOf/allOf or direct
+      const nextCursorProp = props?.['next_cursor'] as Record<string, any>;
+      const desc = (nextCursorProp?.description ??
+        nextCursorProp?.allOf?.[1]?.description ??
+        nextCursorProp?.allOf?.[0]?.description ??
+        '') as string;
       expect(desc.toLowerCase()).toMatch(/null|last page/);
     });
   });
@@ -502,7 +571,10 @@ describe('GET /openapi.json', () => {
 
 describe('POST /api/admin/api-keys — 201 response schema', () => {
   /** Resolve $ref paths like "#/components/schemas/Foo" within the spec */
-  function resolveSchema(spec: Record<string, unknown>, schemaOrRef: Record<string, unknown>): Record<string, unknown> {
+  function resolveSchema(
+    spec: Record<string, unknown>,
+    schemaOrRef: Record<string, unknown>
+  ): Record<string, unknown> {
     if ('$ref' in schemaOrRef) {
       const parts = (schemaOrRef['$ref'] as string).replace('#/', '').split('/');
       let node: unknown = spec;
@@ -515,8 +587,13 @@ describe('POST /api/admin/api-keys — 201 response schema', () => {
   async function get201Schema() {
     const res = await request(app).get('/openapi.json');
     const spec = res.body as Record<string, unknown>;
-    const createOp = ((spec.paths as Record<string, unknown>)['/api/admin/api-keys'] as Record<string, unknown>)?.post as Record<string, unknown>;
-    const raw = (((createOp?.responses as Record<string, unknown>)?.['201'] as Record<string, unknown>)?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const createOp = (
+      (spec.paths as Record<string, unknown>)['/api/admin/api-keys'] as Record<string, unknown>
+    )?.post as Record<string, unknown>;
+    const raw = (
+      ((createOp?.responses as Record<string, unknown>)?.['201'] as Record<string, unknown>)
+        ?.content as Record<string, unknown>
+    )?.['application/json'] as Record<string, unknown>;
     return resolveSchema(spec, (raw?.schema ?? {}) as Record<string, unknown>);
   }
 
@@ -541,8 +618,13 @@ describe('POST /api/admin/api-keys — 201 response schema', () => {
   it('204 revoke response is documented on DELETE /api/admin/api-keys/{id}', async () => {
     const res = await request(app).get('/openapi.json');
     const spec = res.body as Record<string, unknown>;
-    const deleteOp = ((spec.paths as Record<string, unknown>)['/api/admin/api-keys/{id}'] as Record<string, unknown>)?.delete as Record<string, unknown>;
-    const r204 = (deleteOp?.responses as Record<string, unknown>)?.['204'] as Record<string, unknown>;
+    const deleteOp = (
+      (spec.paths as Record<string, unknown>)['/api/admin/api-keys/{id}'] as Record<string, unknown>
+    )?.delete as Record<string, unknown>;
+    const r204 = (deleteOp?.responses as Record<string, unknown>)?.['204'] as Record<
+      string,
+      unknown
+    >;
     expect(r204).toBeDefined();
     expect(r204['description']).toBeTruthy();
     // Per OpenAPI 3.1 a 204 must NOT include a content body
@@ -575,7 +657,10 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
     const res = await request(app).get('/openapi.json');
     const spec = res.body as Record<string, unknown>;
     return (
-      (spec.paths as Record<string, unknown>)['/internal/indexer/contract-events'] as Record<string, unknown>
+      (spec.paths as Record<string, unknown>)['/internal/indexer/contract-events'] as Record<
+        string,
+        unknown
+      >
     )?.post as Record<string, unknown>;
   }
 
@@ -690,7 +775,14 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
     const schema = schemas['ContractEventSchema'] as Record<string, unknown>;
     const props = schema.properties as Record<string, unknown>;
     const topic = props?.topic as Record<string, unknown>;
-    const knownTopics = ['stream.created', 'stream.updated', 'stream.cancelled', 'stream.completed', 'stream.funded', 'stream.withdrawn'];
+    const knownTopics = [
+      'stream.created',
+      'stream.updated',
+      'stream.cancelled',
+      'stream.completed',
+      'stream.funded',
+      'stream.withdrawn',
+    ];
     expect(knownTopics).toContain(topic.example as string);
   });
 
@@ -708,10 +800,16 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
     const res = await request(app).get('/openapi.json');
     const spec = res.body as Record<string, unknown>;
     const op = (
-      (spec.paths as Record<string, unknown>)['/internal/indexer/contract-events'] as Record<string, unknown>
+      (spec.paths as Record<string, unknown>)['/internal/indexer/contract-events'] as Record<
+        string,
+        unknown
+      >
     )?.post as Record<string, unknown>;
     const body = op.requestBody as Record<string, unknown>;
-    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     const schema = content?.schema as Record<string, unknown>;
     const props = schema?.properties as Record<string, unknown>;
     const events = props?.events as Record<string, unknown>;
@@ -727,7 +825,10 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
   it('ingest route body schema events field is an array', async () => {
     const op = await getIngestOp();
     const body = op.requestBody as Record<string, unknown>;
-    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     const schema = content?.schema as Record<string, unknown>;
     const props = schema?.properties as Record<string, unknown>;
     const events = props?.events as Record<string, unknown>;
@@ -737,7 +838,10 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
   it('ingest route body has examples with streamCreated and streamCancelled', async () => {
     const op = await getIngestOp();
     const body = op.requestBody as Record<string, unknown>;
-    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     const examples = content?.examples as Record<string, unknown>;
     expect(examples?.streamCreated).toBeDefined();
     expect(examples?.streamCancelled).toBeDefined();
@@ -746,7 +850,10 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
   it('streamCreated example has topic stream.created', async () => {
     const op = await getIngestOp();
     const body = op.requestBody as Record<string, unknown>;
-    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     const examples = content?.examples as Record<string, unknown>;
     const example = examples?.streamCreated as Record<string, unknown>;
     const value = example?.value as Record<string, unknown>;
@@ -757,7 +864,10 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
   it('streamCancelled example has topic stream.cancelled', async () => {
     const op = await getIngestOp();
     const body = op.requestBody as Record<string, unknown>;
-    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (body?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     const examples = content?.examples as Record<string, unknown>;
     const example = examples?.streamCancelled as Record<string, unknown>;
     const value = example?.value as Record<string, unknown>;
@@ -770,7 +880,10 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
     const responses = op.responses as Record<string, unknown>;
     const r200 = responses?.['200'] as Record<string, unknown>;
     expect(r200).toBeDefined();
-    const content = (r200?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (r200?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     expect(content?.schema).toBeDefined();
   });
 
@@ -779,7 +892,10 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
     const responses = op.responses as Record<string, unknown>;
     const r400 = responses?.['400'] as Record<string, unknown>;
     expect(r400).toBeDefined();
-    const content = (r400?.content as Record<string, unknown>)?.['application/json'] as Record<string, unknown>;
+    const content = (r400?.content as Record<string, unknown>)?.['application/json'] as Record<
+      string,
+      unknown
+    >;
     const examples = content?.examples as Record<string, unknown>;
     expect(examples?.unknownTopic).toBeDefined();
     expect(examples?.emptyBatch).toBeDefined();
@@ -808,5 +924,66 @@ describe('POST /internal/indexer/contract-events — ContractEventSchema spec', 
     const op = await getIngestOp();
     const desc = (op.description ?? '') as string;
     expect(desc.toLowerCase()).toMatch(/idempotent|duplicate/);
+  });
+});
+
+// ── WebSocket subscription filter — OpenAPI spec tests ───────────────────────
+
+describe('WebSocket Subscription Filter — OpenAPI spec tests', () => {
+  async function getSchemas() {
+    const res = await request(app).get('/openapi.json');
+    return (res.body?.components?.schemas ?? {}) as Record<string, unknown>;
+  }
+
+  it('registers WebSocket schemas in components/schemas', async () => {
+    const schemas = await getSchemas();
+    expect(schemas['WebSocketSubscriptionFilter']).toBeDefined();
+    expect(schemas['WebSocketSubscribeMessage']).toBeDefined();
+    expect(schemas['WebSocketUnsubscribeMessage']).toBeDefined();
+  });
+
+  it('WebSocketSubscriptionFilter matches the fields supported in runtime', async () => {
+    const schemas = await getSchemas();
+    const filter = schemas['WebSocketSubscriptionFilter'] as Record<string, unknown>;
+    expect(filter.type).toBe('object');
+    const props = filter.properties as Record<string, any>;
+
+    // Ensure all runtime fields are documented
+    expect(props.stream_id).toBeDefined();
+    expect(props.streamId).toBeDefined();
+    expect(props.recipient_address).toBeDefined();
+    expect(props.recipientAddress).toBeDefined();
+
+    // Check descriptions and references
+    expect(props.stream_id.description).toContain('stream');
+    expect(props.recipient_address.allOf?.[0]?.$ref).toContain('StellarAddress');
+    expect(props.recipientAddress.allOf?.[0]?.$ref).toContain('StellarAddress');
+  });
+
+  it('WebSocketSubscribeMessage references filter and type subscribe', async () => {
+    const schemas = await getSchemas();
+    const subMsg = schemas['WebSocketSubscribeMessage'] as Record<string, unknown>;
+    expect(subMsg.type).toBe('object');
+    const props = subMsg.properties as Record<string, any>;
+    // Check type const or enum
+    const typeValue = props.type.const || props.type.enum?.[0];
+    expect(typeValue).toBe('subscribe');
+  });
+
+  it('WebSocketUnsubscribeMessage references filter and type unsubscribe', async () => {
+    const schemas = await getSchemas();
+    const unsubMsg = schemas['WebSocketUnsubscribeMessage'] as Record<string, unknown>;
+    expect(unsubMsg.type).toBe('object');
+    const props = unsubMsg.properties as Record<string, any>;
+    // Check type const or enum
+    const typeValue = props.type.const || props.type.enum?.[0];
+    expect(typeValue).toBe('unsubscribe');
+  });
+
+  it('API description references the WebSocket protocol and endpoint', async () => {
+    const res = await request(app).get('/openapi.json');
+    const desc = res.body?.info?.description ?? '';
+    expect(desc).toMatch(/\/ws\/streams/);
+    expect(desc.toLowerCase()).toMatch(/websocket/);
   });
 });

@@ -533,6 +533,61 @@ export async function traceWebhookDispatch<T>(
 }
 
 /**
+ * Emit a span event on every circuit breaker state transition.
+ *
+ * Called by the Stellar RPC `CircuitBreaker` on each state change
+ * (CLOSED→OPEN, OPEN→HALF_OPEN, HALF_OPEN→CLOSED). Attaches the event to
+ * both the custom Fluxora Tracer span (if one is active) and to the OTel
+ * active span via `trace.getActiveSpan()`.
+ *
+ * Steady-state successes (no state change) must NOT call this function —
+ * the caller is responsible for gating on an actual transition.
+ *
+ * Security: RPC endpoint URLs and credentials must never be passed here.
+ * Only safe diagnostic values (state names, failure counts) are recorded.
+ *
+ * @param prevState        - The state before the transition.
+ * @param newState         - The state after the transition.
+ * @param failureCount     - Number of consecutive failures in the window.
+ * @param failureKind      - Classification of the failure that caused the trip
+ *                           (omit for recovery transitions where no new failure
+ *                           occurred, e.g. HALF_OPEN→CLOSED on probe success).
+ */
+export function recordCircuitBreakerTransition(
+  prevState: string,
+  newState: string,
+  failureCount: number,
+  failureKind?: string,
+): void {
+  const attributes: Record<string, unknown> = {
+    'circuit_breaker.prev_state': prevState,
+    'circuit_breaker.new_state': newState,
+    'circuit_breaker.failure_count': failureCount,
+  };
+  if (failureKind !== undefined) {
+    attributes['circuit_breaker.failure_kind'] = failureKind;
+  }
+
+  // 1. OTel active span (no-throw guard)
+  try {
+    trace.getActiveSpan()?.addEvent('circuit_breaker.state_change', attributes);
+  } catch {
+    // tracing failures must never affect application logic
+  }
+
+  // 2. Custom Fluxora tracer (no-throw guard)
+  try {
+    const tracer = getTracer();
+    const spans = tracer.getActiveSpans();
+    if (spans.length > 0) {
+      tracer.recordEvent(spans[spans.length - 1], 'circuit_breaker.state_change', attributes);
+    }
+  } catch {
+    // tracing failures must never affect application logic
+  }
+}
+
+/**
  * Record a WebSocket broadcast event on the active OTel span (if any).
  * Does not create a new span — attaches an event to the current context.
  */
