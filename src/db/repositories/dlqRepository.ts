@@ -20,6 +20,39 @@
 import { getPool, query } from '../pool.js';
 import type { DlqEntry } from '../../routes/dlq.js';
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Safely serialize a payload to JSON, handling non-serializable values
+ * like circular references and BigInt.
+ *
+ * If serialization fails, returns a safe fallback representation that
+ * records the error and a type hint without exposing sensitive data.
+ *
+ * @param payload — The payload object to serialize
+ * @returns A JSON string, or a safe fallback on serialization error
+ *
+ * @security
+ * Fallback representation avoids including the original payload to prevent
+ * accidentally leaking secrets in error states.
+ */
+function safeSerializePayload(payload: unknown): string {
+  try {
+    return JSON.stringify(payload);
+  } catch (error) {
+    // Serialization failed (e.g., circular reference, BigInt, or Symbol)
+    // Record a safe fallback that documents the failure without leaking data.
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    const fallback = {
+      _serialization_error: true,
+      reason: errorMsg,
+      type: typeof payload,
+      timestamp: new Date().toISOString(),
+    };
+    return JSON.stringify(fallback);
+  }
+}
+
 // ── Configurable threshold ────────────────────────────────────────────────────
 
 /**
@@ -88,7 +121,7 @@ export const dlqRepository = {
       [
         entry.id,
         entry.topic,
-        JSON.stringify(entry.payload),
+        safeSerializePayload(entry.payload),
         entry.error,
         entry.attempts,
         entry.correlationId ?? null,
