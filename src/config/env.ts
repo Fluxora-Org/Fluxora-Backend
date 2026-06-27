@@ -270,12 +270,14 @@ export const EnvSchema = z.object({
   SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
   /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
   SSE_RETRY_MS: integerEnv('SSE_RETRY_MS', 100, 300_000).default(5000),
-  /** Interval in milliseconds between SSE heartbeat comments per connection. */
-  SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
-  INDEXER_ENABLED: booleanEnv().default(false),
-  WORKER_ENABLED: booleanEnv().default(false),
-  INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
-  INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
+   /** Interval in milliseconds between SSE heartbeat comments per connection. */
+   SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
+   /** Milliseconds to wait for each SSE connection to drain during shutdown before force-closing. */
+   SSE_DRAIN_TIMEOUT_MS: integerEnv('SSE_DRAIN_TIMEOUT_MS', 1_000, 60_000).default(30_000),
+   INDEXER_ENABLED: booleanEnv().default(false),
+   WORKER_ENABLED: booleanEnv().default(false),
+   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
+   INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
   ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
   RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
