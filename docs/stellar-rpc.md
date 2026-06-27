@@ -36,9 +36,10 @@ When the circuit is `OPEN`:
 
 Closed-circuit cache behavior emits:
 
-- `rpc_fallback_cache_hits_total`
-- `rpc_fallback_cache_misses_total`
-- `rpc_fallback_cache_early_refreshes_total`
+  - `rpc_fallback_cache_hits_total`
+  - `rpc_fallback_cache_misses_total`
+  - `rpc_fallback_cache_early_refreshes_total`
+  - `fluxora_rpc_cache_corrupt_total`
 
 Redis cache read/write failures are logged as warnings and treated as misses or no-op writes. The fallback cache must not become a hard dependency for normal RPC calls.
 
