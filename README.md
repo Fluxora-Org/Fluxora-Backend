@@ -141,6 +141,13 @@ Response:
 }
 ```
 
+### Partition Management
+
+The `contract_events` table is range-partitioned by `happened_at` to prevent unbounded growth.
+Partitions are rotated and dropped automatically based on a configurable retention policy.
+- An ops script `dropOldPartitions` in `src/scripts/db-ops.ts` is available to detach and drop partitions older than a specified number of days.
+- By default, it runs in a `dryRun` mode. To actually drop data, invoke it with `dryRun = false`.
+
 ## 🧪 Testing
 
 ```bash

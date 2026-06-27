@@ -52,6 +52,18 @@ import {
 
 const REPO = 'streamRepository';
 
+/**
+ * Hard maximum number of rows any paginated read may return in a single page.
+ *
+ * This cap is enforced at the repository layer regardless of the caller-
+ * provided limit, providing defence-in-depth against unbounded queries even
+ * if route-level validation is bypassed.
+ *
+ * Both `findWithCursor` (cursor pagination) and `find` (offset pagination)
+ * honour this constant so the two paths are always in agreement.
+ */
+export const MAX_PAGE_SIZE = 100;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface UpsertResult {
@@ -311,7 +323,17 @@ export const streamRepository = {
     });
   },
 
-  /** Cursor-based paginated list with optional filters. */
+  /**
+   * Cursor-based paginated list with optional filters.
+   *
+   * @param filter - Column-level predicates to narrow the result set.
+   * @param limit  - Desired page size. Clamped to {@link MAX_PAGE_SIZE} at the
+   *   repository layer so callers cannot trigger unbounded reads regardless of
+   *   how the route layer is configured.
+   * @param afterId       - Exclusive lower bound for keyset pagination.
+   * @param includeTotal  - When `true`, a separate COUNT(*) query is executed
+   *   and returned as `total`.
+   */
   async findWithCursor(
     filter: StreamFilter,
     limit: number,
@@ -319,6 +341,10 @@ export const streamRepository = {
     includeTotal?: boolean,
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
+      const effectiveLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
+      if (effectiveLimit !== limit) {
+        debug('findWithCursor: limit clamped', { requested: limit, effective: effectiveLimit });
+      }
       const pool = await getReadPool();
       const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
@@ -353,7 +379,7 @@ export const streamRepository = {
       const whereCursor = cursorConditions.length > 0 ? `WHERE ${cursorConditions.join(' AND ')}` : '';
 
       const limitParamIndex = cursorParams.length + 1;
-      cursorParams.push(limit + 1);
+      cursorParams.push(effectiveLimit + 1);
       const keyIndex = cursorParams.length + 1;
       cursorParams.push(keySet.current);
       const previousKeyIndex = keySet.previous ? cursorParams.length + 1 : undefined;
@@ -366,8 +392,8 @@ export const streamRepository = {
           ? query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${whereBase}`, params)
           : Promise.resolve(null),
       ]);
-      const hasMore = dataResult.rows.length > limit;
-      const rows = hasMore ? dataResult.rows.slice(0, limit) : dataResult.rows;
+      const hasMore = dataResult.rows.length > effectiveLimit;
+      const rows = hasMore ? dataResult.rows.slice(0, effectiveLimit) : dataResult.rows;
       const streams = rows.map(rowToRecord);
       const result: { streams: StreamRecord[]; hasMore: boolean; total?: number } = { streams, hasMore };
       if (countResult) result.total = Number(countResult.rows[0]!.count);
@@ -394,8 +420,34 @@ export const streamRepository = {
    * client input is interpolated — satisfying the SQL-injection-safety
    * requirement.  LIMIT and OFFSET are passed as bound parameters (`$n`).
    */
+  /**
+   * Offset-based paginated list.
+   *
+   * `pagination.limit` is clamped to {@link MAX_PAGE_SIZE} at the repository
+   * layer so both pagination strategies share the same hard cap.
+   *
+   * **Ordering guarantee**: rows are sorted by `created_at DESC, id DESC`.
+   * Because `created_at` defaults to `NOW()` and is not unique (multiple
+   * streams inserted in the same transaction or millisecond share the same
+   * timestamp), the secondary `id DESC` tiebreaker makes the composite key
+   * unique.  PostgreSQL can then produce a deterministic, stable order across
+   * OFFSET pages, preventing duplicate or skipped rows when ties straddle a
+   * page boundary.
+   *
+   * The composite index `idx_streams_created_at_id_desc` (added by migration
+   * `20260624000000_streams_created_at_id_tiebreaker_index.ts`) covers this
+   * ordering efficiently.
+   *
+   * Security: the ORDER BY clause references fixed column names only — no
+   * client input is interpolated — satisfying the SQL-injection-safety
+   * requirement.  LIMIT and OFFSET are passed as bound parameters (`$n`).
+   */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
+      const effectiveLimit = Math.min(Math.max(pagination.limit, 1), MAX_PAGE_SIZE);
+      if (effectiveLimit !== pagination.limit) {
+        debug('find: limit clamped', { requested: pagination.limit, effective: effectiveLimit });
+      }
       const pool = await getReadPool();
       const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
@@ -439,12 +491,12 @@ export const streamRepository = {
         query<Record<string, unknown>>(
           pool,
           `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-          [...params, pagination.limit, pagination.offset],
+          [...params, effectiveLimit, pagination.offset],
         ),
       ]);
       const total = Number(countResult.rows[0]!.count);
       const streams = dataResult.rows.map(rowToRecord);
-      return { streams, total, limit: pagination.limit, offset: pagination.offset, hasMore: pagination.offset + streams.length < total };
+      return { streams, total, limit: effectiveLimit, offset: pagination.offset, hasMore: pagination.offset + streams.length < total };
     });
   },
 
