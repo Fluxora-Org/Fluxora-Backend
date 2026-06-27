@@ -52,8 +52,7 @@ import {
 } from './messageHandler.js';
 import {
   getClientIp,
-  checkLimiter,
-  trackConnection,
+  checkAndReserve,
   untrackConnection,
 } from './connectionLimiter.js';
 
@@ -181,24 +180,93 @@ export class StreamHub extends EventEmitter {
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
 
-    server.on('upgrade', (req, socket, head) => {
+    // ── WebSocket upgrade handler with atomic per-IP connection limiting ─────
+
+    /**
+     * HTTP upgrade handler for WebSocket connections with TOCTOU-safe per-IP limiting.
+     * 
+     * SECURITY CRITICAL: Per-IP connection limiting using atomic check-and-reserve.
+     * This handler prevents attackers from bypassing the per-IP connection cap via
+     * concurrent upgrade race conditions.
+     * 
+     * ALGORITHM:
+     * 1. ATOMIC CHECK-AND-RESERVE:
+     *    - Call checkAndReserve(ip) which synchronously checks the limit before incrementing.
+     *    - This prevents multiple concurrent requests from both passing the check.
+     *    - Reservation MUST be released exactly once on any failure path.
+     * 
+     * 2. PRE-UPGRADE CLEANUP HANDLER:
+     *    - Install a socket 'close' listener that releases the reservation if the upgrade fails.
+     *    - This covers:
+     *      * Network errors (socket closes before upgrade completes)
+     *      * Timeouts (socket closes due to handshake timeout)
+     *      * Auth failures (if WS_AUTH_REQUIRED is set)
+     *    - The 'cleaned' flag ensures untrackConnection is called exactly once.
+     * 
+     * 3. UPGRADE SUCCESS PATH:
+     *    - Upgrade is accepted via this.wss.handleUpgrade(...)
+     *    - Set 'cleaned = true' to prevent socket close listener from firing
+     *    - Remove the close listener (no longer needed)
+     *    - onConnect is called with the established WebSocket (reservation stays active)
+     * 
+     * 4. COUNTER RELEASE ON DISCONNECT:
+     *    - When the WebSocket closes (normal or abnormal), onDisconnect is called
+     *    - onDisconnect calls untrackConnection(ip) to decrement the counter
+     * 
+     * COUNTER LIFECYCLE:
+     *   checkAndReserve(ip) ──┬─→ allowed=false  →  close socket (no release)
+     *                         │
+     *                         └─→ allowed=true   →  reserve slot (must release once)
+     *                                                ├─→ upgrade failure  →  socket close handler  →  untrackConnection
+     *                                                └─→ upgrade success  →  onConnect (owns slot)  →  onDisconnect  →  untrackConnection
+     * 
+     * INVARIANTS:
+     *   - Each successful checkAndReserve increments the counter (atomic)
+     *   - The counter is decremented exactly once per successful reservation
+     *   - Counter never goes negative (clamped to 0)
+     *   - No leaks under concurrent close events
+     * 
+     * @security Prevents attackers from opening more than the allowed connections via burst requests.
+     * @security Counter is atomic and cannot be bypassed via race conditions.
+     * @security No counter underflow or leaks on failed upgrades.
+     */
+    server.on('upgrade', async (req, socket, head) => {
       const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
       if (pathname !== '/ws/streams') return;
 
-      // 1. Connection Limiter Check
+      // 1. Connection Limiter Check — atomically reserve IP slot
       const ip = getClientIp(req);
-      const limitResult = checkLimiter(ip);
+      const limitResult = await checkAndReserve(ip);
       if (!limitResult.allowed) {
-        this.wss.handleUpgrade(req, socket, head, (ws) => {
-          ws.close(limitResult.code || 4029, limitResult.reason);
-        });
+        // SECURITY: Reject BEFORE upgrade. Send HTTP error instead of upgrading.
+        // This ensures the client never enters the OPEN state and the connection
+        // is rejected cleanly at the HTTP level.
+        socket.write(
+          'HTTP/1.1 429 Too Many Requests\r\n' +
+            'Content-Type: text/plain\r\n' +
+            'Connection: close\r\n\r\n' +
+            `${limitResult.reason || 'Too many connections'}\r\n`
+        );
+        socket.destroy();
         return;
       }
+
+      let cleaned = false;
+      // Release the IP slot if upgrade fails (before onConnect is called)
+      const handleCleanup = () => {
+        if (!cleaned) {
+          cleaned = true;
+          untrackConnection(ip);
+          socket.removeListener('close', handleCleanup);
+        }
+      };
+      socket.on('close', handleCleanup);
 
       // 2. Auth Check (if required)
       if (this.wsAuthRequired) {
         const result = verifyWsToken(req, this.jwtSecret);
         if (!result.ok) {
+          handleCleanup(); // release reservation and remove listener
           socket.write(
             'HTTP/1.1 401 Unauthorized\r\n' +
               'Content-Type: text/plain\r\n' +
@@ -210,8 +278,10 @@ export class StreamHub extends EventEmitter {
         }
       }
 
-      // 3. Accept Upgrade
+      // 3. Accept Upgrade — mark cleaned to prevent double-cleanup on close
       this.wss.handleUpgrade(req, socket, head, (ws) => {
+        cleaned = true; // prevent the socket close handler from firing
+        socket.removeListener('close', handleCleanup);
         this.wss.emit('connection', ws, req);
       });
     });
@@ -226,7 +296,6 @@ export class StreamHub extends EventEmitter {
   private onConnect(ws: WebSocket, req: IncomingMessage): void {
     const connectionId = randomUUID();
     const ip = getClientIp(req);
-    trackConnection(ip);
     const connectedAt = Date.now();
     const correlationId = this.extractCorrelationId(req.headers);
     const authenticatedSubject = this.extractAuthenticatedSubject(req);
@@ -289,6 +358,33 @@ export class StreamHub extends EventEmitter {
     ws.on('error', () => ws.close(1011, 'Internal Error'));
   }
 
+  /**
+   * Handles WebSocket disconnection — cleanup and counter decrement.
+   * 
+   * SECURITY: Calls untrackConnection to decrement the per-IP connection counter.
+   * This ensures the counter is decremented exactly once when a connection closes,
+   * completing the TOCTOU-safe counter lifecycle started in the upgrade handler.
+   * 
+   * COUNTER LIFECYCLE COMPLETION:
+   *   - checkAndReserve(ip) incremented the counter ← upgrade handler
+   *   - untrackConnection(ip) decrements the counter ← THIS FUNCTION
+   * 
+   * Paired with checkAndReserve in the upgrade handler to maintain correct count
+   * under concurrent conditions (no race conditions possible).
+   * 
+   * CLEANUP ACTIONS:
+   *   1. Untrack the connection (decrement per-IP counter)
+   *   2. Remove all subscription filters
+   *   3. Log disconnect event with metrics
+   *   4. Remove client from tracking map
+   * 
+   * @param ws The WebSocket that is closing.
+   * @param code WebSocket close code (RFC 6455 standard codes).
+   * @param reason Close reason (optional UTF-8 string).
+   * 
+   * @security Ensures counter is decremented exactly once per established connection.
+   * @security Prevents counter leaks or underflow.
+   */
   private onDisconnect(ws: WebSocket, code?: number, reason?: Buffer): void {
     const state = this.clients.get(ws);
     if (!state) return;
