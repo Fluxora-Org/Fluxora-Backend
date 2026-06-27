@@ -33,14 +33,75 @@ import { correlationStore } from '../tracing/middleware.js';
 
 export const IDEMPOTENCY_KEY_PREFIX = 'fluxora:idempotency:';
 
-/** Shape stored in Redis for each idempotency entry. */
+/**
+ * Monotonically increasing integer that identifies the envelope schema.
+ * Bump this constant whenever the shape of {@link IdempotentEntry} changes
+ * in a backward-incompatible way.  Stored entries whose `version` field
+ * does not equal this value are treated as absent (recomputed).
+ */
+export const ENVELOPE_VERSION = 1;
+
+/**
+ * Shape stored in Redis for each idempotency entry.
+ *
+ * All stored Redis data is treated as **untrusted input**: the envelope is
+ * schema-validated before use so a corrupt, stale, or cross-service value
+ * cannot crash callers or produce incorrect idempotency decisions.
+ */
 export interface IdempotentEntry<T = unknown> {
+  /** Envelope schema version — must equal {@link ENVELOPE_VERSION}. */
+  version: number;
   /** SHA-256 hex digest of the normalised request body. */
   requestFingerprint: string;
   /** HTTP status code of the original response. */
   statusCode: number;
   /** Full response body as returned to the client. */
   body: T;
+}
+
+/**
+ * Parse raw Redis JSON and validate it against the expected envelope schema.
+ *
+ * Returns the validated entry, or `null` when:
+ * - `raw` is not valid JSON
+ * - required fields are missing or have wrong types
+ * - `version` does not match {@link ENVELOPE_VERSION}
+ *
+ * Callers receive a reason string for structured warning logs.
+ */
+function parseAndValidateEnvelope<T>(
+  raw: string,
+): { entry: IdempotentEntry<T>; invalidReason?: never } | { entry?: never; invalidReason: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { invalidReason: 'invalid JSON' };
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    return { invalidReason: 'envelope is not an object' };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+
+  if (typeof obj['requestFingerprint'] !== 'string') {
+    return { invalidReason: 'missing or invalid requestFingerprint' };
+  }
+  if (typeof obj['statusCode'] !== 'number') {
+    return { invalidReason: 'missing or invalid statusCode' };
+  }
+  if (!('body' in obj)) {
+    return { invalidReason: 'missing body' };
+  }
+  if (typeof obj['version'] !== 'number') {
+    return { invalidReason: 'missing version field' };
+  }
+  if (obj['version'] !== ENVELOPE_VERSION) {
+    return { invalidReason: `version mismatch: got ${obj['version']}, expected ${ENVELOPE_VERSION}` };
+  }
+
+  return { entry: obj as unknown as IdempotentEntry<T> };
 }
 
 export interface IdempotencyStore<T = unknown> {
@@ -107,7 +168,18 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       const raw = await this.client.get(this.buildKey(key));
       this.onStateChange?.(true);
       if (raw === null) return null;
-      return JSON.parse(raw) as IdempotentEntry<T>;
+
+      const result = parseAndValidateEnvelope<T>(raw);
+      if (result.invalidReason !== undefined) {
+        this.logger.warn('Idempotency store: envelope validation failed — treating as absent', {
+          operation: 'get',
+          correlationId: correlationStore.getStore(),
+          keyLength: key.length,
+          reason: result.invalidReason,
+        });
+        return null;
+      }
+      return result.entry;
     } catch (err) {
       this.onStateChange?.(false);
       this.logger.warn('Idempotency store: Redis get failed — degrading to pass-through', {
@@ -122,7 +194,8 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
 
   async set(key: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
     try {
-      await this.client.set(this.buildKey(key), JSON.stringify(entry), { ex: ttlSeconds });
+      const versioned: IdempotentEntry<T> = { ...entry, version: ENVELOPE_VERSION };
+      await this.client.set(this.buildKey(key), JSON.stringify(versioned), { ex: ttlSeconds });
       this.onStateChange?.(true);
     } catch (err) {
       this.onStateChange?.(false);

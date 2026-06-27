@@ -1,58 +1,52 @@
-import { PoolClient } from 'pg';
+import { MigrationBuilder, ColumnDefinitions } from 'node-pg-migrate';
+
+export const shorthands: ColumnDefinitions | undefined = undefined;
 
 /**
- * Migration: Add indexes for optimized contract event replay
- * 
- * Indexes created:
- * 1. Composite index on (contract_id, ledger) - speeds up replay queries filtering by these columns
- * 2. Partial index on (contract_id, ledger) WHERE ingested_at IS NULL - optimizes queries for unprocessed events
- * 
- * These indexes significantly improve replay performance by:
- * - Reducing table scan time for contract_id + ledger lookups
- * - Enabling efficient identification of events pending ingestion
- * - Supporting the ORDER BY block_height, event_id pattern used in batched fetches
+ * Creates indexes on the contract_events table concurrently.
+ * * SECURITY & OPS NOTE:
+ * We disable the transaction block via `pgm.noTransaction()` because PostgreSQL 
+ * strictly forbids `CREATE INDEX CONCURRENTLY` inside a transaction block.
+ * Building concurrently ensures we do not hold an exclusive lock that blocks writes 
+ * to `contract_events` in production. 
+ * * IF A MIGRATION FAILS: 
+ * A failed CONCURRENTLY build can leave an INVALID index in Postgres. 
+ * You must check `pg_index.indisvalid` and drop the invalid index manually 
+ * before re-running the migration, otherwise query planning may degrade.
  */
+export async function up(pgm: MigrationBuilder): Promise<void> {
+  // Disable transaction wrapping for this specific migration
+  pgm.noTransaction();
 
-export async function up(client: PoolClient): Promise<void> {
-  console.log('Creating contract_events replay indexes...');
+  // Create the Contract Ledger Index
+  pgm.createIndex('contract_events', ['contract_id', 'ledger_sequence'], {
+    name: 'idx_contract_events_contract_ledger',
+    concurrently: true,
+    ifNotExists: true,
+  });
 
-  // Composite index for general replay queries
-  await client.query(`
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_contract_ledger
-    ON contract_events (contract_id, ledger, block_height, event_id);
-  `);
-
-  // Partial index for unprocessed events (ingested_at IS NULL)
-  // This is useful for tracking replay progress and identifying incomplete ingestions
-  await client.query(`
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_events_pending_ingestion
-    ON contract_events (contract_id, ledger, block_height)
-    WHERE ingested_at IS NULL;
-  `);
-
-  // Index on historical_events for efficient batch fetching during replay
-  await client.query(`
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_historical_events_replay
-    ON historical_events (contract_id, ledger, block_height, event_id);
-  `);
-
-  console.log('Indexes created successfully');
+  // Create the Replay Index with the partial predicate
+  pgm.createIndex('contract_events', ['contract_id'], {
+    name: 'idx_contract_events_replay_null_ingested',
+    concurrently: true,
+    ifNotExists: true,
+    where: 'ingested_at IS NULL',
+  });
 }
 
-export async function down(client: PoolClient): Promise<void> {
-  console.log('Dropping contract_events replay indexes...');
+export async function down(pgm: MigrationBuilder): Promise<void> {
+  // Must also disable transaction for dropping indexes concurrently
+  pgm.noTransaction();
 
-  await client.query(`
-    DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_contract_ledger;
-  `);
+  pgm.dropIndex('contract_events', ['contract_id', 'ledger_sequence'], {
+    name: 'idx_contract_events_contract_ledger',
+    concurrently: true,
+    ifExists: true,
+  });
 
-  await client.query(`
-    DROP INDEX CONCURRENTLY IF EXISTS idx_contract_events_pending_ingestion;
-  `);
-
-  await client.query(`
-    DROP INDEX CONCURRENTLY IF EXISTS idx_historical_events_replay;
-  `);
-
-  console.log('Indexes dropped successfully');
+  pgm.dropIndex('contract_events', ['contract_id'], {
+    name: 'idx_contract_events_replay_null_ingested',
+    concurrently: true,
+    ifExists: true,
+  });
 }

@@ -42,3 +42,16 @@ describe('RBAC Permission Middleware', () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe('Scope Permission Middleware (requireScope)', () => {
+  it('returns 401 if authentication is missing entirely', async () => {
+    const res = await request(app)
+      .get('/api/streams') // Assuming this route uses requireScope
+      .query({ limit: 10 });
+    
+    // An endpoint with requireScope but no auth should fail with 401
+    // (If the route uses authenticateApiKey, it might pass as anonymous if it doesn't fail closed,
+    // but requireScope should catch it now.)
+    expect(res.status).toBe(401);
+  });
+});

@@ -49,7 +49,7 @@ vi.mock('@aws-sdk/lib-storage', () => {
 
 // ── Import module under test AFTER mocks are registered ──────────────────────
 
-import { backupDatabase, restoreDatabase } from '../src/scripts/db-ops.js'
+import { backupDatabase, restoreDatabase, dropOldPartitions } from '../src/scripts/db-ops.js'
 import * as childProcess from 'child_process'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -435,5 +435,47 @@ describe('DbOperationResult shape', () => {
     expect(result.success).toBe(false)
     expect(result).toHaveProperty('error')
     expect(typeof result.error).toBe('string')
+  })
+})
+
+// ── dropOldPartitions ─────────────────────────────────────────────────────────
+
+describe('dropOldPartitions', () => {
+  it('returns dropped partitions and correctly parses time bounds', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_default', partition_bound: 'DEFAULT' },
+          { partition_name: 'contract_events_old', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" },
+          { partition_name: 'contract_events_future', partition_bound: "FOR VALUES FROM ('2050-01-01 00:00:00+00') TO ('2050-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, false);
+    
+    expect(result.droppedPartitions).toContain('contract_events_old');
+    expect(result.droppedPartitions).not.toContain('contract_events_default');
+    expect(result.droppedPartitions).not.toContain('contract_events_future');
+    expect(fakePool.query).toHaveBeenCalledWith('DROP TABLE IF EXISTS contract_events_old');
+    expect(fakePool.query).not.toHaveBeenCalledWith('DROP TABLE IF EXISTS contract_events_future');
+  })
+
+  it('honors dryRun flag by not executing DROP TABLE', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_old', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, true);
+    
+    expect(result.droppedPartitions).toContain('contract_events_old');
+    expect(result.message).toContain('[DRY RUN]');
+    // The first query gets the partitions, but DROP TABLE is never called
+    expect(fakePool.query).toHaveBeenCalledTimes(1);
+    expect(fakePool.query).toHaveBeenCalledWith(expect.stringContaining('SELECT'), ['contract_events']);
   })
 })

@@ -8,6 +8,8 @@ function validEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     DATABASE_URL: 'postgresql://localhost/fluxora_test',
     JWT_SECRET: 'a-very-long-secret-key-for-testing-only-12345',
     INDEXER_WORKER_TOKEN: 'indexer-worker-token-for-testing-only-12345',
+    STELLAR_CONTRACT_ADDRESS: 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC',
+    STELLAR_TOKEN_ADDRESS: 'CBFFW3D5R2P3BQOS4P2AKFRHHBEVU234RWPK7QGR4LZQIFJGG5EFTAK6',
     ...overrides,
   };
 }
@@ -76,5 +78,25 @@ describe('EnvSchema startup validation', () => {
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).not.toContain(secretValue);
     }
+  });
+
+  it('throws EnvironmentError when API_KEYS is set but API_KEY_PEPPER is missing', async () => {
+    const env = validEnv({ API_KEYS: 'key1,key2' });
+    delete env.API_KEY_PEPPER;
+
+    await expect(importEnvWith(env)).rejects.toMatchObject({
+      name: 'EnvironmentError',
+      issues: expect.arrayContaining([expect.stringContaining('API_KEY_PEPPER: API_KEY_PEPPER is required when API_KEYS is configured')]),
+    });
+  });
+
+  it('loads successfully when both API_KEYS and API_KEY_PEPPER are provided', async () => {
+    const env = validEnv({ 
+      API_KEYS: 'key1,key2',
+      API_KEY_PEPPER: 'a-very-long-pepper-key-for-testing-only-123'
+    });
+
+    const { loadConfig } = await importEnvWith(env);
+    expect(() => loadConfig()).not.toThrow();
   });
 });
