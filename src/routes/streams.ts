@@ -1109,17 +1109,30 @@ streamsRouter.get(
 
     // Register a shutdown drain callback so drainSseEventBus() can close this
     // response cleanly with a retry:0 directive instead of an abrupt socket close.
-    const deregisterShutdown = registerSseShutdownCallback(() => {
-      try {
-        if (!res.writableEnded && !res.destroyed) {
-          res.write('retry: 0\n\n');
-          res.end();
+    // A forceClose callback is also registered so that when the per-connection
+    // drain timeout is exceeded the underlying socket is destroyed immediately.
+    const deregisterShutdown = registerSseShutdownCallback(
+      async () => {
+        try {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write('retry: 0\n\n');
+            res.end();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
         }
-      } catch {
-        // Best-effort — the socket may already be gone.
-      }
-      cleanup('shutdown_drain');
-    });
+        cleanup('shutdown_drain');
+      },
+      () => {
+        try {
+          if (!res.destroyed) {
+            res.destroy();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
+        }
+      },
+    );
     const origUnsubscribe = unsubscribeLiveUpdates;
     unsubscribeLiveUpdates = () => {
       origUnsubscribe();

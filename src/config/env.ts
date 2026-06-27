@@ -410,6 +410,8 @@ export interface Config {
   sseRetryMs: number;
   /** Interval in milliseconds between per-connection SSE heartbeat comments. */
   sseHeartbeatIntervalMs: number;
+  /** Milliseconds to wait for each SSE connection to drain during shutdown before force-closing. */
+  sseDrainTimeoutMs: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
   indexerStallThresholdMs: number;
@@ -563,6 +565,7 @@ function toConfig(env: ParsedEnv): Config {
     sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
     sseRetryMs: env.SSE_RETRY_MS,
     sseHeartbeatIntervalMs: env.SSE_HEARTBEAT_INTERVAL_MS,
+    sseDrainTimeoutMs: env.SSE_DRAIN_TIMEOUT_MS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,

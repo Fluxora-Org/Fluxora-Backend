@@ -377,6 +377,8 @@ import {
 } from '../src/redis/client.js';
 
 describe('#336 SSE drain hook', () => {
+  const TEST_DRAIN_TIMEOUT = 5_000;
+
   beforeEach(() => {
     _resetSseSubscriptionsForTest();
   });
@@ -385,45 +387,45 @@ describe('#336 SSE drain hook', () => {
     _resetSseSubscriptionsForTest();
   });
 
-  it('drainSseEventBus() calls all registered shutdown callbacks', () => {
+  it('drainSseEventBus() calls all registered shutdown callbacks', async () => {
     const cb1 = vi.fn();
     const cb2 = vi.fn();
     registerSseShutdownCallback(cb1);
     registerSseShutdownCallback(cb2);
 
-    drainSseEventBus();
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
 
     expect(cb1).toHaveBeenCalledTimes(1);
     expect(cb2).toHaveBeenCalledTimes(1);
   });
 
-  it('drainSseEventBus() clears callbacks so a second call is a no-op', () => {
+  it('drainSseEventBus() clears callbacks so a second call is a no-op', async () => {
     const cb = vi.fn();
     registerSseShutdownCallback(cb);
 
-    drainSseEventBus();
-    drainSseEventBus();
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
 
     expect(cb).toHaveBeenCalledTimes(1);
   });
 
-  it('deregister function removes the callback before drain', () => {
+  it('deregister function removes the callback before drain', async () => {
     const cb = vi.fn();
     const deregister = registerSseShutdownCallback(cb);
     deregister();
 
-    drainSseEventBus();
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
 
     expect(cb).not.toHaveBeenCalled();
   });
 
-  it('drain isolates a throwing callback and still calls remaining ones', () => {
+  it('drain isolates a throwing callback and still calls remaining ones', async () => {
     const bad = vi.fn(() => { throw new Error('boom'); });
     const good = vi.fn();
     registerSseShutdownCallback(bad);
     registerSseShutdownCallback(good);
 
-    expect(() => drainSseEventBus()).not.toThrow();
+    await expect(drainSseEventBus(TEST_DRAIN_TIMEOUT)).resolves.toBeUndefined();
     expect(good).toHaveBeenCalledTimes(1);
   });
 
@@ -431,13 +433,47 @@ describe('#336 SSE drain hook', () => {
     _resetShutdownState();
     const cb = vi.fn();
     registerSseShutdownCallback(cb);
-    addShutdownHook(() => drainSseEventBus());
+    addShutdownHook(() => drainSseEventBus(TEST_DRAIN_TIMEOUT));
 
     const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, resolve));
     await gracefulShutdown(server, 'SIGTERM', 5_000);
 
     expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('force-closes a stuck SSE subscriber and calls remaining callbacks', async () => {
+    const forceClosed = vi.fn();
+    const good = vi.fn();
+
+    // Simulate a stuck drain callback by returning a promise that never resolves.
+    // The event loop remains free so the per-callback timer can fire and trigger
+    // forceClose via Promise.race.
+    const stuckDrain = vi.fn(() => new Promise<void>(() => { /* never settles */ }));
+
+    registerSseShutdownCallback(stuckDrain, forceClosed);
+    registerSseShutdownCallback(good);
+
+    // Use a very short timeout so the first callback triggers force-close.
+    await drainSseEventBus(50);
+
+    // The stuck drain was initiated and forceClose was triggered on timeout.
+    expect(stuckDrain).toHaveBeenCalledTimes(1);
+    expect(forceClosed).toHaveBeenCalledTimes(1);
+    // The remaining callback should still be called.
+    expect(good).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not call forceClose when drain completes within timeout', async () => {
+    const fast = vi.fn();
+    const forceClose = vi.fn();
+
+    registerSseShutdownCallback(fast, forceClose);
+
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
+
+    expect(fast).toHaveBeenCalledTimes(1);
+    expect(forceClose).not.toHaveBeenCalled();
   });
 });
 
