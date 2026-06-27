@@ -10,6 +10,8 @@ import {
   _resetSseSubscriptionsForTest,
   getLiveSseSubscriberCount,
   SSE_STREAM_UPDATE_EVENT,
+  SSE_CLOSE_EVENT,
+  SSE_CLOSE_REASONS,
   sseEventBus,
 } from '../../src/streams/sseEmitter.js';
 import { getStreamHub } from '../../src/ws/hub.js';
@@ -613,15 +615,74 @@ describe('GET /api/streams/:id/events (SSE Endpoint)', () => {
       req.on('error', reject);
     });
 
+    // ── Typed terminal event assertions ──────────────────────────────────────
+    // The response must contain the initial ok comment.
     expect(output).toContain(': ok\n\n');
-    expect(output).toContain('event: close');
-    expect(output).toContain('max_duration');
+
+    // The terminal frame must use the canonical SSE_CLOSE_EVENT type so
+    // clients can distinguish a deliberate max-duration rotation from a
+    // network drop (which produces no event frame at all).
+    expect(output).toContain(`event: ${SSE_CLOSE_EVENT}`);
+
+    // The data payload must carry the canonical MAX_DURATION reason string.
+    expect(output).toContain(`"reason":"${SSE_CLOSE_REASONS.MAX_DURATION}"`);
+
+    // The frame must NOT contain any stream-level data (security check).
+    expect(output).not.toContain('"streamId"');
+    expect(output).not.toContain('"payload"');
 
     await delay(50);
 
     expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
     expect(getActiveSseConnectionCount()).toBe(0);
     expect(await getMetricValue(sseActiveConnectionsGauge)).toBe(0);
+  });
+
+  it('emits close event with parseable JSON data on max-duration', async () => {
+    process.env.SSE_MAX_CONNECTION_DURATION_MS = '50';
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const output = await new Promise<string>((resolve, reject) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/streams/stream-123/events',
+        agent: false,
+      }, (res) => {
+        let data = '';
+        const timeout = setTimeout(() => {
+          req.destroy(new Error('Timed out waiting for SSE max-duration close'));
+        }, 1000);
+        res.on('data', (chunk) => { data += chunk.toString(); });
+        res.on('end', () => { clearTimeout(timeout); resolve(data); });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+    });
+
+    // Parse the data line from the close frame to verify the JSON structure.
+    const closeFrameMatch = output.match(/event: close\ndata: (.+)\n/);
+    expect(closeFrameMatch).not.toBeNull();
+    const parsed = JSON.parse(closeFrameMatch![1]);
+    expect(parsed).toEqual({ reason: SSE_CLOSE_REASONS.MAX_DURATION });
+  });
+
+  it('does not emit a close frame on normal client disconnect', async () => {
+    process.env.SSE_MAX_CONNECTION_DURATION_MS = String(30 * 60 * 1000); // 30 min
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const connection = await openSseConnection('/api/streams/stream-123/events');
+
+    // Capture everything received so far before destroying.
+    const dataBeforeClose = connection.data;
+
+    // Simulate a client-side disconnect.
+    await closeSseConnection(connection);
+
+    // No close frame should have been emitted (the connection closed from the
+    // client side, not a server max-duration expiry).
+    expect(dataBeforeClose).not.toContain(`event: ${SSE_CLOSE_EVENT}`);
+    expect(dataBeforeClose).not.toContain(SSE_CLOSE_REASONS.MAX_DURATION);
   });
 
   it('uses one shared sseEventBus dispatcher for multiple active SSE subscribers', async () => {

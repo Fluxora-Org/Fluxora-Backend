@@ -591,6 +591,28 @@ export class WebhookService {
         signal: controller.signal,
       });
 
+      // Validate Content-Type header (must be present and not empty)
+      const contentType = response.headers.get('content-type');
+      if (!contentType) {
+        throw new Error('Missing Content-Type header in webhook response');
+      }
+
+      // Enforce maximum response body size
+      const maxBytes = Number(process.env.WEBHOOK_MAX_RESPONSE_BYTES) || 64 * 1024;
+      if (response.body) {
+        const reader = response.body.getReader();
+        let bytesRead = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+          if (bytesRead > maxBytes) {
+            controller.abort();
+            throw new Error('Webhook response exceeds maximum allowed size');
+          }
+        }
+      }
+
       return response;
     } finally {
       clearTimeout(timeoutId);

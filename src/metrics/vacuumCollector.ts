@@ -45,14 +45,26 @@ export const pgLastAutovacuumAgeSeconds =
 // ── Query ─────────────────────────────────────────────────────────────────────
 
 const VACUUM_STATS_SQL = `
+  WITH RECURSIVE tables AS (
+    SELECT oid, relname AS root_table, relname AS table_name
+    FROM pg_class
+    WHERE relname = ANY($1::text[]) AND relkind IN ('r', 'p')
+    UNION ALL
+    SELECT i.inhrelid, t.root_table, c.relname
+    FROM pg_inherits i
+    JOIN tables t ON t.oid = i.inhparent
+    JOIN pg_class c ON c.oid = i.inhrelid
+  )
   SELECT
-    relname          AS table_name,
-    n_dead_tup,
-    n_live_tup,
-    last_autovacuum
-  FROM pg_stat_user_tables
-  WHERE relname = ANY($1::text[])
+    t.root_table AS table_name,
+    SUM(s.n_dead_tup) AS n_dead_tup,
+    SUM(s.n_live_tup) AS n_live_tup,
+    MAX(s.last_autovacuum) AS last_autovacuum
+  FROM tables t
+  JOIN pg_stat_user_tables s ON s.relid = t.oid
+  GROUP BY t.root_table
 `;
+
 
 interface VacuumRow {
   table_name: string;
