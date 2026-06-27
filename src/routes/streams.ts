@@ -89,6 +89,8 @@ import { getClientIp } from '../ws/connectionLimiter.js';
 import {
   eventMatchesStreamId,
   SSE_STREAM_UPDATE_EVENT,
+  SSE_CLOSE_EVENT,
+  SSE_CLOSE_REASONS,
   subscribeToSseStream,
   registerSseShutdownCallback,
 } from '../streams/sseEmitter.js';
@@ -997,9 +999,13 @@ streamsRouter.get(
     heartbeatInterval.unref?.();
 
     // Bound long-lived SSE streams. Browser EventSource clients reconnect automatically.
+    // Emits a typed `event: close` frame before ending the response so clients
+    // can distinguish a deliberate server-side rotation (max_duration) from a
+    // network drop and reconnect promptly rather than applying error back-off.
+    // @security payload contains only the reason string — no stream data or PII.
     maxDurationTimer = setTimeout(() => {
       if (cleanedUp) return;
-      writeSse(`event: close\ndata: ${JSON.stringify({ reason: 'max_duration' })}\n\n`);
+      writeSse(`event: ${SSE_CLOSE_EVENT}\ndata: ${JSON.stringify({ reason: SSE_CLOSE_REASONS.MAX_DURATION })}\n\n`);
       if (!res.writableEnded && !res.destroyed) {
         res.end();
       }

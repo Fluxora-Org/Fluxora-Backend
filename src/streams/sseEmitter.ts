@@ -7,6 +7,33 @@ import {
 
 export const SSE_STREAM_UPDATE_EVENT = 'stream_update';
 
+/**
+ * The SSE event type emitted for deliberate server-side connection closure.
+ *
+ * Clients that receive `event: close` should inspect `data.reason` to decide
+ * whether to reconnect immediately (e.g. `max_duration`) or back off
+ * (e.g. `server_shutdown`).  This string is the single source of truth — both
+ * the emitter (`streams.ts`) and the test suite import it from here.
+ *
+ * @security The payload carries only the reason enum — no stream data or user
+ *   information is included.
+ */
+export const SSE_CLOSE_EVENT = 'close';
+
+/**
+ * Canonical reason strings embedded in the `event: close` data payload.
+ * Keeping them here prevents silent divergence between the route and tests.
+ */
+export const SSE_CLOSE_REASONS = {
+  /** The connection reached its configured max-duration limit. */
+  MAX_DURATION: 'max_duration',
+  /** The server is shutting down and instructing clients to stop reconnecting. */
+  SERVER_SHUTDOWN: 'server_shutdown',
+} as const;
+
+export type SseCloseReason = typeof SSE_CLOSE_REASONS[keyof typeof SSE_CLOSE_REASONS];
+
+
 // Central EventEmitter to handle SSE broadcast subscriptions locally.
 export const sseEventBus = new EventEmitter();
 

@@ -20,6 +20,7 @@
 
 import { AsyncLocalStorage } from 'async_hooks';
 import { logger } from '../lib/logger.js';
+import { recordCircuitBreakerTransition } from '../tracing/hooks.js';
 import {
   NoOpRpcFallbackCache,
   RedisRpcFallbackCache,
@@ -168,6 +169,8 @@ export class CircuitBreaker {
 
     if (this.state === 'OPEN') {
       if (Date.now() - this.openedAt >= this.resetTimeoutMs) {
+        // OPEN → HALF_OPEN: probe window has elapsed
+        recordCircuitBreakerTransition('OPEN', 'HALF_OPEN', this.failures.length);
         this.state = 'HALF_OPEN';
       } else {
         throw new CircuitOpenError();
@@ -179,19 +182,26 @@ export class CircuitBreaker {
       this.onSuccess();
       return result;
     } catch (err) {
-      this.onFailure();
+      this.onFailure(err);
       throw err;
     }
   }
 
   private onSuccess(): void {
+    const prev = this.state;
     this.failures = [];
     this.state = 'CLOSED';
+    // Only emit when there is an actual state change (HALF_OPEN → CLOSED recovery).
+    // Steady-state CLOSED successes produce no event.
+    if (prev !== 'CLOSED') {
+      recordCircuitBreakerTransition(prev, 'CLOSED', 0);
+    }
   }
 
-  private onFailure(): void {
+  private onFailure(err?: unknown): void {
     this.failures.push(Date.now());
     if (this.failures.length >= this.failureThreshold) {
+      const prev = this.state;
       this.state = 'OPEN';
       this.openedAt = Date.now();
       logger.warn('Stellar RPC circuit breaker tripped', undefined, {
@@ -199,6 +209,9 @@ export class CircuitBreaker {
         failureCount: this.failures.length,
         windowMs: this.windowMs,
       });
+      // CLOSED → OPEN or HALF_OPEN → OPEN
+      const failureKind = err !== undefined ? classifyError(err) : undefined;
+      recordCircuitBreakerTransition(prev, 'OPEN', this.failures.length, failureKind);
     }
   }
 
