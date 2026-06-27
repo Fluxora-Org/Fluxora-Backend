@@ -15,6 +15,7 @@ import {
 import type { RedisClient } from '../../src/redis/client.js';
 import {
   deRegisterRpcMetrics,
+  fluxora_rpc_cache_corrupt_total,
   rpcFallbackCacheEarlyRefreshesTotal,
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,
@@ -258,6 +259,7 @@ describe('StellarRpcService fallback cache', () => {
 describe('corrupt cache entries', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    fluxora_rpc_cache_corrupt_total.reset();
   });
 
   it('returns null and deletes key and increments counter for empty string value', async () => {
@@ -278,6 +280,10 @@ describe('corrupt cache entries', () => {
     expect(result).toBeNull();
     expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
     expect(cache.corruptEntriesTotal).toBe(1);
+    
+    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    expect(metric.values[0]?.value).toBe(1);
+    expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'syntax_error' });
   });
 
   it('returns null and deletes key and increments counter for truncated JSON', async () => {
@@ -298,6 +304,34 @@ describe('corrupt cache entries', () => {
     expect(result).toBeNull();
     expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
     expect(cache.corruptEntriesTotal).toBe(1);
+
+    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    expect(metric.values[0]?.value).toBe(1);
+    expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'syntax_error' });
+  });
+
+  it('returns null and deletes key and increments counter for valid JSON with wrong shape', async () => {
+    const fakeRedis: RedisClient = {
+      get: vi.fn().mockResolvedValue('{"sequence": 123}'), // Missing envelope
+      set: vi.fn(),
+      setNx: vi.fn(),
+      del: vi.fn(),
+      exists: vi.fn(),
+      close: vi.fn(),
+      multi: vi.fn(),
+      zcount: vi.fn(),
+    };
+    const cache = new RedisRpcFallbackCache(fakeRedis);
+
+    const result = await cache.get('testOp');
+
+    expect(result).toBeNull();
+    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(cache.corruptEntriesTotal).toBe(1);
+
+    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    expect(metric.values[0]?.value).toBe(1);
+    expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'wrong_shape' });
   });
 
   it('does not swallow Redis transport errors', async () => {
