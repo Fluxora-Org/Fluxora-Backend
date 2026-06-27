@@ -184,6 +184,18 @@ describe('revoke', () => {
       1,
     );
   });
+
+  it('throws when Redis SET fails during revocation (revoke-path failure)', async () => {
+    mockRedis.set.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    await expect(revoke('jti-fail', 3600)).rejects.toThrow('ECONNREFUSED');
+  });
+
+  it('throws when Redis connection times out during revocation', async () => {
+    mockRedis.set.mockRejectedValue(new Error('ETIMEDOUT'));
+
+    await expect(revoke('jti-timeout', 3600)).rejects.toThrow('ETIMEDOUT');
+  });
 });
 
 describe('isRevoked', () => {

@@ -108,6 +108,8 @@ function resolveRevocationTtl(input: number | JwtRevocationOptions | undefined):
  * - Uses SET with EX (expiry) to prevent unbounded storage growth
  * - Overwrites any existing entry (idempotent — duplicate revocations are safe)
  * - Logs revocation for audit trail
+ * - On Redis error (connection failed, timeout): throws the error
+ *   (caller must handle retry/fallback logic — see isRevoked for fail-closed behavior)
  */
 export async function revoke(
   jti: string,
