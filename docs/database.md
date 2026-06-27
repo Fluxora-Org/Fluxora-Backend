@@ -139,6 +139,15 @@ Gauges are updated on every `connect`, `acquire`, and `remove` pool event.
 4. Consider increasing `POOL_QUEUE_LIMIT` if bursts are short-lived and acceptable to queue.
 5. Check for connection leaks: if `db_pool_active_connections` stays high after traffic drops, a caller may not be releasing connections.
 
+### Partition Management
+
+The `contract_events` table is partitioned by `happened_at` to ensure bounded growth. Partition management must be performed periodically to drop old data:
+1. Ensure `dropOldPartitions` from `src/scripts/db-ops.ts` is scheduled via cron or a periodic job.
+2. The function should be invoked with the retention period (e.g., 30 days).
+3. The job must run with a database role that has permissions to execute `DROP TABLE`.
+4. Validate that detached partitions are backed up per the existing S3 retention policy before actually dropping them.
+5. Run the function in `dryRun = true` mode initially to audit partitions that will be dropped.
+
 ### Recommended alert thresholds
 
 ```yaml
