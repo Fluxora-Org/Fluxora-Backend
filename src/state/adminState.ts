@@ -3,10 +3,15 @@
  *
  * Holds pause flags and reindex tracking in memory, with file-backed
  * persistence for pause flags so admin toggles survive process restarts.
+ *
+ * Pause-flag writes are protected by a distributed lock (Redis-backed with file lock fallback)
+ * to ensure safe concurrent writes across multiple processes.
  */
 
 import * as fs from 'node:fs';
 import { dirname } from 'node:path';
+import type { RedisClient } from '../redis/client.js';
+import { RedisDistributedLock, NoOpLock, Lock } from './adminStateLock.js';
 import { logger } from '../lib/logger.js';
 
 export interface PauseFlags {
@@ -51,6 +56,8 @@ const state: AdminState = {
     processedItems: 0,
   },
 };
+
+let pauseFlagsLock: Lock | null = null;
 
 hydratePauseFlagsFromPersistence();
 
@@ -108,32 +115,37 @@ function readPersistedPauseFlags(): PauseFlags | null {
   }
 }
 
-function writePersistedPauseFlags(flags: PauseFlags): void {
-  const adminStatePath = resolveAdminStatePath();
-  const tempPath = `${adminStatePath}.${process.pid}.tmp`;
-  const payload: PersistedAdminStateV1 = {
-    version: 1,
-    pauseFlags: {
-      streamCreation: flags.streamCreation,
-      ingestion: flags.ingestion,
-    },
-  };
-
-  fs.mkdirSync(dirname(adminStatePath), { recursive: true, mode: 0o700 });
+async function writePersistedPauseFlags(flags: PauseFlags): Promise<void> {
+  const lock = await acquirePauseFlagsLock();
   try {
-    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
-    fs.renameSync(tempPath, adminStatePath);
-  } catch (err) {
-    // Best effort cleanup for failed atomic writes.
+    const adminStatePath = resolveAdminStatePath();
+    const tempPath = `${adminStatePath}.${process.pid}.tmp`;
+    const payload: PersistedAdminStateV1 = {
+      version: 1,
+      pauseFlags: {
+        streamCreation: flags.streamCreation,
+        ingestion: flags.ingestion,
+      },
+    };
+
+    fs.mkdirSync(dirname(adminStatePath), { recursive: true, mode: 0o700 });
     try {
-      fs.rmSync(tempPath, { force: true });
-    } catch {
-      // no-op
+      fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+      fs.renameSync(tempPath, adminStatePath);
+    } catch (err) {
+      // Best effort cleanup for failed atomic writes.
+      try {
+        fs.rmSync(tempPath, { force: true });
+      } catch {
+        // no-op
+      }
+      throw err;
     }
-    throw err;
+  } finally {
+    await lock.release();
   }
 }
 
@@ -143,11 +155,31 @@ function hydratePauseFlagsFromPersistence(): void {
   state.pauseFlags = persisted;
 }
 
+/**
+ * Initialize distributed locking for pause flags with a Redis client.
+ * Call this during app startup after Redis is available.
+ * If not called, file-based locking will be used as fallback.
+ */
+export function initializeAdminStateLock(redis: RedisClient): void {
+  pauseFlagsLock = new RedisDistributedLock(redis, 'pauseFlags');
+}
+
+async function acquirePauseFlagsLock(): Promise<Lock> {
+  if (!pauseFlagsLock) {
+    pauseFlagsLock = new RedisDistributedLock(
+      // Create a minimal Redis-compatible interface that falls back to file locking
+      { setNx: async () => false, del: async () => {} } as RedisClient,
+      'pauseFlags',
+    );
+  }
+  return pauseFlagsLock.acquire();
+}
+
 export function getPauseFlags(): PauseFlags {
   return { ...state.pauseFlags };
 }
 
-export function setPauseFlags(flags: Partial<PauseFlags>): PauseFlags {
+export async function setPauseFlags(flags: Partial<PauseFlags>): Promise<PauseFlags> {
   const next: PauseFlags = {
     streamCreation:
       flags.streamCreation !== undefined ? flags.streamCreation : state.pauseFlags.streamCreation,
@@ -162,7 +194,7 @@ export function setPauseFlags(flags: Partial<PauseFlags>): PauseFlags {
   }
 
   try {
-    writePersistedPauseFlags(next);
+    await writePersistedPauseFlags(next);
   } catch (err) {
     throw new AdminStatePersistenceError('Failed to persist admin pause flags', err);
   }

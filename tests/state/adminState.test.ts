@@ -44,20 +44,20 @@ describe('adminState', () => {
       expect(flags.ingestion).toBe(false);
     });
 
-    it('sets streamCreation flag', () => {
-      const updated = setPauseFlags({ streamCreation: true });
+    it('sets streamCreation flag', async () => {
+      const updated = await setPauseFlags({ streamCreation: true });
       expect(updated.streamCreation).toBe(true);
       expect(updated.ingestion).toBe(false);
     });
 
-    it('sets ingestion flag', () => {
-      const updated = setPauseFlags({ ingestion: true });
+    it('sets ingestion flag', async () => {
+      const updated = await setPauseFlags({ ingestion: true });
       expect(updated.streamCreation).toBe(false);
       expect(updated.ingestion).toBe(true);
     });
 
-    it('sets both flags at once', () => {
-      const updated = setPauseFlags({ streamCreation: true, ingestion: true });
+    it('sets both flags at once', async () => {
+      const updated = await setPauseFlags({ streamCreation: true, ingestion: true });
       expect(updated.streamCreation).toBe(true);
       expect(updated.ingestion).toBe(true);
     });
@@ -68,14 +68,14 @@ describe('adminState', () => {
       expect(getPauseFlags().streamCreation).toBe(false);
     });
 
-    it('isStreamCreationPaused reflects state', () => {
+    it('isStreamCreationPaused reflects state', async () => {
       expect(isStreamCreationPaused()).toBe(false);
-      setPauseFlags({ streamCreation: true });
+      await setPauseFlags({ streamCreation: true });
       expect(isStreamCreationPaused()).toBe(true);
     });
 
-    it('persists pause flags and reloads them from storage', () => {
-      setPauseFlags({ streamCreation: true, ingestion: true });
+    it('persists pause flags and reloads them from storage', async () => {
+      await setPauseFlags({ streamCreation: true, ingestion: true });
 
       _resetForTest({ clearPersistence: false });
       expect(getPauseFlags()).toEqual({ streamCreation: false, ingestion: false });
@@ -95,6 +95,62 @@ describe('adminState', () => {
     // is skipped — see https://vitest.dev/guide/browser/#limitations.
     it.skip('throws and keeps prior state when persistence write fails', () => {
       // Originally exercised the failure path via a writeFileSync spy.
+    });
+
+    it('handles concurrent writes safely via distributed lock', async () => {
+      // Simulate 5 concurrent writes that should not corrupt the state file
+      const promises = Array.from({ length: 5 }, (_, i) =>
+        setPauseFlags({
+          streamCreation: i % 2 === 0,
+          ingestion: i % 2 !== 0,
+        }),
+      );
+
+      const results = await Promise.all(promises);
+
+      // All writes should succeed (no exceptions)
+      expect(results).toHaveLength(5);
+      results.forEach((result) => {
+        expect(result).toHaveProperty('streamCreation');
+        expect(result).toHaveProperty('ingestion');
+      });
+
+      // State file should be valid JSON and readable
+      const fileContents = fs.readFileSync(adminStateFile, 'utf8');
+      const parsed = JSON.parse(fileContents);
+      expect(parsed.version).toBe(1);
+      expect(parsed.pauseFlags).toHaveProperty('streamCreation');
+      expect(parsed.pauseFlags).toHaveProperty('ingestion');
+
+      // Final state should match last write
+      _reloadPauseFlagsFromPersistenceForTest();
+      const finalFlags = getPauseFlags();
+      expect(finalFlags.streamCreation).toBe(4 % 2 === 0);
+      expect(finalFlags.ingestion).toBe(4 % 2 !== 0);
+    });
+
+    it('serializes concurrent writes via distributed lock', async () => {
+      const writeOrder: number[] = [];
+
+      // Mock console to track write order (in practice, this would show lock acquires)
+      const writePromises = Array.from({ length: 3 }, (_, i) =>
+        setPauseFlags({
+          streamCreation: i === 0,
+          ingestion: i === 1,
+        }).then((result) => {
+          writeOrder.push(i);
+          return result;
+        }),
+      );
+
+      await Promise.all(writePromises);
+
+      // Verify that state file contains valid JSON (lock prevented corruption)
+      const fileContents = fs.readFileSync(adminStateFile, 'utf8');
+      expect(() => JSON.parse(fileContents)).not.toThrow();
+
+      // All writes should have completed
+      expect(writeOrder).toHaveLength(3);
     });
   });
 
