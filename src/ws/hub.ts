@@ -56,6 +56,12 @@ import {
   trackConnection,
   untrackConnection,
 } from './connectionLimiter.js';
+import {
+  collectWsBackpressureMetrics,
+  removeWsClientBackpressureGauge,
+  DEFAULT_WS_BACKPRESSURE_INTERVAL_MS,
+  DEFAULT_WS_SLOW_CLIENT_BYTES,
+} from '../metrics/wsBackpressure.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -114,6 +120,15 @@ interface ClientState {
   messageTimestamps: number[];
 }
 
+// ── Backpressure collector options ────────────────────────────────────────────
+
+export interface StreamHubBackpressureCollectorOptions {
+  /** Poll interval in milliseconds. 0 disables the periodic collector. */
+  intervalMs?: number;
+  /** Threshold above which a client is counted as "slow" in the aggregate gauge. */
+  slowThresholdBytes?: number;
+}
+
 // ── Hub options ───────────────────────────────────────────────────────────────
 
 export interface StreamHubOptions {
@@ -133,6 +148,18 @@ export interface StreamHubOptions {
    * When absent, replayFromCursor sends an empty result.
    */
   eventStore?: ContractEventStore;
+  /**
+   * Optional override for the per-client backpressure collector.
+   * - `intervalMs`: 0 disables the periodic collector entirely (operations
+   *   that drive `deliverBatch` will still update the gauge for any client
+   *   they sample).
+   * - `slowThresholdBytes`: threshold above which a client is classified as
+   *   "slow" by the aggregate gauge.
+   *
+   * Defaults: intervalMs = `DEFAULT_WS_BACKPRESSURE_INTERVAL_MS` (5s),
+   * slowThresholdBytes = `DEFAULT_WS_SLOW_CLIENT_BYTES` (1 MiB).
+   */
+  backpressureCollector?: StreamHubBackpressureCollectorOptions;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -147,6 +174,8 @@ export class StreamHub extends EventEmitter {
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
   private eventStore: ContractEventStore | undefined;
+  private readonly backpressureCollectorInterval: NodeJS.Timeout | undefined;
+  private readonly backpressureSlowThresholdBytes: number;
 
   public getEventStore(): ContractEventStore | undefined {
     return this.eventStore;
@@ -178,8 +207,28 @@ export class StreamHub extends EventEmitter {
 
     this.eventStore = options?.eventStore;
 
+    // Default: 5s poll, 1 MiB slow threshold. intervalMs=0 disables the timer.
+    const collectorOpts = options?.backpressureCollector;
+    const intervalMs =
+      collectorOpts?.intervalMs ?? DEFAULT_WS_BACKPRESSURE_INTERVAL_MS;
+    this.backpressureSlowThresholdBytes =
+      collectorOpts?.slowThresholdBytes ?? DEFAULT_WS_SLOW_CLIENT_BYTES;
+
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
+
+    // Start the backpressure collector AFTER WebSocketServer setup so the
+    // initial collection can see any clients that already connected while
+    // the server was listening.
+    this.backpressureCollectorInterval =
+      intervalMs > 0
+        ? setInterval(() => {
+            collectWsBackpressureMetrics(this, this.backpressureSlowThresholdBytes);
+          }, intervalMs)
+        : undefined;
+    if (intervalMs > 0) {
+      collectWsBackpressureMetrics(this, this.backpressureSlowThresholdBytes);
+    }
 
     server.on('upgrade', (req, socket, head) => {
       const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
@@ -298,6 +347,9 @@ export class StreamHub extends EventEmitter {
     for (const filter of state.subscriptionFilters.values()) {
       this.removeSubscriptionFromIndexes(ws, filter);
     }
+
+    // Remove the per-client gauge time series so it doesn't accumulate.
+    removeWsClientBackpressureGauge(state.id);
 
     const durationMs = Date.now() - state.connectedAt;
     logger.info('WebSocket disconnected', state.correlationId, {
@@ -727,6 +779,16 @@ export class StreamHub extends EventEmitter {
     return this.clients.size;
   }
 
+  /**
+   * Internal entry-point used by the per-client backpressure collector to
+   * enumerate connected sockets. Underscore-prefixed because it exposes raw
+   * `WebSocket` references — callers MUST treat them as opaque and only read
+   * stable, read-only properties (e.g. `bufferedAmount`, `readyState`).
+   */
+  _getClients(): IterableIterator<[WebSocket, ClientState]> {
+    return this.clients.entries();
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
@@ -821,6 +883,9 @@ export class StreamHub extends EventEmitter {
   }
 
   async close(cb?: () => void): Promise<void> {
+    if (this.backpressureCollectorInterval) {
+      clearInterval(this.backpressureCollectorInterval);
+    }
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
   }
