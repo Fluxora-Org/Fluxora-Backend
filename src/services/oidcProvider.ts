@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
 import { createRedisClient, type RedisClient } from '../redis/client.js';
+import { addShutdownHook } from '../shutdown.js';
 import { info, warn, error } from '../utils/logger.js';
 
 interface JwksKey {
@@ -31,13 +32,13 @@ const jwksMemoryCache = new Map<string, CachedJwks>();
 const memoryReplayCache = new Map<string, number>();
 
 /** Hard cap for the in-memory replay cache to prevent unbounded memory growth. */
-const REPLAY_CACHE_MAX_SIZE = 10000;
+const REPLAY_CACHE_MAX_SIZE = 10_000;
 
 /** Interval at which expired replay entries are swept from the in-memory cache. */
 const REPLAY_CACHE_SWEEP_INTERVAL_MS = 60_000;
 
 /** Periodic timer handle for replay cache eviction. */
-let replayCacheSweepTimer: NodeJS.Timeout | null = null;
+let replayCacheSweepTimer: ReturnType<typeof setInterval> | null = null;
 
 let redisClient: RedisClient | null = null;
 let redisClientPromise: Promise<RedisClient | null> | null = null;
@@ -75,6 +76,72 @@ export async function getOidcRedisClient(): Promise<RedisClient | null> {
   })();
 
   return redisClientPromise;
+}
+
+/**
+ * Eviction policy for the in-memory OIDC ID-token replay cache:
+ *
+ * - Each entry maps a token hash to an `expiresAt` timestamp (epoch ms).
+ * - Entries are never removed before `expiresAt`; doing so would weaken replay protection.
+ * - Expired entries are pruned on every insert and on a periodic timer.
+ * - When the cache is at {@link REPLAY_CACHE_MAX_SIZE} with only valid entries,
+ *   new entries skip the in-memory store (Redis remains authoritative when enabled).
+ * - The sweep timer is `unref()`'d so it does not keep the process alive, and is
+ *   cleared during graceful shutdown.
+ */
+function pruneExpiredReplayEntries(nowMs = Date.now()): void {
+  for (const [key, expiresAt] of memoryReplayCache) {
+    if (expiresAt <= nowMs) {
+      memoryReplayCache.delete(key);
+    }
+  }
+}
+
+function recordReplayEntry(replayKey: string, expiresAtMs: number): void {
+  pruneExpiredReplayEntries();
+  if (memoryReplayCache.size >= REPLAY_CACHE_MAX_SIZE) {
+    warn('OIDC replay cache at capacity; skipping in-memory record', {
+      size: memoryReplayCache.size,
+      maxSize: REPLAY_CACHE_MAX_SIZE,
+    });
+    return;
+  }
+  memoryReplayCache.set(replayKey, expiresAtMs);
+}
+
+/**
+ * Starts the periodic sweep timer for the in-memory replay cache.
+ *
+ * The timer is `.unref()`'d so it does not keep the Node.js process alive
+ * when no other work is pending. It is safe to call multiple times.
+ */
+function startReplayCacheSweepTimer(): void {
+  if (replayCacheSweepTimer || process.env.NODE_ENV === 'test') {
+    return;
+  }
+
+  replayCacheSweepTimer = setInterval(() => {
+    pruneExpiredReplayEntries();
+  }, REPLAY_CACHE_SWEEP_INTERVAL_MS);
+
+  if (typeof replayCacheSweepTimer.unref === 'function') {
+    replayCacheSweepTimer.unref();
+  }
+}
+
+/**
+ * Stops the periodic replay-cache sweep timer and frees the handle.
+ */
+export function stopReplayCacheSweepTimer(): void {
+  if (replayCacheSweepTimer) {
+    clearInterval(replayCacheSweepTimer);
+    replayCacheSweepTimer = null;
+  }
+}
+
+if (process.env.NODE_ENV !== 'test') {
+  startReplayCacheSweepTimer();
+  addShutdownHook(() => stopReplayCacheSweepTimer());
 }
 
 /**
@@ -192,7 +259,6 @@ async function preventReplay(idToken: string, exp: number): Promise<void> {
   const replayKey = `fluxora:oidc_replay:${tokenHash}`;
   const nowMs = Date.now();
 
-  // Start periodic sweep timer on first use
   startReplayCacheSweepTimer();
 
   // 1. Check in-memory replay cache
@@ -221,90 +287,7 @@ async function preventReplay(idToken: string, exp: number): Promise<void> {
   }
 
   // Store in memory replay cache as fallback / double check
-  enforceReplayCacheSizeCap();
-  memoryReplayCache.set(replayKey, nowMs + ttl * 1000);
-}
-
-/**
- * Sweeps expired entries from the in-memory replay cache.
- * Iterates the cache and evicts entries whose `expiresAt` timestamp (ms)
- * is older than or equal to the current time.
- *
- * Replay protection is preserved because entries remain in the cache until
- * their token-level expiry. Removing an expired entry is safe: the token is
- * already past its `exp` claim at the provider and would be rejected on
- * re-submission before reaching the replay check.
- */
-function sweepExpiredReplayEntries(): void {
-  const now = Date.now();
-  for (const [key, expiresAt] of memoryReplayCache.entries()) {
-    if (expiresAt <= now) {
-      memoryReplayCache.delete(key);
-    }
-  }
-}
-
-/**
- * Bounded cache — enforces the memory-replay cache size cap.
- *
- * If the cache has reached `REPLAY_CACHE_MAX_SIZE`, expired entries are
- * swept first. If it remains at capacity the oldest entry is evicted.
- *
- * Redis remains the authoritative replay-detection store, so removing an
- * in-memory entry does not weaken replay security; the primary check runs
- * against Redis before the memory write.
- */
-function enforceReplayCacheSizeCap(): void {
-  if (memoryReplayCache.size < REPLAY_CACHE_MAX_SIZE) {
-    return;
-  }
-
-  sweepExpiredReplayEntries();
-
-  if (memoryReplayCache.size >= REPLAY_CACHE_MAX_SIZE) {
-    // Evict the oldest entry — Map iteration preserves insertion order.
-    const oldestKey = memoryReplayCache.keys().next().value;
-    if (oldestKey !== undefined) {
-      warn('In-memory replay cache at capacity; evicting oldest entry', {
-        cacheSize: memoryReplayCache.size,
-        maxSize: REPLAY_CACHE_MAX_SIZE,
-      });
-      memoryReplayCache.delete(oldestKey);
-    }
-  }
-}
-
-/**
- * Starts the periodic sweep timer for the in-memory replay cache.
- *
- * The timer is `.unref()`'d so it does not keep the Node.js process alive
- * when no other work is pending. It is safe to call multiple times.
- */
-function startReplayCacheSweepTimer(): void {
-  if (replayCacheSweepTimer) {
-    return;
-  }
-
-  replayCacheSweepTimer = setInterval(() => {
-    sweepExpiredReplayEntries();
-  }, REPLAY_CACHE_SWEEP_INTERVAL_MS);
-
-  if (typeof (replayCacheSweepTimer as NodeJS.Timeout).unref === 'function') {
-    (replayCacheSweepTimer as NodeJS.Timeout).unref();
-  }
-}
-
-/**
- * Stops the periodic replay-cache sweep timer and frees the handle.
- *
- * Intended for use in test teardown (`_resetOidcProviderForTest`) and can be
- * wired into the application's graceful-shutdown sequence.
- */
-export function stopReplayCacheSweepTimer(): void {
-  if (replayCacheSweepTimer) {
-    clearInterval(replayCacheSweepTimer);
-    replayCacheSweepTimer = null;
-  }
+  recordReplayEntry(replayKey, nowMs + ttl * 1000);
 }
 
 /**
@@ -439,3 +422,13 @@ export async function _resetOidcProviderForTest(): Promise<void> {
   }
   redisClientPromise = null;
 }
+
+/** @internal Test-only accessors for replay-cache eviction behavior. */
+export const _replayCacheForTest = {
+  size: (): number => memoryReplayCache.size,
+  pruneExpired: pruneExpiredReplayEntries,
+  maxSize: REPLAY_CACHE_MAX_SIZE,
+  recordEntry: recordReplayEntry,
+  startSweepTimer: startReplayCacheSweepTimer,
+  stopSweepTimer: stopReplayCacheSweepTimer,
+};

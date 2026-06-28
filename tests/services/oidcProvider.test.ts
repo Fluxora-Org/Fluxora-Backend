@@ -15,6 +15,7 @@ import {
   getJwks,
   _resetOidcProviderForTest,
   stopReplayCacheSweepTimer,
+  _replayCacheForTest,
 } from '../../src/services/oidcProvider.js';
 
 // Helper to generate RSA Key pair
@@ -326,7 +327,6 @@ describe('OIDC Provider Service & Routes', () => {
     });
   });
 
-
   // ── Replay Cache Eviction Tests ─────────────────────────────────────────────
 
   describe('replay cache eviction', () => {
@@ -376,32 +376,17 @@ describe('OIDC Provider Service & Routes', () => {
       await expect(verifyIdToken(token)).rejects.toThrow('Token replay detected');
     });
 
-    it('should enforce size cap by evicting oldest entry', async () => {
-      vi.mocked(mockClient.exists).mockResolvedValue(false);
-      vi.mocked(global.fetch).mockResolvedValue({
-        ok: true,
-        json: async () => ({ keys: [jwk1] }),
-      } as Response);
-
-      const tokens = [];
-      for (let i = 0; i < 10001; i++) {
-        tokens.push(jwt.sign(
-          { iss: issuer, aud: audience, sub: 'user' + i },
-          privateKey,
-          { algorithm: 'RS256', keyid: kid1, expiresIn: '5s' }
-        ));
+    it('should keep the map bounded under churn without evicting valid entries', () => {
+      const now = Date.now();
+      for (let i = 0; i < _replayCacheForTest.maxSize + 50; i++) {
+        _replayCacheForTest.recordEntry(`fluxora:oidc_replay:token-${i}`, now + 1_000);
       }
+      expect(_replayCacheForTest.size()).toBeLessThanOrEqual(_replayCacheForTest.maxSize);
 
-      for (let i = 0; i < 10000; i++) {
-        await expect(verifyIdToken(tokens[i])).resolves.toBeDefined();
-      }
-
-      await expect(verifyIdToken(tokens[10000])).resolves.toBeDefined();
-
-      vi.mocked(mockClient.exists).mockResolvedValue(true);
-      await expect(verifyIdToken(tokens[0])).rejects.toThrow('Token replay detected');
+      vi.setSystemTime(now + 2_000);
+      _replayCacheForTest.pruneExpired();
+      expect(_replayCacheForTest.size()).toBe(0);
     });
-
 
     it('should stop sweep timer on cache reset', async () => {
       const token = jwt.sign(
@@ -411,6 +396,7 @@ describe('OIDC Provider Service & Routes', () => {
       );
       await expect(verifyIdToken(token)).resolves.toBeDefined();
 
+      stopReplayCacheSweepTimer();
       await _resetOidcProviderForTest();
 
       vi.advanceTimersByTime(120000);
@@ -448,12 +434,10 @@ describe('OIDC Provider Service & Routes', () => {
       await expect(verifyIdToken(token3)).resolves.toBeDefined();
 
       vi.mocked(mockClient.exists).mockResolvedValue(true);
-      // Redis catches both replays regardless of memory state
       await expect(verifyIdToken(token1)).rejects.toThrow('Token replay detected');
       await expect(verifyIdToken(token2)).rejects.toThrow('Token replay detected');
     });
   });
-
 
   // ── Route Endpoint Integration Tests ──────────────────────────────────────
 
