@@ -9,6 +9,7 @@ import {
   WEBHOOK_CIRCUIT_BREAKER_KEY_PREFIX,
   WEBHOOK_CIRCUIT_BREAKER_PROBE_PREFIX,
 } from '../../src/redis/webhookCircuitBreakerStore.js';
+import { logger } from '../../src/lib/logger.js';
 import {
   attemptWebhookDeliveryWithRateLimit,
   checkWebhookDeliveryGate,
@@ -169,6 +170,82 @@ describe('RedisWebhookCircuitBreakerStore', () => {
     const disabled = { ...policy, circuitBreakerThreshold: 0 };
     const result = await store.checkAndClaimAttempt(consumerUrl, disabled);
     expect(result.allowed).toBe(true);
+  });
+
+  describe('Redis failure logging', () => {
+    let loggerSpy: ReturnType<typeof vi.spyOn>;
+    let consoleSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      loggerSpy = vi.spyOn(logger, 'error');
+      consoleSpy = vi.spyOn(console, 'error');
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('logs via structured logger (not console.error) on checkAndClaimAttempt Redis failure', async () => {
+      redis.throwOnNext('get');
+      const result = await store.checkAndClaimAttempt(consumerUrl, policy);
+
+      expect(result.allowed).toBe(true);
+      expect(loggerSpy).toHaveBeenCalledOnce();
+      expect(loggerSpy).toHaveBeenCalledWith(
+        expect.stringContaining('failing open'),
+        undefined,
+        expect.objectContaining({
+          operation: 'checkAndClaimAttempt',
+          consumerKey: hashConsumerUrl(consumerUrl),
+          error: expect.any(String),
+        }),
+      );
+      expect(consoleSpy).not.toHaveBeenCalled();
+    });
+
+    it('logs via structured logger (not console.error) on recordSuccess Redis failure', async () => {
+      redis.throwOnNext('get');
+      const result = await store.recordSuccess(consumerUrl, policy);
+
+      expect(result.state).toBe('closed');
+      expect(loggerSpy).toHaveBeenCalledOnce();
+      expect(loggerSpy).toHaveBeenCalledWith(
+        expect.stringContaining('recordSuccess'),
+        undefined,
+        expect.objectContaining({
+          operation: 'recordSuccess',
+          consumerKey: hashConsumerUrl(consumerUrl),
+          error: expect.any(String),
+        }),
+      );
+      expect(consoleSpy).not.toHaveBeenCalled();
+    });
+
+    it('logs via structured logger (not console.error) on recordFailure Redis failure', async () => {
+      redis.throwOnNext('get');
+      const result = await store.recordFailure(consumerUrl, policy);
+
+      expect(result.state).toBe('closed');
+      expect(loggerSpy).toHaveBeenCalledOnce();
+      expect(loggerSpy).toHaveBeenCalledWith(
+        expect.stringContaining('recordFailure'),
+        undefined,
+        expect.objectContaining({
+          operation: 'recordFailure',
+          consumerKey: hashConsumerUrl(consumerUrl),
+          error: expect.any(String),
+        }),
+      );
+      expect(consoleSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not include raw consumer URL in log metadata', async () => {
+      redis.throwOnNext('get');
+      await store.checkAndClaimAttempt(consumerUrl, policy);
+
+      const [, , meta] = loggerSpy.mock.calls[0] as [string, string | undefined, Record<string, unknown>];
+      expect(JSON.stringify(meta)).not.toContain(consumerUrl);
+    });
   });
 });
 

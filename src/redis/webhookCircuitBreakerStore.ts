@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Counter } from 'prom-client';
 import type { RedisClient } from './client.js';
 import { registry } from '../metrics.js';
+import { logger } from '../lib/logger.js';
 
 export interface CircuitBreakerPolicy {
   circuitBreakerThreshold?: number;
@@ -164,7 +165,11 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
         resetAt: null,
       };
     } catch (err) {
-      console.error('[WebhookCircuitBreakerStore] Redis error — failing open:', err);
+      logger.error('WebhookCircuitBreakerStore Redis error — failing open', undefined, {
+        operation: 'checkAndClaimAttempt',
+        consumerKey: hashConsumerUrl(consumerUrl),
+        error: err instanceof Error ? err.message : String(err),
+      });
       return { allowed: true, state: 'closed', consecutiveFailures: 0, resetAt: null };
     }
   }
@@ -178,7 +183,11 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
       if (previous.state !== 'closed') emit(previous.state, 'closed');
       return next;
     } catch (err) {
-      console.error('[WebhookCircuitBreakerStore] Redis error on recordSuccess:', err);
+      logger.error('WebhookCircuitBreakerStore Redis error on recordSuccess', undefined, {
+        operation: 'recordSuccess',
+        consumerKey: hashConsumerUrl(consumerUrl),
+        error: err instanceof Error ? err.message : String(err),
+      });
       return closed();
     }
   }
@@ -211,7 +220,11 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
       await this.client.del(probeKey(consumerUrl));
       return next;
     } catch (err) {
-      console.error('[WebhookCircuitBreakerStore] Redis error on recordFailure:', err);
+      logger.error('WebhookCircuitBreakerStore Redis error on recordFailure', undefined, {
+        operation: 'recordFailure',
+        consumerKey: hashConsumerUrl(consumerUrl),
+        error: err instanceof Error ? err.message : String(err),
+      });
       return closed();
     }
   }
