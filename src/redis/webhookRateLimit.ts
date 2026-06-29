@@ -40,8 +40,58 @@ export interface RateLimitResult {
 /** Default: 10 attempts per second per consumer URL. */
 export const DEFAULT_WEBHOOK_RETRY_RPS = 10;
 
+/** Hard limits applied during config validation. */
+export const RATE_LIMIT_MAX_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+export const RATE_LIMIT_MAX_LIMIT = 100_000;
+export const RATE_LIMIT_MIN_WINDOW_MS = 100; // 100ms minimum
+
+export class RateLimitConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RateLimitConfigError';
+  }
+}
+
+export function validateRateLimitConfig(config: RateLimitConfig): void {
+  if (!Number.isFinite(config.limit) || config.limit <= 0) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.limit must be a positive finite number, got ${config.limit}`,
+    );
+  }
+  if (config.limit > RATE_LIMIT_MAX_LIMIT) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.limit exceeds maximum allowed (${RATE_LIMIT_MAX_LIMIT}), got ${config.limit}`,
+    );
+  }
+  if (!Number.isFinite(config.windowMs) || config.windowMs < RATE_LIMIT_MIN_WINDOW_MS) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.windowMs must be >= ${RATE_LIMIT_MIN_WINDOW_MS}ms, got ${config.windowMs}`,
+    );
+  }
+  if (config.windowMs > RATE_LIMIT_MAX_WINDOW_MS) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.windowMs exceeds maximum allowed (${RATE_LIMIT_MAX_WINDOW_MS}ms), got ${config.windowMs}`,
+    );
+  }
+}
+
 export class WebhookRateLimiter {
+  private readonly consumerConfigs = new Map<string, RateLimitConfig>();
+
   constructor(private readonly redisClient: RedisClient) {}
+
+  setConsumerConfig(consumerUrl: string, config: RateLimitConfig): void {
+    validateRateLimitConfig(config);
+    this.consumerConfigs.set(consumerUrl, { ...config });
+  }
+
+  removeConsumerConfig(consumerUrl: string): void {
+    this.consumerConfigs.delete(consumerUrl);
+  }
+
+  resolveConfig(consumerUrl: string, fallback: RateLimitConfig): RateLimitConfig {
+    return this.consumerConfigs.get(consumerUrl) ?? fallback;
+  }
 
   /**
    * Check whether a delivery attempt to `consumerUrl` is within the
@@ -53,9 +103,11 @@ export class WebhookRateLimiter {
    * webhook retry use-cases this is an acceptable trade-off.
    */
   async checkLimit(consumerUrl: string, config: RateLimitConfig): Promise<RateLimitResult> {
+    validateRateLimitConfig(config);
+    const resolvedConfig = this.resolveConfig(consumerUrl, config);
     const key = `webhook_rl:${hashUrl(consumerUrl)}`;
     const now = Date.now();
-    const windowStart = now - config.windowMs;
+    const windowStart = now - resolvedConfig.windowMs;
 
     try {
       // Step 1: prune expired entries and count remaining in one pipeline.
@@ -72,10 +124,10 @@ export class WebhookRateLimiter {
       // Step 2: count current window entries.
       const count = await this.redisClient.zcount(key, windowStart, '+inf');
 
-      if (count >= config.limit) {
+      if (count >= resolvedConfig.limit) {
         // Determine when the oldest entry in the window expires so the
         // caller can schedule a deferral for exactly that long.
-        const retryAfterMs = config.windowMs;
+        const retryAfterMs = resolvedConfig.windowMs;
         return { canAttempt: false, retryAfterMs };
       }
 
@@ -83,7 +135,7 @@ export class WebhookRateLimiter {
       // suffix) so concurrent attempts from multiple workers don't collide
       // on NX and silently drop each other's records.
       const member = `${now}:${Math.random().toString(36).slice(2, 8)}`;
-      const ttlMs = config.windowMs * 2; // generous TTL so Redis auto-cleans
+      const ttlMs = resolvedConfig.windowMs * 2; // generous TTL so Redis auto-cleans
 
       const recordResults = await this.redisClient
         .multi()
