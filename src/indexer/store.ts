@@ -176,14 +176,28 @@ export class PostgresContractEventStore implements ContractEventStore {
   public readonly kind: IndexerStoreKind = 'postgres';
   constructor(private readonly client: PgClientLike, private readonly tableName = 'contract_events') {}
 
+  /**
+   * Inserts multiple contract events into the database.
+   *
+   * Enforces server-authoritative ingest timestamps:
+   * - If `ingestedAt` is omitted, null, or undefined on an event record, the insert uses the
+   *   database-level DEFAULT `now()` value, making the PostgreSQL server the authoritative
+   *   source for ingestion timestamps.
+   * - If an explicit `ingestedAt` timestamp is provided, it will override the database default.
+   * - This ensures existing database entries and legacy writes can define explicit timestamps
+   *   if needed, but default writes rely on the database server time.
+   *
+   * @param events List of contract events to insert.
+   * @returns List of successfully inserted and duplicate event IDs.
+   */
   async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
     if (events.length === 0) {
       return { insertedEventIds: [], duplicateEventIds: [] };
     }
 
     const values: unknown[] = [];
-    const placeholders = events.map((event, index) => {
-      const offset = index * 11;
+    let placeholderOffset = 1;
+    const placeholders = events.map((event) => {
       values.push(
         event.eventId,
         event.ledger,
@@ -198,13 +212,37 @@ export class PostgresContractEventStore implements ContractEventStore {
         event.ledgerHash
       );
 
-      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}::jsonb, $${offset + 10}::timestamptz, $${offset + 11})`;
+      const basePlaceholders = [
+        `$${placeholderOffset}`,
+        `$${placeholderOffset + 1}`,
+        `$${placeholderOffset + 2}`,
+        `$${placeholderOffset + 3}`,
+        `$${placeholderOffset + 4}`,
+        `$${placeholderOffset + 5}`,
+        `$${placeholderOffset + 6}`,
+        `$${placeholderOffset + 7}`,
+        `$${placeholderOffset + 8}::jsonb`,
+        `$${placeholderOffset + 9}::timestamptz`,
+        `$${placeholderOffset + 10}`,
+      ];
+
+      placeholderOffset += 11;
+
+      if (event.ingestedAt !== undefined && event.ingestedAt !== null) {
+        values.push(event.ingestedAt);
+        basePlaceholders.push(`$${placeholderOffset}::timestamptz`);
+        placeholderOffset += 1;
+      } else {
+        basePlaceholders.push('DEFAULT');
+      }
+
+      return `(${basePlaceholders.join(', ')})`;
     });
 
     const sql = `
       INSERT INTO ${this.tableName} (
         event_id, ledger, contract_id, topic, tx_hash,
-        tx_index, operation_index, event_index, payload, happened_at, ledger_hash
+        tx_index, operation_index, event_index, payload, happened_at, ledger_hash, ingested_at
       )
       VALUES ${placeholders.join(', ')}
       ON CONFLICT (event_id) DO NOTHING

@@ -62,7 +62,7 @@ adminRouter.get('/pause', (_req, res) => {
  * Body (all fields optional):
  *   { "streamCreation": true, "ingestion": false }
  */
-adminRouter.put('/pause', (req, res) => {
+adminRouter.put('/pause', async (req, res) => {
   const requestId = req.id ?? req.correlationId;
   const { streamCreation, ingestion } = req.body ?? {};
 
@@ -100,7 +100,7 @@ adminRouter.put('/pause', (req, res) => {
   const previous = getPauseFlags();
   let updated;
   try {
-    updated = setPauseFlags({ streamCreation, ingestion });
+    updated = await setPauseFlags({ streamCreation, ingestion });
   } catch (err) {
     if (err instanceof AdminStatePersistenceError) {
       res.status(503).json(
