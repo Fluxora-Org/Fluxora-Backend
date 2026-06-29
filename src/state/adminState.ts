@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import type { RedisClient } from '../redis/client.js';
 import { RedisDistributedLock, NoOpLock, Lock } from './adminStateLock.js';
 import { logger } from '../lib/logger.js';
+import { adminReindexJobDurationSeconds } from '../metrics/businessMetrics.js';
 
 export interface PauseFlags {
   /** Block new stream creation via the public API. */
@@ -238,6 +239,7 @@ export async function triggerReindex(): Promise<ReindexState> {
 }
 
 async function runReindexJob(): Promise<void> {
+  const endTimer = adminReindexJobDurationSeconds.startTimer();
   try {
     // Simulate incremental reindex work (placeholder for Horizon replay).
     const steps = 5;
@@ -247,10 +249,12 @@ async function runReindexJob(): Promise<void> {
     }
     state.reindex.status = 'completed';
     state.reindex.completedAt = new Date().toISOString();
+    endTimer({ outcome: 'success' });
   } catch (err) {
     state.reindex.status = 'failed';
     state.reindex.completedAt = new Date().toISOString();
     state.reindex.error = err instanceof Error ? err.message : String(err);
+    endTimer({ outcome: 'failure' });
   }
 }
 
