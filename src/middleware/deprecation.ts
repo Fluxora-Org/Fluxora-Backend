@@ -101,11 +101,15 @@ function applyDeprecationHeaders(req: Request, res: Response, entries: Normalize
 
     if (entry.sunset.getTime() <= Date.now()) {
       logger.warn('deprecated route is past its sunset date', {
+        event: 'route.sunset.past',
         method: req.method,
         path: req.path,
         route: entry.route,
         sunsetDate: entry.sunsetDate,
+        sunsetTimestamp: entry.sunset.toISOString(),
+        overdueMs: Date.now() - entry.sunset.getTime(),
         correlationId: req.correlationId,
+        userAgent: req.headers['user-agent'] ?? 'unknown',
       });
     }
   }
