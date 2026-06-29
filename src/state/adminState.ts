@@ -9,7 +9,7 @@
  */
 
 import * as fs from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { RedisClient } from '../redis/client.js';
 import { RedisDistributedLock, NoOpLock, Lock } from './adminStateLock.js';
 import { logger } from '../lib/logger.js';
@@ -289,4 +289,38 @@ export function _reloadPauseFlagsFromPersistenceForTest(): void {
     return;
   }
   state.pauseFlags = persisted;
+}
+
+/**
+ * Checks whether the configured `ADMIN_STATE_FILE` path is writable at startup.
+ *
+ * Performs a write-and-delete probe using a `.probe` sentinel file in the same
+ * directory as the admin state file. If the probe fails (e.g. read-only
+ * container filesystem), a structured warning is emitted but the server
+ * continues to start — in-memory pause flags remain fully functional without
+ * persistence.
+ *
+ * Security: the probe file path is derived solely from the server-controlled
+ * environment variable and is not logged in the warning to avoid leaking
+ * internal directory structure in security-sensitive deployments.
+ *
+ * @returns A promise that resolves to `true` if the path is writable, or
+ *   `false` if the write probe failed.
+ */
+export async function checkAdminStatePersistence(): Promise<boolean> {
+  const adminStatePath = resolveAdminStatePath();
+  const dir = dirname(adminStatePath);
+  const probePath = join(dir, '.fluxora-admin-state.probe');
+
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(probePath, '', { encoding: 'utf8', mode: 0o600 });
+    fs.rmSync(probePath, { force: true });
+    return true;
+  } catch {
+    logger.warn('Admin state file path is not writable; pause flags will not persist across restarts', undefined, {
+      event: 'admin_state_file_not_writable',
+    });
+    return false;
+  }
 }

@@ -197,6 +197,8 @@ export class RedisBanStore implements BanStore {
  */
 export class HybridBanStore implements BanStore {
   usingFallback = false;
+  /** Number of times a Redis operation failed and the fallback was invoked. */
+  fallbackModeCount = 0;
   private readonly localCache = new InMemoryBanStore();
 
   constructor(
@@ -224,6 +226,7 @@ export class HybridBanStore implements BanStore {
     } catch (err) {
       this.onError?.(err, 'isBanned');
       this.usingFallback = true;
+      this.fallbackModeCount += 1;
       return this.fallback.isBanned(ip);
     }
   }
@@ -238,6 +241,7 @@ export class HybridBanStore implements BanStore {
     } catch (err) {
       this.onError?.(err, 'ban');
       this.usingFallback = true;
+      this.fallbackModeCount += 1;
       // Local cache already has it — fail safe
       await this.fallback.ban(options);
     }
