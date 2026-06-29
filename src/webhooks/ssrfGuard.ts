@@ -19,14 +19,18 @@
  */
 
 import { logger } from '../lib/logger.js';
+import { getConfig } from '../config/env.js';
 
 /**
  * Error thrown when a webhook target URL fails SSRF validation.
  */
 export class WebhookTargetValidationError extends Error {
-  constructor(message: string) {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
     super(message);
     this.name = 'WebhookTargetValidationError';
+    this.code = code;
   }
 }
 
@@ -203,25 +207,68 @@ function isBlockedIPv6(ip: string): { blocked: boolean; reason?: string } {
 }
 
 /**
+ * Helper to perform a DNS lookup with a timeout and abort support.
+ *
+ * @param hostname - The hostname to resolve.
+ * @param timeoutMs - The timeout in milliseconds.
+ * @returns A promise that resolves with the lookup result (address).
+ * @throws {WebhookTargetValidationError} If the lookup times out or fails.
+ */
+async function lookupWithTimeout(hostname: string, timeoutMs: number): Promise<string> {
+  const dns = await import('dns');
+  const { lookup } = dns.promises;
+
+  const controller = new AbortController();
+  const signal = controller.signal;
+
+  let timeoutId: NodeJS.Timeout | undefined;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(
+        new WebhookTargetValidationError(
+          `DNS resolution timed out for hostname: ${hostname}`,
+          'DNS_TIMEOUT'
+        )
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    const lookupPromise = lookup(hostname, { all: false, signal });
+    const result = await Promise.race([lookupPromise, timeoutPromise]);
+    return result.address;
+  } catch (error: any) {
+    if (error instanceof WebhookTargetValidationError) {
+      throw error;
+    }
+
+    if (error.name === 'AbortError' || error.code === 'ECANCELED') {
+      throw new WebhookTargetValidationError(
+        `DNS resolution timed out for hostname: ${hostname}`,
+        'DNS_TIMEOUT'
+      );
+    }
+
+    throw new WebhookTargetValidationError(
+      `DNS resolution failed for hostname: ${hostname}`,
+      'DNS_RESOLUTION_FAILED'
+    );
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+/**
  * Resolve a hostname to its IP addresses.
  * This is used to defeat DNS rebinding attacks.
  */
-async function resolveHostname(hostname: string): Promise<string[]> {
-  try {
-    // Use Node.js DNS resolution
-    const dns = await import('dns');
-    const { lookup } = dns.promises;
-    
-    const { address, family } = await lookup(hostname, { all: false });
-    
-    // Convert to array for consistent interface
-    return [address];
-  } catch (error) {
-    // If DNS resolution fails, fail closed
-    throw new WebhookTargetValidationError(
-      `DNS resolution failed for hostname: ${hostname}`
-    );
-  }
+async function resolveHostname(hostname: string, timeoutMs: number): Promise<string[]> {
+  const address = await lookupWithTimeout(hostname, timeoutMs);
+  return [address];
 }
 
 /**
@@ -230,13 +277,15 @@ async function resolveHostname(hostname: string): Promise<string[]> {
 function validateProtocol(url: URL, requireHttps: boolean): void {
   if (requireHttps && url.protocol !== 'https:') {
     throw new WebhookTargetValidationError(
-      `Webhook URL must use HTTPS, got: ${url.protocol}`
+      `Webhook URL must use HTTPS, got: ${url.protocol}`,
+      'INVALID_PROTOCOL'
     );
   }
   
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new WebhookTargetValidationError(
-      `Webhook URL must use HTTP or HTTPS, got: ${url.protocol}`
+      `Webhook URL must use HTTP or HTTPS, got: ${url.protocol}`,
+      'INVALID_PROTOCOL'
     );
   }
 }
@@ -268,7 +317,8 @@ function validateAllowlist(hostname: string, allowlist: string[] | undefined): v
   }
   
   throw new WebhookTargetValidationError(
-    `Webhook hostname not in allowlist: ${hostname}`
+    `Webhook hostname not in allowlist: ${hostname}`,
+    'ALLOWLIST_VIOLATION'
   );
 }
 
@@ -283,14 +333,16 @@ function validateIPAddress(ip: string): void {
     const result = isBlockedIPv6(ip);
     if (result.blocked) {
       throw new WebhookTargetValidationError(
-        `Blocked IPv6 address: ${ip} (${result.reason})`
+        `Blocked IPv6 address: ${ip} (${result.reason})`,
+        'BLOCKED_ADDRESS'
       );
     }
   } else {
     const result = isBlockedIPv4(ip);
     if (result.blocked) {
       throw new WebhookTargetValidationError(
-        `Blocked IPv4 address: ${ip} (${result.reason})`
+        `Blocked IPv4 address: ${ip} (${result.reason})`,
+        'BLOCKED_ADDRESS'
       );
     }
   }
@@ -327,10 +379,20 @@ export async function validateWebhookTarget(
   options?: {
     requireHttps?: boolean;
     allowlist?: string[];
+    dnsTimeoutMs?: number;
   }
 ): Promise<void> {
   const requireHttps = options?.requireHttps ?? true;
   const allowlist = options?.allowlist;
+
+  let dnsTimeoutMs = options?.dnsTimeoutMs;
+  if (dnsTimeoutMs === undefined) {
+    try {
+      dnsTimeoutMs = getConfig().webhookDnsTimeoutMs;
+    } catch {
+      dnsTimeoutMs = 2000; // Sensible default fallback
+    }
+  }
 
   try {
     // Parse URL
@@ -339,7 +401,8 @@ export async function validateWebhookTarget(
       parsedUrl = new URL(url);
     } catch (error) {
       throw new WebhookTargetValidationError(
-        `Invalid webhook URL format: ${url}`
+        `Invalid webhook URL format: ${url}`,
+        'INVALID_URL'
       );
     }
 
@@ -360,7 +423,7 @@ export async function validateWebhookTarget(
       validateIPAddress(hostname);
     } else {
       // Hostname - resolve and validate all IPs
-      const resolvedIPs = await resolveHostname(hostname);
+      const resolvedIPs = await resolveHostname(hostname, dnsTimeoutMs);
       
       for (const ip of resolvedIPs) {
         validateIPAddress(ip);
@@ -373,6 +436,7 @@ export async function validateWebhookTarget(
       // Log the validation failure (without the full URL for security)
       logger.warn('Webhook target validation failed', undefined, {
         reason: error.message,
+        code: error.code,
       });
       throw error;
     }
@@ -382,7 +446,8 @@ export async function validateWebhookTarget(
       error: error instanceof Error ? error.message : String(error),
     });
     throw new WebhookTargetValidationError(
-      'Webhook target validation failed unexpectedly'
+      'Webhook target validation failed unexpectedly',
+      'UNKNOWN_ERROR'
     );
   }
 }

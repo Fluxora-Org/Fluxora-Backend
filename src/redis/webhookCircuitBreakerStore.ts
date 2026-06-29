@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Counter } from 'prom-client';
 import type { RedisClient } from './client.js';
 import { registry } from '../metrics.js';
+import { logger } from '../lib/logger.js';
 
 export interface CircuitBreakerPolicy {
   circuitBreakerThreshold?: number;
@@ -164,7 +165,11 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
         resetAt: null,
       };
     } catch (err) {
-      console.error('[WebhookCircuitBreakerStore] Redis error — failing open:', err);
+      logger.error('WebhookCircuitBreakerStore Redis error — failing open', undefined, {
+        operation: 'checkAndClaimAttempt',
+        consumerKey: hashConsumerUrl(consumerUrl),
+        error: err instanceof Error ? err.message : String(err),
+      });
       return { allowed: true, state: 'closed', consecutiveFailures: 0, resetAt: null };
     }
   }
@@ -178,7 +183,11 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
       if (previous.state !== 'closed') emit(previous.state, 'closed');
       return next;
     } catch (err) {
-      console.error('[WebhookCircuitBreakerStore] Redis error on recordSuccess:', err);
+      logger.error('WebhookCircuitBreakerStore Redis error on recordSuccess', undefined, {
+        operation: 'recordSuccess',
+        consumerKey: hashConsumerUrl(consumerUrl),
+        error: err instanceof Error ? err.message : String(err),
+      });
       return closed();
     }
   }
@@ -211,7 +220,11 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
       await this.client.del(probeKey(consumerUrl));
       return next;
     } catch (err) {
-      console.error('[WebhookCircuitBreakerStore] Redis error on recordFailure:', err);
+      logger.error('WebhookCircuitBreakerStore Redis error on recordFailure', undefined, {
+        operation: 'recordFailure',
+        consumerKey: hashConsumerUrl(consumerUrl),
+        error: err instanceof Error ? err.message : String(err),
+      });
       return closed();
     }
   }
@@ -230,10 +243,38 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
   }
 }
 
+/**
+ * In-memory implementation of the {@link WebhookCircuitBreakerStore}.
+ *
+ * Enforces half-open probe semantics and ensures the exactly-one-probe invariant:
+ * - When the circuit is 'open' and the reset period has passed, exactly one probe attempt
+ *   is allowed to be in-flight to check the service health.
+ * - This behavior is isolated per consumer URL. Concurrent probe requests on different
+ *   URLs do not interfere with one another.
+ * - A probe attempt is registered with a Time-To-Live (TTL) matching the Redis implementation's
+ *   lock duration (maximum 60 seconds) to ensure that if a dispatcher crashes or abandons
+ *   the probe, the state does not remain stale indefinitely.
+ * - The probe state is reset after a successful probe, after a failed probe, or after any completed
+ *   probe attempt (either manually via success/failure records, or when the TTL expires).
+ */
 export class InMemoryWebhookCircuitBreakerStore implements WebhookCircuitBreakerStore {
   private readonly states = new Map<string, WebhookCircuitBreakerRecord>();
-  private readonly probes = new Set<string>();
+  /** Maps hashed consumer URL key -> probe lock expiration timestamp (ms since epoch) */
+  private readonly probes = new Map<string, number>();
 
+  /**
+   * Checks the circuit breaker state and attempts to claim a half-open probe.
+   *
+   * @param consumerUrl The target webhook endpoint.
+   * @param policy The circuit breaker configuration policy.
+   * @param now The current timestamp.
+   * @returns A check result indicating if the attempt is allowed, the state, failures, and reset duration.
+   *
+   * @remarks
+   * Evaluates if a probe is already in-flight by verifying if a probe exists in the local map and
+   * its expiration time is in the future. Ensures exactly one probe is admitted in flight per consumer URL
+   * under concurrent calls.
+   */
   async checkAndClaimAttempt(
     consumerUrl: string,
     policy: CircuitBreakerPolicy,
@@ -250,10 +291,13 @@ export class InMemoryWebhookCircuitBreakerStore implements WebhookCircuitBreaker
       if (now < record.resetAt) {
         return { allowed: false, state: 'open', consecutiveFailures: record.consecutiveFailures, resetAt: record.resetAt };
       }
-      if (this.probes.has(key)) {
+      const probeExpiry = this.probes.get(key);
+      if (probeExpiry !== undefined && now < probeExpiry) {
         return { allowed: false, state: 'half-open', consecutiveFailures: record.consecutiveFailures, resetAt: record.resetAt };
       }
-      this.probes.add(key);
+      const resetMs = policy.circuitBreakerResetMs ?? 300_000;
+      const expiry = now + Math.min(resetMs, 60_000);
+      this.probes.set(key, expiry);
       this.states.set(key, { state: 'half-open', consecutiveFailures: record.consecutiveFailures, resetAt: 0 });
       emit('open', 'half-open');
       return { allowed: true, state: 'half-open', consecutiveFailures: record.consecutiveFailures, resetAt: null };
@@ -266,6 +310,10 @@ export class InMemoryWebhookCircuitBreakerStore implements WebhookCircuitBreaker
     };
   }
 
+  /**
+   * Records a successful probe outcome, resetting the consecutive failures
+   * count and closing the circuit. Clears the in-flight probe state.
+   */
   async recordSuccess(consumerUrl: string, _policy: CircuitBreakerPolicy): Promise<WebhookCircuitBreakerRecord> {
     const key = hashConsumerUrl(consumerUrl);
     const previous = this.states.get(key) ?? closed();
@@ -276,6 +324,10 @@ export class InMemoryWebhookCircuitBreakerStore implements WebhookCircuitBreaker
     return next;
   }
 
+  /**
+   * Records a failed probe outcome, re-opening the circuit breaker with a backoff delay.
+   * Clears the in-flight probe state.
+   */
   async recordFailure(consumerUrl: string, policy: CircuitBreakerPolicy, now = Date.now()): Promise<WebhookCircuitBreakerRecord> {
     const threshold = policy.circuitBreakerThreshold ?? 0;
     if (threshold <= 0) return closed();

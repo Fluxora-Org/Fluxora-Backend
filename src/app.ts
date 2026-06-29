@@ -239,7 +239,7 @@ export function createApp(options: AppOptions = {}): Express {
   //   1. Drain SSE — close open event-stream responses with retry:0.
   //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
   //   3. Quit Redis — close all tracked Redis sockets.
-  addShutdownHook(() => drainSseEventBus());
+  addShutdownHook(() => drainSseEventBus(appConfig.sseDrainTimeoutMs));
   addShutdownHook(() => requestStopReplay());
   addShutdownHook(() => quitAllRedisClients());
 

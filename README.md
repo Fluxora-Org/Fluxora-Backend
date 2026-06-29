@@ -186,6 +186,7 @@ The test suite includes:
 | `PORT` | 3000 | HTTP server port |
 | `API_KEYS` | - | Comma-separated list of valid API keys |
 | `API_KEY_PEPPER` | - | Server-side pepper for API key hashing (**Required if API_KEYS is configured**) |
+| `WEBHOOK_DNS_TIMEOUT_MS` | 2000 | Webhook DNS lookup resolution timeout in milliseconds (fail-closed) |
 
 
 ### Batch Size Tuning
