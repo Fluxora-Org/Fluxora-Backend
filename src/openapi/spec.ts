@@ -1829,17 +1829,32 @@ registry.registerPath({
         'application/json': {
           schema: z.object({
             ok: z.literal(true),
-            deliveryId: z.string(),
-            eventType: z.string().nullable(),
-            event: z.unknown(),
+            deliveryId: z.string().openapi({ example: 'del_01HXYZ', description: 'Echoed delivery ID' }),
+            eventType: z.string().nullable().openapi({ example: 'stream.created' }),
+            event: z.record(z.string(), z.unknown()).nullable().openapi({ description: 'Parsed event payload' }),
           }),
         },
       },
     },
     '400': errorResponses['400'],
-    '401': errorResponses['401'],
+    '401': {
+      description: 'Invalid signature or missing required headers',
+      content: { 'application/json': { schema: ErrorEnvelope } },
+    },
+    '409': {
+      description: 'Duplicate delivery — already processed this delivery ID',
+      content: {
+        'application/json': {
+          schema: z.object({
+            error: z.literal('duplicate_delivery'),
+            message: z.string(),
+            deliveryId: z.string(),
+          }),
+        },
+      },
+    },
     '413': {
-      description: 'Payload too large',
+      description: 'Payload too large (> 1 MB)',
       content: { 'application/json': { schema: ErrorEnvelope } },
     },
   },
