@@ -227,6 +227,16 @@ export const wsAuthFailureTotal =
     registers: [registry],
   });
 
+export const adminReindexJobDurationSeconds =
+  (registry.getSingleMetric('fluxora_admin_reindex_job_duration_seconds') as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_admin_reindex_job_duration_seconds',
+    help: 'Duration of adminState.triggerReindex job in seconds, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60],
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
@@ -244,4 +254,5 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_live_subscribers');
   registry.removeSingleMetric('fluxora_sse_event_listeners');
   registry.removeSingleMetric('fluxora_ws_auth_failure_total');
+  registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
 }

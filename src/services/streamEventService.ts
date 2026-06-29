@@ -12,8 +12,21 @@ import { streamRepository } from "../db/repositories/streamRepository.js";
 import { CreateStreamInput, StreamStatus } from "../db/types.js";
 import { info, warn, error as logError, debug } from "../utils/logger.js";
 import { getStreamHub } from "../ws/hub.js";
-import { enrichActiveSpanWithStream } from "../tracing/hooks.js";
+import { enrichActiveSpanWithStream, traceSpan } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";
+
+/**
+ * Structured event code emitted in all catch-block log entries.
+ *
+ * Using a single, stable string allows log-based alerting rules to
+ * filter on `event === STREAM_EVENT_PROCESSING_FAILED` and then
+ * further narrow by `eventType` to target a specific handler.
+ *
+ * @example
+ * // CloudWatch / Datadog filter:
+ * //   { event: "stream_event_processing_failed", eventType: "StreamCancelled" }
+ */
+export const STREAM_EVENT_PROCESSING_FAILED = "stream_event_processing_failed" as const;
 
 
 /**
@@ -147,7 +160,22 @@ export const streamEventService = {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      /**
+       * Structured catch block for StreamCreated processing failures.
+       *
+       * Fields:
+       *   event     - stable code for log-based alerting
+       *   eventType - discriminates which handler failed
+       *   contractId - chain contract that emitted the event
+       *
+       * NOTE: streamId is intentionally omitted here because it may not
+       * have been derived yet when the error occurred. sender/recipient
+       * Stellar addresses are NOT logged (classified as PII in src/pii/policy.ts).
+       */
       logError("Failed to process StreamCreated event", {
+        event: STREAM_EVENT_PROCESSING_FAILED,
+        eventType: event.type,
+        contractId: event.contractId,
         eventId,
         error: message,
         correlationId,
@@ -247,7 +275,23 @@ export const streamEventService = {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      /**
+       * Structured catch block for StreamUpdated processing failures.
+       *
+       * Fields:
+       *   event      - stable code for log-based alerting
+       *   eventType  - discriminates which handler failed
+       *   contractId - chain contract that emitted the event
+       *   streamId   - identifies the affected stream
+       *
+       * NOTE: sender/recipient Stellar addresses are NOT logged
+       * (classified as PII in src/pii/policy.ts).
+       */
       logError("Failed to process StreamUpdated event", {
+        event: STREAM_EVENT_PROCESSING_FAILED,
+        eventType: event.type,
+        contractId: event.contractId,
+        streamId: event.streamId,
         eventId,
         error: message,
         correlationId,
@@ -281,7 +325,21 @@ export const streamEventService = {
     });
 
     try {
+      // Enrich span with stream ID first (streamId is always available)
       enrichActiveSpanWithStream(event.streamId);
+
+      // Fetch existing stream to enrich span with sender/recipient before update.
+      // Security: sender_address and recipient_address are PII — they are passed
+      // only to enrichActiveSpanWithStream which guards against logging raw values.
+      const existing = await streamRepository.getById(event.streamId);
+      if (existing) {
+        enrichActiveSpanWithStream(
+          event.streamId,
+          existing.sender_address,
+          existing.recipient_address,
+        );
+      }
+
       const updatedStream = await streamRepository.updateStream(
         event.streamId,
         { status: "cancelled" },
@@ -311,7 +369,23 @@ export const streamEventService = {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      /**
+       * Structured catch block for StreamCancelled processing failures.
+       *
+       * Fields:
+       *   event      - stable code for log-based alerting
+       *   eventType  - discriminates which handler failed
+       *   contractId - chain contract that emitted the event
+       *   streamId   - identifies the affected stream
+       *
+       * NOTE: sender/recipient Stellar addresses are NOT logged
+       * (classified as PII in src/pii/policy.ts).
+       */
       logError("Failed to process StreamCancelled event", {
+        event: STREAM_EVENT_PROCESSING_FAILED,
+        eventType: event.type,
+        contractId: event.contractId,
+        streamId: event.streamId,
         eventId,
         error: message,
         correlationId,
@@ -327,7 +401,15 @@ export const streamEventService = {
   },
 
   /**
-   * Process any stream event (dispatches to appropriate handler)
+   * Process any stream event (dispatches to appropriate handler).
+   *
+   * Creates a parent tracing span that groups all three event-type branches
+   * (StreamCreated, StreamUpdated, StreamCancelled) under a single trace.
+   * The span carries `stream.event_type` and, when provided, `correlation_id`
+   * as attributes.
+   *
+   * Security: Stellar address values (sender_address, recipient_address) must
+   * NOT be set as span attributes here — see src/pii/policy.ts.
    *
    * @param event The blockchain event
    * @param correlationId Request ID for tracing
@@ -336,24 +418,39 @@ export const streamEventService = {
     event: StreamEvent,
     correlationId?: string,
   ): Promise<EventIngestionResult> {
-    switch (event.type) {
-      case "StreamCreated":
-        return this.processStreamCreated(event, correlationId);
-      case "StreamUpdated":
-        return this.processStreamUpdated(event, correlationId);
-      case "StreamCancelled":
-        return this.processStreamCancelled(event, correlationId);
-      default: {
-        const exhaustiveCheck: never = event;
-        return {
-          eventId: "",
-          streamId: "",
-          action: "created",
-          success: false,
-          error: `Unknown event type: ${exhaustiveCheck as string}`,
-        };
-      }
+    const spanCorrelationId = correlationId ?? "unknown";
+    const spanTags: Record<string, unknown> = {
+      "stream.event_type": event.type,
+    };
+    if (correlationId !== undefined) {
+      spanTags["correlation_id"] = correlationId;
     }
+
+    return traceSpan(
+      "streamEventService.processEvent",
+      spanCorrelationId,
+      spanTags,
+      async () => {
+        switch (event.type) {
+          case "StreamCreated":
+            return this.processStreamCreated(event, correlationId);
+          case "StreamUpdated":
+            return this.processStreamUpdated(event, correlationId);
+          case "StreamCancelled":
+            return this.processStreamCancelled(event, correlationId);
+          default: {
+            const exhaustiveCheck: never = event;
+            return {
+              eventId: "",
+              streamId: "",
+              action: "created" as const,
+              success: false,
+              error: `Unknown event type: ${exhaustiveCheck as string}`,
+            };
+          }
+        }
+      },
+    );
   },
 
   /**
