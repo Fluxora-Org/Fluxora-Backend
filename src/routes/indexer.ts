@@ -20,6 +20,7 @@ import { Router } from 'express';
 import {
   payloadTooLarge,
   unauthorized,
+  validationError,
 } from '../middleware/errorHandler.js';
 import { ContractEventStore, InMemoryContractEventStore } from '../indexer/store.js';
 import {
@@ -68,10 +69,13 @@ function enforceContentLength(req: any): void {
   }
 }
 
-function parseIntParam(val: unknown): number | undefined {
+function parseIntParam(val: unknown, name = 'Parameter'): number | undefined {
   if (val === undefined || val === '') return undefined;
   const n = Number(val);
-  return Number.isInteger(n) && n >= 0 ? n : undefined;
+  if (!Number.isInteger(n) || n < 0) {
+    throw validationError(`${name} must be a non-negative integer`);
+  }
+  return n;
 }
 
 // ── POST /contract-events ─────────────────────────────────────────────────────
@@ -112,11 +116,11 @@ indexerRouter.get('/events/replay', async (req: any, res: any, next: any) => {
 
     const filter: import('../db/types.js').StreamEventReplayFilter = {
       ...(afterEventId !== undefined ? { afterEventId } : {}),
-      ...(parseIntParam(req.query.fromLedger) !== undefined ? { fromLedger: parseIntParam(req.query.fromLedger) } : {}),
-      ...(parseIntParam(req.query.toledger) !== undefined ? { toledger: parseIntParam(req.query.toledger) } : {}),
+      ...(parseIntParam(req.query.fromLedger, 'fromLedger') !== undefined ? { fromLedger: parseIntParam(req.query.fromLedger, 'fromLedger') } : {}),
+      ...(parseIntParam(req.query.toledger, 'toledger') !== undefined ? { toledger: parseIntParam(req.query.toledger, 'toledger') } : {}),
       ...(typeof req.query.contractId === 'string' ? { contractId: req.query.contractId } : {}),
       ...(typeof req.query.topic === 'string' ? { topic: req.query.topic } : {}),
-      ...(parseIntParam(req.query.limit) !== undefined ? { limit: parseIntParam(req.query.limit) } : {}),
+      ...(parseIntParam(req.query.limit, 'limit') !== undefined ? { limit: parseIntParam(req.query.limit, 'limit') } : {}),
     };
 
     try {
@@ -142,12 +146,12 @@ indexerRouter.get('/events', async (req: any, res: any, next: any) => {
     requireIndexerToken(req);
 
     const filter: import('../db/types.js').StreamEventReplayFilter = {
-      ...(parseIntParam(req.query.fromLedger) !== undefined ? { fromLedger: parseIntParam(req.query.fromLedger) } : {}),
-      ...(parseIntParam(req.query.toledger) !== undefined ? { toledger: parseIntParam(req.query.toledger) } : {}),
+      ...(parseIntParam(req.query.fromLedger, 'fromLedger') !== undefined ? { fromLedger: parseIntParam(req.query.fromLedger, 'fromLedger') } : {}),
+      ...(parseIntParam(req.query.toledger, 'toledger') !== undefined ? { toledger: parseIntParam(req.query.toledger, 'toledger') } : {}),
       ...(typeof req.query.contractId === 'string' ? { contractId: req.query.contractId } : {}),
       ...(typeof req.query.topic === 'string' ? { topic: req.query.topic } : {}),
-      ...(parseIntParam(req.query.limit) !== undefined ? { limit: parseIntParam(req.query.limit) } : {}),
-      ...(parseIntParam(req.query.offset) !== undefined ? { offset: parseIntParam(req.query.offset) } : {}),
+      ...(parseIntParam(req.query.limit, 'limit') !== undefined ? { limit: parseIntParam(req.query.limit, 'limit') } : {}),
+      ...(parseIntParam(req.query.offset, 'offset') !== undefined ? { offset: parseIntParam(req.query.offset, 'offset') } : {}),
     };
 
     const result = await indexerIngestionService.getEvents(filter);
