@@ -70,6 +70,7 @@ export class WebhookDispatcher {
     const enhancedPolicy = this.policy as EnhancedRetryPolicy;
 
     // Validate webhook target for SSRF protection before any network call
+    let validatedUrl = url;
     try {
       let allowlist: string[] | undefined;
       try {
@@ -78,7 +79,7 @@ export class WebhookDispatcher {
       } catch {
         // Config not initialized, proceed without allowlist
       }
-      await validateWebhookTarget(url, {
+      validatedUrl = await validateWebhookTarget(url, {
         allowlist,
       });
     } catch (error) {
@@ -97,7 +98,7 @@ export class WebhookDispatcher {
       throw error;
     }
 
-    const gate = await circuitBreakerStore.checkAndClaimAttempt(url, enhancedPolicy);
+    const gate = await circuitBreakerStore.checkAndClaimAttempt(validatedUrl, enhancedPolicy);
     if (!gate.allowed) {
       const nextRetryAt = resolveCircuitBreakerDeferral(gate, enhancedPolicy).getTime();
       logger.warn('Webhook delivery deferred by circuit breaker', undefined, {
@@ -123,7 +124,7 @@ export class WebhookDispatcher {
     const signature = computeWebhookSignature(secret, timestamp, payload);
 
     try {
-      const response = await this.sendRequest(url, payload, deliveryId, eventType, timestamp, signature, effectiveCorrelationId);
+      const response = await this.sendRequest(validatedUrl, payload, deliveryId, eventType, timestamp, signature, effectiveCorrelationId);
       
       const attempt: WebhookDeliveryAttempt = {
         attemptNumber,
@@ -132,7 +133,7 @@ export class WebhookDispatcher {
       };
 
       if (response.ok) {
-        await circuitBreakerStore.recordSuccess(url, enhancedPolicy as CircuitBreakerPolicy);
+        await circuitBreakerStore.recordSuccess(validatedUrl, enhancedPolicy as CircuitBreakerPolicy);
         logger.info('Webhook delivered successfully', undefined, {
           deliveryId,
           eventType,
@@ -152,8 +153,8 @@ export class WebhookDispatcher {
       attempt.error = errorMessage;
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
-        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
-        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
+        ? (await circuitBreakerStore.recordFailure(validatedUrl, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(validatedUrl))?.consecutiveFailures ?? 0;
       const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
@@ -197,8 +198,8 @@ export class WebhookDispatcher {
       };
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
-        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
-        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
+        ? (await circuitBreakerStore.recordFailure(validatedUrl, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(validatedUrl))?.consecutiveFailures ?? 0;
       const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
@@ -330,6 +331,7 @@ export interface SimpleWebhookDispatch {
 
 export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void> {
   // Validate webhook target for SSRF protection before any network call
+  let validatedUrl = opts.url;
   try {
     let allowlist: string[] | undefined;
     try {
@@ -338,7 +340,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
     } catch {
       // Config not initialized, proceed without allowlist
     }
-    await validateWebhookTarget(opts.url, {
+    validatedUrl = await validateWebhookTarget(opts.url, {
       allowlist,
     });
   } catch (error) {
@@ -376,7 +378,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    await fetch(opts.url, {
+    await fetch(validatedUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

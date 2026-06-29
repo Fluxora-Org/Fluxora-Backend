@@ -20,6 +20,7 @@
 
 import { logger } from '../lib/logger.js';
 import { getConfig } from '../config/env.js';
+import { domainToASCII } from 'node:url';
 
 /**
  * Error thrown when a webhook target URL fails SSRF validation.
@@ -381,7 +382,7 @@ export async function validateWebhookTarget(
     allowlist?: string[];
     dnsTimeoutMs?: number;
   }
-): Promise<void> {
+): Promise<string> {
   const requireHttps = options?.requireHttps ?? true;
   const allowlist = options?.allowlist;
 
@@ -403,6 +404,20 @@ export async function validateWebhookTarget(
       throw new WebhookTargetValidationError(
         `Invalid webhook URL format: ${url}`,
         'INVALID_URL'
+      );
+    }
+
+    // Normalize hostname to ASCII (IDNA/punycode)
+    try {
+      const asciiHostname = domainToASCII(parsedUrl.hostname);
+      if (asciiHostname === '') {
+        throw new Error('Failed to normalize hostname');
+      }
+      parsedUrl.hostname = asciiHostname;
+    } catch (error) {
+      throw new WebhookTargetValidationError(
+        `Invalid hostname (IDNA normalization failed): ${parsedUrl.hostname}`,
+        'INVALID_HOSTNAME'
       );
     }
 
@@ -431,6 +446,7 @@ export async function validateWebhookTarget(
     }
 
     // All checks passed
+    return parsedUrl.toString();
   } catch (error) {
     if (error instanceof WebhookTargetValidationError) {
       // Log the validation failure (without the full URL for security)
