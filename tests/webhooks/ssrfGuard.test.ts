@@ -24,7 +24,7 @@ describe('SSRF Guard DNS Timeout and Resolution', () => {
 
     await expect(
       validateWebhookTarget('https://safe-domain.com/webhook', { dnsTimeoutMs: 500 })
-    ).resolves.not.toThrow();
+    ).resolves.toBe('https://safe-domain.com/webhook');
   });
 
   it('should reject private IP resolved from hostname', async () => {
@@ -103,5 +103,35 @@ describe('SSRF Guard DNS Timeout and Resolution', () => {
     await expect(promise).rejects.toThrow(WebhookTargetValidationError);
     expect(capturedSignal).toBeDefined();
     expect(capturedSignal?.aborted).toBe(true);
+  });
+});
+
+describe('SSRF Guard IDNA and Homograph Normalization', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should normalize valid Unicode hostnames to punycode', async () => {
+    vi.mocked(dns.promises.lookup).mockResolvedValue({ address: '8.8.8.8', family: 4 } as any);
+
+    const result = await validateWebhookTarget('https://faß.de/webhook', { dnsTimeoutMs: 500 });
+    expect(result).toBe('https://xn--fa-hia.de/webhook');
+    
+    expect(dns.promises.lookup).toHaveBeenCalledWith('xn--fa-hia.de', expect.any(Object));
+  });
+
+  it('should normalize homograph hostnames to punycode', async () => {
+    vi.mocked(dns.promises.lookup).mockResolvedValue({ address: '8.8.8.8', family: 4 } as any);
+
+    // Some environments normalize this to example.com, ensuring it doesn't bypass checks as raw unicode
+    const result = await validateWebhookTarget('https://ⓔⓍⓐⓂⓅⓁⓔ.com/webhook', { dnsTimeoutMs: 500 });
+    expect(result).toBe('https://example.com/webhook');
+  });
+
+  it('should reject hostnames that fail IDNA normalization or URL parsing', async () => {
+    // Unpaired surrogates often fail URL parsing or IDNA normalization
+    const promise = validateWebhookTarget('https://a\uD800b.com/webhook', { dnsTimeoutMs: 500 });
+    
+    await expect(promise).rejects.toThrow(WebhookTargetValidationError);
   });
 });
