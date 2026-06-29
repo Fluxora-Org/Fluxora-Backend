@@ -1,4 +1,4 @@
-import { Registry, collectDefaultMetrics, Counter, Histogram } from 'prom-client';
+import { Registry, collectDefaultMetrics, Counter, Histogram, Gauge } from 'prom-client';
 
 /** Dedicated registry so default Node.js metrics don't leak into other registries. */
 export const registry = new Registry();
@@ -80,3 +80,20 @@ export const dedupRedisFallbackTotal =
     labelNames: ['operation'] as const,
     registers: [registry],
   });
+
+
+/**
+ * Current number of active IP bans in the InMemoryBanStore.
+ * Updated on every ban/unban operation via setActiveBansCount().
+ */
+export const banStoreActiveBans: Gauge =
+  (registry.getSingleMetric('fluxora_ban_store_active_bans') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_ban_store_active_bans',
+    help: 'Current number of active bans in the InMemoryBanStore',
+    registers: [registry],
+  });
+
+export function setActiveBansCount(count: number): void {
+  banStoreActiveBans.set(count);
+}
