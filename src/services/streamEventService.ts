@@ -15,6 +15,19 @@ import { getStreamHub } from "../ws/hub.js";
 import { enrichActiveSpanWithStream } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";
 
+/**
+ * Structured event code emitted in all catch-block log entries.
+ *
+ * Using a single, stable string allows log-based alerting rules to
+ * filter on `event === STREAM_EVENT_PROCESSING_FAILED` and then
+ * further narrow by `eventType` to target a specific handler.
+ *
+ * @example
+ * // CloudWatch / Datadog filter:
+ * //   { event: "stream_event_processing_failed", eventType: "StreamCancelled" }
+ */
+export const STREAM_EVENT_PROCESSING_FAILED = "stream_event_processing_failed" as const;
+
 
 /**
  * Raw event types from Stellar Soroban RPC
@@ -147,7 +160,22 @@ export const streamEventService = {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      /**
+       * Structured catch block for StreamCreated processing failures.
+       *
+       * Fields:
+       *   event     - stable code for log-based alerting
+       *   eventType - discriminates which handler failed
+       *   contractId - chain contract that emitted the event
+       *
+       * NOTE: streamId is intentionally omitted here because it may not
+       * have been derived yet when the error occurred. sender/recipient
+       * Stellar addresses are NOT logged (classified as PII in src/pii/policy.ts).
+       */
       logError("Failed to process StreamCreated event", {
+        event: STREAM_EVENT_PROCESSING_FAILED,
+        eventType: event.type,
+        contractId: event.contractId,
         eventId,
         error: message,
         correlationId,
@@ -247,7 +275,23 @@ export const streamEventService = {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      /**
+       * Structured catch block for StreamUpdated processing failures.
+       *
+       * Fields:
+       *   event      - stable code for log-based alerting
+       *   eventType  - discriminates which handler failed
+       *   contractId - chain contract that emitted the event
+       *   streamId   - identifies the affected stream
+       *
+       * NOTE: sender/recipient Stellar addresses are NOT logged
+       * (classified as PII in src/pii/policy.ts).
+       */
       logError("Failed to process StreamUpdated event", {
+        event: STREAM_EVENT_PROCESSING_FAILED,
+        eventType: event.type,
+        contractId: event.contractId,
+        streamId: event.streamId,
         eventId,
         error: message,
         correlationId,
@@ -311,7 +355,23 @@ export const streamEventService = {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      /**
+       * Structured catch block for StreamCancelled processing failures.
+       *
+       * Fields:
+       *   event      - stable code for log-based alerting
+       *   eventType  - discriminates which handler failed
+       *   contractId - chain contract that emitted the event
+       *   streamId   - identifies the affected stream
+       *
+       * NOTE: sender/recipient Stellar addresses are NOT logged
+       * (classified as PII in src/pii/policy.ts).
+       */
       logError("Failed to process StreamCancelled event", {
+        event: STREAM_EVENT_PROCESSING_FAILED,
+        eventType: event.type,
+        contractId: event.contractId,
+        streamId: event.streamId,
         eventId,
         error: message,
         correlationId,
