@@ -940,15 +940,77 @@ registry.registerPath({
 
 // ── Privacy ───────────────────────────────────────────────────────────────────
 
+/**
+ * TrustBoundary schema — describes what each actor class may and may not do.
+ * Consumed by the GET /api/privacy/policy endpoint and referenced in
+ * authorization middleware for automated compliance checks.
+ */
+const TrustBoundarySchema = registry.register(
+  'TrustBoundary',
+  z
+    .object({
+      actor: z.string().openapi({
+        example: 'Anonymous client',
+        description: 'The actor class this boundary applies to.',
+      }),
+      description: z.string().openapi({
+        example: 'Unauthenticated public internet request.',
+        description: 'Human-readable description of the actor class.',
+      }),
+      allowed: z.array(z.string()).openapi({
+        example: ['Read public stream list and individual stream details'],
+        description: 'Operations this actor class is permitted to perform.',
+      }),
+      denied: z.array(z.string()).openapi({
+        example: ['Create or mutate stream records (future: requires auth)'],
+        description: 'Operations explicitly denied to this actor class.',
+      }),
+    })
+    .openapi({
+      description:
+        'Defines access boundaries for a specific actor class. ' +
+        'The denied array must not reference internal bypass mechanisms or undocumented admin paths.',
+    })
+);
+
+const PrivacyPolicyResponseSchema = z.object({
+  service: z.string().openapi({ example: 'fluxora-backend' }),
+  version: z.string().openapi({ example: '0.1.0' }),
+  piiPolicy: z.object({
+    summary: z.string(),
+    dataClassifications: z.array(
+      z.object({
+        level: z.string().openapi({ example: 'PUBLIC' }),
+        description: z.string(),
+      })
+    ),
+    fieldPolicies: z.object({
+      streamFields: z.record(z.string(), z.unknown()),
+      requestFields: z.record(z.string(), z.unknown()),
+    }),
+    retentionSchedule: z.array(z.record(z.string(), z.unknown())),
+    trustBoundaries: z.array(TrustBoundarySchema).openapi({
+      description:
+        'Trust boundary definitions for all actor classes. ' +
+        'Enables automated compliance checks to verify the declared access model.',
+    }),
+  }),
+  _links: z.record(z.string(), z.string()),
+});
+
 registry.registerPath({
   method: 'get',
   path: '/api/privacy/policy',
   summary: 'PII policy document',
+  description:
+    'Returns the full PII policy document including field classifications, ' +
+    'retention schedule, and trust boundaries for all actor classes. ' +
+    'Suitable for machine-readable compliance audits and data-controller integrations.',
   tags: ['privacy'],
   responses: {
     '200': {
-      description: 'Full PII policy',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      description: 'Full PII policy including trustBoundaries array',
+      content: { 'application/json': { schema: PrivacyPolicyResponseSchema } },
     },
   },
 });
