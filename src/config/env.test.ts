@@ -176,6 +176,28 @@ describe('Environment Configuration', () => {
 
             expect(() => loadConfig()).toThrow(ConfigError);
         });
+
+        it('should parse WEBHOOK_DNS_TIMEOUT_MS with default value', () => {
+            process.env.NODE_ENV = 'development';
+            const config = loadConfig();
+
+            expect(config.webhookDnsTimeoutMs).toBe(2000);
+        });
+
+        it('should allow WEBHOOK_DNS_TIMEOUT_MS override', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.WEBHOOK_DNS_TIMEOUT_MS = '5000';
+            const config = loadConfig();
+
+            expect(config.webhookDnsTimeoutMs).toBe(5000);
+        });
+
+        it('should reject invalid WEBHOOK_DNS_TIMEOUT_MS', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.WEBHOOK_DNS_TIMEOUT_MS = '-100';
+
+            expect(() => loadConfig()).toThrow(ConfigError);
+        });
     });
 
     // -------------------------------------------------------------------------

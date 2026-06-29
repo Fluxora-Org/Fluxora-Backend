@@ -703,13 +703,48 @@ registry.registerPath({
   method: 'get',
   path: '/api/streams/{id}',
   summary: 'Get stream by ID',
+  description:
+    'Returns a single stream record. Supports conditional GET via the ' +
+    '`If-None-Match` request header (RFC 7232 §3.2). ' +
+    'When the ETag matches, a 304 Not Modified response is returned ' +
+    'with no body, indicating the client\'s cached representation is still fresh. ' +
+    'The server emits a weak ETag (`W/"…"`) derived from the stream id and ' +
+    '`updated_at` timestamp.',
   tags: ['streams'],
-  request: { params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }) },
+  request: {
+    params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }),
+    headers: z.object({
+      'If-None-Match': z.string().optional().openapi({
+        description:
+          'Conditional request header (RFC 7232 §3.2). ' +
+          'Accepts `*`, a single entity-tag, or a comma-separated list of ' +
+          'entity-tags. Weak comparison is used per the spec.',
+        example: 'W/"abc123..."',
+      }),
+    }),
+  },
   responses: {
     '200': {
       description: 'Stream record',
       content: {
         'application/json': { schema: successSchema(z.object({ stream: StreamObject })) },
+      },
+    },
+    '304': {
+      description:
+        'Not Modified — the ETag matches the `If-None-Match` value. ' +
+        'Body is empty. The response includes the same `ETag` and `Last-Modified` ' +
+        'headers that would accompany a 200 response.',
+      headers: {
+        ...commonResponseHeaders,
+        'ETag': {
+          description: 'Weak entity-tag of the unchanged representation.',
+          schema: { type: 'string', example: 'W/"abc123..."' },
+        },
+        'Last-Modified': {
+          description: 'Last modification timestamp of the stream.',
+          schema: { type: 'string', format: 'http-date', example: 'Thu, 01 Jan 2026 00:00:00 GMT' },
+        },
       },
     },
     '404': errorResponses['404'],
