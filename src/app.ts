@@ -35,6 +35,7 @@ import {
 } from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { requireJsonContentType } from './middleware/contentType.js';
+import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
@@ -270,6 +271,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
+  app.use('/api', requireJsonAccept);
   // Correlation ID must run before express.json() so req.correlationId is available
   // even when JSON parsing throws and the error handler fires immediately.
   app.use(correlationIdMiddleware);

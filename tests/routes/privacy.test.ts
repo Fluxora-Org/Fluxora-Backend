@@ -140,6 +140,52 @@ describe('GET /api/privacy/policy', () => {
     }
   });
 
+  it('trustBoundaries array length matches TRUST_BOUNDARIES from policy module', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    expect(res.body.piiPolicy.trustBoundaries).toHaveLength(TRUST_BOUNDARIES.length);
+  });
+
+  it('trustBoundaries array content matches TRUST_BOUNDARIES from policy module exactly', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    expect(res.body.piiPolicy.trustBoundaries).toEqual(TRUST_BOUNDARIES);
+  });
+
+  it('each trust boundary has actor, description, allowed, and denied fields', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    for (const boundary of res.body.piiPolicy.trustBoundaries) {
+      expect(typeof boundary.actor).toBe('string');
+      expect(boundary.actor.length).toBeGreaterThan(0);
+      expect(typeof boundary.description).toBe('string');
+      expect(boundary.description.length).toBeGreaterThan(0);
+      expect(Array.isArray(boundary.allowed)).toBe(true);
+      expect(Array.isArray(boundary.denied)).toBe(true);
+    }
+  });
+
+  it('trustBoundaries allowed and denied entries are all strings', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    for (const boundary of res.body.piiPolicy.trustBoundaries) {
+      for (const entry of boundary.allowed) {
+        expect(typeof entry).toBe('string');
+      }
+      for (const entry of boundary.denied) {
+        expect(typeof entry).toBe('string');
+      }
+    }
+  });
+
+  it('trustBoundaries denied entries do not reference internal hostnames or IPs', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    const internalPatterns = [/localhost/, /127\.0\.0\.1/, /internal\./, /\.local\b/];
+    for (const boundary of res.body.piiPolicy.trustBoundaries) {
+      for (const entry of boundary.denied) {
+        for (const pattern of internalPatterns) {
+          expect(entry).not.toMatch(pattern);
+        }
+      }
+    }
+  });
+
   it('includes HATEOAS _links with self, retention, health, and streams', async () => {
     const res = await request(app).get('/api/privacy/policy');
     expect(res.body._links.self).toBe('/api/privacy/policy');
