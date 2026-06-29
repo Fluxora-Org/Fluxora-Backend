@@ -256,6 +256,7 @@ export const EnvSchema = z.object({
     byteSizeToNumber,
     z.number().int('WEBHOOK_MAX_RESPONSE_BYTES must resolve to whole bytes').positive('WEBHOOK_MAX_RESPONSE_BYTES must be positive'),
   ).default(64 * 1024),
+  WEBHOOK_DNS_TIMEOUT_MS: integerEnv('WEBHOOK_DNS_TIMEOUT_MS', 1).default(2000),
 
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
   ENABLE_RATE_LIMIT: booleanEnv().optional(),
@@ -270,12 +271,14 @@ export const EnvSchema = z.object({
   SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
   /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
   SSE_RETRY_MS: integerEnv('SSE_RETRY_MS', 100, 300_000).default(5000),
-  /** Interval in milliseconds between SSE heartbeat comments per connection. */
-  SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
-  INDEXER_ENABLED: booleanEnv().default(false),
-  WORKER_ENABLED: booleanEnv().default(false),
-  INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
-  INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
+   /** Interval in milliseconds between SSE heartbeat comments per connection. */
+   SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
+   /** Milliseconds to wait for each SSE connection to drain during shutdown before force-closing. */
+   SSE_DRAIN_TIMEOUT_MS: integerEnv('SSE_DRAIN_TIMEOUT_MS', 1_000, 60_000).default(30_000),
+   INDEXER_ENABLED: booleanEnv().default(false),
+   WORKER_ENABLED: booleanEnv().default(false),
+   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
+   INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
   ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
   RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
@@ -392,6 +395,7 @@ export interface Config {
   webhookRetryRps: number;
   webhookAllowedHosts: string[] | undefined;
   webhookMaxResponseBytes: number;
+  webhookDnsTimeoutMs: number;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -408,6 +412,8 @@ export interface Config {
   sseRetryMs: number;
   /** Interval in milliseconds between per-connection SSE heartbeat comments. */
   sseHeartbeatIntervalMs: number;
+  /** Milliseconds to wait for each SSE connection to drain during shutdown before force-closing. */
+  sseDrainTimeoutMs: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
   indexerStallThresholdMs: number;
@@ -547,6 +553,7 @@ function toConfig(env: ParsedEnv): Config {
       ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
       : undefined,
     webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
+    webhookDnsTimeoutMs: env.WEBHOOK_DNS_TIMEOUT_MS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
@@ -561,6 +568,7 @@ function toConfig(env: ParsedEnv): Config {
     sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
     sseRetryMs: env.SSE_RETRY_MS,
     sseHeartbeatIntervalMs: env.SSE_HEARTBEAT_INTERVAL_MS,
+    sseDrainTimeoutMs: env.SSE_DRAIN_TIMEOUT_MS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,

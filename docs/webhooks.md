@@ -13,6 +13,7 @@ Required configuration:
 - `WEBHOOK_RETRY_RPS`: maximum outbound retry attempts per second per consumer URL. Defaults to `10`. Set lower (e.g. `2`) for consumers known to be slow or fragile.
 - `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD`: consecutive retryable failures before the circuit opens. Defaults to `0` (disabled). Set e.g. `10` to enable cross-instance protection.
 - `WEBHOOK_CIRCUIT_BREAKER_RESET_MS`: how long the circuit stays open before a single half-open probe. Defaults to `300000` (5 minutes).
+- `WEBHOOK_DNS_TIMEOUT_MS`: DNS lookup resolution timeout in milliseconds (fail-closed). Defaults to `2000` (2 seconds).
 
 The service startup path starts the dispatcher after migrations are checked. Shutdown registers the dispatcher as a drainable service, so SIGTERM/SIGINT stops future polls and waits for the in-flight batch before closing database connections.
 
@@ -149,15 +150,20 @@ Add to your environment configuration:
 ```bash
 # Optional: Restrict webhook delivery to specific hosts
 WEBHOOK_ALLOWED_HOSTS=api.example.com,*.trusted.com
+
+# Optional: Webhook DNS resolution timeout (in milliseconds)
+WEBHOOK_DNS_TIMEOUT_MS=2000
 ```
 
 ### Error handling
 
 SSRF validation failures are logged without exposing the full URL for security. The validation fails closed: any ambiguous or unresolvable target is rejected with a `WebhookTargetValidationError`.
 
+If DNS resolution times out or is aborted, it is rejected with a `WebhookTargetValidationError` containing a `DNS_TIMEOUT` code, which fails closed.
+
 ### Implementation details
 
 - Validation function: `validateWebhookTarget(url, options)` in `src/webhooks/ssrfGuard.ts`
 - Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
 - Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
-- DNS resolution: Uses Node.js `dns.promises.lookup()`
+- DNS resolution: Uses Node.js `dns.promises.lookup()` wrapped with a custom timeout helper and `AbortController` bounded by `WEBHOOK_DNS_TIMEOUT_MS` (default `2000` ms).

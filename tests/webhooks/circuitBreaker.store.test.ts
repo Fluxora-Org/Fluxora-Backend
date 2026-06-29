@@ -8,6 +8,7 @@ import {
   hashConsumerUrl,
   WEBHOOK_CIRCUIT_BREAKER_KEY_PREFIX,
   WEBHOOK_CIRCUIT_BREAKER_PROBE_PREFIX,
+  type WebhookCircuitBreakerStore,
 } from '../../src/redis/webhookCircuitBreakerStore.js';
 import {
   attemptWebhookDeliveryWithRateLimit,
@@ -200,6 +201,230 @@ describe('InMemoryWebhookCircuitBreakerStore', () => {
   });
 });
 
+describe('Circuit Breaker Store Concurrency and Lifecycle (Shared Semantics)', () => {
+  const urls = [
+    'https://consumer-a.example/webhooks',
+    'https://consumer-b.example/webhooks',
+  ];
+
+  const runSharedSuite = (getStore: () => WebhookCircuitBreakerStore, isRedis: boolean) => {
+    let store: WebhookCircuitBreakerStore;
+
+    beforeEach(() => {
+      store = getStore();
+    });
+
+    afterEach(async () => {
+      await store.close();
+    });
+
+    it('enforces exactly one probe admitted per URL under concurrency', async () => {
+      const now = 10_000_000;
+      const targetUrl = urls[0];
+
+      // Move URL to open state
+      for (let i = 0; i < 3; i++) {
+        await store.recordFailure(targetUrl, policy, now + i * 1000);
+      }
+
+      const openState = await store.getState(targetUrl);
+      expect(openState?.state).toBe('open');
+
+      // Attempt to claim probe concurrently
+      const results = await Promise.all([
+        store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt),
+        store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt),
+        store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt),
+      ]);
+
+      const allowedCount = results.filter((r) => r.allowed).length;
+      expect(allowedCount).toBe(1);
+
+      const allowedResult = results.find((r) => r.allowed);
+      expect(allowedResult?.state).toBe('half-open');
+
+      const deniedResults = results.filter((r) => !r.allowed);
+      expect(deniedResults).toHaveLength(2);
+      for (const res of deniedResults) {
+        expect(res.state).toBe('half-open');
+      }
+    });
+
+    it('ensures concurrent probes for two different URLs do not interfere', async () => {
+      const now = 20_000_000;
+      const urlA = urls[0];
+      const urlB = urls[1];
+
+      // Open both URL A and URL B
+      for (let i = 0; i < 3; i++) {
+        await store.recordFailure(urlA, policy, now + i * 1000);
+        await store.recordFailure(urlB, policy, now + i * 1000);
+      }
+
+      const stateA = await store.getState(urlA);
+      const stateB = await store.getState(urlB);
+
+      expect(stateA?.state).toBe('open');
+      expect(stateB?.state).toBe('open');
+
+      // Claim concurrently for different URLs
+      const [resA, resB] = await Promise.all([
+        store.checkAndClaimAttempt(urlA, policy, stateA!.resetAt),
+        store.checkAndClaimAttempt(urlB, policy, stateB!.resetAt),
+      ]);
+
+      expect(resA.allowed).toBe(true);
+      expect(resA.state).toBe('half-open');
+      expect(resB.allowed).toBe(true);
+      expect(resB.state).toBe('half-open');
+    });
+
+    it('resets probe state correctly after successful probe', async () => {
+      const now = 30_000_000;
+      const targetUrl = urls[0];
+
+      // Open
+      for (let i = 0; i < 3; i++) {
+        await store.recordFailure(targetUrl, policy, now + i * 1000);
+      }
+
+      const openState = await store.getState(targetUrl);
+      const probeRes = await store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt);
+      expect(probeRes.allowed).toBe(true);
+
+      // Record success
+      await store.recordSuccess(targetUrl, policy);
+
+      const stateAfterSuccess = await store.getState(targetUrl);
+      expect(stateAfterSuccess?.state).toBe('closed');
+      expect(stateAfterSuccess?.consecutiveFailures).toBe(0);
+
+      // Verify a new probe is not active and the circuit is closed (allowed = true, state = closed)
+      const checkRes = await store.checkAndClaimAttempt(targetUrl, policy, now);
+      expect(checkRes.allowed).toBe(true);
+      expect(checkRes.state).toBe('closed');
+    });
+
+    it('resets probe state correctly after failed probe', async () => {
+      const now = 40_000_000;
+      const targetUrl = urls[0];
+
+      // Open
+      for (let i = 0; i < 3; i++) {
+        await store.recordFailure(targetUrl, policy, now + i * 1000);
+      }
+
+      const openState1 = await store.getState(targetUrl);
+      const probeRes1 = await store.checkAndClaimAttempt(targetUrl, policy, openState1!.resetAt);
+      expect(probeRes1.allowed).toBe(true);
+
+      // Record failure (re-opens circuit)
+      const recordFailTime = openState1!.resetAt + 1000;
+      const reopenState = await store.recordFailure(targetUrl, policy, recordFailTime);
+      expect(reopenState.state).toBe('open');
+
+      // Now that it has failed, the probe state is cleared.
+      // After resetAt is reached again, we should be able to claim a new probe.
+      const probeRes2 = await store.checkAndClaimAttempt(targetUrl, policy, reopenState.resetAt);
+      expect(probeRes2.allowed).toBe(true);
+      expect(probeRes2.state).toBe('half-open');
+    });
+
+    it('repeated concurrent probes for the same URL behave correctly', async () => {
+      const now = 50_000_000;
+      const targetUrl = urls[0];
+
+      // 1. Open
+      for (let i = 0; i < 3; i++) {
+        await store.recordFailure(targetUrl, policy, now + i * 1000);
+      }
+
+      let openState = await store.getState(targetUrl);
+
+      // 2. Claim concurrently (Cycle 1)
+      const results1 = await Promise.all([
+        store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt),
+        store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt),
+      ]);
+      expect(results1.filter(r => r.allowed)).toHaveLength(1);
+
+      // 3. Complete probe with failure
+      const failTime = openState!.resetAt + 1000;
+      openState = await store.recordFailure(targetUrl, policy, failTime);
+      expect(openState.state).toBe('open');
+
+      // 4. Claim concurrently again (Cycle 2)
+      const results2 = await Promise.all([
+        store.checkAndClaimAttempt(targetUrl, policy, openState.resetAt),
+        store.checkAndClaimAttempt(targetUrl, policy, openState.resetAt),
+      ]);
+      expect(results2.filter(r => r.allowed)).toHaveLength(1);
+    });
+
+    it('probe expires and allows another probe', async () => {
+      const now = 60_000_000;
+      const targetUrl = urls[0];
+
+      // Open
+      for (let i = 0; i < 3; i++) {
+        await store.recordFailure(targetUrl, policy, now + i * 1000);
+      }
+
+      const openState = await store.getState(targetUrl);
+      
+      // Claim first probe
+      const firstProbe = await store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt);
+      expect(firstProbe.allowed).toBe(true);
+
+      // Try to claim another probe immediately (should be denied)
+      const immediateSecond = await store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt);
+      expect(immediateSecond.allowed).toBe(false);
+
+      // Reset the state to 'open' to simulate that the first probe did not complete
+      // and we want to retry. (If state remains 'half-open', subsequent checks are blocked by state).
+      if (isRedis) {
+        const stateKey = `${WEBHOOK_CIRCUIT_BREAKER_KEY_PREFIX}${hashConsumerUrl(targetUrl)}`;
+        const record = { state: 'open' as const, consecutiveFailures: 3, resetAt: openState!.resetAt };
+        await (store as any).client.set(stateKey, JSON.stringify(record));
+      } else {
+        (store as any).states.set(hashConsumerUrl(targetUrl), { state: 'open', consecutiveFailures: 3, resetAt: openState!.resetAt });
+      }
+
+      // If we check now, it should still be blocked because the probe lock/key is still active
+      const stillBlocked = await store.checkAndClaimAttempt(targetUrl, policy, openState!.resetAt);
+      expect(stillBlocked.allowed).toBe(false);
+
+      // Now simulate expiration of the probe lock:
+      if (isRedis) {
+        const probeKey = `${WEBHOOK_CIRCUIT_BREAKER_PROBE_PREFIX}${hashConsumerUrl(targetUrl)}`;
+        await (store as any).client.del(probeKey);
+      }
+
+      const checkTime = isRedis ? openState!.resetAt : openState!.resetAt + 65_000;
+      const afterExpiry = await store.checkAndClaimAttempt(targetUrl, policy, checkTime);
+      
+      // It should be allowed now because the probe lock expired/was cleared!
+      expect(afterExpiry.allowed).toBe(true);
+      expect(afterExpiry.state).toBe('half-open');
+    });
+  };
+
+  describe('InMemoryWebhookCircuitBreakerStore', () => {
+    runSharedSuite(() => new InMemoryWebhookCircuitBreakerStore(), false);
+  });
+
+  describe('RedisWebhookCircuitBreakerStore', () => {
+    let redis: FakeRedisClient;
+    beforeEach(() => {
+      redis = new FakeRedisClient();
+    });
+    afterEach(() => {
+      redis.reset();
+    });
+    runSharedSuite(() => new RedisWebhookCircuitBreakerStore(redis), true);
+  });
+});
+
 describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () => {
   let redis: FakeRedisClient;
   let store: RedisWebhookCircuitBreakerStore;
@@ -307,7 +532,6 @@ describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () =>
       attemptNumber: 1,
       policy,
       now,
-      lastAttempt: { attemptNumber: 1, timestamp: now, statusCode: 500 },
     });
 
     expect(plan.shouldRetry).toBe(true);
