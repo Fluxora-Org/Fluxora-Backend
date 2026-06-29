@@ -348,6 +348,10 @@ export async function verifyIdToken(idToken: string): Promise<{
     throw new Error('OIDC issuer URL is not configured');
   }
 
+  if (!audience) {
+    throw new Error('OIDC audience (client_id) is not configured — aud validation cannot be skipped');
+  }
+
   // 1. Decode token to extract kid
   const decoded = jwt.decode(idToken, { complete: true });
   if (!decoded || typeof decoded === 'string' || !decoded.header || !decoded.payload) {
@@ -383,7 +387,14 @@ export async function verifyIdToken(idToken: string): Promise<{
     }
   }
 
-  // 3. Verify token signature and claims
+  // 3a. Explicit aud claim pre-check before signature verification
+  const rawAud = payload.aud;
+  const audArray = Array.isArray(rawAud) ? rawAud : [rawAud];
+  if (!audArray.includes(audience)) {
+    throw new Error(`Token aud claim does not include configured client_id. Expected "${audience}", got ${JSON.stringify(rawAud)}`);
+  }
+
+  // 3b. Verify token signature and claims (also re-validates aud via jwt library)
   const verifiedPayload = verifyWithJwk(idToken, jwk, issuerUrl, audience);
 
   // 4. Token replay prevention
