@@ -67,6 +67,7 @@ import {
   tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
+import { requireJsonAccept } from '../middleware/contentType.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
@@ -440,6 +441,7 @@ export function enforceStreamScope(req: Request, res: Response, next: NextFuncti
  */
 streamsRouter.get(
   '/',
+  requireJsonAccept,
   authenticateApiKey,
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
