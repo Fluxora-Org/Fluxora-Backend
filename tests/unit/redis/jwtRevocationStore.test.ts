@@ -151,6 +151,71 @@ describe('revoke', () => {
     expect(mockRedis.set).not.toHaveBeenCalled();
   });
 
+  // ── TTL boundary / resolveRevocationTtl edge-case tests ─────────────────────
+
+  it('skips Redis write when exp is far in the past (never passes non-positive EX)', async () => {
+    // exp is 1 hour before now — token long since expired.
+    const nowSeconds = 1_700_000_000;
+    const result = await revoke('jti-far-past', {
+      exp: nowSeconds - 3600,
+      nowSeconds,
+    });
+
+    expect(result).toEqual({ revoked: false, ttlSeconds: 0 });
+    expect(mockRedis.set).not.toHaveBeenCalled();
+  });
+
+  it('skips Redis write when exp equals now (exp == now yields TTL 0, treated as expired)', async () => {
+    // When exp == nowSeconds, ceil(exp - now) == 0 which is non-positive.
+    // The revocation should be skipped rather than passing EX 0 to Redis.
+    const nowSeconds = 1_700_000_000;
+    const result = await revoke('jti-exp-now', {
+      exp: nowSeconds,
+      nowSeconds,
+    });
+
+    expect(result).toEqual({ revoked: false, ttlSeconds: 0 });
+    expect(mockRedis.set).not.toHaveBeenCalled();
+  });
+
+  it('stores with TTL=1 when exp is exactly 1 second in the future', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+    const nowSeconds = 1_700_000_000;
+
+    const result = await revoke('jti-one-sec', {
+      exp: nowSeconds + 1,
+      nowSeconds,
+    });
+
+    expect(result).toEqual({ revoked: true, ttlSeconds: 1 });
+    expect(mockRedis.set).toHaveBeenCalledWith('jwt:revoked:jti-one-sec', '1', 'EX', 1);
+  });
+
+  it('stores with correct TTL when exp is far in the future', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+    const nowSeconds = 1_700_000_000;
+    const exp = nowSeconds + 86400; // 24 hours from now
+
+    const result = await revoke('jti-far-future', { exp, nowSeconds });
+
+    expect(result).toEqual({ revoked: true, ttlSeconds: 86400 });
+    expect(mockRedis.set).toHaveBeenCalledWith('jwt:revoked:jti-far-future', '1', 'EX', 86400);
+  });
+
+  it('rounds up fractional remaining seconds so a token with <1 s left still gets TTL=1', async () => {
+    // With 0.5 s remaining, ceil(0.5) = 1 — must not be treated as expired.
+    mockRedis.set.mockResolvedValue('OK');
+    const nowSeconds = 1_700_000_000;
+
+    const result = await revoke('jti-half-sec', {
+      exp: nowSeconds + 0.5,
+      nowSeconds,
+    });
+
+    expect(result).toEqual({ revoked: true, ttlSeconds: 1 });
+    expect(mockRedis.set).toHaveBeenCalledWith('jwt:revoked:jti-half-sec', '1', 'EX', 1);
+  });
+
   it('rejects empty jti', async () => {
     await expect(revoke('', 3600)).rejects.toThrow('jti must be a non-empty string');
   });
@@ -183,6 +248,18 @@ describe('revoke', () => {
       'EX',
       1,
     );
+  });
+
+  it('throws when Redis SET fails during revocation (revoke-path failure)', async () => {
+    mockRedis.set.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    await expect(revoke('jti-fail', 3600)).rejects.toThrow('ECONNREFUSED');
+  });
+
+  it('throws when Redis connection times out during revocation', async () => {
+    mockRedis.set.mockRejectedValue(new Error('ETIMEDOUT'));
+
+    await expect(revoke('jti-timeout', 3600)).rejects.toThrow('ETIMEDOUT');
   });
 });
 

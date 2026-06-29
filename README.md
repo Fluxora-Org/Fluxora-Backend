@@ -141,6 +141,13 @@ Response:
 }
 ```
 
+### Partition Management
+
+The `contract_events` table is range-partitioned by `happened_at` to prevent unbounded growth.
+Partitions are rotated and dropped automatically based on a configurable retention policy.
+- An ops script `dropOldPartitions` in `src/scripts/db-ops.ts` is available to detach and drop partitions older than a specified number of days.
+- By default, it runs in a `dryRun` mode. To actually drop data, invoke it with `dryRun = false`.
+
 ## 🧪 Testing
 
 ```bash
@@ -179,6 +186,7 @@ The test suite includes:
 | `PORT` | 3000 | HTTP server port |
 | `API_KEYS` | - | Comma-separated list of valid API keys |
 | `API_KEY_PEPPER` | - | Server-side pepper for API key hashing (**Required if API_KEYS is configured**) |
+| `WEBHOOK_DNS_TIMEOUT_MS` | 2000 | Webhook DNS lookup resolution timeout in milliseconds (fail-closed) |
 
 
 ### Batch Size Tuning

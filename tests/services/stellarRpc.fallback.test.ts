@@ -15,6 +15,7 @@ import {
 import type { RedisClient } from '../../src/redis/client.js';
 import {
   deRegisterRpcMetrics,
+  fluxora_rpc_cache_corrupt_total,
   rpcFallbackCacheEarlyRefreshesTotal,
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,
@@ -255,9 +256,54 @@ describe('StellarRpcService fallback cache', () => {
   });
 });
 
+describe('rpcFallbackCache key collisions', () => {
+  it('does not collide distinct (operation, parts[]) tuples', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+
+    // These two tuples would collide under a naive delimiter-join strategy.
+    // With the collision-resistant builder, they must map to distinct keys.
+
+    // Build a tuple-pair that would collide under a naive delimiter-join
+    // (operation/parts treated as raw, unescaped string segments).
+
+
+
+
+    const operation1 = 'getLatestLedger';
+    const parts1 = ['a', 'b'];
+
+    const operation2 = 'getLatestLedger::a';
+    const parts2 = ['b'];
+
+    // Ensure safe inputs (avoid relying on delimiter-forging characters).
+    expect(() => cache.setEntry(operation1, { v: 1 }, 60, parts1)).not.toThrow();
+    expect(() => cache.setEntry(operation2, { v: 2 }, 60, parts2)).not.toThrow();
+
+    await cache.setEntry(operation1, { v: 1 }, 60, parts1);
+    await cache.setEntry(operation2, { v: 2 }, 60, parts2);
+
+    await expect(cache.get<{ v: number }>(operation1, parts1)).resolves.toEqual({ v: 1 });
+    await expect(cache.get<{ v: number }>(operation2, parts2)).resolves.toEqual({ v: 2 });
+
+    // Cross-tuple reads must miss.
+    await expect(cache.get<{ v: number }>(operation1, parts2)).resolves.toBeNull();
+    await expect(cache.get<{ v: number }>(operation2, parts1)).resolves.toBeNull();
+  });
+
+  it('rejects unsafe key parts under SAFE_OPERATION', async () => {
+    const cache = new InMemoryRpcFallbackCache();
+
+    // ':' is not allowed by SAFE_OPERATION
+    await expect(cache.setEntry('getLatestLedger', { v: 1 }, 60, ['bad:part'])).rejects.toThrow(
+      /unsafe characters/i,
+    );
+  });
+});
+
 describe('corrupt cache entries', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    fluxora_rpc_cache_corrupt_total.reset();
   });
 
   it('returns null and deletes key and increments counter for empty string value', async () => {
@@ -278,6 +324,10 @@ describe('corrupt cache entries', () => {
     expect(result).toBeNull();
     expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
     expect(cache.corruptEntriesTotal).toBe(1);
+    
+    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    expect(metric.values[0]?.value).toBe(1);
+    expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'syntax_error' });
   });
 
   it('returns null and deletes key and increments counter for truncated JSON', async () => {
@@ -298,6 +348,34 @@ describe('corrupt cache entries', () => {
     expect(result).toBeNull();
     expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
     expect(cache.corruptEntriesTotal).toBe(1);
+
+    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    expect(metric.values[0]?.value).toBe(1);
+    expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'syntax_error' });
+  });
+
+  it('returns null and deletes key and increments counter for valid JSON with wrong shape', async () => {
+    const fakeRedis: RedisClient = {
+      get: vi.fn().mockResolvedValue('{"sequence": 123}'), // Missing envelope
+      set: vi.fn(),
+      setNx: vi.fn(),
+      del: vi.fn(),
+      exists: vi.fn(),
+      close: vi.fn(),
+      multi: vi.fn(),
+      zcount: vi.fn(),
+    };
+    const cache = new RedisRpcFallbackCache(fakeRedis);
+
+    const result = await cache.get('testOp');
+
+    expect(result).toBeNull();
+    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(cache.corruptEntriesTotal).toBe(1);
+
+    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    expect(metric.values[0]?.value).toBe(1);
+    expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'wrong_shape' });
   });
 
   it('does not swallow Redis transport errors', async () => {

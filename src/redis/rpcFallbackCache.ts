@@ -13,10 +13,21 @@
 import { createHash } from 'crypto';
 import type { RedisClient } from './client.js';
 import { logger } from '../lib/logger.js';
+import { fluxora_rpc_cache_corrupt_total } from '../metrics/rpcMetrics.js';
 
 export const RPC_FALLBACK_CACHE_PREFIX = 'rpc:cache::';
 const SAFE_OPERATION = /^[A-Za-z0-9._-]+$/;
 const RPC_FALLBACK_CACHE_ENVELOPE_VERSION = 1;
+
+/**
+ * Key format version.
+ *
+ * Security: cache keys must be collision-resistant across distinct
+ * (operation, cacheParts[]) tuples. Never rely on delimiter-joined raw
+ * inputs because two different tuples could be made to map to the same
+ * joined string.
+ */
+const RPC_FALLBACK_CACHE_KEY_VERSION = 2;
 
 export interface RpcFallbackCacheEntry<T> {
   value: T;
@@ -52,19 +63,43 @@ export function hashCachePart(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function encodeCacheKeyPart(part: string): string {
+  // Enforce an allow-list for untrusted inputs.
+  if (!SAFE_OPERATION.test(part)) {
+    throw new Error('RPC fallback cache key part contains unsafe characters');
+  }
+
+  // Hash each part so key construction cannot be influenced by delimiter
+  // sequences or by part boundaries.
+  return hashCachePart(part);
+}
+
+/**
+ * Builds a collision-resistant cache key.
+ *
+ * We keep the SAFE_OPERATION allow-list check, but we additionally hash each
+ * cache-part (and also the operation name) before concatenation.
+ *
+ * Why: delimiter-joined raw strings can be made to collide via different
+ * (operation, parts[]) tuples.
+ *
+ * Key format stays stable for SAFE operations by including explicit versions.
+ */
 function buildCacheKey(operation: string, cacheParts: readonly string[] = []): string {
   if (!SAFE_OPERATION.test(operation)) {
     throw new Error('RPC fallback cache operation contains unsafe characters');
   }
 
-  for (const part of cacheParts) {
-    if (!SAFE_OPERATION.test(part)) {
-      throw new Error('RPC fallback cache key part contains unsafe characters');
-    }
-  }
+  const encodedOperation = encodeCacheKeyPart(operation);
+  const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
-  return `${RPC_FALLBACK_CACHE_PREFIX}${[operation, ...cacheParts].join('::')}`;
+  // Key format versioning:
+  // - Prevent collisions between different tuple shapes by hashing each part.
+  // - Include key-version to allow future format upgrades.
+  return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
 }
+
+
 
 function isCacheEnvelope<T>(value: unknown): value is RpcFallbackCacheEnvelope<T> {
   return typeof value === 'object'
@@ -96,13 +131,24 @@ function createCacheEnvelope<T>(
 function parseCachedValue<T>(raw: string, key: string): T | null {
   try {
     const parsed = JSON.parse(raw) as unknown;
-    return isCacheEnvelope<T>(parsed) ? parsed.value : parsed as T;
+    if (!isCacheEnvelope<T>(parsed)) {
+      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'wrong_shape' });
+      logger.warn('Corrupt entry in RPC fallback cache', undefined, {
+        event: 'rpc_fallback_cache_corrupt_entry',
+        key,
+        reason: 'wrong_shape',
+      });
+      return null;
+    }
+    return parsed.value;
   } catch (err) {
     if (err instanceof SyntaxError) {
+      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'syntax_error' });
       logger.warn('Corrupt entry in RPC fallback cache', undefined, {
         event: 'rpc_fallback_cache_corrupt_entry',
         key,
         error: err.message,
+        reason: 'syntax_error',
       });
       return null;
     }
@@ -110,18 +156,38 @@ function parseCachedValue<T>(raw: string, key: string): T | null {
   }
 }
 
-function parseCacheEntry<T>(raw: string): RpcFallbackCacheEntry<T> | null {
-  const parsed = JSON.parse(raw) as unknown;
-  if (!isCacheEnvelope<T>(parsed)) {
-    return null;
+function parseCacheEntry<T>(raw: string, key: string): RpcFallbackCacheEntry<T> | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isCacheEnvelope<T>(parsed)) {
+      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'wrong_shape' });
+      logger.warn('Corrupt entry in RPC fallback cache metadata', undefined, {
+        event: 'rpc_fallback_cache_corrupt_entry',
+        key,
+        reason: 'wrong_shape',
+      });
+      return null;
+    }
+    return {
+      value: parsed.value,
+      writtenAt: parsed.writtenAt,
+      expiresAt: parsed.expiresAt,
+      ttlSeconds: parsed.ttlSeconds,
+      refreshDurationMs: parsed.refreshDurationMs,
+    };
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'syntax_error' });
+      logger.warn('Corrupt entry in RPC fallback cache metadata', undefined, {
+        event: 'rpc_fallback_cache_corrupt_entry',
+        key,
+        error: err.message,
+        reason: 'syntax_error',
+      });
+      return null;
+    }
+    throw err;
   }
-  return {
-    value: parsed.value,
-    writtenAt: parsed.writtenAt,
-    expiresAt: parsed.expiresAt,
-    ttlSeconds: parsed.ttlSeconds,
-    refreshDurationMs: parsed.refreshDurationMs,
-  };
 }
 
 export class RedisRpcFallbackCache implements RpcFallbackCache {
@@ -173,7 +239,17 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
     try {
       const raw = await this.client.get(key);
       if (raw === null) return null;
-      return parseCacheEntry<T>(raw);
+      const parsed = parseCacheEntry<T>(raw, key);
+      if (parsed === null) {
+        this._corruptEntriesTotal++;
+        await this.client.del(key);
+        logger.warn('Removed corrupt entry from RPC fallback cache', undefined, {
+          event: 'rpc_fallback_cache_corrupt_entry_removed',
+          key,
+        });
+        return null;
+      }
+      return parsed;
     } catch (err) {
       logger.warn('Stellar RPC fallback cache metadata read failed', undefined, {
         event: 'rpc_fallback_cache_metadata_read_failed',

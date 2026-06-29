@@ -89,6 +89,8 @@ import { getClientIp } from '../ws/connectionLimiter.js';
 import {
   eventMatchesStreamId,
   SSE_STREAM_UPDATE_EVENT,
+  SSE_CLOSE_EVENT,
+  SSE_CLOSE_REASONS,
   subscribeToSseStream,
   registerSseShutdownCallback,
 } from '../streams/sseEmitter.js';
@@ -228,6 +230,31 @@ function setStreamResourceHeaders(
 ): void {
   res.set('ETag', streamEntityTag(metadata));
   res.set('Last-Modified', new Date(metadata.updated_at).toUTCString());
+}
+
+/**
+ * RFC 7232 §3.2 weak comparison for If-None-Match.
+ *
+ * The `*` wildcard matches any current representation.
+ * Otherwise the field value is a comma-separated list of entity-tags and the
+ * recipient uses the weak comparison function (strip `W/` prefix before
+ * character-for-character comparison of the opaque-tag, including DQUOTES).
+ *
+ * @param ifNoneMatch - raw value of the If-None-Match request header
+ * @param etag - the server-computed ETag for the current representation
+ * @returns `true` when any entry in the list matches
+ */
+function matchesIfNoneMatch(ifNoneMatch: string, etag: string): boolean {
+  const trimmed = ifNoneMatch.trim();
+  if (trimmed === '*') return true;
+
+  const normalize = (tag: string): string => tag.replace(/^W\//i, '');
+  const normalizedEtag = normalize(etag);
+
+  return trimmed
+    .split(',')
+    .map((t) => normalize(t.trim()))
+    .some((t) => t === normalizedEtag);
 }
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
@@ -545,6 +572,22 @@ streamsRouter.get(
     }
 
     if (!record) throw notFound('Stream', id);
+
+    // Conditional GET (RFC 7232 §3.2)
+    const etag = streamEntityTag(record!);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record!.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
     const stream = toApiStream(record!);
     setStreamResourceHeaders(res, record!);
     res.set(
@@ -997,9 +1040,13 @@ streamsRouter.get(
     heartbeatInterval.unref?.();
 
     // Bound long-lived SSE streams. Browser EventSource clients reconnect automatically.
+    // Emits a typed `event: close` frame before ending the response so clients
+    // can distinguish a deliberate server-side rotation (max_duration) from a
+    // network drop and reconnect promptly rather than applying error back-off.
+    // @security payload contains only the reason string — no stream data or PII.
     maxDurationTimer = setTimeout(() => {
       if (cleanedUp) return;
-      writeSse(`event: close\ndata: ${JSON.stringify({ reason: 'max_duration' })}\n\n`);
+      writeSse(`event: ${SSE_CLOSE_EVENT}\ndata: ${JSON.stringify({ reason: SSE_CLOSE_REASONS.MAX_DURATION })}\n\n`);
       if (!res.writableEnded && !res.destroyed) {
         res.end();
       }
@@ -1103,17 +1150,30 @@ streamsRouter.get(
 
     // Register a shutdown drain callback so drainSseEventBus() can close this
     // response cleanly with a retry:0 directive instead of an abrupt socket close.
-    const deregisterShutdown = registerSseShutdownCallback(() => {
-      try {
-        if (!res.writableEnded && !res.destroyed) {
-          res.write('retry: 0\n\n');
-          res.end();
+    // A forceClose callback is also registered so that when the per-connection
+    // drain timeout is exceeded the underlying socket is destroyed immediately.
+    const deregisterShutdown = registerSseShutdownCallback(
+      async () => {
+        try {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write('retry: 0\n\n');
+            res.end();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
         }
-      } catch {
-        // Best-effort — the socket may already be gone.
-      }
-      cleanup('shutdown_drain');
-    });
+        cleanup('shutdown_drain');
+      },
+      () => {
+        try {
+          if (!res.destroyed) {
+            res.destroy();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
+        }
+      },
+    );
     const origUnsubscribe = unsubscribeLiveUpdates;
     unsubscribeLiveUpdates = () => {
       origUnsubscribe();

@@ -20,6 +20,39 @@
 import { getPool, query } from '../pool.js';
 import type { DlqEntry } from '../../routes/dlq.js';
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Safely serialize a payload to JSON, handling non-serializable values
+ * like circular references and BigInt.
+ *
+ * If serialization fails, returns a safe fallback representation that
+ * records the error and a type hint without exposing sensitive data.
+ *
+ * @param payload — The payload object to serialize
+ * @returns A JSON string, or a safe fallback on serialization error
+ *
+ * @security
+ * Fallback representation avoids including the original payload to prevent
+ * accidentally leaking secrets in error states.
+ */
+function safeSerializePayload(payload: unknown): string {
+  try {
+    return JSON.stringify(payload);
+  } catch (error) {
+    // Serialization failed (e.g., circular reference, BigInt, or Symbol)
+    // Record a safe fallback that documents the failure without leaking data.
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    const fallback = {
+      _serialization_error: true,
+      reason: errorMsg,
+      type: typeof payload,
+      timestamp: new Date().toISOString(),
+    };
+    return JSON.stringify(fallback);
+  }
+}
+
 // ── Configurable threshold ────────────────────────────────────────────────────
 
 /**
@@ -88,7 +121,7 @@ export const dlqRepository = {
       [
         entry.id,
         entry.topic,
-        JSON.stringify(entry.payload),
+        safeSerializePayload(entry.payload),
         entry.error,
         entry.attempts,
         entry.correlationId ?? null,
@@ -203,10 +236,13 @@ export const dlqRepository = {
    * Record a failed replay attempt for a topic.
    *
    * Upserts the dlq_consumer_suspension row, incrementing consecutive_failures.
+   * Defensive: Clamps consecutive_failures to a minimum of 0 (using GREATEST) before
+   * incrementing, guarding against negative counts.
    * If the new count meets or exceeds the threshold, sets suspended = TRUE and
    * records suspended_at.
    *
-   * Returns the updated suspension state.
+   * @param topic - The DLQ topic/consumer identifier.
+   * @returns The updated suspension state.
    */
   async recordReplayFailure(topic: string): Promise<ConsumerSuspension> {
     const pool = getPool();
@@ -217,11 +253,11 @@ export const dlqRepository = {
       `INSERT INTO dlq_consumer_suspension (topic, consecutive_failures, suspended, suspended_at, updated_at)
          VALUES ($1, 1, (1 >= $2), CASE WHEN 1 >= $2 THEN now() ELSE NULL END, now())
        ON CONFLICT (topic) DO UPDATE
-         SET consecutive_failures = dlq_consumer_suspension.consecutive_failures + 1,
-             suspended = (dlq_consumer_suspension.consecutive_failures + 1 >= $2),
+         SET consecutive_failures = GREATEST(0, dlq_consumer_suspension.consecutive_failures) + 1,
+             suspended = (GREATEST(0, dlq_consumer_suspension.consecutive_failures) + 1 >= $2),
              suspended_at = CASE
                WHEN dlq_consumer_suspension.suspended = FALSE
-                AND (dlq_consumer_suspension.consecutive_failures + 1 >= $2)
+                AND (GREATEST(0, dlq_consumer_suspension.consecutive_failures) + 1 >= $2)
                THEN now()
                ELSE dlq_consumer_suspension.suspended_at
              END,
@@ -235,7 +271,10 @@ export const dlqRepository = {
 
   /**
    * Record a successful replay for a topic — resets consecutive_failures to 0.
+   * Defensive: Explicitly sets consecutive_failures to 0 (non-negative).
    * A no-op if no suspension row exists.
+   *
+   * @param topic - The DLQ topic/consumer identifier.
    */
   async recordReplaySuccess(topic: string): Promise<void> {
     const pool = getPool();
@@ -251,8 +290,11 @@ export const dlqRepository = {
   },
 
   /**
-   * Re-enable a suspended consumer, clearing the suspension flag.
-   * Returns the updated row, or null if the topic has no suspension record.
+   * Re-enable a suspended consumer, clearing the suspension flag and resetting
+   * consecutive_failures to 0 (non-negative).
+   *
+   * @param topic - The DLQ topic/consumer identifier.
+   * @returns The updated row, or null if the topic has no suspension record.
    */
   async resumeConsumer(topic: string): Promise<ConsumerSuspension | null> {
     const pool = getPool();
