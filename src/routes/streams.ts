@@ -232,6 +232,31 @@ function setStreamResourceHeaders(
   res.set('Last-Modified', new Date(metadata.updated_at).toUTCString());
 }
 
+/**
+ * RFC 7232 §3.2 weak comparison for If-None-Match.
+ *
+ * The `*` wildcard matches any current representation.
+ * Otherwise the field value is a comma-separated list of entity-tags and the
+ * recipient uses the weak comparison function (strip `W/` prefix before
+ * character-for-character comparison of the opaque-tag, including DQUOTES).
+ *
+ * @param ifNoneMatch - raw value of the If-None-Match request header
+ * @param etag - the server-computed ETag for the current representation
+ * @returns `true` when any entry in the list matches
+ */
+function matchesIfNoneMatch(ifNoneMatch: string, etag: string): boolean {
+  const trimmed = ifNoneMatch.trim();
+  if (trimmed === '*') return true;
+
+  const normalize = (tag: string): string => tag.replace(/^W\//i, '');
+  const normalizedEtag = normalize(etag);
+
+  return trimmed
+    .split(',')
+    .map((t) => normalize(t.trim()))
+    .some((t) => t === normalizedEtag);
+}
+
 // ── Cursor helpers ────────────────────────────────────────────────────────────
 
 function encodeCursor(lastId: string): string {
@@ -547,6 +572,22 @@ streamsRouter.get(
     }
 
     if (!record) throw notFound('Stream', id);
+
+    // Conditional GET (RFC 7232 §3.2)
+    const etag = streamEntityTag(record!);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record!.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
     const stream = toApiStream(record!);
     setStreamResourceHeaders(res, record!);
     res.set(

@@ -248,6 +248,97 @@ describe('streams routes', () => {
       mockGetById.mockRejectedValue(new PoolExhaustedError());
       expect((await request(app).get('/api/streams/stream-x')).status).toBe(503);
     });
+
+    // ── Conditional GET (RFC 7232) ───────────────────────────────────────
+
+    it('returns 304 when If-None-Match matches the ETag', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+      expect(res.headers['etag']).toBe(etag);
+    });
+
+    it('returns 304 for If-None-Match: *', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', '*');
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+    });
+
+    it('returns 304 when If-None-Match is a comma-separated list containing the ETag', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', `W/"other", ${etag}, W/"another"`);
+      expect(res.status).toBe(304);
+    });
+
+    it('returns 200 when If-None-Match does not match', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', 'W/"some-other-tag"');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.stream.id).toBe('stream-abc-0');
+    });
+
+    it('returns 200 when If-None-Match is absent', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app).get('/api/streams/stream-abc-0');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it('sets ETag and Last-Modified headers on 304', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({
+        id: 'stream-abc-0', updated_at: '2024-01-01T00:00:00.000Z',
+      }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.headers['etag']).toBeDefined();
+      expect(res.headers['last-modified']).toBeDefined();
+    });
+
+    it('304 has no body', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+    });
+
+    it('does not break the success envelope shape for 200', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', 'W/"non-matching"');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.stream).toBeDefined();
+      expect(res.body.meta.timestamp).toBeDefined();
+    });
   });
 
 
