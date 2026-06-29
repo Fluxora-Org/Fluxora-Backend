@@ -270,3 +270,19 @@ export function createBanStore(
   const memoryStore = new InMemoryBanStore();
   return new HybridBanStore(redisStore, memoryStore, onError);
 }
+
+let _globalBanStore: HybridBanStore | null = null;
+
+export function setGlobalHybridBanStore(store: HybridBanStore): void {
+  _globalBanStore = store;
+}
+
+export function getHybridBanStoreStatus(): { usingFallback: boolean; available: boolean } {
+  if (!_globalBanStore) {
+    return { usingFallback: false, available: false };
+  }
+  return {
+    usingFallback: _globalBanStore.usingFallback,
+    available: true,
+  };
+}

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
+import { getHybridBanStoreStatus } from '../redis/banStore.js';
 import {
   getPauseFlags,
   setPauseFlags,
@@ -358,5 +359,20 @@ adminRouter.delete('/api-keys/:id', async (req, res) => {
     const status = msg.includes('not found') ? 404 : 400;
     const code = status === 404 ? 'NOT_FOUND' : 'API_KEY_ERROR';
     res.status(status).json(errorResponse(code, msg, undefined, requestId));
+  }
+});
+
+/**
+ * GET /api/admin/ban-store/status
+ * Returns the health and fallback state of the HybridBanStore.
+ */
+adminRouter.get('/ban-store/status', (_req, res) => {
+  try {
+    const status = typeof getHybridBanStoreStatus === 'function'
+      ? getHybridBanStoreStatus()
+      : { available: false, reason: 'getHybridBanStoreStatus not implemented' };
+    res.json({ ok: true, banStore: status });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
 });
