@@ -1212,6 +1212,43 @@ registry.registerPath({
   },
 });
 
+// ── Deprecations ─────────────────────────────────────────────────────────────
+
+const DeprecatedRouteEntry = registry.register(
+  'DeprecatedRouteEntry',
+  z.object({
+    route: z.string().openapi({ example: '/api/rate-limits/config', description: 'Deprecated route path' }),
+    sunsetDate: z.string().openapi({ example: '2026-09-30T00:00:00.000Z', description: 'ISO-8601 planned removal date' }),
+    link: z.string().optional().openapi({ example: '/docs/api/deprecation-policy.md#current-deprecations', description: 'Migration or policy documentation URL' }),
+    daysUntilSunset: z.number().int().openapi({ example: 93, description: 'Days until sunset; negative if already past sunset date' }),
+  }).openapi({ description: 'A deprecated route entry with sunset metadata' })
+);
+
+registry.registerPath({
+  method: 'get',
+  path: '/api/admin/deprecations',
+  summary: 'List deprecated routes',
+  description: 'Returns all registered deprecated routes with their sunset dates and computed daysUntilSunset. Past-sunset entries have negative daysUntilSunset.',
+  tags: ['admin'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    '200': {
+      description: 'Deprecations list',
+      content: {
+        'application/json': {
+          schema: z.object({
+            success: z.literal(true),
+            data: z.array(DeprecatedRouteEntry),
+            meta: z.object({ timestamp: z.string() }),
+          }),
+        },
+      },
+    },
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+  },
+});
+
 // ── DLQ ───────────────────────────────────────────────────────────────────────
 
 registry.registerPath({
