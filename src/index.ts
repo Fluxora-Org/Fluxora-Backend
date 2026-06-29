@@ -3,6 +3,7 @@ import { config } from './config/index.js';
 import { indexerRouter } from './routes/indexer';
 import { gracefulShutdown } from './shutdown.js';
 import { indexerService } from './indexer/service.js';
+import { checkAdminStatePersistence } from './state/adminState.js';
 
 const app = express();
 
@@ -29,6 +30,14 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 let server: any;
 
 if (process.env.NODE_ENV !== 'test') {
+  /**
+   * Startup initialization sequence:
+   * 1. Validate admin state file writability (graceful degradation on failure).
+   * 2. Start the HTTP server and begin accepting requests.
+   * 3. Resume any incomplete indexer replays from the database checkpoint.
+   */
+  void checkAdminStatePersistence();
+
   // Start server
   server = app.listen(config.server.port, () => {
     console.log(`Indexer service listening on port ${config.server.port}`);
