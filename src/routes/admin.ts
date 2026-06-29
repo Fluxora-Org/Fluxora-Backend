@@ -12,6 +12,7 @@ import { recordAuditEvent, recordAuditEventToDb } from '../lib/auditLog.js';
 import { getStreamHub } from '../ws/hub.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { clearIndexerStall, ActiveStallError } from '../indexer/stall.js';
+import { routeDeprecations } from '../config/deprecations.js';
 
 export const adminRouter = Router();
 
@@ -27,6 +28,29 @@ adminRouter.get('/status/read-only', (_req, res) => {
 
 // Every admin route requires a valid Bearer token.
 adminRouter.use(requireAdminAuth);
+
+/**
+ * GET /api/admin/deprecations
+ * Returns all registered deprecated routes with their sunset dates and
+ * computed daysUntilSunset, enabling SRE tooling to alert before removal.
+ *
+ * @security Requires valid Bearer admin token.
+ * @returns Array of deprecated route entries, each with `route`, `sunsetDate`,
+ *          optional `link`, and computed `daysUntilSunset` (negative if past sunset).
+ */
+adminRouter.get('/deprecations', (req, res) => {
+  const requestId = req.id ?? req.correlationId;
+  const now = Date.now();
+  const MS_PER_DAY = 86_400_000;
+
+  const deprecations = routeDeprecations.map(({ route, sunsetDate, link }) => {
+    const sunsetMs = new Date(sunsetDate).getTime();
+    const daysUntilSunset = Math.floor((sunsetMs - now) / MS_PER_DAY);
+    return { route, sunsetDate, ...(link !== undefined ? { link } : {}), daysUntilSunset };
+  });
+
+  res.json(successResponse(deprecations, requestId));
+});
 
 /**
  * GET /api/admin/status
