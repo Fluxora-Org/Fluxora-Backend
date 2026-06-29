@@ -337,7 +337,7 @@ adminRouter.post('/api-keys', async (req, res) => {
     return;
   }
   try {
-    const created = await createApiKey(name, req.correlationId);
+    const created = await createApiKey(name, undefined, req.correlationId);
     res.status(201).json(successResponse(created, requestId));
   } catch (err) {
     res.status(400).json(
