@@ -2,8 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { StellarAddressValidator } from '../src/validation/stellarAddressValidator.js';
 import type { StellarRpcService } from '../src/services/stellar-rpc.js';
 
-const VALID_ADDRESS_1 = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
-const VALID_ADDRESS_2 = 'GBVVJJHAN5M34MSDMTSMLQZQOJON4CSYFWNIRLDXEAEDTIFWALKFYBVK';
+const VALID_ADDRESS_1 = 'GAAREIZUIVLGO6EJTKV3ZTO654ABCIRTIRKWM54ITGVLXTG5537RAI5F';
+const VALID_ADDRESS_2 = 'GBNWY7MOT6YMDUXD6QCRMJZYJFNGW7ENT2X4BUPC6MCBKJRXJBMWUCQH';
 const INVALID_ADDRESS = 'GBADADDR000000000000000000000000000000000000000000000000';
 
 function makeMockRpc(allowlist: Set<string>): StellarRpcService {
@@ -43,7 +43,10 @@ describe('StellarAddressValidator allowlist validation', () => {
 
   it('returns invalid with both missing addresses listed when neither exists', async () => {
     const validator = new StellarAddressValidator(rpc, mockRedis, 300);
-    const result = await validator.validate(INVALID_ADDRESS, 'GCOTHER00000000000000000000000000000000000000000000000000');
+    const result = await validator.validate(
+      INVALID_ADDRESS,
+      'GCOTHER00000000000000000000000000000000000000000000000000'
+    );
     expect(result.valid).toBe(false);
     expect(result.missingAddresses).toHaveLength(2);
   });
