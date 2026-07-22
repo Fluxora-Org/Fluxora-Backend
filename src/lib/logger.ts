@@ -10,6 +10,7 @@
  */
 
 import { sanitize, redactKeysInString } from '../pii/sanitizer.js';
+import { getCorrelationId } from '../tracing/middleware.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -26,6 +27,8 @@ function write(level: LogLevel, message: string, correlationId?: string, meta?: 
   const sanitizedMessage = redactKeysInString(message);
   const sanitizedMeta = meta ? sanitize(meta) : undefined;
   
+  const currentCorrelationId = correlationId ?? getCorrelationId();
+
   // meta is spread first so core fields (timestamp, level, message, correlationId)
   // always take precedence and cannot be overwritten by callers.
   const record: LogRecord = {
@@ -33,7 +36,7 @@ function write(level: LogLevel, message: string, correlationId?: string, meta?: 
     timestamp: new Date().toISOString(),
     level,
     message: sanitizedMessage,
-    ...(correlationId !== undefined ? { correlationId } : {}),
+    ...(currentCorrelationId && currentCorrelationId !== 'unknown' ? { correlationId: currentCorrelationId } : {}),
   };
   const line = JSON.stringify(record) + '\n';
   if (level === 'error') {
@@ -118,6 +121,13 @@ export const logger = {
     table_hint: string;
     correlation_id?: string;
   }): void {
+    const currentCorrelationId = fields.correlation_id ?? getCorrelationId();
+    const outFields = { ...fields };
+    if (currentCorrelationId && currentCorrelationId !== 'unknown') {
+      outFields.correlation_id = currentCorrelationId;
+    } else {
+      delete outFields.correlation_id;
+    }
     const record = {
       log_type: 'slow_query',
       class_uid: 5001,       // OCSF Database Activity
@@ -125,7 +135,7 @@ export const logger = {
       severity_id: 3,        // Medium
       severity: 'Medium',
       time: new Date().toISOString(),
-      ...fields,
+      ...outFields,
     };
     process.stdout.write(JSON.stringify(record) + '\n');
   },

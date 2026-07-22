@@ -567,6 +567,12 @@ This means DB queries, RPC calls, and webhook dispatches triggered by the same
 HTTP request all share the same `correlationId` in their spans — even across
 `await` boundaries, `setTimeout`, and `Promise.all`.
 
+Furthermore, `src/lib/logger.ts` automatically retrieves the `correlationId` 
+from the `AsyncLocalStorage` context if one is not explicitly provided. This 
+ensures that all log lines—including DB query logs and indexer-triggered 
+background work—will implicitly carry the `correlationId` if they occur 
+within the async context of the triggering request.
+
 When called outside a request context (e.g., background jobs), `getCorrelationId()`
 returns `'unknown'`.
 
