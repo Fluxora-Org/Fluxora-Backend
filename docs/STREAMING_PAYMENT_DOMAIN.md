@@ -90,7 +90,10 @@ interface StreamCancelledEvent {
 
 ## Idempotency
 
-Every event is keyed by `(transaction_hash, event_index)`. The `streams` table has a `UNIQUE` constraint on this pair, so re-processing the same event is a no-op. This makes the ingestion pipeline safe to replay.
+Every event is keyed by `(transaction_hash, event_index)`. 
+
+1. **Fan-out Dedup:** A short-lived in-memory cache drops duplicate events before they trigger downstream side-effects (e.g., SSE, webhooks). This guarantees that even if the indexer pushes the same event multiple times (e.g., during rapid replay or redundant delivery), downstream consumers do not see duplicate events.
+2. **Database Dedup:** The `streams` table has a `UNIQUE` constraint on this pair `(transaction_hash, event_index)`. Upserting the same `StreamCreated` event twice is safe and acts as a no-op at the storage layer.
 
 ## Querying
 

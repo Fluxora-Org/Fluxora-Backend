@@ -89,6 +89,38 @@ export interface EventIngestionResult {
  * - Duplicate events are safely ignored
  * - Out-of-order events are handled via upsert logic
  */
+
+const DEDUP_CACHE_SIZE = 10000;
+const processedEvents = new Set<string>();
+const processedEventsQueue: string[] = [];
+
+/**
+ * Checks if an event has been recently processed to prevent duplicate fan-out.
+ * Uses a short-lived in-memory LRU-like cache.
+ */
+function isDuplicateEvent(eventId: string): boolean {
+  if (processedEvents.has(eventId)) {
+    return true;
+  }
+  processedEvents.add(eventId);
+  processedEventsQueue.push(eventId);
+  if (processedEventsQueue.length > DEDUP_CACHE_SIZE) {
+    const oldest = processedEventsQueue.shift();
+    if (oldest) {
+      processedEvents.delete(oldest);
+    }
+  }
+  return false;
+}
+
+/**
+ * Exported for testing purposes only.
+ */
+export const _resetDedupCache = (): void => {
+  processedEvents.clear();
+  processedEventsQueue.length = 0;
+};
+
 export const streamEventService = {
   /**
    * Process a stream created event
@@ -114,6 +146,15 @@ export const streamEventService = {
         event.transactionHash,
         event.eventIndex,
       );
+
+      if (isDuplicateEvent(eventId)) {
+        debug("Event already processed (in-memory dedup)", {
+          eventId,
+          streamId,
+          correlationId,
+        });
+        return { eventId, streamId, action: "ignored", success: true };
+      }
 
       enrichActiveSpanWithStream(streamId, event.sender, event.recipient);
 
@@ -207,6 +248,15 @@ export const streamEventService = {
       streamId: event.streamId,
       correlationId,
     });
+
+    if (isDuplicateEvent(eventId)) {
+      debug("Event already processed (in-memory dedup)", {
+        eventId,
+        streamId: event.streamId,
+        correlationId,
+      });
+      return { eventId, streamId: event.streamId, action: "ignored", success: true };
+    }
 
     try {
       enrichActiveSpanWithStream(event.streamId);
@@ -323,6 +373,15 @@ export const streamEventService = {
       streamId: event.streamId,
       correlationId,
     });
+
+    if (isDuplicateEvent(eventId)) {
+      debug("Event already processed (in-memory dedup)", {
+        eventId,
+        streamId: event.streamId,
+        correlationId,
+      });
+      return { eventId, streamId: event.streamId, action: "ignored", success: true };
+    }
 
     try {
       // Enrich span with stream ID first (streamId is always available)
