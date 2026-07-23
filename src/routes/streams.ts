@@ -104,6 +104,7 @@ import {
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
+import { toStreamJsonLd } from '../serialization/jsonld.js';
 export const streamsRouter = Router();
 
 /**
@@ -630,6 +631,44 @@ streamsRouter.get(
         : NO_STORE_STREAM_HEADERS,
     );
     res.json(successResponse({ stream }, requestId));
+  }),
+);
+
+/**
+ * GET /api/streams/:id/export.jsonld
+ * Export a single stream as JSON-LD for data portability.
+ */
+streamsRouter.get(
+  '/:id/export.jsonld',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+    debug('Exporting stream as JSON-LD', { id });
+
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) throw notFound('Stream', id);
+
+    const jsonld = toStreamJsonLd(record!);
+    setStreamResourceHeaders(res, record!);
+    res.set(
+      'Cache-Control',
+      isTerminalStatus(record!.status as ApiStreamStatus)
+        ? CACHEABLE_STREAM_HEADERS
+        : NO_STORE_STREAM_HEADERS,
+    );
+    res.type('application/ld+json');
+    res.send(JSON.stringify(jsonld));
   }),
 );
 
