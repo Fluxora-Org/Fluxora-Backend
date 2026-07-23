@@ -23,7 +23,7 @@
  * and bounded-cardinality guarantee.
  */
 
-import { Gauge } from 'prom-client';
+import { Gauge, Histogram } from 'prom-client';
 import { registry } from '../metrics.js';
 import type { StreamHub } from '../ws/hub.js';
 
@@ -126,6 +126,56 @@ export function collectWsBackpressureMetrics(
 }
 
 /**
+ * Millisecond-scale bucket layout for micro-batch broadcast flush latency histogram.
+ * Specifically chosen to resolve expected millisecond-scale flush windows (0.1ms to 5s).
+ */
+export const WS_BROADCAST_BATCH_FLUSH_BUCKETS = [
+  0.0001, // 0.1ms
+  0.0005, // 0.5ms
+  0.001,  // 1ms
+  0.0025, // 2.5ms
+  0.005,  // 5ms
+  0.01,   // 10ms
+  0.025,  // 25ms
+  0.05,   // 50ms
+  0.1,    // 100ms
+  0.25,   // 250ms
+  0.5,    // 500ms
+  1.0,    // 1s
+  2.5,    // 2.5s
+  5.0,    // 5s
+];
+
+/**
+ * Histogram recording the age in seconds of the oldest event included in a
+ * micro-batched WebSocket broadcast flush.
+ *
+ * Operators use this histogram to observe actual queuing delay and tune the
+ * flush-window default safely.
+ *
+ * Cardinality guarantee: O(1) fixed time-series with zero labels.
+ * `@security` Contains no PII, user identifiers, payload data, or stream IDs.
+ */
+export const wsBroadcastBatchFlushSeconds =
+  (registry.getSingleMetric('fluxora_ws_broadcast_batch_flush_seconds') as Histogram) ||
+  new Histogram({
+    name: 'fluxora_ws_broadcast_batch_flush_seconds',
+    help: 'Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush.',
+    buckets: WS_BROADCAST_BATCH_FLUSH_BUCKETS,
+    registers: [registry],
+  });
+
+/**
+ * Record a batch flush latency observation (in seconds).
+ * Called by StreamHub when a micro-batch is flushed.
+ */
+export function recordWsBroadcastBatchFlushLatency(ageSeconds: number): void {
+  if (typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) && ageSeconds >= 0) {
+    wsBroadcastBatchFlushSeconds.observe(ageSeconds);
+  }
+}
+
+/**
  * Remove the per-client gauge time series for a disconnected client.
  *
  * Must be called from `StreamHub.onDisconnect` for every client so the
@@ -142,12 +192,13 @@ export function removeWsClientBackpressureGauge(connectionId: string): void {
 }
 
 /**
- * Reset all WS backpressure gauges to 0/empty. Useful between test runs.
+ * Reset all WS backpressure metrics to 0/empty. Useful between test runs.
  */
 export function resetWsBackpressureMetrics(): void {
   wsClientBufferedBytes.reset();
   wsMaxBufferedBytes.set(0);
   wsSlowClients.set(0);
+  wsBroadcastBatchFlushSeconds.reset();
 }
 
 /**
