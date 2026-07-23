@@ -60,6 +60,28 @@ histogram_quantile(0.99, rate(fluxora_db_query_duration_seconds_bucket[5m]))
 
 Every PostgreSQL query is timed. When duration ≥ `SLOW_QUERY_THRESHOLD_MS`, a structured OCSF log entry is emitted and a Prometheus counter is incremented.
 
+## Server-Timing response header
+
+Fluxora can return a W3C-compatible `Server-Timing` response header for the streams API so browser developer tools and ad-hoc debugging can see a compact latency breakdown without enabling the OpenTelemetry backend.
+
+### How it works
+
+- Middleware creates a request-scoped registry attached to `res.locals` when `SERVER_TIMING_ENABLED=true`.
+- Route handlers record named phases for `db`, `stellar_rpc`, and `serialize` by pushing sanitized values into the registry.
+- The final header is emitted once per response and contains only phase names and durations.
+
+### Security guarantees
+
+- The header contains no hostnames, query strings, URLs, or PII.
+- Phase names are restricted to a safe token format and durations are rounded to milliseconds.
+- The feature is disabled by default and adds negligible overhead when `SERVER_TIMING_ENABLED` is unset or false.
+
+### Example
+
+```http
+Server-Timing: db;dur=12.5, serialize;dur=3.75
+```
+
 ### Prometheus Counter
 
 ```

@@ -37,6 +37,7 @@ import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
+import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
@@ -279,6 +280,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(serverTimingMiddleware());
   app.use(httpMetrics);
   app.use(createDeprecationMiddleware(routeDeprecations));
   app.use(rateLimiter);
