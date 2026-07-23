@@ -315,12 +315,37 @@ The test suite covers:
 - ✅ Empty replay sets
 - ✅ Batch processing with various sizes
 - ✅ Batch boundary alignment
-- ✅ Duplicate event handling
+- ✅ Duplicate event handling and `HybridDedupCache` downtime fallback
+- ✅ Property-based test suite verifying duplicate suppression invariants during Redis downtime
 - ✅ Concurrent replay prevention
 - ✅ Transaction rollback on errors
 - ✅ Progress tracking and estimation
 - ✅ Block range filtering
 - ✅ SQL injection prevention
+
+## Duplicate Event Suppression & Resiliency
+
+`streamEventService` ingests Soroban RPC streaming events and enforces strict duplicate suppression using an injectable `DedupCache` interface (defaulting to `InMemoryDedupCache` or `HybridDedupCache`).
+
+### Hybrid Cache & Redis Downtime Fallback
+
+When backed by `HybridDedupCache`:
+1. **Primary Cache**: Interacts with Redis (`RedisDedupCache`) to track event keys (`fluxora:dedup:<streamId>:<eventId>`) across server restarts.
+2. **Fallback Cache**: In-memory cache (`InMemoryDedupCache`) that tracks event arrivals locally.
+3. **Graceful Degradation**: If Redis experiences connection failures or outages mid-sequence, `HybridDedupCache` automatically catches Redis exceptions, logs a throttled fallback event, increments Prometheus metric `dedup_redis_fallback_total`, and seamlessly degrades to the in-memory cache.
+
+### Core Invariants
+
+The deduplication layer guarantees the following invariant regardless of event arrival order, duplicate burst frequency, or intermittent Redis downtime:
+
+> **"Each distinct `(transactionHash, eventIndex)` pair triggers at most one database write operation and at most one WebSocket broadcast."**
+
+### Property-Based Testing
+
+Deduplication behavior is verified using property-based testing powered by `fast-check`:
+- **Randomized Event Replay Sequences**: Generates sequences of `StreamCreated`, `StreamUpdated`, and `StreamCancelled` events interleaved with duplicate bursts.
+- **Intermittent Redis Outages**: Simulates random Redis connection failures mid-sequence during event ingestion.
+- **Deterministic Execution**: CI runs are configured deterministically using fixed seeds (`seed: 42`, bounded `numRuns: 100`) to prevent flakiness.
 
 ## Deployment
 
