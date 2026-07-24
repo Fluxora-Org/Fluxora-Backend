@@ -14,6 +14,7 @@ import { privacyHeaders } from './middleware/pii.js';
 import type { Config } from './config/env.js';
 import { loadConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
+import { createGrpcHealthServer, startGrpcHealthServer, stopGrpcHealthServer } from './health/grpcHealth.js';
 import { createRedisClient } from './redis/client.js';
 import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
 import {
@@ -36,11 +37,14 @@ import {
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
+import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
+import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
 import { requestStopReplay } from './indexer/service.js';
+import { initializeIndexerLeaderElection, getIndexerLeaderElection } from './indexer/leaderElection.js';
 import { quitAllRedisClients } from './redis/client.js';
 import { initializeAdminStateLock } from './state/adminState.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
@@ -225,6 +229,53 @@ async function wireAdminStateLock(config: Config): Promise<void> {
   }
 }
 
+/**
+ * Wire Redis-backed distributed leader election for indexer replay.
+ *
+ * When `REDIS_ENABLED=true` (the default): wires a Redis-backed lease so only
+ * one replica runs indexer replay at a time in a multi-instance deployment.
+ * Falls back to the always-leader `NoOpLeaderElection` (today's single-process
+ * behaviour) when Redis is disabled or unreachable.
+ *
+ * This function never rejects — all errors are caught and logged internally.
+ */
+async function wireIndexerLeaderElection(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info(
+      'Redis disabled — indexer replay leader election running in always-leader (single-instance) mode',
+      undefined,
+      { component: 'indexer-leader-election' },
+    );
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    initializeIndexerLeaderElection(redisClient);
+
+    logger.info('Redis indexer leader election wired', undefined, {
+      component: 'indexer-leader-election',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for indexer leader election — falling back to always-leader mode',
+      undefined,
+      {
+        component: 'indexer-leader-election',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+}
+
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
@@ -240,9 +291,13 @@ export function createApp(options: AppOptions = {}): Express {
   // Shutdown hook ordering (runs after server.close() drains HTTP):
   //   1. Drain SSE — close open event-stream responses with retry:0.
   //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
-  //   3. Quit Redis — close all tracked Redis sockets.
+  //   3. Release the indexer leader-election lease — must happen before Redis
+  //      is closed, and after replay has been signalled to stop, so another
+  //      instance can take over promptly instead of waiting out the full lease.
+  //   4. Quit Redis — close all tracked Redis sockets.
   addShutdownHook(() => drainSseEventBus(appConfig.sseDrainTimeoutMs));
   addShutdownHook(() => requestStopReplay());
+  addShutdownHook(() => getIndexerLeaderElection().release());
   addShutdownHook(() => quitAllRedisClients());
 
   // Expose the limiter on app.locals so index.ts can register a shutdown hook
@@ -266,6 +321,23 @@ export function createApp(options: AppOptions = {}): Express {
   void wireIdempotencyStore(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
   void wireAdminStateLock(appConfig);
+  void wireIndexerLeaderElection(appConfig);
+
+  // Optional grpc.health.v1.Health service for Kubernetes-native gRPC probes,
+  // on a separate port from the HTTP server so it never competes with API
+  // traffic. Requires a healthManager (same dependency-check logic as
+  // /health/ready) — without one there is nothing meaningful to reuse.
+  if (options.healthManager && appConfig.grpcHealthEnabled) {
+    const grpcHealthServer = createGrpcHealthServer(options.healthManager);
+    app.locals.grpcHealthServer = grpcHealthServer;
+    startGrpcHealthServer(grpcHealthServer, appConfig.grpcHealthPort).catch((err) => {
+      logger.warn('gRPC health server failed to start', undefined, {
+        component: 'grpc-health',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    addShutdownHook(() => stopGrpcHealthServer(grpcHealthServer));
+  }
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   app.use(privacyHeaders);
@@ -278,9 +350,11 @@ export function createApp(options: AppOptions = {}): Express {
   // even when JSON parsing throws and the error handler fires immediately.
   app.use(correlationIdMiddleware);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
+  app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(serverTimingMiddleware());
   app.use(httpMetrics);
   app.use(createDeprecationMiddleware(routeDeprecations));
   app.use(rateLimiter);

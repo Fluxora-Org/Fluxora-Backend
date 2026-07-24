@@ -1,6 +1,7 @@
 import Redis from 'ioredis';
 import { getConfig } from '../config/env.js';
 import { warn, info, debug } from '../utils/logger.js';
+import { calculateNextRetryDelay } from '../lib/retry.js';
 
 /**
  * Redis key prefix for JWT revocation entries.
@@ -41,7 +42,12 @@ function getRedisClient(): Redis {
     password: config.redisPassword || undefined,
     db: config.redisDb ?? 0,
     retryStrategy: (times) => {
-      const delay = Math.min(times * 50, 2000);
+      const delay = calculateNextRetryDelay(times - 1, {
+        baseDelayMs: 50,
+        maxDelayMs: 2000,
+        maxAttempts: 10,
+      });
+      if (delay === 0) return null; // stop retrying
       warn('Redis retry', { attempt: times, delayMs: delay });
       return delay;
     },

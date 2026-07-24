@@ -170,3 +170,127 @@ To avoid rows landing in the unindexed `DEFAULT` partition, partitions for the n
   for: 2m
   severity: warning
 ```
+
+## Logical Replication for contract_events
+
+### Overview & Architecture
+
+Fluxora provides PostgreSQL logical replication as an enterprise streaming mechanism for external consumers to tail real-time chain events directly from the database. Logical replication provides a high-throughput, push-based alternative to polling `GET /internal/indexer/events` (`src/routes/indexer.ts`).
+
+### Publication Scope & Security
+
+The publication `fluxora_contract_events_pub` is narrowly scoped to ensure data isolation and security:
+
+- **Single Table Scope**: Scoped exclusively to the `contract_events` table. Tables containing Personally Identifiable Information (PII) or sensitive tokens (such as `streams`, `api_keys`, or `webhook_outbox`) are explicitly excluded from replication.
+- **Append-Only Operations**: Configured with `WITH (publish = 'insert')`. Since `contract_events` is an append-only event ledger, restricting publication strictly to `INSERT` operations eliminates unnecessary WAL replication overhead for table maintenance and prevents exposing operational updates or deletes.
+
+### Prerequisites & Server Configuration
+
+To support logical replication, the primary PostgreSQL instance must be configured with the following parameters in `postgresql.conf`:
+
+| Parameter | Required Value | Description |
+|---|---|---|
+| `wal_level` | `logical` | Enables logical decoding and WAL retention for replication slots. *Requires database server restart.* |
+| `max_replication_slots` | `>= 5` | Maximum number of concurrent replication slots supported by the server. |
+| `max_wal_senders` | `>= 5` | Maximum number of concurrent WAL sender processes. |
+
+Additionally, external streaming consumers require a database role with the `REPLICATION` attribute (or membership in `pg_read_all_data` along with table-level `SELECT` permissions on `contract_events`).
+
+### Operational Steps to Attach a Replication Slot
+
+#### 1. Validate Server Configuration
+
+Ensure `wal_level` is set to `logical`:
+
+```sql
+SHOW wal_level;
+-- Expected output: logical
+```
+
+#### 2. Create the Logical Replication Slot
+
+Connect to the primary database as an administrative or replication user and create a replication slot using the standard `pgoutput` plugin:
+
+```sql
+SELECT pg_create_logical_replication_slot('fluxora_contract_events_slot', 'pgoutput');
+```
+
+#### 3. Connect External Streaming Consumer
+
+Configure your streaming consumer (e.g., Debezium, Kafka Connect Postgres Source, or custom `pgoutput` consumer) with the following connection properties:
+
+- **Publication Name**: `fluxora_contract_events_pub`
+- **Replication Slot Name**: `fluxora_contract_events_slot`
+- **Plugin**: `pgoutput`
+- **Tables**: `contract_events`
+
+#### 4. Monitor Active Connections
+
+Verify that the consumer has attached and is actively consuming WAL streams:
+
+```sql
+SELECT
+  pid,
+  usename,
+  application_name,
+  client_addr,
+  state,
+  sync_state,
+  sent_lsn,
+  write_lsn,
+  flush_lsn,
+  replay_lsn
+FROM pg_stat_replication;
+```
+
+### Operational Impact & Primary Health Monitoring
+
+#### Slot Lag & Disk Growth Risk
+
+A PostgreSQL logical replication slot guarantees zero data loss by preserving write-ahead logs (WAL) on the primary database until the consumer confirms receipt (`confirmed_flush_lsn`). 
+
+> [!WARNING]
+> If a streaming consumer disconnects or fails to acknowledge WAL data, PostgreSQL will retain all unconsumed WAL segments on disk. If left unmonitored, an inactive slot can lead to rapid primary disk growth and eventual disk space exhaustion.
+
+#### Monitoring Slot Lag in Bytes
+
+Operators must monitor replication lag via `pg_replication_slots`:
+
+```sql
+SELECT
+  slot_name,
+  plugin,
+  active,
+  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag_bytes,
+  pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes_raw
+FROM pg_replication_slots
+WHERE slot_name = 'fluxora_contract_events_slot';
+```
+
+#### Stale Slot Cleanup Runbook
+
+If a consumer is decommissioned or experiences an extended outage and lag exceeds safety thresholds (e.g., > 10 GB):
+
+1. Check if the slot is active: `SELECT active FROM pg_replication_slots WHERE slot_name = 'fluxora_contract_events_slot';`
+2. If `active = false` and disk usage is critical, drop the slot to free retained WAL segments:
+   ```sql
+   SELECT pg_drop_replication_slot('fluxora_contract_events_slot');
+   ```
+3. *Note*: Dropping a slot requires the external consumer to perform a full re-snapshot when re-attaching.
+
+#### Recommended Prometheus Alerts
+
+```yaml
+# Alert when a replication slot falls behind by more than 5 GB
+- alert: PostgresReplicationSlotLagHigh
+  expr: pg_replication_slots_bytes_behind{slot_name="fluxora_contract_events_slot"} > 5368709120
+  for: 5m
+  severity: warning
+
+# Alert when a replication slot is inactive while lag accumulates
+- alert: PostgresReplicationSlotInactive
+  expr: pg_replication_slots_active{slot_name="fluxora_contract_events_slot"} == 0
+  for: 10m
+  severity: warning
+```
+

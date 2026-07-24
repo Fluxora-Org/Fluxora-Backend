@@ -12,7 +12,7 @@
  */
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { streamEventService, STREAM_EVENT_PROCESSING_FAILED } from '../../src/services/streamEventService.js';
+import { streamEventService, _resetDedupCache, STREAM_EVENT_PROCESSING_FAILED } from '../../src/services/streamEventService.js';
 
 // ---------------------------------------------------------------------------
 // Module mocks – must be hoisted before any imports that transitively load them
@@ -85,7 +85,8 @@ const baseCancelledEvent = {
 describe('streamEventService – structured catch-block logging', () => {
   let logErrorSpy: ReturnType<typeof vi.spyOn>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await _resetDedupCache();
     logErrorSpy = vi.spyOn(logger, 'error');
   });
 

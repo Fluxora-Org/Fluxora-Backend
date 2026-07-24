@@ -13,8 +13,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock all external dependencies before importing the service
 vi.mock('../src/db/repositories/streamRepository.js', () => ({
   streamRepository: {
-    findByStreamId: vi.fn(),
-    createStream: vi.fn(),
+    upsertStream: vi.fn(),
+    getById: vi.fn(),
     updateStream: vi.fn(),
   },
 }));
@@ -24,11 +24,13 @@ vi.mock('../src/utils/logger.js', () => ({
   error: vi.fn(),
   debug: vi.fn(),
 }));
-vi.mock('../src/ws/hub.js', () => ({ getStreamHub: vi.fn(() => null) }));
-vi.mock('../src/tracing/hooks.js', () => ({ enrichActiveSpanWithStream: vi.fn() }));
+vi.mock('../src/tracing/hooks.js', () => ({
+  enrichActiveSpanWithStream: vi.fn(),
+  traceSpan: vi.fn((name, cid, tags, fn) => fn()),
+}));
 vi.mock('../src/streams/sseEmitter.js', () => ({ deriveStreamId: vi.fn((h: string, i: number) => `${h}-${i}`) }));
 
-import { streamEventService, StreamCreatedEvent } from '../src/services/streamEventService.js';
+import { streamEventService, _resetDedupCache, StreamCreatedEvent } from '../src/services/streamEventService.js';
 import { streamRepository } from '../src/db/repositories/streamRepository.js';
 
 function makeCreatedEvent(overrides: Partial<StreamCreatedEvent> = {}): StreamCreatedEvent {
@@ -41,16 +43,16 @@ function makeCreatedEvent(overrides: Partial<StreamCreatedEvent> = {}): StreamCr
     recipient: 'GRECIPIENT',
     amount: '1000000',
     ratePerSecond: '1000',
-    cliffTimestamp: 0,
-    startTimestamp: 1700000000,
-    endTimestamp: 1700086400,
+    startTime: 1700000000,
+    endTime: 1700086400,
     ...overrides,
   };
 }
 
 describe('streamEventService.processBatch', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    await _resetDedupCache();
   });
 
   it('returns an empty array for an empty batch', async () => {
@@ -59,8 +61,7 @@ describe('streamEventService.processBatch', () => {
   });
 
   it('returns one result per event', async () => {
-    (streamRepository.findByStreamId as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (streamRepository.createStream as ReturnType<typeof vi.fn>).mockResolvedValue({ id: '1' });
+    vi.mocked(streamRepository.upsertStream).mockResolvedValue({ created: true } as any);
 
     const events = [
       makeCreatedEvent({ eventIndex: 0 }),
@@ -72,14 +73,9 @@ describe('streamEventService.processBatch', () => {
   });
 
   it('marks a failing event as success=false without aborting subsequent events', async () => {
-    const repoMock = streamRepository.findByStreamId as ReturnType<typeof vi.fn>;
-    const createMock = streamRepository.createStream as ReturnType<typeof vi.fn>;
-
-    // First event: repository throws (simulates DB failure)
-    repoMock.mockRejectedValueOnce(new Error('DB connection lost'));
-    // Second event: processes normally
-    repoMock.mockResolvedValueOnce(null);
-    createMock.mockResolvedValue({ id: '2' });
+    vi.mocked(streamRepository.upsertStream)
+      .mockRejectedValueOnce(new Error('DB connection lost'))
+      .mockResolvedValueOnce({ created: true } as any);
 
     const events = [
       makeCreatedEvent({ eventIndex: 0 }),
@@ -94,8 +90,7 @@ describe('streamEventService.processBatch', () => {
   });
 
   it('marks all events as success when all succeed', async () => {
-    (streamRepository.findByStreamId as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (streamRepository.createStream as ReturnType<typeof vi.fn>).mockResolvedValue({ id: '1' });
+    vi.mocked(streamRepository.upsertStream).mockResolvedValue({ created: true } as any);
 
     const events = [makeCreatedEvent({ eventIndex: 0 }), makeCreatedEvent({ eventIndex: 1 })];
     const results = await streamEventService.processBatch(events);
