@@ -15,7 +15,7 @@ export const DEDUP_KEY_PREFIX = 'fluxora:dedup:';
 
 export interface DedupCache {
     has(streamId: string, eventId: string): Promise<boolean>;
-    add(streamId: string, eventId: string): Promise<void>;
+    add(streamId: string, eventId: string): Promise<boolean>;
     clear(): Promise<void>;
     close(): Promise<void>;
 }
@@ -45,14 +45,15 @@ export class InMemoryDedupCache implements DedupCache {
         return this.seen.has(`${streamId}:${eventId}`);
     }
 
-    async add(streamId: string, eventId: string): Promise<void> {
+    async add(streamId: string, eventId: string): Promise<boolean> {
         const key = `${streamId}:${eventId}`;
-        if (this.seen.has(key)) return;
+        if (this.seen.has(key)) return false;
         if (this.seen.size >= DEDUP_CACHE_MAX) {
             const oldest = this.seen.keys().next().value;
             if (oldest !== undefined) this.seen.delete(oldest);
         }
         this.seen.set(key, true);
+        return true;
     }
 
     async clear(): Promise<void> {
@@ -78,21 +79,22 @@ export class RedisDedupCache implements DedupCache {
     async has(streamId: string, eventId: string): Promise<boolean> {
         try {
             return await this.client.exists(this.buildKey(streamId, eventId));
-        } catch {
+        } catch (e) {
             dedupRedisErrorsTotal.inc({ operation: 'has' });
-            return false;
+            throw e;
         }
     }
 
-    async add(streamId: string, eventId: string): Promise<void> {
+    async add(streamId: string, eventId: string): Promise<boolean> {
         try {
-            await this.client.set(
+            return await this.client.setNx(
                 this.buildKey(streamId, eventId),
                 '1',
-                { ex: this.ttlSeconds }
+                this.ttlSeconds * 1000
             );
-        } catch {
+        } catch (e) {
             dedupRedisErrorsTotal.inc({ operation: 'add' });
+            throw e;
         }
     }
 
@@ -128,16 +130,18 @@ export class HybridDedupCache implements DedupCache {
         }
     }
 
-    async add(streamId: string, eventId: string): Promise<void> {
+    async add(streamId: string, eventId: string): Promise<boolean> {
         if (this.useRedis) {
             try {
-                await this.primary.add(streamId, eventId);
+                const added = await this.primary.add(streamId, eventId);
+                if (added) await this.fallback.add(streamId, eventId);
+                return added;
             } catch {
                 dedupRedisFallbackTotal.inc({ operation: 'add' });
                 logFallback('add', streamId, eventId);
             }
         }
-        await this.fallback.add(streamId, eventId);
+        return await this.fallback.add(streamId, eventId);
     }
 
     async clear(): Promise<void> {

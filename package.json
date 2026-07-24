@@ -23,7 +23,9 @@
     "docker:logs": "docker-compose logs -f indexer",
     "docker:migrate": "docker-compose exec indexer pnpm run migrate",
     "docker:seed": "docker-compose exec indexer pnpm run seed",
-    "docker:test": "docker-compose exec indexer pnpm test"
+    "docker:test": "docker-compose exec indexer pnpm test",
+    "generate:sdk:python": "node scripts/generate-sdk-python.mjs",
+    "check:sdk:python": "node scripts/generate-sdk-python.mjs --check"
   },
   "keywords": [
     "indexer",

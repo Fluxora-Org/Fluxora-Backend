@@ -299,4 +299,43 @@ describe('WebSocket upgrade TOCTOU concurrency', () => {
     await closeWs(conn2.ws!);
     await Promise.all(succeeded.map((r) => (r.ws ? closeWs(r.ws) : Promise.resolve())));
   });
+
+  it('handles concurrent subscribe messages correctly without race conditions', async () => {
+    /**
+     * SCENARIO: Open multiple connections and send simultaneous subscribe
+     * messages for the same streamId.
+     * EXPECTED: Map retains exactly one subscription entry per connection.
+     */
+    const maxConnections = 10;
+    process.env.WS_MAX_CONNECTIONS_PER_IP = String(maxConnections);
+
+    const connections: WebSocket[] = [];
+    for (let i = 0; i < maxConnections; i++) {
+      const result = await attemptConnect(port);
+      expect(result.success).toBe(true);
+      connections.push(result.ws!);
+    }
+
+    const streamId = 'test-stream-concurrency';
+    const subscribeMsg = JSON.stringify({ type: 'subscribe', filter: { streamId } });
+
+    // Send subscribe simultaneously
+    connections.forEach(ws => ws.send(subscribeMsg));
+
+    // Wait for processing
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    // Assert exactly maxConnections subscriptions for this stream
+    expect(hub.getStreamSubscriptionCount(streamId)).toBe(maxConnections);
+
+    await Promise.all(connections.map(ws => closeWs(ws)));
+
+    // The client-side 'close' event can resolve slightly before the server's
+    // onDisconnect handler finishes running, so give cleanup a moment.
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    // Ensure memory is released
+    expect(hub.getStreamSubscriptionCount(streamId)).toBe(0);
+  });
 });
+

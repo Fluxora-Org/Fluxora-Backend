@@ -101,7 +101,7 @@ export function parseTraceparent(raw: unknown): TraceparentFields | null {
   const m = TRACEPARENT_REGEX.exec(lower);
   if (!m) return null;
 
-  const [, version, traceId, parentId, flags] = m as [string, string, string, string, string];
+  const [, version, traceId, parentId, flags] = m as unknown as [string, string, string, string, string];
 
   // Reserved version — spec says receivers MUST NOT forward unknown versions
   // without understanding them.
