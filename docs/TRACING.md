@@ -397,38 +397,128 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 ### Non-Goals (Out of Scope for This Issue)
 
 1. **Real-time streaming to external backends** — OpenTelemetry integration is provided, but external backend setup is operator responsibility
-2. **Automatic span propagation across services** — Correlation ID is used locally; W3C traceparent headers not implemented in this version
-3. **Request sampling at middleware level** — Sampling is implemented at tracer invocation level; per-route sampling is deferred
-4. **Distributed context baggage** — Span context is request-scoped; cross-request baggage (e.g., tenant ID) is not carried
-5. **Span filtering/mutation** — All events matching a name are recorded; filtering to reduce overhead is operator responsibility
-6. **PII classification** — Operators must avoid logging sensitive fields in attributes; no automatic PII detection
+2. **Request sampling at middleware level** — Sampling is implemented at tracer invocation level; per-route sampling is deferred
+3. **Distributed context baggage** — Span context is request-scoped; cross-request baggage (e.g., tenant ID) is not carried
+4. **Span filtering/mutation** — All events matching a name are recorded; filtering to reduce overhead is operator responsibility
+5. **PII classification** — Operators must avoid logging sensitive fields in attributes; no automatic PII detection
 
 ### Follow-Up Work (Documented for Future Sprints)
 
 1. **Automatic instrumentation** — Instrument database driver, HTTP client, message queues without explicit calls
-   - Ticket: [Create issue for auto-instrumentation]
    - Rationale: Reduces boilerplate, improves consistency
 
-2. **W3C Traceparent support** — Implement W3C Trace Context for cross-service propagation
-   - Ticket: [Create issue for W3C traceparent]
-   - Rationale: Enables end-to-end tracing across Fluxora services and external APIs
-   - Depends on: OpenTelemetry integration validation
+2. ~~**W3C Traceparent support**~~ — **IMPLEMENTED** (issue #756). See the W3C Trace Context section below.
 
 3. **Sampling strategies** — Implement head-based sampling (consistent trace decision), tail-based sampling, and per-route overrides
-   - Ticket: [Create issue for advanced sampling]
    - Rationale: Reduce volume of traces in production while capturing interesting requests
 
 4. **Span export batch optimization** — Batch spans for more efficient export to backends
-   - Ticket: [Create issue for batch export]
    - Rationale: Reduce network calls and improve throughput to external collectors
 
 5. **Metrics dashboard** — Create Grafana/CloudWatch dashboard for span metrics
-   - Ticket: [Create issue for metrics dashboard]
    - Rationale: Operational visibility without log parsing
 
 6. **Trace query API** — Add `/admin/traces` endpoint for operators to query spans
-   - Ticket: [Create issue for trace query API]
    - Rationale: Avoid log parsing for debugging; real-time query capability
+
+---
+
+## W3C Trace Context Propagation (issue #756)
+
+Fluxora now implements [W3C Trace Context Level 1](https://www.w3.org/TR/trace-context/)
+for distributed tracing across service boundaries. This enables continuous traces
+from upstream callers through Fluxora to Stellar RPC and webhook consumers.
+
+### Overview
+
+```
+upstream caller
+    │  traceparent: 00-<traceId>-<parentId>-01
+    ▼
+tracingMiddleware (src/tracing/middleware.ts)
+    │  parses traceparent, adopts upstream traceId
+    │  stores TraceparentFields in AsyncLocalStorage
+    ▼
+route handler / business logic
+    │
+    ├─► StellarRpcService.accountExists (Horizon fetch)
+    │       outbound traceparent: 00-<traceId>-<parentId>-01
+    │
+    └─► WebhookDispatcher.sendRequest / dispatchWebhook
+            outbound traceparent: 00-<traceId>-<parentId>-01
+```
+
+### Inbound Parsing (src/tracing/middleware.ts)
+
+The `tracingMiddleware` reads the `traceparent` HTTP header on every inbound
+request and validates it with `parseTraceparent()`:
+
+- **Valid header** → upstream `traceId` is used as the span's `traceId`, upstream
+  `parentId` is stored as `parentSpanId`, and the `TraceparentFields` object is
+  placed in `traceContextStore` (an `AsyncLocalStorage`) for outbound propagation.
+- **Invalid / missing header** → existing behaviour is preserved: the local
+  correlation ID (`x-correlation-id`) is used as the `traceId` and
+  `traceContextStore` stores `null`.
+
+**Security hardening on `parseTraceparent()`:**
+
+| Check | What it prevents |
+|-------|-----------------|
+| Length cap (200 chars) before regex | ReDoS on pathological inputs |
+| Anchored regex (`^…$`) | Partial / prefix matching |
+| Reserved version `ff` rejected | Forward-compat guard per spec |
+| All-zero `traceId` rejected | Invalid per spec §2.2.4 |
+| All-zero `parentId` rejected | Invalid per spec §2.2.5 |
+| Lower-cased before comparison | Case-insensitive, canonical output |
+
+### Outbound Propagation
+
+#### Stellar RPC (src/services/stellar-rpc.ts)
+
+`StellarRpcService.accountExists()` calls `getActiveTraceContext()` before
+each Horizon HTTP fetch. When a non-null context is available, `buildTraceparent()`
+constructs the header and it is added to the request:
+
+```
+traceparent: 00-<upstream-traceId>-<upstream-parentId>-<flags>
+```
+
+No header is added when `getActiveTraceContext()` returns `null` (no upstream trace).
+
+#### Webhook Dispatcher (src/webhooks/dispatcher.ts)
+
+Both `WebhookDispatcher.sendRequest()` (class-based) and `dispatchWebhook()`
+(convenience function) call `getActiveTraceContext()` and attach a `traceparent`
+header when a trace context is present. Correlation ID propagation via
+`x-correlation-id` is unchanged.
+
+### API
+
+```typescript
+// Parse an inbound traceparent header (returns null on any invalid input)
+import { parseTraceparent } from './src/tracing/middleware.js';
+const fields = parseTraceparent(req.headers['traceparent']);
+// → { version, traceId, parentId, flags, sampled } | null
+
+// Build an outbound traceparent header
+import { buildTraceparent } from './src/tracing/middleware.js';
+const header = buildTraceparent(traceId, parentId, sampled);
+// → "00-<traceId>-<parentId>-01"
+
+// Read the active trace context (works anywhere in the async call chain)
+import { getActiveTraceContext } from './src/tracing/middleware.js';
+const ctx = getActiveTraceContext();
+// → TraceparentFields | null
+```
+
+### Backward Compatibility
+
+- Clients that do not send `traceparent` continue to work exactly as before.
+- The correlation-ID header (`x-correlation-id`) continues to function.
+- When both are present, `traceparent` takes precedence for trace continuity;
+  the correlation ID is still propagated independently.
+- No new required environment variables; the feature works automatically once
+  `tracingMiddleware` is in the middleware stack.
 
 ## Configuration Reference
 

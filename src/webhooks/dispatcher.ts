@@ -1,5 +1,5 @@
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
-import { getCorrelationId } from '../tracing/middleware.js';
+import { getCorrelationId, getActiveTraceContext, buildTraceparent } from '../tracing/middleware.js';
 
 import { logger } from '../lib/logger.js';
 
@@ -358,6 +358,19 @@ export class WebhookDispatcher {
         headers[CORRELATION_ID_HEADER] = correlationId;
       }
 
+      // Attach outbound W3C traceparent so webhook consumers can continue the
+      // distributed trace across the service boundary.  Only added when an
+      // active trace context exists in the current async scope; we never
+      // fabricate a traceparent when no upstream trace is present.
+      const activeTrace = getActiveTraceContext();
+      if (activeTrace) {
+        headers['traceparent'] = buildTraceparent(
+          activeTrace.traceId,
+          activeTrace.parentId,
+          activeTrace.sampled,
+        );
+      }
+
       const response = await this.followRedirects(
         url,
         {
@@ -600,6 +613,16 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
     // by the correlationId middleware.
     if (effectiveCorrelationId && effectiveCorrelationId !== 'unknown') {
       headers[CORRELATION_ID_HEADER] = effectiveCorrelationId;
+    }
+
+    // Attach outbound W3C traceparent for end-to-end distributed tracing.
+    const activeTrace = getActiveTraceContext();
+    if (activeTrace) {
+      headers['traceparent'] = buildTraceparent(
+        activeTrace.traceId,
+        activeTrace.parentId,
+        activeTrace.sampled,
+      );
     }
 
     await followDispatchWebhookRedirects(

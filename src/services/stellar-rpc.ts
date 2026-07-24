@@ -21,6 +21,7 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import { logger } from '../lib/logger.js';
 import { recordCircuitBreakerTransition } from '../tracing/hooks.js';
+import { getActiveTraceContext, buildTraceparent } from '../tracing/middleware.js';
 import {
   NoOpRpcFallbackCache,
   RedisRpcFallbackCache,
@@ -29,6 +30,7 @@ import {
   type RpcFallbackCacheEntry,
 } from '../redis/rpcFallbackCache.js';
 import { createRedisClient } from '../redis/client.js';
+import {
   rpcFallbackCacheEarlyRefreshesTotal,
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,
@@ -330,8 +332,24 @@ export class StellarRpcService {
             throw new RpcProviderError('horizonUrl not configured on RPC client', 'PROVIDER');
           }
           const url = `${base}/accounts/${encodeURIComponent(address)}`;
-          const res = await fetch(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs) });
-          if (res.status === 200) return true;
+          // Attach outbound W3C traceparent so Stellar RPC / Horizon can
+          // continue the distributed trace.  The header is only added when an
+          // active trace context exists in the current async scope.
+          const rpcHeaders: Record<string, string> = {};
+          const activeTrace = getActiveTraceContext();
+          if (activeTrace) {
+            // Outbound parent ID = upstream parentId so the outbound span
+            // shares the same parent as this service's span.
+            rpcHeaders['traceparent'] = buildTraceparent(
+              activeTrace.traceId,
+              activeTrace.parentId,
+              activeTrace.sampled,
+            );
+          }
+          const res = await fetch(url, {
+            signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs),
+            headers: rpcHeaders,
+          });          if (res.status === 200) return true;
           if (res.status === 404) return false;
           throw new RpcProviderError(
             `Horizon returned HTTP ${res.status} for account lookup`,
