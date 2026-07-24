@@ -353,6 +353,8 @@ When backed by `HybridDedupCache`:
 2. **Fallback Cache**: In-memory cache (`InMemoryDedupCache`) that tracks event arrivals locally.
 3. **Graceful Degradation**: If Redis experiences connection failures or outages mid-sequence, `HybridDedupCache` automatically catches Redis exceptions, logs a throttled fallback event, increments Prometheus metric `dedup_redis_fallback_total`, and seamlessly degrades to the in-memory cache.
 
+*Note: The event ingestion layer (`streamEventService`) also relies on this HybridDedupCache to safely maintain idempotent cross-instance duplicate-event suppression without a race between check-and-mark logic.*
+
 ### Core Invariants
 
 The deduplication layer guarantees the following invariant regardless of event arrival order, duplicate burst frequency, or intermittent Redis downtime:

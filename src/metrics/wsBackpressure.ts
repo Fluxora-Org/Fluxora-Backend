@@ -1,15 +1,15 @@
 /**
  * src/metrics/wsBackpressure.ts
  *
- * Per-client WebSocket backpressure gauges and subscription cardinality
- * metrics exposed to Prometheus.
+ * Per-client WebSocket backpressure gauges, subscription cardinality
+ * metrics, and micro-batching counters exposed to Prometheus.
  *
  * Four metrics are emitted for live WebSocket subscribers on the
  * `/ws/streams` endpoint:
  *
  *   - `fluxora_ws_backpressure_buffered_bytes{connection_id="…"}` — current
  *     `ws.bufferedAmount` per client, useful for finding a specific slow
- *     peer. This is the primary, bounded-cardinality gauge required by the
+ *     peer.  This is the primary, bounded-cardinality gauge required by the
  *     per-client observability feature.
  *   - `fluxora_ws_max_buffered_bytes`     — max bufferedAmount across all
  *     live clients (low cardinality, suitable for dashboards/alerts).
@@ -21,15 +21,25 @@
  *     stream driving disproportionate broadcast fan-out before it causes
  *     backpressure incidents.
  *
+ * ### Micro-batching counters (three series)
+ *
+ *   - `fluxora_ws_batch_flush_total`         — total flush operations (each
+ *     flush produces one outbound `stream_update_batch` frame per client).
+ *   - `fluxora_ws_batch_events_coalesced_total` — total individual events
+ *     that were coalesced across all flushes.  Comparing this to
+ *     `fluxora_ws_batch_flush_total` gives the average batch size.
+ *   - `fluxora_ws_batch_size_exceeded_total` — flushes where the batch hit
+ *     `WS_BATCH_MAX_SIZE` before the flush window expired (early ejection).
+ *
  * The per-client gauge is updated by a poll loop so the value reflects the
  * actual kernel/OS send-buffer state, not just the snapshot taken during a
- * `deliverBatch` call. Series for disconnected clients are explicitly removed
+ * `deliverBatch` call.  Series for disconnected clients are explicitly removed
  * via `removeWsClientBackpressureGauge` to prevent unbounded label
- * accumulation. See `docs/observability.md` for the labeling-choice rationale
+ * accumulation.  See `docs/observability.md` for the labeling-choice rationale
  * and bounded-cardinality guarantee.
  */
 
-import { Gauge } from 'prom-client';
+import { Counter, Gauge, Histogram } from 'prom-client';
 import { registry } from '../metrics.js';
 import type { StreamHub } from '../ws/hub.js';
 
@@ -49,6 +59,8 @@ export const DEFAULT_WS_SLOW_CLIENT_BYTES = 1 * 1024 * 1024;
  */
 export const DEFAULT_WS_BACKPRESSURE_INTERVAL_MS = 5_000;
 
+// ── Backpressure gauges ────────────────────────────────────────────────────────
+
 /**
  * Maximum number of streams reported by the subscription cardinality gauge.
  * Capping this prevents unbounded Prometheus label cardinality when many
@@ -66,15 +78,15 @@ export const DEFAULT_WS_STREAM_CARDINALITY_TOP_N = 20;
  * Cardinality guarantee: at most one time-series per *currently connected*
  * client. Series are removed when the client disconnects
  * (`removeWsClientBackpressureGauge`) to prevent unbounded memory growth
- * in long-running processes. The label set is therefore bounded by the
+ * in long-running processes.  The label set is therefore bounded by the
  * peak concurrent-connection count, not by total connections over time.
  *
- * `@security` The `connection_id` label is a server-generated UUID v4. It
- * never contains client IP, account subject, JWT `sub`, request ID, or any
- * other identifier that could be used to fingerprint or correlate a
- * particular user. The bounded-cardinality design prevents an attacker
- * from inflating Prometheus memory by repeatedly reconnecting — each
- * reconnect simply replaces the prior series for that one seat.
+ * @security The `connection_id` label is a server-generated UUID v4. It
+ *   never contains client IP, account subject, JWT `sub`, request ID, or
+ *   any other identifier that could be used to fingerprint or correlate a
+ *   particular user.  The bounded-cardinality design prevents an attacker
+ *   from inflating Prometheus memory by repeatedly reconnecting — each
+ *   reconnect simply replaces the prior series for that one seat.
  */
 export const wsClientBufferedBytes =
   (registry.getSingleMetric('fluxora_ws_backpressure_buffered_bytes') as Gauge<'connection_id'>) ||
@@ -106,6 +118,63 @@ export const wsSlowClients =
     help: 'Number of WebSocket clients whose buffered amount exceeds the slow-client threshold',
     registers: [registry],
   });
+
+// ── Micro-batching counters ────────────────────────────────────────────────────
+
+/**
+ * Total number of micro-batch flush operations completed.
+ *
+ * Each flush emits a single `stream_update_batch` frame to a subscribed client
+ * that has opted in via `batching: true` on their subscription.  Monotonically
+ * increasing; reset to 0 only by process restart.
+ *
+ * Use `rate(fluxora_ws_batch_flush_total[1m])` to estimate flush throughput.
+ * Divide `fluxora_ws_batch_events_coalesced_total` by this counter to get the
+ * rolling average batch size.
+ */
+export const wsBatchFlushTotal =
+  (registry.getSingleMetric('fluxora_ws_batch_flush_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_ws_batch_flush_total',
+    help: 'Total number of micro-batch flush operations that emitted a stream_update_batch frame',
+    registers: [registry],
+  });
+
+/**
+ * Total number of individual events coalesced across all batch flushes.
+ *
+ * An "event" is counted once per (streamId, eventId) before it enters a
+ * batch accumulator.  Deduplication at the broadcast level prevents double-
+ * counting when the same event is broadcast twice.
+ *
+ * `fluxora_ws_batch_events_coalesced_total / fluxora_ws_batch_flush_total`
+ * gives the average batch fill ratio over any Prometheus range window.
+ */
+export const wsBatchEventsCoalescedTotal =
+  (registry.getSingleMetric('fluxora_ws_batch_events_coalesced_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_ws_batch_events_coalesced_total',
+    help: 'Total number of individual events coalesced into micro-batch frames',
+    registers: [registry],
+  });
+
+/**
+ * Number of times an early flush was triggered by hitting `WS_BATCH_MAX_SIZE`
+ * before the flush window (`WS_BATCH_FLUSH_MS`) expired.
+ *
+ * Frequent early ejections suggest the max-size limit is too low for the
+ * current event throughput.  Consider increasing `WS_BATCH_MAX_SIZE` or
+ * decreasing `WS_BATCH_FLUSH_MS`.
+ */
+export const wsBatchSizeExceededTotal =
+  (registry.getSingleMetric('fluxora_ws_batch_size_exceeded_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_ws_batch_size_exceeded_total',
+    help: 'Total number of micro-batch flushes triggered early by hitting WS_BATCH_MAX_SIZE',
+    registers: [registry],
+  });
+
+// ── Collection helpers ─────────────────────────────────────────────────────────
 
 /**
  * Subscriber count for the top-N streams by fan-out size. Labelled by
@@ -227,13 +296,63 @@ function collectStreamSubscriberCardinality(
 }
 
 /**
+ * Millisecond-scale bucket layout for micro-batch broadcast flush latency histogram.
+ * Specifically chosen to resolve expected millisecond-scale flush windows (0.1ms to 5s).
+ */
+export const WS_BROADCAST_BATCH_FLUSH_BUCKETS = [
+  0.0001, // 0.1ms
+  0.0005, // 0.5ms
+  0.001,  // 1ms
+  0.0025, // 2.5ms
+  0.005,  // 5ms
+  0.01,   // 10ms
+  0.025,  // 25ms
+  0.05,   // 50ms
+  0.1,    // 100ms
+  0.25,   // 250ms
+  0.5,    // 500ms
+  1.0,    // 1s
+  2.5,    // 2.5s
+  5.0,    // 5s
+];
+
+/**
+ * Histogram recording the age in seconds of the oldest event included in a
+ * micro-batched WebSocket broadcast flush.
+ *
+ * Operators use this histogram to observe actual queuing delay and tune the
+ * flush-window default safely.
+ *
+ * Cardinality guarantee: O(1) fixed time-series with zero labels.
+ * `@security` Contains no PII, user identifiers, payload data, or stream IDs.
+ */
+export const wsBroadcastBatchFlushSeconds =
+  (registry.getSingleMetric('fluxora_ws_broadcast_batch_flush_seconds') as Histogram) ||
+  new Histogram({
+    name: 'fluxora_ws_broadcast_batch_flush_seconds',
+    help: 'Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush.',
+    buckets: WS_BROADCAST_BATCH_FLUSH_BUCKETS,
+    registers: [registry],
+  });
+
+/**
+ * Record a batch flush latency observation (in seconds).
+ * Called by StreamHub when a micro-batch is flushed.
+ */
+export function recordWsBroadcastBatchFlushLatency(ageSeconds: number): void {
+  if (typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) && ageSeconds >= 0) {
+    wsBroadcastBatchFlushSeconds.observe(ageSeconds);
+  }
+}
+
+/**
  * Remove the per-client gauge time series for a disconnected client.
  *
  * Must be called from `StreamHub.onDisconnect` for every client so the
  * label set doesn't grow unbounded across long-lived processes.
  *
  * `prom-client@15` `Gauge.remove(...)` is a no-op when no series exists for
- * the given label combination, so it's safe to call defensively. Total
+ * the given label combination, so it's safe to call defensively.  Total
  * `remove` calls scale linearly with `disconnect` rate, never with the
  * total number of historical connections — so the in-memory cost is
  * bounded by the current concurrency, not process uptime.
@@ -250,16 +369,19 @@ export function resetWsBackpressureMetrics(): void {
   wsClientBufferedBytes.reset();
   wsMaxBufferedBytes.set(0);
   wsSlowClients.set(0);
+  wsBroadcastBatchFlushSeconds.reset();
   wsStreamSubscriberCount.reset();
   previousTopStreamIds = new Set();
 }
+
+// ── Internal helpers ───────────────────────────────────────────────────────────
 
 /**
  * Read `ws.bufferedAmount` defensively.
  *
  * The `ws` library types `bufferedAmount: number`, but in practice the
  * property may be momentarily undefined while a socket transitions state,
- * and tests routinely override it via `Object.defineProperty`. Returning 0
+ * and tests routinely override it via `Object.defineProperty`.  Returning 0
  * in those edge cases keeps the collector crash-free; the `>= 0` clause also
  * masks the unlikely case of a negative value reported by a buggy library.
  */

@@ -81,6 +81,8 @@ const subscriptionFilterSchema = z.object({
   streamId: streamIdSchema.optional(),
   recipient_address: recipientAddressSchema.optional(),
   recipientAddress: recipientAddressSchema.optional(),
+  /** Opt-in micro-batching: coalesce rapid events for this stream into a single frame. */
+  batching: z.boolean().optional(),
 }).passthrough();
 
 const subscriptionMessageSchema = z.object({
@@ -89,6 +91,8 @@ const subscriptionMessageSchema = z.object({
   streamId: streamIdSchema.optional(),
   recipient_address: recipientAddressSchema.optional(),
   recipientAddress: recipientAddressSchema.optional(),
+  /** Opt-in micro-batching: coalesce rapid events for this stream into a single frame. */
+  batching: z.boolean().optional(),
   filter: subscriptionFilterSchema.optional(),
 }).passthrough();
 
@@ -105,6 +109,15 @@ const replayMessageSchema = z.object({
 export interface SubscriptionFilter {
   streamId?: string;
   recipientAddress?: string;
+  /**
+   * When `true`, the hub will coalesce rapid events for this stream/recipient
+   * into a single `stream_update_batch` frame per flush window instead of
+   * sending one frame per event. Default: `false` (unchanged one-frame-per-event
+   * behaviour).
+   *
+   * @see WS_BATCH_FLUSH_MS, WS_BATCH_MAX_SIZE env vars
+   */
+  batchingEnabled?: boolean;
 }
 
 export type WsClientMessage =
@@ -163,8 +176,12 @@ function normalizeSubscriptionFilter(
     throw new Error('subscription filter accepts either stream_id or recipient_address, not both');
   }
 
-  if (streamId !== undefined) return { streamId };
-  if (recipientAddress !== undefined) return { recipientAddress };
+  // Opt-in batching: top-level `batching` takes precedence over nested filter.batching.
+  const batchingEnabled: boolean | undefined =
+    value.batching ?? (value.filter?.batching as boolean | undefined);
+
+  if (streamId !== undefined) return { streamId, ...(batchingEnabled !== undefined ? { batchingEnabled } : {}) };
+  if (recipientAddress !== undefined) return { recipientAddress, ...(batchingEnabled !== undefined ? { batchingEnabled } : {}) };
 
   if (value.filter !== undefined) return {};
 
