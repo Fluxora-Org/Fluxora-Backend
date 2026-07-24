@@ -24,3 +24,35 @@ If the stream does not exist, the endpoint returns `404 Not Found`.
 ## GET /api/streams/:id
 
 `GET` still returns the full stream document. If you only need existence checks, prefer `HEAD` to avoid unnecessary payload transfer.
+
+## GET /api/streams/export
+
+Bulk export of all streams in the database in NDJSON format.
+
+This endpoint streams records row-by-row, ensuring low memory usage even for large tables.
+
+### Query Parameters
+
+| Name | Type | Description |
+| :--- | :--- | :--- |
+| `resume_from` | `string` | Optional cursor to resume a previous interrupted export. |
+
+### Example
+
+```bash
+curl http://localhost:3000/api/streams/export
+```
+
+Each line in the response is a JSON object. The final line of each batch contains a `resumption_cursor` field.
+
+```json
+{"id":"...","sender":"...","recipient":"...","depositAmount":"...","streamedAmount":"...","remainingAmount":"...","ratePerSecond":"...","startTime":...,"endTime":...,"status":"..."}
+{"resumption_cursor":"..."}
+```
+
+To resume after a connection drop:
+
+```bash
+curl "http://localhost:3000/api/streams/export?resume_from=<CURSOR_VALUE>"
+```
+
