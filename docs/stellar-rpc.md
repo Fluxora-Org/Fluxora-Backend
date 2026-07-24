@@ -12,6 +12,10 @@ Fluxora wraps Stellar RPC calls with a circuit breaker and a last-known-good fal
 
 The breaker is configured with `RPC_CB_FAILURE_THRESHOLD`, `RPC_CB_WINDOW_MS`, `RPC_CB_RESET_TIMEOUT_MS`, and `RPC_TIMEOUT_MS`.
 
+## RPC Retries
+
+Individual RPC calls (such as fetching the latest ledger or checking account existence) are automatically wrapped in a retry loop using a shared decorrelated jitter helper. If a transient error occurs (such as a timeout or a provider error) and the circuit is not open, the request will be retried up to `STELLAR_RPC_MAX_RETRIES` times (default 3) before failing, with a base delay of `STELLAR_RPC_RETRY_DELAY` (default 1000ms). Jitter ensures that concurrent callers do not thunder-herd the RPC provider.
+
 ## Fallback Cache
 
 Successful RPC responses are stored in Redis under keys beginning with `rpc:cache::`. The default TTL is 300 seconds and can be changed with `RPC_FALLBACK_CACHE_TTL_SECONDS`.

@@ -8,6 +8,8 @@
  *   4. Read-only enforcement on replica connections.
  *   5. Safe hostname extraction for logging.
  *   6. Singleton caching after the first call.
+ *   7. Force primary option for read-after-write consistency.
+ *   8. Replication lag check functionality.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -39,6 +41,14 @@ vi.mock('../../src/lib/logger.js', () => ({
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
+  },
+}));
+
+// ── Mock db metrics ───────────────────────────────────────────────────────────
+
+vi.mock('../../src/metrics/dbMetrics.js', () => ({
+  dbReplicationLagSeconds: {
+    set: vi.fn(),
   },
 }));
 
@@ -75,7 +85,9 @@ import {
   resolveReplicaPoolConfig,
   checkReplicaHealth,
   createReplicaPool,
+  checkReplicationLag,
 } from '../../src/db/replicaPool.js';
+import { dbReplicationLagSeconds } from '../../src/metrics/dbMetrics.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -86,6 +98,7 @@ describe('replicaPool', () => {
     process.env = { ...ORIGINAL_ENV };
     resetReplicaPool();
     vi.clearAllMocks();
+    (dbReplicationLagSeconds.set as ReturnType<typeof vi.fn>).mockClear();
   });
 
   afterEach(() => {
@@ -399,6 +412,108 @@ describe('replicaPool', () => {
       const expected = 'SET default_transaction_read_only = on; SET statement_timeout = 4000';
       expect(client1.query).toHaveBeenCalledWith(expected);
       expect(client2.query).toHaveBeenCalledWith(expected);
+    });
+  });
+
+  // ── forcePrimary option ────────────────────────────────────────────────────
+
+  describe('forcePrimary option', () => {
+    it('returns primary pool when forcePrimary is true, even with replica configured', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+
+      const pool = await getReadPool({ forcePrimary: true });
+      expect(pool).toBe(mockPrimaryPool);
+    });
+
+    it('returns replica pool when forcePrimary is false (default)', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+
+      const pool = await getReadPool({ forcePrimary: false });
+      expect(pool).not.toBe(mockPrimaryPool);
+    });
+
+    it('returns primary pool when forcePrimary is true and no replica configured', async () => {
+      delete process.env['DATABASE_REPLICA_URL'];
+      const pool = await getReadPool({ forcePrimary: true });
+      expect(pool).toBe(mockPrimaryPool);
+    });
+  });
+
+  // ── checkReplicationLag ────────────────────────────────────────────────────
+
+  describe('checkReplicationLag', () => {
+    it('returns null when no replica pool is available', async () => {
+      delete process.env['DATABASE_REPLICA_URL'];
+      await getReadPool();
+      const lag = await checkReplicationLag();
+      expect(lag).toBeNull();
+    });
+
+    it('returns null when replica is not healthy', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+      await getReadPool();
+      const lag = await checkReplicationLag();
+      expect(lag).toBeNull();
+    });
+
+    it('returns replication lag when replica is healthy and in recovery', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: 5.2 }] });
+      
+      await getReadPool();
+      const lag = await checkReplicationLag();
+      
+      expect(lag).toBe(5.2);
+      expect(dbReplicationLagSeconds.set).toHaveBeenCalledWith(5.2);
+    });
+
+    it('returns 0 when replica is not in recovery', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: 0 }] });
+      
+      await getReadPool();
+      const lag = await checkReplicationLag();
+      
+      expect(lag).toBe(0);
+      expect(dbReplicationLagSeconds.set).toHaveBeenCalledWith(0);
+    });
+
+    it('returns cached value when called within 30 seconds', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      mockQuery.mockResolvedValueOnce({ rows: [{ lag_seconds: 3.1 }] });
+      
+      await getReadPool();
+      const lag1 = await checkReplicationLag();
+      const lag2 = await checkReplicationLag();
+      
+      expect(lag1).toBe(3.1);
+      expect(lag2).toBe(3.1);
+      // Should only call query once (first check)
+      expect(mockQuery).toHaveBeenCalledTimes(2); // health check + first lag check
+    });
+
+    it('logs warning and returns null when lag check fails', async () => {
+      process.env['DATABASE_REPLICA_URL'] = 'postgresql://replica:5432/fluxora';
+      mockQuery.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+      mockQuery.mockRejectedValueOnce(new Error('Query failed'));
+      
+      const { logger } = await import('../../src/lib/logger.js');
+      await getReadPool();
+      const lag = await checkReplicationLag();
+      
+      expect(lag).toBeNull();
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Failed to check replication lag',
+        undefined,
+        { error: 'Query failed' }
+      );
+      expect(dbReplicationLagSeconds.set).toHaveBeenCalledWith(NaN);
     });
   });
 });

@@ -36,8 +36,12 @@ import { authenticate, requireAuth, requirePermission, Permission } from '../mid
 import { successResponse, errorResponse } from '../utils/response.js';
 import { ReplayRequestSchema, parseBody, formatZodIssues } from '../validation/schemas.js';
 import { logger } from '../lib/logger.js';
+import { mtlsValidationMiddleware } from '../indexer/mtls.js';
 
 export const indexerRouter = Router();
+
+// Apply mTLS validation for all indexer endpoints
+indexerRouter.use(mtlsValidationMiddleware);
 
 // ── Internal worker-token auth ────────────────────────────────────────────────
 

@@ -218,9 +218,10 @@ export function sendEarlyHintsWithBoth(
     if (typeof resWithProcessing.writeProcessing === 'function') {
       setImmediate(() => {
         try {
-          if (!res.headersSent && resWithProcessing.writeProcessing) {
+          const writeProcessing = resWithProcessing.writeProcessing;
+          if (!res.headersSent && writeProcessing) {
             links.forEach((linkHeader) => {
-              resWithProcessing.writeProcessing('Link', linkHeader);
+              writeProcessing('Link', linkHeader);
             });
             debug('Early Hints: sent 103 with multiple Link headers', {
               linkCount: links.length,

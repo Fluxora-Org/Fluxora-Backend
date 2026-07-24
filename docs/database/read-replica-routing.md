@@ -66,7 +66,7 @@ configuration:
 If you need different sizing for the replica, this can be extended with
 dedicated env vars in a future iteration.
 
-## Initialisation & Fallback
+## Initialization & Fallback
 
 `getReadPool()` is **lazy** — the replica pool is not created until the
 first read query executes. On the first call:
@@ -82,6 +82,26 @@ first read query executes. On the first call:
 
 The decision is cached after the first call — there is no per-query
 overhead.
+
+## Read-After-Write Consistency
+
+For use cases where you need to read data that was just written (read-after-write consistency),
+you can force the query to use the primary pool by passing `forcePrimary: true` to `getReadPool()`:
+
+```typescript
+import { getReadPool } from '../db/replicaPool';
+
+// Force read from primary for consistency
+const pool = await getReadPool({ forcePrimary: true });
+const result = await query(pool, 'SELECT …');
+```
+
+## Replication Lag Monitoring
+
+Replication lag is monitored via `checkReplicationLag()` and exposed as a Prometheus metric:
+- `fluxora_db_replication_lag_seconds`: Gauge showing current replication lag in seconds
+
+The lag check runs at most every 30 seconds to avoid excessive database load.
 
 ## Security
 
@@ -129,6 +149,7 @@ Connection strings are **never** logged. Only the hostname is extracted
 | `Read-replica pool initialised`                          | info  | Replica connected and healthy              |
 | `Replica health-check failed — falling back to primary`  | warn  | Replica unreachable; using primary         |
 | `Replica pool error`                                     | error | Runtime error on an existing replica conn  |
+| `Failed to check replication lag`                        | warn  | Replication lag check failed               |
 
 ### Health endpoint
 
@@ -149,7 +170,9 @@ The tests cover:
 - Fallback to primary pool
 - Read-only enforcement on connect
 - Singleton caching behaviour
-- Reset / re-initialisation
+- Reset / re-initialization
+- Force primary option
+- Replication lag check
 
 ## Troubleshooting
 
@@ -157,4 +180,4 @@ The tests cover:
 |---------|-------------|-----|
 | Reads still hitting primary despite `DATABASE_REPLICA_URL` being set | Health-check failed on startup | Check replica connectivity; restart the application |
 | `cannot execute INSERT in a read-only transaction` | Write query accidentally routed to replica | Ensure write operations use `getPool()`, not `getReadPool()` |
-| Stale data on reads | Replication lag | Monitor `pg_stat_replication` on primary; consider synchronous replication for critical reads |
+| Stale data on reads | Replication lag | Use `forcePrimary: true` for read-after-write consistency; monitor `fluxora_db_replication_lag_seconds` metric |
