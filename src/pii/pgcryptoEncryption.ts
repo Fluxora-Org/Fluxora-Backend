@@ -15,6 +15,7 @@
  */
 
 import crypto from 'crypto';
+import { pathToFileURL } from 'url';
 import { WorkerPool, BATCH_HASH_THRESHOLD, resolveWorkerUrl, type WorkerPoolOptions } from './workerPool.js';
 import type { HashTaskMessage, HashResultMessage } from './pgcryptoWorker.js';
 
@@ -103,7 +104,7 @@ let _pool: WorkerPool | null = null;
  */
 function getPool(): WorkerPool {
   if (_pool === null) {
-    const workerUrl = resolveWorkerUrl(import.meta.url, './pgcryptoWorker');
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), './pgcryptoWorker');
     const poolOpts: WorkerPoolOptions = {};
     _pool = new WorkerPool(workerUrl, poolOpts);
 

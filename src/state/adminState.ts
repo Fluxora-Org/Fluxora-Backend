@@ -247,7 +247,10 @@ export async function triggerReindex(): Promise<ReindexState> {
     }
 
     // Re-check after acquiring lock (double-checked locking pattern).
-    if (state.reindex.status === 'running') {
+    // Cast to widen: `state.reindex` may have been reassigned by a concurrent
+    // caller during the `await` above, but TS's narrowing from the early
+    // return doesn't account for mutation across an await boundary.
+    if ((state.reindex.status as ReindexStatus) === 'running') {
       await lock.release();
       return { ...state.reindex };
     }
@@ -283,6 +286,15 @@ export async function triggerReindex(): Promise<ReindexState> {
   runReindexJob().catch(() => { /* errors are captured in state */ });
 
   return { ...state.reindex };
+}
+
+/**
+ * Kick off a simulated reindex for a specific stream.
+ * In production this would trigger a stream-specific Horizon replay.
+ */
+export async function triggerStreamReindex(streamId: string): Promise<ReindexState> {
+  logger.info('Triggering stream-specific reindex', undefined, { streamId });
+  return triggerReindex();
 }
 
 async function runReindexJob(): Promise<void> {

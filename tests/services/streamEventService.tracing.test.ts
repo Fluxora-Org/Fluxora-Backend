@@ -51,7 +51,7 @@ vi.mock('@opentelemetry/api', () => ({
   SpanStatusCode: { OK: 0, ERROR: 1 },
 }));
 
-import { streamEventService } from '../../src/services/streamEventService.js';
+import { streamEventService, _resetDedupCache } from '../../src/services/streamEventService.js';
 import type {
   StreamCreatedEvent,
   StreamUpdatedEvent,
@@ -96,11 +96,12 @@ const cancelledEvent: StreamCancelledEvent = {
 describe('streamEventService.processEvent tracing', () => {
   let buffer: SpanBuffer;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     resetTracer();
     buffer = new SpanBuffer({ logEvents: false });
     initializeTracer({ enabled: true, hooks: buffer });
     vi.clearAllMocks();
+    await _resetDedupCache();
   });
 
   it('creates a parent span for StreamCreated with eventType attribute', async () => {

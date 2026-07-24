@@ -9,6 +9,12 @@
  *   - Broadcast stream update events to all subscribed clients.
  *   - Apply backpressure to slow/stalled clients.
  *   - Optionally enforce JWT authentication on upgrade (WS_AUTH_REQUIRED).
+ *   - Opt-in micro-batching: coalesce rapid events per stream into a single
+ *     `stream_update_batch` frame per client within a configurable flush
+ *     window (WS_BATCH_FLUSH_MS, default 50 ms) and max-batch-size cap
+ *     (WS_BATCH_MAX_SIZE, default 25 events).  Clients that do not pass
+ *     `batching: true` in their subscription filter receive the unchanged
+ *     one-frame-per-event behaviour.
  *
  * ## WebSocket JWT Auth (optional, backward-compatible)
  *
@@ -38,7 +44,7 @@ import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError, type ContractEventStore } from '../indexer/store.js';
-import { SSE_STREAM_UPDATE_EVENT, sseEventBus } from '../streams/sseEmitter.js';
+import { SSE_STREAM_UPDATE_EVENT, sseEventBus, SSE_CLOSE_REASONS } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -58,8 +64,12 @@ import {
 import {
   collectWsBackpressureMetrics,
   removeWsClientBackpressureGauge,
+  recordWsBroadcastBatchFlushLatency,
   DEFAULT_WS_BACKPRESSURE_INTERVAL_MS,
   DEFAULT_WS_SLOW_CLIENT_BYTES,
+  wsBatchFlushTotal,
+  wsBatchEventsCoalescedTotal,
+  wsBatchSizeExceededTotal,
 } from '../metrics/wsBackpressure.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -71,6 +81,46 @@ export const RATE_LIMIT_WINDOW_MS = 10_000;
 export const BACKPRESSURE_DROP_BYTES = 1 * 1024 * 1024;
 export const BACKPRESSURE_TERMINATE_BYTES = 4 * 1024 * 1024;
 export const FANOUT_YIELD_BATCH = 256;
+
+// ── Micro-batching configuration ──────────────────────────────────────────────
+
+/**
+ * Minimum/maximum allowed values for the two batching env-vars.
+ * Clamping prevents pathological values (e.g. a 0 ms flush window or an
+ * unbounded max-size that overflows MAX_MESSAGE_BYTES).
+ */
+const BATCH_FLUSH_MS_MIN = 5;
+const BATCH_FLUSH_MS_MAX = 5_000;
+const BATCH_MAX_SIZE_MIN = 1;
+const BATCH_MAX_SIZE_MAX = 500;
+
+/**
+ * Flush window in milliseconds.  After the first event enters a client's
+ * batch accumulator, a timer fires after this many milliseconds and flushes
+ * all queued events as a single `stream_update_batch` frame.
+ *
+ * Configurable via `WS_BATCH_FLUSH_MS` (clamped to 5–5 000 ms).
+ * Default: 50 ms.
+ */
+export const WS_BATCH_FLUSH_MS: number = (() => {
+  const raw = parseInt(process.env['WS_BATCH_FLUSH_MS'] ?? '', 10);
+  if (!Number.isFinite(raw)) return 50;
+  return Math.max(BATCH_FLUSH_MS_MIN, Math.min(BATCH_FLUSH_MS_MAX, raw));
+})();
+
+/**
+ * Maximum number of events per batch before triggering an early (pre-window)
+ * flush.  Keeps individual frames well below MAX_MESSAGE_BYTES even when a
+ * stream emits a very high burst.
+ *
+ * Configurable via `WS_BATCH_MAX_SIZE` (clamped to 1–500).
+ * Default: 25.
+ */
+export const WS_BATCH_MAX_SIZE: number = (() => {
+  const raw = parseInt(process.env['WS_BATCH_MAX_SIZE'] ?? '', 10);
+  if (!Number.isFinite(raw)) return 25;
+  return Math.max(BATCH_MAX_SIZE_MIN, Math.min(BATCH_MAX_SIZE_MAX, raw));
+})();
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -106,6 +156,38 @@ interface ConnectionMetrics {
   messagesSent: number;
   bytesReceived: number;
   bytesSent: number;
+}
+
+// ── Micro-batching types ───────────────────────────────────────────────────────
+
+/**
+ * A single event entry stored in a client's per-stream batch accumulator while
+ * waiting for the flush window to expire.
+ */
+interface BatchedEvent {
+  /** Stream identifier (same for all entries in the accumulator). */
+  streamId: string;
+  /** Unique event identifier — preserved for in-order delivery. */
+  eventId: string;
+  /** Opaque event payload forwarded verbatim to the client. */
+  payload: unknown;
+  /** Correlation ID to forward with the batch frame (may be undefined). */
+  correlationId: string | undefined;
+}
+
+/**
+ * Per-client, per-stream accumulator for the micro-batching layer.
+ *
+ * Keyed by `${connectionId}:${streamId}` inside `StreamHub._batchAccumulators`.
+ * The `timer` field holds the scheduled flush timeout so it can be cancelled
+ * on client disconnect or hub shutdown.
+ */
+interface ClientBatchAccumulator {
+  events: BatchedEvent[];
+  /** `setTimeout` handle for the pending flush. */
+  timer: NodeJS.Timeout;
+  /** Timestamp (ms) the accumulator was created — i.e. when its oldest event arrived. */
+  createdAt: number;
 }
 
 interface ClientState {
@@ -159,6 +241,20 @@ export interface StreamHubOptions {
    * slowThresholdBytes = `DEFAULT_WS_SLOW_CLIENT_BYTES` (1 MiB).
    */
   backpressureCollector?: StreamHubBackpressureCollectorOptions;
+  /**
+   * Micro-batching tunables.  When absent, the module-level env-var defaults
+   * (`WS_BATCH_FLUSH_MS`, `WS_BATCH_MAX_SIZE`) are used.  Providing these in
+   * tests lets suites run at faster cadences without mutating env vars.
+   *
+   * @param flushMs   Flush-window duration in milliseconds (5–5 000).
+   * @param maxSize   Max events per batch before an early flush (1–500).
+   */
+  batching?: {
+    /** Override for WS_BATCH_FLUSH_MS (clamped to 5–5 000 ms). */
+    flushMs?: number;
+    /** Override for WS_BATCH_MAX_SIZE (clamped to 1–500). */
+    maxSize?: number;
+  };
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -175,6 +271,18 @@ export class StreamHub extends EventEmitter {
   private eventStore: ContractEventStore | undefined;
   private readonly backpressureCollectorInterval: NodeJS.Timeout | undefined;
   private readonly backpressureSlowThresholdBytes: number;
+
+  // ── Micro-batching state ─────────────────────────────────────────────────
+  /**
+   * Pending batch accumulators keyed by `${connectionId}:${streamId}`.
+   * Each entry holds the buffered events and a pending flush timer.
+   * Cleared on client disconnect or hub close.
+   */
+  private readonly batchAccumulators = new Map<string, ClientBatchAccumulator>();
+  /** Flush window in ms (from options or WS_BATCH_FLUSH_MS env var). */
+  private readonly batchFlushMs: number;
+  /** Max events per batch before early flush (from options or WS_BATCH_MAX_SIZE). */
+  private readonly batchMaxSize: number;
 
   public getEventStore(): ContractEventStore | undefined {
     return this.eventStore;
@@ -212,6 +320,16 @@ export class StreamHub extends EventEmitter {
       collectorOpts?.intervalMs ?? DEFAULT_WS_BACKPRESSURE_INTERVAL_MS;
     this.backpressureSlowThresholdBytes =
       collectorOpts?.slowThresholdBytes ?? DEFAULT_WS_SLOW_CLIENT_BYTES;
+
+    // ── Micro-batching ────────────────────────────────────────────────────
+    // Options take precedence over env vars so tests can tune without
+    // touching process.env.  Both values are clamped to sane bounds.
+    this.batchFlushMs = options?.batching?.flushMs !== undefined
+      ? Math.max(5, Math.min(5_000, options.batching.flushMs))
+      : WS_BATCH_FLUSH_MS;
+    this.batchMaxSize = options?.batching?.maxSize !== undefined
+      ? Math.max(1, Math.min(500, options.batching.maxSize))
+      : WS_BATCH_MAX_SIZE;
 
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
@@ -444,6 +562,15 @@ export class StreamHub extends EventEmitter {
       this.removeSubscriptionFromIndexes(ws, filter);
     }
 
+    // Cancel any pending batch flush timers for this client to prevent sending
+    // frames to a closed socket and to release accumulator memory immediately.
+    for (const [key, acc] of this.batchAccumulators) {
+      if (key.startsWith(`${state.id}:`)) {
+        clearTimeout(acc.timer);
+        this.batchAccumulators.delete(key);
+      }
+    }
+
     // Remove the per-client gauge time series so it doesn't accumulate.
     removeWsClientBackpressureGauge(state.id);
 
@@ -648,10 +775,10 @@ export class StreamHub extends EventEmitter {
     return targets.length;
   }
 
-  // ── Broadcast ──────────────────────────────────────────────────────────────
+  // ── Broadcast & Micro-Batching ─────────────────────────────────────────────
 
   async broadcast(event: StreamUpdateEvent): Promise<void> {
-    const { streamId, eventId, payload } = event;
+    const { streamId, eventId } = event;
 
     if (await this.dedup.has(streamId, eventId)) return;
     await this.dedup.add(streamId, eventId);
@@ -659,33 +786,247 @@ export class StreamHub extends EventEmitter {
     // Emit to Server-Sent Events bus
     sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, event);
 
+    this.dispatchImmediate(event);
+  }
+
+  private dispatchImmediate(event: StreamUpdateEvent): void {
+    const { streamId, eventId, payload } = event;
     const subscribers = this.matchingSubscribers(event);
     if (subscribers.size === 0) return;
 
-    const correlationId = getCorrelationId();
+    // Prefer an explicit correlationId on the event (e.g. set by the indexer
+    // ingestion path) over the ambient tracing-middleware value so that batch
+    // frames faithfully echo the per-event correlation identifier.
+    const correlationId = event.correlationId ?? getCorrelationId();
+
+    // ── Split subscribers by opt-in batching flag ─────────────────────────
+    // A subscriber opts in to batching by including `batching: true` in its
+    // subscription filter for the matching stream.  Clients that did NOT opt
+    // in receive the existing one-frame-per-event path unchanged.
+    const immediateTargets: WebSocket[] = [];
+
+    for (const ws of subscribers) {
+      const state = this.clients.get(ws);
+      if (!state) continue;
+
+      // Check whether *any* of this client's active subscription filters for
+      // this stream/recipient has batchingEnabled set.
+      let wantsBatching = false;
+      for (const filter of state.subscriptionFilters.values()) {
+        if (filter.batchingEnabled) {
+          wantsBatching = true;
+          break;
+        }
+      }
+
+      if (wantsBatching) {
+        this.enqueueBatch(ws, state, { streamId, eventId, payload, correlationId });
+      } else {
+        immediateTargets.push(ws);
+      }
+    }
+
+    // ── Immediate (non-batched) fanout ────────────────────────────────────
+    if (immediateTargets.length === 0) return;
+
     const message = JSON.stringify({
       type: 'stream_update',
-      streamId,
-      eventId,
-      payload,
+      streamId: event.streamId,
+      eventId: event.eventId,
+      payload: event.payload,
       correlationId,
     });
-    const targets = Array.from(subscribers);
 
-    if (targets.length <= FANOUT_YIELD_BATCH) {
-      this.deliverBatch(targets, message, streamId, eventId);
+    if (immediateTargets.length <= FANOUT_YIELD_BATCH) {
+      this.deliverBatch(immediateTargets, message, streamId, eventId);
       return;
     }
 
     const self = this;
     let i = 0;
     function next(): void {
-      const end = Math.min(i + FANOUT_YIELD_BATCH, targets.length);
-      self.deliverBatch(targets.slice(i, end), message, streamId, eventId);
+      const end = Math.min(i + FANOUT_YIELD_BATCH, immediateTargets.length);
+      self.deliverBatch(immediateTargets.slice(i, end), message, streamId, eventId);
       i = end;
-      if (i < targets.length) setImmediate(next);
+      if (i < immediateTargets.length) setImmediate(next);
     }
     next();
+  }
+
+  // ── Micro-batching ─────────────────────────────────────────────────────────
+
+  /**
+   * Enqueue a single event into the client's per-stream batch accumulator.
+   *
+   * If no accumulator exists for `(connectionId, streamId)`, one is created
+   * and a flush timer is started.  If adding this event fills the accumulator
+   * to `batchMaxSize`, a synchronous early flush is triggered and the Prometheus
+   * `wsBatchSizeExceededTotal` counter is incremented.
+   *
+   * @param ws    The destination WebSocket (server-side handle).
+   * @param state The corresponding `ClientState` for `ws`.
+   * @param entry The event to buffer.
+   *
+   * @security Only server-originated, already-deduped events are enqueued;
+   *   no client-supplied data reaches this method unvalidated.
+   */
+  private enqueueBatch(ws: WebSocket, state: ClientState, entry: BatchedEvent): void {
+    const key = `${state.id}:${entry.streamId}`;
+    let acc = this.batchAccumulators.get(key);
+
+    if (!acc) {
+      // First event in this window — create accumulator and arm timer.
+      const timer = setTimeout(() => {
+        this.flushBatch(ws, key, false);
+      }, this.batchFlushMs);
+      // Allow the process to exit without waiting for the timer.
+      if (typeof timer.unref === 'function') timer.unref();
+
+      acc = { events: [], timer, createdAt: Date.now() };
+      this.batchAccumulators.set(key, acc);
+    }
+
+    acc.events.push(entry);
+
+    // Early flush if the batch is full.
+    if (acc.events.length >= this.batchMaxSize) {
+      clearTimeout(acc.timer);
+      this.batchAccumulators.delete(key);
+      this.flushBatchDirect(ws, entry.streamId, acc.events, true, acc.createdAt);
+    }
+  }
+
+  /**
+   * Timer-driven flush: reads the accumulator and dispatches a batch frame.
+   * The accumulator entry is always removed here so memory is freed even if
+   * the client has disconnected in the interim.
+   *
+   * @param ws         Target WebSocket.
+   * @param key        Accumulator map key (`${connectionId}:${streamId}`).
+   * @param earlyFlush `true` when triggered by max-size, `false` for timer.
+   */
+  private flushBatch(ws: WebSocket, key: string, earlyFlush: boolean): void {
+    const acc = this.batchAccumulators.get(key);
+    if (!acc) return; // already flushed (e.g. on disconnect cleanup)
+
+    this.batchAccumulators.delete(key);
+
+    const streamId = key.slice(key.indexOf(':') + 1);
+    this.flushBatchDirect(ws, streamId, acc.events, earlyFlush, acc.createdAt);
+  }
+
+  /**
+   * Serialise and deliver a batch of events as a single `stream_update_batch`
+   * frame.  Applies the same backpressure checks as `deliverBatch`.
+   *
+   * Frame schema:
+   * ```json
+   * {
+   *   "type": "stream_update_batch",
+   *   "streamId": "…",
+   *   "events": [
+   *     { "eventId": "…", "payload": {…}, "correlationId": "…" },
+   *     …
+   *   ]
+   * }
+   * ```
+   *
+   * @security The serialised frame is bounded by the accumulator size
+   *   (`batchMaxSize`) and the payload sizes deduped upstream. If the
+   *   resulting JSON would exceed `MAX_MESSAGE_BYTES`, the frame is silently
+   *   truncated to the largest sub-array that fits (events are still
+   *   delivered in order; the remainder is discarded rather than silently
+   *   dropped from dedup — the dedup cache already recorded each eventId so
+   *   they will not be re-delivered by a future broadcast).
+   */
+  private flushBatchDirect(
+    ws: WebSocket,
+    streamId: string,
+    events: BatchedEvent[],
+    earlyFlush: boolean,
+    createdAt: number,
+  ): void {
+    if (events.length === 0) return;
+
+    recordWsBroadcastBatchFlushLatency((Date.now() - createdAt) / 1000);
+
+    if (ws.readyState !== WebSocket.OPEN) return;
+
+    // Trim to MAX_MESSAGE_BYTES safety cap (in-order, keep first N events).
+    let safeEvents = events;
+    const fullFrame = JSON.stringify({
+      type: 'stream_update_batch',
+      streamId,
+      events: safeEvents.map(({ eventId, payload, correlationId }) => ({
+        eventId,
+        payload,
+        ...(correlationId !== undefined ? { correlationId } : {}),
+      })),
+    });
+
+    if (Buffer.byteLength(fullFrame, 'utf8') > MAX_MESSAGE_BYTES) {
+      // Binary-search for the largest safe prefix.
+      let lo = 1;
+      let hi = safeEvents.length - 1;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        const candidate = JSON.stringify({
+          type: 'stream_update_batch',
+          streamId,
+          events: events.slice(0, mid).map(({ eventId, payload, correlationId }) => ({
+            eventId,
+            payload,
+            ...(correlationId !== undefined ? { correlationId } : {}),
+          })),
+        });
+        if (Buffer.byteLength(candidate, 'utf8') <= MAX_MESSAGE_BYTES) {
+          lo = mid;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      safeEvents = events.slice(0, lo);
+    }
+
+    if (safeEvents.length === 0) return;
+
+    const message = JSON.stringify({
+      type: 'stream_update_batch',
+      streamId,
+      events: safeEvents.map(({ eventId, payload, correlationId }) => ({
+        eventId,
+        payload,
+        ...(correlationId !== undefined ? { correlationId } : {}),
+      })),
+    });
+
+    // Backpressure check — same thresholds as the non-batched path.
+    const buffered = ws.bufferedAmount;
+    if (buffered > this.terminateBytes) {
+      this.metrics.terminatedConnections++;
+      this.metrics.droppedMessages += safeEvents.length;
+      try { ws.terminate(); } catch { /* ignore */ }
+      this.onDisconnect(ws);
+      return;
+    }
+    if (buffered > this.dropBytes) {
+      this.metrics.droppedMessages += safeEvents.length;
+      return;
+    }
+
+    ws.send(message);
+    this.metrics.sentMessages++;
+
+    const state = this.clients.get(ws);
+    if (state) {
+      state.metrics.messagesSent += 1;
+      state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
+    }
+
+    // Update Prometheus batch counters.
+    wsBatchFlushTotal.inc();
+    wsBatchEventsCoalescedTotal.inc(safeEvents.length);
+    if (earlyFlush) wsBatchSizeExceededTotal.inc();
   }
 
   private matchingSubscribers(event: StreamUpdateEvent): Set<WebSocket> {
@@ -885,6 +1226,18 @@ export class StreamHub extends EventEmitter {
     return this.clients.entries();
   }
 
+  /**
+   * Internal entry-point used by the subscription cardinality collector to
+   * enumerate stream subscription counts. Underscore-prefixed because it
+   * exposes internal map references — callers MUST treat them as read-only.
+   *
+   * @security Exposes only streamId keys and subscriber Set sizes; no
+   *           WebSocket references or client state is leaked.
+   */
+  _getStreamSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
+    return this.streamSubscriptions;
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
@@ -982,8 +1335,20 @@ export class StreamHub extends EventEmitter {
     if (this.backpressureCollectorInterval) {
       clearInterval(this.backpressureCollectorInterval);
     }
+    // Cancel all pending batch flush timers before closing.
+    for (const acc of this.batchAccumulators.values()) {
+      clearTimeout(acc.timer);
+    }
+    this.batchAccumulators.clear();
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
+  }
+
+  async gracefulClose(): Promise<void> {
+    for (const ws of this.clients.keys()) {
+      ws.close(1001, JSON.stringify({ reason: SSE_CLOSE_REASONS.SERVER_SHUTDOWN }));
+    }
+    await this.close();
   }
 
   async _resetDedup(): Promise<void> {
@@ -994,6 +1359,14 @@ export class StreamHub extends EventEmitter {
     this.metrics.droppedMessages = 0;
     this.metrics.terminatedConnections = 0;
     this.metrics.sentMessages = 0;
+  }
+
+  /** Cancel all pending batch timers and clear accumulators. For tests only. */
+  _resetBatchAccumulators(): void {
+    for (const acc of this.batchAccumulators.values()) {
+      clearTimeout(acc.timer);
+    }
+    this.batchAccumulators.clear();
   }
 }
 

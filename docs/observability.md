@@ -60,6 +60,28 @@ histogram_quantile(0.99, rate(fluxora_db_query_duration_seconds_bucket[5m]))
 
 Every PostgreSQL query is timed. When duration ≥ `SLOW_QUERY_THRESHOLD_MS`, a structured OCSF log entry is emitted and a Prometheus counter is incremented.
 
+## Server-Timing response header
+
+Fluxora can return a W3C-compatible `Server-Timing` response header for the streams API so browser developer tools and ad-hoc debugging can see a compact latency breakdown without enabling the OpenTelemetry backend.
+
+### How it works
+
+- Middleware creates a request-scoped registry attached to `res.locals` when `SERVER_TIMING_ENABLED=true`.
+- Route handlers record named phases for `db`, `stellar_rpc`, and `serialize` by pushing sanitized values into the registry.
+- The final header is emitted once per response and contains only phase names and durations.
+
+### Security guarantees
+
+- The header contains no hostnames, query strings, URLs, or PII.
+- Phase names are restricted to a safe token format and durations are rounded to milliseconds.
+- The feature is disabled by default and adds negligible overhead when `SERVER_TIMING_ENABLED` is unset or false.
+
+### Example
+
+```http
+Server-Timing: db;dur=12.5, serialize;dur=3.75
+```
+
 ### Prometheus Counter
 
 ```
@@ -148,6 +170,19 @@ The per-client gauges below expose `ws.bufferedAmount` directly so operators can
 | `fluxora_ws_backpressure_buffered_bytes` | Gauge | `connection_id` (UUID v4) | Current `ws.bufferedAmount` per connected `/ws/streams` client, in bytes. Sampled every 5s by the hub's collector and rounded to non-negative integers. |
 | `fluxora_ws_max_buffered_bytes` | Gauge | — | Maximum `ws.bufferedAmount` observed across all live clients at the most recent sample. Useful for dashboards: spikes here precede drops. |
 | `fluxora_ws_slow_clients` | Gauge | — | Count of live clients whose `bufferedAmount` exceeds the slow threshold (default 1 MiB). |
+| `fluxora_ws_broadcast_batch_flush_seconds` | Histogram | — | Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush. Bounded O(1) cardinality (zero labels). |
+
+### Micro-Batch Broadcast Flush Latency
+
+When WebSocket broadcast micro-batching (flush-window coalescing) is enabled via `flushWindowMs > 0`, events are held briefly to coalesce outbound socket frames. Operators tune `flushWindowMs` to balance network frame overhead against delivery latency.
+
+`fluxora_ws_broadcast_batch_flush_seconds` records, per batch flush, the age (in seconds) of the oldest event included in that flush.
+
+**Bucket layout (seconds):**  
+`0.0001` (0.1ms), `0.0005` (0.5ms), `0.001` (1ms), `0.0025` (2.5ms), `0.005` (5ms), `0.01` (10ms), `0.025` (25ms), `0.05` (50ms), `0.1` (100ms), `0.25` (250ms), `0.5` (500ms), `1.0` (1s), `2.5` (2.5s), `5.0` (5s).
+
+**Zero-Overhead Guarantee:**  
+When micro-batching is disabled (default `flushWindowMs: 0`, single-event-per-frame mode), this metric is a complete no-op with zero runtime overhead and zero histogram observations recorded.
 
 ### Label cardinality and security
 
@@ -206,6 +241,67 @@ fluxora_ws_slow_clients > 5
 
 ---
 
+## WebSocket Subscription Cardinality Gauge
+
+A single stream with an unusually large subscriber count can drive disproportionate broadcast fan-out, consuming CPU and network bandwidth while increasing backpressure risk for every other stream. The subscription cardinality gauge reports the subscriber count for the top-N most-subscribed streams so operators can identify hot streams before they cause incidents.
+
+### Metric
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `fluxora_ws_stream_subscriber_count` | Gauge | `stream_id` (application-assigned stream identifier) | Subscriber count for the top-N WebSocket streams by fan-out size. Only the N most-subscribed streams are reported (default N = 20). |
+
+### Label cardinality and security
+
+The `stream_id` label is the opaque stream identifier assigned by the application. It does not contain PII, client IPs, JWT subjects, or any user-controlled data.
+
+Cardinality is bounded by `DEFAULT_WS_STREAM_CARDINALITY_TOP_N` (20) — at most 20 time-series are emitted at any point. The collector sorts streams by subscriber count descending, keeps the top N, and explicitly removes stale series for streams that drop below the N-th rank between collection cycles. This prevents:
+
+- **Unbounded label growth** when many low-subscriber streams exist — only the top 20 are exposed.
+- **Stale series** lingering after a stream's subscribers leave — stale labels are cleaned up on the next collection cycle.
+
+An attacker cannot inflate Prometheus memory by creating many streams with a handful of subscribers each, because only the top-N are ever exposed regardless of how many total streams exist.
+
+### Configuration
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `DEFAULT_WS_STREAM_CARDINALITY_TOP_N` | `20` | Maximum number of streams reported by the gauge. Exported from `src/metrics/wsBackpressure.ts`. |
+
+### PromQL examples
+
+Top-5 streams by subscriber count:
+
+```promql
+topk(5, fluxora_ws_stream_subscriber_count)
+```
+
+Alert: any single stream with more than 500 subscribers (potential hot-stream):
+
+```promql
+fluxora_ws_stream_subscriber_count > 500
+```
+
+Total subscribers across all top-N streams (approximation of broadcast fan-out):
+
+```promql
+sum(fluxora_ws_stream_subscriber_count)
+```
+
+### Thresholding strategy
+
+- **`max(fluxora_ws_stream_subscriber_count) > 500` for > 5 min**: investigate the identified hot stream. High fan-out magnifies the cost of every broadcast event — one slow client can trigger backpressure for all other subscribers on that stream.
+- **`topk(1, fluxora_ws_stream_subscriber_count)` divergence from `sum(fluxora_ws_stream_subscriber_count)`**: one stream dominates the total subscriber count, indicating fan-out concentration risk.
+- **Correlation with `fluxora_ws_slow_clients` rising**: a hot stream with slow clients compounds backpressure; identify the stream from the cardinality gauge and the slow clients from the per-client backpressure gauge.
+
+### Affected source files
+
+- `src/metrics/wsBackpressure.ts` — `wsStreamSubscriberCount` gauge definition + `collectStreamSubscriberCardinality` helper
+- `src/ws/hub.ts` — `_getStreamSubscriptions()` accessor exposing the internal `streamSubscriptions` map
+- `tests/ws/hub.subscriptionCardinality.test.ts` — top-N cap, stale-series removal, empty-hub, and reset assertions
+
+---
+
 ## Authentication Latency Histograms
 
 Auth runs on every protected request path. When the JWT verifier, revocation-store lookup, or API-key store becomes a bottleneck, these histograms give a distribution view (p50/p95/p99) and a split by success/failure — without leaking credential material.
@@ -254,3 +350,16 @@ This metric increments on thrown subscriber callbacks.
 
 SSE payloads and other stream-level data are not included in the log/metric labels (only `streamId` is logged; the payload is not logged).
 
+
+## Webhook Circuit Breaker Metrics
+
+We track state transitions for webhook circuit breakers to provide visibility into consumer endpoint health.
+
+### `fluxora_webhook_circuit_breaker_transitions_total`
+
+A Prometheus counter tracking state transitions (`closed`, `open`, `half-open`).
+
+Labels:
+- `from_state`: The previous state.
+- `to_state`: The new state.
+- `consumer_hash`: SHA256 hash of the consumer URL, truncated to 16 characters, to ensure bounded cardinality.
