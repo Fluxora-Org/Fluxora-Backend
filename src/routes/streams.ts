@@ -98,6 +98,7 @@ import {
   resolveSseConnectionLimits,
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
+import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
 import {
   RedisIdempotencyStore,
   NoOpIdempotencyStore,
@@ -529,9 +530,21 @@ streamsRouter.get(
       has_more: boolean;
       next_cursor: string | null;
       total?: number;
+      _meta?: { enhanced: boolean };
     } = { streams: pageStreams, has_more: hasMore, next_cursor: nextCursor };
 
     if (includeTotal && result!.total !== undefined) response.total = result!.total;
+
+    // Feature flag: streams_enhanced_response — add _meta field for opted-in requesters.
+    // The requester is identified by API key or IP; falls back to 'anonymous'.
+    // This is a zero-risk opt-in: if the flag is not configured, enhanced stays false.
+    const requesterId: string =
+      (req as unknown as Record<string, unknown>)['apiKey'] as string
+        ?? req.ip
+        ?? 'anonymous';
+    if (isFlagEnabled('streams_enhanced_response', requesterId)) {
+      response._meta = { enhanced: true };
+    }
 
     // Cache only when every stream on the page is in a terminal state.
     // An empty page is treated as all-terminal (nothing mutable present).

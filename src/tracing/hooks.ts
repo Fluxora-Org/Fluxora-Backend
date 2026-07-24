@@ -101,6 +101,232 @@ export interface TracerHooks {
   onError?(correlationId: string, error: Error, context?: Record<string, unknown>): void;
 }
 
+// ── Sampling Strategies ───────────────────────────────────────────────────────
+
+/**
+ * Available trace sampling strategies.
+ *
+ * - `'head'`   — Decision made at trace start using a deterministic hash of the
+ *                traceId. Guarantees consistent sampling across all services that
+ *                share the same traceId.
+ * - `'tail'`   — Decision deferred to span completion. Allows retaining spans
+ *                that contain errors regardless of the base sample rate.
+ * - `'always'` — Every span is sampled. Useful for development/testing.
+ * - `'never'`  — No spans are sampled. Effectively disables tracing output.
+ */
+export type SamplingStrategy = 'head' | 'tail' | 'always' | 'never';
+
+/**
+ * Head-based sampling configuration.
+ *
+ * The sampling decision is made once at the start of a trace using a
+ * deterministic FNV-1a hash of the traceId. The same traceId will always
+ * produce the same decision across all service replicas.
+ *
+ * Optional per-route overrides allow specific routes to use a different sample
+ * rate than the global default (e.g., suppress health-check noise or capture
+ * all payment traces).
+ */
+export interface HeadSamplingConfig {
+  strategy: 'head';
+  /** Global sample rate, 0.0–1.0. */
+  sampleRate: number;
+  /**
+   * Per-route sample rate overrides. Keys are route path strings.
+   * Exact matches take precedence over prefix matches.
+   *
+   * Example: `{ "/health": 0, "/api/payments": 1 }`
+   */
+  perRouteOverrides?: Record<string, number>;
+}
+
+/**
+ * Tail-based sampling configuration.
+ *
+ * The sampling decision is made at span completion time. This enables error
+ * retention: spans that carry an error status or an event named `'error'` are
+ * always kept, even if the base sample rate would normally discard them.
+ *
+ * **Important:** This implementation does NOT buffer all spans in memory.
+ * It checks the span's status and events at `onSpanEnd` time, which means only
+ * the single span under evaluation is inspected — not child spans that may have
+ * been emitted earlier. Full distributed tail sampling (which requires buffering
+ * all spans in a trace until the root span ends) is out of scope.
+ */
+export interface TailSamplingConfig {
+  strategy: 'tail';
+  /**
+   * When `true`, any span whose status is `'error'`, or that contains a span
+   * event named `'error'`, is always retained regardless of `sampleRate`.
+   */
+  keepErrorSpans: boolean;
+  /** Base sample rate applied to non-error spans, 0.0–1.0. */
+  sampleRate: number;
+}
+
+/**
+ * Union of all supported sampling configuration shapes.
+ *
+ * @example
+ * // Head-based, sample 10 % globally, always capture /api/payments
+ * const cfg: SamplingConfig = {
+ *   strategy: 'head',
+ *   sampleRate: 0.1,
+ *   perRouteOverrides: { '/api/payments': 1 },
+ * };
+ *
+ * @example
+ * // Tail-based, keep all error spans + 5 % of successful spans
+ * const cfg: SamplingConfig = {
+ *   strategy: 'tail',
+ *   keepErrorSpans: true,
+ *   sampleRate: 0.05,
+ * };
+ */
+export type SamplingConfig =
+  | HeadSamplingConfig
+  | TailSamplingConfig
+  | { strategy: 'always' }
+  | { strategy: 'never' };
+
+// ── FNV-1a constants (32-bit) ─────────────────────────────────────────────────
+// Using 32-bit arithmetic via bitwise ops so the result is a non-negative JS
+// integer and identical across every JavaScript engine/runtime.
+const FNV_OFFSET_BASIS_32 = 2166136261;
+const FNV_PRIME_32 = 16777619;
+
+/**
+ * Compute a 32-bit FNV-1a hash of `input` and return a non-negative integer.
+ *
+ * The algorithm is:
+ *   hash = FNV_OFFSET_BASIS
+ *   for each byte b in input:
+ *     hash = (hash XOR b) * FNV_PRIME  (mod 2^32)
+ *
+ * The result is forced into the unsigned 32-bit range with `>>> 0` so it is
+ * always a non-negative JS number (0 – 4 294 967 295).
+ */
+function fnv1a32(input: string): number {
+  let hash = FNV_OFFSET_BASIS_32;
+  for (let i = 0; i < input.length; i++) {
+    // charCodeAt is sufficient because traceIds are always ASCII hex strings.
+    hash ^= input.charCodeAt(i);
+    // Multiply mod 2^32, keeping result in unsigned 32-bit range.
+    hash = Math.imul(hash, FNV_PRIME_32) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Determine whether a trace should be sampled using head-based (consistent)
+ * sampling.
+ *
+ * The decision is deterministic: the same `traceId` always produces the same
+ * result for a given `sampleRate`. This is critical when multiple services or
+ * replicas share the same traceId — they will all agree on whether to sample.
+ *
+ * Algorithm:
+ *   1. Hash `traceId` with FNV-1a (32-bit, non-negative).
+ *   2. `bucket = hash % 1000`  (values 0–999)
+ *   3. `sample = bucket < sampleRate * 1000`
+ *
+ * Edge cases:
+ * - `sampleRate <= 0`  → always returns `false`
+ * - `sampleRate >= 1`  → always returns `true`
+ *
+ * @param traceId    - Unique trace identifier (typically a hex string or UUID).
+ * @param sampleRate - Target sampling fraction, 0.0–1.0.
+ * @returns `true` if the trace should be sampled, `false` otherwise.
+ */
+export function shouldSampleHead(traceId: string, sampleRate: number): boolean {
+  if (sampleRate <= 0) return false;
+  if (sampleRate >= 1) return true;
+
+  const hash = fnv1a32(traceId);
+  const bucket = hash % 1000;
+  return bucket < Math.round(sampleRate * 1000);
+}
+
+/**
+ * Determine whether a span should be retained using tail-based sampling.
+ *
+ * Evaluation order:
+ * 1. If `config.keepErrorSpans` is `true` and the span's `status` is `'error'`,
+ *    **always** return `true`.
+ * 2. If `config.keepErrorSpans` is `true` and any span event is named `'error'`,
+ *    **always** return `true`.
+ * 3. Otherwise, apply a random sample using `config.sampleRate`.
+ *
+ * This function does **not** buffer spans in memory; it evaluates the single
+ * `span` argument at call time (typically inside `onSpanEnd`).
+ *
+ * @param span   - The span to evaluate (must be fully populated — endTimeMs set).
+ * @param config - Tail sampling configuration.
+ * @returns `true` if the span should be retained/exported.
+ */
+export function shouldSampleTail(span: Span, config: TailSamplingConfig): boolean {
+  if (config.keepErrorSpans) {
+    if (span.status === 'error') return true;
+    if (span.events.some((e) => e.name === 'error')) return true;
+  }
+  return Math.random() < config.sampleRate;
+}
+
+/**
+ * Resolve an effective sample rate for a given route path, consulting a map of
+ * per-route overrides.
+ *
+ * Resolution order:
+ * 1. **Exact match** — `overrides[route]` if it exists.
+ * 2. **Longest prefix match** — the longest key in `overrides` that is a prefix
+ *    of `route` (and is followed by `'/'` or is an exact match prefix).
+ * 3. Returns `undefined` if no match is found (caller should fall back to the
+ *    global sample rate).
+ *
+ * @param route     - The incoming request route path (e.g. `'/api/streams/123'`).
+ * @param overrides - Map of route paths to sample rates.
+ * @returns The overridden sample rate, or `undefined` if no override applies.
+ *
+ * @example
+ * const overrides = { '/health': 0, '/api': 0.5, '/api/payments': 1 };
+ * resolvePerRouteOverride('/health', overrides);           // 0
+ * resolvePerRouteOverride('/api/payments/123', overrides); // 1 (longest prefix)
+ * resolvePerRouteOverride('/api/streams', overrides);      // 0.5
+ * resolvePerRouteOverride('/metrics', overrides);          // undefined
+ */
+export function resolvePerRouteOverride(
+  route: string,
+  overrides: Record<string, number>,
+): number | undefined {
+  // 1. Exact match
+  if (Object.prototype.hasOwnProperty.call(overrides, route)) {
+    return overrides[route];
+  }
+
+  // 2. Longest prefix match — key must end at a path segment boundary
+  let bestKey: string | undefined;
+  let bestLength = -1;
+
+  for (const key of Object.keys(overrides)) {
+    if (key === route) continue; // already handled above
+    // The route must start with the key, and the next character (if any) must
+    // be '/' to avoid matching '/api' against '/apiv2'.
+    if (
+      route.startsWith(key) &&
+      (key.endsWith('/') || route[key.length] === '/')
+    ) {
+      if (key.length > bestLength) {
+        bestLength = key.length;
+        bestKey = key;
+      }
+    }
+  }
+
+  return bestKey !== undefined ? overrides[bestKey] : undefined;
+}
+
+// ── End of sampling strategy additions ───────────────────────────────────────
+
 /**
  * Configuration for the tracer.
  */
@@ -682,3 +908,192 @@ export function enrichActiveSpanWithStream(
   }
 }
 
+
+// ── Sampling Strategies ───────────────────────────────────────────────────────
+//
+// Issue #757: Head-based and tail-based trace sampling strategies.
+//
+// Head-based sampling: the decision to keep or drop a trace is made at the
+// beginning of the trace, keyed off the trace ID hash. Because the decision
+// is derived deterministically from the trace ID, all services in the call
+// graph that see the same trace ID make the same keep/drop decision, so you
+// never get partial traces.
+//
+// Tail-based sampling: the decision is made at span-end time based on the
+// span's outcome. The current implementation always keeps spans that contain
+// an error status or an error event, without buffering all spans in memory.
+//
+// Per-route overrides: individual API routes can have their own sample rates
+// configured via TRACING_PER_ROUTE_OVERRIDES (JSON env var), overriding the
+// global rate for traffic on that route.
+
+/**
+ * Available sampling strategy identifiers.
+ *
+ * - `'head'`   — deterministic decision keyed on trace ID (recommended for production)
+ * - `'tail'`   — decision made at span-end time; keeps error spans always
+ * - `'always'` — keep every span (useful for development / debugging)
+ * - `'never'`  — drop every span (useful for benchmarking overhead)
+ */
+export type SamplingStrategy = 'head' | 'tail' | 'always' | 'never';
+
+/**
+ * Configuration for head-based sampling.
+ *
+ * The sample decision is made once at trace creation time using a
+ * deterministic hash of the trace ID. All services observing the same
+ * trace ID will make the same decision.
+ */
+export interface HeadSamplingConfig {
+  strategy: 'head';
+  /** Fraction of traces to keep, in [0, 1]. Default 1.0 (keep all). */
+  sampleRate: number;
+  /**
+   * Per-route sample rate overrides.
+   * Keys are route path prefixes (e.g. `"/health"`, `"/api/streams"`).
+   * Values are sample rates in [0, 1].
+   * Exact matches are checked first; then longest prefix match.
+   */
+  perRouteOverrides?: Record<string, number>;
+}
+
+/**
+ * Configuration for tail-based sampling.
+ *
+ * The decision is made at span-end time. Error spans are always kept when
+ * `keepErrorSpans` is true, without requiring full in-memory buffering.
+ */
+export interface TailSamplingConfig {
+  strategy: 'tail';
+  /** Fraction of non-error spans to keep, in [0, 1]. Default 0.1. */
+  sampleRate: number;
+  /**
+   * When true, any span with status `'error'` or an event named `'error'`
+   * is always kept regardless of `sampleRate`.
+   */
+  keepErrorSpans: boolean;
+}
+
+/** Always-on (keep every span) sampling config. */
+export interface AlwaysSamplingConfig {
+  strategy: 'always';
+}
+
+/** Always-off (drop every span) sampling config. */
+export interface NeverSamplingConfig {
+  strategy: 'never';
+}
+
+/** Union of all supported sampling config shapes. */
+export type SamplingConfig =
+  | HeadSamplingConfig
+  | TailSamplingConfig
+  | AlwaysSamplingConfig
+  | NeverSamplingConfig;
+
+// ─── FNV-1a 32-bit hash (no dependencies, pure function) ──────────────────────
+
+/**
+ * Compute a 32-bit FNV-1a hash of a UTF-16 string.
+ *
+ * Used by head-based sampling so the trace-ID → keep/drop decision is:
+ * - Deterministic: same traceId → same hash → same bucket → same decision.
+ * - Uniform: good distribution across the [0, 999] bucket space.
+ * - Fast: O(n) time, zero allocations.
+ *
+ * @param input - Any string (typically a trace ID).
+ * @returns Unsigned 32-bit integer.
+ */
+export function samplingFnv1a32(input: string): number {
+  let hash = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = (hash >>> 0) * 16777619; // FNV prime
+    hash >>>= 0; // keep 32-bit unsigned
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Determine whether a trace should be sampled using head-based (upfront) logic.
+ *
+ * The bucket is derived as `samplingFnv1a32(traceId) % 1000`, giving 1000
+ * evenly-sized slots. A trace is kept when its bucket is less than
+ * `Math.round(sampleRate * 1000)`.
+ *
+ * This function is **pure** — identical inputs always produce identical
+ * outputs, across processes and replicas, with no shared state.
+ *
+ * @param traceId    - The W3C trace ID (hex string) or correlation ID.
+ * @param sampleRate - Fraction in [0, 1]. 0 = never, 1 = always.
+ * @returns `true` if the trace should be kept.
+ */
+export function shouldSampleHead(traceId: string, sampleRate: number): boolean {
+  if (sampleRate <= 0) return false;
+  if (sampleRate >= 1) return true;
+  const bucket = samplingFnv1a32(traceId) % 1000;
+  return bucket < Math.round(sampleRate * 1000);
+}
+
+/**
+ * Determine whether a finished span should be kept using tail-based logic.
+ *
+ * Rules (applied in order):
+ * 1. If `config.keepErrorSpans` is true and the span has `status === 'error'`,
+ *    keep it unconditionally.
+ * 2. If `config.keepErrorSpans` is true and the span has any event named
+ *    `'error'`, keep it unconditionally.
+ * 3. Otherwise, apply a random sample at `config.sampleRate`.
+ *
+ * Note: Step 3 uses `Math.random()` (non-deterministic) deliberately — tail
+ * sampling is about keeping a representative sample of healthy traffic after
+ * the fact. Only head-based sampling uses deterministic hashing.
+ *
+ * @param span   - The completed span to evaluate.
+ * @param config - Tail sampling configuration.
+ * @returns `true` if the span should be kept.
+ */
+export function shouldSampleTail(span: Span, config: TailSamplingConfig): boolean {
+  if (config.keepErrorSpans) {
+    if (span.status === 'error') return true;
+    if (span.events.some((e) => e.name === 'error')) return true;
+  }
+  if (config.sampleRate >= 1) return true;
+  if (config.sampleRate <= 0) return false;
+  return Math.random() < config.sampleRate;
+}
+
+/**
+ * Resolve a per-route sample rate override for a given route path.
+ *
+ * Lookup order:
+ * 1. Exact match (`overrides[route]`)
+ * 2. Longest prefix match (the override key that is a prefix of `route`
+ *    and is the longest such key)
+ * 3. `undefined` — no override applies; use the global sample rate
+ *
+ * @param route     - The incoming request path (e.g. `"/api/streams/abc"`).
+ * @param overrides - Map of route path → sample rate.
+ * @returns Override sample rate in [0, 1], or `undefined` if no match.
+ */
+export function resolvePerRouteOverride(
+  route: string,
+  overrides: Record<string, number>,
+): number | undefined {
+  // 1. Exact match
+  if (Object.prototype.hasOwnProperty.call(overrides, route)) {
+    return overrides[route];
+  }
+
+  // 2. Longest prefix match
+  let best: { key: string; rate: number } | undefined;
+  for (const [key, rate] of Object.entries(overrides)) {
+    if (route.startsWith(key)) {
+      if (best === undefined || key.length > best.key.length) {
+        best = { key, rate };
+      }
+    }
+  }
+
+  return best?.rate;
+}

@@ -594,3 +594,142 @@ const result = await traceSpan(
 
 The helper starts a span, runs the async function, ends the span `ok` on
 success or `error` on throw, and always re-throws the original error.
+
+
+---
+
+## Sampling Strategies
+
+Fluxora supports four trace sampling strategies to control observability cost
+and signal-to-noise ratio in production:
+
+1. **Head-based sampling** (recommended for production)
+2. **Tail-based sampling** (error-focused)
+3. **Always** (useful for development / debugging)
+4. **Never** (useful for benchmarking overhead)
+
+### Head-based sampling (default)
+
+The sampling decision is made **at trace creation time** using a deterministic
+FNV-1a hash of the trace ID. Because the decision is derived from the trace ID
+itself, all services/replicas that see the same trace ID make the same
+keep-or-drop decision, guaranteeing that you never get partial traces.
+
+**Algorithm:**
+```
+bucket = FNV-1a32(traceId) % 1000
+keep   = bucket < round(sampleRate * 1000)
+```
+
+**Properties:**
+- Pure function: same trace ID → same decision, always, on every replica.
+- No shared state required.
+- Uniform distribution: 50% sample rate yields ~50% of traces kept.
+
+**Configuration:**
+
+| Env Var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `TRACING_SAMPLING_STRATEGY` | `'head'` | `'head'` | Enable head-based sampling |
+| `TRACING_HEAD_SAMPLE_RATE` | float 0–1 | value of `TRACING_SAMPLE_RATE` | Fraction of traces to keep |
+| `TRACING_PER_ROUTE_OVERRIDES` | JSON string | unset | Route-specific sample rates (see below) |
+
+**Example:**
+```bash
+export TRACING_SAMPLING_STRATEGY=head
+export TRACING_HEAD_SAMPLE_RATE=0.1       # keep 10% of traces globally
+export TRACING_PER_ROUTE_OVERRIDES='{ "/health": 0, "/api/streams": 1 }'
+# Health checks: never sampled (0%)
+# Stream API: always sampled (100%)
+# Everything else: 10%
+```
+
+### Per-route overrides
+
+When using head-based sampling, individual API routes can have their own
+sample rates configured via `TRACING_PER_ROUTE_OVERRIDES`:
+
+```json
+{
+  "/health": 0,
+  "/metrics": 0,
+  "/api/streams": 1,
+  "/api": 0.25
+}
+```
+
+**Lookup rules:**
+1. Exact match checked first (`/api/streams` matches `/api/streams` exactly).
+2. Longest prefix match (`/api/streams/abc` matches `/api/streams` with rate 1.0, not `/api` with 0.25).
+3. If no match, use global `TRACING_HEAD_SAMPLE_RATE`.
+
+### Tail-based sampling
+
+The decision is made **at span-end time** based on the span's outcome. Error
+spans (status `'error'` or events named `'error'`) are always kept when
+`TRACING_TAIL_KEEP_ERRORS=true`, without requiring full in-memory buffering.
+
+**Configuration:**
+
+| Env Var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `TRACING_SAMPLING_STRATEGY` | `'tail'` | `'head'` | Enable tail-based sampling |
+| `TRACING_HEAD_SAMPLE_RATE` | float 0–1 | 1.0 | Sample rate for non-error spans |
+| `TRACING_TAIL_KEEP_ERRORS` | boolean | `true` | Always keep spans with errors |
+
+**Example:**
+```bash
+export TRACING_SAMPLING_STRATEGY=tail
+export TRACING_HEAD_SAMPLE_RATE=0.01      # 1% of healthy traffic
+export TRACING_TAIL_KEEP_ERRORS=true      # but 100% of errors
+```
+
+**Use case:** Debugging production incidents. You capture every error trace
+while sampling only a small fraction of healthy traffic to keep costs low.
+
+**Limitation:** Unlike head-based sampling, tail sampling does NOT guarantee
+full cross-service trace consistency — if service A drops a trace and service B
+keeps it (due to an error), you may see partial traces. For this reason,
+head-based sampling is recommended for production.
+
+### Always / Never
+
+**Always** (`TRACING_SAMPLING_STRATEGY=always`):
+- Keeps every span.
+- Useful for local development and debugging specific issues.
+- **Not recommended for production** — high cost, high cardinality.
+
+**Never** (`TRACING_SAMPLING_STRATEGY=never`):
+- Drops every span.
+- Useful for benchmarking the overhead of the tracing instrumentation itself.
+
+---
+
+## Implementation Notes
+
+### Determinism
+
+Head-based sampling uses a pure FNV-1a 32-bit hash function:
+- Offset basis: `2166136261`
+- Prime: `16777619`
+- No external dependencies; implemented in `src/tracing/hooks.ts`.
+
+The same trace ID produces the same bucket on every call, on every replica,
+with no clock drift, no shared state, and no race conditions.
+
+### Migration from flat `TRACING_SAMPLE_RATE`
+
+The legacy `TRACING_SAMPLE_RATE` env var (flat probability applied per span)
+is still respected for backward compatibility:
+- When `TRACING_SAMPLING_STRATEGY` is unset or `'head'`, and
+  `TRACING_HEAD_SAMPLE_RATE` is also unset, the global rate defaults to
+  `TRACING_SAMPLE_RATE`.
+- This preserves existing behavior: old configs continue to work without changes.
+
+### Testing
+
+See `tests/tracing/sampling.test.ts` for comprehensive coverage:
+- `shouldSampleHead` determinism and distribution (50% rate → 35%–65% kept)
+- `shouldSampleTail` error retention and random sampling
+- `resolvePerRouteOverride` exact match, prefix match, fallback
+- `getSamplingConfig` env var parsing for all strategies

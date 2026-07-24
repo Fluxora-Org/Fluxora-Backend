@@ -224,6 +224,28 @@ async function wireAdminStateLock(config: Config): Promise<void> {
   }
 }
 
+/**
+ * Blue/green deployment slot middleware.
+ *
+ * Emits `X-Fluxora-Deployment-Slot` on every response so that a front-side
+ * load balancer or the e2e suite can verify which slot answered a request
+ * during a blue/green cutover.
+ *
+ * The slot is read from `DEPLOYMENT_SLOT` env var at request time (not module
+ * load) so that the same binary can serve either slot depending on how it is
+ * launched. Defaults to `"blue"` when the env var is absent or empty.
+ *
+ * Security: the header value is constrained to alphanumeric + hyphens to
+ * prevent header injection. Any non-conforming value is replaced with `"blue"`.
+ */
+function deploymentSlotMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const raw = process.env.DEPLOYMENT_SLOT ?? 'blue';
+  // Sanitise: only allow [a-z0-9-] to prevent header injection.
+  const slot = /^[a-z0-9-]+$/i.test(raw) ? raw : 'blue';
+  res.setHeader('X-Fluxora-Deployment-Slot', slot);
+  next();
+}
+
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
@@ -264,6 +286,19 @@ export function createApp(options: AppOptions = {}): Express {
   void wireIdempotencyStore(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
   void wireAdminStateLock(appConfig);
+
+  // Emit deployment slot header on every response so load balancers and clients
+  // can identify which canary slot handled the request.  Read at request time
+  // (not module load) so the correct value is picked up per container even when
+  // DEPLOYMENT_SLOT is injected as a Docker / Kubernetes env var after the
+  // module has already been imported.
+  app.use((_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('X-Fluxora-Deployment-Slot', process.env['DEPLOYMENT_SLOT'] ?? 'blue');
+    next();
+  });
+
+  // Blue/green slot header — must run before any response can be sent.
+  app.use(deploymentSlotMiddleware);
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   app.use(privacyHeaders);
