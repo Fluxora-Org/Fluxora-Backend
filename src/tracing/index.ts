@@ -133,3 +133,86 @@ export async function stopTracing(): Promise<void> {
 export function _getSdk(): NodeSDK | null {
   return sdk;
 }
+
+// ── Sampling configuration helpers ────────────────────────────────────────────
+
+import type { SamplingConfig } from './hooks.js';
+
+/**
+ * Parse and return the current sampling configuration from environment variables.
+ *
+ * Environment variables:
+ * - `TRACING_SAMPLING_STRATEGY` — `'head'` (default), `'tail'`, `'always'`, `'never'`
+ * - `TRACING_HEAD_SAMPLE_RATE`  — float 0–1 (defaults to `TRACING_SAMPLE_RATE`)
+ * - `TRACING_TAIL_KEEP_ERRORS`  — boolean (default `true`)
+ * - `TRACING_PER_ROUTE_OVERRIDES` — JSON string mapping route path → sample rate
+ *                                    e.g. `{"/health":0,"/api/streams":1}`
+ *
+ * @returns A fully-typed {@link SamplingConfig} representing the current config.
+ */
+export function getSamplingConfig(): SamplingConfig {
+  const strategy = (process.env.TRACING_SAMPLING_STRATEGY ?? 'head') as string;
+
+  // Shared helpers
+  const parseRate = (raw: string | undefined, fallback: number): number => {
+    if (!raw || raw.trim() === '') return fallback;
+    const n = Number.parseFloat(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+  };
+
+  const parseBool = (raw: string | undefined, fallback: boolean): boolean => {
+    if (!raw) return fallback;
+    const v = raw.trim().toLowerCase();
+    if (v === 'true' || v === '1') return true;
+    if (v === 'false' || v === '0') return false;
+    return fallback;
+  };
+
+  const globalRate = parseRate(process.env.TRACING_SAMPLE_RATE, 1);
+
+  if (strategy === 'always') return { strategy: 'always' };
+  if (strategy === 'never') return { strategy: 'never' };
+
+  if (strategy === 'tail') {
+    return {
+      strategy: 'tail',
+      sampleRate: parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate),
+      keepErrorSpans: parseBool(process.env.TRACING_TAIL_KEEP_ERRORS, true),
+    };
+  }
+
+  // Default: head-based sampling
+  const headRate = parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate);
+
+  let perRouteOverrides: Record<string, number> | undefined;
+  const rawOverrides = process.env.TRACING_PER_ROUTE_OVERRIDES;
+  if (rawOverrides && rawOverrides.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(rawOverrides) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        // Validate: only keep entries with numeric values in [0, 1]
+        const validated: Record<string, number> = {};
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (typeof v === 'number' && v >= 0 && v <= 1) {
+            validated[k] = v;
+          }
+        }
+        if (Object.keys(validated).length > 0) {
+          perRouteOverrides = validated;
+        }
+      }
+    } catch {
+      // Malformed JSON — ignore overrides, log to stderr for visibility
+      process.stderr.write(
+        `[tracing] TRACING_PER_ROUTE_OVERRIDES is not valid JSON — per-route overrides disabled\n`,
+      );
+    }
+  }
+
+  const config: SamplingConfig = {
+    strategy: 'head',
+    sampleRate: headRate,
+    ...(perRouteOverrides !== undefined ? { perRouteOverrides } : {}),
+  };
+  return config;
+}

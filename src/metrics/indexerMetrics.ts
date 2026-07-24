@@ -25,6 +25,10 @@
  *   indexer_replay_duration_seconds
  *     Histogram: wall-clock duration of each completed replay job (seconds).
  *     Buckets are biased toward longer backfills (minutes to hours).
+ *
+ *   indexer_mtls_validation_failures_total
+ *     Counter: total number of mTLS client-certificate validation failures.
+ *     Labels: reason (e.g. 'expired', 'unknown_ca', 'missing_cert').
  */
 
 import { Counter, Gauge, Histogram } from 'prom-client';
@@ -47,6 +51,15 @@ export const indexerReplayRowsCommittedTotal =
     name: 'indexer_replay_rows_committed_total',
     help: 'Total number of rows inserted or skipped (ON CONFLICT DO NOTHING) during indexer replays',
     labelNames: ['contract_id'] as const,
+    registers: [registry],
+  });
+
+export const indexerMtlsValidationFailuresTotal =
+  (registry.getSingleMetric('indexer_mtls_validation_failures_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'indexer_mtls_validation_failures_total',
+    help: 'Total number of mTLS client-certificate validation failures on the indexer worker connection',
+    labelNames: ['reason'] as const,
     registers: [registry],
   });
 
@@ -81,4 +94,5 @@ export function deRegisterIndexerMetrics(): void {
   registry.removeSingleMetric('indexer_replay_rows_committed_total');
   registry.removeSingleMetric('indexer_replay_rows_per_second');
   registry.removeSingleMetric('indexer_replay_duration_seconds');
+  registry.removeSingleMetric('indexer_mtls_validation_failures_total');
 }
