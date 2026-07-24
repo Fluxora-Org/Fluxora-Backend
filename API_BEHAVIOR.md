@@ -13,9 +13,17 @@ This document specifies the observable behavior of the Fluxora HTTP API under no
 ## Trust Boundaries
 
 ### Public Internet Clients
-- **Access**: Read-only (GET /health, GET /api/streams, GET /api/streams/{id}, GET /api/admin/status/read-only)
-- **Restrictions**: No authentication required; rate limiting applies
+- **Access**: Read-only (GET /health, GET /api/streams, GET /api/streams/{id}, GET /api/streams/{id}/events, GET /api/streams/{id}/poll, GET /api/admin/status/read-only)
+- **Restrictions**: No authentication required unless WS_AUTH_REQUIRED is enabled; rate limiting applies
 - **Guarantees**: Best-effort; no SLA
+
+### Long-Poll Fallback (GET /api/streams/{id}/poll)
+- **Purpose**: Fallback for clients behind corporate proxies that block WebSockets/SSE.
+- **Behavior**: Holds connection open (bounded by a timeout, default 30s) until a stream update event arrives or timeout elapses.
+- **Resumption**: Supports `?since=<eventId>` query parameter for historical replay of missed events.
+- **Concurrency & Limits**: Shares per-IP concurrent connection limits and maximum duration caps with SSE connections.
+- **Envelope**: Returns event objects using the same shape as WebSocket hub (`{ type: "stream_update", streamId, eventId, payload, correlationId }`).
+
 
 ### Authenticated Partners
 - **Access**: Create and manage streams (POST /api/streams, GET /api/streams)

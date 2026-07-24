@@ -25,6 +25,11 @@ If the stream does not exist, the endpoint returns `404 Not Found`.
 
 `GET` still returns the full stream document. If you only need existence checks, prefer `HEAD` to avoid unnecessary payload transfer.
 
+## GET /api/streams/:id/export.jsonld
+
+Returns a JSON-LD document with a Fluxora-defined `@context`, enabling machine-readable, self-describing data portability for a single stream.
+The response uses `application/ld+json` Content-Type and uses string serialization for all amount fields to preserve full precision.
+
 ## Method Overrides
 
 For legacy clients that cannot issue HTTP methods like `PATCH`, `PUT`, or `DELETE`, you can use the method override feature. This allows you to send a `POST` request with the intended method specified in either:
