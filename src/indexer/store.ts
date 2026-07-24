@@ -119,6 +119,15 @@ export class InMemoryContractEventStore implements ContractEventStore {
     if (filter.topic !== undefined) {
       results = results.filter((r) => r.topic === filter.topic);
     }
+    if (filter.fromHappenedAt !== undefined) {
+      const fromMs = new Date(filter.fromHappenedAt).getTime();
+      results = results.filter((r) => new Date(r.happenedAt).getTime() >= fromMs);
+    }
+    if (filter.toHappenedAt !== undefined) {
+      const toMs = new Date(filter.toHappenedAt).getTime();
+      results = results.filter((r) => new Date(r.happenedAt).getTime() <= toMs);
+    }
+
 
     const total = results.length;
     const slice = filter.afterEventId !== undefined
@@ -293,6 +302,14 @@ export class PostgresContractEventStore implements ContractEventStore {
     if (filter.topic !== undefined) {
       values.push(filter.topic);
       conditions.push(`topic = $${values.length}`);
+    }
+    if (filter.fromHappenedAt !== undefined) {
+      values.push(filter.fromHappenedAt);
+      conditions.push(`happened_at >= $${values.length}::timestamptz`);
+    }
+    if (filter.toHappenedAt !== undefined) {
+      values.push(filter.toHappenedAt);
+      conditions.push(`happened_at <= $${values.length}::timestamptz`);
     }
 
     // Cursor: translate afterEventId into a (ledger, event_id) boundary

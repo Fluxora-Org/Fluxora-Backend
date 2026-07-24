@@ -286,3 +286,21 @@ If a consumer is decommissioned or experiences an extended outage and lag exceed
   severity: warning
 ```
 
+## Partition Pruning for `contract_events`
+
+### Overview & Range Partitioning Strategy
+
+The `contract_events` table is partitioned by range on `happened_at` (`PARTITION BY RANGE (happened_at)`) per migration `20260627000000_contract_events_partitioning.ts`. Range partitioning bounds disk growth and enables aggressive partition pruning during historical range queries.
+
+### Query Predicate Requirements & Pruning Behavior
+
+PostgreSQL partition pruning is driven by predicates on the partition key (`happened_at`). When `StreamEventReplayFilter` query parameters (`fromHappenedAt`, `toHappenedAt`) are passed to `PostgresContractEventStore.getEvents()`, PostgreSQL's query planner automatically prunes non-overlapping partition tables from the execution plan.
+
+- **Single-Partition Bounded Queries**: Queries bounded to a single month (e.g. `happened_at >= '2026-07-01T00:00:00.000Z' AND happened_at <= '2026-07-31T23:59:59.999Z'`) evaluate to an execution plan containing strictly the target partition (e.g., `contract_events_y2026m07`). Other partitions (`contract_events_y2026m06`, `contract_events_y2026m08`, `contract_events_default`) are pruned and omitted from disk scans.
+- **Cross-Partition Range Queries**: Queries spanning multiple partition boundaries (e.g., `happened_at >= '2026-06-15T00:00:00.000Z' AND happened_at <= '2026-07-15T23:59:59.999Z'`) scan only the specific matching partitions (`contract_events_y2026m06` and `contract_events_y2026m07`), excluding irrelevant partitions.
+
+### Verification via EXPLAIN
+
+Partition pruning efficiency is verified via integration tests (`tests/db/contractEvents.partitionPruning.test.ts`) that execute `EXPLAIN (FORMAT JSON)` against representative store query shapes and inspect the plan output structure.
+
+
