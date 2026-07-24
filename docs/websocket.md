@@ -176,3 +176,120 @@ request headers.
 - Inbound client messages are rate-limited per connection.
 - Optional WebSocket JWT authentication can reject unauthenticated upgrades.
 - Backpressure metadata must not include sensitive stream payload contents.
+
+---
+
+## Micro-Batching (opt-in)
+
+When a stream emits many events in a short window (e.g. rapid `stream.updated`
+ticks), sending one WebSocket frame per event is wasteful.  The hub supports an
+opt-in micro-batching mode that coalesces events for the same `streamId` within
+a configurable flush window into a single `stream_update_batch` frame.
+
+### Opting in
+
+Set `batching: true` in the subscription message for the stream you want
+batched.  Clients that omit the flag (or set `batching: false`) continue to
+receive the existing one-frame-per-event behaviour — no client-side changes are
+needed unless you want the optimisation.
+
+```json
+{
+  "type": "subscribe",
+  "streamId": "my-high-throughput-stream",
+  "batching": true
+}
+```
+
+The flag is also accepted inside a nested `filter` object:
+
+```json
+{
+  "type": "subscribe",
+  "filter": {
+    "stream_id": "my-high-throughput-stream",
+    "batching": true
+  }
+}
+```
+
+### Batch frame schema
+
+```json
+{
+  "type": "stream_update_batch",
+  "streamId": "my-high-throughput-stream",
+  "events": [
+    { "eventId": "e1", "payload": {}, "correlationId": "…" },
+    { "eventId": "e2", "payload": {} }
+  ]
+}
+```
+
+- `events` is always in insertion order (in-order delivery guarantee).
+- `correlationId` is omitted from an entry when not present on the source event.
+- Each frame is bounded by `MAX_MESSAGE_BYTES` (4 096 bytes). If the full batch
+  would exceed that limit, the largest safe prefix (by event count) is sent.
+
+### Configuration
+
+| Env var             | Default | Min | Max   | Description                                           |
+|---------------------|--------:|----:|------:|-------------------------------------------------------|
+| `WS_BATCH_FLUSH_MS` |    50   |   5 | 5 000 | Flush-window duration in milliseconds.                |
+| `WS_BATCH_MAX_SIZE` |    25   |   1 |   500 | Max events per batch before triggering an early flush.|
+
+Both values are clamped to their respective bounds at startup; out-of-range
+values fall back to the clamped boundary rather than crashing.
+
+### Flush triggers
+
+A batch for a given `(client, streamId)` is flushed when **either**:
+
+1. **Timer expiry** — `WS_BATCH_FLUSH_MS` milliseconds have elapsed since the
+   first event entered the accumulator.
+2. **Size cap** — the accumulator has reached `WS_BATCH_MAX_SIZE` events
+   (early flush).  The `fluxora_ws_batch_size_exceeded_total` counter
+   increments each time this path fires; frequent early ejections suggest
+   raising `WS_BATCH_MAX_SIZE` or lowering `WS_BATCH_FLUSH_MS`.
+
+### Dedup semantics
+
+Deduplication is applied at the `broadcast()` level — before an event enters
+any accumulator.  A duplicate `(streamId, eventId)` broadcast is dropped by
+the dedup cache and never reaches the batch layer.
+
+### Backpressure
+
+The same `BACKPRESSURE_DROP_BYTES` / `BACKPRESSURE_TERMINATE_BYTES` thresholds
+apply to `stream_update_batch` frames.  A slow client that exceeds the drop
+threshold will have the entire batch frame dropped for that flush cycle.
+
+### Observability
+
+Three new Prometheus counters are emitted:
+
+| Metric                                     | Description                                          |
+|--------------------------------------------|------------------------------------------------------|
+| `fluxora_ws_batch_flush_total`             | Total flush operations (one frame emitted per flush).|
+| `fluxora_ws_batch_events_coalesced_total`  | Total individual events coalesced across all flushes.|
+| `fluxora_ws_batch_size_exceeded_total`     | Flushes triggered early by hitting `WS_BATCH_MAX_SIZE`.|
+
+Average batch fill ratio (PromQL):
+
+```promql
+rate(fluxora_ws_batch_events_coalesced_total[5m])
+  / rate(fluxora_ws_batch_flush_total[5m])
+```
+
+### Security notes
+
+- No client-supplied data flows into the accumulator unvalidated; only events
+  that have already passed `broadcast()` dedup and subscription-filter checks
+  are enqueued.
+- The accumulator key is `${server-generated-connectionId}:${streamId}`.
+  Neither field is client-controlled in a way that allows key collision.
+- Pending timers are cancelled immediately on client disconnect and on
+  `hub.close()` — no frames are ever sent to a closed socket.
+- Each outbound frame is checked against `MAX_MESSAGE_BYTES` before delivery.
+  Oversized frames are truncated to the largest event prefix that fits, rather
+  than silently dropped.

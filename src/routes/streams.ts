@@ -71,6 +71,7 @@ import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
+import { sendEarlyHints } from '../utils/earlyHints.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
 import {
@@ -83,6 +84,7 @@ import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
+import { recordServerTimingPhase } from '../middleware/serverTiming.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
@@ -93,17 +95,20 @@ import {
   SSE_CLOSE_REASONS,
   subscribeToSseStream,
   registerSseShutdownCallback,
+  type LiveSseStreamUpdateEvent,
 } from '../streams/sseEmitter.js';
 import {
   resolveSseConnectionLimits,
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
+import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
 import {
   RedisIdempotencyStore,
   NoOpIdempotencyStore,
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
+import { toStreamJsonLd } from '../serialization/jsonld.js';
 export const streamsRouter = Router();
 
 /**
@@ -496,6 +501,7 @@ streamsRouter.get(
     }
 
     let result: { streams: Stream[]; hasMore: boolean; total?: number };
+    const dbStart = process.hrtime.bigint();
     try {
       const filter: StreamFilter = {};
       if (statusFilter !== undefined) filter.status = statusFilter as NonNullable<StreamFilter['status']>;
@@ -514,6 +520,9 @@ streamsRouter.get(
       };
     } catch (err) {
       wrapDbError(err);
+    } finally {
+      const durationMs = Number(process.hrtime.bigint() - dbStart) / 1e6;
+      recordServerTimingPhase(res, 'db', durationMs);
     }
 
     const pageStreams = result!.streams;
@@ -524,14 +533,45 @@ streamsRouter.get(
 
     info('Listing streams', { limit, returned: pageStreams.length, hasMore, requestId });
 
+    // Send HTTP 103 Early Hints with Link header for next page, if available.
+    // This allows HTTP/2 clients to prefetch DNS/TLS for the next page URL
+    // while the server is preparing the current response. The hint is sent
+    // asynchronously and does not block the main response.
+    if (hasMore && nextCursor) {
+      const queryParams: Record<string, string> = {};
+      if (statusFilter) queryParams.status = statusFilter as string;
+      if (senderFilter) queryParams.sender = senderFilter;
+      if (recipientFilter) queryParams.recipient = recipientFilter;
+      if (include_total === 'true') queryParams.include_total = 'true';
+
+      sendEarlyHints(res, {
+        baseUrl: '/api/streams',
+        hasMore: true,
+        nextCursor,
+        queryParams,
+      });
+    }
+
     const response: {
       streams: Stream[];
       has_more: boolean;
       next_cursor: string | null;
       total?: number;
+      _meta?: { enhanced: boolean };
     } = { streams: pageStreams, has_more: hasMore, next_cursor: nextCursor };
 
     if (includeTotal && result!.total !== undefined) response.total = result!.total;
+
+    // Feature flag: streams_enhanced_response — add _meta field for opted-in requesters.
+    // The requester is identified by API key or IP; falls back to 'anonymous'.
+    // This is a zero-risk opt-in: if the flag is not configured, enhanced stays false.
+    const requesterId: string =
+      (req as unknown as Record<string, unknown>)['apiKey'] as string
+        ?? req.ip
+        ?? 'anonymous';
+    if (isFlagEnabled('streams_enhanced_response', requesterId)) {
+      response._meta = { enhanced: true };
+    }
 
     // Cache only when every stream on the page is in a terminal state.
     // An empty page is treated as all-terminal (nothing mutable present).
@@ -541,7 +581,145 @@ streamsRouter.get(
       allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
     );
 
-    res.json(successResponse(response, requestId));
+    const serializeStart = process.hrtime.bigint();
+    try {
+      res.json(successResponse(response, requestId));
+    } finally {
+      const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
+      recordServerTimingPhase(res, 'serialize', durationMs);
+    }
+  }),
+);
+
+/**
+ * GET /api/streams/export
+ * Export streams in NDJSON format.
+ * Includes a resumption cursor in the final line if interrupted.
+ */
+streamsRouter.get(
+  '/export',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.id as string | undefined;
+    const resumeFrom = req.query.resume_from as string | undefined;
+    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const limit = 100;
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      while (true) {
+        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        
+        for (const record of dbResult.streams) {
+          res.write(JSON.stringify(toApiStream(record)) + '\n');
+        }
+
+        if (dbResult.streams.length > 0) {
+          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
+          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
+        }
+
+        if (!dbResult.hasMore) {
+          res.end();
+          break;
+        }
+      }
+      info('Stream export completed', { requestId });
+    } catch (err) {
+      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
+      wrapDbError(err);
+    }
+  }),
+);
+
+/**
+ * GET /api/streams/export
+ * Export streams in NDJSON format.
+ * Includes a resumption cursor in the final line if interrupted.
+ */
+streamsRouter.get(
+  '/export',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.id as string | undefined;
+    const resumeFrom = req.query.resume_from as string | undefined;
+    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const limit = 100;
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      while (true) {
+        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        
+        for (const record of dbResult.streams) {
+          res.write(JSON.stringify(toApiStream(record)) + '\n');
+        }
+
+        if (dbResult.streams.length > 0) {
+          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
+          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
+        }
+
+        if (!dbResult.hasMore) {
+          res.end();
+          break;
+        }
+      }
+      info('Stream export completed', { requestId });
+    } catch (err) {
+      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
+      wrapDbError(err);
+    }
+  }),
+);
+
+/**
+ * GET /api/streams/export
+ * Export streams in NDJSON format.
+ * Includes a resumption cursor in the final line if interrupted.
+ */
+streamsRouter.get(
+  '/export',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.id as string | undefined;
+    const resumeFrom = req.query.resume_from as string | undefined;
+    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const limit = 100;
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      while (true) {
+        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        
+        for (const record of dbResult.streams) {
+          res.write(JSON.stringify(toApiStream(record)) + '\n');
+        }
+
+        if (dbResult.streams.length > 0) {
+          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
+          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
+        }
+
+        if (!dbResult.hasMore) {
+          res.end();
+          break;
+        }
+      }
+      info('Stream export completed', { requestId });
+    } catch (err) {
+      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
+      wrapDbError(err);
+    }
   }),
 );
 
@@ -630,6 +808,44 @@ streamsRouter.get(
         : NO_STORE_STREAM_HEADERS,
     );
     res.json(successResponse({ stream }, requestId));
+  }),
+);
+
+/**
+ * GET /api/streams/:id/export.jsonld
+ * Export a single stream as JSON-LD for data portability.
+ */
+streamsRouter.get(
+  '/:id/export.jsonld',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+    debug('Exporting stream as JSON-LD', { id });
+
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) throw notFound('Stream', id);
+
+    const jsonld = toStreamJsonLd(record!);
+    setStreamResourceHeaders(res, record!);
+    res.set(
+      'Cache-Control',
+      isTerminalStatus(record!.status as ApiStreamStatus)
+        ? CACHEABLE_STREAM_HEADERS
+        : NO_STORE_STREAM_HEADERS,
+    );
+    res.type('application/ld+json');
+    res.send(JSON.stringify(jsonld));
   }),
 );
 
@@ -1216,6 +1432,290 @@ streamsRouter.get(
       origUnsubscribe();
       deregisterShutdown();
     };
+  }),
+);
+
+/**
+ * GET /api/streams/:id/poll?since=&timeout=
+ *
+ * Long-polling fallback endpoint for clients behind proxies that block WebSockets/SSE.
+ * Holds the HTTP connection open (bounded by a timeout) until a new event for the stream
+ * arrives or the timeout elapses. Returns the same event envelope shape used by the
+ * WebSocket hub.
+ */
+streamsRouter.get(
+  '/:id/poll',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+
+    // 1. JWT Authentication and Authorization
+    const wsAuthRequired = process.env.WS_AUTH_REQUIRED === 'true';
+    const jwtSecret = process.env.JWT_SECRET;
+    const authResult = verifyWsToken(req, jwtSecret);
+
+    if (wsAuthRequired && !authResult.ok) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: `Authentication required: ${authResult.code}`,
+          requestId,
+        },
+      });
+      return;
+    } else if (!wsAuthRequired && !authResult.ok && authResult.code === 'INVALID_TOKEN') {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Invalid or expired authentication token',
+          requestId,
+        },
+      });
+      return;
+    }
+
+    // 2. Reserve connection capacity from sseConnectionLimiter
+    const clientIp = getClientIp(req);
+    const sseLimits = resolveSseConnectionLimits();
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+
+    if (!connectionAttempt.ok) {
+      res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
+      warn('Long-poll connection rejected by limiter', {
+        id,
+        requestId,
+        ip: clientIp,
+        reason: connectionAttempt.reason,
+        activeConnections: connectionAttempt.activeConnections,
+        activeConnectionsForIp: connectionAttempt.activeConnectionsForIp,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+      });
+      throw tooManyRequests(connectionAttempt.message, {
+        reason: connectionAttempt.reason,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        retryAfterSeconds: connectionAttempt.retryAfterSeconds,
+      });
+    }
+
+    const sseConnection = connectionAttempt.connection;
+    let cleanedUp = false;
+    let unsubscribeLiveUpdates: (() => void) | undefined;
+    let pollTimer: NodeJS.Timeout | undefined;
+
+    function detachLifecycleHandlers(): void {
+      res.off('close', onResponseClose);
+      res.off('error', onResponseError);
+      req.off('aborted', onRequestAborted);
+    }
+
+    function cleanup(reason: string): void {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      detachLifecycleHandlers();
+
+      if (pollTimer !== undefined) {
+        clearTimeout(pollTimer);
+        pollTimer = undefined;
+      }
+      if (unsubscribeLiveUpdates !== undefined) {
+        unsubscribeLiveUpdates();
+        unsubscribeLiveUpdates = undefined;
+      }
+
+      sseConnection.release();
+      debug('Long-poll connection cleaned up', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        reason,
+        durationMs: Date.now() - sseConnection.acceptedAt,
+      });
+    }
+
+    function onResponseClose(): void {
+      cleanup('client_close');
+    }
+
+    function onResponseError(err: Error): void {
+      warn('Long-poll response error', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        error: err.message,
+      });
+      cleanup('response_error');
+    }
+
+    function onRequestAborted(): void {
+      cleanup('client_aborted');
+    }
+
+    res.once('close', onResponseClose);
+    res.once('error', onResponseError);
+    req.once('aborted', onRequestAborted);
+
+    // 3. Verify stream existence in DB
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      cleanup('db_error');
+      wrapDbError(err);
+    }
+
+    if (cleanedUp) return;
+
+    if (!record) {
+      cleanup('not_found');
+      throw notFound('Stream', id);
+    }
+
+    // 4. Validate query parameters
+    const rawSince = req.query['since'];
+    let sinceEventId: string | undefined;
+    if (rawSince !== undefined) {
+      try {
+        sinceEventId = parseLastEventIdHeader(rawSince);
+      } catch (err) {
+        cleanup('validation_error');
+        throw err;
+      }
+    }
+
+    const rawTimeout = req.query['timeout'];
+    let timeoutMs = 30_000; // Default 30s
+    if (rawTimeout !== undefined) {
+      if (typeof rawTimeout !== 'string' || !/^\d+$/.test(rawTimeout)) {
+        cleanup('validation_error');
+        throw validationError('timeout must be a positive integer');
+      }
+      const parsedTimeout = Number.parseInt(rawTimeout, 10);
+      if (parsedTimeout < 1) {
+        cleanup('validation_error');
+        throw validationError('timeout must be at least 1 second');
+      }
+      timeoutMs = parsedTimeout > 1000 ? parsedTimeout : parsedTimeout * 1000;
+    }
+    // Bound timeout by max hold duration & sseLimits
+    const MAX_LONG_POLL_HOLD_MS = 30_000;
+    timeoutMs = Math.min(timeoutMs, MAX_LONG_POLL_HOLD_MS, sseLimits.maxConnectionDurationMs);
+
+    // 5. Check historical replay if `since` was supplied
+    if (sinceEventId) {
+      const hub = getStreamHub();
+      const eventStore = hub?.getEventStore();
+      if (eventStore) {
+        try {
+          const result = await eventStore.getEvents({
+            afterEventId: sinceEventId,
+            limit: 100,
+          });
+
+          for (const event of result.events) {
+            if (cleanedUp) break;
+            if (eventMatchesStreamId(event, id)) {
+              const envelope = {
+                type: 'stream_update',
+                streamId: id,
+                eventId: event.eventId,
+                payload: event.payload,
+                correlationId: req.correlationId,
+              };
+              cleanup('replay_event_found');
+              res.json(successResponse(envelope, requestId));
+              return;
+            }
+          }
+        } catch (err) {
+          if (err instanceof StaleCursorError || (err as any)?.name === 'StaleCursorError') {
+            cleanup('stale_cursor');
+            throw validationError(
+              'Replay cursor no longer exists; resync from fromLedger',
+              { code: STALE_CURSOR_ERROR_CODE },
+            );
+          }
+
+          warn('Failed to replay event for long-poll', {
+            error: err instanceof Error ? err.message : String(err),
+            requestId,
+          });
+        }
+      }
+    }
+
+    if (cleanedUp) return;
+
+    // 6. Subscribe to live updates via sseEmitter event bus
+    const sendEventAndFinish = (event: LiveSseStreamUpdateEvent) => {
+      if (cleanedUp || res.destroyed || res.writableEnded) return;
+
+      const envelope = {
+        type: 'stream_update',
+        streamId: event.streamId,
+        eventId: event.eventId,
+        payload: event.payload,
+        correlationId: req.correlationId || event.correlationId,
+      };
+
+      cleanup('event_delivered');
+      res.json(successResponse(envelope, requestId));
+    };
+
+    const listener = (event: LiveSseStreamUpdateEvent) => {
+      if (event.streamId === id) {
+        sendEventAndFinish(event);
+      }
+    };
+
+    unsubscribeLiveUpdates = subscribeToSseStream(id, listener);
+
+    // Register shutdown drain callback
+    const deregisterShutdown = registerSseShutdownCallback(
+      async () => {
+        try {
+          if (!res.writableEnded && !res.destroyed) {
+            res.json(successResponse(null, requestId));
+          }
+        } catch {
+          // Best-effort
+        }
+        cleanup('shutdown_drain');
+      },
+      () => {
+        try {
+          if (!res.destroyed) {
+            res.destroy();
+          }
+        } catch {
+          // Best-effort
+        }
+      },
+    );
+
+    const origUnsubscribe = unsubscribeLiveUpdates;
+    unsubscribeLiveUpdates = () => {
+      origUnsubscribe();
+      deregisterShutdown();
+    };
+
+    // 7. Start hold timer
+    pollTimer = setTimeout(() => {
+      if (cleanedUp || res.destroyed || res.writableEnded) return;
+      cleanup('timeout_elapsed');
+      res.json(successResponse(null, requestId));
+    }, timeoutMs);
+
+    pollTimer.unref?.();
   }),
 );
 

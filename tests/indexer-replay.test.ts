@@ -25,10 +25,22 @@ import {
   IndexerService,
   ReplayCursorRepository,
   ReplayBudgetExceededError,
+  IndexerNotLeaderError,
   replayLock,
   replayState,
 } from '../src/indexer/service.js';
 import { deRegisterIndexerMetrics } from '../src/metrics/indexerMetrics.js';
+import type { IndexerLeaderElection } from '../src/indexer/leaderElection.js';
+
+/** Always-leader fake — mirrors NoOpLeaderElection but spy-able per test. */
+function makeFakeLeaderElection(overrides: Partial<IndexerLeaderElection> = {}): IndexerLeaderElection {
+  return {
+    isLeader: vi.fn(() => true),
+    tryAcquire: vi.fn(async () => true),
+    release: vi.fn(async () => {}),
+    ...overrides,
+  };
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -107,7 +119,12 @@ function makeCursorRepo(overrides: Partial<ReplayCursorRepository> = {}): Replay
 function makeService(
   pool: pg.Pool,
   cursorRepo: ReplayCursorRepository,
-  opts: { batchSize?: number; maxRangeBlocks?: number; replayBudgetMs?: number } = {},
+  opts: {
+    batchSize?: number;
+    maxRangeBlocks?: number;
+    replayBudgetMs?: number;
+    leaderElection?: IndexerLeaderElection;
+  } = {},
 ): IndexerService {
   return new IndexerService(
     pool,
@@ -115,6 +132,7 @@ function makeService(
     opts.maxRangeBlocks ?? 0,  // 0 = unlimited
     opts.replayBudgetMs ?? 0,  // 0 = no budget
     cursorRepo,
+    opts.leaderElection,      // defaults to the module-level NoOpLeaderElection when omitted
   );
 }
 
@@ -284,6 +302,157 @@ describe('IndexerService — concurrent replay rejection', () => {
 
     await expect(svc.replayEvents(REQUEST)).rejects.toThrow('cursor create failed');
     expect(replayLock.isHeld()).toBe(false);
+  });
+});
+
+// ── Distributed leader election (multi-replica) ───────────────────────────────
+
+describe('IndexerService — distributed leader election', () => {
+  it('rejects with IndexerNotLeaderError when another instance holds the lease, without touching the DB', async () => {
+    const pool = makePool();
+    const leaderElection = makeFakeLeaderElection({ tryAcquire: vi.fn(async () => false) });
+    const svc = makeService(pool, makeCursorRepo(), { leaderElection });
+
+    await expect(svc.replayEvents(REQUEST)).rejects.toThrow(IndexerNotLeaderError);
+
+    // Same-process lock must be released so a later attempt (once leadership
+    // is available) is not blocked by this failed attempt.
+    expect(replayLock.isHeld()).toBe(false);
+    // The distributed guard runs before any DB work.
+    expect(pool.connect).not.toHaveBeenCalled();
+    // We never became leader, so there is nothing to release.
+    expect(leaderElection.release).not.toHaveBeenCalled();
+  });
+
+  it('releases the leader-election lease on successful completion', async () => {
+    const cursorRepo = makeCursorRepo({
+      create: vi.fn(async (_c, cid, ledger) => ({
+        id: 'c0',
+        contract_id: cid,
+        ledger,
+        from_block: null,
+        to_block: null,
+        total_rows: 0,
+        last_committed_offset: 0,
+        started_at: new Date(),
+        completed_at: null,
+      })),
+    });
+    const client = makeClient(async (sql) => {
+      if (sql.includes('COUNT')) return { rows: [{ count: '0' }] };
+      return { rows: [] };
+    });
+    const pool = makePool(client);
+    const leaderElection = makeFakeLeaderElection();
+    const svc = makeService(pool, cursorRepo, { leaderElection });
+
+    await expect(svc.replayEvents(REQUEST)).resolves.toBeUndefined();
+    expect(leaderElection.tryAcquire).toHaveBeenCalledTimes(1);
+    expect(leaderElection.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the leader-election lease even when replay throws', async () => {
+    const client = makeClient(async (sql) => {
+      if (sql.includes('COUNT')) return { rows: [{ count: '5' }] };
+      return { rows: [] };
+    });
+    const cursorRepo = makeCursorRepo({
+      create: vi.fn(async () => { throw new Error('cursor create failed'); }),
+    });
+    const pool = makePool(client);
+    const leaderElection = makeFakeLeaderElection();
+    const svc = makeService(pool, cursorRepo, { leaderElection });
+
+    await expect(svc.replayEvents(REQUEST)).rejects.toThrow('cursor create failed');
+    expect(leaderElection.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops at the next safe batch boundary when leadership is lost mid-replay, leaving progress resumable', async () => {
+    const events = [makeEvent('e1', 100), makeEvent('e2', 200), makeEvent('e3', 300), makeEvent('e4', 400)];
+
+    const cursorClient = makeClient(async (sql) => {
+      if (sql.includes('COUNT')) return { rows: [{ count: '4' }] };
+      if (sql.includes('INSERT INTO replay_cursors')) {
+        return {
+          rows: [{
+            id: 'cursor-1',
+            contract_id: 'test-contract',
+            ledger: 1,
+            from_block: null,
+            to_block: null,
+            total_rows: 4,
+            last_committed_offset: 0,
+            started_at: new Date(),
+            completed_at: null,
+          }],
+        };
+      }
+      return { rows: [] }; // findActive returns null
+    });
+
+    // Only batch 1 should ever be fetched — the loop must stop before batch 2.
+    const batch1Client = makeClient(async (sql) => {
+      if (sql.includes('SELECT') && sql.includes('FROM historical_events')) {
+        return { rows: events.slice(0, 2) };
+      }
+      return { rows: [] };
+    });
+
+    const cursorRepo = makeCursorRepo({
+      findActive: vi.fn(async () => null),
+      create: vi.fn(async (_c, cid, ledger) => ({
+        id: 'cursor-1',
+        contract_id: cid,
+        ledger,
+        from_block: null,
+        to_block: null,
+        total_rows: 4,
+        last_committed_offset: 0,
+        started_at: new Date(),
+        completed_at: null,
+      })),
+    });
+
+    const pool = makePool(cursorClient, batch1Client);
+    // isLeader() is checked once per loop iteration before processing a
+    // batch: true for batch 1, false before batch 2 (lease lost mid-replay).
+    const isLeader = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    const leaderElection = makeFakeLeaderElection({ isLeader });
+    const svc = makeService(pool, cursorRepo, { leaderElection });
+
+    await expect(svc.replayEvents(REQUEST)).resolves.toBeUndefined();
+
+    // Batch 1 committed and the cursor advanced — durable progress — and the
+    // loop stopped *before* fetching batch 2 (only cursorClient + batch1Client
+    // connections were ever used; a 3rd pool.connect() would mean batch 2 ran).
+    expect(cursorRepo.advanceOffset).toHaveBeenCalledTimes(1);
+    expect(cursorRepo.advanceOffset).toHaveBeenCalledWith(expect.anything(), 'cursor-1', 2);
+    expect(pool.connect).toHaveBeenCalledTimes(3); // cursor resolve, batch 1, completeCursor
+    expect(leaderElection.release).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('IndexerService#resumeIncompleteReplay — distributed leader election', () => {
+  it('skips resuming (and never touches the DB) when this instance is not the leader', async () => {
+    const pool = makePool();
+    const leaderElection = makeFakeLeaderElection({ tryAcquire: vi.fn(async () => false) });
+    const svc = makeService(pool, makeCursorRepo(), { leaderElection });
+
+    await svc.resumeIncompleteReplay();
+
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it('proceeds to check for an incomplete replay when this instance is the leader', async () => {
+    const client = makeClient(async () => ({ rows: [] })); // no incomplete replay found
+    const pool = makePool(client);
+    const leaderElection = makeFakeLeaderElection();
+    const svc = makeService(pool, makeCursorRepo(), { leaderElection });
+
+    await svc.resumeIncompleteReplay();
+
+    expect(leaderElection.tryAcquire).toHaveBeenCalledTimes(1);
+    expect(pool.connect).toHaveBeenCalledTimes(1);
   });
 });
 

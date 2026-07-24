@@ -38,6 +38,40 @@ export interface RetentionRule {
 }
 
 /**
+ * Extension of `RetentionRule` for categories that can be actively purged
+ * by the scheduled retention-purge job.
+ *
+ * The extra fields tell the job:
+ *  - which database table to target (`table`)
+ *  - which column records the row's age (`ageColumn`) — the job compares
+ *    this against `NOW() - INTERVAL '<retentionDays> days'`
+ *  - how to purge rows whose retention window has expired (`purgeAction`):
+ *      `delete`  — hard-delete the row entirely (use for ephemeral metadata).
+ *      `redact`  — overwrite PII columns with a placeholder and set
+ *                  `purged_at` (use when the row must stay for audit integrity
+ *                   but its sensitive fields must not persist).
+ */
+export interface PurgeableRetentionRule extends RetentionRule {
+  /**
+   * The fully-qualified table name the purge job will operate on.
+   * Must reference a table that has a `legal_hold` boolean column.
+   */
+  table: string;
+  /**
+   * Column used to determine the age of a row for the retention cut-off
+   * calculation. Typically `created_at`.
+   */
+  ageColumn: string;
+  /**
+   * Purge strategy:
+   *  - `delete`  — remove rows past their retention window.
+   *  - `redact`  — blank PII fields and stamp `purged_at`; the row shell
+   *                remains for referential integrity.
+   */
+  purgeAction: 'delete' | 'redact';
+}
+
+/**
  * Field-level classification for stream records.
  *
  * Stellar public keys are pseudonymous — they do not directly identify
@@ -208,6 +242,45 @@ export const RETENTION_SCHEDULE: RetentionRule[] = [
     storageLayer: 'ephemeral (process memory)',
     rationale:
       'Tokens are validated in-flight and never persisted or logged.',
+  },
+];
+
+/**
+ * Subset of the retention schedule that the automated purge job can
+ * enforce.  Each entry extends `RetentionRule` with the database
+ * coordinates and purge strategy needed to actually delete or redact
+ * expired rows.
+ *
+ * Rules are evaluated in order during each purge run.  Add a new entry
+ * here whenever a table gains a `created_at` column and reaches a finite
+ * retention commitment.
+ *
+ * Legal-hold exemption applies globally: any row in the target table
+ * with `legal_hold = TRUE` is skipped by the purge job and a
+ * `PURGE_SKIPPED_LEGAL_HOLD` audit event is written instead.
+ */
+export const PURGEABLE_RETENTION_SCHEDULE: PurgeableRetentionRule[] = [
+  {
+    category: 'Audit logs',
+    retentionDays: 365,
+    storageLayer: 'PostgreSQL — audit_logs',
+    rationale:
+      'Audit records are kept for one year for regulatory compliance (SOC-2, GDPR Art. 5(1)(e)).' +
+      ' After 365 days the row is hard-deleted; no PII is stored in the audit log itself.',
+    table: 'audit_logs',
+    ageColumn: 'timestamp',
+    purgeAction: 'delete',
+  },
+  {
+    category: 'Webhook outbox (processed)',
+    retentionDays: 90,
+    storageLayer: 'PostgreSQL — webhook_outbox',
+    rationale:
+      'Processed outbox rows are retained for 90 days for debugging and replay investigation,' +
+      ' then purged to prevent unbounded table growth.',
+    table: 'webhook_outbox',
+    ageColumn: 'created_at',
+    purgeAction: 'delete',
   },
 ];
 

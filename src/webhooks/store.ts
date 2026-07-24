@@ -20,6 +20,14 @@ export interface DeadLetterQueueItem {
   processedAt?: number;
 }
 
+export type OutboxItemStatus = 'pending' | 'in_flight' | 'delivered' | 'failed';
+
+export interface ClaimOptions {
+  workerId: string;
+  lockTimeoutMs?: number;
+  now?: number;
+}
+
 export interface OutboxItem {
   id: string;
   deliveryId: string;
@@ -33,7 +41,12 @@ export interface OutboxItem {
   scheduledFor: number;
   attempts: number;
   maxAttempts: number;
+  status: OutboxItemStatus;
+  lockedAt?: number;
+  lockedBy?: string;
 }
+
+export const DEFAULT_CLAIM_LOCK_TIMEOUT_MS = 30_000;
 
 export class WebhookDeliveryStore {
   // Main delivery storage
@@ -115,7 +128,7 @@ export class WebhookDeliveryStore {
    */
   addToOutbox(item: Omit<OutboxItem, 'id'>): string {
     const id = `outbox_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const outboxItem: OutboxItem = { ...item, id };
+    const outboxItem: OutboxItem = { status: 'pending', ...item, id };
 
     this.outbox.set(id, outboxItem);
 
@@ -139,7 +152,8 @@ export class WebhookDeliveryStore {
   }
 
   /**
-   * Get items from outbox that are ready for processing
+   * Get items from outbox that are ready for processing (pending status only).
+   * Items claimed by a worker (in_flight) are excluded.
    */
   getReadyOutboxItems(now: number = Date.now()): OutboxItem[] {
     const readyItems: OutboxItem[] = [];
@@ -150,7 +164,11 @@ export class WebhookDeliveryStore {
     for (const priority of priorities) {
       const items = this.outboxPriorityQueue.get(priority) || [];
       const ready = items
-        .filter((item) => item.scheduledFor <= now && item.attempts < item.maxAttempts)
+        .filter((item) =>
+          item.status === 'pending' &&
+          item.scheduledFor <= now &&
+          item.attempts < item.maxAttempts
+        )
         .sort((a, b) => a.scheduledFor - b.scheduledFor);
       readyItems.push(...ready);
     }
@@ -188,6 +206,137 @@ export class WebhookDeliveryStore {
     if (item) {
       item.attempts = attempts;
     }
+  }
+
+  /**
+   * Atomically claim ready outbox items for a specific worker.
+   *
+   * Finds items with `status = 'pending'` that are due (scheduledFor ≤ now
+   * and attempts < maxAttempts), then marks them `in_flight` with the
+   * given `workerId` and a `lockedAt` timestamp.  Multiple workers calling
+   * this method on the same store will never both claim the same row
+   * because the `pending` → `in_flight` transition is synchronous — once
+   * the first caller mutates the status, subsequent callers skip the row.
+   *
+   * @returns  The list of items successfully claimed by this worker.
+   */
+  claimReadyOutboxItems(opts: ClaimOptions = {}): OutboxItem[] {
+    const workerId = opts.workerId ?? 'default-worker';
+    const lockTimeoutMs = opts.lockTimeoutMs ?? DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
+    const now = opts.now ?? Date.now();
+
+    const reclaimWindow = now - lockTimeoutMs;
+    const claimed: OutboxItem[] = [];
+
+    const priorities: ('high' | 'normal' | 'low')[] = ['high', 'normal', 'low'];
+
+    for (const priority of priorities) {
+      const items = this.outboxPriorityQueue.get(priority) || [];
+      for (const item of items) {
+        if (item.attempts >= item.maxAttempts) continue;
+
+        // Claim eligible items: pending or stuck in_flight with expired lock
+        const isPending = item.status === 'pending' && item.scheduledFor <= now;
+        const isStuck = item.status === 'in_flight' &&
+          item.lockedAt != null &&
+          item.lockedAt < reclaimWindow;
+
+        if (!isPending && !isStuck) continue;
+
+        item.status = 'in_flight';
+        item.lockedAt = now;
+        item.lockedBy = workerId;
+        claimed.push(item);
+      }
+    }
+
+    return claimed;
+  }
+
+  /**
+   * Reclaim stuck in-flight items whose lock has expired.
+   *
+   * Finds items with `status = 'in_flight'` where
+   * `lockedAt + lockTimeoutMs < now` and reassigns the lock to the
+   * requesting worker.  This is a subset of what {@link claimReadyOutboxItems}
+   * does (which also handles `pending` items), but is exposed as a
+   * separate method for observability and targeted use cases.
+   */
+  reclaimStuckItems(opts: ClaimOptions = {}): OutboxItem[] {
+    const workerId = opts.workerId ?? 'default-worker';
+    const lockTimeoutMs = opts.lockTimeoutMs ?? DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
+    const now = opts.now ?? Date.now();
+
+    const reclaimWindow = now - lockTimeoutMs;
+    const reclaimed: OutboxItem[] = [];
+
+    for (const item of this.outbox.values()) {
+      if (
+        item.status === 'in_flight' &&
+        item.lockedAt != null &&
+        item.lockedAt < reclaimWindow
+      ) {
+        item.status = 'in_flight';
+        item.lockedAt = now;
+        item.lockedBy = workerId;
+        reclaimed.push(item);
+      }
+    }
+
+    return reclaimed;
+  }
+
+  /**
+   * Release a claimed outbox item so it can be claimed by another worker.
+   *
+   * Only the worker that currently holds the lock can release it (verified
+   * via `lockedBy`).  Resets status to `pending` and clears lock fields.
+   *
+   * @returns `true` if the item was released, `false` if not found or
+   *          the caller does not hold the lock.
+   */
+  releaseOutboxItem(id: string, workerId: string): boolean {
+    const item = this.outbox.get(id);
+    if (!item) return false;
+    if (item.lockedBy !== workerId) return false;
+
+    item.status = 'pending';
+    item.lockedAt = undefined;
+    item.lockedBy = undefined;
+    return true;
+  }
+
+  /**
+   * Mark a claimed outbox item as delivered and remove it from the queue.
+   *
+   * Only the locking worker may mark the item as delivered.
+   *
+   * @returns `true` if the item was delivered, `false` if not found or
+   *          the caller does not hold the lock.
+   */
+  markOutboxItemDelivered(id: string, workerId: string): boolean {
+    const item = this.outbox.get(id);
+    if (!item) return false;
+    if (item.lockedBy !== workerId) return false;
+
+    item.status = 'delivered';
+    item.lockedAt = undefined;
+    item.lockedBy = undefined;
+
+    // Remove from outbox Map
+    this.outbox.delete(id);
+
+    // Remove from priority queue so it won't appear in future queries
+    const priorityItems = this.outboxPriorityQueue.get(item.priority);
+    if (priorityItems) {
+      const index = priorityItems.findIndex((i) => i.id === id);
+      if (index !== -1) {
+        priorityItems.splice(index, 1);
+      }
+    }
+
+    this.metrics.outboxItems--;
+    return true;
   }
 
   /**

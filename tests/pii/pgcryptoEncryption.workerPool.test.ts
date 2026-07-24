@@ -17,6 +17,7 @@
 
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import crypto from 'crypto';
+import { pathToFileURL } from 'url';
 import {
   computeAddressHash,
   computeAddressHashes,
@@ -74,7 +75,7 @@ describe('WorkerPool', () => {
   });
 
   it('dispatches a task to a worker and returns the result', async () => {
-    const workerUrl = resolveWorkerUrl(import.meta.url, '../../src/pii/pgcryptoWorker');
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
     pool = new WorkerPool(workerUrl, {
       workerData: { keys },
       maxWorkers: 2,
@@ -99,7 +100,7 @@ describe('WorkerPool', () => {
   });
 
   it('tracks pending and queued counts', async () => {
-    const workerUrl = resolveWorkerUrl(import.meta.url, '../../src/pii/pgcryptoWorker');
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
     pool = new WorkerPool(workerUrl, {
       workerData: { keys },
       maxWorkers: 1,
@@ -121,13 +122,12 @@ describe('WorkerPool', () => {
   });
 
   it('rejects with PoolShutdownError after shutdown', async () => {
-    const workerUrl = resolveWorkerUrl(import.meta.url, '../../src/pii/pgcryptoWorker');
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
     pool = new WorkerPool(workerUrl, { maxWorkers: 1 });
 
     await pool.shutdown();
     pool = null; // prevent double-shutdown in afterEach
 
-    const p = pool?.exec({ type: 'hash', taskId: 0, address, keys });
     // pool is null, so we test the PoolShutdownError class directly.
     expect(new PoolShutdownError().message).toBe('WorkerPool has been shut down');
     expect(new PoolShutdownError().name).toBe('PoolShutdownError');
@@ -135,7 +135,7 @@ describe('WorkerPool', () => {
 
   it('degrades to fallback when worker creation fails', async () => {
     // Use an invalid worker URL to force failure.
-    const badUrl = new URL('./nonexistent-worker.js', import.meta.url);
+    const badUrl = new URL('./nonexistent-worker.js', pathToFileURL(__filename));
     pool = new WorkerPool(badUrl, { maxWorkers: 1 });
 
     const fallback = vi.fn().mockReturnValue({

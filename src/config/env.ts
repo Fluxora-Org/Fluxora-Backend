@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { warn } from '../lib/logger.js';
 import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
 import {
   getPinnedAddressNetwork,
@@ -238,6 +239,13 @@ export const EnvSchema = z.object({
     parseNumber,
     z.number().min(0, 'TRACING_SAMPLE_RATE must be at least 0').max(1, 'TRACING_SAMPLE_RATE must be at most 1'),
   ).default(1),
+  TRACING_SAMPLING_STRATEGY: z.enum(['head', 'tail', 'always', 'never']).default('head'),
+  TRACING_HEAD_SAMPLE_RATE: z.preprocess(
+    parseNumber,
+    z.number().min(0, 'TRACING_HEAD_SAMPLE_RATE must be at least 0').max(1, 'TRACING_HEAD_SAMPLE_RATE must be at most 1'),
+  ).optional(),
+  TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
+  TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
   TRACING_OTEL_ENABLED: booleanEnv().default(false),
   TRACING_LOG_EVENTS: booleanEnv().default(false),
 
@@ -277,6 +285,14 @@ export const EnvSchema = z.object({
    SSE_DRAIN_TIMEOUT_MS: integerEnv('SSE_DRAIN_TIMEOUT_MS', 1_000, 60_000).default(30_000),
    INDEXER_ENABLED: booleanEnv().default(false),
    WORKER_ENABLED: booleanEnv().default(false),
+   /** Per-checker timeout for HealthCheckManager. Must be strictly greater than 0. */
+   HEALTH_CHECK_TIMEOUT_MS: integerEnv('HEALTH_CHECK_TIMEOUT_MS', 1).default(5000),
+   /** Interval between background health-check runs. Must be strictly greater than 0. */
+   HEALTH_CHECK_INTERVAL_MS: integerEnv('HEALTH_CHECK_INTERVAL_MS', 1).default(30000),
+   /** Enables the grpc.health.v1.Health service for Kubernetes-native gRPC probes. */
+   GRPC_HEALTH_ENABLED: booleanEnv().default(false),
+   /** Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). */
+   GRPC_HEALTH_PORT: integerEnv('GRPC_HEALTH_PORT', 1, 65535).default(50051),
    INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
    INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
@@ -384,6 +400,10 @@ export interface Config {
 
   tracingEnabled: boolean;
   tracingSampleRate: number;
+  tracingSamplingStrategy: 'head' | 'tail' | 'always' | 'never';
+  tracingHeadSampleRate?: number | undefined;
+  tracingTailKeepErrors: boolean;
+  tracingPerRouteOverrides?: string | undefined;
   tracingOtelEnabled: boolean;
   tracingLogEvents: boolean;
 
@@ -416,6 +436,14 @@ export interface Config {
   sseDrainTimeoutMs: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
+  /** Per-checker timeout for HealthCheckManager, in ms. */
+  healthCheckTimeoutMs: number;
+  /** Interval between background health-check runs, in ms. */
+  healthCheckIntervalMs: number;
+  /** Enables the grpc.health.v1.Health service (k8s-native gRPC probes). */
+  grpcHealthEnabled: boolean;
+  /** Port the gRPC health service binds to when enabled. */
+  grpcHealthPort: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -540,6 +568,10 @@ function toConfig(env: ParsedEnv): Config {
 
     tracingEnabled: env.TRACING_ENABLED,
     tracingSampleRate: env.TRACING_SAMPLE_RATE,
+    tracingSamplingStrategy: env.TRACING_SAMPLING_STRATEGY,
+    tracingHeadSampleRate: env.TRACING_HEAD_SAMPLE_RATE,
+    tracingTailKeepErrors: env.TRACING_TAIL_KEEP_ERRORS,
+    tracingPerRouteOverrides: env.TRACING_PER_ROUTE_OVERRIDES,
     tracingOtelEnabled: env.TRACING_OTEL_ENABLED,
     tracingLogEvents: env.TRACING_LOG_EVENTS,
 
@@ -571,6 +603,10 @@ function toConfig(env: ParsedEnv): Config {
     sseDrainTimeoutMs: env.SSE_DRAIN_TIMEOUT_MS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
+    healthCheckTimeoutMs: env.HEALTH_CHECK_TIMEOUT_MS,
+    healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS,
+    grpcHealthEnabled: env.GRPC_HEALTH_ENABLED,
+    grpcHealthPort: env.GRPC_HEALTH_PORT,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
@@ -610,4 +646,130 @@ export function initializeConfig(): Config {
 
 export function resetConfig(): void {
   configInstance = null;
+}
+
+// ─── Hot-reload support ───────────────────────────────────────────────────────
+
+/**
+ * The subset of configuration values that can be changed at runtime by
+ * sending SIGHUP to the process. All other variables require a full restart.
+ */
+export interface HotConfig {
+  rateLimitIpWindowMs: number | undefined;
+  rateLimitIpMax: number | undefined;
+  rateLimitApikeyWindowMs: number | undefined;
+  rateLimitApikeyMax: number | undefined;
+  rateLimitAdminWindowMs: number | undefined;
+  rateLimitAdminMax: number | undefined;
+  tracingSampleRate: number;
+  tracingEnabled: boolean;
+  logLevel: LogLevel;
+  featureFlagsJson: string | undefined;
+  featureFlagsFile: string | undefined;
+}
+
+/**
+ * The set of env-var keys whose change requires a full process restart.
+ * If any of these change between the startup snapshot and a SIGHUP, a WARN
+ * is emitted but the new value is intentionally not applied.
+ */
+const RESTART_ONLY_KEYS = ['DATABASE_URL', 'REDIS_URL', 'JWT_SECRET', 'INDEXER_WORKER_TOKEN'] as const;
+type RestartOnlyKey = (typeof RESTART_ONLY_KEYS)[number];
+
+/** Snapshot of restart-only env values captured at process startup. */
+let startupEnvSnapshot: Readonly<Record<RestartOnlyKey, string | undefined>> | null = null;
+
+/**
+ * Capture the current values of restart-only env variables.
+ * Call this once during startup, before any SIGHUP handler is registered.
+ * Subsequent calls are no-ops (the first snapshot is preserved).
+ */
+export function captureStartupEnvSnapshot(): void {
+  if (startupEnvSnapshot !== null) return;
+  const snapshot = {} as Record<RestartOnlyKey, string | undefined>;
+  for (const key of RESTART_ONLY_KEYS) {
+    snapshot[key] = process.env[key];
+  }
+  startupEnvSnapshot = Object.freeze(snapshot);
+}
+
+/**
+ * Parse the whitelisted hot-reloadable keys from `process.env` and return a
+ * fully-built `HotConfig` object.
+ *
+ * If any restart-only key has changed since startup, a WARN is logged for each
+ * changed key. The new value is NOT applied — callers receive only the
+ * hot-reloadable portion.
+ *
+ * The build is atomic: the returned object is fully constructed before it is
+ * returned to the caller; no intermediate state is ever visible.
+ *
+ * Requires `captureStartupEnvSnapshot()` to have been called first. If it has
+ * not been called yet, a snapshot is taken implicitly now so that the function
+ * still works in isolation (e.g. in tests).
+ */
+export function reloadHotConfig(): HotConfig {
+  // Ensure we have a baseline snapshot to compare against.
+  if (startupEnvSnapshot === null) {
+    captureStartupEnvSnapshot();
+  }
+
+  // Detect and warn about restart-only key changes.
+  for (const key of RESTART_ONLY_KEYS) {
+    const original = startupEnvSnapshot![key];
+    const current = process.env[key];
+    if (current !== original) {
+      warn(
+        `SIGHUP: restart-only variable ${key} changed — restart required to apply`,
+        { variable: key },
+      );
+    }
+  }
+
+  // Atomically build the entire HotConfig from the current environment.
+  // Integer parsing helpers (mirrors the top-level parseInteger logic).
+  const parseOptionalInt = (raw: string | undefined): number | undefined => {
+    if (raw === undefined || raw === '') return undefined;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) ? n : undefined;
+  };
+
+  const parseFloat01 = (raw: string | undefined, fallback: number): number => {
+    if (raw === undefined || raw === '') return fallback;
+    const n = Number.parseFloat(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+  };
+
+  const parseBool = (raw: string | undefined, fallback: boolean): boolean => {
+    if (raw === undefined || raw === '') return fallback;
+    const v = raw.trim().toLowerCase();
+    if (v === 'true' || v === '1') return true;
+    if (v === 'false' || v === '0') return false;
+    return fallback;
+  };
+
+  const validLogLevels: LogLevel[] = ['debug', 'info', 'warn', 'error'];
+  const parseLogLevel = (raw: string | undefined, fallback: LogLevel): LogLevel => {
+    if (raw !== undefined && (validLogLevels as string[]).includes(raw)) {
+      return raw as LogLevel;
+    }
+    return fallback;
+  };
+
+  const newConfig: HotConfig = {
+    rateLimitIpWindowMs: parseOptionalInt(process.env.RATE_LIMIT_IP_WINDOW_MS),
+    rateLimitIpMax: parseOptionalInt(process.env.RATE_LIMIT_IP_MAX),
+    rateLimitApikeyWindowMs: parseOptionalInt(process.env.RATE_LIMIT_APIKEY_WINDOW_MS),
+    rateLimitApikeyMax: parseOptionalInt(process.env.RATE_LIMIT_APIKEY_MAX),
+    rateLimitAdminWindowMs: parseOptionalInt(process.env.RATE_LIMIT_ADMIN_WINDOW_MS),
+    rateLimitAdminMax: parseOptionalInt(process.env.RATE_LIMIT_ADMIN_MAX),
+    tracingSampleRate: parseFloat01(process.env.TRACING_SAMPLE_RATE, 1),
+    tracingEnabled: parseBool(process.env.TRACING_ENABLED, false),
+    logLevel: parseLogLevel(process.env.LOG_LEVEL, 'info'),
+    featureFlagsJson: process.env.FEATURE_FLAGS_JSON || undefined,
+    featureFlagsFile: process.env.FEATURE_FLAGS_FILE || undefined,
+  };
+
+  // Freeze to prevent accidental mutation of the returned snapshot.
+  return Object.freeze(newConfig);
 }

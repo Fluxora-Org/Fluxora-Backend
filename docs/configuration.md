@@ -84,3 +84,86 @@ Secret values are never included in validation messages.
 | `FLUXORA_SHUTDOWN` | boolean | unset; internal graceful shutdown flag |
 
 Booleans accept `true`, `false`, `1`, and `0`.
+
+## Feature Flags
+
+Fluxora ships a LaunchDarkly-style feature flag service (`src/config/featureFlags.ts`)
+that supports percentage-based rollout with deterministic per-requester bucketing.
+
+| Variable | Type | Default | Notes |
+|----------|------|---------|-------|
+| `FEATURE_FLAGS_JSON` | JSON string | unset | Inline flag definitions array. Takes precedence over `FEATURE_FLAGS_FILE`. |
+| `FEATURE_FLAGS_FILE` | path string | unset | Path to a JSON file containing flag definitions. |
+
+### Flag definition format
+
+```json
+[
+  { "name": "streams_enhanced_response", "percentage": 20, "description": "Enable enhanced response fields for 20% of requesters" },
+  { "name": "new_feature", "percentage": 0, "description": "Disabled; staged rollout" }
+]
+```
+
+Fields:
+- `name` — unique string identifier for the flag.
+- `percentage` — integer 0–100. 0 = disabled for all, 100 = enabled for all.
+- `description` — optional human-readable note.
+
+### Determinism guarantee
+
+The rollout decision is computed as `FNV-1a32(flagName + ':' + requesterId) % 100 < percentage`.
+The same requester always receives the same decision for a given flag and percentage,
+without any shared state or random number generation, across all replicas.
+
+---
+
+## Runtime Config Reload (SIGHUP)
+
+Send `SIGHUP` to the running process to hot-reload a whitelisted subset of
+configuration without restarting the HTTP server, database pool, or Redis
+connections.
+
+```bash
+# find the PID
+pgrep -f 'node.*index'
+
+# send SIGHUP
+kill -HUP <pid>
+
+# or with Docker
+docker kill --signal=HUP fluxora-backend
+```
+
+### Hot-reloadable variables
+
+| Variable | Notes |
+|----------|-------|
+| `RATE_LIMIT_IP_WINDOW_MS` | IP rate-limit sliding window (ms) |
+| `RATE_LIMIT_IP_MAX` | Max requests per IP per window |
+| `RATE_LIMIT_APIKEY_WINDOW_MS` | API-key rate-limit window (ms) |
+| `RATE_LIMIT_APIKEY_MAX` | Max requests per API key per window |
+| `RATE_LIMIT_ADMIN_WINDOW_MS` | Admin rate-limit window (ms) |
+| `RATE_LIMIT_ADMIN_MAX` | Max admin requests per window |
+| `TRACING_SAMPLE_RATE` | Global tracing sample rate (0–1) |
+| `TRACING_ENABLED` | Enable/disable tracing globally |
+| `LOG_LEVEL` | Log level (`debug`, `info`, `warn`, `error`) |
+| `FEATURE_FLAGS_JSON` | Inline feature flag definitions |
+| `FEATURE_FLAGS_FILE` | Path to feature flag definitions file |
+
+### Restart-only variables
+
+The following variables require a **full process restart** to take effect.
+If they are changed in the environment and `SIGHUP` is sent, a `WARN`-level
+log entry is emitted but the new value is **not** applied:
+
+- `DATABASE_URL` — changing requires new DB pool connections
+- `REDIS_URL` — changing requires new Redis connections
+- `JWT_SECRET` — changing invalidates all existing tokens
+- `INDEXER_WORKER_TOKEN` — changing requires restart to re-authenticate workers
+
+### Atomicity guarantee
+
+`reloadHotConfig()` constructs the entire new configuration object before
+applying it. No concurrent request can observe a partially-applied config.
+The feature flag map is replaced in a single JavaScript assignment, which is
+atomic in Node.js's single-threaded event loop.

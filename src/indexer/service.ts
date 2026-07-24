@@ -9,6 +9,10 @@ import {
   indexerReplayRowsPerSecond,
   indexerReplayDurationSeconds,
 } from '../metrics/indexerMetrics.js';
+import {
+  getIndexerLeaderElection,
+  type IndexerLeaderElection,
+} from './leaderElection.js';
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -24,6 +28,23 @@ export class ReplayBudgetExceededError extends Error {
         'Re-run to resume from the last committed cursor offset.',
     );
     this.name = 'ReplayBudgetExceededError';
+  }
+}
+
+/**
+ * Thrown when this instance could not acquire (or lost) the distributed
+ * indexer leader-election lease. Another instance is currently the leader
+ * and is expected to own replay; no data was lost, already-committed
+ * batches remain durable, and a re-run resumes from the last committed
+ * cursor offset once this instance becomes leader.
+ */
+export class IndexerNotLeaderError extends Error {
+  constructor() {
+    super(
+      'This instance is not the indexer replay leader; another instance is ' +
+        'currently running (or eligible to run) replay.',
+    );
+    this.name = 'IndexerNotLeaderError';
   }
 }
 
@@ -269,6 +290,7 @@ export class IndexerService {
   private replayBudgetMs: number;
   private cursorRepo: ReplayCursorRepository;
   private pool: pg.Pool;
+  private readonly leaderElectionOverride: IndexerLeaderElection | undefined;
 
   constructor(
     pool?: pg.Pool,
@@ -276,6 +298,7 @@ export class IndexerService {
     maxRangeBlocks?: number,
     replayBudgetMs?: number,
     cursorRepo?: ReplayCursorRepository,
+    leaderElection?: IndexerLeaderElection,
   ) {
     // Use the injected pool or fall back to the shared db pool.
     // Accessing db.pool directly is avoided to keep the service testable.
@@ -284,6 +307,17 @@ export class IndexerService {
     this.maxRangeBlocks = maxRangeBlocks ?? config.indexer.maxRangeBlocks;
     this.replayBudgetMs = replayBudgetMs ?? config.indexer.replayBudgetMs;
     this.cursorRepo = cursorRepo ?? new ReplayCursorRepository();
+    // Only stored when explicitly injected (tests). Otherwise every call
+    // resolves the *current* default via getLeaderElection() below —
+    // this singleton is constructed at module load, before app.ts finishes
+    // wiring Redis, so caching a resolved instance here would freeze it to
+    // the NoOp default forever.
+    this.leaderElectionOverride = leaderElection;
+  }
+
+  /** Resolves the current leader-election instance — never cached, see constructor note. */
+  private getLeaderElection(): IndexerLeaderElection {
+    return this.leaderElectionOverride ?? getIndexerLeaderElection();
   }
 
   /**
@@ -298,18 +332,28 @@ export class IndexerService {
    * committed rows.
    *
    * @param request  Validated replay parameters.
-   * @throws {Error}                    If a replay is already in progress.
+   * @throws {Error}                    If a replay is already in progress on this process.
+   * @throws {IndexerNotLeaderError}     If another instance holds the distributed replay lease.
    * @throws {ReplayBudgetExceededError} If the wall-clock budget is exceeded.
    */
   async replayEvents(request: ReplayRequest): Promise<void> {
     // 1. Validate input (no DB access yet)
     this.validateReplayRequest(request);
 
-    // 2. Concurrent-replay guard
+    // 2. Concurrent-replay guard (same-process)
     if (replayLock.isHeld()) {
       throw new Error('Replay operation already in progress');
     }
     replayLock.acquire();
+
+    // 2b. Distributed leader-election guard (cross-process/multi-replica).
+    //     Acquired after the in-process lock so two concurrent calls into
+    //     the same process still fail fast without touching Redis at all.
+    const leaderElection = this.getLeaderElection();
+    if (!(await leaderElection.tryAcquire())) {
+      replayLock.release();
+      throw new IndexerNotLeaderError();
+    }
 
     const replayStart = Date.now();
     let cursor: ReplayCursor | null = null;
@@ -348,6 +392,22 @@ export class IndexerService {
         if (_stopRequested) {
           logger.warn('replay_stopped_by_shutdown', undefined, {
             event: 'replay_stopped_by_shutdown',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            offset,
+          });
+          break;
+        }
+
+        // Leadership guard: our lease may have expired (e.g. Redis outage)
+        // and another instance may already be leading. Abort at this safe
+        // batch boundary — already-committed batches are durable and a
+        // future run (by whichever instance is leader) resumes from
+        // last_committed_offset.
+        if (!leaderElection.isLeader()) {
+          logger.warn('replay_stopped_lost_leadership', undefined, {
+            event: 'replay_stopped_lost_leadership',
             contract_id: request.contract_id,
             ledger: request.ledger,
             cursor_id: cursor.id,
@@ -440,6 +500,7 @@ export class IndexerService {
       throw error;
     } finally {
       replayLock.release();
+      await leaderElection.release();
     }
   }
 
@@ -767,6 +828,17 @@ export class IndexerService {
    * This facilitates automatic crash recovery when the server restarts.
    */
   async resumeIncompleteReplay(): Promise<void> {
+    // Only the leader replica auto-resumes on startup — otherwise every
+    // replica in a multi-instance deployment would race to resume the same
+    // incomplete replay. replayEvents() re-confirms leadership itself
+    // (idempotently, see leaderElection.ts) once an incomplete run is found.
+    if (!(await this.getLeaderElection().tryAcquire())) {
+      logger.info('Skipping incomplete-replay resume: not the indexer leader', undefined, {
+        event: 'replay_resume_skipped_not_leader',
+      });
+      return;
+    }
+
     const client = await this.pool.connect();
     try {
       const result = await client.query(`
