@@ -56,3 +56,37 @@ To resume after a connection drop:
 curl "http://localhost:3000/api/streams/export?resume_from=<CURSOR_VALUE>"
 ```
 
+## GET /api/streams/:id/export.jsonld
+
+Returns a JSON-LD document with a Fluxora-defined `@context`, enabling machine-readable, self-describing data portability for a single stream.
+The response uses `application/ld+json` Content-Type and uses string serialization for all amount fields to preserve full precision.
+
+## Method Overrides
+
+For legacy clients that cannot issue HTTP methods like `PATCH`, `PUT`, or `DELETE`, you can use the method override feature. This allows you to send a `POST` request with the intended method specified in either:
+
+1. The `X-HTTP-Method-Override` HTTP header
+2. The `_method` query parameter
+
+This feature is only available for authenticated requests and is restricted to `PATCH`, `DELETE`, and `PUT`. Attempts to override unauthenticated routes or use unsupported methods will result in a `400 Bad Request`.
+
+### Examples
+
+Using the HTTP header:
+```http
+POST /api/streams/stream-abc123-0/status
+Authorization: Bearer <token>
+X-HTTP-Method-Override: PATCH
+Content-Type: application/json
+
+{ "status": "paused" }
+```
+
+Using the query parameter:
+```http
+POST /api/streams/stream-abc123-0/status?_method=PATCH
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "status": "paused" }
+```

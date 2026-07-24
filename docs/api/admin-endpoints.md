@@ -39,6 +39,39 @@ Security notes:
 - Input is validated server-side; non-string or empty `stream_id` values return `400`.
 - Audit persistence is attempted after the disconnect so operators get a durable record of the action.
 
+## Bulk Operations
+
+### `POST /api/admin/streams/bulk-actions`
+
+Accepts a batch of operations to apply to streams atomically. Supports pausing, cancelling, and triggering stream reindexing.
+Partial failures are reported per-item in the response without failing the whole batch. Max batch size is 500.
+
+Request body:
+
+```json
+{
+  "batch": [
+    { "streamId": "stream-123", "action": "pause" },
+    { "streamId": "stream-456", "action": "cancel" },
+    { "streamId": "stream-789", "action": "reindex" }
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "results": [
+    { "streamId": "stream-123", "action": "pause", "status": "success" },
+    { "streamId": "stream-456", "action": "cancel", "status": "failed", "error": "Stream not found" },
+    { "streamId": "stream-789", "action": "reindex", "status": "success" }
+  ],
+  "successCount": 2,
+  "failureCount": 1
+}
+```
+
 ## Related admin endpoints
 
 - `GET /api/admin/status`

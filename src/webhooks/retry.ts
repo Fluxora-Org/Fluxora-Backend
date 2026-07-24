@@ -19,12 +19,7 @@ import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerSto
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 
-export type BackoffStrategy = 'exponential' | 'linear' | 'fixed';
-export type JitterAlgorithm = 'full' | 'equal' | 'decorrelated';
-
 export interface EnhancedRetryPolicy extends WebhookRetryPolicy {
-  backoffStrategy?: BackoffStrategy;
-  jitterAlgorithm?: JitterAlgorithm;
   deadLetterAfterMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerResetMs?: number;
@@ -60,49 +55,7 @@ export interface WebhookOutboxRetryPlan {
 // Backoff helpers
 // ---------------------------------------------------------------------------
 
-/** Calculate raw backoff delay (before jitter) for a given attempt number. */
-export function calculateBackoffDelay(attemptNumber: number, policy: EnhancedRetryPolicy): number {
-  const {
-    backoffStrategy = 'exponential',
-    initialBackoffMs,
-    backoffMultiplier,
-    maxBackoffMs,
-  } = policy;
-
-  let baseDelay: number;
-  switch (backoffStrategy) {
-    case 'linear':
-      baseDelay = initialBackoffMs + attemptNumber * initialBackoffMs;
-      break;
-    case 'fixed':
-      baseDelay = initialBackoffMs;
-      break;
-    case 'exponential':
-    default:
-      baseDelay = initialBackoffMs * Math.pow(backoffMultiplier, attemptNumber);
-      break;
-  }
-
-  return Math.min(baseDelay, maxBackoffMs);
-}
-
-/** Apply jitter to a delay value. */
-export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): number {
-  const { jitterPercent = 10, jitterAlgorithm = 'full' } = policy;
-  const jitterRange = delayMs * (jitterPercent / 100);
-
-  switch (jitterAlgorithm) {
-    case 'equal': {
-      const half = delayMs / 2;
-      return half + Math.random() * half;
-    }
-    case 'decorrelated':
-      return Math.random() * delayMs * 3;
-    case 'full':
-    default:
-      return Math.max(0, delayMs - jitterRange / 2 + Math.random() * jitterRange);
-  }
-}
+import { calculateNextRetryDelay } from '../lib/retry.js';
 
 /** Determine if a status code is retryable with enhanced logic. */
 /**
@@ -144,9 +97,12 @@ export function calculateNextRetryTime(
   now: number = Date.now(),
 ): number {
   if (attemptNumber >= policy.maxAttempts) return 0;
-  const raw = calculateBackoffDelay(attemptNumber, policy);
-  const withJitter = applyJitter(raw, policy);
-  return now + Math.round(withJitter);
+  const delayMs = calculateNextRetryDelay(attemptNumber, {
+    baseDelayMs: policy.initialBackoffMs,
+    maxDelayMs: policy.maxBackoffMs,
+    maxAttempts: policy.maxAttempts,
+  });
+  return now + delayMs;
 }
 
 /**
@@ -157,7 +113,11 @@ export function generateRetrySchedule(
   now: number = Date.now(),
 ): RetrySchedule[] {
   return Array.from({ length: policy.maxAttempts }, (_, i) => {
-    const delayMs = Math.round(applyJitter(calculateBackoffDelay(i, policy), policy));
+    const delayMs = calculateNextRetryDelay(i, {
+      baseDelayMs: policy.initialBackoffMs,
+      maxDelayMs: policy.maxBackoffMs,
+      maxAttempts: policy.maxAttempts,
+    });
     return { attemptNumber: i + 1, delayMs, retryAt: now + delayMs };
   });
 }
@@ -277,11 +237,9 @@ export function formatRetryPolicy(policy: EnhancedRetryPolicy): string {
   const base =
     `max_attempts=${policy.maxAttempts}, initial_backoff=${policy.initialBackoffMs}ms, ` +
     `multiplier=${policy.backoffMultiplier}x, max_backoff=${policy.maxBackoffMs}ms, ` +
-    `jitter=${policy.jitterPercent}%, timeout=${policy.timeoutMs}ms`;
+    `jitter=decorrelated, timeout=${policy.timeoutMs}ms`;
 
   const extras: string[] = [];
-  if (policy.backoffStrategy) extras.push(`strategy=${policy.backoffStrategy}`);
-  if (policy.jitterAlgorithm) extras.push(`jitter=${policy.jitterAlgorithm}`);
   if (policy.deadLetterAfterMs) extras.push(`dlq_after=${policy.deadLetterAfterMs}ms`);
   if (policy.circuitBreakerThreshold)
     extras.push(`circuit_breaker=${policy.circuitBreakerThreshold}`);
@@ -298,8 +256,6 @@ export function validateRetryPolicy(policy: EnhancedRetryPolicy): string[] {
   if (policy.backoffMultiplier < 1) errors.push('backoffMultiplier must be at least 1');
   if (policy.maxBackoffMs < policy.initialBackoffMs)
     errors.push('maxBackoffMs must be greater than initialBackoffMs');
-  if (policy.jitterPercent < 0 || policy.jitterPercent > 100)
-    errors.push('jitterPercent must be between 0 and 100');
   if (policy.timeoutMs < 1000) errors.push('timeoutMs must be at least 1000ms');
   if (policy.deadLetterAfterMs && policy.deadLetterAfterMs < 60000)
     errors.push('deadLetterAfterMs must be at least 60000ms (1 minute)');
