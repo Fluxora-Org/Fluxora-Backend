@@ -329,7 +329,11 @@ describe('WebSocket upgrade TOCTOU concurrency', () => {
     expect(hub.getStreamSubscriptionCount(streamId)).toBe(maxConnections);
 
     await Promise.all(connections.map(ws => closeWs(ws)));
-    
+
+    // The client-side 'close' event can resolve slightly before the server's
+    // onDisconnect handler finishes running, so give cleanup a moment.
+    await new Promise(resolve => setTimeout(resolve, 50));
+
     // Ensure memory is released
     expect(hub.getStreamSubscriptionCount(streamId)).toBe(0);
   });

@@ -214,6 +214,10 @@ export interface StreamHubBackpressureCollectorOptions {
 
 export interface StreamHubOptions {
   dedupCache?: IDedupCache;
+  /** Buffered-bytes threshold above which events are dropped for a slow client. Defaults to `BACKPRESSURE_DROP_BYTES` (1 MiB). */
+  dropBytes?: number;
+  /** Buffered-bytes threshold above which a slow client's connection is terminated. Defaults to `BACKPRESSURE_TERMINATE_BYTES` (4 MiB). */
+  terminateBytes?: number;
   /**
    * When true, upgrade requests without a valid JWT are rejected with 401.
    * Defaults to the WS_AUTH_REQUIRED environment variable.
@@ -303,6 +307,13 @@ export class StreamHub extends EventEmitter {
 
   constructor(server: Server, options?: StreamHubOptions) {
     super();
+
+    if (typeof options?.dropBytes === 'number' && options.dropBytes >= 0) {
+      this.dropBytes = options.dropBytes;
+    }
+    if (typeof options?.terminateBytes === 'number' && options.terminateBytes >= 0) {
+      this.terminateBytes = options.terminateBytes;
+    }
 
     if (options?.dedupCache) {
       this.dedup = options.dedupCache;

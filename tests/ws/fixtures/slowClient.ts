@@ -6,6 +6,7 @@ type ServerWebSocket = WebSocket & {
     remotePort?: number;
     write?: (...args: unknown[]) => boolean;
     emit?: (event: string) => boolean;
+    pause?: () => void;
   };
 };
 
