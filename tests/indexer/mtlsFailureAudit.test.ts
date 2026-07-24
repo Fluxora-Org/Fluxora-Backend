@@ -22,7 +22,7 @@ describe('mTLS Validation Failure Audit', () => {
     statusMock = vi.fn().mockReturnValue({ json: jsonMock });
 
     res = {
-      status: statusMock,
+      status: statusMock as unknown as Response['status'],
     };
   });
 

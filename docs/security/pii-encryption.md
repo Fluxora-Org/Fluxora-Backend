@@ -81,3 +81,203 @@ rows transparently.
 - `migrations/20260601_enable_pgcrypto_encrypt_addresses.ts`
 
 Run migrations before starting the service.
+
+## Worker threads pool for batch hashing
+
+Single-row HMAC operations (`computeAddressHash`, `computeAddressHashes`) run
+synchronously on the main event loop.  This is fine for the request path where
+each call processes one row, but bulk operations such as the export endpoint
+or the data-retention purge job iterate thousands of rows and can stall
+request handling.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Main thread                                            │
+│                                                         │
+│  batchComputeAddressHashes(addrs, keys)                 │
+│       │                                                 │
+│       ├── < 50 addresses → synchronous (no workers)     │
+│       │                                                 │
+│       └── ≥ 50 addresses → WorkerPool                   │
+│              │                                          │
+│              ├── Worker 1 ── pgcryptoWorker.js          │
+│              ├── Worker 2 ── pgcryptoWorker.js          │
+│              ├── ...                                    │
+│              └── Worker N ── pgcryptoWorker.js          │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `src/pii/workerPool.ts` | Generic bounded worker_threads pool with graceful degradation |
+| `src/pii/pgcryptoWorker.ts` | Worker thread script — receives hash tasks, returns results |
+| `src/pii/pgcryptoEncryption.ts` | `batchComputeAddressHashes()` — public API for batch hashing |
+
+### Batch threshold
+
+The `BATCH_HASH_THRESHOLD` constant (default: **50**) determines the minimum
+number of addresses before work is dispatched to workers.  Below this
+threshold the overhead of worker IPC (structured clone, message passing)
+exceeds the benefit of parallel execution, so computation runs synchronously
+on the main thread.
+
+### Pool sizing
+
+Worker count is derived from `os.availableParallelism()` with a hard cap of
+`DEFAULT_MAX_WORKERS` (8).  Even on high-core-count machines, the per-worker
+overhead (V8 isolate, event loop) does not justify more than 8 concurrent
+HMAC computations.
+
+### Graceful degradation
+
+If ALL workers fail to start (e.g. restricted sandbox, resource exhaustion),
+the pool degrades transparently to synchronous in-thread execution via a
+registered fallback function.  Callers never see errors from the pool —
+`batchComputeAddressHashes` always returns correct results.
+
+### Shutdown
+
+Call `shutdownPgcryptoPool()` during graceful process shutdown to terminate
+all worker threads and free resources.  The pool is lazily initialized and
+recreated if needed after shutdown.
+
+## Security model for worker threads
+
+### Key delivery
+
+Cryptographic keys are passed to workers via `workerData` (structured clone)
+at worker creation time.  This is the recommended mechanism from the
+`worker_threads` documentation — structured cloning creates an independent
+copy in the worker's V8 isolate.
+
+**The worker NEVER:**
+
+- Reads `PGCRYPTO_KEY` from `process.env`
+- Reads key material from files or environment
+- Logs, serializes, or transmits key material back to the parent thread
+- Stores keys beyond the lifetime of the worker
+
+### Key lifecycle
+
+1. Caller passes `PgcryptoKeySet` to `batchComputeAddressHashes()`.
+2. Each hash task carries the keys in its `HashTaskMessage`.
+3. The worker receives the message, computes HMAC digests, returns results.
+4. Keys exist in worker-local heap memory only during task execution.
+5. When the worker terminates (pool shutdown), all key material is
+   garbage-collected.
+
+### Why per-task keys instead of workerData initialization
+
+Passing keys with each task (rather than once at worker creation) ensures:
+
+- **No stale key state**: each task explicitly provides the current key set,
+  so key rotation takes effect immediately without restarting workers.
+- **No cross-task leakage**: even if a worker is reused across tasks, each
+  task's keys are provided fresh and independently.
+- **Simplicity**: no need for a separate "init" handshake or synchronization.
+
+## Data retention purge job
+
+The scheduled retention-purge job (`src/jobs/retentionPurge.ts`) enforces the
+data-retention policy defined in `src/pii/policy.ts` by deleting or redacting
+rows that have exceeded their configured retention window.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Scheduler (cron / pg_cron / admin trigger)              │
+│       │                                                  │
+│       └── runRetentionPurge(options?)                    │
+│              │                                           │
+│              ├── Rule 1: audit_logs (365 days, delete)   │
+│              │     └── processBatch() → BEGIN/COMMIT     │
+│              │                                           │
+│              ├── Rule 2: webhook_outbox (90 days, delete)│
+│              │     └── processBatch() → BEGIN/COMMIT     │
+│              │                                           │
+│              └── ... (additional rules as added)         │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `src/jobs/retentionPurge.ts` | Purge job — batched, transactional, idempotent |
+| `src/pii/policy.ts` | `PURGEABLE_RETENTION_SCHEDULE` — retention rules with table/age/purge-action |
+| `migrations/20260724000000_streams_legal_hold.ts` | Adds `legal_hold` column + indexes to `streams` |
+
+### Legal-hold exemption
+
+Every row in a target table with `legal_hold = TRUE` is unconditionally skipped
+by the purge job.  A `PURGE_SKIPPED_LEGAL_HOLD` audit event is written for
+each skipped row for compliance evidence.
+
+The legal-hold check happens **inside the same transaction** as the delete,
+preventing a TOCTOU race where a hold is set between the check and the delete.
+
+The `streams` table gains `legal_hold` via migration
+`20260724000000_streams_legal_hold.ts`.  Tables without the column
+(`audit_logs`, `webhook_outbox`) are handled via a `COALESCE` fallback that
+defaults to `FALSE`.
+
+### Execution model
+
+1. **Batched processing**: Each batch acquires a connection, runs
+   `SELECT … FOR UPDATE SKIP LOCKED`, processes rows, then commits.
+   Default batch size is 500 rows (configurable via `batchSize` option).
+
+2. **Idempotent / crash-safe**: Each batch is committed atomically.  A crash
+   mid-run simply restarts from wherever the last successful commit left off.
+   Re-running the job after a crash is safe — already-purged rows are not
+   selected again.
+
+3. **Concurrent-safe**: `FOR UPDATE SKIP LOCKED` prevents multiple purge
+   workers from processing the same rows simultaneously.
+
+### Audit trail
+
+| Event | When | Scope |
+|-------|------|-------|
+| `PURGE_INITIATED` | Batch commits ≥ 1 delete/redact | Per batch (not per row) |
+| `PURGE_SKIPPED_LEGAL_HOLD` | Row has `legal_hold = TRUE` | Per skipped row |
+
+Both events are recorded in the `audit_logs` table with the correlation ID
+from the originating job invocation.
+
+### Configuration
+
+```typescript
+interface PurgeJobOptions {
+  batchSize?: number;   // max rows per transaction (default 500)
+  now?: Date;           // override for deterministic testing
+  pool?: Pool;          // injectable pool for testing
+  correlationId?: string; // propagated into audit entries
+  dryRun?: boolean;     // count-only mode, no deletes
+}
+```
+
+### Adding a new purge rule
+
+1. Add an entry to `PURGEABLE_RETENTION_SCHEDULE` in `src/pii/policy.ts`.
+2. Ensure the target table has an `id` column (or `rowid`) and a
+   `legal_hold` boolean column (or accept the `COALESCE` default of `FALSE`).
+3. The table should have an index on `(ageColumn, legal_hold)` for efficient
+   candidate queries.
+
+### Security model
+
+- Table and column names are developer-controlled constants — safely quoted
+  via `quoteIdentifier()` (defence-in-depth against SQL injection).
+- The job runs with the application's DB principal (requires `DELETE` on
+  target tables, no super-user access needed).
+- Audit events are written inside the transaction for purge actions and
+  via fire-and-forget for legal-hold skips (to persist even if the batch
+  rolls back).
+- `dryRun` mode counts candidates without deleting — useful for compliance
+  audits and pre-deployment validation.

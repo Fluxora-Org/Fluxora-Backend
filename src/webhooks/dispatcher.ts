@@ -193,6 +193,28 @@ export class WebhookDispatcher {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Check if it's WebhookTargetValidationError, which are non-retryable
+      let isNonRetryable = false;
+      if (error instanceof WebhookTargetValidationError) {
+        isNonRetryable = true;
+      }
+      
+      if (isNonRetryable) {
+        logger.error('Webhook delivery failed permanently with error', undefined, {
+          deliveryId,
+          eventType,
+          attemptNumber,
+          error: errorMessage,
+        });
+        
+        return {
+          success: false,
+          error: errorMessage,
+          shouldRetry: false,
+        };
+      }
+
       const attempt: WebhookDeliveryAttempt = {
         attemptNumber,
         timestamp: Date.now(),
@@ -236,6 +258,75 @@ export class WebhookDispatcher {
   }
 
   /**
+   * Follow redirects with SSRF validation on each hop.
+   */
+  private async followRedirects(
+    initialUrl: string,
+    requestOptions: Omit<RequestInit, 'redirect'>,
+    deliveryId: string,
+    eventType: string,
+    maxRedirects: number = 1,
+  ): Promise<Response> {
+    let currentUrl = initialUrl;
+    let redirectCount = 0;
+    let allowlist: string[] | undefined;
+
+    try {
+      const config = getConfig();
+      allowlist = config.webhookAllowedHosts;
+    } catch {
+      // Config not initialized, proceed without allowlist
+    }
+
+    while (true) {
+      const response = await fetch(currentUrl, {
+        ...requestOptions,
+        redirect: 'manual',
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const locationHeader = response.headers.get('Location');
+        if (!locationHeader) {
+          return response;
+        }
+
+        if (redirectCount >= maxRedirects) {
+          logger.error('Too many webhook redirects', undefined, {
+            deliveryId,
+            eventType,
+            redirectCount,
+            maxRedirects,
+          });
+          throw new Error('Too many redirects');
+        }
+
+        // Resolve relative URL to absolute
+        const redirectUrl = new URL(locationHeader, currentUrl).toString();
+        
+        // Validate the redirect URL with SSRF guard
+        try {
+          currentUrl = await validateWebhookTarget(redirectUrl, { allowlist });
+        } catch (error) {
+          if (error instanceof WebhookTargetValidationError) {
+            logger.error('Redirect target rejected by SSRF guard', undefined, {
+              deliveryId,
+              eventType,
+              reason: error.message,
+            });
+            throw error;
+          }
+          throw error;
+        }
+
+        redirectCount++;
+        continue;
+      }
+
+      return response;
+    }
+  }
+
+  /**
    * Send HTTP request to webhook endpoint.
    *
    * This method does not log request metadata; callers must keep secrets,
@@ -267,16 +358,75 @@ export class WebhookDispatcher {
         headers[CORRELATION_ID_HEADER] = correlationId;
       }
 
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: payload,
-        signal: controller.signal,
-      });
+      const response = await this.followRedirects(
+        url,
+        {
+          method: 'POST',
+          headers,
+          body: payload,
+          signal: controller.signal,
+        },
+        deliveryId,
+        eventType,
+      );
 
       return response;
     } finally {
       clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Follow redirects for validation requests.
+   */
+  private async followValidationRedirects(
+    initialUrl: string,
+    maxRedirects: number = 1,
+  ): Promise<Response> {
+    let currentUrl = initialUrl;
+    let redirectCount = 0;
+    let allowlist: string[] | undefined;
+
+    try {
+      const config = getConfig();
+      allowlist = config.webhookAllowedHosts;
+    } catch {
+      // Config not initialized, proceed without allowlist
+    }
+
+    while (true) {
+      const response = await fetch(currentUrl, {
+        method: 'HEAD',
+        redirect: 'manual',
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const locationHeader = response.headers.get('Location');
+        if (!locationHeader) {
+          return response;
+        }
+
+        if (redirectCount >= maxRedirects) {
+          logger.error('Too many redirects during endpoint validation');
+          throw new Error('Too many redirects');
+        }
+
+        const redirectUrl = new URL(locationHeader, currentUrl).toString();
+        try {
+          currentUrl = await validateWebhookTarget(redirectUrl, { allowlist });
+        } catch (error) {
+          if (error instanceof WebhookTargetValidationError) {
+            logger.error('Redirect target rejected by SSRF guard during validation');
+            throw error;
+          }
+          throw error;
+        }
+
+        redirectCount++;
+        continue;
+      }
+
+      return response;
     }
   }
 
@@ -291,10 +441,7 @@ export class WebhookDispatcher {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout for validation
 
-      const response = await fetch(url, {
-        method: 'HEAD',
-        signal: controller.signal,
-      });
+      const response = await this.followValidationRedirects(url);
 
       clearTimeout(timeoutId);
       return response.status < 500; // Accept any non-server-error status
@@ -329,6 +476,63 @@ export interface SimpleWebhookDispatch {
   event: string;
   payload: unknown;
   ledger?: number;
+}
+
+/**
+ * Follow redirects for the dispatchWebhook convenience function.
+ */
+async function followDispatchWebhookRedirects(
+  initialUrl: string,
+  requestOptions: Omit<RequestInit, 'redirect'>,
+  maxRedirects: number = 1,
+): Promise<Response> {
+  let currentUrl = initialUrl;
+  let redirectCount = 0;
+  let allowlist: string[] | undefined;
+
+  try {
+    const config = getConfig();
+    allowlist = config.webhookAllowedHosts;
+  } catch {
+    // Config not initialized, proceed without allowlist
+  }
+
+  while (true) {
+    const response = await fetch(currentUrl, {
+      ...requestOptions,
+      redirect: 'manual',
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const locationHeader = response.headers.get('Location');
+      if (!locationHeader) {
+        return response;
+      }
+
+      if (redirectCount >= maxRedirects) {
+        logger.error('Too many redirects during webhook dispatch');
+        throw new Error('Too many redirects');
+      }
+
+      const redirectUrl = new URL(locationHeader, currentUrl).toString();
+      try {
+        currentUrl = await validateWebhookTarget(redirectUrl, { allowlist });
+      } catch (error) {
+        if (error instanceof WebhookTargetValidationError) {
+          logger.error('Redirect target rejected by SSRF guard during webhook dispatch', undefined, {
+            reason: error.message,
+          });
+          throw error;
+        }
+        throw error;
+      }
+
+      redirectCount++;
+      continue;
+    }
+
+    return response;
+  }
 }
 
 export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void> {
@@ -398,12 +602,15 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
       headers[CORRELATION_ID_HEADER] = effectiveCorrelationId;
     }
 
-    await fetch(validatedUrl, {
-      method: 'POST',
-      headers,
-      body: payloadStr,
-      signal: controller.signal,
-    });
+    await followDispatchWebhookRedirects(
+      validatedUrl,
+      {
+        method: 'POST',
+        headers,
+        body: payloadStr,
+        signal: controller.signal,
+      }
+    );
   } finally {
     clearTimeout(timeoutId);
   }

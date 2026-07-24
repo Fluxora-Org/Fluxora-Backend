@@ -1,6 +1,37 @@
 version: '3.8'
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fluxora Backend – Docker Compose
+#
+# Default profile  : postgres + indexer (existing behaviour, unchanged).
+# chaos profile    : adds Redis + Toxiproxy sitting in front of Postgres and
+#                    Redis so automated chaos tests can inject network faults
+#                    (latency, bandwidth throttle, connection reset) via the
+#                    Toxiproxy HTTP management API on port 8474.
+#
+# Topology (chaos profile):
+#
+#   backend / tests
+#       │
+#       ├─► toxi-postgres :5433 ──► postgres :5432
+#       └─► toxi-redis    :6380 ──► redis    :6379
+#       │
+#       └─► toxiproxy mgmt API :8474  (configure toxics at runtime)
+#
+# Security notes:
+#   - Toxiproxy management port (8474) is bound only to 127.0.0.1 in
+#     production-like deployments; the compose file exposes it only on
+#     localhost so CI runners do not expose it externally.
+#   - All service passwords are test-only values that never appear in
+#     application code or secrets stores.
+#   - The chaos profile containers are isolated in the "chaos" network and
+#     are never started unless "--profile chaos" is explicitly passed.
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
+
+  # ── Default services (always started) ──────────────────────────────────────
+
   postgres:
     image: postgres:15-alpine
     container_name: indexer-postgres
@@ -34,6 +65,85 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+
+  # ── Chaos profile services ──────────────────────────────────────────────────
+  # Start with: docker compose --profile chaos up -d
+
+  # Dedicated Postgres instance used only during chaos tests so the default
+  # indexer-postgres is not disrupted.
+  chaos-postgres:
+    profiles: [chaos]
+    image: postgres:15-alpine
+    container_name: chaos-postgres
+    environment:
+      POSTGRES_DB: chaos_db
+      POSTGRES_USER: chaos_user
+      # test-only password; never used in production
+      POSTGRES_PASSWORD: chaos_password
+    ports:
+      - "5434:5432"
+    networks:
+      - chaos
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chaos_user -d chaos_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Redis instance used only during chaos tests.
+  redis:
+    profiles: [chaos]
+    image: redis:7-alpine
+    container_name: chaos-redis
+    command: redis-server --requirepass chaos_password --loglevel warning
+    ports:
+      - "6381:6379"
+    networks:
+      - chaos
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "chaos_password", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Toxiproxy sits between the backend / tests and both Postgres and Redis.
+  # The management API (8474) is used by toxiproxy.chaos.test.ts to configure
+  # and tear down toxics programmatically.
+  #
+  # Proxy configuration (provisioned at startup via config volume):
+  #   "pg_proxy"    listens on :5433  → forwards to chaos-postgres:5432
+  #   "redis_proxy" listens on :6380  → forwards to chaos-redis:6379
+  toxiproxy:
+    profiles: [chaos]
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: chaos-toxiproxy
+    # Seed proxies at startup so tests can immediately address the proxied ports.
+    # The JSON file is mounted read-only; toxics are added at runtime via the API.
+    command: [
+      "-host", "0.0.0.0",
+      "-config", "/etc/toxiproxy/config.json",
+    ]
+    volumes:
+      - ./toxiproxy.config.json:/etc/toxiproxy/config.json:ro
+    ports:
+      # Toxiproxy management API — bound to localhost only so it is not
+      # reachable from outside the CI runner or developer machine.
+      - "127.0.0.1:8474:8474"
+      # Proxied Postgres endpoint (tests connect here instead of :5434)
+      - "127.0.0.1:5433:5433"
+      # Proxied Redis endpoint (tests connect here instead of :6381)
+      - "127.0.0.1:6380:6380"
+    networks:
+      - chaos
+    depends_on:
+      chaos-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+networks:
+  chaos:
+    driver: bridge
 
 volumes:
   postgres_data:

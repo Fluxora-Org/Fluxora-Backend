@@ -1,0 +1,14 @@
+[
+  {
+    "name": "pg_proxy",
+    "listen": "0.0.0.0:5433",
+    "upstream": "chaos-postgres:5432",
+    "enabled": true
+  },
+  {
+    "name": "redis_proxy",
+    "listen": "0.0.0.0:6380",
+    "upstream": "chaos-redis:6379",
+    "enabled": true
+  }
+]
