@@ -141,6 +141,63 @@ services:
       redis:
         condition: service_healthy
 
+  # ── pgbouncer profile services ──────────────────────────────────────────────
+  # Start with: docker compose --profile pgbouncer up -d
+  #
+  # This profile provisions a minimal PgBouncer in transaction-pooling mode
+  # in front of the default Postgres instance for local verification of the
+  # POOL_MODE=transaction guard.
+  #
+  # Topology:
+  #
+  #   backend / tests
+  #       │
+  #       └─► pgbouncer :6432 (transaction pooler) ──► postgres :5432
+  #
+  # Connect using:
+  #   DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:6432/indexer_db
+  #   POOL_MODE=transaction
+  #
+  # Security notes:
+  #   - The PgBouncer admin console password is a test-only value.
+  #   - The :6432 port is only bound to localhost; production deployments
+  #     should configure TLS and network-level access controls.
+  #   - admin_users and stats_users are restricted to 'pgbouncer_admin'.
+  pgbouncer:
+    profiles: [pgbouncer]
+    image: bitnami/pgbouncer:1.22.0
+    container_name: indexer-pgbouncer
+    environment:
+      # Target Postgres instance
+      POSTGRESQL_HOST: postgres
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_DATABASE: indexer_db
+      POSTGRESQL_USERNAME: indexer_user
+      POSTGRESQL_PASSWORD: indexer_password
+      # PgBouncer pool settings
+      PGBOUNCER_DATABASE: indexer_db
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 100
+      PGBOUNCER_DEFAULT_POOL_SIZE: 20
+      # Auth settings
+      PGBOUNCER_AUTH_TYPE: md5
+      PGBOUNCER_ADMIN_USERS: pgbouncer_admin
+      PGBOUNCER_STATS_USERS: pgbouncer_admin
+      # test-only password; never used in production
+      PGBOUNCER_AUTH_USER: indexer_user
+      PGBOUNCER_AUTH_QUERY: "SELECT p_user, p_password FROM pgbouncer.get_auth($1)"
+    ports:
+      # Expose PgBouncer on localhost only — not accessible outside CI runner
+      - "127.0.0.1:6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U indexer_user -d indexer_db || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 networks:
   chaos:
     driver: bridge

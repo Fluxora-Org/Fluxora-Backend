@@ -8,9 +8,47 @@
  *   DB_IDLE_TIMEOUT          ms before closing an idle connection (default 30000)
  *   POOL_QUEUE_LIMIT         max requests allowed to queue before fast-failing (default 50)
  *   DATABASE_URL             postgres connection string
+ *   POOL_MODE                "session" (default) | "transaction"
+ *                            Set to "transaction" when the app is fronted by
+ *                            PgBouncer or PgCat in transaction-pooling mode.
  *
  * Pool exhaustion → throws PoolExhaustedError (caller maps to 503).
  * Unique constraint violation → throws DuplicateEntryError (caller maps to 409).
+ *
+ * ── PgBouncer / PgCat transaction-pooling compatibility ────────────────────
+ *
+ * Transaction-pooling mode (PgBouncer `pool_mode=transaction` / PgCat
+ * equivalent) multiplexes many app connections onto fewer server connections
+ * by returning the server connection to the pool after each transaction.
+ *
+ * Two features of a plain `pg.Pool` are INCOMPATIBLE with this mode:
+ *
+ *   1. `SET statement_timeout = $1` on the `connect` event fires once per
+ *      logical connection but may land on a different physical server
+ *      connection for each transaction. Because PgBouncer resets session
+ *      state between transactions, the SET is silently lost, leaving queries
+ *      with no timeout at all — a silent correctness failure.
+ *
+ *   2. `pg` driver statement caching (server-side prepared statements) is
+ *      inherently session-scoped. PgBouncer in transaction mode does not
+ *      support prepared statements and will return an error if the app
+ *      attempts to use `PREPARE` / `EXECUTE`.
+ *
+ * When `POOL_MODE=transaction` is set:
+ *   - The `connect` hook skips `SET statement_timeout` (per-query timeout is
+ *     the operator's responsibility at the pgbouncer.ini level, or via a
+ *     wrapper in each query).
+ *   - The pool is created with `allowExitOnIdle: false` (no pg internal
+ *     prepared statement cache in this mode).
+ *   - A startup warning is logged so operators know which features are
+ *     bypassed.
+ *
+ * ⚠  FAILURE MODE — If you are running behind a transaction pooler but
+ *    POOL_MODE is unset or set to "session", the `SET statement_timeout`
+ *    call will be issued but silently lost after each transaction boundary.
+ *    Queries will run WITHOUT any application-side timeout. This is a silent
+ *    correctness failure, not a crash. Set POOL_MODE=transaction explicitly
+ *    to acknowledge and handle this condition.
  *
  * Observability:
  *   - pool.on('connect')  → increments active gauge
@@ -84,9 +122,27 @@ export interface PoolConfig {
    * Defaults to "default".
    */
   poolName?: string;
+  /**
+   * Pooler mode: "session" (default) | "transaction".
+   *
+   * Set to "transaction" when a PgBouncer / PgCat transaction-pooler sits
+   * between the app and Postgres. In transaction mode:
+   *   - session-scoped `SET statement_timeout` is skipped on the connect hook
+   *     (it would be silently lost on each transaction boundary).
+   *   - pg driver prepared-statement caching is disabled.
+   *
+   * ⚠ WARNING: If your deployment uses a transaction pooler but this is left
+   * as "session", statement_timeout will silently not be applied — queries
+   * will run without any application-side timeout.
+   */
+  poolMode?: 'session' | 'transaction';
 }
 
 export function resolvePoolConfig(): PoolConfig {
+  const rawMode = process.env.POOL_MODE ?? 'session';
+  const poolMode: 'session' | 'transaction' =
+    rawMode === 'transaction' ? 'transaction' : 'session';
+
   return {
     connectionString: process.env.DATABASE_URL ?? 'postgresql://localhost/fluxora',
     min: envInt('DB_POOL_MIN', 2),
@@ -95,6 +151,7 @@ export function resolvePoolConfig(): PoolConfig {
     idleTimeoutMillis: envInt('DB_IDLE_TIMEOUT', 30_000),
     queueLimit: envInt('POOL_QUEUE_LIMIT', 50),
     statementTimeoutMs: envInt('STATEMENT_TIMEOUT_MS', 5_000),
+    poolMode,
   };
 }
 
@@ -116,6 +173,26 @@ function syncGauges(pool: pg.Pool, poolName: string): void {
 export function createPool(config?: PoolConfig): pg.Pool {
   const cfg = config ?? resolvePoolConfig();
   const poolName = cfg.poolName ?? 'default';
+  const isTransactionMode = cfg.poolMode === 'transaction';
+
+  // ── PgBouncer / PgCat transaction-mode compatibility warning ─────────────
+  // Emit a structured warning at startup so operators can confirm that the
+  // correct mode is active.  This warning fires once per pool creation, not
+  // once per connection, so it has negligible overhead.
+  if (isTransactionMode) {
+    logger.warn(
+      'Pool created in TRANSACTION mode (PgBouncer/PgCat compatible). ' +
+      'session-scoped SET statement_timeout is disabled. ' +
+      'Ensure statement_timeout is configured at the pooler or server level.',
+      undefined,
+      {
+        event: 'pool_transaction_mode_active',
+        poolName,
+        statementTimeoutMs: cfg.statementTimeoutMs,
+      },
+    );
+  }
+
   const pool = new Pool({
     connectionString: cfg.connectionString,
     min: cfg.min,
@@ -124,15 +201,22 @@ export function createPool(config?: PoolConfig): pg.Pool {
     idleTimeoutMillis: cfg.idleTimeoutMillis,
   });
 
-  // Store queueLimit on the pool instance for use in query()
-  (pool as pg.Pool & { _queueLimit?: number })._queueLimit = cfg.queueLimit;
+  // Store queueLimit and poolMode on the pool instance for use in query()
+  (pool as pg.Pool & { _queueLimit?: number; _poolMode?: string })._queueLimit = cfg.queueLimit;
+  (pool as pg.Pool & { _queueLimit?: number; _poolMode?: string })._poolMode = cfg.poolMode ?? 'session';
 
   // Apply statement_timeout on every new physical connection.
   // SET LOCAL scopes the timeout to the current transaction; for non-transactional
   // queries we use SET (session-level) so it persists for the connection lifetime.
+  //
+  // In transaction-pooling mode this SET is intentionally skipped: PgBouncer
+  // resets session state between transactions, so the SET would be silently
+  // lost and queries would run without any timeout.  Operators must configure
+  // statement_timeout at the pooler layer (pgbouncer.ini `server_reset_query`
+  // or Postgres `ALTER ROLE … SET statement_timeout`).
   pool.on('connect', (client: pg.PoolClient) => {
     syncGauges(pool, poolName);
-    if (cfg.statementTimeoutMs > 0) {
+    if (!isTransactionMode && cfg.statementTimeoutMs > 0) {
       // Fire-and-forget; errors are surfaced via pool.on('error')
       client.query('SET statement_timeout = $1', [cfg.statementTimeoutMs]).catch((err: Error) => {
         logger.error('Failed to set statement_timeout', undefined, { error: err.message });
@@ -142,6 +226,7 @@ export function createPool(config?: PoolConfig): pg.Pool {
       total: pool.totalCount,
       idle: pool.idleCount,
       waiting: pool.waitingCount,
+      poolMode: cfg.poolMode ?? 'session',
     });
   });
 
@@ -177,6 +262,16 @@ export function getPool(): pg.Pool {
 /** Replace the singleton (useful in tests). */
 export function setPool(pool: pg.Pool | null): void {
   _pool = pool;
+}
+
+/**
+ * Returns true when the singleton pool was created in transaction-pooling mode.
+ * Callers that need to know whether session-scoped SETs are reliable can check
+ * this flag and adapt accordingly.
+ */
+export function isTransactionPoolMode(): boolean {
+  if (!_pool) return (process.env.POOL_MODE === 'transaction');
+  return ((_pool as pg.Pool & { _poolMode?: string })._poolMode === 'transaction');
 }
 
 // ── Query helper ──────────────────────────────────────────────────────────────

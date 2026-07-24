@@ -286,3 +286,89 @@ If a consumer is decommissioned or experiences an extended outage and lag exceed
   severity: warning
 ```
 
+
+
+---
+
+## PgBouncer / PgCat Transaction-Pooling Compatibility (issue #754)
+
+At higher connection scale operators commonly front PostgreSQL with
+[PgBouncer](https://www.pgbouncer.org/) or
+[PgCat](https://github.com/levkk/pgcat) in **transaction-pooling mode**
+(`pool_mode = transaction`). This mode returns the server connection to the
+pooler after every transaction rather than keeping it pinned for the
+lifetime of the client connection, enabling many more app connections than
+Postgres server connections.
+
+### Why transaction-pooling is incompatible with the default pool setup
+
+Two features of a plain `pg.Pool` are session-scoped and silently break under
+transaction pooling:
+
+| Feature | Session mode | Transaction mode |
+|---|---|---|
+| `SET statement_timeout = $1` on `connect` | ✅ Works — persists for connection lifetime | ❌ Silently lost — pooler resets session on each transaction boundary |
+| pg driver prepared-statement cache | ✅ Works | ❌ PgBouncer rejects `PREPARE` / `EXECUTE` |
+
+### ⚠ Silent failure mode
+
+If you are running behind a transaction pooler but `POOL_MODE` is **not** set
+to `transaction`, the `SET statement_timeout` call succeeds from the app's
+perspective but is silently discarded by PgBouncer. Queries run **without
+any application-side timeout**. This is not a crash — it is a silent
+correctness failure. Setting `POOL_MODE=transaction` explicitly acknowledges
+and handles this condition.
+
+### Configuration
+
+Set the `POOL_MODE` environment variable:
+
+```bash
+# Session pooling (default — direct Postgres connection or session pooler)
+POOL_MODE=session
+
+# Transaction pooling — use when PgBouncer/PgCat is in transaction mode
+POOL_MODE=transaction
+```
+
+When `POOL_MODE=transaction`:
+
+- The `connect` hook skips `SET statement_timeout`. Configure
+  `statement_timeout` at the pooler layer instead (e.g., pgbouncer.ini
+  `server_reset_query` or `ALTER ROLE app_user SET statement_timeout = '5s'`).
+- A startup warning is logged with `event: pool_transaction_mode_active`.
+
+### Local verification with Docker Compose
+
+A `pgbouncer` Docker Compose profile is provided for local testing:
+
+```bash
+# Start Postgres + PgBouncer in transaction mode
+docker compose --profile pgbouncer up -d
+
+# Connect through PgBouncer (port 6432)
+DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:6432/indexer_db \
+  POOL_MODE=transaction \
+  pnpm dev
+```
+
+The PgBouncer container (`bitnami/pgbouncer:1.22.0`) is configured with
+`PGBOUNCER_POOL_MODE=transaction` and `PGBOUNCER_DEFAULT_POOL_SIZE=20`.
+Port `6432` is bound to `127.0.0.1` only.
+
+### API
+
+```typescript
+import { isTransactionPoolMode } from './src/db/pool.js';
+
+// Check if the active pool is in transaction mode
+if (isTransactionPoolMode()) {
+  // Do not rely on session-scoped state
+}
+```
+
+### Environment variable reference
+
+| Variable | Values | Default | Description |
+|---|---|---|---|
+| `POOL_MODE` | `session` \| `transaction` | `session` | Pool compatibility mode. Set to `transaction` when using PgBouncer/PgCat in transaction-pooling mode. |
