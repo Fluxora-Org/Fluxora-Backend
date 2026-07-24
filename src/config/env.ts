@@ -277,6 +277,14 @@ export const EnvSchema = z.object({
    SSE_DRAIN_TIMEOUT_MS: integerEnv('SSE_DRAIN_TIMEOUT_MS', 1_000, 60_000).default(30_000),
    INDEXER_ENABLED: booleanEnv().default(false),
    WORKER_ENABLED: booleanEnv().default(false),
+   /** Per-checker timeout for HealthCheckManager. Must be strictly greater than 0. */
+   HEALTH_CHECK_TIMEOUT_MS: integerEnv('HEALTH_CHECK_TIMEOUT_MS', 1).default(5000),
+   /** Interval between background health-check runs. Must be strictly greater than 0. */
+   HEALTH_CHECK_INTERVAL_MS: integerEnv('HEALTH_CHECK_INTERVAL_MS', 1).default(30000),
+   /** Enables the grpc.health.v1.Health service for Kubernetes-native gRPC probes. */
+   GRPC_HEALTH_ENABLED: booleanEnv().default(false),
+   /** Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). */
+   GRPC_HEALTH_PORT: integerEnv('GRPC_HEALTH_PORT', 1, 65535).default(50051),
    INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
    INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
   DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
@@ -416,6 +424,14 @@ export interface Config {
   sseDrainTimeoutMs: number;
   indexerEnabled: boolean;
   workerEnabled: boolean;
+  /** Per-checker timeout for HealthCheckManager, in ms. */
+  healthCheckTimeoutMs: number;
+  /** Interval between background health-check runs, in ms. */
+  healthCheckIntervalMs: number;
+  /** Enables the grpc.health.v1.Health service (k8s-native gRPC probes). */
+  grpcHealthEnabled: boolean;
+  /** Port the gRPC health service binds to when enabled. */
+  grpcHealthPort: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -571,6 +587,10 @@ function toConfig(env: ParsedEnv): Config {
     sseDrainTimeoutMs: env.SSE_DRAIN_TIMEOUT_MS,
     indexerEnabled: env.INDEXER_ENABLED,
     workerEnabled: env.WORKER_ENABLED,
+    healthCheckTimeoutMs: env.HEALTH_CHECK_TIMEOUT_MS,
+    healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS,
+    grpcHealthEnabled: env.GRPC_HEALTH_ENABLED,
+    grpcHealthPort: env.GRPC_HEALTH_PORT,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,

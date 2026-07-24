@@ -83,6 +83,7 @@ import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
+import { recordServerTimingPhase } from '../middleware/serverTiming.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
@@ -105,6 +106,7 @@ import {
   InMemoryIdempotencyStore,
   type IdempotencyStore,
 } from '../redis/idempotencyStore.js';
+import { toStreamJsonLd } from '../serialization/jsonld.js';
 export const streamsRouter = Router();
 
 /**
@@ -497,6 +499,7 @@ streamsRouter.get(
     }
 
     let result: { streams: Stream[]; hasMore: boolean; total?: number };
+    const dbStart = process.hrtime.bigint();
     try {
       const filter: StreamFilter = {};
       if (statusFilter !== undefined) filter.status = statusFilter as NonNullable<StreamFilter['status']>;
@@ -515,6 +518,9 @@ streamsRouter.get(
       };
     } catch (err) {
       wrapDbError(err);
+    } finally {
+      const durationMs = Number(process.hrtime.bigint() - dbStart) / 1e6;
+      recordServerTimingPhase(res, 'db', durationMs);
     }
 
     const pageStreams = result!.streams;
@@ -542,7 +548,13 @@ streamsRouter.get(
       allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
     );
 
-    res.json(successResponse(response, requestId));
+    const serializeStart = process.hrtime.bigint();
+    try {
+      res.json(successResponse(response, requestId));
+    } finally {
+      const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
+      recordServerTimingPhase(res, 'serialize', durationMs);
+    }
   }),
 );
 
@@ -631,6 +643,44 @@ streamsRouter.get(
         : NO_STORE_STREAM_HEADERS,
     );
     res.json(successResponse({ stream }, requestId));
+  }),
+);
+
+/**
+ * GET /api/streams/:id/export.jsonld
+ * Export a single stream as JSON-LD for data portability.
+ */
+streamsRouter.get(
+  '/:id/export.jsonld',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+    debug('Exporting stream as JSON-LD', { id });
+
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) throw notFound('Stream', id);
+
+    const jsonld = toStreamJsonLd(record!);
+    setStreamResourceHeaders(res, record!);
+    res.set(
+      'Cache-Control',
+      isTerminalStatus(record!.status as ApiStreamStatus)
+        ? CACHEABLE_STREAM_HEADERS
+        : NO_STORE_STREAM_HEADERS,
+    );
+    res.type('application/ld+json');
+    res.send(JSON.stringify(jsonld));
   }),
 );
 

@@ -14,7 +14,7 @@ function delay(ms: number): Promise<void> {
 }
 
 type MetricSnapshot = {
-  values: Array<{ metricName?: string; labels: Record<string, string | number>; value: number }>;
+  values: Array<{ metricName?: string; labels: Partial<Record<string, string | number>>; value: number }>;
 };
 
 async function getMetricSampleCount(metric: { get: () => Promise<MetricSnapshot> }): Promise<number> {

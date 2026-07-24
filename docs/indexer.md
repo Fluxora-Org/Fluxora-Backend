@@ -275,6 +275,25 @@ Only one replay can run at a time to prevent:
 - Memory pressure from multiple large operations
 - Conflicting progress tracking
 
+This is enforced at two layers:
+1. **In-process** (`ReplayLock` in `src/indexer/service.ts`): rejects a second concurrent call within the same process instantly, no Redis round-trip required.
+2. **Cross-process** (`IndexerLeaderElection` in `src/indexer/leaderElection.ts`): a Redis-backed lease that ensures only one *replica* runs replay at a time in a multi-instance deployment. See "Multi-Replica Leader Election" below.
+
+### Multi-Replica Leader Election
+
+In a multi-replica deployment, every instance shares the same `replay_cursors` table but previously had no way to coordinate *which instance* should actually run a replay — the in-process `ReplayLock` only prevented two concurrent calls on the *same* process. `IndexerLeaderElection` (`src/indexer/leaderElection.ts`) closes that gap with a Redis-backed lease:
+
+- **Acquisition**: `SET NX PX` on a single fixed key (`indexer:leader-election:replay`) — whichever instance sets it first becomes leader for the lease duration (default 15s).
+- **Renewal**: the leader renews the lease on a heartbeat (default every `leaseMs / 3`) via `PEXPIRE`, but only after confirming via `GET` that it still holds the key. If another instance's value is found (meaning our lease already lapsed), or the `PEXPIRE` itself fails, we drop leadership immediately.
+- **Abort on lease loss**: `replayEvents()` checks `isLeader()` at every batch boundary (the same place it already checks the shutdown `_stopRequested` flag). If leadership is lost mid-replay — most likely because Redis was unreachable for a full lease period — the loop stops cleanly after the in-flight batch's transaction has committed. No connection is left open and no batch is left half-committed.
+- **Startup auto-resume**: `resumeIncompleteReplay()` (called once per process on startup) only proceeds if this instance is the leader, so replicas don't all race to resume the same incomplete cursor.
+- **Fail-safe default**: when Redis is disabled (`REDIS_ENABLED=false`) or unreachable, `NoOpLeaderElection` is used instead — every instance is always "leader", which is exactly today's single-process behaviour. Multi-replica coordination only activates once Redis is configured.
+- **Graceful shutdown**: the lease is released via a `shutdown.ts` hook (`src/app.ts`), after the replay-stop signal is sent but before Redis connections are closed, so another replica can take over promptly instead of waiting out the full lease TTL.
+
+**Operational note — Redis outage**: if Redis becomes unreachable, no instance can acquire or renew the lease, so replay simply does not run anywhere until Redis recovers. This is intentional (fail-safe, not fail-open) — no data is lost, since durable progress lives entirely in `replay_cursors.last_committed_offset`, independent of the lease.
+
+**Security note — non-atomic renew/release**: like the existing `RedisDistributedLock` (`src/state/adminStateLock.ts`), lease renewal and release are check-then-act sequences (`GET` then `PEXPIRE`/`DEL`), not Lua-atomic compare-and-swap. This is an accepted, pre-existing class of risk in this codebase, not a new one introduced here. The worst case is a brief window — bounded by `renewIntervalMs` — where two instances both believe they are leader. Because every batch INSERT already uses `ON CONFLICT (event_id) DO NOTHING` (see "Idempotency" above), a second instance briefly replaying the same range produces no duplicate rows, so this window cannot corrupt data — only cause temporarily duplicated (but harmless) work.
+
 ### Transaction Safety
 
 All replay operations run in transactions:
@@ -315,12 +334,37 @@ The test suite covers:
 - ✅ Empty replay sets
 - ✅ Batch processing with various sizes
 - ✅ Batch boundary alignment
-- ✅ Duplicate event handling
+- ✅ Duplicate event handling and `HybridDedupCache` downtime fallback
+- ✅ Property-based test suite verifying duplicate suppression invariants during Redis downtime
 - ✅ Concurrent replay prevention
 - ✅ Transaction rollback on errors
 - ✅ Progress tracking and estimation
 - ✅ Block range filtering
 - ✅ SQL injection prevention
+
+## Duplicate Event Suppression & Resiliency
+
+`streamEventService` ingests Soroban RPC streaming events and enforces strict duplicate suppression using an injectable `DedupCache` interface (defaulting to `InMemoryDedupCache` or `HybridDedupCache`).
+
+### Hybrid Cache & Redis Downtime Fallback
+
+When backed by `HybridDedupCache`:
+1. **Primary Cache**: Interacts with Redis (`RedisDedupCache`) to track event keys (`fluxora:dedup:<streamId>:<eventId>`) across server restarts.
+2. **Fallback Cache**: In-memory cache (`InMemoryDedupCache`) that tracks event arrivals locally.
+3. **Graceful Degradation**: If Redis experiences connection failures or outages mid-sequence, `HybridDedupCache` automatically catches Redis exceptions, logs a throttled fallback event, increments Prometheus metric `dedup_redis_fallback_total`, and seamlessly degrades to the in-memory cache.
+
+### Core Invariants
+
+The deduplication layer guarantees the following invariant regardless of event arrival order, duplicate burst frequency, or intermittent Redis downtime:
+
+> **"Each distinct `(transactionHash, eventIndex)` pair triggers at most one database write operation and at most one WebSocket broadcast."**
+
+### Property-Based Testing
+
+Deduplication behavior is verified using property-based testing powered by `fast-check`:
+- **Randomized Event Replay Sequences**: Generates sequences of `StreamCreated`, `StreamUpdated`, and `StreamCancelled` events interleaved with duplicate bursts.
+- **Intermittent Redis Outages**: Simulates random Redis connection failures mid-sequence during event ingestion.
+- **Deterministic Execution**: CI runs are configured deterministically using fixed seeds (`seed: 42`, bounded `numRuns: 100`) to prevent flakiness.
 
 ## Deployment
 
@@ -410,7 +454,7 @@ WHERE contract_id = 'contract-abc-123' AND ledger = 1;
 
 ## Future Enhancements
 
-- [ ] Persistent replay state (Redis/database) for multi-instance deployments
+- [x] Persistent replay state (Redis/database) for multi-instance deployments — see "Multi-Replica Leader Election" above
 - [ ] Pause/resume replay operations
 - [ ] Replay queue for multiple contracts
 - [ ] Webhook notifications on replay completion

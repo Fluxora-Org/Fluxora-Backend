@@ -38,7 +38,7 @@ import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError, type ContractEventStore } from '../indexer/store.js';
-import { SSE_STREAM_UPDATE_EVENT, sseEventBus } from '../streams/sseEmitter.js';
+import { SSE_STREAM_UPDATE_EVENT, sseEventBus, SSE_CLOSE_REASONS } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -948,6 +948,18 @@ export class StreamHub extends EventEmitter {
     return this.clients.entries();
   }
 
+  /**
+   * Internal entry-point used by the subscription cardinality collector to
+   * enumerate stream subscription counts. Underscore-prefixed because it
+   * exposes internal map references — callers MUST treat them as read-only.
+   *
+   * @security Exposes only streamId keys and subscriber Set sizes; no
+   *           WebSocket references or client state is leaked.
+   */
+  _getStreamSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
+    return this.streamSubscriptions;
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
@@ -1052,6 +1064,13 @@ export class StreamHub extends EventEmitter {
     }
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
+  }
+
+  async gracefulClose(): Promise<void> {
+    for (const ws of this.clients.keys()) {
+      ws.close(1001, JSON.stringify({ reason: SSE_CLOSE_REASONS.SERVER_SHUTDOWN }));
+    }
+    await this.close();
   }
 
   async _resetDedup(): Promise<void> {
