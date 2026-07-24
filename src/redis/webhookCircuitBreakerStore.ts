@@ -47,14 +47,14 @@ export interface WebhookCircuitBreakerStore {
   close(): Promise<void>;
 }
 
-const transitionsTotal =
+export const transitionsTotal =
   (registry.getSingleMetric('fluxora_webhook_circuit_breaker_transitions_total') as Counter<
-    'from_state' | 'to_state'
+    'from_state' | 'to_state' | 'consumer_hash'
   >) ||
   new Counter({
     name: 'fluxora_webhook_circuit_breaker_transitions_total',
     help: 'Webhook circuit breaker state transitions per consumer endpoint',
-    labelNames: ['from_state', 'to_state'] as const,
+    labelNames: ['from_state', 'to_state', 'consumer_hash'] as const,
     registers: [registry],
   });
 
@@ -79,8 +79,13 @@ function ttlSec(policy: CircuitBreakerPolicy): number {
   return Math.ceil(Math.max(resetMs * 2, 300_000) / 1000);
 }
 
-function emit(from: WebhookCircuitBreakerPhase, to: WebhookCircuitBreakerPhase): void {
-  if (from !== to) transitionsTotal.inc({ from_state: from, to_state: to });
+function emit(from: WebhookCircuitBreakerPhase, to: WebhookCircuitBreakerPhase, consumerUrl: string): void {
+  if (from !== to)
+    transitionsTotal.inc({
+      from_state: from,
+      to_state: to,
+      consumer_hash: hashConsumerUrl(consumerUrl),
+    });
 }
 
 function parse(raw: string | null): WebhookCircuitBreakerRecord {
@@ -150,7 +155,7 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
         }
         const next = { state: 'half-open' as const, consecutiveFailures: record.consecutiveFailures, resetAt: 0 };
         await this.client.set(stateKey(consumerUrl), JSON.stringify(next), { ex: ttlSec(policy) });
-        emit('open', 'half-open');
+        emit('open', 'half-open', consumerUrl);
         return {
           allowed: true,
           state: 'half-open',
@@ -180,7 +185,7 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
       const next = closed();
       await this.client.set(stateKey(consumerUrl), JSON.stringify(next), { ex: ttlSec(policy) });
       await this.client.del(probeKey(consumerUrl));
-      if (previous.state !== 'closed') emit(previous.state, 'closed');
+      if (previous.state !== 'closed') emit(previous.state, 'closed', consumerUrl);
       return next;
     } catch (err) {
       logger.error('WebhookCircuitBreakerStore Redis error on recordSuccess', undefined, {
@@ -207,14 +212,14 @@ export class RedisWebhookCircuitBreakerStore implements WebhookCircuitBreakerSto
           consecutiveFailures: previous.consecutiveFailures,
           resetAt: now + this.resetMs(policy),
         };
-        emit('half-open', 'open');
+        emit('half-open', 'open', consumerUrl);
       } else {
         const failures = previous.consecutiveFailures + 1;
         next =
           failures >= this.threshold(policy)
             ? { state: 'open', consecutiveFailures: failures, resetAt: now + this.resetMs(policy) }
             : { state: 'closed', consecutiveFailures: failures, resetAt: 0 };
-        if (next.state === 'open') emit(previous.state === 'open' ? 'open' : 'closed', 'open');
+        if (next.state === 'open') emit(previous.state === 'open' ? 'open' : 'closed', 'open', consumerUrl);
       }
       await this.client.set(stateKey(consumerUrl), JSON.stringify(next), { ex: ttlSec(policy) });
       await this.client.del(probeKey(consumerUrl));
@@ -299,7 +304,7 @@ export class InMemoryWebhookCircuitBreakerStore implements WebhookCircuitBreaker
       const expiry = now + Math.min(resetMs, 60_000);
       this.probes.set(key, expiry);
       this.states.set(key, { state: 'half-open', consecutiveFailures: record.consecutiveFailures, resetAt: 0 });
-      emit('open', 'half-open');
+      emit('open', 'half-open', consumerUrl);
       return { allowed: true, state: 'half-open', consecutiveFailures: record.consecutiveFailures, resetAt: null };
     }
     return {
@@ -320,7 +325,7 @@ export class InMemoryWebhookCircuitBreakerStore implements WebhookCircuitBreaker
     const next = closed();
     this.states.set(key, next);
     this.probes.delete(key);
-    if (previous.state !== 'closed') emit(previous.state, 'closed');
+    if (previous.state !== 'closed') emit(previous.state, 'closed', consumerUrl);
     return next;
   }
 
@@ -336,14 +341,14 @@ export class InMemoryWebhookCircuitBreakerStore implements WebhookCircuitBreaker
     let next: WebhookCircuitBreakerRecord;
     if (previous.state === 'half-open') {
       next = { state: 'open', consecutiveFailures: previous.consecutiveFailures, resetAt: now + (policy.circuitBreakerResetMs ?? 300_000) };
-      emit('half-open', 'open');
+      emit('half-open', 'open', consumerUrl);
     } else {
       const failures = previous.consecutiveFailures + 1;
       next =
         failures >= threshold
           ? { state: 'open', consecutiveFailures: failures, resetAt: now + (policy.circuitBreakerResetMs ?? 300_000) }
           : { state: 'closed', consecutiveFailures: failures, resetAt: 0 };
-      if (next.state === 'open') emit(previous.state === 'open' ? 'open' : 'closed', 'open');
+      if (next.state === 'open') emit(previous.state === 'open' ? 'open' : 'closed', 'open', consumerUrl);
     }
     this.states.set(key, next);
     this.probes.delete(key);

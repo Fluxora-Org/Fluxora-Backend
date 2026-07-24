@@ -148,6 +148,14 @@ The `contract_events` table is partitioned by `happened_at` to ensure bounded gr
 4. Validate that detached partitions are backed up per the existing S3 retention policy before actually dropping them.
 5. Run the function in `dryRun = true` mode initially to audit partitions that will be dropped.
 
+### Partition Pre-creation
+
+To avoid rows landing in the unindexed `DEFAULT` partition, partitions for the next 3 months are pre-created by the background job `src/jobs/partitionMaintenance.ts`.
+
+1. The job runs every 24 hours.
+2. It uses `pg_try_advisory_lock` to prevent concurrent execution.
+3. If partition creation falls behind, the job logs an error and should be monitored for alerting.
+
 ### Recommended alert thresholds
 
 ```yaml

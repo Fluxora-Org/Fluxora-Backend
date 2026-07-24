@@ -50,17 +50,35 @@ services:
       timeout: 5s
       retries: 5
 
-  indexer:
+  app-blue:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: indexer-service
+    container_name: fluxora-blue
     environment:
       DATABASE_URL: postgresql://indexer_user:indexer_password@postgres:5432/indexer_db
       REPLAY_BATCH_SIZE: 1000
       PORT: 3000
+      DEPLOYMENT_SLOT: blue
     ports:
       - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  app-green:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fluxora-green
+    environment:
+      DATABASE_URL: postgresql://indexer_user:indexer_password@postgres:5432/indexer_db
+      REPLAY_BATCH_SIZE: 1000
+      PORT: 3000
+      DEPLOYMENT_SLOT: green
+    ports:
+      - "3001:3000"
     depends_on:
       postgres:
         condition: service_healthy

@@ -126,12 +126,8 @@ export function getDedupCache(): DedupCache {
  * @returns Promise resolving to true if duplicate, false if first encounter
  */
 async function isDuplicateEvent(streamId: string, eventId: string): Promise<boolean> {
-  const isDup = await activeDedupCache.has(streamId, eventId);
-  if (isDup) {
-    return true;
-  }
-  await activeDedupCache.add(streamId, eventId);
-  return false;
+  const added = await activeDedupCache.add(streamId, eventId);
+  return !added;
 }
 
 /**

@@ -16,6 +16,8 @@ import { loadConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
 import { createGrpcHealthServer, startGrpcHealthServer, stopGrpcHealthServer } from './health/grpcHealth.js';
 import { createRedisClient } from './redis/client.js';
+import { setDedupCache } from './services/streamEventService.js';
+import { RedisDedupCache, InMemoryDedupCache, HybridDedupCache } from './redis/dedup.js';
 import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
 import {
   createWebhookCircuitBreakerStore,
@@ -55,6 +57,7 @@ import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { startBackgroundJobs } from './jobs/queue.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -138,6 +141,46 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
       },
     );
     setIdempotencyDependencyState('unavailable');
+  }
+}
+
+async function wireStreamEventDedupCache(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info('Redis disabled — stream event dedup will use in-memory cache');
+    setDedupCache(new InMemoryDedupCache());
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const primary = new RedisDedupCache(redisClient);
+    const fallback = new InMemoryDedupCache();
+    const hybrid = new HybridDedupCache(primary, fallback, true);
+
+    setDedupCache(hybrid);
+    addShutdownHook(() => hybrid.close());
+
+    logger.info('Redis stream event dedup cache wired', undefined, {
+      component: 'stream-event-dedup',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for stream event dedup — falling back to in-memory cache',
+      undefined,
+      {
+        component: 'stream-event-dedup',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setDedupCache(new InMemoryDedupCache());
   }
 }
 
@@ -229,6 +272,28 @@ async function wireAdminStateLock(config: Config): Promise<void> {
 }
 
 /**
+ * Blue/green deployment slot middleware.
+ *
+ * Emits `X-Fluxora-Deployment-Slot` on every response so that a front-side
+ * load balancer or the e2e suite can verify which slot answered a request
+ * during a blue/green cutover.
+ *
+ * The slot is read from `DEPLOYMENT_SLOT` env var at request time (not module
+ * load) so that the same binary can serve either slot depending on how it is
+ * launched. Defaults to `"blue"` when the env var is absent or empty.
+ *
+ * Security: the header value is constrained to alphanumeric + hyphens to
+ * prevent header injection. Any non-conforming value is replaced with `"blue"`.
+ */
+function deploymentSlotMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const raw = process.env.DEPLOYMENT_SLOT ?? 'blue';
+  // Sanitise: only allow [a-z0-9-] to prevent header injection.
+  const slot = /^[a-z0-9-]+$/i.test(raw) ? raw : 'blue';
+  res.setHeader('X-Fluxora-Deployment-Slot', slot);
+  next();
+}
+
+/**
  * Wire Redis-backed distributed leader election for indexer replay.
  *
  * When `REDIS_ENABLED=true` (the default): wires a Redis-backed lease so only
@@ -312,11 +377,13 @@ export function createApp(options: AppOptions = {}): Express {
 
   if (options.pool) {
     app.locals.vacuumInterval = startVacuumCollector(options.pool);
+    startBackgroundJobs(options.pool);
   }
 
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
+  void wireStreamEventDedupCache(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
   void wireAdminStateLock(appConfig);
   void wireIndexerLeaderElection(appConfig);
@@ -336,6 +403,9 @@ export function createApp(options: AppOptions = {}): Express {
     });
     addShutdownHook(() => stopGrpcHealthServer(grpcHealthServer));
   }
+
+  // Blue/green slot header — must run before any response can be sent.
+  app.use(deploymentSlotMiddleware);
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   app.use(privacyHeaders);
