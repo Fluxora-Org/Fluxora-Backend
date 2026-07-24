@@ -81,3 +81,101 @@ rows transparently.
 - `migrations/20260601_enable_pgcrypto_encrypt_addresses.ts`
 
 Run migrations before starting the service.
+
+## Worker threads pool for batch hashing
+
+Single-row HMAC operations (`computeAddressHash`, `computeAddressHashes`) run
+synchronously on the main event loop.  This is fine for the request path where
+each call processes one row, but bulk operations such as the export endpoint
+or the data-retention purge job iterate thousands of rows and can stall
+request handling.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Main thread                                            │
+│                                                         │
+│  batchComputeAddressHashes(addrs, keys)                 │
+│       │                                                 │
+│       ├── < 50 addresses → synchronous (no workers)     │
+│       │                                                 │
+│       └── ≥ 50 addresses → WorkerPool                   │
+│              │                                          │
+│              ├── Worker 1 ── pgcryptoWorker.js          │
+│              ├── Worker 2 ── pgcryptoWorker.js          │
+│              ├── ...                                    │
+│              └── Worker N ── pgcryptoWorker.js          │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `src/pii/workerPool.ts` | Generic bounded worker_threads pool with graceful degradation |
+| `src/pii/pgcryptoWorker.ts` | Worker thread script — receives hash tasks, returns results |
+| `src/pii/pgcryptoEncryption.ts` | `batchComputeAddressHashes()` — public API for batch hashing |
+
+### Batch threshold
+
+The `BATCH_HASH_THRESHOLD` constant (default: **50**) determines the minimum
+number of addresses before work is dispatched to workers.  Below this
+threshold the overhead of worker IPC (structured clone, message passing)
+exceeds the benefit of parallel execution, so computation runs synchronously
+on the main thread.
+
+### Pool sizing
+
+Worker count is derived from `os.availableParallelism()` with a hard cap of
+`DEFAULT_MAX_WORKERS` (8).  Even on high-core-count machines, the per-worker
+overhead (V8 isolate, event loop) does not justify more than 8 concurrent
+HMAC computations.
+
+### Graceful degradation
+
+If ALL workers fail to start (e.g. restricted sandbox, resource exhaustion),
+the pool degrades transparently to synchronous in-thread execution via a
+registered fallback function.  Callers never see errors from the pool —
+`batchComputeAddressHashes` always returns correct results.
+
+### Shutdown
+
+Call `shutdownPgcryptoPool()` during graceful process shutdown to terminate
+all worker threads and free resources.  The pool is lazily initialized and
+recreated if needed after shutdown.
+
+## Security model for worker threads
+
+### Key delivery
+
+Cryptographic keys are passed to workers via `workerData` (structured clone)
+at worker creation time.  This is the recommended mechanism from the
+`worker_threads` documentation — structured cloning creates an independent
+copy in the worker's V8 isolate.
+
+**The worker NEVER:**
+
+- Reads `PGCRYPTO_KEY` from `process.env`
+- Reads key material from files or environment
+- Logs, serializes, or transmits key material back to the parent thread
+- Stores keys beyond the lifetime of the worker
+
+### Key lifecycle
+
+1. Caller passes `PgcryptoKeySet` to `batchComputeAddressHashes()`.
+2. Each hash task carries the keys in its `HashTaskMessage`.
+3. The worker receives the message, computes HMAC digests, returns results.
+4. Keys exist in worker-local heap memory only during task execution.
+5. When the worker terminates (pool shutdown), all key material is
+   garbage-collected.
+
+### Why per-task keys instead of workerData initialization
+
+Passing keys with each task (rather than once at worker creation) ensures:
+
+- **No stale key state**: each task explicitly provides the current key set,
+  so key rotation takes effect immediately without restarting workers.
+- **No cross-task leakage**: even if a worker is reused across tasks, each
+  task's keys are provided fresh and independently.
+- **Simplicity**: no need for a separate "init" handshake or synchronization.
