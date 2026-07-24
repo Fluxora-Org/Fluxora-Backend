@@ -91,6 +91,7 @@ function rowToEntry(row: Record<string, unknown>): DlqEntry {
     correlationId: row['correlation_id'] as string | undefined,
     firstFailedAt: (row['first_failed_at'] as Date).toISOString(),
     lastFailedAt:  (row['last_failed_at']  as Date).toISOString(),
+    status:        row['status']         as 'dead' | 'replayed',
   };
 }
 
@@ -116,8 +117,8 @@ export const dlqRepository = {
     await query(
       pool,
       `INSERT INTO dead_letter_queue
-         (id, topic, payload, error, attempts, correlation_id, first_failed_at, last_failed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         (id, topic, payload, error, attempts, correlation_id, first_failed_at, last_failed_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         entry.id,
         entry.topic,
@@ -127,6 +128,7 @@ export const dlqRepository = {
         entry.correlationId ?? null,
         entry.firstFailedAt,
         entry.lastFailedAt,
+        entry.status ?? 'dead',
       ],
     );
   },
@@ -201,6 +203,25 @@ export const dlqRepository = {
     }
     const result = await query(pool, 'DELETE FROM dead_letter_queue');
     return result.rowCount ?? 0;
+  },
+
+  async replayEntry(id: string, patch: Partial<Pick<DlqEntry, 'attempts' | 'lastFailedAt'>>): Promise<boolean> {
+    const pool = getPool();
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    let idx = 1;
+
+    if (patch.attempts !== undefined) { sets.push(`attempts = $${idx++}`); params.push(patch.attempts); }
+    if (patch.lastFailedAt !== undefined) { sets.push(`last_failed_at = $${idx++}`); params.push(patch.lastFailedAt); }
+    sets.push(`status = $${idx++}`); params.push('replayed');
+
+    params.push(id);
+    const result = await query(
+      pool,
+      `UPDATE dead_letter_queue SET ${sets.join(', ')} WHERE id = $${idx} AND status = 'dead'`,
+      params
+    );
+    return (result.rowCount ?? 0) > 0;
   },
 
   // ── Consumer suspension ─────────────────────────────────────────────────────
