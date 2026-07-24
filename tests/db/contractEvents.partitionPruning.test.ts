@@ -18,7 +18,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
-import { PostgresContractEventStore, InMemoryContractEventStore } from '../../src/indexer/store.js';
+import { PostgresContractEventStore, InMemoryContractEventStore, type PgClientLike } from '../../src/indexer/store.js';
 import { StreamEventReplayFilter } from '../../src/db/types.js';
 
 const DATABASE_URL = process.env['DATABASE_URL'];
@@ -205,7 +205,7 @@ describe.skipIf(!isLiveDb)('contract_events Partition Pruning (Live DB Integrati
 
       await client.query('ANALYZE contract_events;');
 
-      store = new PostgresContractEventStore(client);
+      store = new PostgresContractEventStore(client as unknown as PgClientLike);
       dbAvailable = true;
     } catch {
       dbAvailable = false;
