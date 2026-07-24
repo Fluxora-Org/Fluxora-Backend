@@ -180,6 +180,10 @@ export class StreamHub extends EventEmitter {
     return this.eventStore;
   }
 
+  public getStreamSubscriptionCount(streamId: string): number {
+    return this.streamSubscriptions.get(streamId)?.size ?? 0;
+  }
+
   private readonly metrics: BackpressureMetrics = {
     droppedMessages: 0,
     terminatedConnections: 0,
@@ -653,8 +657,8 @@ export class StreamHub extends EventEmitter {
   async broadcast(event: StreamUpdateEvent): Promise<void> {
     const { streamId, eventId, payload } = event;
 
-    if (await this.dedup.has(streamId, eventId)) return;
-    await this.dedup.add(streamId, eventId);
+    const added = await this.dedup.add(streamId, eventId);
+    if (!added) return;
 
     // Emit to Server-Sent Events bus
     sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, event);

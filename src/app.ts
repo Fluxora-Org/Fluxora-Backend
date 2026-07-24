@@ -16,6 +16,8 @@ import { loadConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
 import { createGrpcHealthServer, startGrpcHealthServer, stopGrpcHealthServer } from './health/grpcHealth.js';
 import { createRedisClient } from './redis/client.js';
+import { setDedupCache } from './services/streamEventService.js';
+import { RedisDedupCache, InMemoryDedupCache, HybridDedupCache } from './redis/dedup.js';
 import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
 import {
   createWebhookCircuitBreakerStore,
@@ -138,6 +140,46 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
       },
     );
     setIdempotencyDependencyState('unavailable');
+  }
+}
+
+async function wireStreamEventDedupCache(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info('Redis disabled — stream event dedup will use in-memory cache');
+    setDedupCache(new InMemoryDedupCache());
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const primary = new RedisDedupCache(redisClient);
+    const fallback = new InMemoryDedupCache();
+    const hybrid = new HybridDedupCache(primary, fallback, true);
+
+    setDedupCache(hybrid);
+    addShutdownHook(() => hybrid.close());
+
+    logger.info('Redis stream event dedup cache wired', undefined, {
+      component: 'stream-event-dedup',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for stream event dedup — falling back to in-memory cache',
+      undefined,
+      {
+        component: 'stream-event-dedup',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setDedupCache(new InMemoryDedupCache());
   }
 }
 
@@ -317,6 +359,7 @@ export function createApp(options: AppOptions = {}): Express {
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
+  void wireStreamEventDedupCache(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
   void wireAdminStateLock(appConfig);
   void wireIndexerLeaderElection(appConfig);

@@ -16,6 +16,7 @@ export interface SlowClient {
   subscribe(streamId: string): void;
   setBufferedAmount(bytes: number): void;
   releaseDrain(): void;
+  simulatePartition(): void;
   restore(): void;
   close(): void;
 }
@@ -84,6 +85,11 @@ export async function createSlowClient(port: number, hub: StreamHub): Promise<Sl
     },
     setBufferedAmount(bytes: number): void {
       bufferedAmount = bytes;
+    },
+    simulatePartition(): void {
+      if (rawSocket && typeof rawSocket.pause === 'function') {
+        rawSocket.pause();
+      }
     },
     releaseDrain(): void {
       bufferedAmount = 0;
