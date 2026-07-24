@@ -31,6 +31,8 @@ import {
 } from '../redis/rpcFallbackCache.js';
 import { createRedisClient } from '../redis/client.js';
 import {
+  rpcCircuitOpenFallbackHitsTotal,
+  rpcCircuitOpenFallbackMissesTotal,
   rpcFallbackCacheEarlyRefreshesTotal,
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,

@@ -170,6 +170,19 @@ The per-client gauges below expose `ws.bufferedAmount` directly so operators can
 | `fluxora_ws_backpressure_buffered_bytes` | Gauge | `connection_id` (UUID v4) | Current `ws.bufferedAmount` per connected `/ws/streams` client, in bytes. Sampled every 5s by the hub's collector and rounded to non-negative integers. |
 | `fluxora_ws_max_buffered_bytes` | Gauge | — | Maximum `ws.bufferedAmount` observed across all live clients at the most recent sample. Useful for dashboards: spikes here precede drops. |
 | `fluxora_ws_slow_clients` | Gauge | — | Count of live clients whose `bufferedAmount` exceeds the slow threshold (default 1 MiB). |
+| `fluxora_ws_broadcast_batch_flush_seconds` | Histogram | — | Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush. Bounded O(1) cardinality (zero labels). |
+
+### Micro-Batch Broadcast Flush Latency
+
+When WebSocket broadcast micro-batching (flush-window coalescing) is enabled via `flushWindowMs > 0`, events are held briefly to coalesce outbound socket frames. Operators tune `flushWindowMs` to balance network frame overhead against delivery latency.
+
+`fluxora_ws_broadcast_batch_flush_seconds` records, per batch flush, the age (in seconds) of the oldest event included in that flush.
+
+**Bucket layout (seconds):**  
+`0.0001` (0.1ms), `0.0005` (0.5ms), `0.001` (1ms), `0.0025` (2.5ms), `0.005` (5ms), `0.01` (10ms), `0.025` (25ms), `0.05` (50ms), `0.1` (100ms), `0.25` (250ms), `0.5` (500ms), `1.0` (1s), `2.5` (2.5s), `5.0` (5s).
+
+**Zero-Overhead Guarantee:**  
+When micro-batching is disabled (default `flushWindowMs: 0`, single-event-per-frame mode), this metric is a complete no-op with zero runtime overhead and zero histogram observations recorded.
 
 ### Label cardinality and security
 
@@ -337,3 +350,16 @@ This metric increments on thrown subscriber callbacks.
 
 SSE payloads and other stream-level data are not included in the log/metric labels (only `streamId` is logged; the payload is not logged).
 
+
+## Webhook Circuit Breaker Metrics
+
+We track state transitions for webhook circuit breakers to provide visibility into consumer endpoint health.
+
+### `fluxora_webhook_circuit_breaker_transitions_total`
+
+A Prometheus counter tracking state transitions (`closed`, `open`, `half-open`).
+
+Labels:
+- `from_state`: The previous state.
+- `to_state`: The new state.
+- `consumer_hash`: SHA256 hash of the consumer URL, truncated to 16 characters, to ensure bounded cardinality.
