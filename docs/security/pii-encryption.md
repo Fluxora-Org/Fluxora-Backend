@@ -281,3 +281,100 @@ interface PurgeJobOptions {
   rolls back).
 - `dryRun` mode counts candidates without deleting — useful for compliance
   audits and pre-deployment validation.
+
+
+---
+
+## GDPR Right-to-Erasure Endpoint (issue #730)
+
+The service implements a GDPR Article 17 (right to erasure) endpoint that
+scrubs PII columns for a data subject identified by their Stellar recipient
+address.
+
+### Endpoint
+
+```
+DELETE /api/privacy/erasure/:recipientAddress
+Authorization: Bearer <ADMIN_API_KEY>
+```
+
+### What is erased
+
+| Column | Action |
+|---|---|
+| `sender_address` | Replaced with `[REDACTED:GDPR-17]` tombstone |
+| `recipient_address` | Replaced with `[REDACTED:GDPR-17]` tombstone |
+| `sender_address_hash` | Set to `NULL` |
+| `recipient_address_hash` | Set to `NULL` |
+
+### What is preserved (financial / audit integrity)
+
+| Data | Reason preserved |
+|---|---|
+| `amount` | Financial audit trail — required for regulatory compliance |
+| `ledger` | Public chain data — not PII |
+| `stream_id` | Opaque internal identifier — not PII |
+| `status` | Stream lifecycle state — not PII |
+| `contract_events` rows | Ledger amounts are public chain data |
+| `audit_logs` entries | Immutable audit trail; erasure itself is logged |
+
+### Legal hold exemption
+
+Streams with `legal_hold = TRUE` are skipped by the erasure query. The
+response body reports `rowsSkippedLegalHold` so the caller knows whether
+all data was erased. The WHERE clause exclusion of legal-hold rows and
+the actual DELETE/UPDATE happen within the same parameterised query, so
+there is no TOCTOU race.
+
+### Audit trail
+
+Every erasure call (successful or failed) writes a `PII_ERASURE_REQUESTED`
+entry to `audit_logs` via `recordAuditEventToDb`. The entry includes:
+
+- `rowsErased` — number of rows updated
+- `rowsSkippedLegalHold` — rows skipped due to legal hold
+- `requestedBy` — truncated Authorization header value (no secrets)
+- `outcome: 'failed'` — only present on error paths
+
+The audit record `resourceId` contains only the first 8 characters of the
+address followed by `…` — enough for correlation without logging the full
+pseudonymous identifier.
+
+### Security notes
+
+1. **Authentication required** — `requireAdminAuth` middleware gates the endpoint.
+2. **Parameterised query** — the address is passed as `$2`; never interpolated.
+3. **No full address in logs** — only an 8-char prefix is ever logged or stored.
+4. **Tombstone is machine-readable** — `[REDACTED:GDPR-17]` allows audit tools to scan for erased rows.
+5. **Idempotent** — re-running with the same address is safe; already-tombstoned rows no longer match the WHERE clause.
+6. **Cache-Control: no-store** — response is never cached by intermediaries.
+
+### Example request
+
+```bash
+curl -X DELETE \
+  "https://api.example.com/api/privacy/erasure/GABCDE...STELLAR_ADDRESS" \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
+```
+
+### Example response
+
+```json
+{
+  "erased": true,
+  "rowsErased": 3,
+  "rowsSkippedLegalHold": 0,
+  "message": "3 row(s) erased."
+}
+```
+
+Response with legal-hold rows:
+
+```json
+{
+  "erased": true,
+  "rowsErased": 2,
+  "rowsSkippedLegalHold": 1,
+  "message": "2 row(s) erased. 1 row(s) skipped due to legal hold."
+}
+```
