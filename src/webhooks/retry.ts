@@ -28,6 +28,8 @@ export interface EnhancedRetryPolicy extends WebhookRetryPolicy {
   deadLetterAfterMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerResetMs?: number;
+  /** For testing: inject a deterministic random function */
+  random?: () => number;
 }
 
 export interface RetrySchedule {
@@ -60,7 +62,16 @@ export interface WebhookOutboxRetryPlan {
 // Backoff helpers
 // ---------------------------------------------------------------------------
 
-/** Calculate raw backoff delay (before jitter) for a given attempt number. */
+/**
+ * Calculate raw backoff delay (before jitter) for a given attempt number.
+ * 
+ * Backoff formulas:
+ * - exponential: initialBackoffMs * (backoffMultiplier)^attemptNumber
+ * - linear: initialBackoffMs + attemptNumber * initialBackoffMs
+ * - fixed: initialBackoffMs
+ * 
+ * The result is capped at maxBackoffMs.
+ */
 export function calculateBackoffDelay(attemptNumber: number, policy: EnhancedRetryPolicy): number {
   const {
     backoffStrategy = 'exponential',
@@ -88,19 +99,19 @@ export function calculateBackoffDelay(attemptNumber: number, policy: EnhancedRet
 
 /** Apply jitter to a delay value. */
 export function applyJitter(delayMs: number, policy: EnhancedRetryPolicy): number {
-  const { jitterPercent = 10, jitterAlgorithm = 'full' } = policy;
+  const { jitterPercent = 10, jitterAlgorithm = 'full', random = Math.random } = policy;
   const jitterRange = delayMs * (jitterPercent / 100);
 
   switch (jitterAlgorithm) {
     case 'equal': {
       const half = delayMs / 2;
-      return half + Math.random() * half;
+      return half + random() * half;
     }
     case 'decorrelated':
-      return Math.random() * delayMs * 3;
+      return random() * delayMs * 3;
     case 'full':
     default:
-      return Math.max(0, delayMs - jitterRange / 2 + Math.random() * jitterRange);
+      return Math.max(0, delayMs - jitterRange / 2 + random() * jitterRange);
   }
 }
 

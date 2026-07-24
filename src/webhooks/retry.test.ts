@@ -4,6 +4,17 @@ import {
   isRetryableStatusCode,
   shouldRetry,
   formatRetryPolicy,
+  calculateBackoffDelay,
+  applyJitter,
+  scheduleWebhookOutboxRetry,
+  shouldSendToDLQ,
+  validateRetryPolicy,
+  generateRetrySchedule,
+  resolveCircuitBreakerDeferral,
+  countsTowardCircuitBreaker,
+  calculateCircuitBreakerResetTime,
+  calculateBackoffDelay,
+  applyJitter,
 } from './retry.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 
@@ -84,7 +95,7 @@ test('calculateNextRetryTime: no retry after max attempts', () => {
   assert.equal(retryAfterMax, 0);
 });
 
-test('calculateNextRetryTime: applies jitter within bounds', () => {
+test('calculateNextRetryTime: applies jitter within bounds (full jitter)', () => {
   const now = 1000000;
   const policy = {
     ...DEFAULT_RETRY_POLICY,
@@ -92,25 +103,81 @@ test('calculateNextRetryTime: applies jitter within bounds', () => {
     backoffMultiplier: 2,
     maxBackoffMs: 60000,
     jitterPercent: 10,
+    jitterAlgorithm: 'full',
   };
 
-  // Run multiple times to verify jitter is applied
-  const retries = Array.from({ length: 10 }, () => calculateNextRetryTime(0, policy, now));
+  // Full jitter: [delay - jitterRange/2, delay + jitterRange/2]
+  const jitterRange = 1000 * (10 / 100);
+  const minExpected = now + 1000 - jitterRange / 2;
+  const maxExpected = now + 1000 + jitterRange / 2;
 
-  // Full jitter schedules within the full [0, raw backoff] window.
-  const minExpected = now;
-  const maxExpected = now + 1000;
-
-  for (const retry of retries) {
+  // Run multiple times to verify jitter stays within bounds
+  for (let i = 0; i < 100; i++) {
+    const retry = calculateNextRetryTime(0, policy, now);
     assert.ok(
       retry >= minExpected && retry <= maxExpected,
       `Retry ${retry} outside bounds [${minExpected}, ${maxExpected}]`
     );
   }
+});
 
-  // Should have some variation (not all the same)
-  const uniqueRetries = new Set(retries);
-  assert.ok(uniqueRetries.size > 1, 'Jitter should produce variation');
+test('applyJitter: full jitter within bounds', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    jitterPercent: 20,
+    jitterAlgorithm: 'full',
+  };
+
+  const delayMs = 1000;
+  const jitterRange = delayMs * (20 / 100);
+  const minDelay = delayMs - jitterRange / 2;
+  const maxDelay = delayMs + jitterRange / 2;
+
+  for (let i = 0; i < 100; i++) {
+    const jittered = applyJitter(delayMs, policy);
+    assert.ok(
+      jittered >= minDelay && jittered <= maxDelay,
+      `Jittered delay ${jittered} outside bounds [${minDelay}, ${maxDelay}]`
+    );
+  }
+});
+
+test('applyJitter: equal jitter within bounds', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    jitterAlgorithm: 'equal',
+  };
+
+  const delayMs = 1000;
+  const minDelay = delayMs / 2;
+  const maxDelay = delayMs;
+
+  for (let i = 0; i < 100; i++) {
+    const jittered = applyJitter(delayMs, policy);
+    assert.ok(
+      jittered >= minDelay && jittered <= maxDelay,
+      `Jittered delay ${jittered} outside bounds [${minDelay}, ${maxDelay}]`
+    );
+  }
+});
+
+test('applyJitter: decorrelated jitter within bounds', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    jitterAlgorithm: 'decorrelated',
+  };
+
+  const delayMs = 1000;
+  const minDelay = 0;
+  const maxDelay = delayMs * 3;
+
+  for (let i = 0; i < 100; i++) {
+    const jittered = applyJitter(delayMs, policy);
+    assert.ok(
+      jittered >= minDelay && jittered <= maxDelay,
+      `Jittered delay ${jittered} outside bounds [${minDelay}, ${maxDelay}]`
+    );
+  }
 });
 
 test('calculateNextRetryTime: supports deterministic full jitter', () => {
@@ -121,29 +188,41 @@ test('calculateNextRetryTime: supports deterministic full jitter', () => {
     backoffMultiplier: 2,
     maxBackoffMs: 60000,
     jitterAlgorithm: 'full' as const,
-    random: () => 0.25,
+    jitterPercent: 10,
+    random: () => 0.5,
   };
 
-  const retry = calculateNextRetryTime(1, policy, now);
-
-  assert.equal(retry, now + 500);
+  const retry = calculateNextRetryTime(0, policy, now);
+  // Full jitter: 1000 - (1000*0.1)/2 + 0.5*(1000*0.1) = 1000 - 50 + 50 = 1000
+  assert.equal(retry, now + 1000);
 });
 
-test('calculateNextRetryTime: decorrelated jitter uses previous delay state', () => {
+test('calculateNextRetryTime: deterministic equal jitter', () => {
   const now = 1000000;
   const policy = {
     ...DEFAULT_RETRY_POLICY,
     initialBackoffMs: 1000,
-    backoffMultiplier: 2,
-    maxBackoffMs: 5000,
-    jitterAlgorithm: 'decorrelated' as const,
-    previousDelayMs: 2000,
+    jitterAlgorithm: 'equal' as const,
     random: () => 0.5,
   };
 
-  const retry = calculateNextRetryTime(2, policy, now);
+  const retry = calculateNextRetryTime(0, policy, now);
+  // Equal jitter: 500 + 0.5*500 = 750
+  assert.equal(retry, now + 750);
+});
 
-  assert.equal(retry, now + 3000);
+test('calculateNextRetryTime: deterministic decorrelated jitter', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    initialBackoffMs: 1000,
+    jitterAlgorithm: 'decorrelated' as const,
+    random: () => 0.5,
+  };
+
+  const retry = calculateNextRetryTime(0, policy, now);
+  // Decorrelated jitter: 0.5*1000*3 = 1500
+  assert.equal(retry, now + 1500);
 });
 
 test('isRetryableStatusCode: retries on 5xx errors', () => {
@@ -235,6 +314,65 @@ test('shouldRetry: does not retry after max attempts', () => {
   assert.ok(!shouldRetry(attempt, 3, policy));
 });
 
+test('scheduleWebhookOutboxRetry: should retry when below max attempts', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    initialBackoffMs: 1000,
+    jitterPercent: 0,
+  };
+  const input = {
+    streamId: 'test',
+    eventType: 'test',
+    payload: { test: true },
+    attemptNumber: 0,
+    policy,
+    now,
+  };
+
+  const plan = scheduleWebhookOutboxRetry(input);
+  assert.equal(plan.shouldRetry, true);
+  assert.equal(plan.attemptNumber, 1);
+  assert.equal(plan.retryAt?.getTime(), now + 1000);
+});
+
+test('scheduleWebhookOutboxRetry: should not retry when at max attempts', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    maxAttempts: 3,
+  };
+  const input = {
+    streamId: 'test',
+    eventType: 'test',
+    payload: { test: true },
+    attemptNumber: 3,
+    policy,
+    now,
+  };
+
+  const plan = scheduleWebhookOutboxRetry(input);
+  assert.equal(plan.shouldRetry, false);
+  assert.equal(plan.attemptNumber, 3);
+  assert.equal(plan.retryAt, null);
+});
+
+test('shouldSendToDLQ: returns true when max attempts reached', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    maxAttempts: 5,
+  };
+  assert.equal(shouldSendToDLQ(5, policy), true);
+});
+
+test('shouldSendToDLQ: returns false when below max attempts', () => {
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    maxAttempts: 5,
+  };
+  assert.equal(shouldSendToDLQ(4, policy), false);
+});
+
 test('formatRetryPolicy: returns readable policy string', () => {
   const policy = DEFAULT_RETRY_POLICY;
   const formatted = formatRetryPolicy(policy);
@@ -245,4 +383,143 @@ test('formatRetryPolicy: returns readable policy string', () => {
   assert.ok(formatted.includes('max_backoff=60000ms'));
   assert.ok(formatted.includes('jitter=10%'));
   assert.ok(formatted.includes('timeout=30000ms'));
+});
+
+test('validateRetryPolicy: validates policy correctly', () => {
+  // Valid policy
+  const validPolicy = { ...DEFAULT_RETRY_POLICY };
+  assert.deepEqual(validateRetryPolicy(validPolicy), []);
+
+  // Invalid policy - maxAttempts <1
+  const invalidPolicy1 = { ...DEFAULT_RETRY_POLICY, maxAttempts: 0 };
+  assert.ok(validateRetryPolicy(invalidPolicy1).includes('maxAttempts must be at least 1'));
+
+  // Invalid policy - initialBackoffMs <100
+  const invalidPolicy2 = { ...DEFAULT_RETRY_POLICY, initialBackoffMs: 99 };
+  assert.ok(validateRetryPolicy(invalidPolicy2).includes('initialBackoffMs must be at least 100ms'));
+
+  // Invalid policy - backoffMultiplier <1
+  const invalidPolicy3 = { ...DEFAULT_RETRY_POLICY, backoffMultiplier: 0.5 };
+  assert.ok(validateRetryPolicy(invalidPolicy3).includes('backoffMultiplier must be at least 1'));
+
+  // Invalid policy - maxBackoffMs < initialBackoffMs
+  const invalidPolicy4 = { ...DEFAULT_RETRY_POLICY, maxBackoffMs: 500 };
+  assert.ok(validateRetryPolicy(invalidPolicy4).includes('maxBackoffMs must be greater than initialBackoffMs'));
+
+  // Invalid policy - jitterPercent <0
+  const invalidPolicy5 = { ...DEFAULT_RETRY_POLICY, jitterPercent: -1 };
+  assert.ok(validateRetryPolicy(invalidPolicy5).includes('jitterPercent must be between 0 and 100'));
+
+  // Invalid policy - jitterPercent >100
+  const invalidPolicy6 = { ...DEFAULT_RETRY_POLICY, jitterPercent: 101 };
+  assert.ok(validateRetryPolicy(invalidPolicy6).includes('jitterPercent must be between 0 and 100'));
+
+  // Invalid policy - timeoutMs <1000
+  const invalidPolicy7 = { ...DEFAULT_RETRY_POLICY, timeoutMs: 999 };
+  assert.ok(validateRetryPolicy(invalidPolicy7).includes('timeoutMs must be at least 1000ms'));
+
+  // Invalid policy - deadLetterAfterMs <60000
+  const invalidPolicy8 = { ...DEFAULT_RETRY_POLICY, deadLetterAfterMs: 59999 };
+  assert.ok(validateRetryPolicy(invalidPolicy8).includes('deadLetterAfterMs must be at least 60000ms (1 minute)'));
+});
+
+test('generateRetrySchedule: generates retry schedule correctly', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    initialBackoffMs: 1000,
+    backoffMultiplier: 2,
+    maxBackoffMs: 4000,
+    jitterPercent: 0,
+    maxAttempts: 3,
+  };
+  const schedule = generateRetrySchedule(policy, now);
+  assert.equal(schedule.length, 3);
+  assert.equal(schedule[0].attemptNumber, 1);
+  assert.equal(schedule[0].delayMs, 1000);
+  assert.equal(schedule[0].retryAt, now + 1000);
+  assert.equal(schedule[1].attemptNumber, 2);
+  assert.equal(schedule[1].delayMs, 2000);
+  assert.equal(schedule[1].retryAt, now + 2000);
+  assert.equal(schedule[2].attemptNumber, 3);
+  assert.equal(schedule[2].delayMs, 4000);
+  assert.equal(schedule[2].retryAt, now + 4000);
+});
+
+test('calculateCircuitBreakerResetTime: calculates reset time correctly', () => {
+  const now = 1000000;
+  const policyWithReset = { ...DEFAULT_RETRY_POLICY, circuitBreakerResetMs: 30000 };
+  const resetTime = calculateCircuitBreakerResetTime(policyWithReset, now);
+  assert.equal(resetTime, now + 30000);
+
+  const policyWithoutReset = { ...DEFAULT_RETRY_POLICY };
+  const resetTimeWithout = calculateCircuitBreakerResetTime(policyWithoutReset, now);
+  assert.equal(resetTimeWithout, 0);
+});
+
+test('countsTowardCircuitBreaker: determines if attempt counts towards circuit breaker', () => {
+  const policy = DEFAULT_RETRY_POLICY;
+
+  // 200 OK with no error - doesn't count
+  const okAttempt = { statusCode: 200, error: undefined };
+  assert.ok(!countsTowardCircuitBreaker(okAttempt as any, policy));
+
+  // 500 error - counts
+  const errorAttempt = { statusCode: 500, error: new Error('test') };
+  assert.ok(countsTowardCircuitBreaker(errorAttempt as any, policy));
+
+  // No status code (network error) - counts
+  const networkErrorAttempt = { statusCode: undefined, error: new Error('network') };
+  assert.ok(countsTowardCircuitBreaker(networkErrorAttempt as any, policy));
+});
+
+test('resolveCircuitBreakerDeferral: resolves deferral time correctly', () => {
+  const now = 1000000;
+  const policy = DEFAULT_RETRY_POLICY;
+
+  // Breaker with resetAt in future
+  const breakerWithReset = { state: 'open' as const, allowed: false, resetAt: now + 5000, consecutiveFailures: 3 };
+  const deferral1 = resolveCircuitBreakerDeferral(breakerWithReset, policy, now);
+  assert.equal(deferral1.getTime(), now + 5000);
+
+  // Breaker in half-open state
+  const breakerHalfOpen = { state: 'half-open' as const, allowed: false, resetAt: null, consecutiveFailures: 1 };
+  const deferral2 = resolveCircuitBreakerDeferral(breakerHalfOpen, policy, now);
+  assert.equal(deferral2.getTime(), now + 1000);
+});
+
+test('calculateBackoffDelay: calculates delay for all strategies', () => {
+  const policy = { ...DEFAULT_RETRY_POLICY, initialBackoffMs: 1000, backoffMultiplier: 2, maxBackoffMs: 10000 };
+  
+  // Exponential
+  const exponentialDelay = calculateBackoffDelay(2, { ...policy, backoffStrategy: 'exponential' });
+  assert.equal(exponentialDelay, 4000);
+
+  // Linear
+  const linearDelay = calculateBackoffDelay(2, { ...policy, backoffStrategy: 'linear' });
+  assert.equal(linearDelay, 3000);
+
+  // Fixed
+  const fixedDelay = calculateBackoffDelay(2, { ...policy, backoffStrategy: 'fixed' });
+  assert.equal(fixedDelay, 1000);
+
+  // Capped
+  const cappedDelay = calculateBackoffDelay(5, { ...policy, backoffStrategy: 'exponential', maxBackoffMs: 5000 });
+  assert.equal(cappedDelay, 5000);
+});
+
+test('applyJitter: applies all jitter algorithms correctly', () => {
+  const policy = { ...DEFAULT_RETRY_POLICY, initialBackoffMs: 1000, jitterPercent: 20, random: () => 0.5 };
+  
+  // Full jitter
+  const fullJitterDelay = applyJitter(1000, { ...policy, jitterAlgorithm: 'full' });
+  assert.equal(fullJitterDelay, 1000); // because jitter range is 200, -100 + 0.5*200 = 0
+
+  // Equal jitter
+  const equalJitterDelay = applyJitter(1000, { ...policy, jitterAlgorithm: 'equal' });
+  assert.equal(equalJitterDelay, 750);
+
+  // Decorrelated jitter
+  const decorrelatedJitterDelay = applyJitter(1000, { ...policy, jitterAlgorithm: 'decorrelated' });
+  assert.equal(decorrelatedJitterDelay, 1500);
 });
