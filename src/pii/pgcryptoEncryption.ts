@@ -6,6 +6,11 @@
  */
 
 import crypto from 'crypto';
+import {
+  BATCH_HASH_THRESHOLD,
+  PgcryptoHashWorkerPool,
+  type AddressHashes,
+} from './workerPool.js';
 
 export const PGCRYPTO_KEY_MIN_LENGTH = 32;
 export const PGP_SYM_ENCRYPT_OPTIONS = 'cipher-algo=aes256,compress-algo=0,armor';
@@ -15,6 +20,10 @@ export interface PgcryptoKeySet {
   current: string;
   previous?: string;
 }
+
+export type AddressHashSet = AddressHashes;
+
+let hashWorkerPool: { keys: PgcryptoKeySet; pool: PgcryptoHashWorkerPool } | undefined;
 
 /**
  * Compute the deterministic HMAC digest used for address filters and indexes.
@@ -33,6 +42,52 @@ export function computeAddressHashes(address: string, keys: PgcryptoKeySet): {
     current: computeAddressHash(address, keys.current),
     previous: keys.previous ? computeAddressHash(address, keys.previous) : undefined,
   };
+}
+
+/**
+ * Compute HMAC digests for many addresses without blocking the event loop.
+ * Small batches deliberately stay synchronous because worker IPC costs more
+ * than the HMAC work. Worker failures fall back to the same deterministic
+ * in-thread implementation.
+ */
+export async function batchComputeAddressHashes(
+  addresses: string[],
+  keys: PgcryptoKeySet,
+): Promise<AddressHashSet[]> {
+  if (addresses.length < BATCH_HASH_THRESHOLD) {
+    return addresses.map((address) => computeAddressHashes(address, keys));
+  }
+
+  if (
+    !hashWorkerPool ||
+    hashWorkerPool.keys.current !== keys.current ||
+    hashWorkerPool.keys.previous !== keys.previous
+  ) {
+    if (hashWorkerPool) await hashWorkerPool.pool.shutdown();
+    hashWorkerPool = { keys: { ...keys }, pool: new PgcryptoHashWorkerPool(keys) };
+  }
+
+  try {
+    return await hashWorkerPool.pool.compute(addresses);
+  } catch {
+    await hashWorkerPool.pool.shutdown();
+    hashWorkerPool = undefined;
+    return addresses.map((address) => computeAddressHashes(address, keys));
+  }
+}
+
+/** Compute current-key HMACs for a large address collection. */
+export async function batchComputeAddressHash(addresses: string[], key: string): Promise<string[]> {
+  const hashes = await batchComputeAddressHashes(addresses, { current: key });
+  return hashes.map((hash) => hash.current);
+}
+
+/** Terminate the lazily created batch pool during graceful service shutdown. */
+export async function shutdownPgcryptoHashWorkerPool(): Promise<void> {
+  if (!hashWorkerPool) return;
+  const pool = hashWorkerPool.pool;
+  hashWorkerPool = undefined;
+  await pool.shutdown();
 }
 
 /**

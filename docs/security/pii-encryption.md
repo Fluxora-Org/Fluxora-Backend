@@ -81,3 +81,31 @@ rows transparently.
 - `migrations/20260601_enable_pgcrypto_encrypt_addresses.ts`
 
 Run migrations before starting the service.
+
+## Batch hashing worker pool
+
+`computeAddressHash` and `computeAddressHashes` remain synchronous for the
+single-row request path. Use `batchComputeAddressHash` or
+`batchComputeAddressHashes` for export, backfill, and retention workloads.
+Batches smaller than 50 rows run in-thread because worker startup and IPC cost
+more than their HMAC work.
+
+Larger batches use a lazily initialized `worker_threads` pool. Its size is
+`min(os.availableParallelism(), 8)`, so hosts with many CPUs cannot create an
+unbounded number of V8 isolates. Call `shutdownPgcryptoHashWorkerPool()` during
+graceful shutdown to terminate workers and release their key copies.
+
+### Worker-key handling
+
+- A pool is bound to one `PgcryptoKeySet`; workers receive that key set only in
+  `workerData`, which is structured-cloned into each worker at startup.
+- Task messages contain address arrays only. Keys are not placed in task
+  payloads, environment variables, logs, errors, or worker responses.
+- A key rotation replaces and terminates the old pool before starting workers
+  for the new key set.
+- If worker construction, startup, or execution fails, the batch helper returns
+  correct synchronous HMAC results rather than propagating worker internals.
+
+Worker threads isolate CPU scheduling, not secrets: normal process-memory and
+host-access controls still apply. Do not include keys in application logging or
+diagnostic dumps.
