@@ -59,6 +59,18 @@ export const dbPoolExhaustedTotal =
     registers: [registry],
   });
 
+/**
+ * Gauge for PostgreSQL replication lag in seconds.
+ * Reports null if replication lag is not measurable (e.g., no replica configured or lag check failed).
+ */
+export const dbReplicationLagSeconds =
+  (registry.getSingleMetric('fluxora_db_replication_lag_seconds') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_db_replication_lag_seconds',
+    help: 'PostgreSQL replication lag in seconds',
+    registers: [registry],
+  });
+
 export function deRegisterDbMetrics(): void {
   registry.removeSingleMetric('fluxora_db_query_duration_seconds');
   registry.removeSingleMetric('fluxora_db_slow_queries_total');
@@ -66,4 +78,5 @@ export function deRegisterDbMetrics(): void {
   registry.removeSingleMetric('fluxora_db_pool_idle_connections');
   registry.removeSingleMetric('fluxora_db_pool_waiting_requests');
   registry.removeSingleMetric('fluxora_db_pool_exhausted_total');
+  registry.removeSingleMetric('fluxora_db_replication_lag_seconds');
 }

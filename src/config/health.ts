@@ -24,6 +24,10 @@ export interface HealthChecker {
 }
 
 export class HealthCheckManager {
+  private readonly checkers = new Map<string, HealthChecker>();
+  private readonly lastResults = new Map<string, DependencyHealth>();
+  private readonly startTime = Date.now();
+
   private get timeoutMs() { return getConfig().healthCheckTimeoutMs; }
   private get intervalMs() { return getConfig().healthCheckIntervalMs; }
 

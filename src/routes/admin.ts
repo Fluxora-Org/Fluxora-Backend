@@ -6,8 +6,12 @@ import {
   setPauseFlags,
   getReindexState,
   triggerReindex,
+  triggerStreamReindex,
   AdminStatePersistenceError,
 } from '../state/adminState.js';
+import { z } from 'zod';
+import { formatZodIssues } from '../validation/schemas.js';
+import { streamRepository } from '../db/repositories/streamRepository.js';
 import { createApiKey, rotateApiKey, revokeApiKey, listApiKeys } from '../lib/apiKey.js';
 import { recordAuditEvent, recordAuditEventToDb } from '../lib/auditLog.js';
 import { getStreamHub } from '../ws/hub.js';
@@ -300,6 +304,75 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
       requestId
     )
   );
+});
+
+// ─── Bulk Operations ──────────────────────────────────────────────────────────
+
+const bulkActionItemSchema = z.object({
+  streamId: z.string().min(1, 'streamId cannot be empty'),
+  action: z.enum(['pause', 'cancel', 'reindex']),
+});
+
+const bulkActionSchema = z.object({
+  batch: z.array(bulkActionItemSchema).min(1, 'Batch cannot be empty').max(500, 'Batch size exceeds limit of 500'),
+});
+
+/**
+ * POST /api/admin/streams/bulk-actions
+ * Accepts a batch of { streamId, action } pairs and applies them atomically via repository updates.
+ * Partial failures are reported per-item in the response.
+ */
+adminRouter.post('/streams/bulk-actions', async (req, res) => {
+  const requestId = req.id ?? req.correlationId;
+  const parseResult = bulkActionSchema.safeParse(req.body);
+
+  if (!parseResult.success) {
+    res.status(400).json(
+      errorResponse(
+        'VALIDATION_ERROR',
+        'Request validation failed',
+        formatZodIssues(parseResult.error.issues),
+        requestId
+      )
+    );
+    return;
+  }
+
+  const { batch } = parseResult.data;
+  const results: Array<{ streamId: string; action: string; status: 'success' | 'failed'; error?: string }> = [];
+  let successCount = 0;
+  let failureCount = 0;
+
+  for (const item of batch) {
+    try {
+      if (item.action === 'pause') {
+        await streamRepository.updateStream(item.streamId, { status: 'paused' }, req.correlationId);
+      } else if (item.action === 'cancel') {
+        await streamRepository.updateStream(item.streamId, { status: 'cancelled' }, req.correlationId);
+      } else if (item.action === 'reindex') {
+        await triggerStreamReindex(item.streamId);
+      }
+      
+      results.push({ streamId: item.streamId, action: item.action, status: 'success' });
+      successCount++;
+    } catch (err) {
+      results.push({
+        streamId: item.streamId,
+        action: item.action,
+        status: 'failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      failureCount++;
+    }
+  }
+
+  recordAuditEvent('ADMIN_BULK_ACTION', 'stream_batch', 'bulk', requestId, {
+    batchSize: batch.length,
+    successCount,
+    failureCount,
+  });
+
+  res.json(successResponse({ results, successCount, failureCount }, requestId));
 });
 
 // ─── API Key Management ───────────────────────────────────────────────────────

@@ -112,3 +112,31 @@ Both slots can run migrations concurrently because:
 
 See `tests/app.blueGreen.test.ts` for header presence verification across
 200/404/500 responses and DEPLOYMENT_SLOT env var mutation tests.
+
+### gRPC Health Check (Kubernetes-native probes)
+
+Kubernetes' built-in gRPC probes (`livenessProbe.grpc` / `readinessProbe.grpc`, and the standalone `grpc-health-probe` binary) speak the standard `grpc.health.v1.Health` protocol rather than plain HTTP. Fluxora can expose this alongside the existing HTTP `/health` endpoints, on a separate port so it never competes with API traffic.
+
+**Runtime Environment Variables (App Level):**
+- `GRPC_HEALTH_ENABLED` (Default: `false`): Enables the gRPC health service.
+- `GRPC_HEALTH_PORT` (Default: `50051`): Port the gRPC health service binds to. Must differ from `PORT` (the HTTP port).
+
+The service reuses the exact same `HealthCheckManager` dependency checks as `/health/ready` (`src/config/health.ts`) — it does not re-implement or duplicate any check logic, so the two surfaces cannot drift out of sync. `healthy` and `degraded` both map to `SERVING` (matching `/health/ready`'s 200 response for both statuses); `unhealthy` maps to `NOT_SERVING`.
+
+**Security note:** like the internal HTTP endpoints documented above, the gRPC health port is intentionally unauthenticated — Kubernetes probes and `grpc-health-probe` don't send credentials. This port must **not** be exposed outside the cluster network (no public LoadBalancer/Ingress); bind it only to a `ClusterIP` service or rely on the pod's default internal-only networking.
+
+**Example — `grpc-health-probe` (manual check):**
+```bash
+grpc-health-probe -addr=localhost:50051
+```
+
+**Example — Kubernetes probe configuration:**
+```yaml
+livenessProbe:
+  grpc:
+    port: 50051
+readinessProbe:
+  grpc:
+    port: 50051
+  periodSeconds: 10
+```
