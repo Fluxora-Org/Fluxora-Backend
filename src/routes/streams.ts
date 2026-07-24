@@ -71,6 +71,7 @@ import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
+import { sendEarlyHints } from '../utils/earlyHints.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
 import {
@@ -523,6 +524,25 @@ streamsRouter.get(
       : null;
 
     info('Listing streams', { limit, returned: pageStreams.length, hasMore, requestId });
+
+    // Send HTTP 103 Early Hints with Link header for next page, if available.
+    // This allows HTTP/2 clients to prefetch DNS/TLS for the next page URL
+    // while the server is preparing the current response. The hint is sent
+    // asynchronously and does not block the main response.
+    if (hasMore && nextCursor) {
+      const queryParams: Record<string, string> = {};
+      if (statusFilter) queryParams.status = statusFilter as string;
+      if (senderFilter) queryParams.sender = senderFilter;
+      if (recipientFilter) queryParams.recipient = recipientFilter;
+      if (include_total === 'true') queryParams.include_total = 'true';
+
+      sendEarlyHints(res, {
+        baseUrl: '/api/streams',
+        hasMore: true,
+        nextCursor,
+        queryParams,
+      });
+    }
 
     const response: {
       streams: Stream[];
