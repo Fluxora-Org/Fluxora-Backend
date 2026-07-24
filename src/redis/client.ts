@@ -8,6 +8,16 @@
 
 import type { Redis, Cluster } from 'ioredis';
 import { logger } from '../logging/logger.js';
+import { calculateNextRetryDelay } from '../lib/retry.js';
+
+function defaultRetryStrategy(times: number): number | null {
+  const delay = calculateNextRetryDelay(times - 1, {
+    baseDelayMs: 50,
+    maxDelayMs: 2000,
+    maxAttempts: 10,
+  });
+  return delay === 0 ? null : delay;
+}
 
 export interface RedisConfig {
   url: string;
@@ -182,6 +192,7 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
       password,
       lazyConnect: true,
       maxRetriesPerRequest: 3,
+      retryStrategy: defaultRetryStrategy,
       enableReadyCheck: true,
       connectTimeout: 5000,
     });
@@ -215,6 +226,7 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
       password,
       lazyConnect: true,
       maxRetriesPerRequest: 3,
+      retryStrategy: defaultRetryStrategy,
       enableReadyCheck: true,
       connectTimeout: 5000,
     });
@@ -246,6 +258,7 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
         connectTimeout: 5000,
         maxRetriesPerRequest: 3,
       },
+      clusterRetryStrategy: defaultRetryStrategy,
       lazyConnect: true,
     });
     await client.connect();
