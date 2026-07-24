@@ -206,6 +206,67 @@ fluxora_ws_slow_clients > 5
 
 ---
 
+## WebSocket Subscription Cardinality Gauge
+
+A single stream with an unusually large subscriber count can drive disproportionate broadcast fan-out, consuming CPU and network bandwidth while increasing backpressure risk for every other stream. The subscription cardinality gauge reports the subscriber count for the top-N most-subscribed streams so operators can identify hot streams before they cause incidents.
+
+### Metric
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `fluxora_ws_stream_subscriber_count` | Gauge | `stream_id` (application-assigned stream identifier) | Subscriber count for the top-N WebSocket streams by fan-out size. Only the N most-subscribed streams are reported (default N = 20). |
+
+### Label cardinality and security
+
+The `stream_id` label is the opaque stream identifier assigned by the application. It does not contain PII, client IPs, JWT subjects, or any user-controlled data.
+
+Cardinality is bounded by `DEFAULT_WS_STREAM_CARDINALITY_TOP_N` (20) — at most 20 time-series are emitted at any point. The collector sorts streams by subscriber count descending, keeps the top N, and explicitly removes stale series for streams that drop below the N-th rank between collection cycles. This prevents:
+
+- **Unbounded label growth** when many low-subscriber streams exist — only the top 20 are exposed.
+- **Stale series** lingering after a stream's subscribers leave — stale labels are cleaned up on the next collection cycle.
+
+An attacker cannot inflate Prometheus memory by creating many streams with a handful of subscribers each, because only the top-N are ever exposed regardless of how many total streams exist.
+
+### Configuration
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `DEFAULT_WS_STREAM_CARDINALITY_TOP_N` | `20` | Maximum number of streams reported by the gauge. Exported from `src/metrics/wsBackpressure.ts`. |
+
+### PromQL examples
+
+Top-5 streams by subscriber count:
+
+```promql
+topk(5, fluxora_ws_stream_subscriber_count)
+```
+
+Alert: any single stream with more than 500 subscribers (potential hot-stream):
+
+```promql
+fluxora_ws_stream_subscriber_count > 500
+```
+
+Total subscribers across all top-N streams (approximation of broadcast fan-out):
+
+```promql
+sum(fluxora_ws_stream_subscriber_count)
+```
+
+### Thresholding strategy
+
+- **`max(fluxora_ws_stream_subscriber_count) > 500` for > 5 min**: investigate the identified hot stream. High fan-out magnifies the cost of every broadcast event — one slow client can trigger backpressure for all other subscribers on that stream.
+- **`topk(1, fluxora_ws_stream_subscriber_count)` divergence from `sum(fluxora_ws_stream_subscriber_count)`**: one stream dominates the total subscriber count, indicating fan-out concentration risk.
+- **Correlation with `fluxora_ws_slow_clients` rising**: a hot stream with slow clients compounds backpressure; identify the stream from the cardinality gauge and the slow clients from the per-client backpressure gauge.
+
+### Affected source files
+
+- `src/metrics/wsBackpressure.ts` — `wsStreamSubscriberCount` gauge definition + `collectStreamSubscriberCardinality` helper
+- `src/ws/hub.ts` — `_getStreamSubscriptions()` accessor exposing the internal `streamSubscriptions` map
+- `tests/ws/hub.subscriptionCardinality.test.ts` — top-N cap, stale-series removal, empty-hub, and reset assertions
+
+---
+
 ## Authentication Latency Histograms
 
 Auth runs on every protected request path. When the JWT verifier, revocation-store lookup, or API-key store becomes a bottleneck, these histograms give a distribution view (p50/p95/p99) and a split by success/failure — without leaking credential material.

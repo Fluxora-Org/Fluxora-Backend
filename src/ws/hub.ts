@@ -885,6 +885,18 @@ export class StreamHub extends EventEmitter {
     return this.clients.entries();
   }
 
+  /**
+   * Internal entry-point used by the subscription cardinality collector to
+   * enumerate stream subscription counts. Underscore-prefixed because it
+   * exposes internal map references — callers MUST treat them as read-only.
+   *
+   * @security Exposes only streamId keys and subscriber Set sizes; no
+   *           WebSocket references or client state is leaked.
+   */
+  _getStreamSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
+    return this.streamSubscriptions;
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
