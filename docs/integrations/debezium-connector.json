@@ -1,0 +1,18 @@
+{
+  "name": "fluxora-streams-cdc-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "plugin.name": "pgoutput",
+    "database.hostname": "localhost",
+    "database.port": "5432",
+    "database.user": "indexer_user",
+    "database.password": "indexer_password",
+    "database.dbname": "indexer_db",
+    "database.server.name": "fluxora-db",
+    "table.include.list": "public.streams",
+    "column.exclude.list": "public.streams.sender_address,public.streams.recipient_address",
+    "decimal.handling.mode": "double",
+    "time.precision.mode": "connect"
+  }
+}

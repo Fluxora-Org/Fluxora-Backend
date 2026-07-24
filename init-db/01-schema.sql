@@ -1,31 +1,44 @@
 -- Initialize Fluxora database schema
 -- This script runs automatically when PostgreSQL container starts for the first time
 
--- Enable UUID extension
+-- Enable UUID and pgcrypto extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- Streams table for treasury streaming protocol
 CREATE TABLE IF NOT EXISTS streams (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    stream_id VARCHAR(255) UNIQUE NOT NULL,
-    sender VARCHAR(56) NOT NULL,
-    recipient VARCHAR(56) NOT NULL,
-    deposit_amount VARCHAR(64) NOT NULL,
-    rate_per_second VARCHAR(64) NOT NULL,
+    id TEXT PRIMARY KEY,
+    sender_address TEXT NOT NULL,
+    sender_address_hash TEXT NOT NULL,
+    recipient_address TEXT NOT NULL,
+    recipient_address_hash TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    streamed_amount TEXT NOT NULL DEFAULT '0',
+    remaining_amount TEXT NOT NULL,
+    rate_per_second TEXT NOT NULL,
     start_time BIGINT NOT NULL,
-    end_time BIGINT NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'active',
-    contract_address VARCHAR(56),
+    end_time BIGINT NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    contract_id TEXT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    event_index INTEGER NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}'
+    metadata JSONB DEFAULT '{}',
+    CONSTRAINT streams_unique_event UNIQUE (transaction_hash, event_index)
 );
 
 -- Index for stream lookups
-CREATE INDEX IF NOT EXISTS idx_streams_sender ON streams(sender);
-CREATE INDEX IF NOT EXISTS idx_streams_recipient ON streams(recipient);
-CREATE INDEX IF NOT EXISTS idx_streams_status ON streams(status);
-CREATE INDEX IF NOT EXISTS idx_streams_created_at ON streams(created_at);
+CREATE INDEX IF NOT EXISTS idx_streams_status_id ON streams (status, id);
+CREATE INDEX IF NOT EXISTS idx_streams_sender_id ON streams (sender_address, id);
+CREATE INDEX IF NOT EXISTS idx_streams_contract_id ON streams (contract_id, id);
+CREATE INDEX IF NOT EXISTS idx_streams_status_created_at_desc ON streams (status, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_streams_recipient ON streams (recipient_address);
+CREATE INDEX IF NOT EXISTS idx_streams_created_at ON streams (created_at);
+CREATE INDEX IF NOT EXISTS idx_streams_start_time ON streams (start_time);
+CREATE INDEX IF NOT EXISTS idx_streams_end_time ON streams (end_time);
+CREATE INDEX IF NOT EXISTS idx_streams_sender_address_hash ON streams (sender_address_hash);
+CREATE INDEX IF NOT EXISTS idx_streams_recipient_address_hash ON streams (recipient_address_hash);
 
 -- Indexer state tracking
 CREATE TABLE IF NOT EXISTS indexer_state (
@@ -42,7 +55,7 @@ CREATE TABLE IF NOT EXISTS indexer_state (
 CREATE TABLE IF NOT EXISTS audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     event_type VARCHAR(50) NOT NULL,
-    stream_id VARCHAR(255) REFERENCES streams(stream_id),
+    stream_id TEXT REFERENCES streams(id),
     transaction_hash VARCHAR(64),
     ledger_sequence BIGINT,
     old_values JSONB,

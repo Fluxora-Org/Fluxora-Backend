@@ -38,7 +38,7 @@ import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError, type ContractEventStore } from '../indexer/store.js';
-import { SSE_STREAM_UPDATE_EVENT, sseEventBus } from '../streams/sseEmitter.js';
+import { SSE_STREAM_UPDATE_EVENT, sseEventBus, SSE_CLOSE_REASONS } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
@@ -58,6 +58,7 @@ import {
 import {
   collectWsBackpressureMetrics,
   removeWsClientBackpressureGauge,
+  recordWsBroadcastBatchFlushLatency,
   DEFAULT_WS_BACKPRESSURE_INTERVAL_MS,
   DEFAULT_WS_SLOW_CLIENT_BYTES,
 } from '../metrics/wsBackpressure.js';
@@ -159,6 +160,16 @@ export interface StreamHubOptions {
    * slowThresholdBytes = `DEFAULT_WS_SLOW_CLIENT_BYTES` (1 MiB).
    */
   backpressureCollector?: StreamHubBackpressureCollectorOptions;
+  /**
+   * Flush window in milliseconds for micro-batching broadcast events.
+   * Defaults to 0 (disabled; immediate one-frame-per-event broadcast).
+   */
+  flushWindowMs?: number;
+  /**
+   * Maximum number of events queued in a micro-batch before an immediate flush is triggered.
+   * Defaults to 100.
+   */
+  maxBatchSize?: number;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -175,6 +186,10 @@ export class StreamHub extends EventEmitter {
   private eventStore: ContractEventStore | undefined;
   private readonly backpressureCollectorInterval: NodeJS.Timeout | undefined;
   private readonly backpressureSlowThresholdBytes: number;
+  private readonly flushWindowMs: number;
+  private readonly maxBatchSize: number;
+  private pendingBatch: Array<{ event: StreamUpdateEvent; enqueuedAt: number }> = [];
+  private batchTimer: NodeJS.Timeout | undefined;
 
   public getEventStore(): ContractEventStore | undefined {
     return this.eventStore;
@@ -191,6 +206,9 @@ export class StreamHub extends EventEmitter {
 
   constructor(server: Server, options?: StreamHubOptions) {
     super();
+
+    this.flushWindowMs = options?.flushWindowMs ?? 0;
+    this.maxBatchSize = options?.maxBatchSize ?? 100;
 
     if (options?.dedupCache) {
       this.dedup = options.dedupCache;
@@ -648,10 +666,10 @@ export class StreamHub extends EventEmitter {
     return targets.length;
   }
 
-  // ── Broadcast ──────────────────────────────────────────────────────────────
+  // ── Broadcast & Micro-Batching ─────────────────────────────────────────────
 
   async broadcast(event: StreamUpdateEvent): Promise<void> {
-    const { streamId, eventId, payload } = event;
+    const { streamId, eventId } = event;
 
     if (await this.dedup.has(streamId, eventId)) return;
     await this.dedup.add(streamId, eventId);
@@ -659,21 +677,66 @@ export class StreamHub extends EventEmitter {
     // Emit to Server-Sent Events bus
     sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, event);
 
+    // ZERO OVERHEAD WHEN BATCHING IS DISABLED (default one-frame-per-event mode)
+    if (this.flushWindowMs <= 0) {
+      this.dispatchImmediate(event);
+      return;
+    }
+
+    // Micro-batching coalescing mode:
+    this.pendingBatch.push({ event, enqueuedAt: Date.now() });
+
+    if (this.pendingBatch.length >= this.maxBatchSize) {
+      this.flushBatch();
+    } else if (!this.batchTimer) {
+      this.batchTimer = setTimeout(() => {
+        this.flushBatch();
+      }, this.flushWindowMs);
+      this.batchTimer.unref?.();
+    }
+  }
+
+  /**
+   * Flush queued micro-batched broadcast events.
+   * Measures age of the oldest event in the batch and records to `fluxora_ws_broadcast_batch_flush_seconds`.
+   */
+  flushBatch(): void {
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = undefined;
+    }
+
+    if (this.pendingBatch.length === 0) return;
+
+    const batch = this.pendingBatch;
+    this.pendingBatch = [];
+
+    // Calculate age of oldest event in the batch in seconds
+    const oldestEnqueuedAt = batch[0]!.enqueuedAt;
+    const ageSeconds = (Date.now() - oldestEnqueuedAt) / 1000;
+    recordWsBroadcastBatchFlushLatency(ageSeconds);
+
+    for (const item of batch) {
+      this.dispatchImmediate(item.event);
+    }
+  }
+
+  private dispatchImmediate(event: StreamUpdateEvent): void {
     const subscribers = this.matchingSubscribers(event);
     if (subscribers.size === 0) return;
 
     const correlationId = getCorrelationId();
     const message = JSON.stringify({
       type: 'stream_update',
-      streamId,
-      eventId,
-      payload,
+      streamId: event.streamId,
+      eventId: event.eventId,
+      payload: event.payload,
       correlationId,
     });
     const targets = Array.from(subscribers);
 
     if (targets.length <= FANOUT_YIELD_BATCH) {
-      this.deliverBatch(targets, message, streamId, eventId);
+      this.deliverBatch(targets, message, event.streamId, event.eventId);
       return;
     }
 
@@ -681,7 +744,7 @@ export class StreamHub extends EventEmitter {
     let i = 0;
     function next(): void {
       const end = Math.min(i + FANOUT_YIELD_BATCH, targets.length);
-      self.deliverBatch(targets.slice(i, end), message, streamId, eventId);
+      self.deliverBatch(targets.slice(i, end), message, event.streamId, event.eventId);
       i = end;
       if (i < targets.length) setImmediate(next);
     }
@@ -885,6 +948,18 @@ export class StreamHub extends EventEmitter {
     return this.clients.entries();
   }
 
+  /**
+   * Internal entry-point used by the subscription cardinality collector to
+   * enumerate stream subscription counts. Underscore-prefixed because it
+   * exposes internal map references — callers MUST treat them as read-only.
+   *
+   * @security Exposes only streamId keys and subscriber Set sizes; no
+   *           WebSocket references or client state is leaked.
+   */
+  _getStreamSubscriptions(): ReadonlyMap<string, Set<WebSocket>> {
+    return this.streamSubscriptions;
+  }
+
   getMetrics(): Readonly<BackpressureMetrics> {
     return { ...this.metrics };
   }
@@ -979,11 +1054,23 @@ export class StreamHub extends EventEmitter {
   }
 
   async close(cb?: () => void): Promise<void> {
+    this.flushBatch();
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = undefined;
+    }
     if (this.backpressureCollectorInterval) {
       clearInterval(this.backpressureCollectorInterval);
     }
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
+  }
+
+  async gracefulClose(): Promise<void> {
+    for (const ws of this.clients.keys()) {
+      ws.close(1001, JSON.stringify({ reason: SSE_CLOSE_REASONS.SERVER_SHUTDOWN }));
+    }
+    await this.close();
   }
 
   async _resetDedup(): Promise<void> {

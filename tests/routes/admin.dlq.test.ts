@@ -30,6 +30,7 @@ const mockRepo = vi.hoisted(() => ({
   recordReplayFailure:     vi.fn(),
   recordReplaySuccess:     vi.fn(),
   resumeConsumer:          vi.fn(),
+  replayEntry:             vi.fn(),
 }));
 
 vi.mock('../../src/db/repositories/dlqRepository.js', () => ({
@@ -71,6 +72,7 @@ const ENTRY = {
   firstFailedAt: '2026-01-01T00:00:00.000Z',
   lastFailedAt:  '2026-01-02T00:00:00.000Z',
   correlationId: 'corr-1',
+  status: 'dead' as const,
 };
 
 const SUSPENSION_NONE = null;
@@ -274,12 +276,13 @@ describe('POST /admin/dlq/:id/replay', () => {
     expect(res.body.error.code).toBe('CONSUMER_SUSPENDED');
     expect(res.body.error.message).toContain('stream.created');
     // Replay must NOT proceed when suspended
-    expect(mockRepo.update).not.toHaveBeenCalled();
+    expect(mockRepo.replayEntry).not.toHaveBeenCalled();
   });
 
   it('resets attempt counter and records success on successful replay', async () => {
     mockRepo.findById.mockResolvedValue(ENTRY);
     mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+    mockRepo.replayEntry.mockResolvedValue(true);
 
     const res = await request(app)
       .post('/admin/dlq/dlq-001/replay')
@@ -287,14 +290,28 @@ describe('POST /admin/dlq/:id/replay', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.id).toBe('dlq-001');
-    expect(mockRepo.update).toHaveBeenCalledWith('dlq-001', expect.objectContaining({ attempts: 0 }));
+    expect(mockRepo.replayEntry).toHaveBeenCalledWith('dlq-001', expect.objectContaining({ attempts: 0 }));
     expect(mockRepo.recordReplaySuccess).toHaveBeenCalledWith('stream.created');
     expect(mockRepo.recordReplayFailure).not.toHaveBeenCalled();
+  });
+
+  it('returns 409 ENTRY_ALREADY_REPLAYED when entry is not dead (already replayed)', async () => {
+    mockRepo.findById.mockResolvedValue(ENTRY);
+    mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+    mockRepo.replayEntry.mockResolvedValue(false);
+
+    const res = await request(app)
+      .post('/admin/dlq/dlq-001/replay')
+      .set('Authorization', `Bearer ${operatorToken}`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ENTRY_ALREADY_REPLAYED');
   });
 
   it('records failure and emits audit when failed=true (#349)', async () => {
     mockRepo.findById.mockResolvedValue(ENTRY);
     mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+    mockRepo.replayEntry.mockResolvedValue(true);
     mockRepo.recordReplayFailure.mockResolvedValue({
       ...SUSPENSION_HEALTHY,
       consecutiveFailures: 3,
@@ -306,6 +323,7 @@ describe('POST /admin/dlq/:id/replay', () => {
       .send({ failed: true });
 
     expect(res.status).toBe(200);
+    expect(mockRepo.replayEntry).toHaveBeenCalled();
     expect(mockRepo.recordReplayFailure).toHaveBeenCalledWith('stream.created');
     expect(mockRepo.recordReplaySuccess).not.toHaveBeenCalled();
   });
@@ -313,6 +331,7 @@ describe('POST /admin/dlq/:id/replay', () => {
   it('emits DLQ_CONSUMER_SUSPENDED audit event when threshold is reached (#349)', async () => {
     mockRepo.findById.mockResolvedValue(ENTRY);
     mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+    mockRepo.replayEntry.mockResolvedValue(true);
     // Simulate threshold being reached on this failure
     mockRepo.recordReplayFailure.mockResolvedValue({
       ...SUSPENSION_ACTIVE,
@@ -334,6 +353,7 @@ describe('POST /admin/dlq/:id/replay', () => {
   it('emits DLQ_REPLAYED audit event on success', async () => {
     mockRepo.findById.mockResolvedValue(ENTRY);
     mockRepo.getConsumerSuspension.mockResolvedValue(SUSPENSION_NONE);
+    mockRepo.replayEntry.mockResolvedValue(true);
 
     await request(app)
       .post('/admin/dlq/dlq-001/replay')

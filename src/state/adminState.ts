@@ -238,6 +238,15 @@ export async function triggerReindex(): Promise<ReindexState> {
   return { ...state.reindex };
 }
 
+/**
+ * Kick off a simulated reindex for a specific stream.
+ * In production this would trigger a stream-specific Horizon replay.
+ */
+export async function triggerStreamReindex(streamId: string): Promise<ReindexState> {
+  logger.info('Triggering stream-specific reindex', undefined, { streamId });
+  return triggerReindex();
+}
+
 async function runReindexJob(): Promise<void> {
   const endTimer = adminReindexJobDurationSeconds.startTimer();
   try {

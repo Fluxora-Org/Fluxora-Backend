@@ -47,6 +47,7 @@ export interface DlqEntry {
   firstFailedAt: string;
   lastFailedAt: string;
   correlationId?: string;
+  status?: 'dead' | 'replayed';
 }
 
 /** Enqueue a dead-letter entry. Called by internal workers. */
@@ -179,10 +180,19 @@ dlqRouter.post(
       return;
     }
 
-    // ── Reset attempt counter and record outcome ──────────────────────────────
+    // ── Reset attempt counter and record outcome, with optimistic concurrency ──
     const replayFailed = req.body?.failed === true;
 
-    await dlqRepository.update(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
+    const replayed = await dlqRepository.replayEntry(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
+    if (!replayed) {
+      res.status(409).json(errorResponse(
+        'ENTRY_ALREADY_REPLAYED',
+        `DLQ entry '${entry.id}' has already been replayed or resolved.`,
+        undefined,
+        req.id,
+      ));
+      return;
+    }
 
     if (replayFailed) {
       const updated = await dlqRepository.recordReplayFailure(entry.topic);
