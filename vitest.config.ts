@@ -1,6 +1,16 @@
 import { defineConfig } from 'vitest/config';
+import path from 'path';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      // @aws-sdk/client-s3 is not an installed runtime dependency — it is only
+      // used by the devops backup-retention script. Point the test resolver to
+      // a hand-written stub so any test that transitively imports the script
+      // does not fail with "Failed to load url @aws-sdk/client-s3".
+      '@aws-sdk/client-s3': path.resolve(__dirname, '__mocks__/@aws-sdk/client-s3.ts'),
+    },
+  },
   test: {
     globals: true,
     environment: 'node',

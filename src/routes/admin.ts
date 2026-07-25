@@ -18,6 +18,12 @@ import { getStreamHub } from '../ws/hub.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { clearIndexerStall, ActiveStallError } from '../indexer/stall.js';
 import { routeDeprecations } from '../config/deprecations.js';
+import {
+  queueRestoreJob,
+  getRestoreJob,
+  listRestoreJobs,
+  type RestoreJob,
+} from '../scripts/backup-retention.js';
 
 export const adminRouter = Router();
 
@@ -472,4 +478,222 @@ adminRouter.get('/ban-store/status', (_req, res) => {
   } catch (err) {
     res.status(503).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
+});
+
+// ─── Backup Restore ───────────────────────────────────────────────────────────
+
+/**
+ * POST /api/admin/restore
+ *
+ * Accepts a backup restore request and queues an async S3 copy job.
+ *
+ * The endpoint returns immediately with HTTP 202 once the job is queued.
+ * The actual S3 copy runs out-of-band; poll GET /api/admin/restore/:jobId
+ * for progress.
+ *
+ * ### Request body
+ * ```json
+ * {
+ *   "backupId": "backups/db-2026-07-01.sql.gz",
+ *   "targetEnvironment": "staging",   // optional, default: "staging"
+ *   "confirmProduction": true          // required only when targetEnvironment is "production"
+ * }
+ * ```
+ *
+ * ### Status transitions (recorded in audit_logs)
+ * ```
+ * queued  →  running  →  completed
+ *                      ↘  failed
+ * ```
+ *
+ * @security Requires valid Bearer admin token (`ADMIN_API_KEY`).
+ * @throws 400 when `backupId` is missing, empty, starts with "/",
+ *             contains "..", or exceeds 1 024 characters.
+ * @throws 400 when `targetEnvironment === "production"` and
+ *             `confirmProduction` is not explicitly `true`.
+ * @throws 503 when the `S3_BACKUP_BUCKET` environment variable is unset.
+ * @returns 202 Accepted with the queued {@link RestoreJob} record.
+ */
+adminRouter.post('/restore', async (req, res) => {
+  const requestId = req.id ?? req.correlationId;
+  const { backupId, targetEnvironment, confirmProduction } = req.body ?? {};
+
+  // ── Input validation ────────────────────────────────────────────────────
+  if (!backupId || typeof backupId !== 'string') {
+    res.status(400).json(
+      errorResponse(
+        'VALIDATION_ERROR',
+        'backupId (non-empty string) is required.',
+        undefined,
+        requestId,
+      ),
+    );
+    return;
+  }
+
+  if (
+    targetEnvironment !== undefined &&
+    targetEnvironment !== 'staging' &&
+    targetEnvironment !== 'production'
+  ) {
+    res.status(400).json(
+      errorResponse(
+        'VALIDATION_ERROR',
+        'targetEnvironment must be "staging" or "production".',
+        undefined,
+        requestId,
+      ),
+    );
+    return;
+  }
+
+  // Require S3_BACKUP_BUCKET to be configured before queueing.
+  if (!process.env.S3_BACKUP_BUCKET) {
+    res.status(503).json(
+      errorResponse(
+        'CONFIGURATION_ERROR',
+        'S3_BACKUP_BUCKET environment variable is required for restore operations.',
+        undefined,
+        requestId,
+      ),
+    );
+    return;
+  }
+
+  // ── Queue job ───────────────────────────────────────────────────────────
+  let job: RestoreJob;
+
+  try {
+    job = queueRestoreJob({
+      backupId,
+      targetEnvironment: targetEnvironment ?? 'staging',
+      confirmProduction: confirmProduction === true,
+      correlationId: requestId,
+      onStatusChange: (updatedJob) => {
+        // Translate each status transition to a durable audit event.
+        // These fire from the async background loop so we use the
+        // non-throwing recordAuditEvent path.
+        const auditActionMap = {
+          queued: 'BACKUP_RESTORE_QUEUED',
+          running: 'BACKUP_RESTORE_STARTED',
+          completed: 'BACKUP_RESTORE_COMPLETED',
+          failed: 'BACKUP_RESTORE_FAILED',
+        } as const;
+
+        const auditAction = auditActionMap[updatedJob.status];
+        if (!auditAction) return;
+
+        recordAuditEvent(auditAction, 'backup', updatedJob.jobId, requestId, {
+          backupId: updatedJob.backupId,
+          targetEnvironment: updatedJob.targetEnvironment,
+          ...(updatedJob.restoredTo !== undefined ? { restoredTo: updatedJob.restoredTo } : {}),
+          ...(updatedJob.errorMessage !== undefined ? { errorMessage: updatedJob.errorMessage } : {}),
+        });
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+
+    // production-confirm missing → 400; anything else → 503
+    const isValidationError =
+      message.includes('confirmProduction') ||
+      message.includes('backupId') ||
+      message.includes('path traversal') ||
+      message.includes('must not') ||
+      message.includes('non-empty') ||
+      message.includes('exceeds');
+
+    const status = isValidationError ? 400 : 503;
+    const code = isValidationError ? 'VALIDATION_ERROR' : 'RESTORE_ERROR';
+
+    res.status(status).json(errorResponse(code, message, undefined, requestId));
+    return;
+  }
+
+  res.status(202).json(
+    successResponse(
+      {
+        message: 'Restore job queued.',
+        job,
+      },
+      requestId,
+    ),
+  );
+});
+
+/**
+ * GET /api/admin/restore/:jobId
+ *
+ * Polls the status of a previously queued restore job.
+ *
+ * Returns the full {@link RestoreJob} record, including:
+ * - `status`:          "queued" | "running" | "completed" | "failed"
+ * - `queuedAt`:        ISO-8601 timestamp when the job was queued
+ * - `startedAt`:       ISO-8601 timestamp when execution began (if started)
+ * - `completedAt`:     ISO-8601 timestamp when the job finished (if finished)
+ * - `restoredTo`:      S3 URI of the restored object (if completed)
+ * - `errorMessage`:    Failure description (if failed)
+ *
+ * @security Requires valid Bearer admin token (`ADMIN_API_KEY`).
+ * @throws 400 when `jobId` is empty or exceeds 255 characters.
+ * @throws 404 when no job with the given ID exists in the current process.
+ * @returns 200 with the job record.
+ */
+adminRouter.get('/restore/:jobId', (req, res) => {
+  const requestId = req.id ?? req.correlationId;
+  const { jobId } = req.params;
+
+  // Lightweight ID validation — cuid2 IDs are 24 characters but allow
+  // any non-empty string up to 255 chars to future-proof persistent stores.
+  if (!jobId || jobId.trim().length === 0) {
+    res.status(400).json(
+      errorResponse('VALIDATION_ERROR', 'jobId must be a non-empty string.', undefined, requestId),
+    );
+    return;
+  }
+
+  if (jobId.length > 255) {
+    res.status(400).json(
+      errorResponse(
+        'VALIDATION_ERROR',
+        'jobId exceeds maximum length of 255 characters.',
+        undefined,
+        requestId,
+      ),
+    );
+    return;
+  }
+
+  const job = getRestoreJob(jobId);
+
+  if (!job) {
+    res.status(404).json(
+      errorResponse(
+        'NOT_FOUND',
+        `Restore job "${jobId}" not found. It may have expired or belong to a different replica.`,
+        undefined,
+        requestId,
+      ),
+    );
+    return;
+  }
+
+  res.json(successResponse({ job }, requestId));
+});
+
+/**
+ * GET /api/admin/restore
+ *
+ * Lists all restore jobs in the current process (newest first).
+ *
+ * In a multi-replica deployment, each replica maintains its own in-memory
+ * store; the list reflects only jobs queued on the responding replica.
+ *
+ * @security Requires valid Bearer admin token (`ADMIN_API_KEY`).
+ * @returns 200 with `{ jobs: RestoreJob[] }`.
+ */
+adminRouter.get('/restore', (_req, res) => {
+  const requestId = _req.id ?? _req.correlationId;
+  const jobs = listRestoreJobs();
+  res.json(successResponse({ jobs }, requestId));
 });

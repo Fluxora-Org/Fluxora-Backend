@@ -31,6 +31,16 @@
  *   - `fluxora_ws_batch_size_exceeded_total` — flushes where the batch hit
  *     `WS_BATCH_MAX_SIZE` before the flush window expired (early ejection).
  *
+ * ### Micro-batching counters (three series)
+ *
+ *   - `fluxora_ws_batch_flush_total`         — total flush operations (each
+ *     flush produces one outbound `stream_update_batch` frame per client).
+ *   - `fluxora_ws_batch_events_coalesced_total` — total individual events
+ *     that were coalesced across all flushes.  Comparing this to
+ *     `fluxora_ws_batch_flush_total` gives the average batch size.
+ *   - `fluxora_ws_batch_size_exceeded_total` — flushes where the batch hit
+ *     `WS_BATCH_MAX_SIZE` before the flush window expired (early ejection).
+ *
  * The per-client gauge is updated by a poll loop so the value reflects the
  * actual kernel/OS send-buffer state, not just the snapshot taken during a
  * `deliverBatch` call.  Series for disconnected clients are explicitly removed

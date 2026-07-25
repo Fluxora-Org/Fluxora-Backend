@@ -75,6 +75,11 @@ import { sendEarlyHints } from '../utils/earlyHints.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
 import {
+  issueWriteFencePin,
+  shouldForcePrimaryFromHeaders,
+  WRITE_FENCE_HEADER,
+} from '../db/writeFencePin.js';
+import {
   CreateStreamSchema,
   parseBody,
   formatZodIssues,
@@ -500,6 +505,13 @@ streamsRouter.get(
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
+    // Read-your-writes: if the client echoes a valid, unexpired write-fence
+    // pin, route this read to the primary pool so the client sees its own
+    // recent write even if the replica is lagging.
+    const forcePrimary = shouldForcePrimaryFromHeaders(
+      req.headers as Record<string, string | string[] | undefined>,
+    );
+
     let result: { streams: Stream[]; hasMore: boolean; total?: number };
     const dbStart = process.hrtime.bigint();
     try {
@@ -512,6 +524,7 @@ streamsRouter.get(
         limit,
         cursor?.lastId,
         includeTotal,
+        { forcePrimary },
       );
       result = {
         streams: dbResult.streams.map(toApiStream),
@@ -974,6 +987,21 @@ streamsRouter.post(
     });
 
     streamsCreatedTotal.inc({ status: stream.status });
+
+    // Issue a read-your-writes fence pin.  The client must echo this token in
+    // the X-Fluxora-Write-Fence request header on its next GET /api/streams
+    // call to ensure the read is routed to the primary pool while the replica
+    // may still be lagging.  The pin expires after RYW_PIN_TTL_SECONDS (default
+    // 30 s) and is ignored if missing, malformed, or expired.
+    try {
+      res.set(WRITE_FENCE_HEADER, issueWriteFencePin());
+    } catch (pinErr) {
+      // Never let a pin-issuance failure break stream creation — log and skip.
+      warn('Failed to issue write-fence pin', {
+        error: pinErr instanceof Error ? pinErr.message : String(pinErr),
+        requestId,
+      });
+    }
 
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
