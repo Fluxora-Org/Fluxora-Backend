@@ -1,4 +1,197 @@
-### Docker Health Check Tuning
+# Deployment Guide
+
+## Tiered Startup Dependency Probing
+
+Before Fluxora accepts any HTTP traffic it runs a two-tier connectivity check
+against every external dependency. This bounds the startup delay and surfaces
+misconfiguration failures early so on-call engineers see a clear structured log
+entry — not a cryptic 503 from the load balancer — within seconds of a bad
+deploy.
+
+### Tiers
+
+| Tier | Dependencies | Failure behaviour |
+|------|-------------|------------------|
+| **hard** | PostgreSQL | Single probe attempt. On failure the process **exits immediately** with exit code 1. The structured `startup_probe:fatal` log includes the sanitised error and `"action": "process will exit"`. |
+| **soft** | Redis, Stellar RPC | Retried with **decorrelated-jitter backoff** until either the probe succeeds or the total wall-clock budget (`STARTUP_PROBE_BUDGET_MS`) is exhausted. On budget exhaustion the service starts in **degraded mode** and the `startup_probe:degraded` log indicates which dependencies are unavailable. |
+
+### Why this design?
+
+- **Postgres is hard**: every write and read path requires a live pool
+  connection. A misconfigured `DATABASE_URL` must be caught immediately — not
+  after a readiness probe timeout that delays container restart.
+- **Redis is soft**: rate-limiting, idempotency, and session stores fall back to
+  in-memory or no-op implementations. A transient Redis restart during a rolling
+  deploy should not kill the process.
+- **Stellar RPC is soft**: the RPC tier has its own circuit breaker and cached
+  fallbacks. Brief unavailability is tolerable; the service degrades gracefully
+  rather than refusing all traffic.
+
+### Configuration
+
+All timeouts and the budget are configurable via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STARTUP_PROBE_BUDGET_MS` | `30000` | Total wall-clock budget (ms) for soft-tier retries. Set this below your container-orchestrator readiness timeout. |
+| `STARTUP_PROBE_POSTGRES_TIMEOUT_MS` | `5000` | Per-attempt timeout (ms) for the single Postgres hard probe. |
+| `STARTUP_PROBE_REDIS_TIMEOUT_MS` | `3000` | Per-attempt timeout (ms) for each Redis soft-probe retry attempt. |
+| `STARTUP_PROBE_STELLAR_TIMEOUT_MS` | `5000` | Per-attempt timeout (ms) for each Stellar RPC soft-probe retry attempt. |
+
+All values must be strictly greater than 0. The Zod schema rejects 0 or
+negative values at boot with a `ConfigError`.
+
+### Kubernetes readiness/liveness alignment
+
+Set `STARTUP_PROBE_BUDGET_MS` to a value **lower** than your pod's
+`initialDelaySeconds` so Fluxora can reach its degraded-or-healthy state before
+the kubelet starts counting readiness failures.
+
+```yaml
+# Example: 30 s budget, probe starts after 35 s
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 35
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+```
+STARTUP_PROBE_BUDGET_MS=30000   # 30 s — leaves 5 s margin before kubelet checks
+```
+
+### Log events
+
+Every stage emits a structured JSON log entry. Fields are always present in
+each event; optional fields are marked with `?`.
+
+#### `startup_probe:begin`
+```json
+{
+  "level": "info",
+  "message": "startup_probe:begin",
+  "dependencies": [
+    { "name": "postgres", "tier": "hard" },
+    { "name": "redis",    "tier": "soft" },
+    { "name": "stellar_rpc", "tier": "soft" }
+  ],
+  "budgetMs": 30000
+}
+```
+
+#### `startup_probe:attempt`
+```json
+{
+  "level": "info",
+  "message": "startup_probe:attempt",
+  "dependency": "postgres",
+  "tier": "hard",
+  "attempt": 1,
+  "timeoutMs": 5000,
+  "budgetRemainingMs": 29800    // soft tier only
+}
+```
+
+#### `startup_probe:success`
+```json
+{
+  "level": "info",
+  "message": "startup_probe:success",
+  "dependency": "postgres",
+  "tier": "hard",
+  "attempt": 1,
+  "outcome": "success",
+  "latencyMs": 42
+}
+```
+
+#### `startup_probe:retry` *(soft tier only)*
+```json
+{
+  "level": "warn",
+  "message": "startup_probe:retry",
+  "dependency": "redis",
+  "tier": "soft",
+  "attempt": 2,
+  "outcome": "retry",
+  "latencyMs": 3001,
+  "error": "redis timed out after 3000 ms",
+  "budgetRemainingMs": 24000
+}
+```
+
+#### `startup_probe:degraded` *(soft tier only)*
+```json
+{
+  "level": "warn",
+  "message": "startup_probe:degraded",
+  "dependency": "stellar_rpc",
+  "tier": "soft",
+  "attempts": 5,
+  "outcome": "degraded",
+  "latencyMs": 5002,
+  "error": "stellar_rpc startup probe timed out after 5000 ms",
+  "action": "service will start in degraded mode"
+}
+```
+
+#### `startup_probe:fatal` *(hard tier only)*
+```json
+{
+  "level": "error",
+  "message": "startup_probe:fatal",
+  "dependency": "postgres",
+  "tier": "hard",
+  "attempt": 1,
+  "outcome": "fatal",
+  "latencyMs": 5001,
+  "error": "connect ECONNREFUSED [redacted-url]",
+  "action": "process will exit"
+}
+```
+
+#### `startup_probe:complete`
+```json
+{
+  "level": "info",
+  "message": "startup_probe:complete",
+  "outcome": "degraded",
+  "degradedDependencies": ["stellar_rpc"],
+  "results": [
+    { "name": "postgres",    "tier": "hard", "outcome": "success",  "attempts": 1, "latencyMs": 42 },
+    { "name": "redis",       "tier": "soft", "outcome": "success",  "attempts": 3, "latencyMs": 12 },
+    { "name": "stellar_rpc", "tier": "soft", "outcome": "degraded", "attempts": 5, "latencyMs": 5002 }
+  ]
+}
+```
+
+### Security
+
+- All error messages emitted in logs are passed through `sanitiseErrorMessage()`
+  (`src/health/checkers.ts`). Connection strings (e.g.
+  `postgresql://user:pass@host/db`, `redis://admin:secret@host:6379`),
+  passwords, and hostnames embedded in error strings are replaced with
+  `[redacted-url]` or `[redacted-credentials]` before any log is written.
+- The probe functions use transient, short-lived clients that are torn down
+  immediately after each attempt — no connection pool pollution.
+- `STARTUP_PROBE_*` timeout values are validated against a minimum of 1 by the
+  Zod schema so they cannot be set to 0 to disable the timeout silently.
+
+### On-call triage quick reference
+
+| Log event | Meaning | Action |
+|-----------|---------|--------|
+| `startup_probe:fatal` | Postgres unreachable | Check `DATABASE_URL`, network policy, DB status |
+| `startup_probe:degraded` for `redis` | Redis unreachable after budget | Check `REDIS_URL`, Redis cluster health |
+| `startup_probe:degraded` for `stellar_rpc` | Stellar RPC unreachable after budget | Check `STELLAR_RPC_URL`, network egress |
+| `startup_probe:complete` with `outcome: healthy` | All dependencies reachable | Normal startup |
+| `startup_probe:complete` with `outcome: degraded` | One or more soft deps unavailable | Service started; investigate degraded deps |
+
+---
+
+## Docker Health Check Tuning
 
 Fluxora's Docker container features parameterised health checks to accommodate different deployment environments.
 
