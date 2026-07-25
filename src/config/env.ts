@@ -400,6 +400,7 @@ export interface Config {
   redisClusterNodes?: string | undefined;
 
   stellarNetwork: StellarNetwork;
+  stellarRpcUrl: string;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
@@ -581,6 +582,7 @@ function toConfig(env: ParsedEnv): Config {
     redisClusterNodes: env.REDIS_CLUSTER_NODES,
 
     stellarNetwork,
+    stellarRpcUrl: env.STELLAR_RPC_URL,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),

@@ -37,9 +37,9 @@ function makeEventuallySuccessProbe(
   name: string,
   tier: StartupProbeConfig['tier'],
   failCount: number,
-): { config: StartupProbeConfig; spy: ReturnType<typeof vi.fn> } {
+): { config: StartupProbeConfig; spy: ReturnType<typeof vi.fn<[], Promise<void>>> } {
   let calls = 0;
-  const spy = vi.fn(async () => {
+  const spy = vi.fn<[], Promise<void>>(async () => {
     calls++;
     if (calls <= failCount) throw new Error(`attempt ${calls} failed`);
   });
