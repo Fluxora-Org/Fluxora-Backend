@@ -163,6 +163,30 @@ describe('backupDatabase', () => {
     expect(result.message).toContain('invalid characters')
   })
 
+  it('fails when S3 bucket is empty', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: '', key: 'dump.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 bucket path is required')
+  })
+
+  it('fails when S3 key is empty', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: 'my-backups', key: '' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 key path is required')
+  })
+
+  it('fails when S3 bucket contains shell metacharacters', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: 'my;rm -rf /', key: 'dump.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('invalid characters')
+  })
+
+  it('fails when S3 key contains shell metacharacters', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: 'my-backups', key: 'dump`whoami`.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('invalid characters')
+  })
+
   // ── Local file backup ─────────────────────────────────────────────────────
 
   it('calls execFile with pg_dump args and returns success', async () => {
@@ -292,6 +316,18 @@ describe('restoreDatabase', () => {
     const result = await restoreDatabase(VALID_URL, './dump|cat /etc/passwd')
     expect(result.success).toBe(false)
     expect(result.message).toContain('invalid characters')
+  })
+
+  it('fails when S3 bucket is empty', async () => {
+    const result = await restoreDatabase(VALID_URL, '', { bucket: '', key: 'dump.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 bucket path is required')
+  })
+
+  it('fails when S3 key is empty', async () => {
+    const result = await restoreDatabase(VALID_URL, '', { bucket: 'my-backups', key: '' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 key path is required')
   })
 
   // ── Local file restore ────────────────────────────────────────────────────
@@ -477,5 +513,69 @@ describe('dropOldPartitions', () => {
     // The first query gets the partitions, but DROP TABLE is never called
     expect(fakePool.query).toHaveBeenCalledTimes(1);
     expect(fakePool.query).toHaveBeenCalledWith(expect.stringContaining('SELECT'), ['contract_events']);
+  })
+
+  // ── Input validation ─────────────────────────────────────────────────
+
+  it('rejects empty parentTable', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, '', 30, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('parentTable is required')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects whitespace-only parentTable', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, '   ', 30, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('parentTable is required')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects negative olderThanDays', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', -1, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('non-negative')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects NaN olderThanDays', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', NaN, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('non-negative')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects Infinity olderThanDays', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', Infinity, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('non-negative')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('handles pool.query rejection gracefully', async () => {
+    const fakePool = {
+      query: vi.fn().mockRejectedValue(new Error('connection refused')),
+    } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('Failed to query partitions')
+    expect(result.message).toContain('connection refused')
+  })
+
+  it('accepts olderThanDays of 0 (drops everything before today)', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'ce_old', partition_bound: "FOR VALUES FROM ('2020-01-01') TO ('2020-02-01')" },
+        ]
+      })
+    } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', 0, true)
+    expect(result.droppedPartitions).toContain('ce_old')
   })
 })

@@ -178,6 +178,15 @@ export async function backupDatabase(
     if (!pathCheck.valid) {
       return { success: false, message: pathCheck.reason! }
     }
+  } else {
+    const bucketCheck = validatePath(s3Target.bucket, 'S3 bucket')
+    if (!bucketCheck.valid) {
+      return { success: false, message: bucketCheck.reason! }
+    }
+    const keyCheck = validatePath(s3Target.key, 'S3 key')
+    if (!keyCheck.valid) {
+      return { success: false, message: keyCheck.reason! }
+    }
   }
 
   try {
@@ -291,6 +300,15 @@ export async function restoreDatabase(
     const pathCheck = validatePath(inputPath, 'Input')
     if (!pathCheck.valid) {
       return { success: false, message: pathCheck.reason! }
+    }
+  } else {
+    const bucketCheck = validatePath(s3Source.bucket, 'S3 bucket')
+    if (!bucketCheck.valid) {
+      return { success: false, message: bucketCheck.reason! }
+    }
+    const keyCheck = validatePath(s3Source.key, 'S3 key')
+    if (!keyCheck.valid) {
+      return { success: false, message: keyCheck.reason! }
     }
   }
 
@@ -416,6 +434,13 @@ export async function dropOldPartitions(
   olderThanDays: number,
   dryRun = true
 ): Promise<{ droppedPartitions: string[]; message: string }> {
+  if (!parentTable || parentTable.trim() === '') {
+    return { droppedPartitions: [], message: 'parentTable is required but was not provided.' }
+  }
+  if (!Number.isFinite(olderThanDays) || olderThanDays < 0) {
+    return { droppedPartitions: [], message: 'olderThanDays must be a non-negative number.' }
+  }
+
   const query = `
     SELECT
       c.relname AS partition_name,
@@ -426,7 +451,17 @@ export async function dropOldPartitions(
     WHERE p.relname = $1
   `;
   
-  const res = await pool.query(query, [parentTable]);
+  let res: import('pg').QueryResult
+  try {
+    res = await pool.query(query, [parentTable])
+  } catch (err: unknown) {
+    const dbErr = err as { message?: string }
+    return {
+      droppedPartitions: [],
+      message: `Failed to query partitions for ${parentTable}: ${dbErr.message || 'unknown error'}`,
+    }
+  }
+
   const droppedPartitions: string[] = [];
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
