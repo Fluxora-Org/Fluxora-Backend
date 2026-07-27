@@ -51,6 +51,7 @@ import {
 import { errorHandler } from '../src/middleware/errorHandler.js';
 import { requestIdMiddleware } from '../src/errors.js';
 import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
+import { serverTimingMiddleware } from '../src/middleware/serverTiming.js';
 import { generateToken } from '../src/lib/auth.js';
 import { authenticate } from '../src/middleware/auth.js';
 import { initializeConfig } from '../src/config/env.js';
@@ -90,6 +91,7 @@ function createTestApp() {
   const app = express();
   app.use(requestIdMiddleware);
   app.use(correlationIdMiddleware);
+  app.use(serverTimingMiddleware());
   app.use(express.json());
   app.use('/api', requireJsonAccept);
   app.use(authenticate);
@@ -524,6 +526,30 @@ describe('Streams API - Decimal String Serialization', () => {
 
       for (const stream of testStreams) {
         await postStream(app, stream).expect(201);
+      }
+    });
+
+    it('emits a Server-Timing header with db and serialize phases when enabled', async () => {
+      const previous = process.env.SERVER_TIMING_ENABLED;
+      process.env.SERVER_TIMING_ENABLED = 'true';
+
+      try {
+        const response = await request(app)
+          .get('/api/streams')
+          .set('Authorization', `Bearer ${testToken}`)
+          .expect(200);
+
+        expect(response.headers['server-timing']).toBeDefined();
+        expect(response.headers['server-timing']).toContain('db;dur=');
+        expect(response.headers['server-timing']).toContain('serialize;dur=');
+        expect(response.headers['server-timing']).not.toContain('localhost');
+        expect(response.headers['server-timing']).not.toContain('query');
+      } finally {
+        if (previous === undefined) {
+          delete process.env.SERVER_TIMING_ENABLED;
+        } else {
+          process.env.SERVER_TIMING_ENABLED = previous;
+        }
       }
     });
 

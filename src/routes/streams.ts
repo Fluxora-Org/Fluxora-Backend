@@ -596,12 +596,13 @@ streamsRouter.get(
     );
 
     const serializeStart = process.hrtime.bigint();
-    try {
-      res.json(successResponse(response, requestId));
-    } finally {
-      const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
-      recordServerTimingPhase(res, 'serialize', durationMs);
-    }
+    const responseEnvelope = successResponse(response, requestId);
+    const serialized = JSON.stringify(responseEnvelope);
+    const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
+    recordServerTimingPhase(res, 'serialize', durationMs);
+
+    res.type('application/json');
+    res.send(serialized);
   }),
 );
 
