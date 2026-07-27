@@ -84,6 +84,54 @@ export function buildEncryptedAddressFilter(
   return `(${hashCondition} OR ${column} = $${filterValueParamIndex})`;
 }
 
+export const DEFAULT_ERASURE_TOMBSTONE = '[REDACTED_GDPR_ERASURE]';
+
+/**
+ * Redaction helper: Permanently redacts encrypted PII columns for matching streams
+ * associated with a recipient address while preserving all financial and ledger data.
+ *
+ * @param queryExecutor - Database client or pool with a query method (supports transactions)
+ * @param recipientAddress - Plaintext address target for GDPR right-to-erasure
+ * @param tombstone - Tombstone value to write into address columns (default: '[REDACTED_GDPR_ERASURE]')
+ * @returns Promise resolving to an object containing `{ rowsErased, rowsSkippedLegalHold }`
+ *
+ * @security Uses parameterized queries ($1, $2) to prevent SQL injection.
+ * Does NOT delete or alter financial columns (`amount`, `ledger`, `tx_hash`, `stream_id`, etc.).
+ */
+export async function redactPiiForAddress(
+  queryExecutor: { query: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number | null; rows: any[] }> },
+  recipientAddress: string,
+  tombstone: string = DEFAULT_ERASURE_TOMBSTONE,
+): Promise<{ rowsErased: number; rowsSkippedLegalHold: number }> {
+  const updateResult = await queryExecutor.query(
+    `UPDATE streams
+        SET sender_address         = $1,
+            recipient_address      = $1,
+            sender_address_hash    = NULL,
+            recipient_address_hash = NULL
+      WHERE (recipient_address = $2 OR sender_address = $2)
+        AND COALESCE(legal_hold, FALSE) = FALSE`,
+    [tombstone, recipientAddress],
+  );
+
+  const rowsErased = updateResult.rowCount ?? 0;
+
+  const holdResult = await queryExecutor.query(
+    `SELECT COUNT(*) AS cnt
+       FROM streams
+      WHERE (recipient_address = $1 OR sender_address = $1)
+        AND legal_hold = TRUE`,
+    [recipientAddress],
+  );
+
+  const rowsSkippedLegalHold = parseInt(
+    (holdResult.rows[0] as { cnt: string } | undefined)?.cnt ?? '0',
+    10,
+  );
+
+  return { rowsErased, rowsSkippedLegalHold };
+}
+
 // ── Batch hashing via worker_threads pool ─────────────────────────────────
 
 /**

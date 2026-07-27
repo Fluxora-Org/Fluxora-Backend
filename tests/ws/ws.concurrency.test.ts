@@ -621,3 +621,354 @@ describe('StreamHub broadcast mid-fan-out client disconnect', () => {
   });
 });
 
+/**
+ * Concurrency test suite verifying StreamHub.broadcast() tolerates client
+ * disconnects that occur **during** the fan-out delivery loop.
+ *
+ * SECURITY NOTES:
+ * - Uses vi.spyOn on a server-side WebSocket.send() to trigger the disconnect
+ *   of a *different* subscriber mid-iteration, creating a deterministic
+ *   mid-fan-out scenario without race conditions.
+ * - Clients are connected sequentially (not with Promise.all) so that the
+ *   hub._getClients() insertion order matches the client array index, keeping
+ *   server-socket lookup deterministic.
+ * - The backpressure collector is disabled (intervalMs: 0) so that metrics
+ *   reflect only the broadcast under test.
+ */
+describe('StreamHub broadcast mid-fan-out client disconnect', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+  const openClients: WebSocket[] = [];
+
+  beforeEach(async () => {
+    server = http.createServer();
+    hub = new StreamHub(server, {
+      backpressureCollector: { intervalMs: 0 },
+    });
+    hub._resetMetrics();
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as { port: number }).port;
+    openClients.length = 0;
+  });
+
+  afterEach(async () => {
+    for (const ws of openClients) {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    }
+    await new Promise<void>((resolve) => hub.close(() => resolve()));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  /** Return server-side WebSocket handles in Map-insertion order. */
+  function getServerSockets(): WebSocket[] {
+    const sockets: WebSocket[] = [];
+    for (const [ws] of hub._getClients()) {
+      sockets.push(ws);
+    }
+    return sockets;
+  }
+
+  /** Connect `count` clients sequentially and track them for cleanup. */
+  async function connectClients(count: number): Promise<WebSocket[]> {
+    const clients: WebSocket[] = [];
+    for (let i = 0; i < count; i++) {
+      const ws = await connectClient(port);
+      openClients.push(ws);
+      clients.push(ws);
+    }
+    return clients;
+  }
+
+  it('handles abrupt ws.terminate() mid-broadcast fan-out', async () => {
+    /**
+     * SCENARIO: Five clients subscribe to a stream. A broadcast() call begins
+     * fan-out to all five. Mid-iteration (when client[1]'s send fires), client[3]
+     * is forcibly terminated via ws.terminate().
+     *
+     * EXPECTED:
+     *   - broadcast() promise resolves cleanly (no exception escapes hub.ts).
+     *   - The terminated client receives zero messages.
+     *   - The remaining 4 clients all receive the stream_update event.
+     *   - BackpressureMetrics: sentMessages=4, droppedMessages=0,
+     *     terminatedConnections=0 (the disconnect was external, not backpressure).
+     *   - hub.clientCount drops to 4 (terminated client is cleaned up).
+     *
+     * SECURITY PROPERTY: Abrupt client termination mid-fan-out does not corrupt
+     * the broadcast loop, leak unhandled exceptions, or skew metrics.
+     */
+    const CLIENT_COUNT = 5;
+    const streamId = 'test-stream-term';
+
+    const clients = await connectClients(CLIENT_COUNT);
+
+    const messages: unknown[][] = clients.map(() => []);
+    clients.forEach((ws, i) => {
+      ws.on('message', (data) => {
+        messages[i].push(JSON.parse(data.toString()));
+      });
+    });
+
+    await wait(20);
+
+    clients.forEach((ws) => sendJson(ws, { type: 'subscribe', filter: { streamId } }));
+    await wait(20);
+
+    const serverSockets = getServerSockets();
+    expect(serverSockets).toHaveLength(CLIENT_COUNT);
+
+    // Trigger terminate on index 3 when index 1's send is called.
+    const terminateTarget = serverSockets[3];
+    const spy = vi.spyOn(serverSockets[1], 'send');
+    spy.mockImplementationOnce(function mock(data: string) {
+      terminateTarget.terminate();
+      spy.mockRestore();
+      return serverSockets[1].send(data);
+    });
+
+    await expect(
+      hub.broadcast({ streamId, eventId: 'evt-mid', payload: { n: 1 } })
+    ).resolves.toBeUndefined();
+
+    await wait(30);
+
+    for (let i = 0; i < CLIENT_COUNT; i++) {
+      if (i === 3) {
+        expect(messages[i]).toHaveLength(0);
+      } else {
+        expect(messages[i]).toHaveLength(1);
+        expect(messages[i][0]).toMatchObject({
+          type: 'stream_update',
+          streamId,
+          eventId: 'evt-mid',
+        });
+      }
+    }
+
+    const metrics = hub.getMetrics();
+    expect(metrics.sentMessages).toBe(CLIENT_COUNT - 1);
+    expect(metrics.droppedMessages).toBe(0);
+    expect(metrics.terminatedConnections).toBe(0);
+    expect(hub.clientCount).toBe(CLIENT_COUNT - 1);
+  });
+
+  it('handles clean ws.close() mid-broadcast fan-out', async () => {
+    /**
+     * SCENARIO: Five clients subscribe to a stream. A broadcast() call begins
+     * fan-out to all five. Mid-iteration (when client[1]'s send fires), client[3]
+     * is cleanly closed via ws.close().
+     *
+     * EXPECTED:
+     *   - broadcast() promise resolves cleanly.
+     *   - The closed client receives zero messages.
+     *   - The remaining 4 clients all receive the stream_update event.
+     *   - BackpressureMetrics: sentMessages=4, droppedMessages=0,
+     *     terminatedConnections=0.
+     *   - hub.clientCount drops to 4.
+     *
+     * SECURITY PROPERTY: Clean close during the same tick as the broadcast loop
+     * is handled gracefully — no exception escapes, no leaking sockets,
+     * no inconsistent counters.
+     *
+     * DIFFERENCE FROM TERMINATE TEST: ws.close() performs the WebSocket close
+     * handshake (sends a close frame) rather than immediately destroying the
+     * underlying TCP socket. Both code paths must be covered.
+     */
+    const CLIENT_COUNT = 5;
+    const streamId = 'test-stream-close';
+
+    const clients = await connectClients(CLIENT_COUNT);
+
+    const messages: unknown[][] = clients.map(() => []);
+    clients.forEach((ws, i) => {
+      ws.on('message', (data) => {
+        messages[i].push(JSON.parse(data.toString()));
+      });
+    });
+
+    await wait(20);
+
+    clients.forEach((ws) => sendJson(ws, { type: 'subscribe', filter: { streamId } }));
+    await wait(20);
+
+    const serverSockets = getServerSockets();
+    expect(serverSockets).toHaveLength(CLIENT_COUNT);
+
+    // Trigger close on index 3 when index 1's send is called.
+    const closeTarget = serverSockets[3];
+    const spy = vi.spyOn(serverSockets[1], 'send');
+    spy.mockImplementationOnce(function mock(data: string) {
+      closeTarget.close();
+      spy.mockRestore();
+      return serverSockets[1].send(data);
+    });
+
+    await expect(
+      hub.broadcast({ streamId, eventId: 'evt-mid-close', payload: { n: 2 } })
+    ).resolves.toBeUndefined();
+
+    await wait(30);
+
+    for (let i = 0; i < CLIENT_COUNT; i++) {
+      if (i === 3) {
+        expect(messages[i]).toHaveLength(0);
+      } else {
+        expect(messages[i]).toHaveLength(1);
+        expect(messages[i][0]).toMatchObject({
+          type: 'stream_update',
+          streamId,
+          eventId: 'evt-mid-close',
+        });
+      }
+    }
+
+    const metrics = hub.getMetrics();
+    expect(metrics.sentMessages).toBe(CLIENT_COUNT - 1);
+    expect(metrics.droppedMessages).toBe(0);
+    expect(metrics.terminatedConnections).toBe(0);
+    expect(hub.clientCount).toBe(CLIENT_COUNT - 1);
+  });
+});
+
+
+describe('Rapid Resubscribe Flapping (#928)', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+
+  const VALID_KEY = 'GCCFZVJYMLYWVOSZ63KUEAQSHYOYEEHZVNEK2EJBIEWJLDKAE6WFEGT7';
+
+  beforeEach(async () => {
+    ({ server, hub, port } = await setup());
+    _resetLimiter();
+  });
+
+  afterEach(async () => {
+    _resetLimiter();
+    await teardown(server, hub);
+  });
+
+  it('converges to the last processed message filter state under rapid flapping', async () => {
+    const result = await attemptConnect(port);
+    expect(result.success).toBe(true);
+    const ws = result.ws!;
+
+    const streamId = 'flapping-stream';
+    const streamId2 = 'another-stream';
+
+    // Send 20 messages rapidly (under rate limit MAX of 30)
+    // 0 to 19. i=19 is odd -> unsubscribe
+    const messages: Record<string, unknown>[] = [];
+    for (let i = 0; i < 20; i++) {
+      if (i % 2 === 0) {
+        messages.push({ type: 'subscribe', filter: { streamId } });
+      } else {
+        messages.push({ type: 'unsubscribe', filter: { streamId } });
+      }
+    }
+    
+    // Add one more subscribe for streamId2
+    messages.push({ type: 'subscribe', filter: { streamId: streamId2 } });
+
+    sendControlMessages(ws, messages);
+    await wait(200); // wait for messages to be processed
+
+    const streamMap = (hub as any).streamSubscriptions as Map<string, Set<WebSocket>>;
+
+    // streamId should be unsubscribed
+    expect(streamMap.has(streamId)).toBe(false);
+
+    // streamId2 should be subscribed
+    expect(streamMap.has(streamId2)).toBe(true);
+    expect(streamMap.get(streamId2)?.size).toBe(1);
+
+    const serverWs = Array.from((hub as any).clients.keys())[0] as WebSocket;
+    expect(streamMap.get(streamId2)?.has(serverWs)).toBe(true);
+
+    const clientState = (hub as any).clients.get(serverWs);
+    expect(clientState.subscriptionFilters.has(`stream:${streamId}`)).toBe(false);
+    expect(clientState.subscriptionFilters.has(`stream:${streamId2}`)).toBe(true);
+
+    await closeWs(ws);
+  });
+
+  /**
+   * SECURITY NOTE:
+   * Asserts the per-connection rate limiter (RATE_LIMIT_MAX/RATE_LIMIT_WINDOW_MS) 
+   * correctly throttles pathological flapping without corrupting subscription state.
+   */
+  it('correctly throttles pathological flapping via rate limiter without corrupting state', async () => {
+    const result = await attemptConnect(port);
+    expect(result.success).toBe(true);
+    const ws = result.ws!;
+
+    const streamId = 'pathological-stream';
+    const messageCount = RATE_LIMIT_MAX + 20;
+
+    const messages: Record<string, unknown>[] = [];
+    for (let i = 0; i < messageCount; i++) {
+      if (i % 2 === 0) {
+        messages.push({ type: 'subscribe', filter: { streamId } });
+      } else {
+        messages.push({ type: 'unsubscribe', filter: { streamId } });
+      }
+    }
+
+    sendControlMessages(ws, messages);
+    await wait(200);
+
+    const streamMap = (hub as any).streamSubscriptions as Map<string, Set<WebSocket>>;
+    
+    const lastProcessedIndex = RATE_LIMIT_MAX - 1;
+    const expectedSubscribe = (lastProcessedIndex % 2 === 0);
+    
+    expect(streamMap.has(streamId)).toBe(expectedSubscribe);
+    if (expectedSubscribe) {
+      expect(streamMap.get(streamId)?.has(ws)).toBe(true);
+    }
+    
+    // Second client: reversed logic
+    const result2 = await attemptConnect(port);
+    const ws2 = result2.ws!;
+    const messages2: Record<string, unknown>[] = [];
+    for (let i = 0; i < messageCount; i++) {
+      if (i % 2 === 0) {
+        messages2.push({ type: 'unsubscribe', filter: { streamId } });
+      } else {
+        messages2.push({ type: 'subscribe', filter: { streamId } });
+      }
+    }
+    
+    sendControlMessages(ws2, messages2);
+    await wait(200);    const expectedSubscribe2 = (lastProcessedIndex % 2 !== 0);
+
+    const serverSockets = Array.from((hub as any).clients.keys()) as WebSocket[];
+    const serverWs1 = serverSockets[0];
+    const serverWs2 = serverSockets[1];
+
+    if (!expectedSubscribe && !expectedSubscribe2) {
+      expect(streamMap.has(streamId)).toBe(false);
+    } else {
+      expect(streamMap.has(streamId)).toBe(true);
+    }
+
+    // Check that we didn't leak stale entries for client 1
+    if (expectedSubscribe) {
+      expect(streamMap.get(streamId)?.has(serverWs1)).toBe(true);
+    } else {
+      expect(streamMap.get(streamId)?.has(serverWs1)).toBeFalsy();
+    }
+
+    // Second client: reversed logic
+    if (expectedSubscribe2) {
+      expect(streamMap.get(streamId)?.has(serverWs2)).toBe(true);
+    } else {
+      expect(streamMap.get(streamId)?.has(serverWs2)).toBeFalsy();
+    }
+
+    await closeWs(ws);
+    await closeWs(ws2);
+  });
+});

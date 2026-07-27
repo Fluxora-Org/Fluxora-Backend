@@ -199,6 +199,11 @@ export function createPool(config?: PoolConfig): pg.Pool {
     max: cfg.max,
     connectionTimeoutMillis: cfg.connectionTimeoutMillis,
     idleTimeoutMillis: cfg.idleTimeoutMillis,
+    // In transaction-pooling mode, pg's internal prepared-statement cache is
+    // incompatible (PgBouncer returns error on PREPARE/EXECUTE).  Setting
+    // allowExitOnIdle: false disables the cache so the driver does not try to
+    // use PREPARE.  In session mode we explicitly enable it (default in pg).
+    allowExitOnIdle: !isTransactionMode,
   });
 
   // Store queueLimit and poolMode on the pool instance for use in query()

@@ -167,6 +167,163 @@ describe('RedisIndexerLeaderElection', () => {
   });
 });
 
+describe('RedisIndexerLeaderElection — multiple instance competition', () => {
+  let redis: FakeRedisClient;
+
+  beforeEach(() => {
+    redis = new FakeRedisClient();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    redis.reset();
+  });
+
+  it('instance B acquires leadership after instance A lease expires', async () => {
+    const leaseMs = 9000;
+    const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
+    const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs });
+
+    // A acquires first.
+    await a.tryAcquire();
+    expect(a.isLeader()).toBe(true);
+    expect(b.isLeader()).toBe(false);
+
+    // A's heartbeat renewal stops working (simulating Redis outage / lease expiry).
+    // A's key expires and B successfully acquires.
+    await redis.del('indexer:leader-election:replay');
+    const acquired = await b.tryAcquire();
+    expect(acquired).toBe(true);
+    expect(b.isLeader()).toBe(true);
+
+    // Advance timers so A's heartbeat fires — A should detect it no longer holds the key.
+    await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
+    expect(a.isLeader()).toBe(false);
+  });
+
+  it('two instances both calling tryAcquire concurrently — only one wins', async () => {
+    const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs: 15_000 });
+    const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs: 15_000 });
+
+    // Both attempt simultaneously (sequentially in test, but key is absent for both).
+    const resultA = await a.tryAcquire();
+    // The second call to tryAcquire fails because A already holds the key.
+    const resultB = await b.tryAcquire();
+
+    expect(resultA).toBe(true);
+    expect(resultB).toBe(false);
+    expect(a.isLeader()).toBe(true);
+    expect(b.isLeader()).toBe(false);
+  });
+
+  it('release by one instance allows the other to acquire', async () => {
+    const leaseMs = 9000;
+    const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
+    const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs });
+
+    await a.tryAcquire();
+    expect(a.isLeader()).toBe(true);
+
+    // A releases gracefully.
+    await a.release();
+    expect(a.isLeader()).toBe(false);
+
+    // B can now acquire.
+    const acquired = await b.tryAcquire();
+    expect(acquired).toBe(true);
+    expect(b.isLeader()).toBe(true);
+  });
+
+  /**
+   * Concurrent-takeover regression test for the check-then-act race in
+   * renew() and release().
+   *
+   * Forces the exact window where:
+   *   1. Instance A's heartbeat fires and `get` confirms A still holds the key.
+   *   2. Between A's `get` and A's `pexpire`, the lease expires and B acquires.
+   *   3. A's stale `pexpire` executes, inadvertently extending B's lease.
+   *
+   * The dual-leadership window must be bounded to at most one renewIntervalMs:
+   * on the next heartbeat, A's `get` returns B's instanceId, A drops leadership
+   * and stops the heartbeat. See docs/indexer.md §"Security note — non-atomic
+   * renew/release" for why this risk is accepted.
+   *
+   * @see docs/indexer.md line ~295
+   */
+  it('renew() check-then-act race: stale pexpire after B takes over — A recovers within one interval', async () => {
+    const leaseMs = 9000;
+    const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
+    const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs });
+
+    // A acquires first.
+    await a.tryAcquire();
+    expect(a.isLeader()).toBe(true);
+
+    // Simulate A's lease expiring and B legitimately acquiring.
+    await redis.del('indexer:leader-election:replay');
+    await b.tryAcquire();
+    expect(b.isLeader()).toBe(true);
+
+    // Spy on redis.get to simulate A seeing stale data on its next heartbeat:
+    // A's `get` returns 'a' (the value A expects) even though B now holds the key.
+    // This forces exactly the race: A's get succeeds (stale), then A's pexpire
+    // fires and extends B's lease.
+    let staleReturned = false;
+    const originalGet = redis.get.bind(redis);
+    vi.spyOn(redis, 'get').mockImplementation(async (key: string) => {
+      if (key === 'indexer:leader-election:replay' && !staleReturned) {
+        staleReturned = true;
+        return 'a';
+      }
+      return originalGet(key);
+    });
+
+    // Advance one interval: A's heartbeat fires, spy returns 'a' (stale view),
+    // A proceeds to pexpire which extends B's lease. A still thinks it's leader.
+    await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
+    expect(a.isLeader()).toBe(true);
+    expect(b.isLeader()).toBe(true);
+
+    // Advance another interval: A's heartbeat fires again, this time get returns 'b'
+    // (no spy interference), A detects B holds the key and drops leadership.
+    await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
+
+    expect(a.isLeader()).toBe(false);
+    expect(b.isLeader()).toBe(true);
+    await expect(redis.get('indexer:leader-election:replay')).resolves.toBe('b');
+  });
+
+  /**
+   * release() check-then-act safety: release() never deletes a lease key that
+   * has since been legitimately re-acquired by a different instance.
+   *
+   * This is called out explicitly in the docs/indexer.md risk write-up:
+   * the check-then-act pattern in release() could, in theory, delete a
+   * re-acquired lease. The existing test "release() does not delete a lease
+   * now held by a different instance" above proves it does not by simulating
+   * the takeover before release() is invoked (no spy needed).
+   *
+   * @see tests/indexer/leaderElection.test.ts "release() does not delete a lease now held by a different instance"
+   * @see docs/indexer.md §"Security note — non-atomic renew/release"
+   */
+  it('release() check-then-act: never deletes a lease re-acquired by another instance', async () => {
+    const leaseMs = 9000;
+    const le = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
+    await le.tryAcquire();
+
+    // Simulate the race: our lease expired, and B legitimately acquired before
+    // we called release(). The check-then-act in release() MUST see B's value
+    // and skip the DEL.
+    await redis.del('indexer:leader-election:replay');
+    await redis.setNx('indexer:leader-election:replay', 'other-instance', leaseMs);
+
+    await le.release();
+
+    await expect(redis.get('indexer:leader-election:replay')).resolves.toBe('other-instance');
+  });
+});
+
 describe('default leader election accessor', () => {
   afterEach(() => {
     _resetIndexerLeaderElection();

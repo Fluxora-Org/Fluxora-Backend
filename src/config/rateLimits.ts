@@ -55,6 +55,15 @@ export const ROUTE_BUDGETS: RouteBudget[] = [
     path: '/api/streams/:id',
     config: { baseLimit: 30, writeLimit: 5, exempt: false }
   },
+  // Privacy endpoints - strict limits for sensitive operations
+  {
+    path: '/api/privacy/consent',
+    config: { baseLimit: 10, writeLimit: 10, exempt: false }
+  },
+  {
+    path: '/api/privacy/erasure/:recipientAddress',
+    config: { baseLimit: 5, writeLimit: 5, exempt: false }
+  },
   // Admin endpoints - different limits
   {
     path: '/api/admin',
@@ -185,4 +194,44 @@ export function setRuntimeRateLimitConfig(
 /** Resets runtime overrides (used in tests and on startup). */
 export function resetRuntimeRateLimitConfig(): void {
   runtimeConfig = null;
+}
+
+// ─── Webhook dispatch rate-limit config ─────────────────────────────────────
+
+export interface WebhookRateLimitConfig {
+  /** Maximum delivery attempts allowed within the sliding window. */
+  limit: number;
+  /** Sliding-window duration in milliseconds. */
+  windowMs: number;
+  /**
+   * Token-bucket burst allowance.
+   * When > 0, up to `burst` consecutive outbound webhook attempts are
+   * allowed in zero time before the steady-state rate is enforced.
+   * When 0 (default) the limiter behaves as a flat sliding-window limit.
+   */
+  burst: number;
+}
+
+/**
+ * Default webhook dispatch rate-limit: 10 attempts per second, no burst.
+ */
+export const DEFAULT_WEBHOOK_RATE_LIMIT: WebhookRateLimitConfig = {
+  limit: 10,
+  windowMs: 1000,
+  burst: 0,
+};
+
+/**
+ * Parse webhook dispatch rate-limit config from environment variables.
+ */
+export function getWebhookRateLimitConfig(
+  env: Record<string, string | undefined>,
+): WebhookRateLimitConfig {
+  const limit =
+    parseInt(env.WEBHOOK_RETRY_RPS ?? '', 10) || DEFAULT_WEBHOOK_RATE_LIMIT.limit;
+  const windowMs = DEFAULT_WEBHOOK_RATE_LIMIT.windowMs;
+  const burst =
+    parseInt(env.WEBHOOK_RETRY_BURST ?? '', 10) || DEFAULT_WEBHOOK_RATE_LIMIT.burst;
+
+  return { limit, windowMs, burst };
 }

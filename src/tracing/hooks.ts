@@ -111,7 +111,6 @@ export interface TracerHooks {
   shutdown?(): Promise<void>;
 }
 
-
 /**
  * Configuration for the tracer.
  */
@@ -134,6 +133,9 @@ export interface TracerConfig {
 
   /** Custom hook handlers. */
   hooks?: TracerHooks;
+
+  /** Sampling strategy configuration. When omitted, all spans are kept (100% sampling). */
+  sampling?: SamplingConfig;
 }
 
 /**
@@ -193,6 +195,25 @@ export class Tracer {
       return this.createNoOpSpan(context);
     }
 
+    // Head-based sampling decision: skip span creation when sampled out.
+    if (this.config.sampling) {
+      const sampling = this.config.sampling;
+      if (sampling.strategy === 'never') {
+        return this.createNoOpSpan(context);
+      }
+      if (sampling.strategy === 'head') {
+        let rate = sampling.sampleRate;
+        const route = context.tags?.['route'] as string | undefined;
+        if (route && sampling.perRouteOverrides) {
+          const override = resolvePerRouteOverride(route, sampling.perRouteOverrides);
+          if (override !== undefined) rate = override;
+        }
+        if (!shouldSampleHead(context.traceId, rate)) {
+          return this.createNoOpSpan(context);
+        }
+      }
+    }
+
     const spanId = String(++this.spanIdCounter);
     const span: Span = {
       context: { ...context, spanId },
@@ -220,6 +241,11 @@ export class Tracer {
       return;
     }
 
+    // Span was sampled out at head or is a no-op — nothing to export.
+    if (!this.activeSpans.has(span.context.spanId)) {
+      return;
+    }
+
     span.endTimeMs = Date.now();
     span.durationMs = span.endTimeMs - span.startTimeMs;
     span.status = status;
@@ -228,6 +254,13 @@ export class Tracer {
     }
 
     this.activeSpans.delete(span.context.spanId);
+
+    // Tail-based sampling: drop non-error spans that fall below the sample rate.
+    if (this.config.sampling?.strategy === 'tail') {
+      if (!shouldSampleTail(span, this.config.sampling)) {
+        return;
+      }
+    }
 
     // Call hooks and OpenTelemetry
     this.safeCall(() => this.config.hooks?.onSpanEnd?.(span));
@@ -262,11 +295,7 @@ export class Tracer {
   /**
    * Record an error with correlation context.
    */
-  recordError(
-    correlationId: string,
-    error: Error,
-    context?: Record<string, unknown>
-  ): void {
+  recordError(correlationId: string, error: Error, context?: Record<string, unknown>): void {
     if (!this.config.enabled) {
       return;
     }
@@ -291,6 +320,21 @@ export class Tracer {
   /**
    * Flush pending spans (for graceful shutdown).
    */
+
+  /**
+   * Finalize a span that was never explicitly ended (e.g. abandoned at shutdown).
+   * Sets endTimeMs, durationMs, and marks status as 'error' with a diagnostic message
+   * so downstream exporters never receive raw pending spans.
+   */
+  private finalizeSpan(span: Span): void {
+    if (span.status === 'pending') {
+      span.endTimeMs = Date.now();
+      span.durationMs = span.endTimeMs - span.startTimeMs;
+      span.status = 'error';
+      span.statusMessage = 'flushed at shutdown: never explicitly ended';
+    }
+  }
+
   async flush(): Promise<void> {
     if (this.config.hooks) {
       if (typeof this.config.hooks.flush === 'function') {
@@ -298,6 +342,7 @@ export class Tracer {
       }
       if (typeof this.config.hooks.onSpanEnd === 'function') {
         for (const span of this.activeSpans.values()) {
+          this.finalizeSpan(span);
           await new Promise<void>((resolve) => {
             this.safeCall(() => {
               const result: void | Promise<void> = this.config.hooks!.onSpanEnd?.(span);
@@ -308,6 +353,7 @@ export class Tracer {
               }
             });
           });
+          this.activeSpans.delete(span.context.spanId);
         }
       }
     }
@@ -394,12 +440,14 @@ export class Tracer {
       // Tracer implementation errors never escape to application code
       // They're logged to stderr for debugging but don't break the request
       const message = err instanceof Error ? err.message : String(err);
-      console.error(JSON.stringify({
-        level: 'error',
-        timestamp: new Date().toISOString(),
-        message: `Tracer hook error: ${message}`,
-        ...(err instanceof Error && err.stack && { stack: err.stack }),
-      }));
+      console.error(
+        JSON.stringify({
+          level: 'error',
+          timestamp: new Date().toISOString(),
+          message: `Tracer hook error: ${message}`,
+          ...(err instanceof Error && err.stack && { stack: err.stack }),
+        })
+      );
     }
   }
 }
@@ -420,7 +468,7 @@ export async function traceSpan<T>(
   correlationId: string,
   tags: Record<string, unknown>,
   fn: (span: Span) => Promise<T>,
-  parentSpanId?: string,
+  parentSpanId?: string
 ): Promise<T> {
   const tracer = getTracer();
   const startContext: Omit<SpanContext, 'spanId'> = {
@@ -496,10 +544,15 @@ import { trace, context, SpanStatusCode } from '@opentelemetry/api';
 export async function traceDbQuery<T>(
   sql: string,
   dbName: string,
-  fn: () => Promise<T>,
+  fn: () => Promise<T>
 ): Promise<T> {
   const correlationId = getCorrelationIdFromContext();
-  return traceSpan('db.query', correlationId, { 'db.system': 'postgresql', 'db.name': dbName, 'db.statement': sql }, async () => fn());
+  return traceSpan(
+    'db.query',
+    correlationId,
+    { 'db.system': 'postgresql', 'db.name': dbName, 'db.statement': sql },
+    async () => fn()
+  );
 }
 
 /**
@@ -511,10 +564,15 @@ export async function traceDbQuery<T>(
 export async function traceRedisCommand<T>(
   command: string,
   key: string,
-  fn: () => Promise<T>,
+  fn: () => Promise<T>
 ): Promise<T> {
   const correlationId = getCorrelationIdFromContext();
-  return traceSpan('redis.command', correlationId, { 'db.system': 'redis', 'db.operation': command, 'db.redis.key': key }, async () => fn());
+  return traceSpan(
+    'redis.command',
+    correlationId,
+    { 'db.system': 'redis', 'db.operation': command, 'db.redis.key': key },
+    async () => fn()
+  );
 }
 
 /**
@@ -522,12 +580,14 @@ export async function traceRedisCommand<T>(
  *
  * @param operation — RPC method name (e.g. "getLatestLedger")
  */
-export async function traceStellarRpc<T>(
-  operation: string,
-  fn: () => Promise<T>,
-): Promise<T> {
+export async function traceStellarRpc<T>(operation: string, fn: () => Promise<T>): Promise<T> {
   const correlationId = getCorrelationIdFromContext();
-  return traceSpan('stellar.rpc', correlationId, { 'rpc.system': 'stellar', 'rpc.method': operation }, async () => fn());
+  return traceSpan(
+    'stellar.rpc',
+    correlationId,
+    { 'rpc.system': 'stellar', 'rpc.method': operation },
+    async () => fn()
+  );
 }
 
 /**
@@ -541,10 +601,15 @@ export async function traceWebhookDispatch<T>(
   event: string,
   url: string,
   attempt: number,
-  fn: () => Promise<T>,
+  fn: () => Promise<T>
 ): Promise<T> {
   const correlationId = getCorrelationIdFromContext();
-  return traceSpan('webhook.dispatch', correlationId, { 'webhook.event': event, 'webhook.url': url, 'webhook.retry': attempt }, async () => fn());
+  return traceSpan(
+    'webhook.dispatch',
+    correlationId,
+    { 'webhook.event': event, 'webhook.url': url, 'webhook.retry': attempt },
+    async () => fn()
+  );
 }
 
 /**
@@ -572,7 +637,7 @@ export function recordCircuitBreakerTransition(
   prevState: string,
   newState: string,
   failureCount: number,
-  failureKind?: string,
+  failureKind?: string
 ): void {
   const attributes: Record<string, unknown> = {
     'circuit_breaker.prev_state': prevState,
@@ -609,7 +674,11 @@ export function recordCircuitBreakerTransition(
 export function recordWsBroadcast(streamId: string, eventId: string, recipients: number): void {
   const activeSpan = trace.getActiveSpan();
   if (!activeSpan) return;
-  activeSpan.addEvent('ws.broadcast', { 'ws.stream_id': streamId, 'ws.event_id': eventId, 'ws.recipients': recipients });
+  activeSpan.addEvent('ws.broadcast', {
+    'ws.stream_id': streamId,
+    'ws.event_id': eventId,
+    'ws.recipients': recipients,
+  });
 }
 
 /**
@@ -637,7 +706,7 @@ export function enrichSpanWithStream(
   span: Span,
   streamId?: string,
   sender?: string,
-  recipient?: string,
+  recipient?: string
 ): void {
   if (!span) return;
   if (!span.context) {
@@ -683,7 +752,7 @@ export function enrichSpanWithStream(
 export function enrichActiveSpanWithStream(
   streamId?: string,
   sender?: string,
-  recipient?: string,
+  recipient?: string
 ): void {
   try {
     const activeSpan = trace.getActiveSpan();
@@ -696,7 +765,6 @@ export function enrichActiveSpanWithStream(
     // ignore active span errors
   }
 }
-
 
 // ── Sampling Strategies ───────────────────────────────────────────────────────
 //
@@ -867,17 +935,18 @@ export function shouldSampleTail(span: Span, config: TailSamplingConfig): boolea
  */
 export function resolvePerRouteOverride(
   route: string,
-  overrides: Record<string, number>,
+  overrides: Record<string, number>
 ): number | undefined {
   // 1. Exact match
   if (Object.prototype.hasOwnProperty.call(overrides, route)) {
     return overrides[route];
   }
 
-  // 2. Longest prefix match
+  // 2. Longest prefix match (segment-aware)
   let best: { key: string; rate: number } | undefined;
   for (const [key, rate] of Object.entries(overrides)) {
-    if (route.startsWith(key)) {
+    const isPrefix = key.endsWith('/') ? route.startsWith(key) : route.startsWith(`${key}/`);
+    if (isPrefix) {
       if (best === undefined || key.length > best.key.length) {
         best = { key, rate };
       }
@@ -1016,6 +1085,21 @@ export class BatchSpanExporter implements TracerHooks {
   /**
    * Flush all buffered spans in batches to the export handler.
    */
+
+  /**
+   * Finalize a span that was never explicitly ended (e.g. abandoned at shutdown).
+   * Sets endTimeMs, durationMs, and marks status as 'error' with a diagnostic message
+   * so downstream exporters never receive raw pending spans.
+   */
+  private finalizeSpan(span: Span): void {
+    if (span.status === 'pending') {
+      span.endTimeMs = Date.now();
+      span.durationMs = span.endTimeMs - span.startTimeMs;
+      span.status = 'error';
+      span.statusMessage = 'flushed at shutdown: never explicitly ended';
+    }
+  }
+
   async flush(): Promise<void> {
     this.clearTimer();
 
@@ -1104,7 +1188,7 @@ export class BatchSpanExporter implements TracerHooks {
           level: 'error',
           timestamp: new Date().toISOString(),
           message: `[BatchSpanExporter] ${msg}: ${err instanceof Error ? err.message : String(err)}`,
-        }),
+        })
       );
     }
   }
@@ -1113,8 +1197,6 @@ export class BatchSpanExporter implements TracerHooks {
 /**
  * Factory helper to create a BatchSpanExporter instance.
  */
-export function createBatchSpanExporter(
-  config: BatchSpanExporterConfig = {},
-): BatchSpanExporter {
+export function createBatchSpanExporter(config: BatchSpanExporterConfig = {}): BatchSpanExporter {
   return new BatchSpanExporter(config);
 }

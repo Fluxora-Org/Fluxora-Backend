@@ -9,7 +9,7 @@
  * so no delivery is silently lost.
  */
 
-import type { RateLimitConfig, WebhookRateLimiter } from '../redis/webhookRateLimit.js';
+import type { IWebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
 import type {
   CircuitBreakerPolicy,
   WebhookCircuitBreakerCheckResult,
@@ -264,7 +264,7 @@ export function validateRetryPolicy(policy: EnhancedRetryPolicy): string[] {
 }
 
 export interface WebhookDeliveryGateDeps {
-  rateLimiter?: WebhookRateLimiter;
+  rateLimiter?: IWebhookRateLimiter;
   circuitBreakerStore?: WebhookCircuitBreakerStore;
   rateLimitConfig?: RateLimitConfig;
 }

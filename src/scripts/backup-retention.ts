@@ -14,6 +14,11 @@
  *   - {@link listRestoreJobs}   – return all in-flight or completed jobs
  *   - {@link _resetRestoreJobs} – test-only helper to clear the job store
  *
+ * Exported utility functions (usable by tests and other modules):
+ *   - {@link calculateAgeInDays}  – age of a Date in days
+ *   - {@link classifyBackup}      – classify a backup by retention policy
+ *   - {@link filterRetainedObjects} – deduplicate retained backups per tier
+ *
  * Usage (CLI):
  *   npx ts-node src/scripts/backup-retention.ts [--dry-run] [--prefix <prefix>]
  *
@@ -28,7 +33,6 @@ import {
   ListObjectsV2Command,
   DeleteObjectsCommand,
   HeadBucketCommand,
-  GetObjectCommand,
   CopyObjectCommand,
 } from '@aws-sdk/client-s3';
 import { createId } from '@paralleldrive/cuid2';
@@ -167,20 +171,20 @@ export function _resetRestoreJobs(): void {
  * - Excessively long keys (>1 024 characters — S3 limit)
  *
  * @param backupId - Raw input from the HTTP request body.
- * @throws {Error} with a human-readable message when the key is unsafe.
+ * @throws {ValidationError} when the key is unsafe.
  */
 function validateBackupId(backupId: unknown): asserts backupId is string {
   if (typeof backupId !== 'string' || backupId.trim() === '') {
-    throw new Error('backupId must be a non-empty string.');
+    throw new ValidationError('backupId must be a non-empty string.');
   }
   if (backupId.startsWith('/')) {
-    throw new Error('backupId must not start with "/".');
+    throw new ValidationError('backupId must not start with "/".');
   }
   if (backupId.includes('..')) {
-    throw new Error('backupId must not contain path traversal sequences.');
+    throw new ValidationError('backupId must not contain path traversal sequences.');
   }
   if (backupId.length > 1024) {
-    throw new Error('backupId exceeds the maximum S3 key length of 1 024 characters.');
+    throw new ValidationError('backupId exceeds the maximum S3 key length of 1 024 characters.');
   }
 }
 
@@ -200,9 +204,6 @@ async function executeRestore(job: RestoreJob, bucket: string, region: string): 
   const client = new S3Client({ region });
 
   try {
-    // Verify the source object exists
-    await client.send(new GetObjectCommand({ Bucket: bucket, Key: job.backupId }));
-
     // Derive destination key:  restored/<env>/<ts>-<filename>
     const filename = job.backupId.split('/').at(-1) ?? job.backupId;
     const destKey = `restored/${job.targetEnvironment}/${job.queuedAt.replace(/[:.]/g, '-')}-${filename}`;
@@ -351,7 +352,7 @@ const DEFAULT_POLICY: RetentionPolicy = {
 /**
  * Calculates the age of an object in days.
  */
-function calculateAgeInDays(lastModified: Date): number {
+export function calculateAgeInDays(lastModified: Date): number {
   const now = new Date();
   const ageMs = now.getTime() - lastModified.getTime();
   return Math.floor(ageMs / (1000 * 60 * 60 * 24));
@@ -369,7 +370,7 @@ function calculateAgeInDays(lastModified: Date): number {
  * For weekly/monthly classification in the age ranges, we identify candidate
  * objects by checking if they're approximately one week or one month apart.
  */
-function classifyBackup(object: BackupObject, policy: RetentionPolicy): 'daily' | 'weekly' | 'monthly' | 'expired' {
+export function classifyBackup(object: BackupObject, policy: RetentionPolicy): 'daily' | 'weekly' | 'monthly' | 'expired' {
   const { ageInDays } = object;
 
   if (ageInDays <= policy.dailyDays) {
@@ -395,7 +396,7 @@ function classifyBackup(object: BackupObject, policy: RetentionPolicy): 'daily' 
  * For weekly (8-28 days): Groups by week, keeps the most recent of each week.
  * For monthly (29-365 days): Groups by month, keeps the most recent of each month.
  */
-function filterRetainedObjects(
+export function filterRetainedObjects(
   objects: BackupObject[],
   policy: RetentionPolicy,
 ): BackupObject[] {

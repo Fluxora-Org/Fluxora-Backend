@@ -1,6 +1,52 @@
 /**
- * Enhanced webhook delivery store with durable storage, outbox pattern, and dead-letter queue
- * In production, this would be backed by a database like PostgreSQL
+ * @module webhooks/store
+ *
+ * ## Two webhook storage subsystems — relationship and rationale
+ *
+ * This codebase contains **two distinct webhook-related storage paths**:
+ *
+ * ### 1. `WebhookDeliveryStore` (this file)
+ *
+ * Backs the *management/inspection HTTP routes* in `src/routes/webhooks.ts`:
+ * - `GET /internal/webhooks/deliveries` — delivery tracking records
+ * - `GET /internal/webhooks/outbox`     — outbound items queued via `/queue`
+ * - `GET /internal/webhooks/dlq`        — dead-letter queue for failed deliveries
+ * - `POST /internal/webhooks/queue`     — enqueue a new delivery for HTTP push
+ *
+ * The **default implementation** (`WebhookDeliveryStore`) is fully in-memory
+ * and is intentionally kept for **development / test environments** where
+ * zero infrastructure dependencies is more valuable than durability.
+ *
+ * In production, set `WEBHOOK_DELIVERY_STORE=postgres` to activate
+ * `PgWebhookDeliveryStore` (see `src/webhooks/pgStore.ts`), which persists
+ * outbox items and DLQ entries in Postgres so they survive restarts and are
+ * visible across all replicas.  A startup warning is emitted when the
+ * process boots with `NODE_ENV=production` and this flag is absent or set to
+ * `"memory"`.
+ *
+ * ### 2. `WebhookDispatcher` / `webhook_outbox` Postgres table
+ *
+ * Lives in `src/webhooks/service.ts` (`WebhookDispatcher` class) and is a
+ * completely separate subsystem.  It implements a transactional outbox pattern
+ * for **stream-event fanout**: when a stream event is written to Postgres, a
+ * corresponding row is inserted into `webhook_outbox` in the *same
+ * transaction*.  The dispatcher polls that table and pushes the events to
+ * registered consumer endpoints via HTTPS.
+ *
+ * This path is durable by design — it was the DB-backed outbox all along.
+ * `WebhookDeliveryStore` is *not* a replacement for it; it handles a
+ * different, higher-level concern (delivery status tracking and the operator
+ * DLQ/inspection surface).
+ *
+ * ### Summary
+ *
+ * | Path                   | Backed by               | Durable? | Purpose                          |
+ * |------------------------|-------------------------|----------|----------------------------------|
+ * | `WebhookDeliveryStore` | In-memory Maps (default)| ❌ / ✅*  | Mgmt routes: track, DLQ, queue   |
+ * | `PgWebhookDeliveryStore`| Postgres tables        | ✅        | Same, but durable across restarts|
+ * | `WebhookDispatcher`    | `webhook_outbox` table  | ✅        | Stream-event fanout via Postgres  |
+ *
+ * *Set `WEBHOOK_DELIVERY_STORE=postgres` to switch to the durable path.
  */
 
 import type { WebhookDelivery, WebhookDeliveryStatus, DLQReasonCode } from './types.js';
@@ -41,14 +87,68 @@ export interface OutboxItem {
   scheduledFor: number;
   attempts: number;
   maxAttempts: number;
-  status: OutboxItemStatus;
+  /** Defaults to `'pending'` when not provided to `addToOutbox`. */
+  status?: OutboxItemStatus;
   lockedAt?: number;
   lockedBy?: string;
 }
 
 export const DEFAULT_CLAIM_LOCK_TIMEOUT_MS = 30_000;
 
-export class WebhookDeliveryStore {
+// ─────────────────────────────────────────────────────────────────────────────
+// IWebhookDeliveryStore — shared interface implemented by both the in-memory
+// store (development) and the Postgres-backed store (production).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Contract for webhook delivery storage.  Both `WebhookDeliveryStore`
+ * (in-memory) and `PgWebhookDeliveryStore` (Postgres) implement this
+ * interface, allowing callers (service.ts, routes/webhooks.ts) to be
+ * storage-agnostic.
+ */
+export interface IWebhookDeliveryStore {
+  store(delivery: WebhookDelivery): void;
+  get(id: string): WebhookDelivery | undefined;
+  getByDeliveryId(deliveryId: string): WebhookDelivery | undefined;
+  updateStatus(id: string, status: WebhookDeliveryStatus): void;
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string;
+  getReadyOutboxItems(now?: number): OutboxItem[];
+  removeFromOutbox(id: string): boolean;
+  updateOutboxItemAttempt(id: string, attempts: number): void;
+  claimReadyOutboxItems(opts?: ClaimOptions): OutboxItem[];
+  reclaimStuckItems(opts?: ClaimOptions): OutboxItem[];
+  releaseOutboxItem(id: string, workerId: string): boolean;
+  markOutboxItemDelivered(id: string, workerId: string): boolean;
+  addToDeadLetterQueue(delivery: WebhookDelivery, failureReason: string, reasonCode?: DLQReasonCode): string;
+  getDeadLetterQueueItems(limit?: number): DeadLetterQueueItem[];
+  processDeadLetterQueueItem(id: string, processedAt?: number): boolean;
+  getPendingRetries(now?: number): WebhookDelivery[];
+  getByEventId(eventId: string): WebhookDelivery[];
+  registerDeliveryId(deliveryId: string): void;
+  isDuplicateDelivery(deliveryId: string): boolean;
+  getMetrics(): { totalDeliveries: number; successfulDeliveries: number; failedDeliveries: number; dlqItems: number; outboxItems: number };
+  cleanup(olderThanMs?: number): { cleaned: number; errors: string[] };
+  clear(): void;
+  getAll(): WebhookDelivery[];
+  getAllOutboxItems(): OutboxItem[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory implementation (development / test default)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * In-memory implementation of `IWebhookDeliveryStore`.
+ *
+ * Suitable for **development and testing** where infrastructure dependencies
+ * should be minimal.  All state is lost on process restart.
+ *
+ * **Do not use in production** — set `WEBHOOK_DELIVERY_STORE=postgres` to
+ * activate the durable Postgres-backed implementation instead.  A startup
+ * warning is logged automatically when this implementation is active in a
+ * production environment.
+ */
+export class WebhookDeliveryStore implements IWebhookDeliveryStore {
   // Main delivery storage
   private deliveries: Map<string, WebhookDelivery> = new Map();
   private deliveryIdIndex: Map<string, string> = new Map();
@@ -126,9 +226,9 @@ export class WebhookDeliveryStore {
   /**
    * Add item to outbox for reliable delivery
    */
-  addToOutbox(item: Omit<OutboxItem, 'id'>): string {
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string {
     const id = `outbox_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const outboxItem: OutboxItem = { status: 'pending', ...item, id };
+    const outboxItem: OutboxItem = { ...item, id, status: 'pending' };
 
     this.outbox.set(id, outboxItem);
 
@@ -149,6 +249,29 @@ export class WebhookDeliveryStore {
     });
 
     return id;
+  }
+
+  /**
+   * Hydrate a full outbox item (with pre-existing id and status) into the
+   * in-memory mirror.  Used by `PgWebhookDeliveryStore.hydrate()` to
+   * restore persisted rows on startup.
+   *
+   * This method intentionally accepts the complete `OutboxItem` including
+   * `id` and `status` — it is **not** a general-purpose enqueue and
+   * should only be called during hydration.
+   */
+  hydrateOutboxItem(item: OutboxItem): string {
+    this.outbox.set(item.id, item);
+
+    const priority = item.priority;
+    if (!this.outboxPriorityQueue.has(priority)) {
+      this.outboxPriorityQueue.set(priority, []);
+    }
+    this.outboxPriorityQueue.get(priority)!.push(item);
+
+    this.metrics.outboxItems++;
+
+    return item.id;
   }
 
   /**
@@ -220,7 +343,7 @@ export class WebhookDeliveryStore {
    *
    * @returns  The list of items successfully claimed by this worker.
    */
-  claimReadyOutboxItems(opts: ClaimOptions = {}): OutboxItem[] {
+  claimReadyOutboxItems(opts: ClaimOptions = { workerId: 'default-worker' }): OutboxItem[] {
     const workerId = opts.workerId ?? 'default-worker';
     const lockTimeoutMs = opts.lockTimeoutMs ?? DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
     const now = opts.now ?? Date.now();
@@ -262,7 +385,7 @@ export class WebhookDeliveryStore {
    * does (which also handles `pending` items), but is exposed as a
    * separate method for observability and targeted use cases.
    */
-  reclaimStuckItems(opts: ClaimOptions = {}): OutboxItem[] {
+  reclaimStuckItems(opts: ClaimOptions = { workerId: 'default-worker' }): OutboxItem[] {
     const workerId = opts.workerId ?? 'default-worker';
     const lockTimeoutMs = opts.lockTimeoutMs ?? DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
     const now = opts.now ?? Date.now();
@@ -530,5 +653,3 @@ export class WebhookDeliveryStore {
     return Array.from(this.outbox.values());
   }
 }
-
-export const webhookDeliveryStore = new WebhookDeliveryStore();

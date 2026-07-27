@@ -212,11 +212,13 @@ describe('reloadFlags', () => {
     expect(getFlags().size).toBe(0);
   });
 
-  it('falls back to empty map when JSON is not an array', async () => {
-    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify({ name: 'flag', percentage: 100 });
+  it('parses object-form flags (not-array JSON is valid)', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify({ percentage: 100, enabled: 50 });
     const { reloadFlags, getFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
-    expect(getFlags().size).toBe(0);
+    expect(getFlags().size).toBe(2);
+    expect(getFlags().get('percentage')?.percentage).toBe(100);
+    expect(getFlags().get('enabled')?.percentage).toBe(50);
   });
 
   it('skips flag entries with missing name', async () => {
@@ -239,6 +241,146 @@ describe('reloadFlags', () => {
     reloadFlags();
     expect(getFlags().has('bad_flag')).toBe(false);
     expect(getFlags().has('ok_flag')).toBe(true);
+  });
+
+  it('loads object-form flag definitions', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify({
+      object_flag: { percentage: 100, description: 'Object style' },
+      shorthand_flag: 100,
+    });
+    const { isEnabled, reloadFlags, getFlags } = await import('../../src/config/featureFlags.js');
+    reloadFlags();
+    expect(isEnabled('object_flag', 'user-1')).toBe(true);
+    expect(isEnabled('shorthand_flag', 'user-1')).toBe(true);
+    expect(getFlags().get('object_flag')?.description).toBe('Object style');
+  });
+});
+
+describe('parseFlagsJson', () => {
+  it('returns empty map for invalid JSON', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson('not valid json!!!');
+    expect(result.size).toBe(0);
+  });
+
+  it('parses a simple valid array and returns exact map contents', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'flag_a', percentage: 25, description: 'First flag' },
+      { name: 'flag_b', percentage: 75 },
+    ]));
+    expect(result.size).toBe(2);
+    expect(result.get('flag_a')).toEqual({
+      name: 'flag_a',
+      percentage: 25,
+      description: 'First flag',
+    });
+    expect(result.get('flag_b')).toEqual({
+      name: 'flag_b',
+      percentage: 75,
+    });
+  });
+
+  it('survives mixed valid/invalid entries and retains only the valid ones', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'valid_flag', percentage: 50 },
+      { percentage: 50 },
+      { name: '', percentage: 50 },
+      { name: '  ', percentage: 50 },
+      { name: 'negative_pct', percentage: -1 },
+      { name: 'over_100', percentage: 101 },
+      { name: 'null_pct', percentage: null },
+      { name: 'string_pct', percentage: '50' },
+      { name: 'nan_pct', percentage: NaN },
+      { name: 'valid_flag_2', percentage: 100 },
+    ]));
+    expect(result.size).toBe(2);
+    expect(result.has('valid_flag')).toBe(true);
+    expect(result.get('valid_flag')?.percentage).toBe(50);
+    expect(result.has('valid_flag_2')).toBe(true);
+    expect(result.get('valid_flag_2')?.percentage).toBe(100);
+  });
+
+  it('accepts boundary percentage 0 and 100 without skipping', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'boundary_0', percentage: 0 },
+      { name: 'boundary_100', percentage: 100 },
+      { name: 'subzero', percentage: -0.1 },
+      { name: 'over100', percentage: 100.1 },
+    ]));
+    expect(result.size).toBe(2);
+    expect(result.has('boundary_0')).toBe(true);
+    expect(result.get('boundary_0')?.percentage).toBe(0);
+    expect(result.has('boundary_100')).toBe(true);
+    expect(result.get('boundary_100')?.percentage).toBe(100);
+    expect(result.has('subzero')).toBe(false);
+    expect(result.has('over100')).toBe(false);
+  });
+
+  it('applies last-wins semantics for duplicate flag names', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'duplicate_flag', percentage: 10, description: 'First' },
+      { name: 'duplicate_flag', percentage: 90, description: 'Second' },
+      { name: 'duplicate_flag', percentage: 50 },
+    ]));
+    expect(result.size).toBe(1);
+    expect(result.has('duplicate_flag')).toBe(true);
+    expect(result.get('duplicate_flag')?.percentage).toBe(50);
+    expect(result.get('duplicate_flag')?.description).toBeUndefined();
+  });
+
+  it('omits non-string description values from parsed definitions', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'with_number_desc', percentage: 25, description: 123 },
+      { name: 'with_null_desc', percentage: 25, description: null },
+      { name: 'with_object_desc', percentage: 25, description: { text: 'desc' } },
+      { name: 'with_array_desc', percentage: 25, description: ['desc'] },
+      { name: 'with_string_desc', percentage: 25, description: 'valid' },
+      { name: 'no_desc', percentage: 25 },
+    ]));
+    expect(result.size).toBe(6);
+    expect(result.get('with_number_desc')?.description).toBeUndefined();
+    expect(result.get('with_null_desc')?.description).toBeUndefined();
+    expect(result.get('with_object_desc')?.description).toBeUndefined();
+    expect(result.get('with_array_desc')?.description).toBeUndefined();
+    expect(result.get('with_string_desc')?.description).toBe('valid');
+    expect(result.get('no_desc')?.description).toBeUndefined();
+  });
+
+  it('parses object-form flags with exact contents', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify({
+      flag_a: { percentage: 30, description: 'Object style' },
+      flag_b: 60,
+    }));
+    expect(result.size).toBe(2);
+    expect(result.get('flag_a')).toEqual({
+      name: 'flag_a',
+      percentage: 30,
+      description: 'Object style',
+    });
+    expect(result.get('flag_b')).toEqual({
+      name: 'flag_b',
+      percentage: 60,
+    });
+  });
+});
+
+describe('getRolloutBucket', () => {
+  it('returns a stable bucket for the same flag and requester', async () => {
+    const { getRolloutBucket } = await import('../../src/config/featureFlags.js');
+    expect(getRolloutBucket('streams_enhanced_response', 'key:abc')).toBe(
+      getRolloutBucket('streams_enhanced_response', 'key:abc'),
+    );
+  });
+
+  it('uses independent buckets per flag', async () => {
+    const { getRolloutBucket } = await import('../../src/config/featureFlags.js');
+    expect(getRolloutBucket('flag_a', 'key:abc')).not.toBe(getRolloutBucket('flag_b', 'key:abc'));
   });
 });
 

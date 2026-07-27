@@ -51,6 +51,11 @@ jobs:
       - name: SDK drift check (Python)
         run: node scripts/generate-sdk-python.mjs --check
 
+      # Drift check: fail CI if sdk/typescript/ diverges from openapi.yaml.
+      # Re-run `pnpm generate:sdk:ts` locally and commit the result to fix.
+      - name: SDK drift check (TypeScript)
+        run: node scripts/generate-sdk-ts.mjs --check
+
       # continue-on-error keeps this visible without blocking the pipeline while
       # a large pre-existing backlog (~467 failing tests / 59 files, unrelated
       # to CI restoration) gets triaged in a dedicated follow-up.
@@ -104,6 +109,42 @@ jobs:
       - name: Run security audit
         run: pnpm audit --audit-level=moderate
         continue-on-error: true
+
+  chaos:
+    name: Chaos tests (Toxiproxy)
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Start chaos stack
+        run: docker compose --profile chaos up -d --wait
+
+      - name: Run chaos tests
+        env:
+          CHAOS_ENABLED: "true"
+          TOXI_URL: "http://localhost:8474"
+          CHAOS_PG_PROXY_URL: "postgresql://chaos_user:chaos_password@localhost:5433/chaos_db"
+          CHAOS_REDIS_PROXY_URL: "redis://:chaos_password@localhost:6380"
+        run: pnpm test tests/incidents/toxiproxy.chaos.test.ts
+
+      - name: Tear down chaos stack
+        if: always()
+        run: docker compose --profile chaos down -v
 
   docker:
     name: Docker Build

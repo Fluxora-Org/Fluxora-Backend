@@ -117,285 +117,141 @@ export const wsMaxBufferedBytes =
   });
 
 /**
- * Number of clients whose bufferedAmount exceeds the warning threshold.
- * Useful for SLO alerts: "more than N slow clients" without scanning the
- * per-client series.
+ * Register a metric safely, reusing an existing registration if one exists.
+ * This is necessary because tests that use `vi.resetModules()` may re-import
+ * this module multiple times, which would otherwise throw "already registered".
  */
-export const wsSlowClients =
-  (registry.getSingleMetric('fluxora_ws_slow_clients') as Gauge) ||
-  new Gauge({
-    name: 'fluxora_ws_slow_clients',
-    help: 'Number of WebSocket clients whose buffered amount exceeds the slow-client threshold',
-    registers: [registry],
-  });
-
-// ── Micro-batching counters ────────────────────────────────────────────────────
+function metric<T>(name: string, factory: () => T): T {
+  const existing = registry.getSingleMetric(name);
+  if (existing) return existing as unknown as T;
+  return factory();
+}
 
 /**
- * Total number of micro-batch flush operations completed.
- *
- * Each flush emits a single `stream_update_batch` frame to a subscribed client
- * that has opted in via `batching: true` on their subscription.  Monotonically
- * increasing; reset to 0 only by process restart.
- *
- * Use `rate(fluxora_ws_batch_flush_total[1m])` to estimate flush throughput.
- * Divide `fluxora_ws_batch_events_coalesced_total` by this counter to get the
- * rolling average batch size.
+ * Histogram tracking the age of the oldest event in a batch when flushed.
+ * Buckets are tuned specifically for sub-second to low-second micro-batching windows.
  */
-export const wsBatchFlushTotal =
-  (registry.getSingleMetric('fluxora_ws_batch_flush_total') as Counter) ||
-  new Counter({
-    name: 'fluxora_ws_batch_flush_total',
-    help: 'Total number of micro-batch flush operations that emitted a stream_update_batch frame',
-    registers: [registry],
-  });
+export const wsBroadcastBatchFlushLatencySeconds = metric(
+  'fluxora_ws_broadcast_batch_flush_seconds',
+  () =>
+    new Histogram({
+      name: 'fluxora_ws_broadcast_batch_flush_seconds',
+      help: 'Latency (in seconds) from the oldest event enqueued to the moment the batch is flushed to WebSockets.',
+      buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
+    }),
+);
 
 /**
- * Total number of individual events coalesced across all batch flushes.
- *
- * An "event" is counted once per (streamId, eventId) before it enters a
- * batch accumulator.  Deduplication at the broadcast level prevents double-
- * counting when the same event is broadcast twice.
- *
- * `fluxora_ws_batch_events_coalesced_total / fluxora_ws_batch_flush_total`
- * gives the average batch fill ratio over any Prometheus range window.
+ * Helper to record batch flush latency in seconds.
  */
-export const wsBatchEventsCoalescedTotal =
-  (registry.getSingleMetric('fluxora_ws_batch_events_coalesced_total') as Counter) ||
-  new Counter({
-    name: 'fluxora_ws_batch_events_coalesced_total',
-    help: 'Total number of individual events coalesced into micro-batch frames',
-    registers: [registry],
-  });
+export function recordWsBroadcastBatchFlushLatency(durationSeconds: number): void {
+  if (durationSeconds >= 0) {
+    wsBroadcastBatchFlushLatencySeconds.observe(durationSeconds);
+  }
+}
 
-/**
- * Number of times an early flush was triggered by hitting `WS_BATCH_MAX_SIZE`
- * before the flush window (`WS_BATCH_FLUSH_MS`) expired.
- *
- * Frequent early ejections suggest the max-size limit is too low for the
- * current event throughput.  Consider increasing `WS_BATCH_MAX_SIZE` or
- * decreasing `WS_BATCH_FLUSH_MS`.
- */
-export const wsBatchSizeExceededTotal =
-  (registry.getSingleMetric('fluxora_ws_batch_size_exceeded_total') as Counter) ||
-  new Counter({
-    name: 'fluxora_ws_batch_size_exceeded_total',
-    help: 'Total number of micro-batch flushes triggered early by hitting WS_BATCH_MAX_SIZE',
-    registers: [registry],
-  });
 
-// ── Collection helpers ─────────────────────────────────────────────────────────
+export const wsSlowClients = metric(
+  'fluxora_ws_slow_clients',
+  () =>
+    new Gauge({
+      name: 'fluxora_ws_slow_clients',
+      help: 'Number of WebSocket clients whose bufferedAmount exceeds the slow threshold.',
+    }),
+);
 
-/**
- * Subscriber count for the top-N streams by fan-out size. Labelled by
- * `stream_id` so operators can identify which stream is driving the most
- * broadcast work.
- *
- * Cardinality guarantee: at most `DEFAULT_WS_STREAM_CARDINALITY_TOP_N`
- * (20) time-series at any point. The collector sorts streams by subscriber
- * count descending, keeps the top N, and explicitly removes stale series
- * for streams that drop below the N-th rank between collection cycles.
- *
- * `@security` The `stream_id` label is the opaque stream identifier
- * assigned by the application. It does not contain PII, client IPs, JWT
- * subjects, or any user-controlled data that could be used for
- * fingerprinting. The bounded cardinality prevents an attacker from
- * inflating Prometheus memory by creating many low-subscriber streams —
- * only the top 20 are ever exposed.
- */
-export const wsStreamSubscriberCount =
-  (registry.getSingleMetric('fluxora_ws_stream_subscriber_count') as Gauge<'stream_id'>) ||
-  new Gauge<'stream_id'>({
-    name: 'fluxora_ws_stream_subscriber_count',
-    help: 'Subscriber count for the top-N WebSocket streams by fan-out size. Capped to prevent unbounded cardinality.',
-    labelNames: ['stream_id'] as const,
-    registers: [registry],
-  });
+// ── Subscription cardinality gauge ────────────────────────────────────────
 
-/**
- * Tracks which stream_id labels are currently emitted so we can remove
- * stale series when a stream drops out of the top-N between collection
- * cycles. Module-scoped; reset by `resetWsBackpressureMetrics`.
- */
-let previousTopStreamIds = new Set<string>();
+export const wsStreamSubscriberCount = metric(
+  'fluxora_ws_stream_subscriber_count',
+  () =>
+    new Gauge({
+      name: 'fluxora_ws_stream_subscriber_count',
+      help: 'Number of subscribers per stream (top-N capped).',
+      labelNames: ['stream_id'],
+    }),
+);
 
-/**
- * Poll the hub for current `ws.bufferedAmount` values and update all four
- * gauges (per-client buffered, max buffered, slow clients, and top-N stream
- * subscriber counts). Safe to call concurrently — prom-client label writes
- * are atomic within a single call, and we only read `ws.bufferedAmount` which
- * is itself node:net state.
- *
- * The function is exported separately from `startWsBackpressureCollector` so
- * tests can drive it deterministically without dealing with `setInterval`
- * timing.
- */
+// ── Batch flush counters ──────────────────────────────────────────────────
+
+export const wsBatchFlushTotal = metric(
+  'fluxora_ws_batch_flush_total',
+  () =>
+    new Counter({
+      name: 'fluxora_ws_batch_flush_total',
+      help: 'Total number of batch flushes (one frame emitted per flush).',
+    }),
+);
+
+export const wsBatchEventsCoalescedTotal = metric(
+  'fluxora_ws_batch_events_coalesced_total',
+  () =>
+    new Counter({
+      name: 'fluxora_ws_batch_events_coalesced_total',
+      help: 'Total number of individual events coalesced across all batch flushes.',
+    }),
+);
+
+export const wsBatchSizeExceededTotal = metric(
+  'fluxora_ws_batch_size_exceeded_total',
+  () =>
+    new Counter({
+      name: 'fluxora_ws_batch_size_exceeded_total',
+      help: 'Number of batch flushes triggered early by hitting the max-size cap.',
+    }),
+);
+
+// ── Collection ────────────────────────────────────────────────────────────
+
 export function collectWsBackpressureMetrics(
-  hub: StreamHub,
+  hub: {
+    _getClients?: () => IterableIterator<[unknown, { id: string }]>;
+    _getStreamSubscriptions?: () => ReadonlyMap<string, Set<unknown>>;
+  },
   slowThresholdBytes: number = DEFAULT_WS_SLOW_CLIENT_BYTES,
   topN: number = DEFAULT_WS_STREAM_CARDINALITY_TOP_N,
 ): void {
-  let maxBuffered = 0;
-  let slowCount = 0;
+  const clientIterator = hub._getClients?.();
+  if (clientIterator) {
+    let max = 0;
+    let slowCount = 0;
 
-  for (const [ws, state] of hub._getClients()) {
-    if (ws.readyState !== ws.OPEN) continue;
+    for (const [ws, state] of clientIterator) {
+      const socket = ws as { readyState?: number; bufferedAmount?: number };
+      if (socket.readyState !== 1) continue;
 
-    const buffered = safeBufferedAmount(ws);
-    wsClientBufferedBytes.set({ connection_id: state.id }, buffered);
+      const ba = typeof socket.bufferedAmount === 'number' ? socket.bufferedAmount : 0;
+      wsClientBufferedBytes.set({ connection_id: state.id }, ba);
 
-    if (buffered > maxBuffered) maxBuffered = buffered;
-    if (buffered > slowThresholdBytes) slowCount++;
+      if (ba > max) max = ba;
+      if (ba > slowThresholdBytes) slowCount++;
+    }
+
+    wsMaxBufferedBytes.set(max);
+    wsSlowClients.set(slowCount);
   }
 
-  // Aggregates are already 0 when no live clients were iterated, so a single
-  // assignment is enough to keep dashboards honest when clients churn.
-  wsMaxBufferedBytes.set(maxBuffered);
-  wsSlowClients.set(slowCount);
+  const streamSubs = hub._getStreamSubscriptions?.();
+  if (streamSubs) {
+    const sorted = Array.from(streamSubs.entries())
+      .map(([id, set]) => [id, set.size] as const)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, topN);
 
-  // ── Top-N stream subscriber cardinality ───────────────────────────────────
-  collectStreamSubscriberCardinality(hub, topN);
-}
-
-/**
- * Compute the top-N streams by subscriber count and update the
- * `fluxora_ws_stream_subscriber_count` gauge. Stale series for streams that
- * dropped below the N-th rank are explicitly removed to keep label
- * cardinality bounded.
- *
- * Complexity: O(S log S) where S = number of active streams. With the default
- * cap of 20, at most 20 label writes + at most 20 label removals per cycle.
- */
-function collectStreamSubscriberCardinality(
-  hub: StreamHub,
-  topN: number,
-): void {
-  if (typeof (hub as { _getStreamSubscriptions?: unknown })._getStreamSubscriptions !== 'function') {
-    return;
-  }
-  const streamSubs = hub._getStreamSubscriptions();
-
-  // Build [streamId, subscriberCount] pairs and sort descending.
-  const entries: Array<[string, number]> = [];
-  for (const [streamId, subscribers] of streamSubs) {
-    entries.push([streamId, subscribers.size]);
-  }
-  entries.sort((a, b) => b[1] - a[1]);
-
-  const currentTop = entries.slice(0, topN);
-
-  // Remove stale series for streams that were in the previous top-N but are
-  // no longer in the current top-N.
-  const currentIds = new Set<string>();
-  for (const [streamId] of currentTop) {
-    currentIds.add(streamId);
-  }
-
-  for (const prevId of previousTopStreamIds) {
-    if (!currentIds.has(prevId)) {
-      wsStreamSubscriberCount.remove({ stream_id: prevId });
+    wsStreamSubscriberCount.reset();
+    for (const [id, count] of sorted) {
+      wsStreamSubscriberCount.set({ stream_id: id }, count);
     }
   }
-
-  // Set values for the current top-N.
-  for (const [streamId, count] of currentTop) {
-    wsStreamSubscriberCount.set({ stream_id: streamId }, count);
-  }
-
-  previousTopStreamIds = currentIds;
 }
 
-/**
- * Millisecond-scale bucket layout for micro-batch broadcast flush latency histogram.
- * Specifically chosen to resolve expected millisecond-scale flush windows (0.1ms to 5s).
- */
-export const WS_BROADCAST_BATCH_FLUSH_BUCKETS = [
-  0.0001, // 0.1ms
-  0.0005, // 0.5ms
-  0.001,  // 1ms
-  0.0025, // 2.5ms
-  0.005,  // 5ms
-  0.01,   // 10ms
-  0.025,  // 25ms
-  0.05,   // 50ms
-  0.1,    // 100ms
-  0.25,   // 250ms
-  0.5,    // 500ms
-  1.0,    // 1s
-  2.5,    // 2.5s
-  5.0,    // 5s
-];
-
-/**
- * Histogram recording the age in seconds of the oldest event included in a
- * micro-batched WebSocket broadcast flush.
- *
- * Operators use this histogram to observe actual queuing delay and tune the
- * flush-window default safely.
- *
- * Cardinality guarantee: O(1) fixed time-series with zero labels.
- * `@security` Contains no PII, user identifiers, payload data, or stream IDs.
- */
-export const wsBroadcastBatchFlushSeconds =
-  (registry.getSingleMetric('fluxora_ws_broadcast_batch_flush_seconds') as Histogram) ||
-  new Histogram({
-    name: 'fluxora_ws_broadcast_batch_flush_seconds',
-    help: 'Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush.',
-    buckets: WS_BROADCAST_BATCH_FLUSH_BUCKETS,
-    registers: [registry],
-  });
-
-/**
- * Record a batch flush latency observation (in seconds).
- * Called by StreamHub when a micro-batch is flushed.
- */
-export function recordWsBroadcastBatchFlushLatency(ageSeconds: number): void {
-  if (typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) && ageSeconds >= 0) {
-    wsBroadcastBatchFlushSeconds.observe(ageSeconds);
-  }
-}
-
-/**
- * Remove the per-client gauge time series for a disconnected client.
- *
- * Must be called from `StreamHub.onDisconnect` for every client so the
- * label set doesn't grow unbounded across long-lived processes.
- *
- * `prom-client@15` `Gauge.remove(...)` is a no-op when no series exists for
- * the given label combination, so it's safe to call defensively.  Total
- * `remove` calls scale linearly with `disconnect` rate, never with the
- * total number of historical connections — so the in-memory cost is
- * bounded by the current concurrency, not process uptime.
- */
 export function removeWsClientBackpressureGauge(connectionId: string): void {
   wsClientBufferedBytes.remove({ connection_id: connectionId });
 }
 
-/**
- * Reset all WS backpressure gauges to 0/empty and clear the subscription
- * cardinality tracking state. Useful between test runs.
- */
 export function resetWsBackpressureMetrics(): void {
   wsClientBufferedBytes.reset();
-  wsMaxBufferedBytes.set(0);
-  wsSlowClients.set(0);
-  wsBroadcastBatchFlushSeconds.reset();
+  wsMaxBufferedBytes.reset();
+  wsSlowClients.reset();
   wsStreamSubscriberCount.reset();
-  previousTopStreamIds = new Set();
-}
-
-// ── Internal helpers ───────────────────────────────────────────────────────────
-
-/**
- * Read `ws.bufferedAmount` defensively.
- *
- * The `ws` library types `bufferedAmount: number`, but in practice the
- * property may be momentarily undefined while a socket transitions state,
- * and tests routinely override it via `Object.defineProperty`.  Returning 0
- * in those edge cases keeps the collector crash-free; the `>= 0` clause also
- * masks the unlikely case of a negative value reported by a buggy library.
- */
-function safeBufferedAmount(ws: { bufferedAmount?: unknown }): number {
-  const value = ws.bufferedAmount;
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
 }

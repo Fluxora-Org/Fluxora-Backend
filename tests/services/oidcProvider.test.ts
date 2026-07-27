@@ -16,7 +16,9 @@ import {
   _resetOidcProviderForTest,
   stopReplayCacheSweepTimer,
   _replayCacheForTest,
+  preventReplay,
 } from '../../src/services/oidcProvider.js';
+import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
 
 // Helper to generate RSA Key pair
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
@@ -40,8 +42,12 @@ const jwk1 = {
 const mockClient: RedisClient = {
   get: vi.fn(),
   set: vi.fn(),
+  setNx: vi.fn(),
   exists: vi.fn(),
   close: vi.fn(),
+  del: vi.fn(),
+  multi: vi.fn() as any,
+  zcount: vi.fn(),
 };
 
 const mockFactory: RedisClientFactory = {
@@ -80,6 +86,7 @@ describe('OIDC Provider Service & Routes', () => {
     // Reset Redis mock implementation
     vi.mocked(mockClient.get).mockResolvedValue(null);
     vi.mocked(mockClient.set).mockResolvedValue(undefined);
+    vi.mocked(mockClient.setNx).mockResolvedValue(true);
     vi.mocked(mockClient.exists).mockResolvedValue(false);
   });
 
@@ -319,11 +326,48 @@ describe('OIDC Provider Service & Routes', () => {
       // First validation: should pass
       await expect(verifyIdToken(token)).resolves.toBeDefined();
 
-      // Mock Redis client exists check for second validation
+      // Mock Redis client check for second validation
       vi.mocked(mockClient.exists).mockResolvedValue(true);
+      vi.mocked(mockClient.setNx).mockResolvedValue(false);
 
       // Second validation: should throw replay error
       await expect(verifyIdToken(token)).rejects.toThrow('Token replay detected');
+    });
+
+    it('should prevent token replay under concurrent requests using FakeRedisClient', async () => {
+      const fakeRedis = new FakeRedisClient();
+      const fakeFactory: RedisClientFactory = {
+        createClient: async () => fakeRedis,
+      };
+      setRedisClientFactory(fakeFactory);
+      await _resetOidcProviderForTest();
+
+      const idToken = 'concurrent-test-token-12345';
+      const exp = Math.floor(Date.now() / 1000) + 300;
+
+      let successCount = 0;
+      let failureCount = 0;
+      await Promise.all([
+        preventReplay(idToken, exp)
+          .then(() => { successCount++; })
+          .catch((err) => {
+            failureCount++;
+            expect(err.message).toContain('Token replay detected');
+          }),
+        preventReplay(idToken, exp)
+          .then(() => { successCount++; })
+          .catch((err) => {
+            failureCount++;
+            expect(err.message).toContain('Token replay detected');
+          }),
+      ]);
+
+      expect(successCount).toBe(1);
+      expect(failureCount).toBe(1);
+
+      // Restore mockFactory for subsequent tests
+      setRedisClientFactory(mockFactory);
+      await _resetOidcProviderForTest();
     });
   });
 
@@ -373,6 +417,7 @@ describe('OIDC Provider Service & Routes', () => {
       await expect(verifyIdToken(token)).resolves.toBeDefined();
 
       vi.mocked(mockClient.exists).mockResolvedValue(true);
+      vi.mocked(mockClient.setNx).mockResolvedValue(false);
       await expect(verifyIdToken(token)).rejects.toThrow('Token replay detected');
     });
 
@@ -434,6 +479,7 @@ describe('OIDC Provider Service & Routes', () => {
       await expect(verifyIdToken(token3)).resolves.toBeDefined();
 
       vi.mocked(mockClient.exists).mockResolvedValue(true);
+      vi.mocked(mockClient.setNx).mockResolvedValue(false);
       await expect(verifyIdToken(token1)).rejects.toThrow('Token replay detected');
       await expect(verifyIdToken(token2)).rejects.toThrow('Token replay detected');
     });

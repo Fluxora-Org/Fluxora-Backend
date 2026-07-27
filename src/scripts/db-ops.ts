@@ -168,13 +168,16 @@ export async function backupDatabase(
   outputPath: string,
   s3Target?: S3Target,
 ): Promise<DbOperationResult> {
-  const urlCheck = validateDatabaseUrl(databaseUrl)
+  const normalizedDatabaseUrl = databaseUrl.trim()
+  const normalizedOutputPath = outputPath.trim()
+
+  const urlCheck = validateDatabaseUrl(normalizedDatabaseUrl)
   if (!urlCheck.valid) {
     return { success: false, message: urlCheck.reason! }
   }
 
   if (!s3Target) {
-    const pathCheck = validatePath(outputPath, 'Output')
+    const pathCheck = validatePath(normalizedOutputPath, 'Output')
     if (!pathCheck.valid) {
       return { success: false, message: pathCheck.reason! }
     }
@@ -184,7 +187,7 @@ export async function backupDatabase(
     if (s3Target) {
       // ── S3 streaming path ────────────────────────────────────────────────
       // Spawn pg_dump writing to stdout, pipe directly to S3 upload.
-      const args = ['--format=custom', '--no-password', databaseUrl]
+      const args = ['--format=custom', '--no-password', normalizedDatabaseUrl]
       const child = spawn('pg_dump', args, { stdio: ['ignore', 'pipe', 'pipe'] })
 
       const passThrough = new PassThrough()
@@ -223,15 +226,15 @@ export async function backupDatabase(
       const args = [
         '--format=custom',
         '--no-password',
-        `--file=${outputPath}`,
-        databaseUrl,
+        `--file=${normalizedOutputPath}`,
+        normalizedDatabaseUrl,
       ]
 
       await execFileAsync('pg_dump', args)
 
       return {
         success: true,
-        message: `Backup successfully written to ${outputPath}`,
+        message: `Backup successfully written to ${normalizedOutputPath}`,
       }
     }
   } catch (error: unknown) {
@@ -282,13 +285,16 @@ export async function restoreDatabase(
   inputPath: string,
   s3Source?: S3Target,
 ): Promise<DbOperationResult> {
-  const urlCheck = validateDatabaseUrl(databaseUrl)
+  const normalizedDatabaseUrl = databaseUrl.trim()
+  const normalizedInputPath = inputPath.trim()
+
+  const urlCheck = validateDatabaseUrl(normalizedDatabaseUrl)
   if (!urlCheck.valid) {
     return { success: false, message: urlCheck.reason! }
   }
 
   if (!s3Source) {
-    const pathCheck = validatePath(inputPath, 'Input')
+    const pathCheck = validatePath(normalizedInputPath, 'Input')
     if (!pathCheck.valid) {
       return { success: false, message: pathCheck.reason! }
     }
@@ -342,7 +348,7 @@ export async function restoreDatabase(
         '--clean',
         '--no-owner',
         '--no-password',
-        `--dbname=${databaseUrl}`,
+        `--dbname=${normalizedDatabaseUrl}`,
       ]
 
       const child = spawn('pg_restore', args, { stdio: ['pipe', 'pipe', 'pipe'] })
@@ -378,15 +384,15 @@ export async function restoreDatabase(
         '--clean',
         '--no-owner',
         '--no-password',
-        `--dbname=${databaseUrl}`,
-        inputPath,
+        `--dbname=${normalizedDatabaseUrl}`,
+        normalizedInputPath,
       ]
 
       await execFileAsync('pg_restore', args)
 
       return {
         success: true,
-        message: `Restore successfully completed from ${inputPath}`,
+        message: `Restore successfully completed from ${normalizedInputPath}`,
       }
     }
   } catch (error: unknown) {
@@ -435,10 +441,11 @@ export async function dropOldPartitions(
     const pName = row.partition_name;
     const pBound = row.partition_bound;
     
-    if (pBound === 'DEFAULT') continue;
+    if (!pBound || pBound === 'DEFAULT') continue;
     
     // Bounds typically look like: FOR VALUES FROM ('2023-01-01 00:00:00+00') TO ('2023-02-01 00:00:00+00')
-    const toMatch = pBound.match(/TO \\('([^']+)'\\)/);
+    // Note: literal parentheses in pg_get_expr output — no backslash escaping needed.
+    const toMatch = pBound.match(/TO \('([^']+)'\)/);
     if (toMatch && toMatch[1]) {
       const toDate = new Date(toMatch[1]);
       if (toDate < cutoffDate) {

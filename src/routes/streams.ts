@@ -67,6 +67,7 @@ import {
   tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
+import { canonicalizeBody } from '../middleware/idempotency.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
@@ -88,6 +89,7 @@ import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
+import { isValidStreamStatus } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { recordServerTimingPhase } from '../middleware/serverTiming.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
@@ -106,6 +108,10 @@ import {
   resolveSseConnectionLimits,
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
+import {
+  resolveLongPollConnectionLimits,
+  tryAcquireLongPollConnection,
+} from '../streams/longPoll.js';
 import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
 import {
   RedisIdempotencyStore,
@@ -180,6 +186,7 @@ type NormalizedCreateInput = {
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
 const NO_STORE_STREAM_HEADERS = 'private, no-store';
+const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
@@ -254,6 +261,28 @@ function toApiStream(record: StreamRecord): Stream {
   };
 }
 
+/**
+ * Resolve a stable rollout identity for feature flag bucketing.
+ *
+ * @security API-key authenticated requests prefer the server-side key id. When
+ * that is not available, raw X-API-Key header material is used only as input to
+ * the feature flag hash and is never logged or included in responses.
+ */
+export function getFeatureFlagRequesterId(req: Request): string {
+  const keyId = (req as Request & { keyId?: unknown }).keyId;
+  if (typeof keyId === 'string' && keyId.trim() !== '') {
+    return `key:${keyId}`;
+  }
+
+  const rawApiKey = req.headers['x-api-key'];
+  const apiKey = Array.isArray(rawApiKey) ? rawApiKey[0] : rawApiKey;
+  if (typeof apiKey === 'string' && apiKey.trim() !== '') {
+    return `api-key:${apiKey.trim()}`;
+  }
+
+  return `ip:${req.ip ?? 'anonymous'}`;
+}
+
 type StreamResourceMetadata = {
   id: string;
   updated_at: string;
@@ -307,11 +336,12 @@ function encodeCursor(lastId: string): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-function decodeCursor(cursor: string): StreamsCursor {
+function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
-  } catch {
+  } catch (err) {
+    warn('Cursor decode failed', { error: err instanceof Error ? err.message : String(err), requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
   if (
@@ -321,6 +351,7 @@ function decodeCursor(cursor: string): StreamsCursor {
     typeof (parsed as { lastId?: unknown }).lastId !== 'string' ||
     (parsed as { lastId: string }).lastId.trim() === ''
   ) {
+    warn('Cursor payload invalid', { parsed, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
   return parsed as StreamsCursor;
@@ -328,32 +359,13 @@ function decodeCursor(cursor: string): StreamsCursor {
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
 
-function parseLimit(limitParam: unknown): number {
-  if (limitParam === undefined) return 50;
-  if (Array.isArray(limitParam) || typeof limitParam !== 'string' || !/^\d+$/.test(limitParam)) {
-    throw validationError('limit must be an integer between 1 and 100');
-  }
-  const n = Number.parseInt(limitParam, 10);
-  if (n < 1 || n > 100) throw validationError('limit must be an integer between 1 and 100');
-  return n;
-}
-
-function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
+function parseCursor(cursorParam: unknown, requestId?: string): StreamsCursor | undefined {
   if (cursorParam === undefined) return undefined;
   if (Array.isArray(cursorParam) || typeof cursorParam !== 'string' || cursorParam.trim() === '') {
+    warn('Cursor shape invalid (not a string)', { cursorParam, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
-  return decodeCursor(cursorParam);
-}
-
-function parseIncludeTotal(includeTotalParam: unknown): boolean {
-  if (includeTotalParam === undefined) return false;
-  if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
-    throw validationError('include_total must be true or false');
-  }
-  if (includeTotalParam === 'true') return true;
-  if (includeTotalParam === 'false') return false;
-  throw validationError('include_total must be true or false');
+  return decodeCursor(cursorParam, requestId);
 }
 
 // ── Body normaliser ───────────────────────────────────────────────────────────
@@ -364,14 +376,15 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   if (!parseResult.success) {
     const formatted = formatZodIssues(parseResult.issues);
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       formatted[0]?.message ?? 'Validation failed',
-      400,
       formatted.map((e) => e.message).join('; '),
     );
   }
 
-  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = parseResult.data;
+  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } =
+    parseResult.data as NormalizedCreateInput;
 
   const amountValidation = validateAmountFields(
     { depositAmount, ratePerSecond } as Record<string, unknown>,
@@ -379,16 +392,16 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   );
   if (!amountValidation.valid) {
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       'Invalid decimal string format for amount fields',
-      400,
       { errors: amountValidation.errors.map((e) => ({ field: e.field, code: e.code, message: e.message })) },
     );
   }
 
   const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && compareDecimalStringToZero(validatedDeposit) <= 0) {
+  if (compareDecimalStringToZero(validatedDeposit) <= 0) {
     throw validationError('depositAmount must be greater than zero');
   }
 
@@ -485,6 +498,7 @@ streamsRouter.get(
   '/',
   authenticateApiKey,
   requireScope('streams:read'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = req.correlationId as string | undefined;
 
@@ -492,16 +506,18 @@ streamsRouter.get(
     const parsed = PaginationSchema.safeParse(req.query);
     if (!parsed.success) {
       const first = parsed.error.issues[0];
+      warn('Stream list pagination validation failed', { error: first?.message, requestId });
       throw validationError(first?.message ?? 'Invalid query parameters');
     }
     const { limit, cursor: rawCursor, status: statusFilter, sender: senderFilter,
             recipient: recipientFilter, include_total } = parsed.data;
 
-    const cursor       = rawCursor !== undefined ? parseCursor(rawCursor) : undefined;
+    const cursor       = rawCursor !== undefined ? parseCursor(rawCursor, requestId) : undefined;
     const includeTotal = include_total === 'true';
 
     if (streamListingDependency.state !== 'healthy') {
       warn('Stream listing dependency unavailable', { dependency: 'stream-list-view', requestId });
+      res.setHeader('Retry-After', '30');
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
@@ -519,6 +535,19 @@ streamsRouter.get(
       if (statusFilter !== undefined) filter.status = statusFilter as NonNullable<StreamFilter['status']>;
       if (senderFilter !== undefined) filter.sender_address = senderFilter;
       if (recipientFilter !== undefined) filter.recipient_address = recipientFilter;
+      
+      if (req.callerAddress) {
+        if (!senderFilter && !recipientFilter) {
+          throw forbidden('Scoped users must filter by sender or recipient matching their address');
+        }
+        if (senderFilter && senderFilter !== req.callerAddress) {
+          throw forbidden('You are not authorized to query streams for this sender');
+        }
+        if (recipientFilter && recipientFilter !== req.callerAddress) {
+          throw forbidden('You are not authorized to query streams for this recipient');
+        }
+      }
+
       const dbResult = await streamRepository.findWithCursor(
         filter,
         limit,
@@ -576,13 +605,8 @@ streamsRouter.get(
     if (includeTotal && result!.total !== undefined) response.total = result!.total;
 
     // Feature flag: streams_enhanced_response — add _meta field for opted-in requesters.
-    // The requester is identified by API key or IP; falls back to 'anonymous'.
-    // This is a zero-risk opt-in: if the flag is not configured, enhanced stays false.
-    const requesterId: string =
-      (req as unknown as Record<string, unknown>)['apiKey'] as string
-        ?? req.ip
-        ?? 'anonymous';
-    if (isFlagEnabled('streams_enhanced_response', requesterId)) {
+    const requesterId = getFeatureFlagRequesterId(req);
+    if (isFlagEnabled(STREAMS_ENHANCED_RESPONSE_FLAG, requesterId)) {
       response._meta = { enhanced: true };
     }
 
@@ -595,12 +619,13 @@ streamsRouter.get(
     );
 
     const serializeStart = process.hrtime.bigint();
-    try {
-      res.json(successResponse(response, requestId));
-    } finally {
-      const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
-      recordServerTimingPhase(res, 'serialize', durationMs);
-    }
+    const responseEnvelope = successResponse(response, requestId);
+    const serialized = JSON.stringify(responseEnvelope);
+    const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
+    recordServerTimingPhase(res, 'serialize', durationMs);
+
+    res.type('application/json');
+    res.send(serialized);
   }),
 );
 
@@ -613,104 +638,27 @@ streamsRouter.get(
   '/export',
   authenticateApiKey,
   requireScope('streams:read'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
-    const resumeFrom = req.query.resume_from as string | undefined;
-    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const requestId = req.correlationId as string | undefined;
+    
+    let resumeFrom = req.query.resume_from;
+    if (Array.isArray(resumeFrom) || (resumeFrom !== undefined && typeof resumeFrom !== 'string')) {
+      warn('Export pagination validation failed', { error: 'resume_from must be a string', requestId });
+      throw validationError('resume_from must be a single valid opaque pagination token');
+    }
+    
+    let cursor = resumeFrom ? parseCursor(resumeFrom, requestId) : undefined;
     const limit = 100;
 
     res.setHeader('Content-Type', 'application/x-ndjson');
     res.setHeader('Cache-Control', 'no-store');
 
     try {
-      while (true) {
-        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
-        
-        for (const record of dbResult.streams) {
-          res.write(JSON.stringify(toApiStream(record)) + '\n');
-        }
-
-        if (dbResult.streams.length > 0) {
-          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
-          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
-        }
-
-        if (!dbResult.hasMore) {
-          res.end();
-          break;
-        }
+      if (req.callerAddress) {
+        throw forbidden('Scoped users are not authorized to use the full export endpoint');
       }
-      info('Stream export completed', { requestId });
-    } catch (err) {
-      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
-      wrapDbError(err);
-    }
-  }),
-);
 
-/**
- * GET /api/streams/export
- * Export streams in NDJSON format.
- * Includes a resumption cursor in the final line if interrupted.
- */
-streamsRouter.get(
-  '/export',
-  authenticateApiKey,
-  requireScope('streams:read'),
-  asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
-    const resumeFrom = req.query.resume_from as string | undefined;
-    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
-    const limit = 100;
-
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.setHeader('Cache-Control', 'no-store');
-
-    try {
-      while (true) {
-        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
-        
-        for (const record of dbResult.streams) {
-          res.write(JSON.stringify(toApiStream(record)) + '\n');
-        }
-
-        if (dbResult.streams.length > 0) {
-          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
-          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
-        }
-
-        if (!dbResult.hasMore) {
-          res.end();
-          break;
-        }
-      }
-      info('Stream export completed', { requestId });
-    } catch (err) {
-      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
-      wrapDbError(err);
-    }
-  }),
-);
-
-/**
- * GET /api/streams/export
- * Export streams in NDJSON format.
- * Includes a resumption cursor in the final line if interrupted.
- */
-streamsRouter.get(
-  '/export',
-  authenticateApiKey,
-  requireScope('streams:read'),
-  asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
-    const resumeFrom = req.query.resume_from as string | undefined;
-    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
-    const limit = 100;
-
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.setHeader('Cache-Control', 'no-store');
-
-    try {
       while (true) {
         const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
         
@@ -826,7 +774,22 @@ streamsRouter.get(
 
 /**
  * GET /api/streams/:id/export.jsonld
- * Export a single stream as JSON-LD for data portability.
+ *
+ * Export a single stream as a JSON-LD document for data portability.
+ *
+ * The response body is a raw JSON-LD object (not wrapped in the standard
+ * `successResponse` envelope) so that linked-data processors can consume it
+ * directly without unwrapping.
+ *
+ * Headers
+ * ───────
+ * - Content-Type: application/ld+json
+ * - ETag / Last-Modified: identical to GET /:id for cache validators
+ * - Cache-Control: public,max-age=300 for terminal streams; private,no-store otherwise
+ * - Link: <https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"
+ *
+ * Authentication: API key + streams:read scope (same as GET /:id).
+ * Rate limiting: inherits the global rate-limiter applied to all /api/* routes.
  */
 streamsRouter.get(
   '/:id/export.jsonld',
@@ -834,13 +797,15 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
+
     if (!id) {
       throw notFound('Stream', '');
     }
-    debug('Exporting stream as JSON-LD', { id });
 
-    let record;
+    debug('Exporting stream as JSON-LD', { id, requestId });
+
+    let record: StreamRecord | undefined | null;
     try {
       record = await streamRepository.getById(id);
     } catch (err) {
@@ -849,16 +814,39 @@ streamsRouter.get(
 
     if (!record) throw notFound('Stream', id);
 
-    const jsonld = toStreamJsonLd(record!);
-    setStreamResourceHeaders(res, record!);
+    // Conditional GET — reuse the same ETag fingerprint as GET /:id so that
+    // clients which already validated the plain-JSON representation can skip
+    // re-fetching the JSON-LD document unconditionally.
+    const etag = streamEntityTag(record);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
+    const jsonLdDoc = toStreamJsonLd(record);
+
+    setStreamResourceHeaders(res, record);
     res.set(
       'Cache-Control',
-      isTerminalStatus(record!.status as ApiStreamStatus)
+      isTerminalStatus(record.status as ApiStreamStatus)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
+    // Advertise the context document per the JSON-LD HTTP spec (§4.1).
+    res.set(
+      'Link',
+      '<https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    );
     res.type('application/ld+json');
-    res.send(JSON.stringify(jsonld));
+    res.send(JSON.stringify(jsonLdDoc));
   }),
 );
 
@@ -922,9 +910,9 @@ streamsRouter.post(
           action: 'conflict',
         });
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           'Idempotency-Key has already been used for a different request payload',
-          409,
           { hint: 'Use a new Idempotency-Key or retry with the original request body' },
         );
       }
@@ -986,7 +974,9 @@ streamsRouter.post(
       recipient:     normalizedInput.recipient,
     });
 
-    streamsCreatedTotal.inc({ status: stream.status });
+    if (isValidStreamStatus(stream.status)) {
+      streamsCreatedTotal.inc({ status: stream.status });
+    }
 
     // Issue a read-your-writes fence pin.  The client must echo this token in
     // the X-Fluxora-Write-Fence request header on its next GET /api/streams
@@ -1038,7 +1028,7 @@ streamsRouter.delete(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
       });
@@ -1049,9 +1039,9 @@ streamsRouter.delete(
     } catch (err) {
       if (err instanceof StatusConflictError) {
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           err.message,
-          409,
           {
             streamId: id,
             currentStatus: record!.status,
@@ -1104,7 +1094,7 @@ streamsRouter.patch(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, newStatus as ApiStreamStatus);
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
         requestedStatus: newStatus,
@@ -1118,9 +1108,9 @@ streamsRouter.patch(
     } catch (err) {
       if (err instanceof StatusConflictError) {
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           err.message,
-          409,
           {
             streamId: id,
             currentStatus: record!.status,
@@ -1186,7 +1176,8 @@ streamsRouter.get(
     // 2. Reserve bounded SSE capacity before repository work or header flush.
     const clientIp = getClientIp(req);
     const sseLimits = resolveSseConnectionLimits();
-    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits, apiKey);
 
     if (!connectionAttempt.ok) {
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
@@ -1534,10 +1525,11 @@ streamsRouter.get(
       return;
     }
 
-    // 2. Reserve connection capacity from sseConnectionLimiter
+    // 2. Reserve connection capacity from longPollConnectionLimiter
     const clientIp = getClientIp(req);
-    const sseLimits = resolveSseConnectionLimits();
-    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits);
+    const longPollLimits = resolveLongPollConnectionLimits();
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireLongPollConnection(clientIp, longPollLimits, apiKey);
 
     if (!connectionAttempt.ok) {
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
@@ -1548,18 +1540,18 @@ streamsRouter.get(
         reason: connectionAttempt.reason,
         activeConnections: connectionAttempt.activeConnections,
         activeConnectionsForIp: connectionAttempt.activeConnectionsForIp,
-        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
-        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        maxConnectionsPerIp: longPollLimits.maxConnectionsPerIp,
+        maxGlobalConnections: longPollLimits.maxGlobalConnections,
       });
       throw tooManyRequests(connectionAttempt.message, {
         reason: connectionAttempt.reason,
-        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
-        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        maxConnectionsPerIp: longPollLimits.maxConnectionsPerIp,
+        maxGlobalConnections: longPollLimits.maxGlobalConnections,
         retryAfterSeconds: connectionAttempt.retryAfterSeconds,
       });
     }
 
-    const sseConnection = connectionAttempt.connection;
+    const longPollConnection = connectionAttempt.connection;
     let cleanedUp = false;
     let unsubscribeLiveUpdates: (() => void) | undefined;
     let pollTimer: NodeJS.Timeout | undefined;
@@ -1584,13 +1576,13 @@ streamsRouter.get(
         unsubscribeLiveUpdates = undefined;
       }
 
-      sseConnection.release();
+      longPollConnection.release();
       debug('Long-poll connection cleaned up', {
         id,
         requestId,
-        ip: sseConnection.ip,
+        ip: longPollConnection.ip,
         reason,
-        durationMs: Date.now() - sseConnection.acceptedAt,
+        durationMs: Date.now() - longPollConnection.acceptedAt,
       });
     }
 
@@ -1602,7 +1594,7 @@ streamsRouter.get(
       warn('Long-poll response error', {
         id,
         requestId,
-        ip: sseConnection.ip,
+        ip: longPollConnection.ip,
         error: err.message,
       });
       cleanup('response_error');
@@ -1658,9 +1650,9 @@ streamsRouter.get(
       }
       timeoutMs = parsedTimeout > 1000 ? parsedTimeout : parsedTimeout * 1000;
     }
-    // Bound timeout by max hold duration & sseLimits
+    // Bound timeout by max hold duration & longPollLimits
     const MAX_LONG_POLL_HOLD_MS = 30_000;
-    timeoutMs = Math.min(timeoutMs, MAX_LONG_POLL_HOLD_MS, sseLimits.maxConnectionDurationMs);
+    timeoutMs = Math.min(timeoutMs, MAX_LONG_POLL_HOLD_MS, longPollLimits.maxConnectionDurationMs);
 
     // 5. Check historical replay if `since` was supplied
     if (sinceEventId) {

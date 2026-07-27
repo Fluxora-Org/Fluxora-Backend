@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
 import { createRateLimiter, extractClientIdentifier, isAdminKey } from '../../src/middleware/rateLimiter.js';
+import { getClientIp } from '../../src/ws/connectionLimiter.js';
 import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
+import * as overrideService from '../../src/services/tenantRateLimitOverride.service.js';
 
 function mockRequest(props: Partial<Request> = {}): Request & { ip?: string } {
   return {
@@ -80,6 +82,44 @@ describe('extractClientIdentifier', () => {
     const req = mockRequest({ headers: { 'x-api-key': '' } });
     const result = extractClientIdentifier(req);
     expect(result.identifierType).toBe('ip');
+  });
+});
+
+describe('extractClientIdentifier() IP extraction is consistent with getClientIp()', () => {
+  const headerMatrix: { description: string; headers: Record<string, string>; remoteAddress: string }[] = [
+    { description: 'direct IPv4', headers: {}, remoteAddress: '192.168.1.1' },
+    { description: 'direct IPv6', headers: {}, remoteAddress: '::1' },
+    { description: 'single proxy IPv4', headers: { 'x-forwarded-for': '10.0.0.1' }, remoteAddress: '127.0.0.1' },
+    { description: 'multi-hop proxy', headers: { 'x-forwarded-for': '10.0.0.1, 10.0.0.2' }, remoteAddress: '127.0.0.1' },
+    { description: 'socket only', headers: {}, remoteAddress: '203.0.113.5' },
+  ];
+
+  for (const { description, headers, remoteAddress } of headerMatrix) {
+    it(`produces identical IP for: ${description}`, () => {
+      const req = { headers, socket: { remoteAddress } } as unknown as Request;
+      const { identifier, identifierType } = extractClientIdentifier(req);
+      const directIp = getClientIp(req);
+      expect(identifierType).toBe('ip');
+      expect(identifier).toBe(directIp);
+    });
+  }
+
+  it('apiKey path bypasses IP extraction entirely', () => {
+    const req = { headers: { 'x-api-key': 'test-key-123' }, socket: { remoteAddress: '192.168.1.1' } } as unknown as Request;
+    const { identifier, identifierType } = extractClientIdentifier(req);
+    expect(identifierType).toBe('apiKey');
+    expect(identifier).toBe('test-key-123');
+  });
+
+  it('common no-proxy case produces same result as the old inline extraction', () => {
+    // Regression: the previous implementation used:
+    //   (req as Request & { ip?: string }).ip ?? req.socket.remoteAddress ?? 'unknown'
+    // The new implementation delegates to getClientIp() which checks the same
+    // socket.remoteAddress when no proxy header matches.
+    const req = { headers: {}, socket: { remoteAddress: '10.0.0.1' }, ip: undefined } as unknown as Request & { ip?: string };
+    const result = extractClientIdentifier(req);
+    expect(result.identifierType).toBe('ip');
+    expect(result.identifier).toBe('10.0.0.1');
   });
 });
 
@@ -310,6 +350,115 @@ describe('rate limiter middleware', () => {
     const result = extractClientIdentifier(req);
     expect(result.identifierType).toBe('ip');
     expect(result.identifier).toBe('unknown');
+  });
+});
+
+describe('rate limiter middleware — per-tenant override resolution', () => {
+  let env: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    env = {
+      RATE_LIMIT_ENABLED: 'true',
+      RATE_LIMIT_IP_MAX: '3',
+      RATE_LIMIT_IP_WINDOW_MS: '60000',
+      RATE_LIMIT_APIKEY_MAX: '5',
+      RATE_LIMIT_APIKEY_WINDOW_MS: '60000',
+    };
+  });
+
+  it('uses override limit when override exists and request is authenticated', async () => {
+    vi.spyOn(overrideService, 'getOverride').mockResolvedValue({
+      id: 'override-1',
+      keyId: 'key-1',
+      maxRequests: 5000,
+      windowMs: 60000,
+      expiresAt: null,
+      createdBy: 'admin:test',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    (req as any).keyId = 'key-1';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5000');
+  });
+
+  it('uses global default when no override exists', async () => {
+    vi.spyOn(overrideService, 'getOverride').mockResolvedValue(null);
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    (req as any).keyId = 'key-1';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5');
+  });
+
+  it('uses global default when override lookup fails', async () => {
+    vi.spyOn(overrideService, 'getOverride').mockRejectedValue(new Error('DB error'));
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    (req as any).keyId = 'key-1';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5');
+  });
+
+  it('does not apply override for unauthenticated requests (no keyId)', async () => {
+    const getOverrideSpy = vi.spyOn(overrideService, 'getOverride');
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'test-key' } });
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '5');
+    expect(getOverrideSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not apply override for admin API keys', async () => {
+    env.ADMIN_API_KEY = 'admin-key';
+    env.RATE_LIMIT_ADMIN_MAX = '20';
+    vi.spyOn(overrideService, 'getOverride').mockResolvedValue({
+      id: 'override-1',
+      keyId: 'admin-key-id',
+      maxRequests: 5000,
+      windowMs: 60000,
+      expiresAt: null,
+      createdBy: 'admin:test',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: { 'x-api-key': 'admin-key' } });
+    (req as any).keyId = 'admin-key-id';
+    const res = mockResponse();
+    const next = mockNext();
+
+    await invoke(limiter, req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '20');
   });
 });
 

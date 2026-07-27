@@ -53,12 +53,35 @@ import {
   setIdempotencyDependencyState,
   fingerprintInput,
   enforceStreamScope,
+  getFeatureFlagRequesterId,
 } from '../../src/routes/streams.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
+import type { Request } from 'express';
 
 // Initialize config before importing anything that needs it
 initializeConfig();
+
+describe('getFeatureFlagRequesterId', () => {
+  it('prefers authenticated API key id over header and IP', () => {
+    const req = {
+      keyId: 'key-record-1',
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('key:key-record-1');
+  });
+
+  it('falls back to raw API key header before IP', () => {
+    const req = {
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('api-key:raw-key');
+  });
+});
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -66,6 +89,7 @@ const VALID_SENDER    = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN
 const VALID_RECIPIENT = 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR';
 
 const TEST_TOKEN = generateToken({ address: VALID_SENDER, role: 'operator' });
+const SCOPED_TOKEN = generateToken({ address: VALID_SENDER, role: 'user' });
 
 const app = createApp();
 
@@ -142,7 +166,7 @@ describe('streams routes', () => {
 
   describe('GET /api/streams', () => {
     it('returns an empty list when no streams exist', async () => {
-      const res = await request(app).get('/api/streams');
+      const res = await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.data.streams).toEqual([]);
@@ -151,7 +175,7 @@ describe('streams routes', () => {
 
     it('returns mapped streams from the repository', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [makeDbRecord()], hasMore: false });
-      const res = await request(app).get('/api/streams');
+      const res = await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.data.streams).toHaveLength(1);
       const s = res.body.data.streams[0];
@@ -162,7 +186,7 @@ describe('streams routes', () => {
 
     it('includes next_cursor when hasMore=true', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [makeDbRecord({ id: 'stream-abc-0' })], hasMore: true });
-      const res = await request(app).get('/api/streams?limit=1');
+      const res = await request(app).get('/api/streams?limit=1').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.data.next_cursor).toBeDefined();
       expect(res.body.data.has_more).toBe(true);
@@ -170,7 +194,7 @@ describe('streams routes', () => {
 
     it('includes total when include_total=true', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false, total: 42 });
-      const res = await request(app).get('/api/streams?include_total=true');
+      const res = await request(app).get('/api/streams?include_total=true').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.data.total).toBe(42);
     });
@@ -193,26 +217,68 @@ describe('streams routes', () => {
       expect((await request(app).get('/api/streams?include_total=maybe')).status).toBe(400);
     });
 
-    it('returns 503 when listing dependency is unavailable', async () => {
+    it('returns 503 and sets Retry-After when listing dependency is unavailable', async () => {
       setStreamListingDependencyState('unavailable');
-      const res = await request(app).get('/api/streams');
+      const res = await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(503);
       expect(res.body.success).toBe(false);
+      expect(res.headers['retry-after']).toBe('30');
     });
 
     it('returns 503 when pool is exhausted', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockFindWithCursor.mockRejectedValue(new PoolExhaustedError());
-      expect((await request(app).get('/api/streams')).status).toBe(503);
+      expect((await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`)).status).toBe(503);
     });
 
     it('passes afterId to repository from a valid cursor', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
       const cursor = Buffer.from(JSON.stringify({ v: 1, lastId: 'stream-abc-0' })).toString('base64url');
-      await request(app).get(`/api/streams?cursor=${cursor}`);
+      await request(app).get(`/api/streams?cursor=${cursor}`).set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(mockFindWithCursor).toHaveBeenCalledWith(
         expect.anything(), expect.any(Number), 'stream-abc-0', expect.any(Boolean),
       );
+    });
+
+    describe('scoped user authorization', () => {
+      it('rejects when no filter is provided', async () => {
+        const res = await request(app)
+          .get('/api/streams')
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(403);
+        expect(res.body.error.message).toMatch(/must filter by sender or recipient/);
+      });
+
+      it('rejects when filtering by someone else', async () => {
+        const res = await request(app)
+          .get(`/api/streams?sender=${VALID_RECIPIENT}`)
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(403);
+      });
+
+      it('allows when filtering by own address', async () => {
+        mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
+        const res = await request(app)
+          .get(`/api/streams?sender=${VALID_SENDER}`)
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(200);
+      });
+    });
+
+    describe('GET /api/streams/export', () => {
+      it('rejects arrays for resume_from', async () => {
+        const res = await request(app)
+          .get('/api/streams/export?resume_from=a&resume_from=b')
+          .set('Authorization', `Bearer ${TEST_TOKEN}`);
+        expect(res.status).toBe(400);
+      });
+
+      it('rejects scoped users from using full export', async () => {
+        const res = await request(app)
+          .get('/api/streams/export')
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(403);
+      });
     });
   });
 
@@ -697,6 +763,13 @@ describe('streams routes', () => {
     it('rejects non-positive depositAmount', async () => {
       const res = await post({ ...validBody, depositAmount: '0' }, uniqueKey());
       expect(res.status).toBe(400);
+    });
+
+    it('rejects omitted depositAmount (same as explicit zero)', async () => {
+      const { depositAmount: _, ...bodyWithoutDeposit } = validBody;
+      const res = await post(bodyWithoutDeposit, uniqueKey());
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
     });
 
     it('rejects numeric depositAmount (must be string)', async () => {

@@ -248,13 +248,18 @@ export class PostgresContractEventStore implements ContractEventStore {
       return `(${basePlaceholders.join(', ')})`;
     });
 
+    // The contract_events table is range-partitioned by happened_at.
+    // The PRIMARY KEY is (happened_at, event_id), so the ON CONFLICT target
+    // must include both columns. Using just (event_id) would fail with
+    // "there is no unique or exclusion constraint matching the ON CONFLICT
+    // specification" on a partitioned table.
     const sql = `
       INSERT INTO ${this.tableName} (
         event_id, ledger, contract_id, topic, tx_hash,
         tx_index, operation_index, event_index, payload, happened_at, ledger_hash, ingested_at
       )
       VALUES ${placeholders.join(', ')}
-      ON CONFLICT (event_id) DO NOTHING
+      ON CONFLICT (happened_at, event_id) DO NOTHING
       RETURNING event_id
     `;
 

@@ -145,6 +145,21 @@ describe('backupDatabase', () => {
     expect(result.success).toBe(true)
   })
 
+  it('trims surrounding whitespace from DATABASE_URL and outputPath before invoking pg_dump', async () => {
+    mockExecFileSuccess()
+
+    const result = await backupDatabase(`  ${VALID_URL}  `, `  ${LOCAL_PATH}  `)
+
+    expect(result.success).toBe(true)
+
+    const mock = childProcess.execFile as unknown as MockInstance
+    expect(mock).toHaveBeenCalledOnce()
+
+    const [, args] = mock.mock.calls[0] as [string, string[]]
+    expect(args).toContain(VALID_URL)
+    expect(args).toContain(`--file=${LOCAL_PATH}`)
+  })
+
   it('fails when outputPath is empty in local mode', async () => {
     const result = await backupDatabase(VALID_URL, '')
     expect(result.success).toBe(false)
@@ -253,6 +268,82 @@ describe('backupDatabase', () => {
     expect(result.message).toBe('Backup failed')
     expect(result.error).toContain('S3 upload failed')
   })
+
+  it('resolves AWS region according to priority hierarchy (target.region > AWS_REGION > AWS_DEFAULT_REGION > us-east-1)', async () => {
+    const { S3Client } = await import('@aws-sdk/client-s3') as { S3Client: MockInstance }
+
+    const originalRegion = process.env.AWS_REGION
+    const originalDefaultRegion = process.env.AWS_DEFAULT_REGION
+
+    try {
+      // 1. Explicit target region takes top priority
+      process.env.AWS_REGION = 'eu-west-1'
+      process.env.AWS_DEFAULT_REGION = 'ap-southeast-1'
+
+      const fakeChild1 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild1)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1', region: 'ca-central-1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'ca-central-1' })
+
+      // 2. AWS_REGION env var takes second priority when target region is omitted
+      const fakeChild2 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild2)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'eu-west-1' })
+
+      // 3. AWS_DEFAULT_REGION env var takes third priority
+      delete process.env.AWS_REGION
+      const fakeChild3 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild3)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'ap-southeast-1' })
+
+      // 4. Default fallback is 'us-east-1'
+      delete process.env.AWS_DEFAULT_REGION
+      const fakeChild4 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild4)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'us-east-1' })
+    } finally {
+      process.env.AWS_REGION = originalRegion
+      process.env.AWS_DEFAULT_REGION = originalDefaultRegion
+    }
+  })
+
+  it('handles child process error event (e.g. pg_dump ENOENT)', async () => {
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const stdin = new PassThrough()
+    stdout.end()
+
+    const fakeChild: Record<string, unknown> = {
+      stdout,
+      stderr,
+      stdin,
+      on: vi.fn((event: string, cb: (err: Error) => void) => {
+        if (event === 'error') {
+          Promise.resolve().then(() => {
+            cb(new Error('spawn pg_dump ENOENT'))
+          })
+        }
+        return fakeChild
+      }),
+    }
+    ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild)
+
+    const result = await backupDatabase(VALID_URL, '', {
+      bucket: 'my-backups',
+      key: 'fluxora/enoent.dump',
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.message).toBe('Backup failed')
+    expect(result.error).toContain('spawn pg_dump ENOENT')
+  })
 })
 
 // ── restoreDatabase ───────────────────────────────────────────────────────────
@@ -313,6 +404,21 @@ describe('restoreDatabase', () => {
     expect(args).toContain('--no-owner')
     // URL passed via --dbname=<url>, never as a bare shell string
     expect(args.some((a: string) => a.startsWith('--dbname='))).toBe(true)
+    expect(args).toContain(LOCAL_PATH)
+  })
+
+  it('trims surrounding whitespace from DATABASE_URL and inputPath before invoking pg_restore', async () => {
+    mockExecFileSuccess()
+
+    const result = await restoreDatabase(`  ${VALID_URL}  `, `  ${LOCAL_PATH}  `)
+
+    expect(result.success).toBe(true)
+
+    const mock = childProcess.execFile as unknown as MockInstance
+    expect(mock).toHaveBeenCalledOnce()
+
+    const [, args] = mock.mock.calls[0] as [string, string[]]
+    expect(args).toContain(`--dbname=${VALID_URL}`)
     expect(args).toContain(LOCAL_PATH)
   })
 
@@ -477,5 +583,40 @@ describe('dropOldPartitions', () => {
     // The first query gets the partitions, but DROP TABLE is never called
     expect(fakePool.query).toHaveBeenCalledTimes(1);
     expect(fakePool.query).toHaveBeenCalledWith(expect.stringContaining('SELECT'), ['contract_events']);
+  })
+
+  it('defaults dryRun to true when omitted', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_old', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    // Call without dryRun argument
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30);
+    
+    expect(result.droppedPartitions).toContain('contract_events_old');
+    expect(result.message).toContain('[DRY RUN]');
+    expect(fakePool.query).toHaveBeenCalledTimes(1);
+  })
+
+  it('handles null or missing partition_bound values gracefully without throwing', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_null', partition_bound: null },
+          { partition_name: 'contract_events_empty', partition_bound: '' },
+          { partition_name: 'contract_events_old', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, true);
+    
+    expect(result.droppedPartitions).toContain('contract_events_old');
+    expect(result.droppedPartitions).not.toContain('contract_events_null');
+    expect(result.droppedPartitions).not.toContain('contract_events_empty');
   })
 })

@@ -4,6 +4,7 @@ import { registry } from '../metrics.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { syncWebhookMetrics } from '../metrics/businessMetrics.js';
 import { webhookDeliveryStore } from '../webhooks/store.js';
+import { warn } from '../utils/logger.js';
 
 export const metricsRouter = express.Router();
 
@@ -23,14 +24,15 @@ export const metricsRouter = express.Router();
  * include: Authorization: Bearer <ADMIN_API_KEY>
  */
 metricsRouter.get('/', requireAdminAuth, async (_req: Request, res: Response) => {
-  try {
-    // Sync webhook metrics from store
-    syncWebhookMetrics(webhookDeliveryStore);
+   try {
+     // Sync webhook metrics from store
+     syncWebhookMetrics(webhookDeliveryStore);
 
-    res.set('Content-Type', registry.contentType);
-    const metrics = await registry.metrics();
-    res.send(metrics);
-  } catch {
-    res.status(500).send('Failed to generate metrics');
-  }
-});
+     res.set('Content-Type', registry.contentType);
+     const metrics = await registry.metrics();
+     res.send(metrics);
+   } catch (err) {
+     warn('Failed to generate metrics', err instanceof Error ? err.message : String(err));
+     res.status(500).send('Failed to generate metrics');
+   }
+ });

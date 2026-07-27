@@ -6,18 +6,21 @@
  * this route (enforce at the gateway / auth middleware layer).
  *
  * Query parameters:
- *   @param limit  - Number of entries to return. Must be 1–100. Defaults to 20.
- *                   Returns 400 if set to 0, negative, or greater than 100.
- *   @param offset - Zero-based offset into the audit log. Must be >= 0. Defaults to 0.
- *                   Returns 400 if negative.
+ *   @param limit      - Number of entries to return. Must be 1–100. Defaults to 20.
+ *                       Returns 400 if out of range.
+ *   @param offset     - Zero-based offset into the audit log. Must be >= 0. Defaults to 0.
+ *                       Returns 400 if negative.
+ *   @param actor      - Filter by actor. Matches against `entry.meta.actor` or `entry.actor`.
+ *   @param actionType - Filter by action type (e.g. STREAM_CREATED, PAUSE_FLAGS_UPDATED).
+ *   @param dateFrom   - ISO-8601 timestamp. Only include entries at or after this time.
+ *   @param dateTo     - ISO-8601 timestamp. Only include entries at or before this time.
  *
  * Response shape:
  *   { success: true, data: { entries: AuditEntry[], total: number }, meta: ResponseMeta }
  *
  * Failure modes:
  *   - No entries yet → 200 with empty array (not 404).
- *   - limit=0 → 400 VALIDATION_ERROR
- *   - limit > 100 → 400 VALIDATION_ERROR
+ *   - limit out of range → 400 VALIDATION_ERROR
  *   - offset < 0 → 400 VALIDATION_ERROR
  *
  * Security notes:
@@ -26,12 +29,14 @@
  *     This prevents accidental exposure of credentials in audit records.
  */
 
+import { z } from 'zod';
 import { Router } from 'express';
 import { getAuditEntries, type AuditEntry } from '../lib/auditLog.js';
 import { successResponse } from '../utils/response.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { ApiError } from '../errors.js';
 import { ApiErrorCode } from '../middleware/errorHandler.js';
+import { OffsetPaginationSchema, MAX_PAGE_LIMIT, DEFAULT_PAGE_LIMIT } from '../validation/paginationSchema.js';
 
 export const auditRouter = Router();
 
@@ -60,28 +65,51 @@ function sanitizeEntry(entry: AuditEntry): AuditEntry {
   return { ...entry, meta: redactRestricted(entry.meta) as Record<string, unknown> };
 }
 
+/** Extended schema that adds filter params on top of offset pagination. */
+const AuditQuerySchema = OffsetPaginationSchema.extend({
+  actor: z.string().optional(),
+  actionType: z.string().optional(),
+  dateFrom: z.string().optional(),
+  dateTo: z.string().optional(),
+});
+
 auditRouter.get('/', authenticate, requireAuth, requirePermission(Permission.AUDIT_READ), (req, res, next) => {
   try {
     const requestId = req.correlationId;
 
-    // ── Pagination parameter validation ──────────────────────────────────────
-    const rawLimit = req.query['limit'];
-    const rawOffset = req.query['offset'];
-
-    const limitNum = rawLimit === undefined ? 20 : Number(rawLimit);
-    const offsetNum = rawOffset === undefined ? 0 : Number(rawOffset);
-
-    if (!Number.isFinite(limitNum) || !Number.isInteger(limitNum) || limitNum < 1 || limitNum > 100) {
-      throw new ApiError(400, ApiErrorCode.VALIDATION_ERROR, 'limit must be an integer between 1 and 100', true);
-    }
-    if (!Number.isFinite(offsetNum) || !Number.isInteger(offsetNum) || offsetNum < 0) {
-      throw new ApiError(400, ApiErrorCode.VALIDATION_ERROR, 'offset must be a non-negative integer', true);
+    const parsed = AuditQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      const firstIssue = parsed.error.issues[0];
+      throw new ApiError(400, ApiErrorCode.VALIDATION_ERROR, firstIssue?.message ?? 'Invalid query parameters', true);
     }
 
-    const allEntries = getAuditEntries();
-    const page = allEntries.slice(offsetNum, offsetNum + limitNum).map(sanitizeEntry);
+    const { limit, offset, actor, actionType, dateFrom, dateTo } = parsed.data;
+    const limitNum = limit ?? DEFAULT_PAGE_LIMIT;
+    const offsetNum = offset ?? 0;
 
-    res.json(successResponse({ entries: page, total: allEntries.length }, requestId));
+    let filteredEntries = getAuditEntries();
+
+    if (actor !== undefined) {
+      filteredEntries = filteredEntries.filter(
+        (e) => e.meta?.actor === actor || (e as AuditEntry & { actor?: string }).actor === actor,
+      );
+    }
+
+    if (actionType !== undefined) {
+      filteredEntries = filteredEntries.filter((e) => e.action === actionType);
+    }
+
+    if (dateFrom !== undefined) {
+      filteredEntries = filteredEntries.filter((e) => e.timestamp >= dateFrom);
+    }
+
+    if (dateTo !== undefined) {
+      filteredEntries = filteredEntries.filter((e) => e.timestamp <= dateTo);
+    }
+
+    const page = filteredEntries.slice(offsetNum, offsetNum + limitNum).map(sanitizeEntry);
+
+    res.json(successResponse({ entries: page, total: filteredEntries.length }, requestId));
   } catch (err) {
     next(err);
   }

@@ -73,6 +73,7 @@ Authentication is evaluated first; unauthenticated or invalid-token requests ret
 | Environment variable | Default | Description |
 | --- | ---: | --- |
 | `SSE_MAX_CONNECTIONS_PER_IP` | `10` | Maximum active SSE connections accepted from a single client IP. |
+| `SSE_MAX_CONNECTIONS_PER_API_KEY` | `50` | Maximum active SSE connections accepted for a single API key (`x-api-key` header). Enforced independently of the per-IP and global caps. |
 | `SSE_MAX_GLOBAL_CONNECTIONS` | `1000` | Maximum active SSE connections accepted process-wide. |
 | `SSE_MAX_CONNECTION_DURATION_MS` | `1800000` | Maximum lifetime of one SSE response before the server closes it. Defaults to 30 minutes. Valid range: 1 ms to 24 hours. |
 | `SSE_RETRY_AFTER_SECONDS` | `15` | Value sent in the `Retry-After` header when the endpoint rejects a connection with `429`. Valid range: 1 second to 24 hours. |
@@ -110,7 +111,7 @@ When `SSE_MAX_CONNECTION_DURATION_MS` is reached, the server writes a final `eve
 The endpoint exports these Prometheus metrics through the existing registry:
 
 * `fluxora_sse_active_connections` — gauge of active SSE responses in the current process.
-* `fluxora_sse_connections_rejected_total{reason="per_ip_limit|global_limit"}` — counter of rejected SSE connection attempts.
+* `fluxora_sse_connections_rejected_total{reason="per_ip_limit|per_key_limit|global_limit"}` — counter of rejected SSE connection attempts.
 
 ### Live fan-out efficiency
 

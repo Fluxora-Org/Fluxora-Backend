@@ -5,6 +5,7 @@ import {
   sseLiveSubscribersGauge,
   sseEventListenersGauge,
   sseSubscriberErrorsTotal,
+  sseBackpressureDropsTotal,
 } from '../metrics/businessMetrics.js';
 import { logger } from '../lib/logger.js';
 
@@ -32,9 +33,25 @@ export const SSE_CLOSE_REASONS = {
   MAX_DURATION: 'max_duration',
   /** The server is shutting down and instructing clients to stop reconnecting. */
   SERVER_SHUTDOWN: 'server_shutdown',
+  /** The connection's per-connection buffer exceeded the backpressure cap. */
+  BACKPRESSURE: 'backpressure',
 } as const;
 
 export type SseCloseReason = (typeof SSE_CLOSE_REASONS)[keyof typeof SSE_CLOSE_REASONS];
+
+/**
+ * Maximum number of events buffered per SSE connection before backpressure drop.
+ *
+ * When a slow consumer's buffer exceeds this threshold, the connection is
+ * severed with a `backpressure` close reason to prevent unbounded memory
+ * growth (DoS vector). Clients should reconnect with exponential backoff.
+ *
+ * Default: 1000 events. Override via `SSE_MAX_BUFFERED_EVENTS` env var.
+ */
+export const SSE_MAX_BUFFERED_EVENTS = parseInt(
+  process.env.SSE_MAX_BUFFERED_EVENTS || '1000',
+  10,
+);
 
 // Central EventEmitter to handle SSE broadcast subscriptions locally.
 export const sseEventBus = new EventEmitter();
@@ -82,7 +99,7 @@ function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
       const error = err instanceof Error ? err : new Error(String(err));
 
       // Security: do not log SSE payload. Only log streamId + error identity.
-      logger.error('SSE subscriber callback threw', {
+      logger.error('SSE subscriber callback threw', event.correlationId, {
         streamId: event.streamId,
         subscriberError: {
           name: error.name,
@@ -100,14 +117,14 @@ function isDispatchAttached(): boolean {
 function ensureDispatchAttached(): void {
   if (!isDispatchAttached()) {
     sseEventBus.on(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
-    sseEventListenersGauge.set(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT));
+    sseEventListenersGauge.set(Math.max(0, sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)));
   }
 }
 
 function detachDispatchIfIdle(): void {
   if (totalLiveSubscriberCount() === 0) {
     sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
-    sseEventListenersGauge.set(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT));
+    sseEventListenersGauge.set(Math.max(0, sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)));
   }
 }
 
@@ -130,8 +147,8 @@ export function subscribeToSseStream(
   }
 
   subscribers.add(subscriber);
-  ensureDispatchAttached();
-  sseLiveSubscribersGauge.set(totalLiveSubscriberCount());
+   ensureDispatchAttached();
+   sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
 
   let unsubscribed = false;
   return () => {
@@ -146,8 +163,74 @@ export function subscribeToSseStream(
       liveSubscribersByStreamId.delete(streamId);
     }
     detachDispatchIfIdle();
-    sseLiveSubscribersGauge.set(totalLiveSubscriberCount());
+  sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
   };
+}
+
+/**
+ * Options for backpressure-aware SSE subscription.
+ */
+export interface SseBackpressureOptions {
+  /** Maximum buffered events before dropping the connection. Default: SSE_MAX_BUFFERED_EVENTS. */
+  maxBufferedEvents?: number;
+  /** Callback invoked when backpressure triggers a disconnect. Use to send close event and end response. */
+  onBackpressureDrop?: (reason: SseCloseReason) => void;
+}
+
+/**
+ * Register a live SSE subscriber with per-connection backpressure protection.
+ *
+ * Wraps the subscriber callback with a buffer counter. When the buffer exceeds
+ * `maxBufferedEvents`, the connection is dropped via `onBackpressureDrop` callback
+ * and the `sseBackpressureDropsTotal` metric is incremented.
+ *
+ * This prevents unbounded memory growth when a slow consumer cannot drain events
+ * fast enough (DoS vector).
+ *
+ * @param streamId - Stream ID to subscribe to
+ * @param subscriber - Original subscriber callback
+ * @param options - Backpressure configuration
+ * @returns Unsubscribe function
+ */
+export function subscribeToSseStreamWithBackpressure(
+  streamId: string,
+  subscriber: SseStreamSubscriber,
+  options: SseBackpressureOptions = {},
+): () => void {
+  const maxBuffered = options.maxBufferedEvents ?? SSE_MAX_BUFFERED_EVENTS;
+  let bufferedCount = 0;
+  let dropped = false;
+
+  const wrappedSubscriber = (event: LiveSseStreamUpdateEvent) => {
+    if (dropped) return;
+
+    bufferedCount++;
+
+    if (bufferedCount > maxBuffered) {
+      dropped = true;
+      sseBackpressureDropsTotal.inc();
+
+      logger.warn('SSE connection dropped due to backpressure', undefined, {
+        streamId,
+        bufferedCount,
+        maxBuffered,
+      });
+
+      options.onBackpressureDrop?.(SSE_CLOSE_REASONS.BACKPRESSURE);
+      return;
+    }
+
+    try {
+      subscriber(event);
+      bufferedCount--;  // Only decrement on successful delivery
+    } catch (err) {
+      // Don't decrement - event is still buffered (not drained by slow consumer)
+      // Re-throw so upstream error handling (sseSubscriberErrorsTotal) works
+      throw err;
+    }
+  };
+
+  return subscribeToSseStream(streamId, wrappedSubscriber);
 }
 
 export function getLiveSseSubscriberCount(streamId?: string): number {

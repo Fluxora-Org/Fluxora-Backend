@@ -285,79 +285,94 @@ interface PurgeJobOptions {
 
 ---
 
-## GDPR Right-to-Erasure Endpoint (issue #730)
+## GDPR Right-to-Erasure Endpoint (Issue #910)
 
-The service implements a GDPR Article 17 (right to erasure) endpoint that
-scrubs PII columns for a data subject identified by their Stellar recipient
-address.
+The service implements a GDPR Article 17 (Right to Erasure / Right to be Forgotten) endpoint that permanently scrubs encrypted PII columns for a data subject identified by their Stellar recipient address while fully preserving financial integrity and transaction history.
 
-### Endpoint
+### Endpoint Overview
 
-```
+```http
 DELETE /api/privacy/erasure/:recipientAddress
-Authorization: Bearer <ADMIN_API_KEY>
+Authorization: Bearer <TOKEN>
 ```
 
-### What is erased
+### Authorization Requirements
 
-| Column | Action |
+Access to the GDPR erasure endpoint is strictly restricted. Reusing `src/middleware/adminAuth.ts`, the endpoint enforces role-based authorization:
+
+- **Allowed Roles**: `admin`, `data-protection-officer`
+- **Forbidden Roles**: `operator`, `viewer`, `user`, or anonymous callers (rejected with `401 Unauthorized` or `403 Forbidden`).
+
+### GDPR Erasure Process
+
+1. **Input Validation**: The `recipientAddress` parameter is validated to ensure it is a non-empty string under 256 characters.
+2. **Authentication & Authorization**: The caller's credentials and role claims are verified via `requireAdminAuth`.
+3. **Database Transaction**: Operations run inside an explicit database transaction (`BEGIN` ... `COMMIT`).
+4. **PII Redaction**: PII columns are permanently overwritten with tombstone values and hash lookup columns are set to `NULL`.
+5. **Legal Hold Check**: Rows with `legal_hold = TRUE` are safely skipped.
+6. **Audit Entry Written**: An immutable audit log entry is persisted within the transaction without storing the erased PII.
+7. **Transaction Commit**: If all steps succeed, the transaction is committed; on any error, a `ROLLBACK` is performed automatically.
+
+### Tombstone Strategy
+
+Encrypted PII columns are overwritten with a static, machine-readable tombstone string:
+
+`[REDACTED_GDPR_ERASURE]`
+
+| Column | Redaction Action |
 |---|---|
-| `sender_address` | Replaced with `[REDACTED:GDPR-17]` tombstone |
-| `recipient_address` | Replaced with `[REDACTED:GDPR-17]` tombstone |
-| `sender_address_hash` | Set to `NULL` |
-| `recipient_address_hash` | Set to `NULL` |
+| `sender_address` | Replaced with `[REDACTED_GDPR_ERASURE]` tombstone |
+| `recipient_address` | Replaced with `[REDACTED_GDPR_ERASURE]` tombstone |
+| `sender_address_hash` | Set to `NULL` (keyed hash invalidated) |
+| `recipient_address_hash` | Set to `NULL` (keyed hash invalidated) |
 
-### What is preserved (financial / audit integrity)
+Schema compatibility is strictly maintained: address columns are never set to `NULL` if non-null values are expected.
 
-| Data | Reason preserved |
-|---|---|
-| `amount` | Financial audit trail — required for regulatory compliance |
-| `ledger` | Public chain data — not PII |
-| `stream_id` | Opaque internal identifier — not PII |
-| `status` | Stream lifecycle state — not PII |
-| `contract_events` rows | Ledger amounts are public chain data |
-| `audit_logs` entries | Immutable audit trail; erasure itself is logged |
+### Preserved Financial Records
 
-### Legal hold exemption
+To comply with statutory financial retention laws and preserve accounting integrity, non-PII financial and transaction data is never modified or deleted:
 
-Streams with `legal_hold = TRUE` are skipped by the erasure query. The
-response body reports `rowsSkippedLegalHold` so the caller knows whether
-all data was erased. The WHERE clause exclusion of legal-hold rows and
-the actual DELETE/UPDATE happen within the same parameterised query, so
-there is no TOCTOU race.
+| Field / Table | Status | Reason Preserved |
+|---|---|---|
+| `amount` | **Preserved** | Required for financial audit trail and accounting balance verification |
+| `ledger` | **Preserved** | Stellar public ledger sequence number — not PII |
+| `stream_id` | **Preserved** | Opaque internal record identifier — not PII |
+| `status` | **Preserved** | Lifecycle state of stream — not PII |
+| `contract_events` | **Preserved** | On-chain contract event records — public chain data |
+| `audit_logs` | **Preserved** | Immutable append-only audit trail |
 
-### Audit trail
+### Audit Logging
 
-Every erasure call (successful or failed) writes a `PII_ERASURE_REQUESTED`
-entry to `audit_logs` via `recordAuditEventToDb`. The entry includes:
+Every erasure request records audit events (`GDPR_ERASURE` and `PII_ERASURE_REQUESTED`) in the `audit_logs` table via `recordErasureAuditLog`.
 
-- `rowsErased` — number of rows updated
-- `rowsSkippedLegalHold` — rows skipped due to legal hold
-- `requestedBy` — truncated Authorization header value (no secrets)
-- `outcome: 'failed'` — only present on error paths
+**Recorded Metadata:**
+- `requesterIdentity`: Token subject or truncated bearer token string
+- `requesterRole`: Role of the authorized caller (`admin` or `data-protection-officer`)
+- `timestamp`: ISO-8601 timestamp of erasure execution
+- `action`: `GDPR_ERASURE`
+- `outcome`: `success` or `failed`
+- `rowsErased`: Number of matching stream rows redacted
+- `rowsSkippedLegalHold`: Number of rows skipped due to active legal hold
 
-The audit record `resourceId` contains only the first 8 characters of the
-address followed by `…` — enough for correlation without logging the full
-pseudonymous identifier.
+> [!SECURITY]
+> The full erased recipient address is **never** stored inside the audit log. The `resourceId` field only records a truncated 8-character prefix followed by an ellipsis (e.g. `GDTEST12…`).
 
-### Security notes
+### Operational Considerations
 
-1. **Authentication required** — `requireAdminAuth` middleware gates the endpoint.
-2. **Parameterised query** — the address is passed as `$2`; never interpolated.
-3. **No full address in logs** — only an 8-char prefix is ever logged or stored.
-4. **Tombstone is machine-readable** — `[REDACTED:GDPR-17]` allows audit tools to scan for erased rows.
-5. **Idempotent** — re-running with the same address is safe; already-tombstoned rows no longer match the WHERE clause.
-6. **Cache-Control: no-store** — response is never cached by intermediaries.
+1. **Transaction Atomicity**: All updates and audit writes occur within a single database transaction. If an error occurs midway, `ROLLBACK` restores state.
+2. **Idempotency**: Repeated requests for the same address return `200 OK` with `rowsErased: 0`. Already-tombstoned rows no longer match the query.
+3. **Legal Hold Exemption**: Rows with `legal_hold = TRUE` are skipped to satisfy statutory compliance holds.
+4. **Cache Invalidation**: Responses include `Cache-Control: no-store` and `X-Content-Type-Options: nosniff` headers.
 
-### Example request
+### Example Request
 
 ```bash
 curl -X DELETE \
-  "https://api.example.com/api/privacy/erasure/GABCDE...STELLAR_ADDRESS" \
+  "https://api.example.com/api/privacy/erasure/GDTEST123456789012345678901234567890123456789012345678" \
   -H "Authorization: Bearer $ADMIN_API_KEY"
 ```
 
-### Example response
+### Example Response
 
 ```json
 {
@@ -365,16 +380,5 @@ curl -X DELETE \
   "rowsErased": 3,
   "rowsSkippedLegalHold": 0,
   "message": "3 row(s) erased."
-}
-```
-
-Response with legal-hold rows:
-
-```json
-{
-  "erased": true,
-  "rowsErased": 2,
-  "rowsSkippedLegalHold": 1,
-  "message": "2 row(s) erased. 1 row(s) skipped due to legal hold."
 }
 ```

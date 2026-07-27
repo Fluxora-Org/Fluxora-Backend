@@ -404,8 +404,7 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 
 ### Follow-Up Work (Documented for Future Sprints)
 
-1. **Automatic instrumentation** — Instrument database driver, HTTP client, message queues without explicit calls
-   - Rationale: Reduces boilerplate, improves consistency
+1. ~~**Automatic instrumentation**~~ — **IMPLEMENTED** (issue #941). See the Automatic Instrumentation section below.
 
 2. ~~**W3C Traceparent support**~~ — **IMPLEMENTED** (issue #756). See the W3C Trace Context section below.
 
@@ -419,6 +418,45 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 
 6. **Trace query API** — Add `/admin/traces` endpoint for operators to query spans
    - Rationale: Avoid log parsing for debugging; real-time query capability
+
+---
+
+## Automatic Instrumentation (issue #941)
+
+Fluxora registers `PgInstrumentation` and `HttpInstrumentation` (along with
+`ExpressInstrumentation` and `IORedisInstrumentation`) with the `NodeSDK`
+at startup so that every `pg.Pool.query` / `pg.Client.query` call and every
+outbound HTTP request automatically produces a child span — no manual
+`traceSpan()` wrapper required.
+
+### What is auto-instrumented
+
+| Library | Instrumentation class | Spans produced |
+|---------|-----------------------|----------------|
+| `pg` (Pool/Client) | `PgInstrumentation` | `pg.query` with `db.statement`, `db.parameters` attributes |
+| `http` / `https` | `HttpInstrumentation` | `HTTP <method>` for outbound requests; inbound server spans (suppressed for `/health` and `/metrics`) |
+| Express | `ExpressInstrumentation` | Route-handler and middleware spans |
+| ioredis | `IORedisInstrumentation` | `redis.<command>` spans |
+
+### Relationship with manual `traceSpan()`
+
+The manual `traceSpan()` helper (used in `src/db/pool.ts`, etc.) and the
+auto-instrumentation do **not** conflict. Auto-instrumented spans are
+produced by the OTel SDK patching the `pg` and `http` prototypes at module
+load time; `traceSpan()` creates application-level business spans via the
+hook-based tracer. Both appear in the trace tree — the auto-instrumented
+span is a child of the request span, and the manual span is a sibling.
+
+### Disabling auto-instrumentation
+
+Set `OTEL_SDK_DISABLED=true` to skip the entire OTel SDK (including all
+auto-instrumentation). There is currently no granular toggle to disable
+individual instrumentations.
+
+### Code references
+
+- SDK bootstrap: [`src/tracing/index.ts`](../src/tracing/index.ts) (`instrumentations` array)
+- Tests: [`tests/tracing/autoInstrumentation.test.ts`](../tests/tracing/autoInstrumentation.test.ts)
 
 ---
 
@@ -527,7 +565,7 @@ const ctx = getActiveTraceContext();
 |----------|------|---------|-------------|
 | `TRACING_ENABLED` | boolean | `false` | Enable distributed tracing |
 | `TRACING_SAMPLE_RATE` | float (0.0-1.0) | `1.0` | Fraction of requests to trace (100% if enabled) |
-| `TRACING_OTEL_ENABLED` | boolean | `false` | Enable OpenTelemetry export |
+| `TRACING_OTEL_ENABLED` | boolean | `false` | Enable OpenTelemetry export **and** the logs bridge |
 | `TRACING_LOG_EVENTS` | boolean | `false` | Log span events to stdout/stderr |
 
 ### Code Configuration
@@ -567,6 +605,7 @@ app.use(tracingMiddleware({
 - Tracer core: [src/tracing/hooks.ts](../src/tracing/hooks.ts)
 - Middleware integration: [src/tracing/middleware.ts](../src/tracing/middleware.ts)
 - Built-in hooks: [src/tracing/builtin.ts](../src/tracing/builtin.ts)
+- **Logs bridge**: [src/tracing/logsBridge.ts](../src/tracing/logsBridge.ts)
 - Tests: [tests/tracing/](../tests/tracing/)
 
 ---
@@ -822,6 +861,129 @@ See `tests/tracing/sampling.test.ts` for comprehensive coverage:
 - `shouldSampleTail` error retention and random sampling
 - `resolvePerRouteOverride` exact match, prefix match, fallback
 - `getSamplingConfig` env var parsing for all strategies
+
+---
+
+## OpenTelemetry Logs Bridge (issue #942)
+
+Fluxora now includes a **logs bridge** (`src/tracing/logsBridge.ts`) that
+forwards every entry written by the structured logger (`src/lib/logger.ts`)
+to the [OpenTelemetry Logs API](https://opentelemetry.io/docs/specs/otel/logs/)
+as a `LogRecord`, enabling full log-trace correlation in backends such as
+Datadog and Elastic.
+
+### Design: Additive, not a replacement
+
+The bridge is strictly **additive**.
+
+- The existing `process.stdout` / `process.stderr` JSON output is completely
+  unchanged. Every log line still lands in the console, the shipping agent, or
+  whatever file sink is configured.
+- The OTel emission is an extra side-effect, active only when
+  `TRACING_OTEL_ENABLED=true` and `initLogsBridge({ enabled: true })` has been
+  called (typically right after `startTracing()`).
+- When the bridge is disabled, `forwardToOtel()` returns immediately without
+  allocating any objects — zero overhead on the hot path.
+
+### How log entries become OTel LogRecords
+
+Each call to the internal `write()` function in `src/lib/logger.ts` now ends
+with a call to `forwardToOtel()` after the primary write. `forwardToOtel`:
+
+1. **Guards** — returns early if bridge is disabled.
+2. **Double-sanitizes** — runs `redactKeysInString` on the message body and
+   `sanitize()` on the metadata again (defence-in-depth; the logger already
+   sanitized them once before passing them in).
+3. **Flattens meta** — each primitive meta field becomes a LogRecord attribute.
+   Nested objects and arrays are JSON-stringified.
+4. **Redacts Stellar keys in string attributes** — `redactKeysInString` is
+   applied to every string attribute value, catching keys embedded in
+   free-form text that field-name based redaction would miss.
+5. **Correlates with the active OTel span** — if a W3C OTel span is active in
+   the current async context, its `traceId` and `spanId` are attached as
+   `trace.id` / `span.id` attributes so log-trace join queries work out of the box.
+6. **Emits** — calls `logs.getLogger('fluxora-backend/logs-bridge').emit(record)`.
+7. **Swallows errors** — any exception from the OTel SDK is silently caught; a
+   broken exporter or misconfigured collector can never affect application behavior.
+
+### Severity mapping
+
+| Fluxora level | OTel SeverityNumber | OTel SeverityText |
+|---------------|--------------------|--------------------|
+| `debug`       | 5 (`DEBUG`)        | `DEBUG`            |
+| `info`        | 9 (`INFO`)         | `INFO`             |
+| `warn`        | 13 (`WARN`)        | `WARN`             |
+| `error`       | 17 (`ERROR`)       | `ERROR`            |
+
+### LogRecord attributes
+
+| Attribute key   | Source                                 |
+|-----------------|----------------------------------------|
+| `correlation.id`| `correlationId` from the log call      |
+| `trace.id`      | `spanContext().traceId` (active span)  |
+| `span.id`       | `spanContext().spanId` (active span)   |
+| `<meta key>`    | Every primitive field in `meta`        |
+
+### Enabling the bridge
+
+```bash
+# Both flags must be enabled:
+export TRACING_OTEL_ENABLED=true   # gates the forwardToOtel() call
+export OTEL_SERVICE_NAME=fluxora-backend
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318  # or your collector URL
+```
+
+In application startup code (after `startTracing()`):
+
+```typescript
+import { startTracing } from './tracing/index.js';
+import { initLogsBridge } from './tracing/logsBridge.js';
+import { getConfig } from './config/env.js';
+
+const config = getConfig();
+startTracing();
+initLogsBridge({ enabled: config.tracingOtelEnabled });
+```
+
+### PII guarantees
+
+The bridge applies the same two-layer PII pipeline as the structured logger:
+
+1. **Field-name redaction** (`sanitize()`) — any key from `src/pii/policy.ts`
+   (e.g. `password`, `token`, `authToken`, `secret`, Stellar address fields)
+   is replaced with `[REDACTED]` before the value ever reaches the OTel SDK.
+2. **Stellar key masking** (`redactKeysInString()`) — any string value (message
+   body or attribute value) that contains a `G…` 56-char Stellar public key
+   has those keys partially masked (`GAAZ..WN7`). This catches keys embedded
+   in free-form log messages that field-level redaction cannot detect.
+
+No PII should ever reach a downstream OTel collector via the bridge.
+
+### Integration with Datadog and Elastic
+
+When the OTel Collector is configured to forward logs to Datadog or
+Elasticsearch, the `trace.id` and `span.id` attributes on each LogRecord are
+automatically mapped to the backend's trace correlation fields:
+
+- **Datadog**: `trace.id` → `dd.trace_id`, `span.id` → `dd.span_id`
+  (via the Datadog OTel exporter mapping). See [`docs/integrations/datadog.md`](integrations/datadog.md).
+- **Elastic APM**: `trace.id` → `trace.id`, `span.id` → `transaction.id`
+  (via the Elastic OTel exporter). See [`docs/integrations/elastic.md`](integrations/elastic.md).
+
+### Security assumptions
+
+| Assumption | Mechanism |
+|---|---|
+| No PII in OTel attributes | Double-sanitize + Stellar key masking |
+| Bridge errors are non-fatal | All SDK calls wrapped in `try/catch` |
+| Bridge inactive by default | `bridgeEnabled = false` until `initLogsBridge({ enabled: true })` |
+| Logs backend credentials never logged | OTLP headers from env only, never written to stdout |
+
+### Code references
+
+- Bridge implementation: [`src/tracing/logsBridge.ts`](../src/tracing/logsBridge.ts)
+- Logger integration: [`src/lib/logger.ts`](../src/lib/logger.ts) (`forwardToOtel` call in `write()`)
+- Tests: [`tests/tracing/logsBridge.test.ts`](../tests/tracing/logsBridge.test.ts)
 
 ---
 

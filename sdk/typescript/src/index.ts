@@ -1,8 +1,11 @@
 /**
- * Fluxora TypeScript Client SDK
- * Entrypoint re-exporting client, types, errors, pagination, and idempotency tools.
+ * @fluxora/sdk — TypeScript Client SDK
+ *
+ * Generated from `openapi.yaml` by `scripts/generate-sdk-ts.mjs`.
+ * Do not edit by hand — run `pnpm generate:sdk:ts` instead.
+ *
+ * @module @fluxora/sdk
  */
-
 export * from './types.js';
 export * from './errors.js';
 export * from './idempotency.js';

@@ -243,12 +243,10 @@ describe('grpcHealth', () => {
 
       // Open a Watch stream and never close it client-side.
       const call = client.watch({ service: '' });
-      // Expected once we call cancel() (or the server force-closes the
-      // stream) — without a listener, grpc-js surfaces it as an unhandled
-      // 'error' event on the EventEmitter, failing the test run.
       call.on('error', () => {});
-      call.on('data',() => {});
-      await new Promise((r) => setTimeout(r, 15));
+      await new Promise<void>((resolve) => {
+        call.once('data', () => resolve());
+      });
 
       const start = Date.now();
       await stopGrpcHealthServer(server, 100);

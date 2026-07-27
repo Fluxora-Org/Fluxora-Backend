@@ -22,8 +22,11 @@ import {
   queueRestoreJob,
   getRestoreJob,
   listRestoreJobs,
+  ValidationError,
+  ConfigurationError,
   type RestoreJob,
 } from '../scripts/backup-retention.js';
+import { tenantRateLimitOverridesRouter } from './admin/tenantRateLimitOverrides.js';
 
 export const adminRouter = Router();
 
@@ -32,13 +35,16 @@ export const adminRouter = Router();
  * Read-only endpoint for pause-flag visibility without admin credentials.
  * Exposes non-sensitive service posture only.
  */
-adminRouter.get('/status/read-only', (_req, res) => {
-  const requestId = _req.id ?? _req.correlationId;
+adminRouter.get('/status/read-only', (req, res) => {
+  const requestId = req.correlationId;
   res.json(successResponse({ pauseFlags: getPauseFlags() }, requestId));
 });
 
 // Every admin route requires a valid Bearer token.
 adminRouter.use(requireAdminAuth);
+
+// Per-tenant rate limit override management
+adminRouter.use('/rate-limits/overrides', tenantRateLimitOverridesRouter);
 
 /**
  * GET /api/admin/deprecations
@@ -68,8 +74,8 @@ adminRouter.get('/deprecations', (req, res) => {
  * Returns current pause flags and reindex state so operators can
  * inspect service posture at a glance.
  */
-adminRouter.get('/status', (_req, res) => {
-  const requestId = _req.id ?? _req.correlationId;
+adminRouter.get('/status', (req, res) => {
+  const requestId = req.correlationId;
   res.json(
     successResponse(
       {
@@ -85,8 +91,8 @@ adminRouter.get('/status', (_req, res) => {
  * GET /api/admin/pause
  * Read-only view of the current pause flags.
  */
-adminRouter.get('/pause', (_req, res) => {
-  const requestId = _req.id ?? _req.correlationId;
+adminRouter.get('/pause', (req, res) => {
+  const requestId = req.correlationId;
   res.json(successResponse(getPauseFlags(), requestId));
 });
 
@@ -173,8 +179,8 @@ adminRouter.put('/pause', async (req, res) => {
  * GET /api/admin/reindex
  * Returns the current reindex job state.
  */
-adminRouter.get('/reindex', (_req, res) => {
-  const requestId = _req.id ?? _req.correlationId;
+adminRouter.get('/reindex', (req, res) => {
+  const requestId = req.correlationId;
   res.json(successResponse(getReindexState(), requestId));
 });
 
@@ -182,8 +188,8 @@ adminRouter.get('/reindex', (_req, res) => {
  * POST /api/admin/reindex
  * Triggers a reindex operation. Returns 409 if one is already running.
  */
-adminRouter.post('/reindex', async (_req, res) => {
-  const requestId = _req.id ?? _req.correlationId;
+adminRouter.post('/reindex', async (req, res) => {
+  const requestId = req.correlationId;
   const current = getReindexState();
   if (current.status === 'running') {
     res.status(409).json(
@@ -329,7 +335,7 @@ const bulkActionSchema = z.object({
  * Partial failures are reported per-item in the response.
  */
 adminRouter.post('/streams/bulk-actions', async (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const parseResult = bulkActionSchema.safeParse(req.body);
 
   if (!parseResult.success) {
@@ -387,8 +393,8 @@ adminRouter.post('/streams/bulk-actions', async (req, res) => {
  * GET /api/admin/api-keys
  * Lists all API key records (hashes only — raw keys are never returned).
  */
-adminRouter.get('/api-keys', async (_req, res) => {
-  const requestId = _req.id ?? _req.correlationId;
+adminRouter.get('/api-keys', async (req, res) => {
+  const requestId = req.correlationId;
   res.json(successResponse({ apiKeys: await listApiKeys() }, requestId));
 });
 
@@ -469,14 +475,22 @@ adminRouter.delete('/api-keys/:id', async (req, res) => {
  * GET /api/admin/ban-store/status
  * Returns the health and fallback state of the HybridBanStore.
  */
-adminRouter.get('/ban-store/status', (_req, res) => {
+adminRouter.get('/ban-store/status', (req, res) => {
+  const requestId = req.correlationId;
   try {
     const status = typeof getHybridBanStoreStatus === 'function'
       ? getHybridBanStoreStatus()
       : { available: false, reason: 'getHybridBanStoreStatus not implemented' };
-    res.json({ ok: true, banStore: status });
+    res.json(successResponse({ banStore: status }, requestId));
   } catch (err) {
-    res.status(503).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    res.status(503).json(
+      errorResponse(
+        'SERVICE_UNAVAILABLE',
+        err instanceof Error ? err.message : String(err),
+        undefined,
+        requestId,
+      ),
+    );
   }
 });
 
@@ -515,7 +529,7 @@ adminRouter.get('/ban-store/status', (_req, res) => {
  * @returns 202 Accepted with the queued {@link RestoreJob} record.
  */
 adminRouter.post('/restore', async (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const { backupId, targetEnvironment, confirmProduction } = req.body ?? {};
 
   // ── Input validation ────────────────────────────────────────────────────
@@ -592,21 +606,20 @@ adminRouter.post('/restore', async (req, res) => {
       },
     });
   } catch (err) {
+    if (err instanceof ValidationError) {
+      res.status(400).json(
+        errorResponse('VALIDATION_ERROR', err.message, undefined, requestId),
+      );
+      return;
+    }
+    if (err instanceof ConfigurationError) {
+      res.status(503).json(
+        errorResponse('CONFIGURATION_ERROR', err.message, undefined, requestId),
+      );
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
-
-    // production-confirm missing → 400; anything else → 503
-    const isValidationError =
-      message.includes('confirmProduction') ||
-      message.includes('backupId') ||
-      message.includes('path traversal') ||
-      message.includes('must not') ||
-      message.includes('non-empty') ||
-      message.includes('exceeds');
-
-    const status = isValidationError ? 400 : 503;
-    const code = isValidationError ? 'VALIDATION_ERROR' : 'RESTORE_ERROR';
-
-    res.status(status).json(errorResponse(code, message, undefined, requestId));
+    res.status(503).json(errorResponse('RESTORE_ERROR', message, undefined, requestId));
     return;
   }
 
@@ -640,7 +653,7 @@ adminRouter.post('/restore', async (req, res) => {
  * @returns 200 with the job record.
  */
 adminRouter.get('/restore/:jobId', (req, res) => {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const { jobId } = req.params;
 
   // Lightweight ID validation — cuid2 IDs are 24 characters but allow
@@ -692,8 +705,8 @@ adminRouter.get('/restore/:jobId', (req, res) => {
  * @security Requires valid Bearer admin token (`ADMIN_API_KEY`).
  * @returns 200 with `{ jobs: RestoreJob[] }`.
  */
-adminRouter.get('/restore', (_req, res) => {
-  const requestId = _req.id ?? _req.correlationId;
+adminRouter.get('/restore', (req, res) => {
+  const requestId = req.correlationId;
   const jobs = listRestoreJobs();
   res.json(successResponse({ jobs }, requestId));
 });

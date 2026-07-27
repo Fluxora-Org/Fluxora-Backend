@@ -13,6 +13,10 @@ import {
   getIndexerLeaderElection,
   type IndexerLeaderElection,
 } from './leaderElection.js';
+import {
+  indexerEventsIngestedTotal,
+  indexerLagSeconds,
+} from '../metrics/businessMetrics.js';
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -1202,7 +1206,7 @@ export class IndexerIngestionService {
     bucket.timestamps = bucket.timestamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
     if (bucket.timestamps.length >= MAX_RATE_LIMIT_REQUESTS) {
       warn('Indexer ingest rate limit exceeded', { actor, limit: MAX_RATE_LIMIT_REQUESTS, windowMs: RATE_LIMIT_WINDOW_MS });
-      throw new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, 'indexer ingest rate limit exceeded', 429, {
+      throw new ApiError(429, ApiErrorCode.TOO_MANY_REQUESTS, 'indexer ingest rate limit exceeded', {
         retryAfterSeconds: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000),
       });
     }
@@ -1263,6 +1267,18 @@ export class IndexerIngestionService {
       debug('Indexer contract event ids processed', {
         requestId: context.requestId, insertedEventIds: result.insertedEventIds, duplicateEventIds: result.duplicateEventIds,
       });
+
+      if (result.insertedEventIds.length > 0) {
+        indexerEventsIngestedTotal.inc(result.insertedEventIds.length);
+
+        const latestHappenedAtMs = events.reduce((max, event) => {
+          const happenedAtMs = Date.parse(event.happenedAt);
+          return Number.isFinite(happenedAtMs) && happenedAtMs > max ? happenedAtMs : max;
+        }, 0);
+        if (latestHappenedAtMs > 0) {
+          indexerLagSeconds.set(Math.max(0, (Date.now() - latestHappenedAtMs) / 1000));
+        }
+      }
 
       return {
         insertedCount: result.insertedEventIds.length,

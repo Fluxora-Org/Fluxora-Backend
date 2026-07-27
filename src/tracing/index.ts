@@ -50,7 +50,7 @@ function safeUrl(value: string | undefined, fallback: string): string {
 }
 
 import { addShutdownHook } from '../shutdown.js';
-import { getTracer } from './hooks.js';
+import { getTracer, initializeTracer } from './hooks.js';
 
 // ── SDK singleton ─────────────────────────────────────────────────────────────
 
@@ -100,6 +100,11 @@ export function startTracing(): boolean {
     });
 
     sdk.start();
+
+    // Wire sampling strategy into the custom Tracer so head/tail decisions
+    // are applied to spans created via traceSpan() and the hooks-based tracer.
+    const sampling = getSamplingConfig();
+    initializeTracer({ enabled: true, sampling });
 
     // Register shutdown hook to flush all pending spans and stop SDK on exit
     addShutdownHook(async () => {

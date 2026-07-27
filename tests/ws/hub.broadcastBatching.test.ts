@@ -20,7 +20,7 @@
  */
 
 import http from 'http';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import {
   StreamHub,
@@ -419,5 +419,128 @@ describe('StreamHub micro-batching', () => {
       payload: { amount: 42 },
       correlationId: 'corr-xyz',
     });
+  });
+});
+
+// ── Environment-variable parsing (IIFE boundary tests) ────────────────────────
+
+const BATCH_FLUSH_MS_MIN = 5;
+const BATCH_FLUSH_MS_MAX = 5_000;
+const BATCH_MAX_SIZE_MIN = 1;
+const BATCH_MAX_SIZE_MAX = 500;
+
+describe('WS_BATCH_FLUSH_MS env-var parsing', () => {
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    vi.resetModules();
+  });
+
+  async function loadHubWithEnv(overrides: Partial<NodeJS.ProcessEnv>) {
+    Object.assign(process.env, overrides);
+    const hub = await import('../../src/ws/hub.js');
+    return hub;
+  }
+
+  it('unset — returns default 50', async () => {
+    delete process.env['WS_BATCH_FLUSH_MS'];
+    const hub = await loadHubWithEnv({});
+    expect(hub.WS_BATCH_FLUSH_MS).toBe(50);
+  });
+
+  it('non-numeric string — returns default 50', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_FLUSH_MS: 'abc' });
+    expect(hub.WS_BATCH_FLUSH_MS).toBe(50);
+  });
+
+  it('negative value — clamped to BATCH_FLUSH_MS_MIN', async () => {
+    // Deliberate: negative values are clamped to the minimum, not treated as
+    // invalid. This locks in the current arithmetic behavior as intentional.
+    const hub = await loadHubWithEnv({ WS_BATCH_FLUSH_MS: '-100' });
+    expect(hub.WS_BATCH_FLUSH_MS).toBe(BATCH_FLUSH_MS_MIN);
+  });
+
+  it('exactly at minimum — returns BATCH_FLUSH_MS_MIN', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_FLUSH_MS: String(BATCH_FLUSH_MS_MIN) });
+    expect(hub.WS_BATCH_FLUSH_MS).toBe(BATCH_FLUSH_MS_MIN);
+  });
+
+  it('exactly at maximum — returns BATCH_FLUSH_MS_MAX', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_FLUSH_MS: String(BATCH_FLUSH_MS_MAX) });
+    expect(hub.WS_BATCH_FLUSH_MS).toBe(BATCH_FLUSH_MS_MAX);
+  });
+
+  it('beyond maximum — clamped to BATCH_FLUSH_MS_MAX', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_FLUSH_MS: String(BATCH_FLUSH_MS_MAX + 1) });
+    expect(hub.WS_BATCH_FLUSH_MS).toBe(BATCH_FLUSH_MS_MAX);
+  });
+
+  it('typical valid value — returned as-is', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_FLUSH_MS: '250' });
+    expect(hub.WS_BATCH_FLUSH_MS).toBe(250);
+  });
+});
+
+describe('WS_BATCH_MAX_SIZE env-var parsing', () => {
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    vi.resetModules();
+  });
+
+  async function loadHubWithEnv(overrides: Partial<NodeJS.ProcessEnv>) {
+    Object.assign(process.env, overrides);
+    const hub = await import('../../src/ws/hub.js');
+    return hub;
+  }
+
+  it('unset — returns default 25', async () => {
+    delete process.env['WS_BATCH_MAX_SIZE'];
+    const hub = await loadHubWithEnv({});
+    expect(hub.WS_BATCH_MAX_SIZE).toBe(25);
+  });
+
+  it('non-numeric string — returns default 25', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_MAX_SIZE: 'abc' });
+    expect(hub.WS_BATCH_MAX_SIZE).toBe(25);
+  });
+
+  it('negative value — clamped to BATCH_MAX_SIZE_MIN', async () => {
+    // Deliberate: negative values are clamped to the minimum, not treated as
+    // invalid. This locks in the current arithmetic behavior as intentional.
+    const hub = await loadHubWithEnv({ WS_BATCH_MAX_SIZE: '-100' });
+    expect(hub.WS_BATCH_MAX_SIZE).toBe(BATCH_MAX_SIZE_MIN);
+  });
+
+  it('exactly at minimum — returns BATCH_MAX_SIZE_MIN', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_MAX_SIZE: String(BATCH_MAX_SIZE_MIN) });
+    expect(hub.WS_BATCH_MAX_SIZE).toBe(BATCH_MAX_SIZE_MIN);
+  });
+
+  it('exactly at maximum — returns BATCH_MAX_SIZE_MAX', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_MAX_SIZE: String(BATCH_MAX_SIZE_MAX) });
+    expect(hub.WS_BATCH_MAX_SIZE).toBe(BATCH_MAX_SIZE_MAX);
+  });
+
+  it('beyond maximum — clamped to BATCH_MAX_SIZE_MAX', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_MAX_SIZE: String(BATCH_MAX_SIZE_MAX + 1) });
+    expect(hub.WS_BATCH_MAX_SIZE).toBe(BATCH_MAX_SIZE_MAX);
+  });
+
+  it('typical valid value — returned as-is', async () => {
+    const hub = await loadHubWithEnv({ WS_BATCH_MAX_SIZE: '100' });
+    expect(hub.WS_BATCH_MAX_SIZE).toBe(100);
   });
 });

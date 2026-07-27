@@ -21,7 +21,7 @@ export interface DedupCache {
 }
 
 const DEDUP_TTL_SECONDS = 86400;
-const DEDUP_CACHE_MAX = 10_000;
+export const DEDUP_CACHE_MAX = 10_000;
 const FALLBACK_LOG_THROTTLE_MS = 5_000;
 
 let lastFallbackLog = 0;
@@ -30,7 +30,7 @@ function logFallback(operation: string, streamId: string, eventId: string): void
   const now = Date.now();
   if (now - lastFallbackLog >= FALLBACK_LOG_THROTTLE_MS) {
     lastFallbackLog = now;
-    logger.debug('dedup:fallback', { operation, streamId, eventId });
+    logger.debug('dedup:fallback', undefined, { operation, streamId, eventId });
   }
 }
 
@@ -39,6 +39,11 @@ export function __resetDedupForTest(): void {
 }
 
 export class InMemoryDedupCache implements DedupCache {
+    /** FIFO eviction: when size reaches DEDUP_CACHE_MAX, the oldest-inserted key is evicted.
+     * Under sustained load at capacity, this is a one-in-one-out FIFO.
+     * Trade-off: evicted keys will be treated as new (false negative) if replayed.
+     * This is the fallback for HybridDedupCache when Redis is unavailable;
+     * during a Redis outage, dedup degrades to best-effort on the most recent DEDUP_CACHE_MAX events. */
     private readonly seen = new Map<string, true>();
 
     async has(streamId: string, eventId: string): Promise<boolean> {
@@ -133,6 +138,13 @@ export class HybridDedupCache implements DedupCache {
     async add(streamId: string, eventId: string): Promise<boolean> {
         if (this.useRedis) {
             try {
+                const inFallback = await this.fallback.has(streamId, eventId);
+                if (inFallback) {
+                    try {
+                        await this.primary.add(streamId, eventId);
+                    } catch {}
+                    return false;
+                }
                 const added = await this.primary.add(streamId, eventId);
                 if (added) await this.fallback.add(streamId, eventId);
                 return added;

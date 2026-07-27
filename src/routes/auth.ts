@@ -7,6 +7,8 @@ import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { revoke } from '../redis/jwtRevocationStore.js';
 import { Permission, requirePermission } from '../middleware/auth.js';
+import { authLockoutMiddleware } from '../middleware/authLockout.js';
+import { getClientIp } from '../ws/connectionLimiter.js';
 
 export const authRouter = Router();
 
@@ -73,6 +75,7 @@ const SessionRequestSchema = z.object({
  */
 authRouter.post(
   '/session',
+  authLockoutMiddleware,
   asyncHandler(async (req: Request, res: Response) => {
     const result = SessionRequestSchema.safeParse(req.body);
     const requestId = req.correlationId;
@@ -101,7 +104,15 @@ authRouter.post(
           targetRole = verified.role;
         }
       } catch (err) {
-        throw unauthorized(`OIDC token validation failed: ${err instanceof Error ? err.message : String(err)}`);
+        const store = req.authAttemptStore;
+        const ip = getClientIp(req);
+        if (store) {
+          void store.recordFailure(ip);
+          if (targetAddress) {
+            void store.recordFailure(targetAddress);
+          }
+        }
+        throw unauthorized('Invalid credentials');
       }
     }
 
@@ -112,6 +123,13 @@ authRouter.post(
     const token = generateToken({ address: targetAddress, role: targetRole as 'operator' | 'viewer' });
 
     info('Session created', { address: targetAddress, role: targetRole, requestId, authMethod: idToken ? 'oidc' : 'shared-secret' });
+
+    const store = req.authAttemptStore;
+    if (store) {
+      const ip = getClientIp(req);
+      void store.resetAttempts(ip);
+      void store.resetAttempts(targetAddress);
+    }
 
     res.json({
       token,

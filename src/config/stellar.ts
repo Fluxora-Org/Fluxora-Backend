@@ -10,7 +10,7 @@ export interface StellarNetworkConfig {
    */
   networkPassphrase: string;
   /** Default streaming-contract deployment address for the network. */
-  streamingContractAddress: string;
+  streamingContractAddress?: string;
   /** Default token contract address for the network. */
   tokenContractAddress?: string;
 }
@@ -34,7 +34,6 @@ export const STELLAR_NETWORKS: Record<StellarNetwork, StellarNetworkConfig> = {
     horizonUrl: 'http://localhost:8000',
     passphrase: 'Standalone Network ; February 2017',
     networkPassphrase: 'Standalone Network ; February 2017',
-    streamingContractAddress: 'CLOCALPLACEHOLDER000000000000000000000000000000000000000',
   },
 };
 

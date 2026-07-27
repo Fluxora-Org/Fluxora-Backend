@@ -98,16 +98,16 @@ export const apiKeyRepository = {
    */
   async rotate(
     id: string,
-    patch: { keyHash: string; salt: string; prefix: string; rotatedAt: string },
+    patch: { keyHash: string; salt: string; prefix: string; rotatedAt: string; scopes: string[] },
   ): Promise<ApiKeyRecord | undefined> {
     const pool = getPool();
     const result = await query<Record<string, unknown>>(
       pool,
       `UPDATE api_keys
-         SET key_hash = $2, salt = $3, prefix = $4, rotated_at = $5
+         SET key_hash = $2, salt = $3, prefix = $4, rotated_at = $5, scopes = $6
        WHERE id = $1
        RETURNING ${SELECT_COLUMNS}`,
-      [id, patch.keyHash, patch.salt, patch.prefix, patch.rotatedAt],
+      [id, patch.keyHash, patch.salt, patch.prefix, patch.rotatedAt, patch.scopes],
     );
     return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
   },

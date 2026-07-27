@@ -305,4 +305,32 @@ describe('Environment Configuration', () => {
             expect(config.horizonNetworkPassphrase).toBe('Custom Network ; 2024');
         });
     });
+    describe('OIDC configuration', () => {
+        it('should leave oidcIssuerUrl/oidcAudience undefined when not set', () => {
+            process.env.NODE_ENV = 'development';
+            delete process.env.OIDC_ISSUER_URL;
+            delete process.env.OIDC_AUDIENCE;
+            const config = loadConfig();
+
+            expect(config.oidcIssuerUrl).toBeUndefined();
+            expect(config.oidcAudience).toBeUndefined();
+        });
+
+        it('should surface OIDC_ISSUER_URL and OIDC_AUDIENCE on Config when set', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.OIDC_ISSUER_URL = 'https://idp.example.com';
+            process.env.OIDC_AUDIENCE = 'fluxora-dashboard';
+            const config = loadConfig();
+
+            expect(config.oidcIssuerUrl).toBe('https://idp.example.com');
+            expect(config.oidcAudience).toBe('fluxora-dashboard');
+        });
+
+        it('should reject an invalid OIDC_ISSUER_URL', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.OIDC_ISSUER_URL = 'not-a-valid-url';
+
+            expect(() => loadConfig()).toThrow(ConfigError);
+        });
+    });
 });

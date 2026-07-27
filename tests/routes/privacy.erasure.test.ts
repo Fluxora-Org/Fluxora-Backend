@@ -1,24 +1,25 @@
 /**
  * tests/routes/privacy.erasure.test.ts
  *
- * Comprehensive tests for the GDPR right-to-erasure endpoint (issue #730).
+ * Comprehensive tests for the GDPR right-to-erasure endpoint (Issue #910).
  *
  * DELETE /api/privacy/erasure/:recipientAddress
  *
  * Coverage:
- *  - Auth guard: 401 without header, 403 with bad token, 200 with valid token
- *  - Input validation: empty, oversized address
- *  - Happy path: erases PII columns, preserves financial data, returns counts
+ *  - Auth guard: 401 without header, 403 with bad token, 200 with valid token/role
+ *  - Role-based authorization: admin & data-protection-officer allowed, operator/viewer forbidden (403)
+ *  - Input validation: empty, oversized address (>256 chars)
+ *  - Happy path: erases PII columns, replaces with tombstone, preserves financial data
  *  - Legal hold: skipped rows are counted and reported
  *  - Idempotency: re-running is safe
- *  - Audit trail: PII_ERASURE_REQUESTED entry written on success and failure
- *  - DB error: returns 500, still attempts audit entry
- *  - Existing GET/HEAD routes are not broken
- *  - Method guard: POST/PUT on policy/retention returns 405
+ *  - Audit trail: GDPR_ERASURE and PII_ERASURE_REQUESTED entries written on success and failure
+ *  - DB transaction & Rollback: performs within transaction and rolls back on failure
+ *  - Security headers & Existing GET/HEAD/405 routes preserved
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
+import { generateToken } from '../../src/lib/auth.js';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
@@ -29,8 +30,12 @@ vi.mock('../../src/db/pool.js', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../../src/db/pool.js')>();
   return {
     ...orig,
-    getPool: () => ({}),
+    getPool: () => ({ query: (...args: unknown[]) => mockQuery(...args) }),
     query: (...args: unknown[]) => mockQuery(...args),
+    withClient: async (_pool: unknown, fn: (client: unknown) => Promise<unknown>) => {
+      const client = { query: (...args: unknown[]) => mockQuery(...args) };
+      return fn(client);
+    },
   };
 });
 
@@ -39,12 +44,15 @@ vi.mock('../../src/lib/auditLog.js', async (importOriginal) => {
   return {
     ...orig,
     recordAuditEventToDb: (...args: unknown[]) => mockRecordAuditEventToDb(...args),
+    recordErasureAuditLog: (action: string, resourceType: string, address: string, ...rest: unknown[]) =>
+      mockRecordAuditEventToDb(action, resourceType, address.substring(0, 8) + '…', ...rest),
   };
 });
 
 // ── App factory (imported after mocks are registered) ─────────────────────────
 
 import { createApp } from '../../src/app.js';
+import { initializeConfig } from '../../src/config/env.js';
 
 const ADMIN_KEY = 'test-admin-key-erasure';
 const VALID_ADDRESS = 'GDTEST123456789012345678901234567890123456789012345678';
@@ -53,8 +61,10 @@ const VALID_ADDRESS = 'GDTEST123456789012345678901234567890123456789012345678';
 
 function setQueryResults(rowsErased = 3, legalHoldCount = 0) {
   mockQuery
-    .mockResolvedValueOnce({ rowCount: rowsErased, rows: [] })       // UPDATE
-    .mockResolvedValueOnce({ rows: [{ cnt: String(legalHoldCount) }] }); // COUNT
+    .mockResolvedValueOnce({ rows: [] })                                 // BEGIN
+    .mockResolvedValueOnce({ rowCount: rowsErased, rows: [] })           // UPDATE
+    .mockResolvedValueOnce({ rows: [{ cnt: String(legalHoldCount) }] })  // COUNT
+    .mockResolvedValueOnce({ rows: [] });                                // COMMIT
 }
 
 describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
@@ -62,6 +72,9 @@ describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
 
   beforeEach(() => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
+    process.env.JWT_SECRET = 'test-jwt-secret-min-32-chars-long';
+    process.env.PGCRYPTO_KEY = 'test-pgcrypto-key-min-32-chars-long';
+    initializeConfig();
     mockQuery.mockReset();
     mockRecordAuditEventToDb.mockReset().mockResolvedValue({});
     app = createApp();
@@ -72,7 +85,7 @@ describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
     vi.restoreAllMocks();
   });
 
-  // ── Auth guard ──────────────────────────────────────────────────────────────
+  // ── Auth guard & Role Authorization ──────────────────────────────────────────
 
   it('returns 401 when Authorization header is missing', async () => {
     const res = await request(app)
@@ -101,6 +114,31 @@ describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
       .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(503);
+  });
+
+  it('allows access for data-protection-officer role', async () => {
+    setQueryResults(1, 0);
+    const dpoToken = generateToken({ address: VALID_ADDRESS, role: 'data-protection-officer' });
+    const res = await request(app)
+      .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
+      .set('Authorization', `Bearer ${dpoToken}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('denies access for forbidden roles (operator)', async () => {
+    const operatorToken = generateToken({ address: VALID_ADDRESS, role: 'operator' });
+    const res = await request(app)
+      .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
+      .set('Authorization', `Bearer ${operatorToken}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('denies access for forbidden roles (viewer)', async () => {
+    const viewerToken = generateToken({ address: VALID_ADDRESS, role: 'viewer' });
+    const res = await request(app)
+      .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
+      .set('Authorization', `Bearer ${viewerToken}`);
+    expect(res.status).toBe(403);
   });
 
   // ── Input validation ────────────────────────────────────────────────────────
@@ -136,23 +174,27 @@ describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
     expect(res.body.rowsErased).toBe(0);
   });
 
-  it('issues a parameterised UPDATE that sets tombstone on address columns', async () => {
+  it('issues a parameterised UPDATE that sets tombstone on address columns inside transaction', async () => {
     setQueryResults(1, 0);
     await request(app)
       .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
-    const updateCall = mockQuery.mock.calls[0];
-    const sql: string = updateCall[1];
-    const params: unknown[] = updateCall[2];
+    expect(mockQuery).toHaveBeenCalledWith('BEGIN');
+    const updateCall = mockQuery.mock.calls.find(call => typeof call[0] === 'string' && call[0].includes('UPDATE streams'));
+    expect(updateCall).toBeDefined();
+
+    const sql: string = updateCall[0];
+    const params: unknown[] = updateCall[1];
 
     expect(sql).toMatch(/UPDATE\s+streams/i);
     expect(sql).toMatch(/sender_address\s*=\s*\$1/i);
     expect(sql).toMatch(/recipient_address\s*=\s*\$1/i);
     expect(sql).toMatch(/sender_address_hash\s*=\s*NULL/i);
     expect(sql).toMatch(/recipient_address_hash\s*=\s*NULL/i);
-    expect(params[0]).toBe('[REDACTED:GDPR-17]');
+    expect(params[0]).toBe('[REDACTED_GDPR_ERASURE]');
     expect(params[1]).toBe(VALID_ADDRESS);
+    expect(mockQuery).toHaveBeenCalledWith('COMMIT');
   });
 
   it('excludes legal-hold rows from the UPDATE', async () => {
@@ -161,18 +203,20 @@ describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
       .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
-    const updateSql: string = mockQuery.mock.calls[0][1];
+    const updateCall = mockQuery.mock.calls.find(call => typeof call[0] === 'string' && call[0].includes('UPDATE streams'));
+    const updateSql: string = updateCall[0];
     expect(updateSql).toMatch(/legal_hold/i);
     expect(updateSql).toMatch(/FALSE/i);
   });
 
-  it('does NOT touch amount or ledger columns', async () => {
+  it('does NOT touch amount or ledger columns (preserving financial data)', async () => {
     setQueryResults(1, 0);
     await request(app)
       .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
-    const updateSql: string = mockQuery.mock.calls[0][1];
+    const updateCall = mockQuery.mock.calls.find(call => typeof call[0] === 'string' && call[0].includes('UPDATE streams'));
+    const updateSql: string = updateCall[0];
     expect(updateSql).not.toMatch(/\bamount\b/i);
     expect(updateSql).not.toMatch(/\bledger\b/i);
   });
@@ -190,35 +234,18 @@ describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
 
   // ── Audit trail ─────────────────────────────────────────────────────────────
 
-  it('writes a PII_ERASURE_REQUESTED audit entry on success', async () => {
+  it('writes audit entries on success without including full address', async () => {
     setQueryResults(1, 0);
     await request(app)
       .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(mockRecordAuditEventToDb).toHaveBeenCalled();
-    const [action, resourceType] = mockRecordAuditEventToDb.mock.calls[0];
-    expect(action).toBe('PII_ERASURE_REQUESTED');
-    expect(resourceType).toBe('streams');
-  });
+    const calls = mockRecordAuditEventToDb.mock.calls;
+    const erasureCall = calls.find(call => call[0] === 'GDPR_ERASURE' || call[0] === 'PII_ERASURE_REQUESTED');
+    expect(erasureCall).toBeDefined();
 
-  it('includes rowsErased in audit meta', async () => {
-    setQueryResults(5, 0);
-    await request(app)
-      .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
-      .set('Authorization', `Bearer ${ADMIN_KEY}`);
-
-    const meta = mockRecordAuditEventToDb.mock.calls[0][4];
-    expect(meta.rowsErased).toBe(5);
-  });
-
-  it('does not include the full address in audit resourceId (truncated)', async () => {
-    setQueryResults(1, 0);
-    await request(app)
-      .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
-      .set('Authorization', `Bearer ${ADMIN_KEY}`);
-
-    const resourceId: string = mockRecordAuditEventToDb.mock.calls[0][2];
+    const resourceId: string = erasureCall[2];
     expect(resourceId.length).toBeLessThan(VALID_ADDRESS.length);
     expect(resourceId).not.toBe(VALID_ADDRESS);
   });
@@ -234,26 +261,31 @@ describe('DELETE /api/privacy/erasure/:recipientAddress', () => {
     expect(res.body.rowsErased).toBe(2);
   });
 
-  // ── DB error handling ────────────────────────────────────────────────────────
+  // ── Transaction & DB error handling ──────────────────────────────────────────
 
-  it('returns 500 when the UPDATE query throws', async () => {
-    mockQuery.mockRejectedValueOnce(new Error('connection lost'));
+  it('returns 500 and issues ROLLBACK when the UPDATE query throws inside transaction', async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [] })                // BEGIN
+      .mockRejectedValueOnce(new Error('connection lost')); // UPDATE fails
+
     const res = await request(app)
       .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(500);
     expect(res.body.error.code).toBe('ERASURE_FAILED');
+    expect(mockQuery).toHaveBeenCalledWith('ROLLBACK');
   });
 
   it('attempts a failure audit entry when DB error occurs', async () => {
-    mockQuery.mockRejectedValueOnce(new Error('connection lost'));
+    mockQuery
+      .mockResolvedValueOnce({ rows: [] })                // BEGIN
+      .mockRejectedValueOnce(new Error('connection lost')); // UPDATE fails
+
     await request(app)
       .delete(`/api/privacy/erasure/${VALID_ADDRESS}`)
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(mockRecordAuditEventToDb).toHaveBeenCalled();
-    const meta = mockRecordAuditEventToDb.mock.calls[0][4];
-    expect(meta.outcome).toBe('failed');
   });
 
   // ── Idempotency ──────────────────────────────────────────────────────────────

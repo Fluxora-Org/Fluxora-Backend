@@ -278,7 +278,7 @@ test('WebhookDeliveryStore: getReadyOutboxItems orders by scheduledFor, ledger, 
 
 function addReadyItem(
   store: WebhookDeliveryStore,
-  overrides?: Partial<Omit<OutboxItem, 'id'>>,
+  overrides?: Partial<Omit<OutboxItem, 'id' | 'status'>>,
 ): string {
   return store.addToOutbox({
     deliveryId: 'deliv_test',
@@ -455,4 +455,73 @@ test('claimReadyOutboxItems: respects maxAttempts', () => {
   // No one should be able to claim an exhausted item
   const claimed = store.claimReadyOutboxItems({ workerId: 'worker-a', now });
   expect(claimed).toHaveLength(0);
+});
+
+test('addToOutbox always creates pending items regardless of input', () => {
+  const store = new WebhookDeliveryStore();
+  const now = Date.now();
+
+  // Attempt to pass every non-pending status via the spread of an object.
+  // The compile-time type should prevent `status` from being accepted, but
+  // this test provides a runtime regression guarantee as well.
+  const statuses = ['in_flight', 'delivered', 'failed'] as const;
+
+  for (const status of statuses) {
+    const baseItem = {
+      deliveryId: `deliv_${status}`,
+      eventId: 'event_test',
+      eventType: 'stream.created' as const,
+      endpointUrl: 'https://example.com',
+      payload: '{}',
+      secret: 'sec',
+      priority: 'normal' as const,
+      createdAt: now,
+      scheduledFor: now,
+      attempts: 0,
+      maxAttempts: 5,
+    };
+
+    // Spread an object that includes `status` to simulate a caller accidentally
+    // forwarding an existing item's fields.  The `addToOutbox` signature now
+    // excludes `status`, so at compile-time this would be an error; the cast
+    // below is intentional to test the runtime guard.
+    const itemWithStatus = { ...baseItem, status } as unknown as Parameters<
+      WebhookDeliveryStore['addToOutbox']
+    >[0];
+
+    const id = store.addToOutbox(itemWithStatus);
+    const stored = store.getAllOutboxItems().find((i) => i.id === id)!;
+
+    expect(stored.status).toBe('pending');
+  }
+});
+
+test('addToOutbox creates pending items for a normal call', () => {
+  const store = new WebhookDeliveryStore();
+  const id = addReadyItem(store, { deliveryId: 'normal_item' });
+  const item = store.getAllOutboxItems().find((i) => i.id === id)!;
+  expect(item.status).toBe('pending');
+});
+
+test('hydrateOutboxItem preserves the provided status', () => {
+  const store = new WebhookDeliveryStore();
+  const item: OutboxItem = {
+    id: 'hydrated_1',
+    deliveryId: 'deliv_hydrated',
+    eventId: 'event_hydrated',
+    eventType: 'stream.created',
+    endpointUrl: 'https://example.com',
+    payload: '{}',
+    secret: 'sec',
+    priority: 'normal',
+    createdAt: 0,
+    scheduledFor: 0,
+    attempts: 1,
+    maxAttempts: 5,
+    status: 'in_flight',
+  };
+
+  store.hydrateOutboxItem(item);
+  const stored = store.getAllOutboxItems().find((i) => i.id === 'hydrated_1')!;
+  expect(stored.status).toBe('in_flight');
 });

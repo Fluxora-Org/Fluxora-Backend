@@ -1,5 +1,11 @@
 # WebSocket Streams
 
+<!--
+  NatSpec / doc-comment style: this file documents both the public WebSocket
+  protocol and internal resilience mechanisms, with explicit security and
+  testing notes for each component.
+-->
+
 Fluxora exposes real-time treasury stream updates on `/ws/streams` using standard WebSockets.
 
 ## Connection Handshake
@@ -177,6 +183,100 @@ It also writes a structured `ws_backpressure` warning log with the same metadata
 The event and log intentionally exclude payload bodies, JWTs, API keys, and raw
 request headers.
 
+## Network Partition Resilience
+
+Fluxora's `StreamHub` is designed to tolerate network-partitioned clients —
+clients whose TCP connection accepts writes into the kernel send buffer but
+never reads or acknowledges data. In production, this occurs when a client's
+network drops inbound packets while keeping the TCP socket half-open (e.g.
+unplugged Wi-Fi, firewall silences inbound traffic, client process hangs).
+
+### Detection via `bufferedAmount`
+
+The hub checks `ws.bufferedAmount` before every outbound frame. When the
+remote peer stops reading, the kernel buffer fills and `bufferedAmount` grows.
+The hub acts at two thresholds:
+
+| Threshold                        | Action                                              |
+| -------------------------------- | --------------------------------------------------- |
+| `BACKPRESSURE_DROP_BYTES` (1 MiB) | Drop the frame for that client.                    |
+| `BACKPRESSURE_TERMINATE_BYTES` (4 MiB) | Drop the frame, terminate the connection, clean up subscriptions. |
+
+Both thresholds are configurable per-hub instance via
+`StreamHubOptions.dropBytes` / `StreamHubOptions.terminateBytes` or at
+runtime with `hub.setBackpressureThresholds({ dropBytes, terminateBytes })`.
+
+### Per-connection isolation
+
+Backpressure is applied independently per connection. A partitioned client
+never blocks delivery to healthy subscribers on the same stream. The hub
+iterates subscribers in a tight loop and skips or terminates slow sockets
+without `await` — no slow client can stall the broadcast.
+
+### Events and observability
+
+Each drop or termination emits a `backpressure` event:
+
+```ts
+hub.on('backpressure', (event) => {
+  // { action: 'drop' | 'terminate', streamId, eventId,
+  //   connectionId, bufferedAmount, thresholdBytes, timestamp }
+});
+```
+
+A structured `ws_backpressure` warning log is written with the same metadata.
+Neither the event nor the log includes payload bodies, JWTs, or user
+identifiers.
+
+### Testing with simulated network partitions
+
+The test fixture in `tests/ws/fixtures/slowClient.ts` provides
+`simulatePartition()` which emulates a full TCP receive-window stall:
+
+1. Sets a `partitioned` flag on the raw socket's `write` override.
+2. Each `ws.send()` call from that point forward increments an internal
+   `bufferedAmount` counter instead of writing to the real socket.
+3. The overridden write returns `true` (data accepted into the simulated OS
+   buffer) but never fires drain callbacks — the remote peer never acks.
+4. The hub sees `bufferedAmount` grow naturally with each broadcast and
+   applies the same drop/terminate thresholds as in production.
+
+See `tests/ws/ws.networkPartition.test.ts` for comprehensive tests covering:
+
+- `bufferedAmount` accumulation per broadcast
+- Drop-threshold crossing with backpressure event emission
+- Terminate-threshold crossing with connection cleanup
+- Bounded delivery latency to healthy peers during partition
+- Multiple partitioned clients handled independently
+- Subscription state cleanup after partition-triggered termination
+
+Example usage in a test:
+
+```ts
+const slow = await createSlowClient(port, hub);
+slow.subscribe('my-stream');
+slow.simulatePartition();
+
+// Each broadcast increases bufferedAmount naturally
+await hub.broadcast({ streamId: 'my-stream', eventId: 'e1', payload: {} });
+expect(slow.getBufferedAmount()).toBeGreaterThan(0);
+
+// Eventually thresholds are crossed
+await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
+// → backpressure event emitted, client may be terminated
+```
+
+### Security notes (partition handling)
+
+- No per-client unbounded queuing: the hub never queues messages for slow
+  clients beyond a single broadcast cycle.
+- Terminated connections have their subscriptions fully cleaned up:
+  `streamSubscriptions`, `recipientSubscriptions`, and per-client batch
+  accumulators are all purged.
+- The `backpressure` event intentionally excludes payloads, JWTs, and PII.
+- All termination is unidirectional (server originates close) — a partitioned
+  client cannot force the hub to hold state.
+
 ## Security Notes
 
 - Only JSON text frames are accepted; binary frames are rejected.
@@ -184,6 +284,87 @@ request headers.
 - Inbound client messages are rate-limited per connection.
 - Optional WebSocket JWT authentication can reject unauthenticated upgrades.
 - Backpressure metadata must not include sensitive stream payload contents.
+
+---
+
+## Graceful Shutdown
+
+When the server receives SIGTERM or SIGINT it performs an ordered shutdown that
+notifies every connected WebSocket client **before** closing the HTTP server,
+giving clients enough information to distinguish a planned deploy from an
+abnormal termination.
+
+### Client close frame
+
+```
+Code:   1001 (RFC 6455 "Going Away")
+Reason: {"reason":"server_shutdown"}   ← JSON-encoded, ≤ 125 bytes
+```
+
+The `reason` field is one of the documented `WS_CLOSE_REASONS` constants
+exported from `src/ws/hub.ts`:
+
+| Reason string      | Meaning                                                  |
+|--------------------|----------------------------------------------------------|
+| `server_shutdown`  | Planned deploy / SIGTERM — back off before reconnecting. |
+| `max_duration`     | Connection hit its max-duration limit — reconnect now.   |
+
+### Recommended client behaviour
+
+```js
+ws.onclose = (event) => {
+  try {
+    const { reason } = JSON.parse(event.reason);
+    if (reason === 'server_shutdown') {
+      // Planned shutdown — wait for the service to come back, then reconnect.
+      scheduleReconnectWithExponentialBackoff();
+    } else {
+      // Other close reason (e.g. max_duration) — reconnect immediately.
+      reconnect();
+    }
+  } catch {
+    // Malformed or empty reason — treat as abnormal, apply backoff.
+    scheduleReconnectWithExponentialBackoff();
+  }
+};
+```
+
+### Timeout budget
+
+Each client is given `closeFrameTimeoutMs` (default **5 000 ms**) to
+acknowledge the close frame.  Clients that do not reply within the deadline are
+force-terminated via `ws.terminate()` so the shutdown never blocks indefinitely
+on a single stalled connection.
+
+Configure a tighter deadline if your process shutdown budget is constrained:
+
+```ts
+const hub = new StreamHub(server, { closeFrameTimeoutMs: 1_000 });
+```
+
+### Shutdown hook wiring
+
+`StreamHub.gracefulClose()` is registered as a `DrainableService` via
+`addDrainableShutdownHook` in `src/websockets/streamChannel.ts`.  It runs in
+the correct order relative to HTTP and database draining:
+
+```
+SIGTERM received
+  → HTTP server stops accepting new TCP connections
+  → StreamHub.gracefulClose() — notifies WS clients, waits for ACK
+  → HTTP server drains in-flight requests
+  → DB pool closes
+  → process exits
+```
+
+### Security notes
+
+- The close-frame reason payload contains **only** the opaque enum string
+  `"server_shutdown"`.  No stream data, user identifiers, internal diagnostics,
+  connection IDs, or secrets are included.
+- The payload is bounded to ≤ 125 bytes (RFC 6455 §5.5 close-frame limit).
+- Per-client timeouts prevent a malicious or stalled client from holding the
+  shutdown sequence hostage.
 
 ---
 
@@ -317,3 +498,54 @@ that occur **during** the fan-out iteration:
   for the disconnected client.
 - Pending batch-accumulator timers for the disconnected client are cancelled
   by `onDisconnect`, preventing stale frame delivery.
+
+## Broadcast Authorization & Audit
+
+All WebSocket broadcasts originate from the blockchain indexer service, not from HTTP API endpoints. This section documents the broadcast trigger surface and authorization model.
+
+### Trigger Surface
+
+Broadcasts are triggered exclusively by `src/services/streamEventService.ts` when processing blockchain events:
+
+| Event Type | Function | Broadcast Payload |
+|------------|----------|-------------------|
+| `stream.created` | `processStreamCreated()` | Full stream details (id, parties, amounts, contract metadata) |
+| `stream.updated` | `processStreamUpdated()` | Updated fields (status, amounts, timestamps) |
+| `stream.cancelled` | `processStreamCancelled()` | Stream ID and cancellation status |
+
+### Authorization Model
+
+**No admin authentication is required** for broadcasts because:
+
+1. **Indexer-only origin**: Broadcasts are triggered by the blockchain indexer service ingesting on-chain events, not by HTTP API requests
+2. **No user-controlled path**: There is no HTTP endpoint that allows external users to trigger broadcasts directly
+3. **Chain of trust**: The indexer processes verified blockchain events from the Stellar network, establishing trust at the chain level
+
+The broadcast path:
+```
+Blockchain Event → Indexer Service → StreamEventService.process*() → Hub.broadcast() → WebSocket clients
+```
+
+### Audit Logging
+
+Every broadcast is logged via `recordAuditEvent()` with:
+
+- **Action**: `STREAM_BROADCAST`
+- **Resource**: `stream`
+- **Resource ID**: Stream ID
+- **Metadata**: Event type (`stream.created`, `stream.updated`, `stream.cancelled`) and event ID
+
+This provides a complete audit trail of all broadcasts for compliance and debugging purposes.
+
+### Security Properties
+
+- **No spoofing risk**: Broadcasts cannot be triggered by external HTTP requests
+- **Idempotency**: The indexer deduplicates events before broadcasting
+- **Recipient filtering**: Broadcasts include `recipientAddress` for client-side filtering
+- **Payload validation**: All broadcast payloads are validated before transmission
+
+### Testing
+
+The broadcast authorization model is tested in:
+- `tests/integration/broadcast-auth.test.ts` — Verifies no HTTP endpoint can trigger broadcasts
+- `tests/services/streamEventService.test.ts` — Validates audit logging for all event types

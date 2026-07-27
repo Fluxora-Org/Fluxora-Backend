@@ -16,6 +16,7 @@ import { enrichActiveSpanWithStream, traceSpan } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";
 import type { DedupCache } from "../redis/dedup.js";
 import { InMemoryDedupCache } from "../redis/dedup.js";
+import { recordAuditEvent } from "../lib/auditLog.js";
 
 /**
  * Structured event code emitted in all catch-block log entries.
@@ -200,6 +201,13 @@ export const streamEventService = {
         info("Stream created from event", { streamId, eventId, correlationId });
         const hub = getStreamHub();
         if (hub) {
+          recordAuditEvent(
+            "STREAM_BROADCAST",
+            "stream",
+            streamId,
+            correlationId,
+            { event: "stream.created", eventId, contractId: event.contractId }
+          );
           hub.broadcast({
             streamId,
             eventId,
@@ -319,6 +327,13 @@ export const streamEventService = {
         });
         const hub = getStreamHub();
         if (hub) {
+          recordAuditEvent(
+            "STREAM_BROADCAST",
+            "stream",
+            event.streamId,
+            correlationId,
+            { event: "stream.updated", eventId }
+          );
           hub.broadcast({
             streamId: event.streamId,
             eventId,
@@ -430,6 +445,13 @@ export const streamEventService = {
       });
       const hub = getStreamHub();
       if (hub) {
+        recordAuditEvent(
+          "STREAM_BROADCAST",
+          "stream",
+          event.streamId,
+          correlationId,
+          { event: "stream.cancelled", eventId }
+        );
         hub.broadcast({
           streamId: event.streamId,
           eventId,

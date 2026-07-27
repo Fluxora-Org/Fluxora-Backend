@@ -193,12 +193,24 @@ To avoid rows landing in the unindexed `DEFAULT` partition, partitions for the n
 
 Fluxora provides PostgreSQL logical replication as an enterprise streaming mechanism for external consumers to tail real-time chain events directly from the database. Logical replication provides a high-throughput, push-based alternative to polling `GET /internal/indexer/events` (`src/routes/indexer.ts`).
 
+Migration: `migrations/20260723180000_contract_events_logical_replication.ts`
+Tests: `tests/db/logicalReplication.test.ts`
+
 ### Publication Scope & Security
 
 The publication `fluxora_contract_events_pub` is narrowly scoped to ensure data isolation and security:
 
 - **Single Table Scope**: Scoped exclusively to the `contract_events` table. Tables containing Personally Identifiable Information (PII) or sensitive tokens (such as `streams`, `api_keys`, or `webhook_outbox`) are explicitly excluded from replication.
 - **Append-Only Operations**: Configured with `WITH (publish = 'insert')`. Since `contract_events` is an append-only event ledger, restricting publication strictly to `INSERT` operations eliminates unnecessary WAL replication overhead for table maintenance and prevents exposing operational updates or deletes.
+
+### Partition Awareness
+
+`contract_events` is a range-partitioned table (`PARTITION BY RANGE happened_at`). The publication uses `FOR TABLE contract_events` — **without `ONLY`** — so that INSERT changes from all child partitions (e.g., `contract_events_y2026m07`, `contract_events_default`) flow through the publication automatically as new monthly partitions are created.
+
+> [!NOTE]
+> Using `FOR TABLE ONLY contract_events` would silently publish nothing because all rows live in child partitions, not the parent table. Never add `ONLY` to this publication.
+
+By default (PostgreSQL 15+), `publish_via_partition_root = true` causes the WAL decoder to report all partition rows under the parent `contract_events` table identity. This simplifies consumer schema management — consumers see a single `contract_events` stream regardless of which monthly partition holds the row. For PostgreSQL 12–14, rows are reported under their respective child partition names.
 
 ### Prerequisites & Server Configuration
 
@@ -310,6 +322,24 @@ If a consumer is decommissioned or experiences an extended outage and lag exceed
   severity: warning
 ```
 
+### Running the Live Integration Tests
+
+The test suite in `tests/db/logicalReplication.test.ts` contains both offline unit tests (always run) and live-DB integration tests (require a real Postgres instance with `wal_level=logical`).
+
+Live tests are guarded by `INTEGRATION_DB=true` so they are **never triggered accidentally** by the test setup placeholder `DATABASE_URL`:
+
+```bash
+# Run live DB tests against a real database
+INTEGRATION_DB=true \
+DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:5432/indexer_db \
+pnpm test tests/db/logicalReplication.test.ts
+```
+
+The live suite verifies:
+- `fluxora_contract_events_pub` exists in `pg_publication` with `pubinsert=true`, `pubupdate=false`, `pubdelete=false`, `pubtruncate=false`
+- The publication is attached **solely** to `contract_events` (verified via `pg_publication_tables`)
+- `down()` fully removes the publication; `up()` re-applies it cleanly (rollback/re-apply cycle)
+
 ---
 
 ## PgBouncer / PgCat Transaction-Pooling Compatibility (issue #754)
@@ -412,4 +442,282 @@ PostgreSQL partition pruning is driven by predicates on the partition key (`happ
 
 ### Verification via EXPLAIN
 
-Partition pruning efficiency is verified via integration tests (`tests/db/contractEvents.partitionPruning.test.ts`) that execute `EXPLAIN (FORMAT JSON)` against representative store query shapes and inspect the plan output structure.
+Partition pruning efficiency is verified via integration tests
+(`tests/db/contractEvents.partitionPruning.test.ts`) that execute
+`EXPLAIN (FORMAT JSON)` against representative store query shapes and inspect
+the plan output structure.
+
+#### Test coverage
+
+| Test category | Description |
+|---|---|
+| **Offline — plan helpers** | `planScansPartition` / `getScannedPartitions` unit-tested against mock EXPLAIN JSON — no database required |
+| **Offline — InMemoryStore** | `InMemoryContractEventStore.getEvents()` filter parity: single-partition range, cross-partition range, no-filter |
+| **Live DB — single-partition EXPLAIN** | Bounded July query scans **only** `contract_events_y2026m07`; June and August partitions are pruned from the plan |
+| **Live DB — cross-partition EXPLAIN** | June-to-July range scans **exactly** `contract_events_y2026m06` and `contract_events_y2026m07`; August is pruned |
+| **Live DB — August-only EXPLAIN** | Bounded August query scans **only** `contract_events_y2026m08` |
+| **Live DB — store correctness** | `PostgresContractEventStore.getEvents()` returns the expected seed rows and excludes out-of-range rows |
+| **Live DB — ON CONFLICT idempotency** | Re-inserting an existing `(happened_at, event_id)` pair is a silent no-op (reported as `duplicateEventIds`) |
+
+#### Running the live tests
+
+```bash
+DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:5432/indexer_db \
+  pnpm test tests/db/contractEvents.partitionPruning.test.ts
+```
+
+Offline-only (no database):
+
+```bash
+pnpm test tests/db/contractEvents.partitionPruning.test.ts
+```
+
+#### `store.ts` — ON CONFLICT target
+
+Because `contract_events` is range-partitioned and its primary key is
+`(happened_at, event_id)`, the `INSERT … ON CONFLICT` clause in
+`PostgresContractEventStore.insertMany()` must specify **both** columns:
+
+```sql
+ON CONFLICT (happened_at, event_id) DO NOTHING
+```
+
+Using only `(event_id)` raises a PostgreSQL error
+(`there is no unique or exclusion constraint matching the ON CONFLICT
+specification`) on partitioned tables and was corrected as part of issue #932.
+
+---
+
+## Background Job Queue (pg-boss)
+
+### Overview
+
+Fluxora uses [pg-boss](https://github.com/timgit/pg-boss) for Postgres-backed background job processing. pg-boss provides durable, at-least-once job delivery with built-in retry, exponential backoff, cron scheduling, and dead letter queues — all within PostgreSQL.
+
+### The JobQueue Class
+
+Located at `src/jobs/queue.ts`, the `JobQueue` class wraps pg-boss and integrates with the application's existing `pg.Pool`:
+
+```typescript
+import { JobQueue, getJobQueue, setJobQueue } from './src/jobs/queue.js';
+
+const queue = new JobQueue(pool);
+setJobQueue(queue);
+```
+
+### Configuration
+
+pg-boss creates its own lightweight connection pool (2–4 connections, derived from the application pool's `max`). It uses the `pgboss` schema inside the same PostgreSQL database.
+
+Retry and expiration settings can be configured per job registration or per send:
+
+| Option | Default | Description |
+|---|---|---|
+| `retryLimit` | `2` | Max retries before the job is dead-lettered |
+| `retryDelay` | `60` | Base delay in seconds between retries |
+| `retryBackoff` | `true` | Exponential backoff enabled by default |
+| `retryDelayMax` | — | Cap for backoff-delay growth |
+| `expireInSeconds` | `900` | Max seconds a job may stay in active state |
+| `deadLetter` | — | Queue name to route terminally-failed jobs to |
+
+### Job Handler Registration
+
+Handlers are registered by name before the queue is started:
+
+```typescript
+queue.register('send-email', async (ctx) => {
+  const { id, data } = ctx;
+  await emailService.send(data);
+}, {
+  retryLimit: 3,
+  retryDelay: 30,
+  retryBackoff: true,
+});
+```
+
+The handler receives a `JobHandlerContext` with `id`, `name`, and `data`. Throwing from the handler triggers pg-boss's retry mechanism.
+
+### Sending Jobs
+
+```typescript
+await queue.send('send-email', { to: 'user@example.com', template: 'welcome' }, {
+  retryLimit: 3,
+  deadLetter: 'job_dead_letter_queue',
+});
+```
+
+### Scheduling with Cron
+
+```typescript
+await queue.schedule('partition-maintenance', '0 0 * * *', undefined, {
+  retryLimit: 2,
+  retryDelay: 60,
+});
+```
+
+### Retry and Dead Letter Behavior
+
+1. If a handler throws, pg-boss retries the job with exponential backoff (`retryDelay * 2^retryCount` with jitter).
+2. After exhausting `retryLimit` retries, the job is moved to the configured dead letter queue (`deadLetter` option).
+3. A custom `job_dead_letter` table (see migration below) stores additional metadata about failed jobs for operational inspection.
+
+### Lifecycle
+
+```typescript
+await queue.start();  // Begins processing — registers work handlers
+await queue.stop();   // Graceful shutdown — stops workers and releases resources
+```
+
+### Singleton Access
+
+The module exports `getJobQueue()` / `setJobQueue()` following the same pattern as `pool.ts`:
+
+```typescript
+import { getJobQueue } from './src/jobs/queue.js';
+const queue = getJobQueue();
+if (queue) {
+  await queue.send('my-job', data);
+}
+```
+
+### Migration
+
+Migration `migrations/20260727000000_job_dead_letter.ts` creates the `job_dead_letter` table for jobs that have exhausted retries:
+
+```sql
+CREATE TABLE IF NOT EXISTS job_dead_letter (
+  id BIGSERIAL PRIMARY KEY,
+  job_name TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  payload JSONB,
+  error_message TEXT,
+  failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  retry_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_job_dead_letter_name ON job_dead_letter(job_name);
+```
+
+Apply with:
+
+```bash
+pnpm run migrate
+```
+
+### Tests
+
+Unit tests for the queue are in `tests/jobs/queue.test.ts`. They mock pg-boss using `vi.mock()` to test the `JobQueue` class independently of a real database.
+
+---
+
+## Scripted Database Operations & Operator Ergonomics
+
+### Overview & Architecture
+
+Script-based database operations reside in [`src/scripts/db-ops.ts`](../src/scripts/db-ops.ts). This module provides production-grade wrappers around PostgreSQL utilities (`pg_dump` and `pg_restore`) as well as SQL partition cleanup utilities (`dropOldPartitions`).
+
+The design prioritizes zero-disk footprint (streaming dumps directly to/from S3), strict shell injection safety, credential isolation, and fail-safe operator defaults.
+
+```
+                  ┌──────────────────────────────────────────────┐
+                  │              src/scripts/db-ops.ts           │
+                  └──────┬───────────────────────────────┬───────┘
+                         │                               │
+             ┌───────────▼───────────┐       ┌───────────▼───────────┐
+             │    backupDatabase     │       │    restoreDatabase    │
+             └─────┬───────────┬─────┘       └─────┬───────────┬─────┘
+                   │           │                   │           │
+           (Local) │           │ (S3 Stream)  (Local)│           │ (S3 Stream)
+                   ▼           ▼                   ▼           ▼
+             execFile       spawn               execFile     spawn
+            "pg_dump"     "pg_dump"            "pg_restore" "pg_restore"
+             └─► Disk      └─► S3 Upload         ▲           ▲
+                                                 │           │
+                                                Disk       S3 Stream
+```
+
+### Core Operations Reference
+
+#### 1. `backupDatabase(databaseUrl, outputPath, s3Target?)`
+
+Generates a custom-format PostgreSQL database backup (`--format=custom`).
+
+- **Local Mode** (`s3Target` omitted): Executes `pg_dump` via `execFile`, writing output directly to `outputPath`.
+- **S3 Streaming Mode** (`s3Target` provided): Spawns `pg_dump` stdout stream piped into a `PassThrough` stream to AWS S3 using `@aws-sdk/lib-storage` `Upload`. The dump streams directly to S3 without creating temporary files on the local filesystem.
+- **Return Type**: `Promise<DbOperationResult>` where:
+  ```typescript
+  export interface DbOperationResult {
+    success: boolean;
+    message: string;
+    /** Raw stderr / error detail — never contains connection passwords or AWS keys */
+    error?: string;
+  }
+  ```
+
+#### 2. `restoreDatabase(databaseUrl, inputPath, s3Source?)`
+
+Restores a custom-format PostgreSQL database dump using `pg_restore`.
+
+- **Local Mode** (`s3Source` omitted): Executes `pg_restore` via `execFile` from `inputPath`.
+- **S3 Streaming Mode** (`s3Source` provided): Downloads object body via S3 `GetObjectCommand` and streams `response.Body` directly into `pg_restore` standard input (`stdin`).
+- **Flags Used**:
+  - `--clean`: Drops database objects before restoring them.
+  - `--no-owner`: Skips restoration of original object ownership, enabling portable restores across environments with different database roles.
+  - `--no-password`: Prevents prompt hanging when credentials are missing or invalid.
+
+> [!WARNING]
+> `--clean` drops existing database tables/objects before recreating them. Ensure active database connections are closed or quieted before invoking `restoreDatabase` in production.
+
+#### 3. `dropOldPartitions(pool, parentTable, olderThanDays, dryRun = true)`
+
+Performs retention-based partition pruning for range-partitioned tables such as `contract_events`.
+
+- **Bound Extraction**: Queries `pg_inherits` and `pg_class`, extracting upper bound date strings using `/TO \('([^']+)'\)/` from `pg_get_expr(c.relpartbound, c.oid)`.
+- **Default Partition Handling**: Automatically skips the `DEFAULT` partition (`partition_bound === 'DEFAULT'`).
+- **Dry-Run Safety**: Defaults `dryRun = true`. Operators must explicitly pass `dryRun = false` to execute `DROP TABLE IF EXISTS`.
+
+### Security & Credential Protection
+
+1. **Input Validation**:
+   - Connection strings: Validated against `^postgre(?:s|sql):\/\/` before spawning subprocesses. Rejects empty strings, whitespace, and non-postgres schemes (`mysql://`, `redis://`, etc.).
+   - File paths: Validated to reject empty strings and shell control characters (`[\0`$|;&<>]`).
+2. **Subprocess Isolation**:
+   - Uses Node.js `execFile` (array form) and `spawn` with explicit argument vectors.
+   - Arguments are never concatenated into a shell string, eliminating shell injection vectors.
+3. **Password & Credential Masking**:
+   - `DATABASE_URL` credentials and AWS secrets are consumed strictly from environment variables or argument inputs.
+   - Raw database passwords are never printed to console or leaked inside `DbOperationResult.error` strings during error conditions.
+4. **AWS Credential Isolation**:
+   - Uses AWS SDK v3 environment provider chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+   - S3 credentials are never logged or stored in job results.
+
+### Decimal-String Serialization Guarantee
+
+Financial and numerical fields in Fluxora (e.g. event stream amounts, token balances) are stored as decimal strings in database `TEXT` or `NUMERIC` columns.
+
+The `db-ops` module processes backup and restore operations purely as binary/text byte streams. No JSON coercion or numeric parsing is applied to table records, guaranteeing zero loss of precision for monetary values.
+
+### Operator Ergonomics & Safety Controls
+
+| Ergonomic Control | Behavior | Benefit |
+|---|---|---|
+| **Default Dry Run** | `dropOldPartitions` defaults `dryRun = true` | Prevents accidental data deletion if invoked without arguments |
+| **Lazy AWS SDK Loading** | Dynamic `import('@aws-sdk/client-s3')` and `import('@aws-sdk/lib-storage')` | `db-ops.ts` runs in local-only mode even when `@aws-sdk` packages are not installed |
+| **AWS Region Resolution** | `s3Target.region` ➔ `AWS_REGION` ➔ `AWS_DEFAULT_REGION` ➔ `'us-east-1'` | Flexible environment configuration across AWS ECS, Lambda, and local environments |
+| **Whitespace Normalization** | Trims leading/trailing whitespace from `databaseUrl`, `outputPath`, and `inputPath` | Prevents spurious validation failures from whitespace in config files or CLI input |
+| **Clean Output Interface** | `DbOperationResult` standardizes `{ success, message, error }` | Simplifies caller code, logging, and error handling |
+
+### Regression Surface & Edge-Case Matrix
+
+| Component / Function | Input / Condition | Expected Behavior | Failure Mode / Mitigation |
+|---|---|---|---|
+| `backupDatabase` | Empty or whitespace `databaseUrl` | Returns `{ success: false, message: 'DATABASE_URL is required...' }` | Fast failure before subprocess creation |
+| `backupDatabase` | Non-postgres scheme (`mysql://`) | Returns `{ success: false, message: 'DATABASE_URL must be a valid PostgreSQL...' }` | Fast failure before subprocess creation |
+| `backupDatabase` | File path with `;` or `` ` `` | Returns `{ success: false, message: 'Output path contains invalid characters.' }` | Rejection of unsafe path inputs |
+| `backupDatabase` | Local mode, `pg_dump` fails | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | Error captured without password leakage |
+| `backupDatabase` | S3 mode, AWS SDK missing | Throws Error: `'AWS SDK v3 is not installed...'` | Clear diagnostic message asking user to install SDK |
+| `backupDatabase` | S3 mode, `pg_dump` non-zero exit | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | S3 upload discarded, error reported |
+| `restoreDatabase` | S3 mode, S3 object body null/empty | Returns `{ success: false, message: 'Restore failed', error: 'S3 object ... returned an empty body' }` | Prevents hanging `pg_restore` on empty input |
+| `dropOldPartitions` | Table has `DEFAULT` partition | `DEFAULT` partition is skipped; never dropped | Prevents dropping catch-all partition |
+| `dropOldPartitions` | Unparseable partition bound | Partition is skipped without throwing | Log/continue without breaking retention task |
+| `dropOldPartitions` | `dryRun = true` | Returns list of partition names in `droppedPartitions`; no `DROP TABLE` query issued | Safe audit before execution |
+

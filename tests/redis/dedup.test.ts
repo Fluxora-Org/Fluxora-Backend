@@ -15,6 +15,7 @@ import {
     RedisDedupCache,
     HybridDedupCache,
     __resetDedupForTest,
+    DEDUP_CACHE_MAX,
     type DedupCache,
 } from '../../src/redis/dedup.js';
 import type { RedisClient } from '../../src/redis/client.js';
@@ -25,8 +26,12 @@ import { logger } from '../../src/logging/logger.js';
 const mockRedisClient = (overrides: Partial<RedisClient> = {}): RedisClient => ({
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue(undefined),
+    setNx: vi.fn().mockResolvedValue(true),
+    del: vi.fn().mockResolvedValue(undefined),
     exists: vi.fn().mockResolvedValue(false),
     close: vi.fn().mockResolvedValue(undefined),
+    multi: vi.fn(),
+    zcount: vi.fn().mockResolvedValue(0),
     ...overrides,
 });
 
@@ -98,22 +103,22 @@ describe('RedisDedupCache', () => {
         expect(client.exists).toHaveBeenCalledWith('fluxora:dedup:stream-1:evt-1');
     });
 
-    it('delegates set to Redis client with TTL', async () => {
+    it('delegates add to Redis client via setNx with TTL', async () => {
         await cache.add('stream-1', 'evt-1');
-        expect(client.set).toHaveBeenCalledWith(
+        expect(client.setNx).toHaveBeenCalledWith(
             'fluxora:dedup:stream-1:evt-1',
             '1',
-            { ex: 86400 }
+            86400 * 1000
         );
     });
 
-    it('returns custom TTL when provided', async () => {
+    it('uses custom TTL when provided', async () => {
         const cacheWithTTL = new RedisDedupCache(client, 3600);
         await cacheWithTTL.add('stream-1', 'evt-1');
-        expect(client.set).toHaveBeenCalledWith(
+        expect(client.setNx).toHaveBeenCalledWith(
             'fluxora:dedup:stream-1:evt-1',
             '1',
-            { ex: 3600 }
+            3600 * 1000
         );
     });
 
@@ -122,14 +127,18 @@ describe('RedisDedupCache', () => {
         expect(client.close).toHaveBeenCalled();
     });
 
-    it('returns false when Redis exists throws', async () => {
+    it('rethrows and records metric when Redis exists throws', async () => {
+        const incSpy = vi.spyOn(dedupRedisErrorsTotal, 'inc');
         vi.mocked(client.exists).mockRejectedValue(new Error('connection failed'));
-        await expect(cache.has('stream-1', 'evt-1')).resolves.toBe(false);
+        await expect(cache.has('stream-1', 'evt-1')).rejects.toThrow('connection failed');
+        expect(incSpy).toHaveBeenCalledWith({ operation: 'has' });
     });
 
-    it('swallows errors when add throws', async () => {
-        vi.mocked(client.set).mockRejectedValue(new Error('write failed'));
-        await expect(cache.add('stream-1', 'evt-1')).resolves.toBeUndefined();
+    it('rethrows and records metric when add throws', async () => {
+        const incSpy = vi.spyOn(dedupRedisErrorsTotal, 'inc');
+        vi.mocked(client.setNx).mockRejectedValue(new Error('write failed'));
+        await expect(cache.add('stream-1', 'evt-1')).rejects.toThrow('write failed');
+        expect(incSpy).toHaveBeenCalledWith({ operation: 'add' });
     });
 
     it('clear is a no-op', async () => {
@@ -157,7 +166,7 @@ describe('RedisDedupCache – metrics', () => {
         const incSpy = vi.spyOn(dedupRedisErrorsTotal, 'inc');
         client.throwOnNext('exists');
 
-        await cache.has('s1', 'e1');
+        await expect(cache.has('s1', 'e1')).rejects.toThrow();
 
         expect(incSpy).toHaveBeenCalledWith({ operation: 'has' });
     });
@@ -165,9 +174,9 @@ describe('RedisDedupCache – metrics', () => {
     it('increments error counter on add() failure', async () => {
         __resetDedupForTest();
         const incSpy = vi.spyOn(dedupRedisErrorsTotal, 'inc');
-        client.throwOnNext('set');
+        client.throwOnNext('setNx');
 
-        await cache.add('s1', 'e1');
+        await expect(cache.add('s1', 'e1')).rejects.toThrow();
 
         expect(incSpy).toHaveBeenCalledWith({ operation: 'add' });
     });
@@ -186,7 +195,7 @@ describe('HybridDedupCache', () => {
         beforeEach(() => {
             const mockPrimary: DedupCache = {
                 has: vi.fn().mockResolvedValue(false),
-                add: vi.fn().mockResolvedValue(undefined),
+                add: vi.fn().mockResolvedValue(true),
                 clear: vi.fn().mockResolvedValue(undefined),
                 close: vi.fn().mockResolvedValue(undefined),
             };
@@ -194,18 +203,12 @@ describe('HybridDedupCache', () => {
             hybrid = new HybridDedupCache(primary, fallback, true);
         });
 
-        it('checks Redis first, then fallback', async () => {
-            await hybrid.has('stream-1', 'evt-1');
-            expect(vi.mocked(primary.has)).toHaveBeenCalledWith('stream-1', 'evt-1');
-            await expect(fallback.has('stream-1', 'evt-1')).resolves.toBe(false);
-        });
-
         it('returns true if found in Redis', async () => {
             vi.mocked(primary.has).mockResolvedValue(true);
             await expect(hybrid.has('stream-1', 'evt-1')).resolves.toBe(true);
         });
 
-        it('adds to both caches', async () => {
+        it('adds to both caches on first encounter', async () => {
             await hybrid.add('stream-1', 'evt-1');
             expect(vi.mocked(primary.add)).toHaveBeenCalledWith('stream-1', 'evt-1');
             await expect(fallback.has('stream-1', 'evt-1')).resolves.toBe(true);
@@ -281,7 +284,7 @@ describe('HybridDedupCache', () => {
             await hybrid.has('stream-1', 'evt-1');
 
             expect(incSpy).toHaveBeenCalledWith({ operation: 'has' });
-            expect(debugSpy).toHaveBeenCalledWith('dedup:fallback', {
+            expect(debugSpy).toHaveBeenCalledWith('dedup:fallback', undefined, {
                 operation: 'has',
                 streamId: 'stream-1',
                 eventId: 'evt-1',
@@ -297,7 +300,7 @@ describe('HybridDedupCache', () => {
             await hybrid.add('stream-1', 'evt-1');
 
             expect(incSpy).toHaveBeenCalledWith({ operation: 'add' });
-            expect(debugSpy).toHaveBeenCalledWith('dedup:fallback', {
+            expect(debugSpy).toHaveBeenCalledWith('dedup:fallback', undefined, {
                 operation: 'add',
                 streamId: 'stream-1',
                 eventId: 'evt-1',
@@ -311,10 +314,78 @@ describe('DedupCache key format', () => {
         const client = mockRedisClient();
         const cache = new RedisDedupCache(client);
         await cache.add('stream-abc', 'evt-xyz');
-        expect(client.set).toHaveBeenCalledWith(
+        expect(client.setNx).toHaveBeenCalledWith(
             'fluxora:dedup:stream-abc:evt-xyz',
             '1',
-            expect.any(Object)
+            expect.any(Number)
         );
+    });
+});
+
+describe('InMemoryDedupCache FIFO eviction', () => {
+    it('evicts the oldest-inserted key when exceeding DEDUP_CACHE_MAX', async () => {
+        const cache = new InMemoryDedupCache();
+        const max = DEDUP_CACHE_MAX;
+
+        for (let i = 0; i < max; i++) {
+            await cache.add('stream', 'evt-' + i);
+        }
+
+        await expect(cache.has('stream', 'evt-0')).resolves.toBe(true);
+
+        const added = await cache.add('stream', 'evt-' + max);
+        expect(added).toBe(true);
+
+        await expect(cache.has('stream', 'evt-0')).resolves.toBe(false);
+        await expect(cache.has('stream', 'evt-1')).resolves.toBe(true);
+        await expect(cache.has('stream', 'evt-' + max)).resolves.toBe(true);
+    });
+
+    it('evicts in strict FIFO order over multiple insertions', async () => {
+        const cache = new InMemoryDedupCache();
+        const max = DEDUP_CACHE_MAX;
+
+        for (let i = 0; i < max; i++) {
+            await cache.add('s', 'e-' + i);
+        }
+
+        for (let i = 0; i < 5; i++) {
+            await cache.add('s', 'overflow-' + i);
+        }
+
+        for (let i = 0; i < 5; i++) {
+            await expect(cache.has('s', 'e-' + i)).resolves.toBe(false);
+        }
+
+        await expect(cache.has('s', 'e-5')).resolves.toBe(true);
+    });
+});
+
+describe('HybridDedupCache Redis-outage replay false-negative', () => {
+    it('treats replayed event as new after cache overflow during Redis outage', async () => {
+        const max = DEDUP_CACHE_MAX;
+        const fallback = new InMemoryDedupCache();
+
+        const brokenPrimary: DedupCache = {
+            has: vi.fn().mockRejectedValue(new Error('Redis down')),
+            add: vi.fn().mockRejectedValue(new Error('Redis down')),
+            clear: vi.fn(),
+            close: vi.fn(),
+        };
+
+        const hybrid = new HybridDedupCache(brokenPrimary, fallback, true);
+
+        for (let i = 0; i < max + 100; i++) {
+            await hybrid.add('stream', 'evt-' + i);
+        }
+
+        await expect(hybrid.has('stream', 'evt-0')).resolves.toBe(false);
+
+        const readded = await hybrid.add('stream', 'evt-0');
+        expect(readded).toBe(true);
+
+        await expect(hybrid.has('stream', 'evt-' + (max + 99))).resolves.toBe(true);
+        const duplicate = await hybrid.add('stream', 'evt-' + (max + 99));
+        expect(duplicate).toBe(false);
     });
 });

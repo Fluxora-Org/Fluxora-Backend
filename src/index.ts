@@ -38,6 +38,8 @@ import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { reloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
 import { probeStartupDependencies } from './config/health.js';
+import { startTracing } from './tracing/index.js';
+import { initLogsBridge } from './tracing/logsBridge.js';
 
 const app = express();
 
@@ -68,18 +70,28 @@ if (process.env.NODE_ENV !== 'test') {
   /**
    * Startup initialization sequence:
    * 1. Capture startup env snapshot for restart-only-key detection.
-   * 2. Run tiered startup dependency probes:
+   * 2. Start the OpenTelemetry SDK and activate the logs bridge
+   *    (when TRACING_OTEL_ENABLED=true). Both calls are no-ops when disabled.
+   * 3. Run tiered startup dependency probes:
    *    - Postgres (hard): single attempt, fast-fail on error.
    *    - Redis (soft): retry-with-backoff, degrade on budget exhaustion.
    *    - Stellar RPC (soft): retry-with-backoff, degrade on budget exhaustion.
-   * 3. Validate admin state file writability (graceful degradation on failure).
-   * 4. Start the HTTP server and begin accepting requests.
-   * 5. Resume any incomplete indexer replays from the database checkpoint.
+   * 4. Validate admin state file writability (graceful degradation on failure).
+   * 5. Start the HTTP server and begin accepting requests.
+   * 6. Resume any incomplete indexer replays from the database checkpoint.
    */
   captureStartupEnvSnapshot();
 
   (async () => {
     const cfg = loadConfig();
+
+    // ── OpenTelemetry SDK & Logs Bridge ───────────────────────────────────
+    // Must be called before the first request is served so that
+    // auto-instrumentation patches are active from the start.
+    // startTracing() is a no-op when OTEL_SDK_DISABLED=true or already running.
+    // initLogsBridge() is a no-op when tracingOtelEnabled=false.
+    startTracing();
+    initLogsBridge({ enabled: cfg.tracingOtelEnabled });
 
     // ── Tiered startup probing ────────────────────────────────────────────
     // Build lightweight probes that do not require full client initialisation.

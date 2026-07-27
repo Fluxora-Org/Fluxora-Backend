@@ -6,6 +6,7 @@ import {
   getWebhookCircuitBreakerStore,
   setWebhookCircuitBreakerStore,
   hashConsumerUrl,
+  transitionsTotal,
   WEBHOOK_CIRCUIT_BREAKER_KEY_PREFIX,
   WEBHOOK_CIRCUIT_BREAKER_PROBE_PREFIX,
   type WebhookCircuitBreakerStore,
@@ -614,5 +615,307 @@ describe('checkWebhookDeliveryGate / attemptWebhookDeliveryWithRateLimit', () =>
     expect(plan.shouldRetry).toBe(true);
     expect(plan.retryAt).toEqual(new Date(now + 2000));
     expect(plan.payload).toMatchObject({ id: 'evt-1', _webhookRetry: { attemptNumber: 2 } });
+  });
+});
+
+// ── Metric emission helpers ────────────────────────────────────────────────────
+
+async function getCounterValue(
+  labels: { from_state: string; to_state: string; consumer_hash: string },
+): Promise<number> {
+  const snapshot = await transitionsTotal.get();
+  const series = snapshot.values.find(
+    (v) =>
+      v.labels.from_state === labels.from_state &&
+      v.labels.to_state === labels.to_state &&
+      v.labels.consumer_hash === labels.consumer_hash,
+  );
+  return series?.value ?? 0;
+}
+
+async function getTotalCounterValue(): Promise<number> {
+  const snapshot = await transitionsTotal.get();
+  return snapshot.values.reduce((sum, v) => sum + v.value, 0);
+}
+
+// ── Redis store metric emissions ───────────────────────────────────────────────
+
+describe('Webhook Circuit Breaker — metric emissions (Redis store)', () => {
+  let redis: FakeRedisClient;
+  let store: RedisWebhookCircuitBreakerStore;
+
+  const url = 'https://metrics-test.example/hook';
+  const hash = hashConsumerUrl(url);
+
+  beforeEach(() => {
+    redis = new FakeRedisClient();
+    store = new RedisWebhookCircuitBreakerStore(redis);
+    registry.removeSingleMetric('fluxora_webhook_circuit_breaker_transitions_total');
+  });
+
+  afterEach(async () => {
+    await store.close();
+    redis.reset();
+  });
+
+  it('emits closed → open when threshold is reached', async () => {
+    const now = 100_000;
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(url, policy, now + i);
+    }
+
+    const val = await getCounterValue({ from_state: 'closed', to_state: 'open', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('emits open → half-open when probe is claimed after reset', async () => {
+    const now = 200_000;
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(url, policy, now + i);
+    }
+    const openState = await store.getState(url);
+    await store.checkAndClaimAttempt(url, policy, openState!.resetAt);
+
+    const val = await getCounterValue({ from_state: 'open', to_state: 'half-open', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('emits half-open → open when probe fails', async () => {
+    const now = 300_000;
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(url, policy, now + i);
+    }
+    const openState = await store.getState(url);
+    await store.checkAndClaimAttempt(url, policy, openState!.resetAt);
+    await store.recordFailure(url, policy, openState!.resetAt + 1);
+
+    const val = await getCounterValue({ from_state: 'half-open', to_state: 'open', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('emits half-open → closed on successful probe', async () => {
+    const now = 400_000;
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(url, policy, now + i);
+    }
+    const openState = await store.getState(url);
+    await store.checkAndClaimAttempt(url, policy, openState!.resetAt);
+    await store.recordSuccess(url, policy);
+
+    const val = await getCounterValue({ from_state: 'half-open', to_state: 'closed', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('emits open → closed when recordSuccess is called on an open circuit (recovery)', async () => {
+    const now = 500_000;
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(url, policy, now + i);
+    }
+    const openState = await store.getState(url);
+    expect(openState?.state).toBe('open');
+
+    await store.recordSuccess(url, policy);
+
+    const val = await getCounterValue({ from_state: 'open', to_state: 'closed', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('does not emit when recording success on already-closed circuit', async () => {
+    await store.recordSuccess(url, policy);
+
+    const total = await getTotalCounterValue();
+    expect(total).toBe(0);
+  });
+
+  it('does not emit when failure count is below threshold (stays closed)', async () => {
+    await store.recordFailure(url, policy, Date.now());
+
+    const total = await getTotalCounterValue();
+    expect(total).toBe(0);
+  });
+
+  it('does not emit when threshold is disabled', async () => {
+    const disabled = { ...policy, circuitBreakerThreshold: 0 };
+    await store.recordFailure(url, disabled, Date.now());
+
+    const total = await getTotalCounterValue();
+    expect(total).toBe(0);
+  });
+
+  it('tracks separate counters for different consumer URLs', async () => {
+    const urlA = 'https://consumer-a.example/hook';
+    const urlB = 'https://consumer-b.example/hook';
+    const hashA = hashConsumerUrl(urlA);
+    const hashB = hashConsumerUrl(urlB);
+
+    const now = 600_000;
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(urlA, policy, now + i);
+      await store.recordFailure(urlB, policy, now + i);
+    }
+
+    const valA = await getCounterValue({ from_state: 'closed', to_state: 'open', consumer_hash: hashA });
+    const valB = await getCounterValue({ from_state: 'closed', to_state: 'open', consumer_hash: hashB });
+    expect(valA).toBe(1);
+    expect(valB).toBe(1);
+  });
+
+  it('increments counter across multiple open/close cycles', async () => {
+    const now = 700_000;
+
+    // Cycle 1: closed → open
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(url, policy, now + i);
+    }
+    const openState = await store.getState(url);
+
+    // Cycle 1: open → half-open → closed
+    await store.checkAndClaimAttempt(url, policy, openState!.resetAt);
+    await store.recordSuccess(url, policy);
+
+    // Cycle 2: closed → open
+    for (let i = 0; i < 3; i++) {
+      await store.recordFailure(url, policy, now + 100_000 + i);
+    }
+
+    const valClosedOpen = await getCounterValue({ from_state: 'closed', to_state: 'open', consumer_hash: hash });
+    expect(valClosedOpen).toBe(2);
+  });
+
+  it('emits no metrics when Redis errors force fail-open', async () => {
+    redis.throwOnNext('get');
+    await store.checkAndClaimAttempt(url, policy);
+
+    const total = await getTotalCounterValue();
+    expect(total).toBe(0);
+  });
+});
+
+// ── In-memory store metric emissions ───────────────────────────────────────────
+
+describe('Webhook Circuit Breaker — metric emissions (InMemory store)', () => {
+  let memory: InMemoryWebhookCircuitBreakerStore;
+
+  const url = 'https://metrics-memory.example/hook';
+  const hash = hashConsumerUrl(url);
+
+  beforeEach(() => {
+    memory = new InMemoryWebhookCircuitBreakerStore();
+    registry.removeSingleMetric('fluxora_webhook_circuit_breaker_transitions_total');
+  });
+
+  afterEach(async () => {
+    await memory.close();
+  });
+
+  it('emits closed → open when threshold is reached', async () => {
+    const now = 800_000;
+    for (let i = 0; i < 3; i++) {
+      await memory.recordFailure(url, policy, now + i);
+    }
+
+    const val = await getCounterValue({ from_state: 'closed', to_state: 'open', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('emits open → half-open when probe is claimed after reset', async () => {
+    const now = 900_000;
+    for (let i = 0; i < 3; i++) {
+      await memory.recordFailure(url, policy, now + i);
+    }
+    const openState = await memory.getState(url);
+    await memory.checkAndClaimAttempt(url, policy, openState!.resetAt);
+
+    const val = await getCounterValue({ from_state: 'open', to_state: 'half-open', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('emits half-open → open when probe fails', async () => {
+    const now = 1_000_000;
+    for (let i = 0; i < 3; i++) {
+      await memory.recordFailure(url, policy, now + i);
+    }
+    const openState = await memory.getState(url);
+    await memory.checkAndClaimAttempt(url, policy, openState!.resetAt);
+    await memory.recordFailure(url, policy, openState!.resetAt + 1);
+
+    const val = await getCounterValue({ from_state: 'half-open', to_state: 'open', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('emits half-open → closed on successful probe', async () => {
+    const now = 1_100_000;
+    for (let i = 0; i < 3; i++) {
+      await memory.recordFailure(url, policy, now + i);
+    }
+    const openState = await memory.getState(url);
+    await memory.checkAndClaimAttempt(url, policy, openState!.resetAt);
+    await memory.recordSuccess(url, policy);
+
+    const val = await getCounterValue({ from_state: 'half-open', to_state: 'closed', consumer_hash: hash });
+    expect(val).toBe(1);
+  });
+
+  it('does not emit when recording success on already-closed circuit', async () => {
+    await memory.recordSuccess(url, policy);
+
+    const total = await getTotalCounterValue();
+    expect(total).toBe(0);
+  });
+
+  it('does not emit when failure count is below threshold (stays closed)', async () => {
+    await memory.recordFailure(url, policy, Date.now());
+
+    const total = await getTotalCounterValue();
+    expect(total).toBe(0);
+  });
+
+  it('increments counter across multiple open/close cycles', async () => {
+    const now = 1_200_000;
+
+    // Cycle 1: closed → open → half-open → closed
+    for (let i = 0; i < 3; i++) {
+      await memory.recordFailure(url, policy, now + i);
+    }
+    const openState = await memory.getState(url);
+    await memory.checkAndClaimAttempt(url, policy, openState!.resetAt);
+    await memory.recordSuccess(url, policy);
+
+    // Cycle 2: closed → open
+    for (let i = 0; i < 3; i++) {
+      await memory.recordFailure(url, policy, now + 100_000 + i);
+    }
+
+    const valClosedOpen = await getCounterValue({ from_state: 'closed', to_state: 'open', consumer_hash: hash });
+    expect(valClosedOpen).toBe(2);
+  });
+});
+
+// ── Consumer URL hashing (cardinality bounds) ──────────────────────────────────
+
+describe('Webhook Circuit Breaker — consumer_hash label cardinality', () => {
+  it('produces a 16-character hex string', () => {
+    const h = hashConsumerUrl('https://example.com/webhook');
+    expect(h).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('is deterministic for the same URL', () => {
+    const h1 = hashConsumerUrl('https://example.com/webhook');
+    const h2 = hashConsumerUrl('https://example.com/webhook');
+    expect(h1).toBe(h2);
+  });
+
+  it('produces different hashes for different URLs', () => {
+    const h1 = hashConsumerUrl('https://a.example.com/webhook');
+    const h2 = hashConsumerUrl('https://b.example.com/webhook');
+    expect(h1).not.toBe(h2);
+  });
+
+  it('does not leak the raw URL into the hash', () => {
+    const rawUrl = 'https://sensitive-internal.corp/webhook?token=abc123';
+    const h = hashConsumerUrl(rawUrl);
+    expect(h).not.toContain('sensitive');
+    expect(h).not.toContain('abc123');
+    expect(h).not.toContain('corp');
   });
 });

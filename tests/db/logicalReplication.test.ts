@@ -6,9 +6,15 @@
  * COVERS:
  *  - Migration SQL structure and idempotency checks for `up()` and `down()`.
  *  - Verification of narrow scoping: ONLY `contract_events` table and ONLY `publish = 'insert'`.
- *  - Guarantee that sensitive tables (such as `streams` or `api_keys`) are NOT included in the publication.
+ *  - Guarantee that sensitive tables (such as `streams`, `api_keys`, `webhook_outbox`) are NOT
+ *    included in the publication — preventing inadvertent PII exposure to replication consumers.
+ *  - Partition-aware publication: verifies the migration does NOT use `FOR TABLE ONLY` so that
+ *    child partitions (e.g., `contract_events_y2026m07`) are automatically included.
  *  - Operational query validation (slot creation, lag monitoring in bytes).
- *  - Live DB integration assertions (catalog checks on `pg_publication` and `pg_publication_tables`) when `DATABASE_URL` is available.
+ *  - Publication constant is stable and matches docs/database.md references.
+ *  - Live DB integration assertions (catalog checks on `pg_publication` and `pg_publication_tables`)
+ *    when an explicit `INTEGRATION_DB=true` environment variable is set alongside `DATABASE_URL`.
+ *    Live tests are skipped in normal CI where only a fake DATABASE_URL is available.
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
@@ -21,8 +27,13 @@ import {
   CONTRACT_EVENTS_PUBLICATION_NAME,
 } from '../../migrations/20260723180000_contract_events_logical_replication.js';
 
+/**
+ * Live-DB tests only run when INTEGRATION_DB=true is explicitly set.
+ * The test setup (tests/setup.ts) always populates DATABASE_URL with a placeholder
+ * value for unit tests; checking INTEGRATION_DB prevents false-positive live connections.
+ */
 const DATABASE_URL = process.env['DATABASE_URL'];
-const isLiveDb = Boolean(DATABASE_URL);
+const isLiveDb = process.env['INTEGRATION_DB'] === 'true' && Boolean(DATABASE_URL);
 
 /** Expected SQL commands and parameters for logical replication operations */
 export const LOGICAL_REPLICATION_CONSTANTS = {
@@ -109,6 +120,99 @@ describe('Postgres Logical Replication (Offline Contract Tests)', () => {
     expect(OPERATIONAL_QUERIES.dropSlot).toContain(LOGICAL_REPLICATION_CONSTANTS.slotName);
     expect(OPERATIONAL_QUERIES.monitorSlotLag).toContain('pg_replication_slots');
     expect(OPERATIONAL_QUERIES.monitorSlotLag).toContain('confirmed_flush_lsn');
+  });
+
+  it('does NOT use FOR TABLE ONLY — publication must include partitions of contract_events', async () => {
+    /**
+     * contract_events is a partitioned table (PARTITION BY RANGE happened_at).
+     * PostgreSQL logical replication publishes from the partition that holds the
+     * row, so the publication must reference the parent table WITHOUT "ONLY"
+     * (the default: `FOR TABLE contract_events` includes all child partitions).
+     * Using `FOR TABLE ONLY contract_events` would silently publish nothing from
+     * partitioned storage since rows land in child partitions, not the parent.
+     */
+    const pgm = createMockMigrationBuilder();
+    await up(pgm);
+
+    const sqlArg = (pgm.sql as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    // Must NOT restrict to parent-only rows
+    expect(sqlArg).not.toContain('FOR TABLE ONLY');
+    expect(sqlArg).not.toContain('for table only');
+    // Must contain the standard inclusive form
+    expect(sqlArg).toContain('FOR TABLE contract_events');
+  });
+
+  it('up() calls pgm.sql exactly once — no additional DDL side-effects', async () => {
+    const pgm = createMockMigrationBuilder();
+    await up(pgm);
+    // Only one pgm.sql call expected — the idempotent DO $$ ... $$ block
+    expect(pgm.sql).toHaveBeenCalledTimes(1);
+  });
+
+  it('down() calls pgm.sql exactly once — no additional DDL side-effects', async () => {
+    const pgm = createMockMigrationBuilder();
+    await down(pgm);
+    // Only one pgm.sql call expected — the DROP PUBLICATION IF EXISTS statement
+    expect(pgm.sql).toHaveBeenCalledTimes(1);
+  });
+
+  it('down() SQL is a fully safe no-op when publication does not exist (IF EXISTS guard)', async () => {
+    /**
+     * The `DROP PUBLICATION IF EXISTS` form guarantees the migration rollback
+     * never throws an error on a fresh environment where the publication was
+     * never created — this is a critical property for CI reset safety.
+     */
+    const pgm = createMockMigrationBuilder();
+    await down(pgm);
+    const sqlArg = (pgm.sql as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(sqlArg).toContain('IF EXISTS');
+    expect(sqlArg).toContain('DROP PUBLICATION');
+  });
+
+  it('publication name does not contain whitespace, special chars, or uppercase', () => {
+    /**
+     * PostgreSQL publication names follow identifier rules. Names with spaces or
+     * mixed case need quoting in tools like pg_dumpall or Debezium connector config.
+     * Enforcing lowercase-with-underscores keeps operational tooling simple.
+     */
+    expect(CONTRACT_EVENTS_PUBLICATION_NAME).toMatch(/^[a-z][a-z0-9_]*$/);
+    expect(CONTRACT_EVENTS_PUBLICATION_NAME).not.toContain(' ');
+    expect(CONTRACT_EVENTS_PUBLICATION_NAME).not.toMatch(/[A-Z]/);
+  });
+
+  it('slot name constant uses pgoutput plugin — native Postgres logical decoding, no extra plugin required', () => {
+    /**
+     * pgoutput is the built-in logical decoding plugin available in all PostgreSQL 10+
+     * deployments. It does not require the wal2json or decoderbufs extension.
+     * This ensures consumers (Debezium, pg_recvlogical, etc.) can attach without
+     * additional server-side plugin installation.
+     */
+    expect(OPERATIONAL_QUERIES.createSlot).toContain("'pgoutput'");
+    expect(OPERATIONAL_QUERIES.createSlot).not.toContain('wal2json');
+    expect(OPERATIONAL_QUERIES.createSlot).not.toContain('decoderbufs');
+  });
+
+  it('lag monitoring query uses raw byte diff, not size_pretty — enables numeric alerting thresholds', () => {
+    /**
+     * Prometheus alerting rules and monitoring dashboards require numeric byte values
+     * rather than human-readable strings from pg_size_pretty(). The raw
+     * pg_wal_lsn_diff() column enables `> 5368709120` (5 GB) style alert rules.
+     */
+    expect(OPERATIONAL_QUERIES.monitorSlotLag).toContain('pg_wal_lsn_diff(');
+    expect(OPERATIONAL_QUERIES.monitorSlotLag).toContain('pg_current_wal_lsn()');
+    expect(OPERATIONAL_QUERIES.monitorSlotLag).toContain('confirmed_flush_lsn');
+    // Must return a numeric column, not pg_size_pretty
+    expect(OPERATIONAL_QUERIES.monitorSlotLag).not.toContain('pg_size_pretty');
+  });
+
+  it('LOGICAL_REPLICATION_CONSTANTS are internally consistent', () => {
+    // Publication name in constants matches the exported constant
+    expect(LOGICAL_REPLICATION_CONSTANTS.publicationName).toBe(CONTRACT_EVENTS_PUBLICATION_NAME);
+    // Slot name references the documented slot identifier
+    expect(LOGICAL_REPLICATION_CONSTANTS.slotName).toBe('fluxora_contract_events_slot');
+    // Confirm the table name and operation are consistent with the issue requirements
+    expect(LOGICAL_REPLICATION_CONSTANTS.targetTable).toBe('contract_events');
+    expect(LOGICAL_REPLICATION_CONSTANTS.allowedOperation).toBe('insert');
   });
 });
 

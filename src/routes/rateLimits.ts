@@ -51,7 +51,9 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
     const method = typeof req.query.method === 'string' ? req.query.method.toUpperCase() : undefined;
 
     // getStatus now queries the live Redis store (or in-memory fallback).
-    const status = await limiter.getStatus(identifier, identifierType, path, method);
+    // Pass the authenticated identity (keyId) so per-tenant overrides are reflected.
+    const keyId = req.keyId;
+    const status = await limiter.getStatus(identifier, identifierType, path, method, keyId);
 
     res.setHeader('X-RateLimit-Limit', String(status.limit));
     res.setHeader('X-RateLimit-Remaining', String(status.remaining));

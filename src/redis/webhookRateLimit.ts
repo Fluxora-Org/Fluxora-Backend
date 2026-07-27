@@ -37,6 +37,13 @@ export interface RateLimitConfig {
   limit: number;
   /** Sliding-window duration in milliseconds. */
   windowMs: number;
+  /**
+   * Token-bucket burst allowance.
+   * When > 0, up to `burst` consecutive attempts are allowed in zero time
+   * before the steady-state rate (limit / windowMs) is enforced.
+   * When 0 (default), the limiter behaves as a flat sliding-window limit.
+   */
+  burst: number;
 }
 
 export interface RateLimitResult {
@@ -56,6 +63,16 @@ export const DEFAULT_WEBHOOK_RETRY_RPS = 10;
 export const RATE_LIMIT_MAX_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 export const RATE_LIMIT_MAX_LIMIT = 100_000;
 export const RATE_LIMIT_MIN_WINDOW_MS = 100; // 100ms minimum
+
+/**
+ * Minimal interface that both the Redis-backed and token-bucket rate
+ * limiters implement.  Keeps the dispatch pipeline decoupled from the
+ * storage strategy.
+ */
+export interface IWebhookRateLimiter {
+  checkLimit(consumerUrl: string, config: RateLimitConfig): Promise<RateLimitResult>;
+  recordFailure(consumerUrl: string, config: RateLimitConfig): Promise<void>;
+}
 
 export class RateLimitConfigError extends Error {
   constructor(message: string) {
@@ -85,9 +102,14 @@ export function validateRateLimitConfig(config: RateLimitConfig): void {
       `RateLimitConfig.windowMs exceeds maximum allowed (${RATE_LIMIT_MAX_WINDOW_MS}ms), got ${config.windowMs}`,
     );
   }
+  if (!Number.isFinite(config.burst) || config.burst < 0) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.burst must be a non-negative finite number, got ${config.burst}`,
+    );
+  }
 }
 
-export class WebhookRateLimiter {
+export class WebhookRateLimiter implements IWebhookRateLimiter {
   private readonly consumerConfigs = new Map<string, RateLimitConfig>();
 
   constructor(private readonly redisClient: RedisClient) {}

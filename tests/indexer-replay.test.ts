@@ -31,6 +31,7 @@ import {
 } from '../src/indexer/service.js';
 import { deRegisterIndexerMetrics } from '../src/metrics/indexerMetrics.js';
 import type { IndexerLeaderElection } from '../src/indexer/leaderElection.js';
+import { initializeIndexerLeaderElection } from '../src/indexer/leaderElection.js';
 
 /** Always-leader fake — mirrors NoOpLeaderElection but spy-able per test. */
 function makeFakeLeaderElection(overrides: Partial<IndexerLeaderElection> = {}): IndexerLeaderElection {
@@ -1045,6 +1046,216 @@ describe('IndexerService — structured logging', () => {
 });
 
 // ── getReplayProgress ──────────────────────────────────────────────────────────
+
+// ── Graceful shutdown integration ─────────────────────────────────────────────
+
+describe('IndexerService — graceful shutdown releases leader lease', () => {
+  it('shutdown hook releases the leader-election lease after stop signal', async () => {
+    const { requestStopReplay, _resetStopReplay } = await import('../src/indexer/service.js');
+    const { getIndexerLeaderElection, _resetIndexerLeaderElection } = await import('../src/indexer/leaderElection.js');
+    const { FakeRedisClient } = await import('../src/redis/__test__/fakeRedisClient.js');
+
+    const redis = new FakeRedisClient();
+    initializeIndexerLeaderElection(redis, { instanceId: 'shutdown-test', leaseMs: 15_000 });
+
+    try {
+      // Acquire the lease so we have something to release.
+      const leader = getIndexerLeaderElection();
+      await leader.tryAcquire();
+      expect(leader.isLeader()).toBe(true);
+
+      // Simulate the shutdown hook ordering from src/app.ts:
+      //   1. requestStopReplay()
+      //   2. getIndexerLeaderElection().release()
+      requestStopReplay();
+      await leader.release();
+
+      expect(leader.isLeader()).toBe(false);
+      await expect(redis.exists('indexer:leader-election:replay')).resolves.toBe(false);
+    } finally {
+      _resetStopReplay();
+      _resetIndexerLeaderElection();
+    }
+  });
+});
+
+// ── Redis-backed lease expiry during replay ───────────────────────────────────
+
+describe('IndexerService — Redis lease expiry mid-replay', () => {
+  it('stops replay at batch boundary when FakeRedis lease expires via heartbeat failure', async () => {
+    vi.useFakeTimers();
+    try {
+      const { FakeRedisClient } = await import('../src/redis/__test__/fakeRedisClient.js');
+      const redis = new FakeRedisClient();
+      const leaseMs = 9000;
+
+      const events = [
+        makeEvent('e1', 100),
+        makeEvent('e2', 200),
+        makeEvent('e3', 300),
+        makeEvent('e4', 400),
+      ];
+
+      const cursorClient = makeClient(async (sql) => {
+        if (sql.includes('COUNT')) return { rows: [{ count: '4' }] };
+        if (sql.includes('INSERT INTO replay_cursors')) {
+          return {
+            rows: [{
+              id: 'cursor-redis',
+              contract_id: 'test-contract',
+              ledger: 1,
+              from_block: null,
+              to_block: null,
+              total_rows: 4,
+              last_committed_offset: 0,
+              started_at: new Date(),
+              completed_at: null,
+            }],
+          };
+        }
+        return { rows: [] };
+      });
+
+      const batch1Client = makeClient(async (sql) => {
+        if (sql.includes('FROM historical_events')) return { rows: events.slice(0, 2) };
+        return { rows: [] };
+      });
+
+      const cursorRepo = makeCursorRepo({
+        findActive: vi.fn(async () => null),
+        create: vi.fn(async (_c, cid, ledger) => ({
+          id: 'cursor-redis',
+          contract_id: cid,
+          ledger,
+          from_block: null,
+          to_block: null,
+          total_rows: 4,
+          last_committed_offset: 0,
+          started_at: new Date(),
+          completed_at: null,
+        })),
+      });
+
+      const pool = makePool(cursorClient, batch1Client);
+      // Use the REAL RedisIndexerLeaderElection backed by FakeRedisClient.
+      const { RedisIndexerLeaderElection } = await import('../src/indexer/leaderElection.js');
+      const leaderElection = new RedisIndexerLeaderElection(redis, {
+        instanceId: 'replay-redis-test',
+        leaseMs,
+      });
+
+      const svc = makeService(pool, cursorRepo, { batchSize: 2, leaderElection });
+
+      // Start replay — it acquires leadership internally via tryAcquire().
+      // After batch 1 commits, we simulate lease expiry by having another
+      // instance take over the key. The next heartbeat will detect this and
+      // flip isLeader() to false, so the loop stops before batch 2.
+      //
+      // Schedule the lease expiry to happen BETWEEN batch 1 commit and the
+      // loop's next isLeader() check by using a spy on processBatch to
+      // inject the expiry at the right moment.
+      let batchCount = 0;
+      const originalProcessBatch = (svc as unknown as { processBatch: typeof svc['processBatch'] }).processBatch.bind(svc);
+      const processBatchSpy = vi.spyOn(
+        svc as unknown as { processBatch: (...args: unknown[]) => Promise<{ rowsFetched: number }> },
+        'processBatch',
+      ).mockImplementation(async (...args: unknown[]) => {
+        const result = await originalProcessBatch(...args as Parameters<typeof originalProcessBatch>);
+        batchCount++;
+        if (batchCount === 1) {
+          // After batch 1 committed successfully, simulate lease expiry:
+          // another instance takes over the key.
+          await redis.del('indexer:leader-election:replay');
+          await redis.setNx('indexer:leader-election:replay', 'other-instance', leaseMs);
+          // Advance the fake timer so the heartbeat fires and detects the expiry.
+          await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
+        }
+        return result;
+      });
+
+      await svc.replayEvents(REQUEST);
+
+      // Only batch 1 was processed (advanceOffset called once).
+      expect(cursorRepo.advanceOffset).toHaveBeenCalledTimes(1);
+      expect(cursorRepo.advanceOffset).toHaveBeenCalledWith(expect.anything(), 'cursor-redis', 2);
+      // The leader election should have been released in the finally block.
+      expect(leaderElection.isLeader()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ── Multiple instances competing for replay ───────────────────────────────────
+
+describe('IndexerService — multiple instances competing', () => {
+  it('second instance cannot start replay while first holds the lease', async () => {
+    const { FakeRedisClient } = await import('../src/redis/__test__/fakeRedisClient.js');
+    const redis = new FakeRedisClient();
+    const { RedisIndexerLeaderElection } = await import('../src/indexer/leaderElection.js');
+
+    const leaderA = new RedisIndexerLeaderElection(redis, { instanceId: 'instance-a', leaseMs: 15_000 });
+    const leaderB = new RedisIndexerLeaderElection(redis, { instanceId: 'instance-b', leaseMs: 15_000 });
+
+    // Both try to acquire — only one wins.
+    const acquiredA = await leaderA.tryAcquire();
+    const acquiredB = await leaderB.tryAcquire();
+    expect(acquiredA).toBe(true);
+    expect(acquiredB).toBe(false);
+
+    // Build service for instance B.
+    const client = makeClient(async () => ({ rows: [] }));
+    const pool = makePool(client);
+    const cursorRepo = makeCursorRepo();
+    const svcB = makeService(pool, cursorRepo, { leaderElection: leaderB });
+
+    // Instance B should fail with IndexerNotLeaderError.
+    await expect(svcB.replayEvents(REQUEST)).rejects.toThrow(IndexerNotLeaderError);
+
+    // Instance A can still replay (simulate with a separate service).
+    const svcA = makeService(pool, makeCursorRepo({
+      create: vi.fn(async (_c, cid, ledger) => ({
+        id: 'a-cursor',
+        contract_id: cid,
+        ledger,
+        from_block: null,
+        to_block: null,
+        total_rows: 0,
+        last_committed_offset: 0,
+        started_at: new Date(),
+        completed_at: null,
+      })),
+    }), { leaderElection: leaderA });
+
+    // Zero-event replay so it completes quickly.
+    const client2 = makeClient(async (sql) => {
+      if (sql.includes('COUNT')) return { rows: [{ count: '0' }] };
+      return { rows: [] };
+    });
+    const pool2 = makePool(client2);
+    const svcA2 = makeService(pool2, makeCursorRepo({
+      create: vi.fn(async (_c, cid, ledger) => ({
+        id: 'a-cursor',
+        contract_id: cid,
+        ledger,
+        from_block: null,
+        to_block: null,
+        total_rows: 0,
+        last_committed_offset: 0,
+        started_at: new Date(),
+        completed_at: null,
+      })),
+    }), { leaderElection: leaderA });
+
+    await expect(svcA2.replayEvents(REQUEST)).resolves.toBeUndefined();
+
+    // After A finishes and releases, B can acquire.
+    // (A's replayEvents already called release in finally.)
+    const acquiredB2 = await leaderB.tryAcquire();
+    expect(acquiredB2).toBe(true);
+    expect(leaderB.isLeader()).toBe(true);
+  });
+});
 
 describe('IndexerService — getReplayProgress', () => {
   it('returns isReplaying: false when idle', () => {

@@ -344,29 +344,32 @@ The test suite covers:
 
 ## Duplicate Event Suppression & Resiliency
 
-`streamEventService` ingests Soroban RPC streaming events and enforces strict duplicate suppression using an injectable `DedupCache` interface (defaulting to `InMemoryDedupCache` or `HybridDedupCache`).
+`streamEventService` ingests Soroban RPC streaming events and enforces strict duplicate suppression using an injectable `DedupCache` interface (`InMemoryDedupCache`, `RedisDedupCache`, or `HybridDedupCache`).
 
 ### Hybrid Cache & Redis Downtime Fallback
 
-When backed by `HybridDedupCache`:
+When configured with `HybridDedupCache`:
 1. **Primary Cache**: Interacts with Redis (`RedisDedupCache`) to track event keys (`fluxora:dedup:<streamId>:<eventId>`) across server restarts.
-2. **Fallback Cache**: In-memory cache (`InMemoryDedupCache`) that tracks event arrivals locally.
-3. **Graceful Degradation**: If Redis experiences connection failures or outages mid-sequence, `HybridDedupCache` automatically catches Redis exceptions, logs a throttled fallback event, increments Prometheus metric `dedup_redis_fallback_total`, and seamlessly degrades to the in-memory cache.
-
-*Note: The event ingestion layer (`streamEventService`) also relies on this HybridDedupCache to safely maintain idempotent cross-instance duplicate-event suppression without a race between check-and-mark logic.*
+2. **Fallback Cache**: Local in-memory cache (`InMemoryDedupCache`) tracking event arrivals.
+3. **Outage State Transitions (`available` → `unavailable` → `recovered`)**:
+   - **Normal Operation (`available`)**: Events are checked/added in Redis. On new additions, `HybridDedupCache` syncs to the local in-memory fallback cache.
+   - **Redis Outage (`unavailable`)**: If Redis throws connection errors mid-sequence, `HybridDedupCache` catches the error, logs a throttled fallback warning (`dedup:fallback`), increments Prometheus metric `dedup_redis_fallback_total`, and seamlessly uses the in-memory cache. Replay continues without throwing errors or dropping events.
+   - **Redis Recovery (`recovered`)**: When Redis becomes reachable again, `HybridDedupCache` checks the fallback cache first. Any event processed during the outage remains suppressed, preventing duplicate database writes upon Redis reconnection. New events sync to both primary and fallback caches.
 
 ### Core Invariants
 
-The deduplication layer guarantees the following invariant regardless of event arrival order, duplicate burst frequency, or intermittent Redis downtime:
+The deduplication layer guarantees the following invariant regardless of event arrival order, duplicate burst frequency, or intermittent Redis downtime timing:
 
-> **"Each distinct `(transactionHash, eventIndex)` pair triggers at most one database write operation and at most one WebSocket broadcast."**
+> **"Each distinct `(transactionHash, eventIndex)` pair triggers at most one database write operation (upsert/update) and at most one WebSocket broadcast."**
 
 ### Property-Based Testing
 
-Deduplication behavior is verified using property-based testing powered by `fast-check`:
-- **Randomized Event Replay Sequences**: Generates sequences of `StreamCreated`, `StreamUpdated`, and `StreamCancelled` events interleaved with duplicate bursts.
-- **Intermittent Redis Outages**: Simulates random Redis connection failures mid-sequence during event ingestion.
-- **Deterministic Execution**: CI runs are configured deterministically using fixed seeds (`seed: 42`, bounded `numRuns: 100`) to prevent flakiness.
+Deduplication behavior and outage recovery are verified using property-based testing powered by `fast-check` in [streamEventService.dedup.test.ts](file:///c:/Users/ICT%20LASIEC/Fluxora-Backend/tests/services/streamEventService.dedup.test.ts):
+
+- **Randomized Replay Sequences**: Generates sequences of `StreamCreated`, `StreamUpdated`, and `StreamCancelled` events with randomized `transactionHash` and `eventIndex`.
+- **Dynamic Outage Simulation**: Mocks `HybridDedupCache` under fluctuating Redis states (`available`, `unavailable`, `recovered`) and interleaved duplicate bursts.
+- **Deterministic CI Configuration**: Configured with a fixed seed (`seed: 42`) and bounded runs (`numRuns: 100`) to ensure 100% reproducible test outcomes in CI without flaky behavior.
+- **Explicit Edge Case Coverage**: Includes unit tests for empty replays, single events, all duplicates, all unique events, duplicate bursts, alternating duplicates, pre-start outages, mid-sequence outages, full outages, and post-outage recoveries.
 
 ## Deployment
 
