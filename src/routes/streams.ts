@@ -331,11 +331,12 @@ function encodeCursor(lastId: string): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-function decodeCursor(cursor: string): StreamsCursor {
+function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
-  } catch {
+  } catch (err) {
+    warn('Cursor decode failed', { error: err instanceof Error ? err.message : String(err), requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
   if (
@@ -345,6 +346,7 @@ function decodeCursor(cursor: string): StreamsCursor {
     typeof (parsed as { lastId?: unknown }).lastId !== 'string' ||
     (parsed as { lastId: string }).lastId.trim() === ''
   ) {
+    warn('Cursor payload invalid', { parsed, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
   return parsed as StreamsCursor;
@@ -352,32 +354,13 @@ function decodeCursor(cursor: string): StreamsCursor {
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
 
-function parseLimit(limitParam: unknown): number {
-  if (limitParam === undefined) return 50;
-  if (Array.isArray(limitParam) || typeof limitParam !== 'string' || !/^\d+$/.test(limitParam)) {
-    throw validationError('limit must be an integer between 1 and 100');
-  }
-  const n = Number.parseInt(limitParam, 10);
-  if (n < 1 || n > 100) throw validationError('limit must be an integer between 1 and 100');
-  return n;
-}
-
-function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
+function parseCursor(cursorParam: unknown, requestId?: string): StreamsCursor | undefined {
   if (cursorParam === undefined) return undefined;
   if (Array.isArray(cursorParam) || typeof cursorParam !== 'string' || cursorParam.trim() === '') {
+    warn('Cursor shape invalid (not a string)', { cursorParam, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
-  return decodeCursor(cursorParam);
-}
-
-function parseIncludeTotal(includeTotalParam: unknown): boolean {
-  if (includeTotalParam === undefined) return false;
-  if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
-    throw validationError('include_total must be true or false');
-  }
-  if (includeTotalParam === 'true') return true;
-  if (includeTotalParam === 'false') return false;
-  throw validationError('include_total must be true or false');
+  return decodeCursor(cursorParam, requestId);
 }
 
 // ── Body normaliser ───────────────────────────────────────────────────────────
@@ -510,6 +493,7 @@ streamsRouter.get(
   '/',
   authenticateApiKey,
   requireScope('streams:read'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = req.correlationId as string | undefined;
 
@@ -517,16 +501,18 @@ streamsRouter.get(
     const parsed = PaginationSchema.safeParse(req.query);
     if (!parsed.success) {
       const first = parsed.error.issues[0];
+      warn('Stream list pagination validation failed', { error: first?.message, requestId });
       throw validationError(first?.message ?? 'Invalid query parameters');
     }
     const { limit, cursor: rawCursor, status: statusFilter, sender: senderFilter,
             recipient: recipientFilter, include_total } = parsed.data;
 
-    const cursor       = rawCursor !== undefined ? parseCursor(rawCursor) : undefined;
+    const cursor       = rawCursor !== undefined ? parseCursor(rawCursor, requestId) : undefined;
     const includeTotal = include_total === 'true';
 
     if (streamListingDependency.state !== 'healthy') {
       warn('Stream listing dependency unavailable', { dependency: 'stream-list-view', requestId });
+      res.setHeader('Retry-After', '30');
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
@@ -544,6 +530,19 @@ streamsRouter.get(
       if (statusFilter !== undefined) filter.status = statusFilter as NonNullable<StreamFilter['status']>;
       if (senderFilter !== undefined) filter.sender_address = senderFilter;
       if (recipientFilter !== undefined) filter.recipient_address = recipientFilter;
+      
+      if (req.callerAddress) {
+        if (!senderFilter && !recipientFilter) {
+          throw forbidden('Scoped users must filter by sender or recipient matching their address');
+        }
+        if (senderFilter && senderFilter !== req.callerAddress) {
+          throw forbidden('You are not authorized to query streams for this sender');
+        }
+        if (recipientFilter && recipientFilter !== req.callerAddress) {
+          throw forbidden('You are not authorized to query streams for this recipient');
+        }
+      }
+
       const dbResult = await streamRepository.findWithCursor(
         filter,
         limit,
@@ -633,16 +632,27 @@ streamsRouter.get(
   '/export',
   authenticateApiKey,
   requireScope('streams:read'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
-    const resumeFrom = req.query.resume_from as string | undefined;
-    let cursor = resumeFrom ? parseCursor(resumeFrom) : undefined;
+    const requestId = req.correlationId as string | undefined;
+    
+    let resumeFrom = req.query.resume_from;
+    if (Array.isArray(resumeFrom) || (resumeFrom !== undefined && typeof resumeFrom !== 'string')) {
+      warn('Export pagination validation failed', { error: 'resume_from must be a string', requestId });
+      throw validationError('resume_from must be a single valid opaque pagination token');
+    }
+    
+    let cursor = resumeFrom ? parseCursor(resumeFrom, requestId) : undefined;
     const limit = 100;
 
     res.setHeader('Content-Type', 'application/x-ndjson');
     res.setHeader('Cache-Control', 'no-store');
 
     try {
+      if (req.callerAddress) {
+        throw forbidden('Scoped users are not authorized to use the full export endpoint');
+      }
+
       while (true) {
         const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
         
