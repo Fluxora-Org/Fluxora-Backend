@@ -9,10 +9,12 @@
  * - All monetary amounts flow as **decimal strings** (never JS numbers).
  * - Idempotency keys are auto-generated for POST /api/streams when omitted.
  * - Cursor-based pagination is encapsulated in `StreamPaginator`.
+ * - The SDK performs no hidden retries; callers own retry policy and should
+ *   reuse explicit idempotency keys for retried stream creation attempts.
  *
  * ## Security notes
  * - Bearer tokens and API keys are stored in memory only; never logged.
- * - The `Authorization` header is only set when a credential is present.
+ * - Auth headers are only set when non-empty credentials are present.
  * - Client-side validation (empty/missing required params) fires before any
  *   network round-trip, reducing the attack surface for injection.
  * - TLS validation is delegated to the platform's `fetch` implementation.
@@ -91,8 +93,8 @@ export class FluxoraClient {
 
   constructor(config: FluxoraClientConfig = {}) {
     this.baseUrl = (config.baseUrl ?? 'http://localhost:3000').replace(/\/+$/, '');
-    this.apiKey = config.apiKey;
-    this.bearerToken = config.bearerToken;
+    this.apiKey = config.apiKey?.trim() || undefined;
+    this.bearerToken = config.bearerToken?.trim() || undefined;
     this.headers = {
       'User-Agent': 'FluxoraTypeScriptSDK/0.1.0',
       Accept: 'application/json',
@@ -106,7 +108,7 @@ export class FluxoraClient {
    * @security Token is stored in memory only; never logged.
    */
   public setBearerToken(token: string): void {
-    this.bearerToken = token;
+    this.bearerToken = token.trim() || undefined;
   }
 
   /**
@@ -114,7 +116,7 @@ export class FluxoraClient {
    * @security Key is stored in memory only; never logged.
    */
   public setApiKey(apiKey: string): void {
-    this.apiKey = apiKey;
+    this.apiKey = apiKey.trim() || undefined;
   }
 
   // ── Core HTTP dispatcher ───────────────────────────────────────────────────
@@ -125,6 +127,10 @@ export class FluxoraClient {
    * On non-2xx responses the method throws:
    * - `IdempotencyConflictError` for 409 `IDEMPOTENCY_CONFLICT`
    * - `FluxoraApiError` for all other non-2xx responses
+   *
+   * The dispatcher intentionally performs exactly one `fetch` call. Retry,
+   * timeout, and abort policies belong to the caller or runtime `fetch`
+   * implementation so SDK behavior remains deterministic across deploys.
    *
    * @param method  - HTTP verb (GET, POST, DELETE, PATCH, PUT).
    * @param path    - Request path (e.g. `'/api/streams'`).

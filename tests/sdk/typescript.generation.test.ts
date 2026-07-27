@@ -282,6 +282,13 @@ describe('SDK Package Structure & Documentation', () => {
     it('includes a regeneration command', () => {
       expect(readme).toContain('generate:sdk:ts');
     });
+
+    it('documents the SDK generation contract and regression surface', () => {
+      expect(readme).toContain('SDK Generation Contract');
+      expect(readme).toContain('does **not** retry requests internally');
+      expect(readme).toContain('Network failures from `fetch` are allowed to bubble unchanged');
+      expect(readme).toContain('Generated output must pass `pnpm check:sdk:ts`');
+    });
   });
 });
 
@@ -313,6 +320,32 @@ describe('FluxoraClient', () => {
     const c = client as unknown as Record<string, unknown>;
     expect(c['bearerToken']).toBe('jwt-token-abc');
     expect(c['apiKey']).toBe('ak-123');
+  });
+
+  it('trims runtime credentials and treats whitespace-only values as absent', async () => {
+    const capturedHeaders: Record<string, string>[] = [];
+    await withFetchMock(async (_url, init) => {
+      capturedHeaders.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(JSON.stringify({ status: 'ok' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }, async () => {
+      const client = new FluxoraClient({
+        baseUrl: 'http://test.local',
+        bearerToken: '  jwt-with-spaces  ',
+        apiKey: '  key-with-spaces  ',
+      });
+      await client.getHealth();
+      client.setBearerToken('   ');
+      client.setApiKey('   ');
+      await client.getHealth();
+    });
+
+    expect(capturedHeaders[0]?.['Authorization']).toBe('Bearer jwt-with-spaces');
+    expect(capturedHeaders[0]?.['X-API-Key']).toBe('key-with-spaces');
+    expect(capturedHeaders[1]?.['Authorization']).toBeUndefined();
+    expect(capturedHeaders[1]?.['X-API-Key']).toBeUndefined();
   });
 
   // 8. Client-side ValidationError guards.
@@ -505,6 +538,125 @@ describe('FluxoraClient', () => {
       await client.getHealth();
     });
     expect(capturedHeaders[0]?.['Authorization']).toBeUndefined();
+  });
+
+  it('runtime credentials override constructor auth headers deterministically', async () => {
+    const capturedHeaders: Record<string, string>[] = [];
+    await withFetchMock(async (_url, init) => {
+      capturedHeaders.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(JSON.stringify({ status: 'ok' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }, async () => {
+      const client = new FluxoraClient({
+        baseUrl: 'http://test.local',
+        bearerToken: 'runtime-jwt',
+        apiKey: 'runtime-key',
+        headers: {
+          Authorization: 'Bearer constructor-jwt',
+          'X-API-Key': 'constructor-key',
+        },
+      });
+      await client.getHealth();
+    });
+
+    expect(capturedHeaders[0]?.['Authorization']).toBe('Bearer runtime-jwt');
+    expect(capturedHeaders[0]?.['X-API-Key']).toBe('runtime-key');
+  });
+
+  it('serialises false, 0, and empty-string query params but omits nullish values', async () => {
+    const capturedUrls: string[] = [];
+    await withFetchMock(async (url) => {
+      capturedUrls.push(url as string);
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }, async () => {
+      const client = new FluxoraClient({ baseUrl: 'http://test.local' });
+      await (client as unknown as {
+        request<T>(method: string, path: string, options: { params: Record<string, unknown> }): Promise<T>;
+      }).request('GET', '/probe', {
+        params: {
+          include_total: false,
+          limit: 0,
+          status: '',
+          cursor: null,
+          sender: undefined,
+        },
+      });
+    });
+
+    const url = new URL(capturedUrls[0]);
+    expect(url.searchParams.get('include_total')).toBe('false');
+    expect(url.searchParams.get('limit')).toBe('0');
+    expect(url.searchParams.get('status')).toBe('');
+    expect(url.searchParams.has('cursor')).toBe(false);
+    expect(url.searchParams.has('sender')).toBe(false);
+  });
+
+  it('performs exactly one fetch per SDK call and lets network errors bubble unchanged', async () => {
+    const networkError = new TypeError('fetch failed');
+    const fetchMock = vi.fn(async () => {
+      throw networkError;
+    });
+
+    await withFetchMock(fetchMock, async () => {
+      const client = new FluxoraClient({ baseUrl: 'http://test.local' });
+      await expect(client.getHealth()).rejects.toBe(networkError);
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns an empty object for successful empty response bodies', async () => {
+    await withFetchMock(async () => new Response('', { status: 204 }), async () => {
+      const client = new FluxoraClient({ baseUrl: 'http://test.local' });
+      const result = await (client as unknown as {
+        request<T>(method: string, path: string): Promise<T>;
+      }).request<Record<string, never>>('DELETE', '/empty');
+
+      expect(result).toEqual({});
+    });
+  });
+
+  it('turns text error bodies into FluxoraApiError messages', async () => {
+    await withFetchMock(async () =>
+      new Response('service unavailable', {
+        status: 503,
+        statusText: 'Service Unavailable',
+        headers: { 'x-request-id': 'req-text-body' },
+      }),
+      async () => {
+        const client = new FluxoraClient({ baseUrl: 'http://test.local' });
+        let err: FluxoraApiError | undefined;
+        try { await client.getHealth(); } catch (e) { err = e as FluxoraApiError; }
+
+        expect(err).toBeInstanceOf(FluxoraApiError);
+        expect(err?.code).toBe('HTTP_ERROR');
+        expect(err?.message).toContain('service unavailable');
+        expect(err?.requestId).toBe('req-text-body');
+      },
+    );
+  });
+
+  it('extracts requestId from response metadata when the header is absent', async () => {
+    await withFetchMock(async () =>
+      new Response(
+        JSON.stringify({
+          error: { code: 'RATE_LIMITED', message: 'Too many requests' },
+          meta: { requestId: 'req-from-meta' },
+        }),
+        { status: 429, headers: { 'Content-Type': 'application/json' } },
+      ),
+      async () => {
+        const client = new FluxoraClient({ baseUrl: 'http://test.local' });
+        let err: FluxoraApiError | undefined;
+        try { await client.getHealth(); } catch (e) { err = e as FluxoraApiError; }
+        expect(err?.requestId).toBe('req-from-meta');
+      },
+    );
   });
 });
 
