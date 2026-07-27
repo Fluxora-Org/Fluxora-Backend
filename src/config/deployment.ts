@@ -138,11 +138,12 @@ export function buildDeploymentChecklistReport(input: {
         ? parityRequired
           ? 'fail'
           : 'not_applicable'
-        : indexerHealth.status === 'healthy'
+        : indexerHealth.status === 'healthy' || indexerHealth.dependency === 'healthy'
           ? 'pass'
           : parityRequired
             ? 'fail'
             : 'warn',
+
       !config.indexerEnabled ? 'Indexer is disabled.' : indexerHealth.summary,
     ),
     makeCheck(

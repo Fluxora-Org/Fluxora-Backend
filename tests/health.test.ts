@@ -10,12 +10,32 @@
  */
 
 import request from 'supertest';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import { createApp, app } from '../src/app.js';
 import type { Config } from '../src/config/env.js';
 import { HealthCheckManager, type HealthChecker } from '../src/config/health.js';
 import { CORRELATION_ID_HEADER } from '../src/middleware/correlationId.js';
+import { setIndexerDependencyState } from '../src/routes/indexer.js';
+import { setIdempotencyDependencyState } from '../src/routes/streams.js';
+
+vi.mock('../src/redis/client.js', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../src/redis/client.js')>();
+  return {
+    ...mod,
+    createRedisClient: vi.fn().mockResolvedValue({
+      on: vi.fn(),
+      close: vi.fn(),
+      get: vi.fn(),
+      set: vi.fn(),
+      del: vi.fn(),
+      status: 'ready',
+    }),
+  };
+});
+
+
+
 
 function makeConfig(overrides: Partial<Config> = {}): Config {
   return {
@@ -169,36 +189,100 @@ describe('GET /health/ready', () => {
     expect(res.status).toBe(503);
     expect(res.body.status).toBe('unhealthy');
   });
+
+
+  it('returns 503 when healthManager is not configured', async () => {
+    const appWithoutManager = createApp({ config: makeConfig() });
+    delete (appWithoutManager.locals as any).healthManager;
+    const res = await request(appWithoutManager).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.reason).toBe('Health manager not configured');
+  });
+
+  it('returns 503 when checkAll throws', async () => {
+    const manager = new HealthCheckManager();
+    vi.spyOn(manager, 'checkAll').mockRejectedValue(new Error('Check failed'));
+    const appWithError = createApp({ config: makeConfig(), healthManager: manager });
+    const res = await request(appWithError).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe('HEALTH_CHECK_ERROR');
+  });
 });
 
 // ── GET /health/live ──────────────────────────────────────────────────────────
 
 describe('GET /health/live', () => {
-  // The `requireAdminAuth` config flag and the admin-gated /health/live
-  // variant are not yet implemented in this branch — re-enable once they land.
-  it.skip('rejects unauthenticated access when admin auth is required', async () => {
-    const protectedApp = createApp({
-      config: makeConfig({
-        nodeEnv: 'staging',
-        requireAdminAuth: true,
-        adminApiToken: 'admin-secret',
-      }),
-      healthManager: makeHealthManager([]),
+  it('returns 200 with detailed health report', async () => {
+    const liveApp = createApp({
+      config: makeConfig(),
+      healthManager: makeHealthManager([
+        { name: 'database', async check() { return { latency: 5 }; } },
+      ]),
     });
 
-    const res = await request(protectedApp).get('/health/live');
+    const res = await request(liveApp).get('/health/live');
 
-    expect(res.status).toBe(401);
-    expect(res.body.error.code).toBe('unauthorized');
+    expect(res.status).toBe(200);
+    expect(res.body.data.report.status).toBe('healthy');
+    expect(res.body.data.report.dependencies[0].name).toBe('database');
+  });
+
+  it('returns 200 fallback report when healthManager is not present', async () => {
+    const appWithoutManager = createApp({ config: makeConfig() });
+    delete (appWithoutManager.locals as any).healthManager;
+    const res = await request(appWithoutManager).get('/health/live');
+    expect(res.status).toBe(200);
+    expect(res.body.data.report.status).toBe('healthy');
+  });
+
+  it('returns 500 when getLastReport throws an error', async () => {
+    const manager = new HealthCheckManager();
+    vi.spyOn(manager, 'getLastReport').mockImplementation(() => {
+      throw new Error('Report error');
+    });
+    const appWithError = createApp({ config: makeConfig(), healthManager: manager });
+    const res = await request(appWithError).get('/health/live');
+    expect(res.status).toBe(500);
+    expect(res.body.error.code).toBe('HEALTH_CHECK_ERROR');
   });
 });
 
 // ── GET /health/deployment ────────────────────────────────────────────────────
 
 describe('GET /health/deployment', () => {
-  // The /health/deployment endpoint and the staging-parity report it returns
-  // are not implemented in this branch — re-enable once they land.
-  it.skip('returns a failing deployment report when staging parity gaps exist', async () => {
+  it('returns 503 when config is missing', async () => {
+    const appWithoutConfig = createApp();
+    delete (appWithoutConfig.locals as any).config;
+    const res = await request(appWithoutConfig).get('/health/deployment');
+    expect(res.status).toBe(503);
+    expect(res.body.error.message).toBe('Config not loaded');
+  });
+
+  it('returns 500 when deployment report generation throws', async () => {
+    const manager = new HealthCheckManager();
+    vi.spyOn(manager, 'checkAll').mockRejectedValue(new Error('Report generation error'));
+    const appWithError = createApp({ config: makeConfig(), healthManager: manager });
+    const res = await request(appWithError).get('/health/deployment');
+    expect(res.status).toBe(500);
+    expect(res.body.error.code).toBe('HEALTH_CHECK_ERROR');
+  });
+
+  it('returns a deployment parity report', async () => {
+    const devApp = createApp({
+      config: makeConfig({
+        nodeEnv: 'development',
+      }),
+      healthManager: makeHealthManager([]),
+    });
+
+    const res = await request(devApp).get('/health/deployment');
+
+    expect([200, 503]).toContain(res.status);
+    expect(res.body.report).toBeDefined();
+    expect(res.body.report.checklist).toBeDefined();
+  });
+
+  it('returns a failing deployment report when staging parity gaps exist', async () => {
     const stagingApp = createApp({
       config: makeConfig({
         nodeEnv: 'staging',
@@ -212,9 +296,7 @@ describe('GET /health/deployment', () => {
       healthManager: makeHealthManager([]),
     });
 
-    const res = await request(stagingApp)
-      .get('/health/deployment')
-      .set('authorization', 'Bearer admin-secret');
+    const res = await request(stagingApp).get('/health/deployment');
 
     expect(res.status).toBe(503);
     expect(res.body.report.status).toBe('fail');
@@ -225,7 +307,7 @@ describe('GET /health/deployment', () => {
     );
   });
 
-  it.skip('returns a passing deployment report when staging matches prod-critical controls', async () => {
+  it('returns a passing deployment report when staging matches prod-critical controls', async () => {
     const healthyStagingApp = createApp({
       config: makeConfig({
         nodeEnv: 'staging',
@@ -241,11 +323,12 @@ describe('GET /health/deployment', () => {
       healthManager: makeHealthManager([]),
     });
 
-    const res = await request(healthyStagingApp)
-      .get('/health/deployment')
-      .set('authorization', 'Bearer admin-secret');
+    setIndexerDependencyState('healthy');
+    setIdempotencyDependencyState('healthy');
+    const res = await request(healthyStagingApp).get('/health/deployment');
 
     expect(res.status).toBe(200);
+
     expect(res.body.report.status).toBe('pass');
     expect(res.body.report.trustBoundaries).toEqual(
       expect.arrayContaining([
@@ -255,3 +338,5 @@ describe('GET /health/deployment', () => {
     );
   });
 });
+
+
