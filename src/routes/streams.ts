@@ -82,6 +82,7 @@ import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
+import { isValidStreamStatus } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
 import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
@@ -680,7 +681,9 @@ streamsRouter.post(
       recipient:     normalizedInput.recipient,
     });
 
-    streamsCreatedTotal.inc({ status: stream.status });
+    if (isValidStreamStatus(stream.status)) {
+      streamsCreatedTotal.inc({ status: stream.status });
+    }
 
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');

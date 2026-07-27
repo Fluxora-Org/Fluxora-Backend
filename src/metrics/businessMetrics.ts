@@ -1,6 +1,45 @@
 import { Counter, Histogram, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
+export type StreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+export type WebhookDeliveryOutcome = 'success' | 'failed';
+export type SseConnectionRejectionReason = 'per_ip_limit' | 'global_limit';
+
+const VALID_STREAM_STATUSES: readonly StreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
+const VALID_OUTCOMES: readonly WebhookDeliveryOutcome[] = ['success', 'failed'];
+const VALID_REJECTION_REASONS: readonly SseConnectionRejectionReason[] = ['per_ip_limit', 'global_limit'];
+
+/**
+ * Returns true if the value is a known StreamStatus label value.
+ */
+export function isValidStreamStatus(value: string): value is StreamStatus {
+  return (VALID_STREAM_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known webhook delivery outcome label value.
+ */
+export function isValidDeliveryOutcome(value: string): value is WebhookDeliveryOutcome {
+  return (VALID_OUTCOMES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known SSE connection rejection reason.
+ */
+export function isValidRejectionReason(value: string): value is SseConnectionRejectionReason {
+  return (VALID_REJECTION_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * Observes a duration into the histogram, clamping NaN and negative values to 0.
+ *
+ * Prevents metric corruption from clock skew, negative deltas, or uninitialized
+ * timers while keeping the happy-path label set unchanged.
+ */
+export function safeObserveDuration(histogram: Histogram, durationSeconds: number): void {
+  histogram.observe(Number.isFinite(durationSeconds) && durationSeconds >= 0 ? durationSeconds : 0);
+}
+
 /**
  * Histogram tracking JWT verification latency in seconds.
  *
@@ -185,6 +224,9 @@ export const webhookOutboxPendingItemsGauge =
  * This function should be called periodically (via scheduled task) or on each `/metrics` scrape.
  * It reads the current state from the webhook delivery store and updates the gauges.
  *
+ * All gauge values are clamped to a minimum of 0 to prevent negative metric values
+ * caused by temporary store inconsistencies or misconfigured backends.
+ *
  * @param store - WebhookDeliveryStore instance to read metrics from
  *
  * @example
@@ -198,18 +240,18 @@ export const webhookOutboxPendingItemsGauge =
  * @see webhookOutboxPendingItemsGauge
  */
 export function syncWebhookMetrics(store: {
-  getMetrics(): {
-    totalDeliveries: number;
-    successfulDeliveries: number;
-    failedDeliveries: number;
-    dlqItems: number;
-    outboxItems: number;
-  };
-}): void {
-  const metrics = store.getMetrics();
-  webhookDlqItemsGauge.set(Math.max(0, metrics.dlqItems));
-  webhookOutboxPendingItemsGauge.set(Math.max(0, metrics.outboxItems));
-}
+   getMetrics(): {
+     totalDeliveries: number;
+     successfulDeliveries: number;
+     failedDeliveries: number;
+     dlqItems: number;
+     outboxItems: number;
+   };
+ }): void {
+   const metrics = store.getMetrics();
+   webhookDlqItemsGauge.set(Math.max(0, metrics.dlqItems));
+   webhookOutboxPendingItemsGauge.set(Math.max(0, metrics.outboxItems));
+ }
 
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
