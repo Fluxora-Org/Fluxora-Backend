@@ -60,7 +60,7 @@ export function createIdempotencyMiddleware(
 
       if (existing) {
         if (existing.requestFingerprint !== incomingHash) {
-          logger.warn('Idempotency conflict detected', {
+          logger.warn('Idempotency conflict detected', req.correlationId as string, {
             idempotencyKeyLength: idempotencyKey.length,
             incomingHash,
             storedHash: existing.requestFingerprint,
@@ -73,9 +73,8 @@ export function createIdempotencyMiddleware(
           });
         }
 
-        logger.info('Replaying idempotent response', { 
+        logger.info('Replaying idempotent response', req.correlationId as string, { 
             idempotencyKeyLength: idempotencyKey.length,
-            requestId: req.correlationId 
         });
         
         res.set('Idempotency-Key', idempotencyKey);
@@ -101,7 +100,7 @@ export function createIdempotencyMiddleware(
             { requestFingerprint: incomingHash, statusCode: res.statusCode, body },
             ttlSeconds,
           ).catch((err) => {
-            logger.error('Failed to store idempotent response', { 
+            logger.error('Failed to store idempotent response', req.correlationId as string, { 
                 error: err instanceof Error ? err.message : String(err) 
             });
           });
@@ -115,7 +114,7 @@ export function createIdempotencyMiddleware(
 
       next();
     } catch (err) {
-      logger.error('Idempotency middleware error', { 
+      logger.error('Idempotency middleware error', req.correlationId as string, { 
           error: err instanceof Error ? err.message : String(err) 
       });
       next();
