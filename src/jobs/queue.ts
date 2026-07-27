@@ -202,6 +202,42 @@ export function startBackgroundJobs(pool: Pool): void {
     },
   );
 
+  queue.register(
+    DEAD_LETTER_QUEUE,
+    async (ctx) => {
+      const payload = ctx.data as any;
+      const originalJobName = payload?.name || 'unknown';
+      const originalJobId = payload?.id || 'unknown';
+      const originalPayload = payload?.data ?? null;
+      let errorMessage = 'Unknown error';
+      if (payload?.output) {
+        if (typeof payload.output === 'string') errorMessage = payload.output;
+        else if (payload.output.message) errorMessage = payload.output.message;
+        else errorMessage = JSON.stringify(payload.output);
+      }
+      
+      const retryCount = payload?.retrycount || payload?.retryCount || 0;
+
+      logger.error('Job permanently failed and moved to DLQ', undefined, {
+        jobName: originalJobName,
+        jobId: originalJobId,
+        error: errorMessage,
+      });
+
+      await pool.query(
+        `INSERT INTO job_dead_letter (job_name, job_id, payload, error_message, retry_count)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          originalJobName,
+          originalJobId,
+          originalPayload,
+          errorMessage,
+          retryCount,
+        ]
+      );
+    }
+  );
+
   queue.start().catch((err: Error) => {
     logger.error('Failed to start job queue', undefined, { error: err.message });
   });
