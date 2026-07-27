@@ -82,7 +82,7 @@ function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
       const error = err instanceof Error ? err : new Error(String(err));
 
       // Security: do not log SSE payload. Only log streamId + error identity.
-      logger.error('SSE subscriber callback threw', {
+      logger.error('SSE subscriber callback threw', event.correlationId, {
         streamId: event.streamId,
         subscriberError: {
           name: error.name,
