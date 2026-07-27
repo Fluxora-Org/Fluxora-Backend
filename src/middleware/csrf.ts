@@ -47,28 +47,42 @@ export function parseCookies(cookieHeader?: string): Record<string, string> {
  * requests do not use ambient browser cookies and MUST NOT be subjected to CSRF checks.
  *
  * Evaluation Rules:
- * 1. If request includes an Authorization header (e.g., Bearer JWT), return false.
- * 2. If request includes an X-API-Key header or query parameter, return false.
- * 3. If request includes cookies in req.headers.cookie, return true.
- * 4. Otherwise, return false.
+ * 1. If the request includes a non-blank Authorization header (e.g., `Bearer <jwt>`),
+ *    the request is API-authenticated → return false.
+ * 2. If the request includes an `X-API-Key` **header**, return false.
+ * 3. If the request includes an `x-api-key` **query parameter**, return false.
+ * 4. If the request carries at least one cookie in `req.headers.cookie`, return true.
+ * 5. Otherwise return false (no credential, no cookie = unauthenticated entirely).
+ *
+ * Note on rule 1: an Authorization header that is present but consists only of
+ * whitespace is treated as absent, so such requests are not bypassed by this rule
+ * and continue to rules 2-5.
  *
  * @param req - Express Request object
  * @returns boolean indicating if request is cookie-session authenticated
  */
 export function isCookieAuthenticated(req: Request): boolean {
-  // Check for Bearer / Authorization header
+  // Rule 1 — Bearer / Authorization header (non-blank)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.trim().length > 0) {
     return false;
   }
 
-  // Check for API Key (header or query)
-  const apiKey = getApiKeyFromRequest(req.headers);
-  if (apiKey) {
+  // Rule 2 — API Key in request headers (e.g. X-API-Key: flx_...)
+  const apiKeyFromHeader = getApiKeyFromRequest(req.headers);
+  if (apiKeyFromHeader) {
     return false;
   }
 
-  // Check for presence of cookies
+  // Rule 3 — API Key supplied as a query parameter (?x-api-key=flx_...)
+  // req.query values are strings or string arrays after Express URL parsing.
+  const queryApiKey = req.query?.['x-api-key'];
+  const normalizedQueryKey = Array.isArray(queryApiKey) ? queryApiKey[0] : queryApiKey;
+  if (normalizedQueryKey && typeof normalizedQueryKey === 'string' && normalizedQueryKey.trim().length > 0) {
+    return false;
+  }
+
+  // Rule 4 — Presence of at least one cookie → treat as browser/cookie-session request
   const cookieHeader = req.headers.cookie;
   if (!cookieHeader || cookieHeader.trim().length === 0) {
     return false;
