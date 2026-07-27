@@ -339,6 +339,26 @@ export const adminReindexJobDurationSeconds =
     registers: [registry],
   });
 
+/**
+ * Counter for jobs that have been permanently routed to the dead-letter queue.
+ *
+ * Each increment represents one terminal job failure that was persisted to
+ * `job_dead_letter`.  Labelled by `job_name` so operators can see which
+ * specific job types are failing most frequently without requiring a DB query.
+ *
+ * @security
+ * - Label cardinality is bounded: job_name values come from developer-controlled
+ *   `register()` call sites, not from user input.
+ */
+export const jobDlqEntriesTotal =
+  (registry.getSingleMetric('fluxora_job_dlq_entries_total') as Counter<'job_name'>) ||
+  new Counter({
+    name: 'fluxora_job_dlq_entries_total',
+    help: 'Total number of jobs permanently moved to the dead-letter queue, labelled by job name',
+    labelNames: ['job_name'] as const,
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
@@ -360,5 +380,6 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
   registry.removeSingleMetric('fluxora_longpoll_active_connections');
   registry.removeSingleMetric('fluxora_longpoll_connections_rejected_total');
+  registry.removeSingleMetric('fluxora_job_dlq_entries_total');
 }
 
