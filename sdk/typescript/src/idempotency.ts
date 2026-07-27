@@ -14,12 +14,48 @@
  * - `hashBody()` — computes a SHA-256 hex digest matching the server-side
  *   `fingerprintInput()` in `src/routes/streams.ts`.
  *
+ * ## Idempotency Contract
+ *
+ * ### Key Format and Validation
+ * - Keys must be 1–128 characters matching `[A-Za-z0-9:_-]`.
+ * - UUID v4 format is recommended but not required.
+ * - The server validates key format via `requireIdempotencyKey` middleware.
+ * - Invalid or missing keys return `400 VALIDATION_ERROR`.
+ *
+ * ### Conflict Detection
+ * - Same key + same body hash → cached response replayed (201 with `Idempotency-Replayed: true`).
+ * - Same key + different body hash → `409 CONFLICT` with `stored_hash` and `incoming_hash`.
+ * - Different keys → always treated as separate operations (no collision).
+ *
+ * ### Retry Behavior
+ * - Generate a **new key per logical operation**.
+ * - Reuse the **same key** when retrying a failed request to make it idempotent.
+ * - Do not reuse keys across different logical operations.
+ * - The SDK does not retry requests internally; retry logic is application-level.
+ *
+ * ### Cache TTL
+ * - Idempotency entries expire after `IDEMPOTENCY_TTL_SECONDS` (default 24 hours).
+ * - After expiry, the same key can be reused safely for a new operation.
+ * - TTL is server-side configured; clients cannot control it.
+ *
  * ## Security
  * - Keys are generated with `crypto.randomUUID()` (WebCrypto) where available,
  *   with a `Math.random`-based UUID v4 fallback for older environments.
  * - `hashBody()` uses `crypto.subtle.digest` (WebCrypto) with a Node.js
  *   `node:crypto` `createHash` fallback.
  * - Key values are never logged or echoed in error responses.
+ * - Only key length is logged server-side for debugging.
+ *
+ * ## Error Handling
+ * - `hashBody()` throws `Error` when no crypto API is available.
+ * - Conflict errors include both hashes for debugging mismatched payloads.
+ * - Network errors from `fetch` bubble up unchanged; retry with the same key.
+ *
+ * ## Observability
+ * - Successful responses include `Idempotency-Key` header echoing the submitted key.
+ * - Replayed responses include `Idempotency-Replayed: true` header.
+ * - Fresh responses include `Idempotency-Replayed: false` header.
+ * - Request IDs (from `X-Request-ID`) correlate client and server logs.
  *
  * @module @fluxora/sdk/idempotency
  */
