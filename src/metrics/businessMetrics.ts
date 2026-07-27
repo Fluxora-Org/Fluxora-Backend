@@ -1,6 +1,53 @@
 import { Counter, Histogram, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
+export type StreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+export type WebhookDeliveryOutcome = 'success' | 'failed';
+export type SseConnectionRejectionReason = 'per_ip_limit' | 'global_limit';
+
+const VALID_STREAM_STATUSES: readonly StreamStatus[] = [
+  'active',
+  'paused',
+  'completed',
+  'cancelled',
+];
+const VALID_OUTCOMES: readonly WebhookDeliveryOutcome[] = ['success', 'failed'];
+const VALID_REJECTION_REASONS: readonly SseConnectionRejectionReason[] = [
+  'per_ip_limit',
+  'global_limit',
+];
+
+/**
+ * Returns true if the value is a known StreamStatus label value.
+ */
+export function isValidStreamStatus(value: string): value is StreamStatus {
+  return (VALID_STREAM_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known webhook delivery outcome label value.
+ */
+export function isValidDeliveryOutcome(value: string): value is WebhookDeliveryOutcome {
+  return (VALID_OUTCOMES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known SSE connection rejection reason.
+ */
+export function isValidRejectionReason(value: string): value is SseConnectionRejectionReason {
+  return (VALID_REJECTION_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * Observes a duration into the histogram, clamping NaN and negative values to 0.
+ *
+ * Prevents metric corruption from clock skew, negative deltas, or uninitialized
+ * timers while keeping the happy-path label set unchanged.
+ */
+export function safeObserveDuration(histogram: Histogram, durationSeconds: number): void {
+  histogram.observe(Number.isFinite(durationSeconds) && durationSeconds >= 0 ? durationSeconds : 0);
+}
+
 /**
  * Histogram tracking JWT verification latency in seconds.
  *
@@ -73,6 +120,23 @@ export const sseConnectionsRejectedTotal =
   new Counter({
     name: 'fluxora_sse_connections_rejected_total',
     help: 'Total number of rejected Server-Sent Events stream connection attempts',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+export const longPollActiveConnectionsGauge =
+  (registry.getSingleMetric('fluxora_longpoll_active_connections') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_longpoll_active_connections',
+    help: 'Current number of active long-polling fallback stream connections',
+    registers: [registry],
+  });
+
+export const longPollConnectionsRejectedTotal =
+  (registry.getSingleMetric('fluxora_longpoll_connections_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_longpoll_connections_rejected_total',
+    help: 'Total number of rejected long-polling connection attempts',
     labelNames: ['reason'] as const,
     registers: [registry],
   });
@@ -255,6 +319,8 @@ function sanitizeMetricGaugeValue(val: unknown): number {
  * - `getMetrics()` throws → gauges set to `0` (error swallowed)
  * - `getMetrics()` returns `null` / `undefined` / partial objects → missing fields sanitize to `0`
  * - Invalid numeric fields → sanitized via {@link sanitizeMetricGaugeValue}
+ * - Negative values → clamped to `0`
+ * - Large values → clamped to `Number.MAX_SAFE_INTEGER`
  *
  * @param store - WebhookDeliveryStore-like object to read metrics from
  *
@@ -366,4 +432,6 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_backpressure_drops_total');
   registry.removeSingleMetric('fluxora_ws_auth_failure_total');
   registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
+  registry.removeSingleMetric('fluxora_longpoll_active_connections');
+  registry.removeSingleMetric('fluxora_longpoll_connections_rejected_total');
 }

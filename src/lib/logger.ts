@@ -153,3 +153,6 @@ export const logger = {
     process.stdout.write(JSON.stringify(record) + '\n');
   },
 };
+
+export type Logger = typeof logger;
+

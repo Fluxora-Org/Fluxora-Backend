@@ -297,3 +297,60 @@ describe('stopBackgroundJobs', () => {
     expect(mod.getJobQueue()).toBeNull();
   });
 });
+
+// ── startBackgroundJobs tests ─────────────────────────────────────────────
+
+describe('startBackgroundJobs', () => {
+  beforeEach(async () => {
+    const { setJobQueue } = await import('../../src/jobs/queue.js');
+    setJobQueue(null);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('registers partition-maintenance and job_dead_letter_queue handlers', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    
+    // We mock Pool
+    const mockPool = {
+      query: vi.fn().mockResolvedValue({ rowCount: 1 }),
+    } as any;
+
+    // Spy on register, start, schedule, send
+    const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
+    const startSpy = vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
+    
+    mod.startBackgroundJobs(mockPool);
+
+    expect(registerSpy).toHaveBeenCalledWith('partition-maintenance', expect.any(Function), expect.any(Object));
+    expect(registerSpy).toHaveBeenCalledWith('job_dead_letter_queue', expect.any(Function));
+    expect(startSpy).toHaveBeenCalled();
+
+    // Verify DLQ handler behavior
+    const dlqCall = registerSpy.mock.calls.find(c => c[0] === 'job_dead_letter_queue');
+    const dlqHandler = dlqCall![1];
+
+    const dlqCtx = {
+      id: 'dlq-id',
+      name: 'job_dead_letter_queue',
+      data: {
+        name: 'original-job',
+        id: 'orig-123',
+        data: { foo: 'bar' },
+        output: 'Some error occurred',
+        retryCount: 3,
+      }
+    };
+
+    await dlqHandler(dlqCtx as any);
+
+    expect(mockPool.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO job_dead_letter'),
+      ['original-job', 'orig-123', { foo: 'bar' }, 'Some error occurred', 3]
+    );
+  });
+});

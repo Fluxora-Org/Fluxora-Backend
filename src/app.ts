@@ -41,7 +41,7 @@ import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
-import { canaryRoutingMiddleware } from './middleware/canaryRouting.js';
+import { canaryRoutingMiddleware } from './middleware/canaryRouting.ts';
 import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';

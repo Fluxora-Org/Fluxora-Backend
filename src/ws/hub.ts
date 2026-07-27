@@ -53,7 +53,6 @@ import { CORRELATION_ID_HEADER, isValidCorrelationId } from '../middleware/corre
 import {
   isValidStellarPublicKey,
   parseHandshakeSubscriptionFilter,
-  parseWsClientMessage,
   type SubscriptionFilter,
   type WsClientMessage,
   validateWebSocketMessage,
@@ -699,7 +698,7 @@ export class StreamHub extends EventEmitter {
 
   // ── Message handling ───────────────────────────────────────────────────────
 
-  private async handleMessage(ws: WebSocket, raw: string): Promise<void> {
+  async handleMessage(ws: WebSocket, raw: string): Promise<void> {
     const result = validateWebSocketMessage(raw);
     if (!result.ok) {
       this.sendError(ws, result.code, result.message);

@@ -141,12 +141,13 @@ Response:
 }
 ```
 
-### Partition Management
+### Scripted Database Operations & Partition Management
 
-The `contract_events` table is range-partitioned by `happened_at` to prevent unbounded growth.
-Partitions are rotated and dropped automatically based on a configurable retention policy.
-- An ops script `dropOldPartitions` in `src/scripts/db-ops.ts` is available to detach and drop partitions older than a specified number of days.
-- By default, it runs in a `dryRun` mode. To actually drop data, invoke it with `dryRun = false`.
+Scripted database backup, restore, and partition retention operations are managed via `src/scripts/db-ops.ts`.
+- `backupDatabase` / `restoreDatabase`: Support local custom-format dumps as well as zero-disk S3 streaming.
+- `dropOldPartitions`: Detaches and drops range partitions older than a specified threshold. Runs in `dryRun = true` mode by default.
+
+For complete details on operator ergonomics, security controls, credential protection, and region resolution, see [docs/database.md](docs/database.md#scripted-database-operations--operator-ergonomics).
 
 ## 🧪 Testing
 

@@ -256,30 +256,17 @@ export const EnvSchema = z
     METRICS_ENABLED: booleanEnv().default(true),
     CORS_ALLOWED_ORIGINS: optionalString('CORS_ALLOWED_ORIGINS'),
 
-    TRACING_ENABLED: booleanEnv().default(false),
-    TRACING_SAMPLE_RATE: z
-      .preprocess(
-        parseNumber,
-        z
-          .number()
-          .min(0, 'TRACING_SAMPLE_RATE must be at least 0')
-          .max(1, 'TRACING_SAMPLE_RATE must be at most 1')
-      )
-      .default(1),
-    TRACING_SAMPLING_STRATEGY: z.enum(['head', 'tail', 'always', 'never']).default('head'),
-    TRACING_HEAD_SAMPLE_RATE: z
-      .preprocess(
-        parseNumber,
-        z
-          .number()
-          .min(0, 'TRACING_HEAD_SAMPLE_RATE must be at least 0')
-          .max(1, 'TRACING_HEAD_SAMPLE_RATE must be at most 1')
-      )
-      .optional(),
-    TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
-    TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
-    TRACING_OTEL_ENABLED: booleanEnv().default(false),
-    TRACING_LOG_EVENTS: booleanEnv().default(false),
+  WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
+  WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
+  WEBHOOK_SECRET_PREVIOUS: optionalString('WEBHOOK_SECRET_PREVIOUS'),
+  FLUXORA_WEBHOOK_SECRET: optionalString('FLUXORA_WEBHOOK_SECRET'),
+  FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
+  WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
+  WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+  WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
+  WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv('WEBHOOK_CIRCUIT_BREAKER_THRESHOLD', 0, 1000).default(0),
+  WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(300_000),
+  WEBHOOK_ALLOWED_HOSTS: optionalString('WEBHOOK_ALLOWED_HOSTS'),
 
     WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
     WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
@@ -559,10 +546,7 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
-  webhookRetryBurst: number;
-  webhookAllowedHosts: string[] | undefined;
-  webhookMaxResponseBytes: number;
-  webhookDnsTimeoutMs: number;
+  webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -756,14 +740,9 @@ function toConfig(env: ParsedEnv): Config {
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
     webhookRetryRps: env.WEBHOOK_RETRY_RPS,
-    webhookRetryBurst: env.WEBHOOK_RETRY_BURST,
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
-      ? env.WEBHOOK_ALLOWED_HOSTS.split(',')
-          .map((h) => h.trim())
-          .filter((h) => h.length > 0)
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
       : undefined,
-    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
-    webhookDnsTimeoutMs: env.WEBHOOK_DNS_TIMEOUT_MS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,

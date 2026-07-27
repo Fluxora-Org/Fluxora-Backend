@@ -262,6 +262,7 @@ Zero external runtime dependencies; uses the standard Web \`fetch\` API.
 | **Typed error hierarchy** | \`FluxoraApiError\`, \`IdempotencyConflictError\`, \`ValidationError\` |
 | **Client-side validation** | Input guards throw \`ValidationError\` before any network round-trip |
 | **Auth support** | Bearer JWT + static API key |
+| **Deterministic dispatch** | No hidden retries; query params and JSON bodies are sent in caller insertion order |
 
 ---
 
@@ -341,7 +342,7 @@ try {
 POST /api/streams requires an \`Idempotency-Key\` header. The SDK handles this automatically:
 
 - If you omit \`idempotencyKey\`, the SDK auto-generates a UUID v4.
-- If you supply a key, reuse the **same key when retrying** to prevent duplicate creation.
+- The SDK does **not** retry requests internally. If your application retries, supply and reuse the **same key** for every attempt of the same logical create operation.
 - Reusing a key with a **different body** throws \`IdempotencyConflictError\`.
 
 \`\`\`typescript
@@ -356,10 +357,26 @@ const same = await client.createStream(payload, key); // replays cached response
 ## Security notes
 
 - Bearer tokens and API keys are stored in memory only and never logged.
-- The \`Authorization\` header is only added when a credential is present.
+- The \`Authorization\` and \`X-API-Key\` headers are only added when non-empty credentials are present; runtime setters trim surrounding whitespace.
 - Client-side input validation rejects obviously invalid values before network dispatch.
+- Per-request SDK headers override constructor headers. Runtime credentials override any user-supplied \`Authorization\` or \`X-API-Key\` constructor headers.
 - TLS certificate validation is performed by the platform's \`fetch\` implementation.
 - Idempotency key values are never echoed in error bodies or logs (server-side guarantee).
+
+---
+
+## SDK Generation Contract
+
+The TypeScript SDK is generated from \`openapi.yaml\` and its compatibility
+surface is intentionally small:
+
+- Public exports remain \`types\`, \`errors\`, \`idempotency\`, \`pagination\`, and \`client\`.
+- \`FluxoraClient\` methods preserve the current backend envelopes and unwrap only the documented stream convenience shapes.
+- Requests use native \`fetch\` once per SDK method call. Network failures from \`fetch\` are allowed to bubble unchanged.
+- Query parameters omit only \`undefined\` and \`null\` values; \`false\`, \`0\`, and empty strings are serialized.
+- JSON responses are parsed when possible. Empty successful responses resolve to \`{}\`; text error bodies become \`FluxoraApiError\` messages.
+- Request IDs are read from \`X-Request-ID\` first, then response envelope metadata, then nested error objects.
+- Generated output must pass \`pnpm check:sdk:ts\`; drift is treated as a regression.
 
 ---
 
@@ -1151,7 +1168,7 @@ export class StreamPaginator {
   async *autoPaginate(): AsyncGenerator<Stream, void, unknown> {
     while (this.hasMore) {
       const page = await this.nextPage();
-      if (!page || page.length === 0) break;
+      if (!page) break;
       for (const item of page) {
         yield item;
       }
@@ -1175,10 +1192,12 @@ function generateClient() {
  * - All monetary amounts flow as **decimal strings** (never JS numbers).
  * - Idempotency keys are auto-generated for POST /api/streams when omitted.
  * - Cursor-based pagination is encapsulated in \`StreamPaginator\`.
+ * - The SDK performs no hidden retries; callers own retry policy and should
+ *   reuse explicit idempotency keys for retried stream creation attempts.
  *
  * ## Security notes
  * - Bearer tokens and API keys are stored in memory only; never logged.
- * - The \`Authorization\` header is only set when a credential is present.
+ * - Auth headers are only set when non-empty credentials are present.
  * - Client-side validation (empty/missing required params) fires before any
  *   network round-trip, reducing the attack surface for injection.
  * - TLS validation is delegated to the platform's \`fetch\` implementation.
@@ -1257,8 +1276,8 @@ export class FluxoraClient {
 
   constructor(config: FluxoraClientConfig = {}) {
     this.baseUrl = (config.baseUrl ?? 'http://localhost:3000').replace(/\\/+$/, '');
-    this.apiKey = config.apiKey;
-    this.bearerToken = config.bearerToken;
+    this.apiKey = config.apiKey?.trim() || undefined;
+    this.bearerToken = config.bearerToken?.trim() || undefined;
     this.headers = {
       'User-Agent': 'FluxoraTypeScriptSDK/0.1.0',
       Accept: 'application/json',
@@ -1272,7 +1291,7 @@ export class FluxoraClient {
    * @security Token is stored in memory only; never logged.
    */
   public setBearerToken(token: string): void {
-    this.bearerToken = token;
+    this.bearerToken = token.trim() || undefined;
   }
 
   /**
@@ -1280,7 +1299,7 @@ export class FluxoraClient {
    * @security Key is stored in memory only; never logged.
    */
   public setApiKey(apiKey: string): void {
-    this.apiKey = apiKey;
+    this.apiKey = apiKey.trim() || undefined;
   }
 
   // ── Core HTTP dispatcher ───────────────────────────────────────────────────
@@ -1291,6 +1310,10 @@ export class FluxoraClient {
    * On non-2xx responses the method throws:
    * - \`IdempotencyConflictError\` for 409 \`IDEMPOTENCY_CONFLICT\`
    * - \`FluxoraApiError\` for all other non-2xx responses
+   *
+   * The dispatcher intentionally performs exactly one \`fetch\` call. Retry,
+   * timeout, and abort policies belong to the caller or runtime \`fetch\`
+   * implementation so SDK behavior remains deterministic across deploys.
    *
    * @param method  - HTTP verb (GET, POST, DELETE, PATCH, PUT).
    * @param path    - Request path (e.g. \`'/api/streams'\`).

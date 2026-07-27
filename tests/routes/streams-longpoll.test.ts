@@ -15,10 +15,10 @@ import {
 import { getStreamHub } from '../../src/ws/hub.js';
 import { generateToken } from '../../src/lib/auth.js';
 import {
-  _resetSseConnectionLimiter,
-  getActiveSseConnectionCount,
-} from '../../src/streams/sseConnectionLimiter.js';
-import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
+  _resetLongPollConnectionLimiter,
+  getActiveLongPollConnectionCount,
+} from '../../src/streams/longPoll.js';
+import { longPollActiveConnectionsGauge, longPollConnectionsRejectedTotal } from '../../src/metrics/businessMetrics.js';
 import { StaleCursorError } from '../../src/indexer/store.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
@@ -174,11 +174,11 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     process.env.WS_AUTH_REQUIRED = 'false';
-    process.env.SSE_MAX_CONNECTIONS_PER_IP = '10';
-    process.env.SSE_MAX_GLOBAL_CONNECTIONS = '1000';
-    process.env.SSE_MAX_CONNECTION_DURATION_MS = String(30 * 60 * 1000);
-    process.env.SSE_RETRY_AFTER_SECONDS = '15';
-    _resetSseConnectionLimiter();
+    process.env.LONG_POLL_MAX_CONNECTIONS_PER_IP = '10';
+    process.env.LONG_POLL_MAX_GLOBAL_CONNECTIONS = '1000';
+    process.env.LONG_POLL_MAX_CONNECTION_DURATION_MS = String(30 * 60 * 1000);
+    process.env.LONG_POLL_RETRY_AFTER_SECONDS = '15';
+    _resetLongPollConnectionLimiter();
     mockGetById.mockResolvedValue(undefined);
     mockGetEvents.mockResolvedValue({ events: [], total: 0 });
 
@@ -194,7 +194,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
-    _resetSseConnectionLimiter();
+    _resetLongPollConnectionLimiter();
     _resetSseSubscriptionsForTest();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     sseEventBus.removeAllListeners(SSE_STREAM_UPDATE_EVENT);
@@ -208,7 +208,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(res.status).toBe(404);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('NOT_FOUND');
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('holds connection open and times out with null data when no event arrives', async () => {
@@ -223,7 +223,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(res.body.data).toBeNull();
     expect(res.body.meta).toHaveProperty('timestamp');
     expect(elapsed).toBeGreaterThanOrEqual(950);
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('delivers live event immediately when emitted via sseEventBus', async () => {
@@ -235,7 +235,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(getLiveSseSubscriberCount('stream-123')).toBe(1);
-    expect(getActiveSseConnectionCount()).toBe(1);
+    expect(getActiveLongPollConnectionCount()).toBe(1);
 
     sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, {
       streamId: 'stream-123',
@@ -254,7 +254,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
       payload: { amount: '100', status: 'active' },
       correlationId: expect.any(String),
     });
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
     expect(getLiveSseSubscriberCount('stream-123')).toBe(0);
   });
 
@@ -288,7 +288,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
       afterEventId: 'evt-99',
       limit: 100,
     });
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('rejects invalid since parameter with 400 VALIDATION_ERROR', async () => {
@@ -299,7 +299,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('rejects invalid timeout parameter with 400 VALIDATION_ERROR', async () => {
@@ -310,7 +310,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('handles StaleCursorError when replaying events', async () => {
@@ -322,19 +322,19 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('rejects long-poll requests exceeding per-IP capacity with 429 and Retry-After', async () => {
-    process.env.SSE_MAX_CONNECTIONS_PER_IP = '1';
-    process.env.SSE_RETRY_AFTER_SECONDS = '10';
+    process.env.LONG_POLL_MAX_CONNECTIONS_PER_IP = '1';
+    process.env.LONG_POLL_RETRY_AFTER_SECONDS = '10';
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 
     const firstPollPromise = requestPoll('/api/streams/stream-123/poll?timeout=5');
 
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(getActiveSseConnectionCount()).toBe(1);
+    expect(getActiveLongPollConnectionCount()).toBe(1);
 
     const rejected = await requestPoll('/api/streams/stream-123/poll?timeout=5');
 
@@ -350,7 +350,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     });
 
     await firstPollPromise;
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('rejects unauthenticated request when WS_AUTH_REQUIRED is true', async () => {
@@ -362,7 +362,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(res.status).toBe(401);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('UNAUTHORIZED');
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('accepts valid JWT token in Authorization header when WS_AUTH_REQUIRED is true', async () => {
@@ -375,7 +375,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
   it('cleans up connection slot and unsubscribes if client aborts request', async () => {
@@ -398,14 +398,14 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(getActiveSseConnectionCount()).toBe(1);
+    expect(getActiveLongPollConnectionCount()).toBe(1);
     expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners + 1);
 
     req.destroy();
 
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(getActiveSseConnectionCount()).toBe(0);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
     expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
   });
 });

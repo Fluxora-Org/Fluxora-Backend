@@ -25,7 +25,7 @@ import {
   CANARY_HEADER,
   DEFAULT_CANARY_SALT,
   CANARY_BUCKET_COUNT,
-} from '../../src/middleware/canaryRouting.js';
+} from '../../src/middleware/canaryRouting.ts';
 import { correlationIdMiddleware } from '../../src/middleware/correlationId.js';
 import { createApp } from '../../src/app.js';
 

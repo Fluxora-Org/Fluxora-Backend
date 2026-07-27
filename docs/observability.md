@@ -67,8 +67,9 @@ Fluxora can return a W3C-compatible `Server-Timing` response header for the stre
 ### How it works
 
 - Middleware creates a request-scoped registry attached to `res.locals` when `SERVER_TIMING_ENABLED=true`.
-- Route handlers record named phases for `db`, `stellar_rpc`, and `serialize` by pushing sanitized values into the registry.
+- Streams route handlers record named phases by pushing sanitized values into the registry. Current streams responses include `db` and `serialize`; paths that make Stellar RPC calls may also record `stellar_rpc`.
 - The final header is emitted once per response and contains only phase names and durations.
+- Responses without recorded phases omit the header, even when the feature is enabled.
 
 ### Security guarantees
 
