@@ -26,8 +26,10 @@ import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-const SENDER    = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
-const RECIPIENT = 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN';
+const SENDER = 'GAAREIZUIVLGO6EJTKV3ZTO654ABCIRTIRKWM54ITGVLXTG5537RAI5F';
+const RECIPIENT = 'GBNWY7MOT6YMDUXD6QCRMJZYJFNGW7ENT2X4BUPC6MCBKJRXJBMWUCQH';
+const CONTRACT_ADDRESS = 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC';
+const WRONG_NETWORK_ACCOUNT = 'GCV3ZTO654ABCIRTIRKWM54ITGVLXTG5537RAIJSINKGK5UHTCU3V7YT';
 const TTL = 300;
 
 function makeRpc(responses: Record<string, boolean | Error>) {
@@ -39,6 +41,42 @@ function makeRpc(responses: Record<string, boolean | Error>) {
     }),
   } as unknown as import('../../src/services/stellar-rpc.js').StellarRpcService;
 }
+
+function mutateChecksum(address: string): string {
+  const last = address[address.length - 1];
+  return `${address.slice(0, -1)}${last === 'A' ? 'B' : 'A'}`;
+}
+
+const MALFORMED_ACCOUNT_CASES = [
+  {
+    name: 'too short',
+    address: SENDER.slice(0, -1),
+  },
+  {
+    name: 'too long',
+    address: `${SENDER}A`,
+  },
+  {
+    name: 'invalid checksum',
+    address: mutateChecksum(SENDER),
+  },
+  {
+    name: 'wrong prefix',
+    address: `S${SENDER.slice(1)}`,
+  },
+  {
+    name: 'contract StrKey where account is expected',
+    address: CONTRACT_ADDRESS,
+  },
+  {
+    name: 'fullwidth G homoglyph',
+    address: `Ｇ${SENDER.slice(1)}`,
+  },
+  {
+    name: 'Greek Alpha homoglyph inside payload',
+    address: `${SENDER.slice(0, 2)}Α${SENDER.slice(3)}`,
+  },
+] as const;
 
 // ── Core validation logic ─────────────────────────────────────────────────────
 
@@ -53,6 +91,49 @@ describe('StellarAddressValidator', () => {
     const rpc = makeRpc({ [SENDER]: true, [RECIPIENT]: true });
     const v = new StellarAddressValidator(rpc, redis, TTL);
     expect(await v.validate(SENDER, RECIPIENT)).toEqual({ valid: true });
+  });
+
+  it.each(MALFORMED_ACCOUNT_CASES)(
+    'rejects malformed sender address before RPC: $name',
+    async ({ address }) => {
+      const rpc = {
+        accountExists: vi.fn(async () => true),
+      } as unknown as import('../../src/services/stellar-rpc.js').StellarRpcService;
+      const v = new StellarAddressValidator(rpc, redis, TTL);
+
+      const result = await v.validate(address, RECIPIENT);
+
+      expect(result.valid).toBe(false);
+      expect(result.missingAddresses).toContain(address);
+      expect(rpc.accountExists).not.toHaveBeenCalledWith(address);
+    }
+  );
+
+  it.each(MALFORMED_ACCOUNT_CASES)(
+    'rejects malformed recipient address before RPC: $name',
+    async ({ address }) => {
+      const rpc = {
+        accountExists: vi.fn(async () => true),
+      } as unknown as import('../../src/services/stellar-rpc.js').StellarRpcService;
+      const v = new StellarAddressValidator(rpc, redis, TTL);
+
+      const result = await v.validate(SENDER, address);
+
+      expect(result.valid).toBe(false);
+      expect(result.missingAddresses).toContain(address);
+      expect(rpc.accountExists).not.toHaveBeenCalledWith(address);
+    }
+  );
+
+  it('rejects a valid account StrKey that does not exist on the configured chain', async () => {
+    const rpc = makeRpc({ [SENDER]: true, [WRONG_NETWORK_ACCOUNT]: false });
+    const v = new StellarAddressValidator(rpc, redis, TTL);
+
+    const result = await v.validate(SENDER, WRONG_NETWORK_ACCOUNT);
+
+    expect(result.valid).toBe(false);
+    expect(result.missingAddresses).toContain(WRONG_NETWORK_ACCOUNT);
+    expect(rpc.accountExists).toHaveBeenCalledWith(WRONG_NETWORK_ACCOUNT);
   });
 
   it('returns valid:false with sender in missingAddresses when sender absent', async () => {
@@ -114,11 +195,7 @@ describe('StellarAddressValidator', () => {
     const rpc = makeRpc({ [SENDER]: true, [RECIPIENT]: true });
     const v = new StellarAddressValidator(rpc, redis, 600);
     await v.validate(SENDER, RECIPIENT);
-    expect(setSpy).toHaveBeenCalledWith(
-      expect.stringContaining(SENDER),
-      '1',
-      { ex: 600 },
-    );
+    expect(setSpy).toHaveBeenCalledWith(expect.stringContaining(SENDER), '1', { ex: 600 });
   });
 
   it('falls through to RPC when Redis get throws', async () => {
@@ -154,7 +231,7 @@ describe('StellarAddressValidator', () => {
     expect(result.valid).toBe(true);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Circuit breaker OPEN'),
-      expect.any(Object),
+      expect.any(Object)
     );
     warnSpy.mockRestore();
   });
@@ -166,10 +243,7 @@ describe('StellarAddressValidator', () => {
     const v = new StellarAddressValidator(rpc, redis, TTL);
     const result = await v.validate(SENDER, RECIPIENT);
     expect(result.valid).toBe(true);
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('RPC error'),
-      expect.any(Object),
-    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('RPC error'), expect.any(Object));
     warnSpy.mockRestore();
   });
 

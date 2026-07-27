@@ -195,6 +195,7 @@ describe('admin API key routes', () => {
 
     const deleteRes = await authed(request(app).delete(`/api/admin/api-keys/${keyId}`));
     expect(deleteRes.status).toBe(204);
+    expect(deleteRes.headers['x-request-id']).toBeTruthy();
     expect(deleteRes.body).toEqual({}); // 204 should have empty body
     expect(recordAuditEventToDb).toHaveBeenCalledWith(
       'API_KEY_REVOKED', 'api_key', keyId, expect.anything(), expect.any(Object),

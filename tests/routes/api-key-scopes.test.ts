@@ -1,5 +1,5 @@
 /**
- * Tests for API key scope enforcement.
+ * Tests for API key scope enforcement & getApiKeyRecord.
  * 
  * Covers:
  * - API key creation with custom scopes
@@ -7,64 +7,145 @@
  * - Scope validation on protected routes
  * - Missing/insufficient scope errors
  * - API key revocation
+ * - getApiKeyRecord async lookup and dead code removal regression tests
  */
 
 import request from 'supertest';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { ApiKeyRecord } from '../../src/db/types.js';
+
+vi.mock('../../src/config/env.js', () => ({
+  getConfig: () => ({
+    apiKeyPepper: 'test-pepper-32-chars-long-secret-key-pepper!',
+  }),
+}));
+
+const inMemoryKeys = new Map<string, ApiKeyRecord>();
+
+vi.mock('../../src/db/repositories/apiKeyRepository.js', () => ({
+  apiKeyRepository: {
+    insert: vi.fn(async (record: ApiKeyRecord) => {
+      inMemoryKeys.set(record.id, record);
+    }),
+    findActiveByPrefix: vi.fn(async (prefix: string) => {
+      return Array.from(inMemoryKeys.values()).filter(
+        (k) => k.prefix === prefix && k.active,
+      );
+    }),
+    getById: vi.fn(async (id: string) => {
+      return inMemoryKeys.get(id);
+    }),
+    rotate: vi.fn(),
+    revoke: vi.fn(async (id: string) => {
+      const existing = inMemoryKeys.get(id);
+      if (!existing) return undefined;
+      const updated = { ...existing, active: false };
+      inMemoryKeys.set(id, updated);
+      return updated;
+    }),
+    listAll: vi.fn(async () => Array.from(inMemoryKeys.values())),
+  },
+}));
+
+vi.mock('../../src/lib/auditLog.js', () => ({
+  recordAuditEventToDb: vi.fn(async () => {}),
+}));
+
 import app from '../../src/app.js';
+import * as apiKeyModule from '../../src/lib/apiKey.js';
 import {
   createApiKey,
-  _resetApiKeyStoreForTest,
+  getApiKeyRecord,
+  revokeApiKey,
   DEFAULT_SCOPES,
 } from '../../src/lib/apiKey.js';
 
-describe('API Key Scopes', () => {
+describe('API Key Scopes & getApiKeyRecord', () => {
   beforeEach(() => {
-    _resetApiKeyStoreForTest();
+    inMemoryKeys.clear();
   });
 
   afterEach(() => {
-    _resetApiKeyStoreForTest();
+    inMemoryKeys.clear();
+  });
+
+  describe('Regression - Dead code removal', () => {
+    it('should not export dead functions (getApiKeyScopes, hasScope, _resetApiKeyStoreForTest)', () => {
+      expect((apiKeyModule as any).getApiKeyScopes).toBeUndefined();
+      expect((apiKeyModule as any).hasScope).toBeUndefined();
+      expect((apiKeyModule as any)._resetApiKeyStoreForTest).toBeUndefined();
+    });
+  });
+
+  describe('getApiKeyRecord', () => {
+    it('should return record including scopes for a valid key', async () => {
+      const created = await createApiKey('record-test', ['streams:read', 'admin:reindex']);
+      const record = await getApiKeyRecord(created.key);
+
+      expect(record).toBeDefined();
+      expect(record?.id).toBe(created.id);
+      expect(record?.name).toBe('record-test');
+      expect(record?.scopes).toEqual(['streams:read', 'admin:reindex']);
+    });
+
+    it('should return undefined for non-existent raw key', async () => {
+      const record = await getApiKeyRecord('flx_nonexistent_key_1234567890');
+      expect(record).toBeUndefined();
+    });
+
+    it('should return undefined for empty or invalid raw key input', async () => {
+      expect(await getApiKeyRecord('')).toBeUndefined();
+      expect(await getApiKeyRecord(null as any)).toBeUndefined();
+      expect(await getApiKeyRecord(undefined as any)).toBeUndefined();
+    });
+
+    it('should not return revoked keys', async () => {
+      const created = await createApiKey('revoked-test');
+      await revokeApiKey(created.id);
+
+      const record = await getApiKeyRecord(created.key);
+      expect(record).toBeUndefined();
+    });
   });
 
   describe('createApiKey with scopes', () => {
-    it('should create a key with default scopes if none provided', () => {
-      const result = createApiKey('test-key');
+    it('should create a key with default scopes if none provided', async () => {
+      const result = await createApiKey('test-key');
       expect(result.key).toBeDefined();
       expect(result.key).toMatch(/^flx_/);
     });
 
-    it('should create a key with custom scopes', () => {
-      // Note: This test verifies the function exists and accepts scopes
-      // The actual verification requires checking the internal store
-      const result = createApiKey('read-only-key', ['streams:read']);
+    it('should create a key with custom scopes', async () => {
+      const result = await createApiKey('read-only-key', ['streams:read']);
       expect(result.key).toBeDefined();
       expect(result.id).toBeDefined();
+
+      const record = await getApiKeyRecord(result.key);
+      expect(record?.scopes).toEqual(['streams:read']);
     });
 
-    it('should fall back to default scopes for empty scope array', () => {
-      const result = createApiKey('test-key', []);
+    it('should fall back to default scopes for empty scope array', async () => {
+      const result = await createApiKey('test-key', []);
       expect(result.key).toBeDefined();
-      // Default scopes should be applied
+      const record = await getApiKeyRecord(result.key);
+      expect(record?.scopes).toEqual(DEFAULT_SCOPES);
     });
   });
 
   describe('GET /api/streams with API key', () => {
     it('should allow request with valid API key with streams:read scope', async () => {
-      const apiKey = createApiKey('read-key', ['streams:read']);
+      const apiKey = await createApiKey('read-key', ['streams:read']);
       
       const response = await request(app)
         .get('/api/streams')
         .set('X-API-Key', apiKey.key)
         .query({ limit: 10 });
 
-      // Should not be blocked by scope check (may fail due to other reasons like no streams)
-      // but should not return 403 for scope
       expect(response.status).not.toBe(403);
     });
 
     it('should deny request with API key missing streams:read scope', async () => {
-      const apiKey = createApiKey('write-only-key', ['streams:write']);
+      const apiKey = await createApiKey('write-only-key', ['streams:write']);
       
       const response = await request(app)
         .get('/api/streams')
@@ -81,7 +162,6 @@ describe('API Key Scopes', () => {
         .get('/api/streams')
         .query({ limit: 10 });
 
-      // Should be allowed without API key
       expect(response.status).not.toBe(401);
     });
 
@@ -98,7 +178,7 @@ describe('API Key Scopes', () => {
 
   describe('POST /api/streams with API key', () => {
     it('should deny request with API key missing streams:write scope', async () => {
-      const apiKey = createApiKey('read-only-key', ['streams:read']);
+      const apiKey = await createApiKey('read-only-key', ['streams:read']);
       
       const response = await request(app)
         .post('/api/streams')
@@ -113,14 +193,13 @@ describe('API Key Scopes', () => {
           end_time: Math.floor(Date.now() / 1000) + 86400,
         });
 
-      // Should be denied due to missing write scope
       expect(response.status).toBe(403);
       expect(response.body.error?.code).toBe('FORBIDDEN');
       expect(response.body.error?.message).toContain('scopes');
     });
 
     it('should allow request with API key having streams:write scope', async () => {
-      const apiKey = createApiKey('write-key', ['streams:write']);
+      const apiKey = await createApiKey('write-key', ['streams:write']);
       
       const response = await request(app)
         .post('/api/streams')
@@ -135,41 +214,36 @@ describe('API Key Scopes', () => {
           end_time: Math.floor(Date.now() / 1000) + 86400,
         });
 
-      // Should not be blocked by scope check
-      // (may fail due to other validation, but not scope)
       expect(response.status).not.toBe(403);
     });
   });
 
   describe('DELETE /api/streams/:id with API key', () => {
     it('should deny request with API key missing streams:write scope', async () => {
-      const apiKey = createApiKey('read-only-key', ['streams:read']);
+      const apiKey = await createApiKey('read-only-key', ['streams:read']);
       
       const response = await request(app)
         .delete('/api/streams/stream-123')
         .set('X-API-Key', apiKey.key);
 
-      // Should be denied due to missing write scope
       expect(response.status).toBe(403);
       expect(response.body.error?.code).toBe('FORBIDDEN');
     });
 
     it('should allow request with API key having streams:write scope', async () => {
-      const apiKey = createApiKey('write-key', ['streams:write']);
+      const apiKey = await createApiKey('write-key', ['streams:write']);
       
       const response = await request(app)
         .delete('/api/streams/stream-123')
         .set('X-API-Key', apiKey.key);
 
-      // Should not be blocked by scope check
-      // (may fail due to stream not found, but not scope)
       expect(response.status).not.toBe(403);
     });
   });
 
   describe('GET /api/streams/:id/events with API key', () => {
     it('should deny request with API key missing streams:read scope', async () => {
-      const apiKey = createApiKey('write-only-key', ['streams:write']);
+      const apiKey = await createApiKey('write-only-key', ['streams:write']);
       
       const response = await request(app)
         .get('/api/streams/stream-123/events')
@@ -182,13 +256,12 @@ describe('API Key Scopes', () => {
 
   describe('scope validation edge cases', () => {
     it('should handle API key with multiple scopes', async () => {
-      const apiKey = createApiKey('multi-scope-key', [
+      const apiKey = await createApiKey('multi-scope-key', [
         'streams:read',
         'streams:write',
         'admin:pause',
       ]);
       
-      // Should work with read
       const readResponse = await request(app)
         .get('/api/streams')
         .set('X-API-Key', apiKey.key)
@@ -198,15 +271,13 @@ describe('API Key Scopes', () => {
     });
 
     it('should require at least one matching scope', async () => {
-      // Create key with streams:write but requireScope checks for streams:read OR streams:write
-      const apiKey = createApiKey('write-key', ['streams:write']);
+      const apiKey = await createApiKey('write-key', ['streams:write']);
       
       const response = await request(app)
         .get('/api/streams')
         .set('X-API-Key', apiKey.key)
         .query({ limit: 10 });
 
-      // Should fail because streams:write does not match streams:read
       expect(response.status).toBe(403);
     });
   });
@@ -218,9 +289,8 @@ describe('API Key Scopes', () => {
     });
 
     it('should allow full access with default scopes', async () => {
-      const apiKey = createApiKey('default-scope-key');
+      const apiKey = await createApiKey('default-scope-key');
       
-      // Should have both read and write by default
       const readResponse = await request(app)
         .get('/api/streams')
         .set('X-API-Key', apiKey.key)

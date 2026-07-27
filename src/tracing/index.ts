@@ -49,6 +49,9 @@ function safeUrl(value: string | undefined, fallback: string): string {
   }
 }
 
+import { addShutdownHook } from '../shutdown.js';
+import { getTracer, initializeTracer } from './hooks.js';
+
 // ── SDK singleton ─────────────────────────────────────────────────────────────
 
 let sdk: NodeSDK | null = null;
@@ -97,6 +100,17 @@ export function startTracing(): boolean {
     });
 
     sdk.start();
+
+    // Wire sampling strategy into the custom Tracer so head/tail decisions
+    // are applied to spans created via traceSpan() and the hooks-based tracer.
+    const sampling = getSamplingConfig();
+    initializeTracer({ enabled: true, sampling });
+
+    // Register shutdown hook to flush all pending spans and stop SDK on exit
+    addShutdownHook(async () => {
+      await stopTracing();
+    });
+
     return true;
   } catch (err) {
     // SDK startup must never crash the application.
@@ -117,6 +131,13 @@ export function startTracing(): boolean {
  * Call during graceful shutdown before process.exit().
  */
 export async function stopTracing(): Promise<void> {
+  try {
+    const tracer = getTracer();
+    await tracer.flush();
+  } catch {
+    // ignore tracer flush errors
+  }
+
   if (!sdk) return;
   try {
     await sdk.shutdown();
@@ -130,4 +151,126 @@ export async function stopTracing(): Promise<void> {
 /** Exposed for tests only — do not call in production code. */
 export function _getSdk(): NodeSDK | null {
   return sdk;
+}
+
+// ── Sampling configuration helpers ────────────────────────────────────────────
+
+import type { SamplingConfig } from './hooks.js';
+
+/**
+ * Parse and return the current sampling configuration from environment variables.
+ *
+ * Environment variables:
+ * - `TRACING_SAMPLING_STRATEGY` — `'head'` (default), `'tail'`, `'always'`, `'never'`
+ * - `TRACING_HEAD_SAMPLE_RATE`  — float 0–1 (defaults to `TRACING_SAMPLE_RATE`)
+ * - `TRACING_TAIL_KEEP_ERRORS`  — boolean (default `true`)
+ * - `TRACING_PER_ROUTE_OVERRIDES` — JSON string mapping route path → sample rate
+ *                                    e.g. `{"/health":0,"/api/streams":1}`
+ *
+ * @returns A fully-typed {@link SamplingConfig} representing the current config.
+ */
+export function getSamplingConfig(): SamplingConfig {
+  const strategy = (process.env.TRACING_SAMPLING_STRATEGY ?? 'head') as string;
+
+  // Shared helpers
+  const parseRate = (raw: string | undefined, fallback: number): number => {
+    if (!raw || raw.trim() === '') return fallback;
+    const n = Number.parseFloat(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+  };
+
+  const parseBool = (raw: string | undefined, fallback: boolean): boolean => {
+    if (!raw) return fallback;
+    const v = raw.trim().toLowerCase();
+    if (v === 'true' || v === '1') return true;
+    if (v === 'false' || v === '0') return false;
+    return fallback;
+  };
+
+  const globalRate = parseRate(process.env.TRACING_SAMPLE_RATE, 1);
+
+  if (strategy === 'always') return { strategy: 'always' };
+  if (strategy === 'never') return { strategy: 'never' };
+
+  if (strategy === 'tail') {
+    return {
+      strategy: 'tail',
+      sampleRate: parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate),
+      keepErrorSpans: parseBool(process.env.TRACING_TAIL_KEEP_ERRORS, true),
+    };
+  }
+
+  // Default: head-based sampling
+  const headRate = parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate);
+
+  let perRouteOverrides: Record<string, number> | undefined;
+  const rawOverrides = process.env.TRACING_PER_ROUTE_OVERRIDES;
+  if (rawOverrides && rawOverrides.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(rawOverrides) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        // Validate: only keep entries with numeric values in [0, 1]
+        const validated: Record<string, number> = {};
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (typeof v === 'number' && v >= 0 && v <= 1) {
+            validated[k] = v;
+          }
+        }
+        if (Object.keys(validated).length > 0) {
+          perRouteOverrides = validated;
+        }
+      }
+    } catch {
+      // Malformed JSON — ignore overrides, log to stderr for visibility
+      process.stderr.write(
+        `[tracing] TRACING_PER_ROUTE_OVERRIDES is not valid JSON — per-route overrides disabled\n`,
+      );
+    }
+  }
+
+  const config: SamplingConfig = {
+    strategy: 'head',
+    sampleRate: headRate,
+    ...(perRouteOverrides !== undefined ? { perRouteOverrides } : {}),
+  };
+  return config;
+}
+
+// ── Batch Span Exporter configuration ─────────────────────────────────────────
+
+export interface OTelBatchConfig {
+  maxExportBatchSize: number;
+  scheduledDelayMillis: number;
+  maxQueueSize: number;
+}
+
+/**
+ * Parse OpenTelemetry BatchSpanProcessor configuration from environment variables.
+ *
+ * Environment variables:
+ * - `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` or `TRACING_BATCH_MAX_SIZE` (default: 512)
+ * - `OTEL_BSP_SCHEDULED_DELAY_MILLIS` or `TRACING_BATCH_TIMEOUT_MS` (default: 5000)
+ * - `OTEL_BSP_MAX_QUEUE_SIZE` or `TRACING_BATCH_QUEUE_SIZE` (default: 2048)
+ */
+export function getOTelBatchConfig(): OTelBatchConfig {
+  const parseNum = (val: string | undefined, fallback: number, min = 1): number => {
+    if (!val || val.trim() === '') return fallback;
+    const n = parseInt(val, 10);
+    return Number.isFinite(n) && n >= min ? n : fallback;
+  };
+
+  return {
+    maxExportBatchSize: parseNum(
+      process.env.OTEL_BSP_MAX_EXPORT_BATCH_SIZE ?? process.env.TRACING_BATCH_MAX_SIZE,
+      512,
+    ),
+    scheduledDelayMillis: parseNum(
+      process.env.OTEL_BSP_SCHEDULED_DELAY_MILLIS ?? process.env.TRACING_BATCH_TIMEOUT_MS,
+      5000,
+    ),
+    maxQueueSize: parseNum(
+      process.env.OTEL_BSP_MAX_QUEUE_SIZE ?? process.env.TRACING_BATCH_QUEUE_SIZE,
+      2048,
+    ),
+  };
 }

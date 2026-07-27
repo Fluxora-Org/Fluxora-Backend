@@ -7,23 +7,24 @@
  *   upsertStream uses INSERT … ON CONFLICT DO NOTHING so the same
  *   (transaction_hash, event_index) pair is safe to submit multiple times.
  *
- * Decimal-string invariant:
- *   Amount columns are stored and returned as TEXT.  No numeric coercion
- *   is performed here — callers own that responsibility.
+ * Decimal-string amounts:
+ *   All monetary fields (amount, streamed_amount, remaining_amount,
+ *   rate_per_second) are stored and returned as TEXT.  The repository never
+ *   converts them to numbers, preserving full precision across the
+ *   chain → DB → API boundary.
  *
- * Transactional operations
- * ------------------------
- * `transactionalUpsertStream` and `transactionalUpdateStream` wrap the stream
- * write, an audit_logs row, and an optional webhook_outbox row inside a single
- * SQLite transaction.  If any step fails the entire transaction is rolled back,
- * guaranteeing that the three tables are always in sync.
+ * PII encryption:
+ *   sender_address and recipient_address are stored encrypted via pgcrypto
+ *   (pgp_sym_encrypt with AES-256).  Every read path uses streamSelectColumns()
+ *   to emit decrypt_stream_address() SQL fragments so addresses are decrypted
+ *   inside PostgreSQL before the row reaches application code.  Encryption
+ *   keys are resolved from config via resolvePgcryptoKeys() and are never
+ *   logged or included in error messages.  Key rotation is supported via an
+ *   optional PGCRYPTO_KEY_PREVIOUS.
  *
- * Decimal-string amounts
- * ----------------------
- * All monetary fields (amount, streamed_amount, remaining_amount,
- * rate_per_second) are stored and returned as TEXT.  The repository never
- * converts them to numbers, preserving full precision across the
- * chain → DB → API boundary.
+ * Typed row mapping:
+ *   Never pass a bare domain interface to `query<T>()`. Query with
+ *   `Record<string, unknown>` and map through `rowToRecord()` (see README.md).
  *
  * @module db/repositories/streamRepository
  */
@@ -54,6 +55,18 @@ import {
 
 
 const REPO = 'streamRepository';
+
+/**
+ * Hard maximum number of rows any paginated read may return in a single page.
+ *
+ * This cap is enforced at the repository layer regardless of the caller-
+ * provided limit, providing defence-in-depth against unbounded queries even
+ * if route-level validation is bypassed.
+ *
+ * Both `findWithCursor` (cursor pagination) and `find` (offset pagination)
+ * honour this constant so the two paths are always in agreement.
+ */
+export const MAX_PAGE_SIZE = 100;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -98,6 +111,19 @@ function resolvePgcryptoKeys(): { current: string; previous?: string } {
     throw new Error('PGCRYPTO_KEY is required to encrypt and decrypt stream PII');
   }
   return { current: config.pgcryptoKey, previous: config.pgcryptoKeyPrevious };
+}
+
+/**
+ * Error thrown when a concurrent UPDATE changed the stream's status between
+ * the validation read and the conditional UPDATE, indicating a lost race.
+ *
+ * Route handlers should catch this and surface it as HTTP 409 CONFLICT.
+ */
+export class StatusConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StatusConflictError';
+  }
 }
 
 function isValidStatusTransition(from: StreamStatus, to: StreamStatus): boolean {
@@ -196,7 +222,7 @@ export const streamRepository = {
     enrichActiveSpanWithStream(id);
     return timed('updateStream', async () => {
       const pool = getPool();
-      const current = await this.getById(id);
+      const current = await this.getById(id, { forcePrimary: true });
       if (!current) throw new Error(`Stream not found: ${id}`);
       enrichActiveSpanWithStream(current.id, current.sender_address, current.recipient_address);
       if (input.status && !isValidStatusTransition(current.status, input.status)) {
@@ -212,6 +238,12 @@ export const streamRepository = {
       if (input.end_time !== undefined) { setClauses.push(`end_time = $${idx++}`); values.push(input.end_time); }
       values.push(id);
 
+      // Compare-and-swap guard: bind the validated current.status so the
+      // UPDATE only succeeds if the status hasn't changed since we read it.
+      // This prevents the check-then-act race documented in issue #842.
+      const statusParamIdx = values.length + 1;
+      values.push(current.status);
+
       const keySet = resolvePgcryptoKeys();
       const keyIndex = values.length + 1;
       const previousKeyIndex = keySet.previous ? keyIndex + 1 : undefined;
@@ -220,20 +252,57 @@ export const streamRepository = {
         values.push(keySet.previous);
       }
 
-      const sql = `UPDATE streams SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING ${streamSelectColumns(keyIndex, previousKeyIndex)}`;
+      const sql = `UPDATE streams SET ${setClauses.join(', ')} WHERE id = $${idx} AND status = $${statusParamIdx} RETURNING ${streamSelectColumns(keyIndex, previousKeyIndex)}`;
       const result = await query<Record<string, unknown>>(pool, sql, values);
-      if (result.rows.length === 0) throw new Error(`Stream not found after update: ${id}`);
+      if (result.rows.length === 0) {
+        // Distinguish "stream deleted" from "status changed concurrently"
+        const exists = await query<{ exists: boolean }>(
+          pool,
+          'SELECT EXISTS(SELECT 1 FROM streams WHERE id = $1)',
+          [id],
+        );
+        if (!exists.rows[0]?.exists) {
+          throw new Error(`Stream not found after update: ${id}`);
+        }
+        throw new StatusConflictError(
+          `Status conflict: stream ${id} status changed concurrently from '${current.status}'. Precondition no longer holds.`,
+        );
+      }
       info('Stream updated', { id, input, correlationId });
       return rowToRecord(result.rows[0]!);
     });
   },
 
-  /** Fetch a single stream by its primary key. */
-  async getById(id: string): Promise<StreamRecord | undefined> {
+  /**
+   * Fetch a single stream by its primary key.
+   *
+   * Uses {@link streamSelectColumns} with the resolved pgcrypto keyset so that
+   * `sender_address` and `recipient_address` are decrypted by the database
+   * before the row reaches the application layer.  This matches the decryption
+   * contract honoured by every other read path (`getByEvent`, `findWithCursor`,
+   * `find`).
+   *
+   * **Parameter layout** (built dynamically):
+   * - `$1`  — stream id
+   * - `$2`  — current encryption key (always present when pgcrypto is enabled)
+   * - `$3`  — previous encryption key (optional; omitted when key rotation is not active)
+   *
+   * **Security**: keys are sourced exclusively from {@link resolvePgcryptoKeys}
+   * and are never logged or included in error messages.
+   */
+  async getById(id: string, options?: { forcePrimary?: boolean }): Promise<StreamRecord | undefined> {
     enrichActiveSpanWithStream(id);
     return timed('getById', async () => {
-      const pool = await getReadPool();
-      const result = await query<Record<string, unknown>>(pool, 'SELECT * FROM streams WHERE id = $1', [id]);
+      const pool = await getReadPool({ forcePrimary: options?.forcePrimary });
+      const keySet = resolvePgcryptoKeys();
+      const params: unknown[] = [id, keySet.current];
+      const previousKeyIndex = keySet.previous ? params.length + 1 : undefined;
+      if (keySet.previous) params.push(keySet.previous);
+      const result = await query<Record<string, unknown>>(
+        pool,
+        `SELECT ${streamSelectColumns(2, previousKeyIndex)} FROM streams WHERE id = $1`,
+        params,
+      );
       if (result.rows[0]) {
         const record = rowToRecord(result.rows[0]);
         enrichActiveSpanWithStream(record.id, record.sender_address, record.recipient_address);
@@ -290,15 +359,32 @@ export const streamRepository = {
     });
   },
 
-  /** Cursor-based paginated list with optional filters. */
+  /**
+   * Cursor-based paginated list with optional filters.
+   *
+   * @param filter - Column-level predicates to narrow the result set.
+   * @param limit  - Desired page size. Clamped to {@link MAX_PAGE_SIZE} at the
+   *   repository layer so callers cannot trigger unbounded reads regardless of
+   *   how the route layer is configured.
+   * @param afterId       - Exclusive lower bound for keyset pagination.
+   * @param includeTotal  - When `true`, a separate COUNT(*) query is executed
+   *   and returned as `total`.
+   * @param options       - Optional routing overrides.  Pass `{ forcePrimary: true }`
+   *   to route this read to the primary pool (read-your-writes consistency).
+   */
   async findWithCursor(
     filter: StreamFilter,
     limit: number,
     afterId?: string,
     includeTotal?: boolean,
+    options?: { forcePrimary?: boolean },
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
-      const pool = await getReadPool();
+      const effectiveLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
+      if (effectiveLimit !== limit) {
+        debug('findWithCursor: limit clamped', { requested: limit, effective: effectiveLimit });
+      }
+      const pool = await getReadPool({ forcePrimary: options?.forcePrimary });
       const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -332,7 +418,7 @@ export const streamRepository = {
       const whereCursor = cursorConditions.length > 0 ? `WHERE ${cursorConditions.join(' AND ')}` : '';
 
       const limitParamIndex = cursorParams.length + 1;
-      cursorParams.push(limit + 1);
+      cursorParams.push(effectiveLimit + 1);
       const keyIndex = cursorParams.length + 1;
       cursorParams.push(keySet.current);
       const previousKeyIndex = keySet.previous ? cursorParams.length + 1 : undefined;
@@ -345,8 +431,8 @@ export const streamRepository = {
           ? query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${whereBase}`, params)
           : Promise.resolve(null),
       ]);
-      const hasMore = dataResult.rows.length > limit;
-      const rows = hasMore ? dataResult.rows.slice(0, limit) : dataResult.rows;
+      const hasMore = dataResult.rows.length > effectiveLimit;
+      const rows = hasMore ? dataResult.rows.slice(0, effectiveLimit) : dataResult.rows;
       const streams = rows.map(rowToRecord);
       const result: { streams: StreamRecord[]; hasMore: boolean; total?: number } = { streams, hasMore };
       if (countResult) result.total = Number(countResult.rows[0]!.count);
@@ -354,9 +440,53 @@ export const streamRepository = {
     });
   },
 
-  /** Offset-based paginated list. */
+  /**
+   * Offset-based paginated list.
+   *
+   * **Ordering guarantee**: rows are sorted by `created_at DESC, id DESC`.
+   * Because `created_at` defaults to `NOW()` and is not unique (multiple
+   * streams inserted in the same transaction or millisecond share the same
+   * timestamp), the secondary `id DESC` tiebreaker makes the composite key
+   * unique.  PostgreSQL can then produce a deterministic, stable order across
+   * OFFSET pages, preventing duplicate or skipped rows when ties straddle a
+   * page boundary.
+   *
+   * The composite index `idx_streams_created_at_id_desc` (added by migration
+   * `20260624000000_streams_created_at_id_tiebreaker_index.ts`) covers this
+   * ordering efficiently.
+   *
+   * Security: the ORDER BY clause references fixed column names only — no
+   * client input is interpolated — satisfying the SQL-injection-safety
+   * requirement.  LIMIT and OFFSET are passed as bound parameters (`$n`).
+   */
+  /**
+   * Offset-based paginated list.
+   *
+   * `pagination.limit` is clamped to {@link MAX_PAGE_SIZE} at the repository
+   * layer so both pagination strategies share the same hard cap.
+   *
+   * **Ordering guarantee**: rows are sorted by `created_at DESC, id DESC`.
+   * Because `created_at` defaults to `NOW()` and is not unique (multiple
+   * streams inserted in the same transaction or millisecond share the same
+   * timestamp), the secondary `id DESC` tiebreaker makes the composite key
+   * unique.  PostgreSQL can then produce a deterministic, stable order across
+   * OFFSET pages, preventing duplicate or skipped rows when ties straddle a
+   * page boundary.
+   *
+   * The composite index `idx_streams_created_at_id_desc` (added by migration
+   * `20260624000000_streams_created_at_id_tiebreaker_index.ts`) covers this
+   * ordering efficiently.
+   *
+   * Security: the ORDER BY clause references fixed column names only — no
+   * client input is interpolated — satisfying the SQL-injection-safety
+   * requirement.  LIMIT and OFFSET are passed as bound parameters (`$n`).
+   */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
+      const effectiveLimit = Math.min(Math.max(pagination.limit, 1), MAX_PAGE_SIZE);
+      if (effectiveLimit !== pagination.limit) {
+        debug('find: limit clamped', { requested: pagination.limit, effective: effectiveLimit });
+      }
       const pool = await getReadPool();
       const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
@@ -399,13 +529,13 @@ export const streamRepository = {
         query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-          [...params, pagination.limit, pagination.offset],
+          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          [...params, effectiveLimit, pagination.offset],
         ),
       ]);
       const total = Number(countResult.rows[0]!.count);
       const streams = dataResult.rows.map(rowToRecord);
-      return { streams, total, limit: pagination.limit, offset: pagination.offset, hasMore: pagination.offset + streams.length < total };
+      return { streams, total, limit: effectiveLimit, offset: pagination.offset, hasMore: pagination.offset + streams.length < total };
     });
   },
 

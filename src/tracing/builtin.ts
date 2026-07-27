@@ -15,7 +15,7 @@
  * - Memory is bounded by maxSpans config
  */
 
-import { Span, SpanEvent, TracerHooks } from './hooks.js';
+import { Span, SpanEvent, TracerHooks, BatchSpanExporter, BatchSpanExporterConfig } from './hooks.js';
 
 /**
  * In-memory span buffer configuration.
@@ -350,12 +350,14 @@ export class ErrorClassifier {
 
 /**
  * Create a built-in tracer hook chain.
- * Combines SpanBuffer, MetricsCollector, and other handlers.
+ * Combines SpanBuffer, MetricsCollector, BatchSpanExporter, and other handlers.
  */
 export function createBuiltInHooks(config: {
   enableBuffer?: boolean;
   enableMetrics?: boolean;
+  enableBatching?: boolean;
   bufferConfig?: SpanBufferConfig;
+  batchConfig?: BatchSpanExporterConfig;
 }): TracerHooks {
   const handlers: TracerHooks[] = [];
 
@@ -365,6 +367,10 @@ export function createBuiltInHooks(config: {
 
   if (config.enableMetrics !== false) {
     handlers.push(new MetricsCollector());
+  }
+
+  if (config.enableBatching === true) {
+    handlers.push(new BatchSpanExporter(config.batchConfig));
   }
 
   return {
@@ -403,6 +409,28 @@ export function createBuiltInHooks(config: {
           // Silent failure
         }
       });
+    },
+    async flush(): Promise<void> {
+      for (const h of handlers) {
+        try {
+          if (typeof h.flush === 'function') {
+            await h.flush();
+          }
+        } catch {
+          // Silent failure
+        }
+      }
+    },
+    async shutdown(): Promise<void> {
+      for (const h of handlers) {
+        try {
+          if (typeof h.shutdown === 'function') {
+            await h.shutdown();
+          }
+        } catch {
+          // Silent failure
+        }
+      }
     },
   };
 }

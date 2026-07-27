@@ -31,6 +31,7 @@ import {
 } from '../src/routes/indexer.js';
 import { isLedgerRolledBack, _resetRolledBackLedgers } from '../src/indexer/service.js';
 import { dispatchWebhook } from '../src/webhooks/dispatcher.js';
+import { webhookDeliveriesSuppressedTotal } from '../src/metrics/businessMetrics.js';
 
 const INDEXER_TOKEN = 'test-reorg-token';
 const TOKEN = INDEXER_TOKEN;
@@ -85,6 +86,7 @@ describe('Indexer reorg handling', () => {
   beforeEach(() => {
     resetIndexerState();
     setIndexerIngestAuthToken(TOKEN);
+    webhookDeliveriesSuppressedTotal.reset();
     store = new InMemoryContractEventStore();
     setIndexerEventStore(store);
   });
@@ -192,6 +194,9 @@ describe('Reorg rollback prevents duplicate webhooks and WS events', () => {
         ledger: 200,
       });
       expect(dispatched).toHaveLength(0);
+      // Counter should have been incremented
+      const metricValue = webhookDeliveriesSuppressedTotal.get().values[0].value;
+      expect(metricValue).toBe(1);
     } finally {
       global.fetch = originalFetch;
     }

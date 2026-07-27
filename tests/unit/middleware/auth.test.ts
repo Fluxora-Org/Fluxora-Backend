@@ -352,3 +352,74 @@ describe('requirePermission', () => {
     expect(next).not.toHaveBeenCalled();
   });
 });
+
+// ── Issue #836: API-key auth must never throw an unhandled exception ──
+
+vi.mock('../../../src/lib/apiKey.js', () => ({
+  getApiKeyFromRequest: vi.fn(),
+  findRecordByRawKey: vi.fn(),
+  isValidApiKey: vi.fn(),
+}));
+
+import { authenticateApiKey } from '../../../src/middleware/auth.js';
+import { findRecordByRawKey, getApiKeyFromRequest } from '../../../src/lib/apiKey.js';
+
+function mockReqWithApiKey(key?: string): Partial<Request> {
+  return {
+    headers: key ? { 'x-api-key': key } : {},
+    id: 'req-836',
+    correlationId: 'req-836',
+  };
+}
+
+describe('authenticateApiKey (issue #836)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns a clean 401 (not 500) for an unknown API key', async () => {
+    (getApiKeyFromRequest as any).mockReturnValue('flx_unknownkeyvalue');
+    (findRecordByRawKey as any).mockResolvedValue(undefined);
+
+    const req = mockReqWithApiKey('flx_unknownkeyvalue') as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticateApiKey(req, res, next);
+
+    expect(res.statusCode).toBe(401);
+    expect((res as any).jsonBody.error.code).toBe('UNAUTHORIZED');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('authenticates a valid active key and attaches scopes', async () => {
+    (getApiKeyFromRequest as any).mockReturnValue('flx_validkeyvalue');
+    (findRecordByRawKey as any).mockResolvedValue({
+      id: 'key-1',
+      active: true,
+      scopes: ['streams:read', 'streams:write'],
+    });
+
+    const req = mockReqWithApiKey('flx_validkeyvalue') as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticateApiKey(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect((req as any).keyId).toBe('key-1');
+    expect((req as any).keyScopes).toEqual(['streams:read', 'streams:write']);
+  });
+
+  it('proceeds without keyScopes when no API key header is present', async () => {
+    (getApiKeyFromRequest as any).mockReturnValue(undefined);
+
+    const req = mockReqWithApiKey() as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticateApiKey(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+  });
+});

@@ -34,9 +34,75 @@ import { CircuitOpenError } from '../services/stellar-rpc.js';
 
 export const STELLAR_ACCOUNT_CACHE_PREFIX = 'fluxora:stellar:account:';
 
+const STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE = 6 << 3;
+const STELLAR_STRKEY_LENGTH = 56;
+const STELLAR_STRKEY_DECODED_LENGTH = 35;
+const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
+const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const STELLAR_ACCOUNT_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
+
+// SEP-23 StrKey validation for Stellar Ed25519 public keys.
+function decodeStellarBase32(value: string): number[] | null {
+  const bytes: number[] = [];
+  let bits = 0;
+  let current = 0;
+
+  for (const char of value) {
+    const digit = STELLAR_STRKEY_ALPHABET.indexOf(char);
+    if (digit === -1) return null;
+
+    current = (current << 5) | digit;
+    bits += 5;
+
+    if (bits >= 8) {
+      bytes.push((current >> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+
+  return bytes;
+}
+
+function crc16XModem(bytes: readonly number[]): number {
+  let crc = 0;
+
+  for (const byte of bytes) {
+    crc ^= byte << 8;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 0x8000) !== 0 ? (crc << 1) ^ 0x1021 : crc << 1;
+      crc &= 0xffff;
+    }
+  }
+
+  return crc;
+}
+
+function isValidStellarAccountAddress(value: string): boolean {
+  if (typeof value !== 'string') return false;
+  if (value.length !== STELLAR_STRKEY_LENGTH || !STELLAR_ACCOUNT_PUBLIC_KEY_REGEX.test(value)) {
+    return false;
+  }
+
+  const decoded = decodeStellarBase32(value);
+  if (decoded === null || decoded.length !== STELLAR_STRKEY_DECODED_LENGTH) {
+    return false;
+  }
+
+  if (decoded[0] !== STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE) {
+    return false;
+  }
+
+  const payload = decoded.slice(0, STELLAR_STRKEY_PAYLOAD_LENGTH);
+  const expectedChecksum = crc16XModem(payload);
+  const actualChecksum =
+    decoded[STELLAR_STRKEY_PAYLOAD_LENGTH]! | (decoded[STELLAR_STRKEY_PAYLOAD_LENGTH + 1]! << 8);
+
+  return expectedChecksum === actualChecksum;
+}
+
 export interface AddressValidationResult {
   valid: boolean;
-  /** Populated when valid is false and the address was reachable but absent. */
+  /** Populated when valid is false and an address is malformed or absent. */
   missingAddresses?: string[];
 }
 
@@ -44,17 +110,25 @@ export class StellarAddressValidator {
   constructor(
     private readonly rpc: StellarRpcService,
     private readonly redis: RedisClient | null,
-    private readonly cacheTtlSeconds: number,
+    private readonly cacheTtlSeconds: number
   ) {}
 
   /**
    * Validate that both addresses exist on-chain.
    *
-   * Returns { valid: false, missingAddresses } when one or both are absent.
+   * Returns { valid: false, missingAddresses } when one or both are malformed
+   * or absent.
    * Returns { valid: true } when both exist (or when the RPC is unavailable
    * and we fail-open).
    */
   async validate(sender: string, recipient: string): Promise<AddressValidationResult> {
+    const malformed = [sender, recipient].filter(
+      (address) => !isValidStellarAccountAddress(address)
+    );
+    if (malformed.length > 0) {
+      return { valid: false, missingAddresses: malformed };
+    }
+
     const [senderExists, recipientExists] = await Promise.all([
       this.checkAddress(sender),
       this.checkAddress(recipient),
@@ -89,9 +163,12 @@ export class StellarAddressValidator {
       return exists;
     } catch (err) {
       if (err instanceof CircuitOpenError) {
-        console.warn('[StellarAddressValidator] Circuit breaker OPEN — failing open for address check', {
-          addressLength: address.length,
-        });
+        console.warn(
+          '[StellarAddressValidator] Circuit breaker OPEN — failing open for address check',
+          {
+            addressLength: address.length,
+          }
+        );
         return null; // fail-open
       }
       // Network / provider error — fail-open with a warning
@@ -116,11 +193,9 @@ export class StellarAddressValidator {
   private async setCached(address: string): Promise<void> {
     if (!this.redis) return;
     try {
-      await this.redis.set(
-        `${STELLAR_ACCOUNT_CACHE_PREFIX}${address}`,
-        '1',
-        { ex: this.cacheTtlSeconds },
-      );
+      await this.redis.set(`${STELLAR_ACCOUNT_CACHE_PREFIX}${address}`, '1', {
+        ex: this.cacheTtlSeconds,
+      });
     } catch {
       // Cache write failure is non-fatal
     }

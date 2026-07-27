@@ -1,8 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import express from 'express';
 import { requireAdminAuth } from '../../src/middleware/adminAuth.js';
 import { authApiKeyLookupDurationSeconds } from '../../src/metrics/businessMetrics.js';
+import { generateToken } from '../../src/lib/auth.js';
+import { initializeConfig } from '../../src/config/env.js';
 
 function buildApp() {
   const app = express();
@@ -17,6 +19,10 @@ function buildApp() {
 describe('requireAdminAuth middleware', () => {
   const ADMIN_KEY = 'test-admin-secret-key-1234';
   let originalKey: string | undefined;
+
+  beforeAll(() => {
+    initializeConfig();
+  });
 
   beforeEach(() => {
     originalKey = process.env.ADMIN_API_KEY;
@@ -73,9 +79,7 @@ describe('requireAdminAuth middleware', () => {
 
   it('returns 403 when token has wrong length', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
-    const res = await request(buildApp())
-      .get('/protected')
-      .set('Authorization', 'Bearer short');
+    const res = await request(buildApp()).get('/protected').set('Authorization', 'Bearer short');
     expect(res.status).toBe(403);
     expect(res.body.error).toMatch(/Invalid admin credentials/i);
   });
@@ -87,6 +91,89 @@ describe('requireAdminAuth middleware', () => {
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true });
+  });
+
+  it.each(['admin', 'data-protection-officer'])(
+    'passes through for a valid JWT with the %s role',
+    async (role) => {
+      process.env.ADMIN_API_KEY = ADMIN_KEY;
+      const token = generateToken({ address: 'GADMIN', role, permissions: [] });
+
+      const res = await request(buildApp())
+        .get('/protected')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true });
+    }
+  );
+
+  it.each(['operator', 'viewer'])(
+    'returns 403 for a correctly signed JWT with the %s role',
+    async (role) => {
+      process.env.ADMIN_API_KEY = ADMIN_KEY;
+      const token = generateToken({ address: 'GNONADMIN', role });
+
+      const res = await request(buildApp())
+        .get('/protected')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: 'Invalid admin credentials.' });
+    }
+  );
+
+  it('fails closed before JWT verification when ADMIN_API_KEY is not configured', async () => {
+    delete process.env.ADMIN_API_KEY;
+    const token = generateToken({ address: 'GADMIN', role: 'admin' });
+
+    const res = await request(buildApp()).get('/protected').set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({
+      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
+    });
+  });
+
+  it.each([
+    ['lowercase scheme', `bearer ${ADMIN_KEY}`],
+    ['repeated whitespace', `Bearer  ${ADMIN_KEY}`],
+  ])('returns 401 for %s instead of normalizing the header', async (_case, header) => {
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+
+    const res = await request(buildApp()).get('/protected').set('Authorization', header);
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'Authorization header must use Bearer scheme.' });
+  });
+
+  it('returns 401 when Authorization header exceeds maximum length', async () => {
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+    const oversized = 'Bearer ' + 'A'.repeat(8186);
+    const res = await request(buildApp()).get('/protected').set('Authorization', oversized);
+    expect(res.status).toBe(401);
+    expect(res.body.error).toMatch(/too large/i);
+  });
+
+  it('processes Authorization header at exactly maximum length through normal auth flow', async () => {
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+    const exact = 'Bearer ' + 'A'.repeat(8185);
+    expect(exact.length).toBe(8192);
+    const res = await request(buildApp()).get('/protected').set('Authorization', exact);
+    // Header passed the length check and entered normal auth (token won't match)
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/Invalid admin credentials/i);
+  });
+
+  it('rejects oversized headers before token parsing and timing-safe comparison', async () => {
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+    const oversized = 'Bearer ' + ADMIN_KEY + 'A'.repeat(8200);
+    expect(oversized.length).toBeGreaterThan(8192);
+    const res = await request(buildApp()).get('/protected').set('Authorization', oversized);
+    // Returns oversized error (401) rather than credential error (403),
+    // proving split/timingSafeEqual were never reached.
+    expect(res.status).toBe(401);
+    expect(res.body.error).toMatch(/too large/i);
   });
 
   // ── API key lookup histogram (issue #361) ──
@@ -101,11 +188,17 @@ describe('requireAdminAuth middleware', () => {
      * declared labels). We assert on the count series to confirm the label
      * set is bounded to `outcome`.
      */
-    function findApiKeyCountSeries(values: any[], outcome: string) {
+    type HistogramValue = {
+      metricName?: string;
+      labels: Partial<Record<string, string | number>>;
+      value: number;
+    };
+
+    function findApiKeyCountSeries(values: HistogramValue[], outcome: string) {
       return values.find(
         (v) =>
           v.metricName === 'fluxora_auth_apikey_lookup_duration_seconds_count' &&
-          (v.labels as Record<string, string>).outcome === outcome,
+          (v.labels as Record<string, string>).outcome === outcome
       );
     }
 
@@ -120,6 +213,22 @@ describe('requireAdminAuth middleware', () => {
       const success = findApiKeyCountSeries(val.values, 'success');
       expect(success).toBeDefined();
       expect(success?.value).toBeGreaterThanOrEqual(1);
+      expect(Object.keys(success!.labels)).toEqual(['outcome']);
+    });
+
+    it('records outcome=success for an authorized JWT without adding identity labels', async () => {
+      process.env.ADMIN_API_KEY = ADMIN_KEY;
+      const token = generateToken({ address: 'GADMIN', role: 'admin' });
+
+      await request(buildApp())
+        .get('/protected')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      const val = await authApiKeyLookupDurationSeconds.get();
+      const success = findApiKeyCountSeries(val.values, 'success');
+      expect(success).toBeDefined();
+      expect(success?.value).toBe(1);
       expect(Object.keys(success!.labels)).toEqual(['outcome']);
     });
 

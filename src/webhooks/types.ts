@@ -6,6 +6,26 @@ export type WebhookEventType = 'stream.created' | 'stream.updated' | 'stream.can
 
 export type WebhookDeliveryStatus = 'pending' | 'delivered' | 'failed' | 'permanent_failure';
 
+/**
+ * Distinct reason codes for DLQ entries.
+ * Operators can use these to distinguish between different failure modes
+ * and prioritize remediation accordingly.
+ *
+ * - `poison`: Structurally invalid payload, unparseable URL, or non-retryable 4xx (deterministic failure)
+ * - `exhausted`: Hit max retry attempts with transient failures
+ * - `timeout`: Delivery took longer than configured timeout
+ * - `circuit_breaker`: Circuit breaker is open for this endpoint
+ * - `rate_limited`: Persistent rate-limiting despite backoff
+ * - `other`: Catch-all for other permanent failures
+ */
+export type DLQReasonCode =
+  | 'poison'
+  | 'exhausted'
+  | 'timeout'
+  | 'circuit_breaker'
+  | 'rate_limited'
+  | 'other';
+
 export interface WebhookEvent {
   id: string;
   type: WebhookEventType;

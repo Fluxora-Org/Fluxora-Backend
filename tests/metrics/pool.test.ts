@@ -15,15 +15,17 @@
  *  - Security: label value is application-controlled, not user input
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   dbPoolActive,
   dbPoolIdle,
   dbPoolWaiting,
+  dbPoolNegativeActive,
   syncPoolGauges,
   deRegisterPoolMetrics,
 } from '../../src/metrics/pool.js';
 import { registry } from '../../src/metrics.js';
+import { logger } from '../../src/lib/logger.js';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -41,10 +43,12 @@ async function gaugeValue(gauge: typeof dbPoolActive, poolName: string): Promise
 
 beforeEach(() => {
   deRegisterPoolMetrics();
+  dbPoolNegativeActive.reset();
 });
 
 afterEach(() => {
   deRegisterPoolMetrics();
+  dbPoolNegativeActive.reset();
 });
 
 // ── Gauge registration ────────────────────────────────────────────────────────
@@ -247,5 +251,64 @@ describe('security — label values', () => {
     // The label value is exactly the trusted name passed by the application
     expect(entry).toBeDefined();
     expect(entry?.labels['pool']).toBe(trustedName);
+  });
+});
+
+// ── syncPoolGauges: negative active anomaly detection ──────────────────────────
+
+describe('syncPoolGauges — negative active anomaly detection', () => {
+  it('logs a structured warning and increments counter when totalCount < idleCount', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    // Inconsistent pool state: totalCount < idleCount
+    syncPoolGauges(makePoolState(2, 5, 0), 'default');
+
+    // Gauge still clamped to 0 (no regression to existing behavior)
+    expect(await gaugeValue(dbPoolActive, 'default')).toBe(0);
+
+    // Warning logged with raw pool figures
+    expect(warnSpy).toHaveBeenCalledOnce();
+    const warnCall = warnSpy.mock.calls[0];
+    expect(warnCall[0]).toBe('pg.Pool accounting inconsistency: totalCount < idleCount');
+    expect(warnCall[1]).toMatchObject({
+      pool: 'default',
+      totalCount: 2,
+      idleCount: 5,
+      waitingCount: 0,
+      clampedActive: 0,
+    });
+
+    // Counter incremented with pool label
+    const counterData = await dbPoolNegativeActive.get();
+    const counterEntry = counterData.values.find((v) => v.labels['pool'] === 'default');
+    expect(counterEntry?.value).toBe(1);
+
+    warnSpy.mockRestore();
+  });
+
+  it('increments counter separately per pool when anomaly occurs', async () => {
+    syncPoolGauges(makePoolState(2, 5, 0), 'default');
+    syncPoolGauges(makePoolState(1, 3, 0), 'read-replica');
+
+    const counterData = await dbPoolNegativeActive.get();
+    const defaultEntry = counterData.values.find((v) => v.labels['pool'] === 'default');
+    const replicaEntry = counterData.values.find((v) => v.labels['pool'] === 'read-replica');
+
+    expect(defaultEntry?.value).toBe(1);
+    expect(replicaEntry?.value).toBe(1);
+  });
+
+  it('does not log or increment counter for normal pool state', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    syncPoolGauges(makePoolState(10, 3, 2), 'default');
+
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    const counterData = await dbPoolNegativeActive.get();
+    const entry = counterData.values.find((v) => v.labels['pool'] === 'default');
+    expect(entry?.value ?? 0).toBe(0);
+
+    warnSpy.mockRestore();
   });
 });

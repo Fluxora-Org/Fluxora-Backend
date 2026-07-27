@@ -198,6 +198,79 @@ describe('gracefulShutdown()', () => {
 
     expect(forceCloseSpy).toHaveBeenCalled();
   });
+
+  // ─── Hook isolation — #863 ───────────────────────────────────────────────
+
+  it('runs all hooks when one throws synchronously, one rejects, and one succeeds (hook isolation)', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const executionOrder: string[] = [];
+
+    addShutdownHook(() => {
+      executionOrder.push('throws');
+      throw new Error('sync failure');
+    });
+
+    addShutdownHook(async () => {
+      executionOrder.push('rejects');
+      throw new Error('async failure');
+    });
+
+    addShutdownHook(async () => {
+      executionOrder.push('succeeds');
+    });
+
+    await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
+
+    expect(executionOrder).toEqual(['throws', 'rejects', 'succeeds']);
+  });
+
+  it('logs enough context to identify which hook failed (hook index and count)', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const { logger } = await import('../src/lib/logger.js');
+    const errorSpy = vi.spyOn(logger, 'error');
+
+    addShutdownHook(() => {
+      throw new Error('hook-0-error');
+    });
+
+    addShutdownHook(() => {
+      throw new Error('hook-1-error');
+    });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    const errorCalls = errorSpy.mock.calls.filter(
+      ([msg]) => msg === 'Shutdown hook threw an error',
+    );
+    expect(errorCalls).toHaveLength(2);
+    expect(errorCalls[0]?.[2]).toMatchObject({ hookIndex: 0, hookCount: 2 });
+    expect(errorCalls[1]?.[2]).toMatchObject({ hookIndex: 1, hookCount: 2 });
+
+    errorSpy.mockRestore();
+  });
+
+  it('catches a regression to Promise.all-style execution (all-or-nothing)', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const reached: boolean[] = [];
+
+    addShutdownHook(() => {
+      reached.push(true);
+      throw new Error('boom');
+    });
+
+    addShutdownHook(async () => {
+      reached.push(true);
+    });
+
+    await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
+    expect(reached).toEqual([true, true]);
+  });
 });
 
 // --- WebSocket Hub Shutdown Tests ---
@@ -352,5 +425,238 @@ describe('Graceful Shutdown Integration', () => {
     await gracefulShutdown(server, 'SIGTERM', 5_000);
     
     expect(results).toEqual(['sync', 'async']);
+  });
+});
+
+// ─── #336 subsystem shutdown hooks ───────────────────────────────────────────
+
+import {
+  drainSseEventBus,
+  registerSseShutdownCallback,
+  _resetSseSubscriptionsForTest,
+} from '../src/streams/sseEmitter.js';
+import {
+  requestStopReplay,
+  _resetStopReplay,
+  replayLock,
+} from '../src/indexer/service.js';
+import {
+  quitAllRedisClients,
+  _resetRedisClientRegistry,
+  setRedisClientFactory,
+  getRedisClientFactory,
+  type RedisClient,
+  type RedisConfig,
+} from '../src/redis/client.js';
+
+describe('#336 SSE drain hook', () => {
+  const TEST_DRAIN_TIMEOUT = 5_000;
+
+  beforeEach(() => {
+    _resetSseSubscriptionsForTest();
+  });
+
+  afterEach(() => {
+    _resetSseSubscriptionsForTest();
+  });
+
+  it('drainSseEventBus() calls all registered shutdown callbacks', async () => {
+    const cb1 = vi.fn();
+    const cb2 = vi.fn();
+    registerSseShutdownCallback(cb1);
+    registerSseShutdownCallback(cb2);
+
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
+
+    expect(cb1).toHaveBeenCalledTimes(1);
+    expect(cb2).toHaveBeenCalledTimes(1);
+  });
+
+  it('drainSseEventBus() clears callbacks so a second call is a no-op', async () => {
+    const cb = vi.fn();
+    registerSseShutdownCallback(cb);
+
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
+
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('deregister function removes the callback before drain', async () => {
+    const cb = vi.fn();
+    const deregister = registerSseShutdownCallback(cb);
+    deregister();
+
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
+
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('drain isolates a throwing callback and still calls remaining ones', async () => {
+    const bad = vi.fn(() => { throw new Error('boom'); });
+    const good = vi.fn();
+    registerSseShutdownCallback(bad);
+    registerSseShutdownCallback(good);
+
+    await expect(drainSseEventBus(TEST_DRAIN_TIMEOUT)).resolves.toBeUndefined();
+    expect(good).toHaveBeenCalledTimes(1);
+  });
+
+  it('is invoked by gracefulShutdown() via addShutdownHook', async () => {
+    _resetShutdownState();
+    const cb = vi.fn();
+    registerSseShutdownCallback(cb);
+    addShutdownHook(() => drainSseEventBus(TEST_DRAIN_TIMEOUT));
+
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('force-closes a stuck SSE subscriber and calls remaining callbacks', async () => {
+    const forceClosed = vi.fn();
+    const good = vi.fn();
+
+    // Simulate a stuck drain callback by returning a promise that never resolves.
+    // The event loop remains free so the per-callback timer can fire and trigger
+    // forceClose via Promise.race.
+    const stuckDrain = vi.fn(() => new Promise<void>(() => { /* never settles */ }));
+
+    registerSseShutdownCallback(stuckDrain, forceClosed);
+    registerSseShutdownCallback(good);
+
+    // Use a very short timeout so the first callback triggers force-close.
+    await drainSseEventBus(50);
+
+    // The stuck drain was initiated and forceClose was triggered on timeout.
+    expect(stuckDrain).toHaveBeenCalledTimes(1);
+    expect(forceClosed).toHaveBeenCalledTimes(1);
+    // The remaining callback should still be called.
+    expect(good).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not call forceClose when drain completes within timeout', async () => {
+    const fast = vi.fn();
+    const forceClose = vi.fn();
+
+    registerSseShutdownCallback(fast, forceClose);
+
+    await drainSseEventBus(TEST_DRAIN_TIMEOUT);
+
+    expect(fast).toHaveBeenCalledTimes(1);
+    expect(forceClose).not.toHaveBeenCalled();
+  });
+});
+
+describe('#336 indexer stop hook', () => {
+  afterEach(() => {
+    _resetStopReplay();
+  });
+
+  it('requestStopReplay() is invoked by a registered shutdown hook', async () => {
+    _resetShutdownState();
+    const stopped = vi.fn(() => requestStopReplay());
+    addShutdownHook(stopped);
+
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(stopped).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('#336 Redis quit hook', () => {
+  const originalFactory = getRedisClientFactory();
+
+  afterEach(() => {
+    setRedisClientFactory(originalFactory);
+    _resetRedisClientRegistry();
+  });
+
+  it('quitAllRedisClients() calls close() on every tracked client', async () => {
+    const close1 = vi.fn().mockResolvedValue(undefined);
+    const close2 = vi.fn().mockResolvedValue(undefined);
+
+    // Inject a fake factory that returns stub clients
+    let callCount = 0;
+    setRedisClientFactory({
+      async createClient(): Promise<RedisClient> {
+        callCount++;
+        const stub: RedisClient = {
+          async get() { return null; },
+          async set() {},
+          async setNx() { return false; },
+          async del() {},
+          async exists() { return false; },
+          close: callCount === 1 ? close1 : close2,
+          multi() { return null as any; },
+          async zcount() { return 0; },
+        };
+        return stub;
+      },
+    });
+
+    // Import createRedisClient after factory is set
+    const { createRedisClient } = await import('../src/redis/client.js');
+    const cfg: RedisConfig = { url: 'redis://localhost:6379', enabled: true };
+    await createRedisClient(cfg);
+    await createRedisClient(cfg);
+
+    await quitAllRedisClients();
+
+    expect(close1).toHaveBeenCalledTimes(1);
+    expect(close2).toHaveBeenCalledTimes(1);
+  });
+
+  it('quitAllRedisClients() is idempotent — second call is a no-op', async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+    setRedisClientFactory({
+      async createClient(): Promise<RedisClient> {
+        return {
+          async get() { return null; },
+          async set() {},
+          async setNx() { return false; },
+          async del() {},
+          async exists() { return false; },
+          close,
+          multi() { return null as any; },
+          async zcount() { return 0; },
+        };
+      },
+    });
+
+    const { createRedisClient } = await import('../src/redis/client.js');
+    await createRedisClient({ url: 'redis://localhost:6379', enabled: true });
+
+    await quitAllRedisClients();
+    await quitAllRedisClients();
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('quitAllRedisClients() swallows per-client close errors', async () => {
+    const close = vi.fn().mockRejectedValue(new Error('network gone'));
+    setRedisClientFactory({
+      async createClient(): Promise<RedisClient> {
+        return {
+          async get() { return null; },
+          async set() {},
+          async setNx() { return false; },
+          async del() {},
+          async exists() { return false; },
+          close,
+          multi() { return null as any; },
+          async zcount() { return 0; },
+        };
+      },
+    });
+
+    const { createRedisClient } = await import('../src/redis/client.js');
+    await createRedisClient({ url: 'redis://localhost:6379', enabled: true });
+
+    await expect(quitAllRedisClients()).resolves.toBeUndefined();
   });
 });

@@ -39,8 +39,6 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.9
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -52,7 +50,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run database migrations
-        run: pnpm run build && node dist/db/migrate.js
+        run: pnpm run build && node dist/src/db/migrate.js
         # Secrets are never echoed; DATABASE_URL is injected from env above.
 
       - name: Run e2e tests

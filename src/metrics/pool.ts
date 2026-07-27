@@ -16,8 +16,9 @@
  * query parameters, preventing label-injection attacks.
  */
 
-import { Gauge } from 'prom-client';
+import { Gauge, Counter } from 'prom-client';
 import { registry } from '../metrics.js';
+import { logger } from '../lib/logger.js';
 
 /** Number of connections currently checked out (active). */
 export const dbPoolActive =
@@ -49,6 +50,16 @@ export const dbPoolWaiting =
     registers: [registry],
   });
 
+/** Counter incremented when totalCount < idleCount (should never happen for a healthy pg.Pool). */
+export const dbPoolNegativeActive =
+  (registry.getSingleMetric('fluxora_db_pool_negative_active_total') as Counter<'pool'>) ||
+  new Counter<'pool'>({
+    name: 'fluxora_db_pool_negative_active_total',
+    help: 'Total count of times db_pool_active was clamped to 0 due to totalCount < idleCount',
+    labelNames: ['pool'],
+    registers: [registry],
+  });
+
 /**
  * Sync all three gauges from the current pool state.
  *
@@ -61,14 +72,25 @@ export function syncPoolGauges(
   poolName: string,
 ): void {
   const active = pool.totalCount - pool.idleCount;
+  if (active < 0) {
+    dbPoolNegativeActive.inc({ pool: poolName });
+    logger.warn('pg.Pool accounting inconsistency: totalCount < idleCount', {
+      pool: poolName,
+      totalCount: pool.totalCount,
+      idleCount: pool.idleCount,
+      waitingCount: pool.waitingCount,
+      clampedActive: 0,
+    });
+  }
   dbPoolActive.set({ pool: poolName }, active < 0 ? 0 : active);
   dbPoolIdle.set({ pool: poolName }, pool.idleCount);
   dbPoolWaiting.set({ pool: poolName }, pool.waitingCount);
 }
 
-/** Remove all three gauges from the registry (useful between test runs). */
+/** Remove all three gauges and the negative-active counter from the registry (useful between test runs). */
 export function deRegisterPoolMetrics(): void {
   registry.removeSingleMetric('db_pool_active');
   registry.removeSingleMetric('db_pool_idle');
   registry.removeSingleMetric('db_pool_waiting');
+  registry.removeSingleMetric('fluxora_db_pool_negative_active_total');
 }

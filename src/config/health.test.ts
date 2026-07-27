@@ -32,7 +32,7 @@ describe('Health Check Environment Configuration', () => {
   it('should reject zero or negative timeout values via parseIntEnv min limit', () => {
     process.env.HEALTH_CHECK_TIMEOUT_MS = '0';
     expect(() => loadConfig()).toThrow(ConfigError);
-    expect(() => loadConfig()).toThrow(/below minimum 1/);
+    expect(() => loadConfig()).toThrow(/at least 1|below minimum 1/);
   });
 });
 

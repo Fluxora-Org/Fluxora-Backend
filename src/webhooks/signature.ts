@@ -1,5 +1,13 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
+const SIG_COMPARE_KEY = 'fluxora-webhook-sig';
+
+function constantTimeCompare(a: string, b: string): boolean {
+  const hashA = createHmac('sha256', SIG_COMPARE_KEY).update(a).digest('hex');
+  const hashB = createHmac('sha256', SIG_COMPARE_KEY).update(b).digest('hex');
+  return timingSafeEqual(Buffer.from(hashA, 'utf8'), Buffer.from(hashB, 'utf8'));
+}
+
 export const FLUXORA_WEBHOOK_HEADERS = {
   deliveryId: 'x-fluxora-delivery-id',
   timestamp: 'x-fluxora-timestamp',
@@ -166,10 +174,7 @@ export function verifyWebhookSignature(
 
   for (const { value, isPrevious } of secrets) {
     const expected = computeWebhookSignature(value, timestamp, body);
-    if (
-      actualSignature.length === expected.length &&
-      timingSafeEqual(Buffer.from(actualSignature, 'utf8'), Buffer.from(expected, 'utf8'))
-    ) {
+    if (constantTimeCompare(actualSignature, expected)) {
       matched = true;
       usedPreviousSecret = isPrevious;
       break;

@@ -51,12 +51,37 @@ import {
   _resetStreams,
   setStreamListingDependencyState,
   setIdempotencyDependencyState,
+  fingerprintInput,
+  enforceStreamScope,
+  getFeatureFlagRequesterId,
 } from '../../src/routes/streams.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
+import type { Request } from 'express';
 
 // Initialize config before importing anything that needs it
 initializeConfig();
+
+describe('getFeatureFlagRequesterId', () => {
+  it('prefers authenticated API key id over header and IP', () => {
+    const req = {
+      keyId: 'key-record-1',
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('key:key-record-1');
+  });
+
+  it('falls back to raw API key header before IP', () => {
+    const req = {
+      headers: { 'x-api-key': 'raw-key' },
+      ip: '203.0.113.10',
+    } as unknown as Request;
+
+    expect(getFeatureFlagRequesterId(req)).toBe('api-key:raw-key');
+  });
+});
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -64,6 +89,7 @@ const VALID_SENDER    = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN
 const VALID_RECIPIENT = 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR';
 
 const TEST_TOKEN = generateToken({ address: VALID_SENDER, role: 'operator' });
+const SCOPED_TOKEN = generateToken({ address: VALID_SENDER, role: 'user' });
 
 const app = createApp();
 
@@ -140,7 +166,7 @@ describe('streams routes', () => {
 
   describe('GET /api/streams', () => {
     it('returns an empty list when no streams exist', async () => {
-      const res = await request(app).get('/api/streams');
+      const res = await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.data.streams).toEqual([]);
@@ -149,7 +175,7 @@ describe('streams routes', () => {
 
     it('returns mapped streams from the repository', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [makeDbRecord()], hasMore: false });
-      const res = await request(app).get('/api/streams');
+      const res = await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.data.streams).toHaveLength(1);
       const s = res.body.data.streams[0];
@@ -160,7 +186,7 @@ describe('streams routes', () => {
 
     it('includes next_cursor when hasMore=true', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [makeDbRecord({ id: 'stream-abc-0' })], hasMore: true });
-      const res = await request(app).get('/api/streams?limit=1');
+      const res = await request(app).get('/api/streams?limit=1').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.data.next_cursor).toBeDefined();
       expect(res.body.data.has_more).toBe(true);
@@ -168,7 +194,7 @@ describe('streams routes', () => {
 
     it('includes total when include_total=true', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false, total: 42 });
-      const res = await request(app).get('/api/streams?include_total=true');
+      const res = await request(app).get('/api/streams?include_total=true').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(200);
       expect(res.body.data.total).toBe(42);
     });
@@ -191,26 +217,68 @@ describe('streams routes', () => {
       expect((await request(app).get('/api/streams?include_total=maybe')).status).toBe(400);
     });
 
-    it('returns 503 when listing dependency is unavailable', async () => {
+    it('returns 503 and sets Retry-After when listing dependency is unavailable', async () => {
       setStreamListingDependencyState('unavailable');
-      const res = await request(app).get('/api/streams');
+      const res = await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(res.status).toBe(503);
       expect(res.body.success).toBe(false);
+      expect(res.headers['retry-after']).toBe('30');
     });
 
     it('returns 503 when pool is exhausted', async () => {
       const { PoolExhaustedError } = await import('../../src/db/pool.js');
       mockFindWithCursor.mockRejectedValue(new PoolExhaustedError());
-      expect((await request(app).get('/api/streams')).status).toBe(503);
+      expect((await request(app).get('/api/streams').set('Authorization', `Bearer ${TEST_TOKEN}`)).status).toBe(503);
     });
 
     it('passes afterId to repository from a valid cursor', async () => {
       mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
       const cursor = Buffer.from(JSON.stringify({ v: 1, lastId: 'stream-abc-0' })).toString('base64url');
-      await request(app).get(`/api/streams?cursor=${cursor}`);
+      await request(app).get(`/api/streams?cursor=${cursor}`).set('Authorization', `Bearer ${TEST_TOKEN}`);
       expect(mockFindWithCursor).toHaveBeenCalledWith(
         expect.anything(), expect.any(Number), 'stream-abc-0', expect.any(Boolean),
       );
+    });
+
+    describe('scoped user authorization', () => {
+      it('rejects when no filter is provided', async () => {
+        const res = await request(app)
+          .get('/api/streams')
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(403);
+        expect(res.body.error.message).toMatch(/must filter by sender or recipient/);
+      });
+
+      it('rejects when filtering by someone else', async () => {
+        const res = await request(app)
+          .get(`/api/streams?sender=${VALID_RECIPIENT}`)
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(403);
+      });
+
+      it('allows when filtering by own address', async () => {
+        mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
+        const res = await request(app)
+          .get(`/api/streams?sender=${VALID_SENDER}`)
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(200);
+      });
+    });
+
+    describe('GET /api/streams/export', () => {
+      it('rejects arrays for resume_from', async () => {
+        const res = await request(app)
+          .get('/api/streams/export?resume_from=a&resume_from=b')
+          .set('Authorization', `Bearer ${TEST_TOKEN}`);
+        expect(res.status).toBe(400);
+      });
+
+      it('rejects scoped users from using full export', async () => {
+        const res = await request(app)
+          .get('/api/streams/export')
+          .set('Authorization', `Bearer ${SCOPED_TOKEN}`);
+        expect(res.status).toBe(403);
+      });
     });
   });
 
@@ -248,8 +316,178 @@ describe('streams routes', () => {
       mockGetById.mockRejectedValue(new PoolExhaustedError());
       expect((await request(app).get('/api/streams/stream-x')).status).toBe(503);
     });
+
+    // ── Conditional GET (RFC 7232) ───────────────────────────────────────
+
+    it('returns 304 when If-None-Match matches the ETag', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+      expect(res.headers['etag']).toBe(etag);
+    });
+
+    it('returns 304 for If-None-Match: *', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', '*');
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+    });
+
+    it('returns 304 when If-None-Match is a comma-separated list containing the ETag', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', `W/"other", ${etag}, W/"another"`);
+      expect(res.status).toBe(304);
+    });
+
+    it('returns 200 when If-None-Match does not match', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', 'W/"some-other-tag"');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.stream.id).toBe('stream-abc-0');
+    });
+
+    it('returns 200 when If-None-Match is absent', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app).get('/api/streams/stream-abc-0');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it('sets ETag and Last-Modified headers on 304', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({
+        id: 'stream-abc-0', updated_at: '2024-01-01T00:00:00.000Z',
+      }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.headers['etag']).toBeDefined();
+      expect(res.headers['last-modified']).toBeDefined();
+    });
+
+    it('304 has no body', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const first = await request(app).get('/api/streams/stream-abc-0');
+      const etag = first.headers['etag'] as string;
+
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', etag);
+      expect(res.status).toBe(304);
+      expect(res.text).toBe('');
+    });
+
+    it('does not break the success envelope shape for 200', async () => {
+      mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-abc-0' }));
+      const res = await request(app)
+        .get('/api/streams/stream-abc-0')
+        .set('If-None-Match', 'W/"non-matching"');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.stream).toBeDefined();
+      expect(res.body.meta.timestamp).toBeDefined();
+    });
   });
 
+
+  // ── fingerprintInput() key-order stability ───────────────────────────────
+
+  describe('fingerprintInput()', () => {
+    it('produces the same digest regardless of NormalizedCreateInput key insertion order', () => {
+      const values = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+
+      // Object A: properties in canonical (sorted) order
+      const objA: Record<string, unknown> = {
+        depositAmount: values.depositAmount,
+        endTime:       values.endTime,
+        ratePerSecond: values.ratePerSecond,
+        recipient:     values.recipient,
+        sender:        values.sender,
+        startTime:     values.startTime,
+      };
+
+      // Object B: properties in reverse order
+      const objB: Record<string, unknown> = {
+        startTime:     values.startTime,
+        sender:        values.sender,
+        recipient:     values.recipient,
+        ratePerSecond: values.ratePerSecond,
+        endTime:       values.endTime,
+        depositAmount: values.depositAmount,
+      };
+
+      // Object C: properties in insertion-order (as returned by normalizeCreateInput)
+      const objC: Record<string, unknown> = {
+        sender:        values.sender,
+        recipient:     values.recipient,
+        depositAmount: values.depositAmount,
+        ratePerSecond: values.ratePerSecond,
+        startTime:     values.startTime,
+        endTime:       values.endTime,
+      };
+
+      const fpA = fingerprintInput(objA as Parameters<typeof fingerprintInput>[0]);
+      const fpB = fingerprintInput(objB as Parameters<typeof fingerprintInput>[0]);
+      const fpC = fingerprintInput(objC as Parameters<typeof fingerprintInput>[0]);
+
+      expect(fpA).toBe(fpB);
+      expect(fpB).toBe(fpC);
+    });
+
+    it('produces different digests for different input values', async () => {
+      const base: Parameters<typeof fingerprintInput>[0] = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+
+      const modified = { ...base, depositAmount: '9999' };
+      expect(fingerprintInput(base)).not.toBe(fingerprintInput(modified));
+    });
+
+    it('returns a 64-character hex string', () => {
+      const input: Parameters<typeof fingerprintInput>[0] = {
+        sender:        'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient:     'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+        depositAmount: '1000',
+        ratePerSecond: '10',
+        startTime:     1700000000,
+        endTime:       0,
+      };
+      const fp = fingerprintInput(input);
+      expect(fp).toMatch(/^[a-f0-9]{64}$/);
+    });
+  });
 
   // ── POST /api/streams — idempotency ──────────────────────────────────────
 
@@ -527,6 +765,13 @@ describe('streams routes', () => {
       expect(res.status).toBe(400);
     });
 
+    it('rejects omitted depositAmount (same as explicit zero)', async () => {
+      const { depositAmount: _, ...bodyWithoutDeposit } = validBody;
+      const res = await post(bodyWithoutDeposit, uniqueKey());
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
     it('rejects numeric depositAmount (must be string)', async () => {
       const res = await post({ ...validBody, depositAmount: 1000 }, uniqueKey());
       expect(res.status).toBe(400);
@@ -712,5 +957,48 @@ describe('streams routes', () => {
       const res = await post(validBody, uniqueKey('envelope-fresh')).expect(201);
       expect(res.body.meta.idempotencyReplayed).toBeUndefined();
     });
+  });
+});
+
+// ── enforceStreamScope middleware ─────────────────────────────────────────────
+
+describe('enforceStreamScope', () => {
+  function mockReqRes(overrides: Record<string, unknown> = {}) {
+    const req: Record<string, unknown> = { ...overrides };
+    const res = {
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    };
+    const next = vi.fn();
+    return { req, res, next } as unknown as Parameters<typeof enforceStreamScope>;
+  }
+
+  it('calls next() when req.user is not set (unauthenticated)', () => {
+    const { req, res, next } = mockReqRes();
+    enforceStreamScope(req as any, res as any, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((req as any).callerAddress).toBeUndefined();
+  });
+
+  it('calls next() when user role is operator (bypass)', () => {
+    const { req, res, next } = mockReqRes({ user: { address: 'GABCDEF123', role: 'operator' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((req as any).callerAddress).toBeUndefined();
+  });
+
+  it('sets callerAddress and calls next() for authenticated user with address', () => {
+    const { req, res, next } = mockReqRes({ user: { address: 'GXYZ789', role: 'viewer' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect((req as any).callerAddress).toBe('GXYZ789');
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 500 when authenticated user has no address', () => {
+    const { req, res, next } = mockReqRes({ user: { address: undefined, role: 'viewer' } });
+    enforceStreamScope(req as any, res as any, next);
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    expect(next).not.toHaveBeenCalled();
   });
 });

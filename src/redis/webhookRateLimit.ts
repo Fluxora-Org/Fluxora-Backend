@@ -18,13 +18,32 @@
  */
 
 import { createHash } from 'node:crypto';
+import { Counter } from 'prom-client';
 import type { RedisClient } from './client.js';
+import { registry } from '../metrics.js';
+import { logger } from '../lib/logger.js';
+
+export const webhookRateLimiterFailOpenTotal =
+  (registry.getSingleMetric('fluxora_webhook_rate_limiter_fail_open_total') as Counter<'consumer_hash'>) ||
+  new Counter({
+    name: 'fluxora_webhook_rate_limiter_fail_open_total',
+    help: 'Total webhook rate limiter fail-open activations on Redis error',
+    labelNames: ['consumer_hash'] as const,
+    registers: [registry],
+  });
 
 export interface RateLimitConfig {
   /** Maximum delivery attempts allowed within the window. */
   limit: number;
   /** Sliding-window duration in milliseconds. */
   windowMs: number;
+  /**
+   * Token-bucket burst allowance.
+   * When > 0, up to `burst` consecutive attempts are allowed in zero time
+   * before the steady-state rate (limit / windowMs) is enforced.
+   * When 0 (default), the limiter behaves as a flat sliding-window limit.
+   */
+  burst: number;
 }
 
 export interface RateLimitResult {
@@ -40,8 +59,73 @@ export interface RateLimitResult {
 /** Default: 10 attempts per second per consumer URL. */
 export const DEFAULT_WEBHOOK_RETRY_RPS = 10;
 
-export class WebhookRateLimiter {
+/** Hard limits applied during config validation. */
+export const RATE_LIMIT_MAX_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+export const RATE_LIMIT_MAX_LIMIT = 100_000;
+export const RATE_LIMIT_MIN_WINDOW_MS = 100; // 100ms minimum
+
+/**
+ * Minimal interface that both the Redis-backed and token-bucket rate
+ * limiters implement.  Keeps the dispatch pipeline decoupled from the
+ * storage strategy.
+ */
+export interface IWebhookRateLimiter {
+  checkLimit(consumerUrl: string, config: RateLimitConfig): Promise<RateLimitResult>;
+  recordFailure(consumerUrl: string, config: RateLimitConfig): Promise<void>;
+}
+
+export class RateLimitConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RateLimitConfigError';
+  }
+}
+
+export function validateRateLimitConfig(config: RateLimitConfig): void {
+  if (!Number.isFinite(config.limit) || config.limit <= 0) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.limit must be a positive finite number, got ${config.limit}`,
+    );
+  }
+  if (config.limit > RATE_LIMIT_MAX_LIMIT) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.limit exceeds maximum allowed (${RATE_LIMIT_MAX_LIMIT}), got ${config.limit}`,
+    );
+  }
+  if (!Number.isFinite(config.windowMs) || config.windowMs < RATE_LIMIT_MIN_WINDOW_MS) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.windowMs must be >= ${RATE_LIMIT_MIN_WINDOW_MS}ms, got ${config.windowMs}`,
+    );
+  }
+  if (config.windowMs > RATE_LIMIT_MAX_WINDOW_MS) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.windowMs exceeds maximum allowed (${RATE_LIMIT_MAX_WINDOW_MS}ms), got ${config.windowMs}`,
+    );
+  }
+  if (!Number.isFinite(config.burst) || config.burst < 0) {
+    throw new RateLimitConfigError(
+      `RateLimitConfig.burst must be a non-negative finite number, got ${config.burst}`,
+    );
+  }
+}
+
+export class WebhookRateLimiter implements IWebhookRateLimiter {
+  private readonly consumerConfigs = new Map<string, RateLimitConfig>();
+
   constructor(private readonly redisClient: RedisClient) {}
+
+  setConsumerConfig(consumerUrl: string, config: RateLimitConfig): void {
+    validateRateLimitConfig(config);
+    this.consumerConfigs.set(consumerUrl, { ...config });
+  }
+
+  removeConsumerConfig(consumerUrl: string): void {
+    this.consumerConfigs.delete(consumerUrl);
+  }
+
+  resolveConfig(consumerUrl: string, fallback: RateLimitConfig): RateLimitConfig {
+    return this.consumerConfigs.get(consumerUrl) ?? fallback;
+  }
 
   /**
    * Check whether a delivery attempt to `consumerUrl` is within the
@@ -53,9 +137,11 @@ export class WebhookRateLimiter {
    * webhook retry use-cases this is an acceptable trade-off.
    */
   async checkLimit(consumerUrl: string, config: RateLimitConfig): Promise<RateLimitResult> {
+    validateRateLimitConfig(config);
+    const resolvedConfig = this.resolveConfig(consumerUrl, config);
     const key = `webhook_rl:${hashUrl(consumerUrl)}`;
     const now = Date.now();
-    const windowStart = now - config.windowMs;
+    const windowStart = now - resolvedConfig.windowMs;
 
     try {
       // Step 1: prune expired entries and count remaining in one pipeline.
@@ -72,10 +158,10 @@ export class WebhookRateLimiter {
       // Step 2: count current window entries.
       const count = await this.redisClient.zcount(key, windowStart, '+inf');
 
-      if (count >= config.limit) {
+      if (count >= resolvedConfig.limit) {
         // Determine when the oldest entry in the window expires so the
         // caller can schedule a deferral for exactly that long.
-        const retryAfterMs = config.windowMs;
+        const retryAfterMs = resolvedConfig.windowMs;
         return { canAttempt: false, retryAfterMs };
       }
 
@@ -83,7 +169,7 @@ export class WebhookRateLimiter {
       // suffix) so concurrent attempts from multiple workers don't collide
       // on NX and silently drop each other's records.
       const member = `${now}:${Math.random().toString(36).slice(2, 8)}`;
-      const ttlMs = config.windowMs * 2; // generous TTL so Redis auto-cleans
+      const ttlMs = resolvedConfig.windowMs * 2; // generous TTL so Redis auto-cleans
 
       const recordResults = await this.redisClient
         .multi()
@@ -99,7 +185,13 @@ export class WebhookRateLimiter {
     } catch (err) {
       // Fail-open: log and allow the attempt so a Redis outage does not
       // silently halt all webhook deliveries.
-      console.error('[WebhookRateLimiter] Redis error — failing open:', err);
+      const consumerHash = hashUrl(consumerUrl);
+      webhookRateLimiterFailOpenTotal.inc({ consumer_hash: consumerHash });
+      logger.error('WebhookRateLimiter Redis error — failing open', undefined, {
+        operation: 'checkLimit',
+        consumerKey: consumerHash,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return { canAttempt: true, retryAfterMs: null };
     }
   }

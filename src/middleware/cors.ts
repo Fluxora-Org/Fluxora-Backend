@@ -17,6 +17,23 @@ const DEFAULT_ALLOWED_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
 const DEFAULT_ALLOWED_HEADERS = 'Content-Type,Authorization,X-Correlation-ID';
 const PREFLIGHT_MAX_AGE = '86400'; // 24 hours in seconds
 
+export function isOriginAllowed(origin: string, allowedOrigins: Set<string>): boolean {
+  if (allowedOrigins.has(origin)) {
+    return true;
+  }
+
+  for (const allowed of allowedOrigins) {
+    if (allowed.startsWith('*.')) {
+      const baseDomain = allowed.slice(2);
+      if (origin.endsWith('.' + baseDomain)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function parseAllowedOrigins(raw: string | undefined): Set<string> {
   if (!raw) {
     return new Set();
@@ -76,7 +93,7 @@ export function corsAllowlistMiddleware(req: CorsRequest, res: CorsResponse, nex
   }
 
   const allowedOrigins = parseAllowedOrigins(process.env.CORS_ALLOWED_ORIGINS);
-  const isAllowed = allowedOrigins.has(origin);
+  const isAllowed = isOriginAllowed(origin, allowedOrigins);
 
   if (isAllowed) {
     allowOrigin(req, res, origin);

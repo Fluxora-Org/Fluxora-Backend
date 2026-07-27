@@ -30,6 +30,8 @@ export interface ReplayProgress {
   replayCursorId?: string;
   /** Offset of the last committed batch boundary (matches last_committed_offset in DB). */
   currentOffset?: number;
+  /** Overall status of the replay from the checkpoint ('in-progress' | 'completed'). */
+  status?: string;
 }
 
 /**

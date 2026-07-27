@@ -75,7 +75,7 @@ export function createIdempotencyMiddleware(
 
         logger.info('Replaying idempotent response', { 
             idempotencyKeyLength: idempotencyKey.length,
-            requestId: req.id 
+            requestId: req.correlationId 
         });
         
         res.set('Idempotency-Key', idempotencyKey);
@@ -86,7 +86,7 @@ export function createIdempotencyMiddleware(
         // Note: existing.body already contains the 'data' part if it was stored via successResponse
         const responseData = (existing.body as any)?.data ?? existing.body;
         return res.status(existing.statusCode).json(
-          idempotentReplayResponse(responseData, req.id as string)
+          idempotentReplayResponse(responseData, req.correlationId as string)
         );
       }
 

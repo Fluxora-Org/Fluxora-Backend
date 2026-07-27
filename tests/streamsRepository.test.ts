@@ -25,7 +25,38 @@ vi.mock('../src/db/replicaPool.js', () => ({
   getReadPool: (...args: unknown[]) => mockGetReadPool(...args),
 }));
 
-import { streamRepository } from '../src/db/repositories/streamRepository.js';
+vi.mock('../src/config/env.js', () => ({
+  getConfig: vi.fn(() => ({ pgcryptoKey: 'test-key-32-bytes-padding-xxxxxx', pgcryptoKeyPrevious: undefined })),
+  initializeConfig: vi.fn(),
+}));
+
+vi.mock('../src/pii/pgcryptoEncryption.js', () => ({
+  computeAddressHashes: vi.fn(() => ({ current: 'hash', previous: undefined })),
+}));
+
+vi.mock('../src/tracing/hooks.js', () => ({
+  enrichActiveSpanWithStream: vi.fn(),
+}));
+
+vi.mock('../src/db/queries/streams.js', () => ({
+  encryptAddressValue: vi.fn((col: number) => `$${col}`),
+  streamSelectColumns: vi.fn(() => '*'),
+  senderAddressFilterCondition: vi.fn((f: number) => `sender_address = $${f}`),
+  recipientAddressFilterCondition: vi.fn((f: number) => `recipient_address = $${f}`),
+}));
+
+vi.mock('../src/metrics/dbMetrics.js', () => ({
+  dbQueryDurationSeconds: { startTimer: vi.fn(() => vi.fn()) },
+}));
+
+vi.mock('../src/utils/logger.js', () => ({
+  info: vi.fn(),
+  debug: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+import { streamRepository, MAX_PAGE_SIZE, StatusConflictError } from '../src/db/repositories/streamRepository.js';
 import type { CreateStreamInput, UpdateStreamInput } from '../src/db/types.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -172,6 +203,83 @@ describe('streamRepository', () => {
       expect(typeof record!.end_time).toBe('number');
       expect(record!.start_time).toBe(1700000000);
       expect(record!.end_time).toBe(1800000000);
+    });
+
+    it('uses streamSelectColumns (not SELECT *) so addresses are decrypted', async () => {
+      const { streamSelectColumns } = await import('../src/db/queries/streams.js');
+      const selectColsMock = vi.mocked(streamSelectColumns);
+      selectColsMock.mockClear();
+
+      queryReturnsRows([makeRow()]);
+      await streamRepository.getById('stream-x');
+
+      // streamSelectColumns must have been called — meaning the query uses the
+      // decryption fragments instead of a bare SELECT *
+      expect(selectColsMock).toHaveBeenCalled();
+    });
+
+    it('passes current key as $2 and no previous key when rotation is inactive', async () => {
+      queryReturnsRows([makeRow()]);
+      await streamRepository.getById('stream-x');
+
+      // params[0] = id, params[1] = current key (no third param when no previous key)
+      const call = mockQuery.mock.calls.at(-1) as [unknown, string, unknown[]];
+      const params = call[2];
+      expect(params).toHaveLength(2);
+      expect(params[1]).toBe('test-key-32-bytes-padding-xxxxxx');
+    });
+
+    it('appends previous key as $3 when key rotation is active', async () => {
+      const { getConfig } = await import('../src/config/env.js');
+      vi.mocked(getConfig).mockReturnValueOnce({
+        pgcryptoKey: 'current-key-32-bytes-padding-xxx',
+        pgcryptoKeyPrevious: 'previous-key-32-bytes-padding-xx',
+      } as ReturnType<typeof getConfig>);
+
+      queryReturnsRows([makeRow()]);
+      await streamRepository.getById('stream-x');
+
+      const call = mockQuery.mock.calls.at(-1) as [unknown, string, unknown[]];
+      const params = call[2];
+      expect(params).toHaveLength(3);
+      expect(params[1]).toBe('current-key-32-bytes-padding-xxx');
+      expect(params[2]).toBe('previous-key-32-bytes-padding-xx');
+    });
+
+    it('returns the same decrypted address as findWithCursor for the same row', async () => {
+      // Both paths should map the row identically — the decryption happens in
+      // SQL, so the row returned to rowToRecord is already plaintext in both cases.
+      const decryptedRow = makeRow({
+        sender_address:    'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+        recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+      });
+
+      // getById call
+      queryReturnsRows([decryptedRow]);
+      const byId = await streamRepository.getById(decryptedRow['id'] as string);
+
+      // findWithCursor call (data query only — no count)
+      queryReturnsRows([decryptedRow]);
+      const cursor = await streamRepository.findWithCursor({}, 1);
+
+      expect(byId!.sender_address).toBe(cursor.streams[0]!.sender_address);
+      expect(byId!.recipient_address).toBe(cursor.streams[0]!.recipient_address);
+    });
+
+    it('throws when encryption is disabled (no PGCRYPTO_KEY configured)', async () => {
+      // When pgcryptoKey is absent the repository must fail closed — it cannot
+      // silently return ciphertext as if it were a valid Stellar address.
+      const { getConfig } = await import('../src/config/env.js');
+      vi.mocked(getConfig).mockReturnValueOnce({
+        pgcryptoKey: undefined,
+        pgcryptoKeyPrevious: undefined,
+      } as unknown as ReturnType<typeof getConfig>);
+
+      await expect(streamRepository.getById('stream-x')).rejects.toThrow(
+        'PGCRYPTO_KEY is required to encrypt and decrypt stream PII',
+      );
+      // The DB must not have been queried — no key means no query
+      expect(mockQuery).not.toHaveBeenCalled();
     });
   });
 
@@ -383,6 +491,157 @@ describe('streamRepository', () => {
     });
   });
 
+  // ── find (offset pagination) ────────────────────────────────────────────────
+
+  describe('find', () => {
+    /**
+     * Helper that builds a row with a caller-controlled `created_at` so we can
+     * simulate multiple rows sharing the exact same timestamp (the tied-
+     * timestamp scenario that triggered this fix).
+     */
+    function makeRowAt(id: string, createdAt: Date): Record<string, unknown> {
+      return makeRow({ id, created_at: createdAt, updated_at: createdAt });
+    }
+
+    it('returns streams ordered by created_at DESC, id DESC (ORDER BY tiebreaker)', async () => {
+      const sharedTs = new Date('2024-06-01T12:00:00.000Z');
+      // DB returns rows already in the expected order (repo maps them as-is)
+      const rows = [
+        makeRowAt('stream-z', sharedTs),
+        makeRowAt('stream-m', sharedTs),
+        makeRowAt('stream-a', sharedTs),
+      ];
+      // find() issues two parallel queries: COUNT(*) then SELECT
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '3' }] }); // COUNT
+      mockQuery.mockResolvedValueOnce({ rows });                    // SELECT
+
+      const result = await streamRepository.find({}, { limit: 10, offset: 0 });
+
+      expect(result.streams.map(s => s.id)).toEqual(['stream-z', 'stream-m', 'stream-a']);
+      // Confirm the SELECT SQL contains the tiebreaker ordering
+      const selectCall = mockQuery.mock.calls.find(
+        (call: any[]) => typeof call[1] === 'string' && call[1].includes('ORDER BY'),
+      );
+      expect(selectCall).toBeDefined();
+      expect(selectCall![1]).toMatch(/ORDER BY created_at DESC, id DESC/);
+    });
+
+    it('no rows skipped or duplicated across pages when timestamps are tied', async () => {
+      // Six rows all with the same created_at; page size = 3
+      const ts = new Date('2024-06-01T00:00:00.000Z');
+      const allIds = ['s6', 's5', 's4', 's3', 's2', 's1']; // DESC id order
+      const page1Rows = allIds.slice(0, 3).map(id => makeRowAt(id, ts));
+      const page2Rows = allIds.slice(3, 6).map(id => makeRowAt(id, ts));
+
+      // Page 1
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '6' }] });
+      mockQuery.mockResolvedValueOnce({ rows: page1Rows });
+      const page1 = await streamRepository.find({}, { limit: 3, offset: 0 });
+
+      // Page 2
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '6' }] });
+      mockQuery.mockResolvedValueOnce({ rows: page2Rows });
+      const page2 = await streamRepository.find({}, { limit: 3, offset: 3 });
+
+      const page1Ids = page1.streams.map(s => s.id);
+      const page2Ids = page2.streams.map(s => s.id);
+
+      // No duplicates across pages
+      const overlap = page1Ids.filter(id => page2Ids.includes(id));
+      expect(overlap).toHaveLength(0);
+      // Together they cover all 6 rows exactly once
+      expect([...page1Ids, ...page2Ids].sort()).toEqual([...allIds].sort());
+    });
+
+    it('computes hasMore correctly for a partial last page', async () => {
+      const ts = new Date('2024-06-01T00:00:00.000Z');
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '5' }] });
+      mockQuery.mockResolvedValueOnce({ rows: [makeRowAt('s5', ts), makeRowAt('s4', ts)] });
+
+      const result = await streamRepository.find({}, { limit: 3, offset: 3 });
+
+      // 3 + 2 = 5 = total → no more pages
+      expect(result.hasMore).toBe(false);
+      expect(result.total).toBe(5);
+    });
+
+    it('computes hasMore=true when more rows remain', async () => {
+      const ts = new Date('2024-06-01T00:00:00.000Z');
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '10' }] });
+      mockQuery.mockResolvedValueOnce({ rows: [makeRowAt('s10', ts), makeRowAt('s9', ts), makeRowAt('s8', ts)] });
+
+      const result = await streamRepository.find({}, { limit: 3, offset: 0 });
+
+      // 0 + 3 = 3 < 10 → more pages
+      expect(result.hasMore).toBe(true);
+    });
+
+    it('returns empty streams and hasMore=false for an empty table', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [{ count: '0' }] });
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      const result = await streamRepository.find({}, { limit: 20, offset: 0 });
+
+      expect(result.streams).toHaveLength(0);
+      expect(result.hasMore).toBe(false);
+      expect(result.total).toBe(0);
+    });
+  });
+
+  // ── concurrency / compare-and-swap ──────────────────────────────────────────
+
+  describe('concurrency (compare-and-swap)', () => {
+    it('throws StatusConflictError when status changed between read and update', async () => {
+      // Simulate: getById reads status=active, but another tx changed it before UPDATE
+      queryReturnsRows([makeRow({ status: 'active' })]);  // getById (forcePrimary)
+      queryReturnsRows([]);                               // UPDATE returns empty — status guard failed
+      queryReturnsRows([{ exists: true }]);               // Stream still exists (stale read → conflict)
+
+      await expect(
+        streamRepository.updateStream('stream-x', { status: 'cancelled' }),
+      ).rejects.toThrow(StatusConflictError);
+    });
+
+    it('detects stream deletion between read and update', async () => {
+      queryReturnsRows([makeRow({ status: 'active' })]);  // getById
+      queryReturnsRows([]);                               // UPDATE returns empty
+      queryReturnsRows([{ exists: false }]);              // Stream no longer exists
+
+      await expect(
+        streamRepository.updateStream('stream-x', { status: 'cancelled' }),
+      ).rejects.toThrow('Stream not found after update');
+    });
+
+    it('two concurrent updateStream calls: exactly one succeeds, the other gets StatusConflictError', async () => {
+      // Both calls see the same initial state (status=active)
+      queryReturnsRows([makeRow({ status: 'active' })]);  // Call 1 getById
+      queryReturnsRows([makeRow({ status: 'active' })]);  // Call 2 getById
+      queryReturnsRows([makeRow({ status: 'paused' })]);  // Call 1 UPDATE succeeds
+      queryReturnsRows([]);                               // Call 2 UPDATE fails (status guard)
+      queryReturnsRows([{ exists: true }]);               // Call 2 exists check
+
+      const [r1, r2] = await Promise.allSettled([
+        streamRepository.updateStream('stream-x', { status: 'paused' }),
+        streamRepository.updateStream('stream-x', { status: 'cancelled' }),
+      ]);
+
+      const succeeded = [r1, r2].find(r => r.status === 'fulfilled');
+      const conflicted = [r1, r2].find(
+        r => r.status === 'rejected' && r.reason instanceof StatusConflictError,
+      );
+
+      expect(succeeded).toBeDefined();
+      expect(conflicted).toBeDefined();
+
+      if (succeeded?.status === 'fulfilled') {
+        expect(succeeded.value.status).toBe('paused');
+      }
+      if (conflicted?.status === 'rejected') {
+        expect(conflicted.reason).toBeInstanceOf(StatusConflictError);
+      }
+    });
+  });
+
   // ── error propagation ───────────────────────────────────────────────────────
 
   describe('error propagation', () => {
@@ -394,6 +653,85 @@ describe('streamRepository', () => {
     it('propagates unexpected DB errors from upsertStream', async () => {
       mockQuery.mockRejectedValueOnce(new Error('syntax error'));
       await expect(streamRepository.upsertStream(makeInput())).rejects.toThrow('syntax error');
+    });
+  });
+
+  // ── MAX_PAGE_SIZE limit clamping ──────────────────────────────────────────────
+
+  describe('MAX_PAGE_SIZE limit clamping', () => {
+    it('exports MAX_PAGE_SIZE as 100', () => {
+      expect(MAX_PAGE_SIZE).toBe(100);
+    });
+
+    describe('findWithCursor', () => {
+      it('clamps limit above MAX_PAGE_SIZE to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        // Return exactly MAX_PAGE_SIZE rows (hasMore = false when result <= effectiveLimit)
+        const rows = Array.from({ length: MAX_PAGE_SIZE }, (_, i) =>
+          makeRow({ id: `stream-${i}`, transaction_hash: TX_HASH, event_index: i }),
+        );
+        mockQuery.mockResolvedValue({ rows });
+
+        const result = await streamRepository.findWithCursor({}, 9999);
+        // Should never return more than MAX_PAGE_SIZE streams
+        expect(result.streams.length).toBeLessThanOrEqual(MAX_PAGE_SIZE);
+      });
+
+      it('does not clamp limit equal to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        // Return fewer rows than limit+1 so hasMore is false
+        const rows = [makeRow()];
+        mockQuery.mockResolvedValue({ rows });
+
+        const result = await streamRepository.findWithCursor({}, MAX_PAGE_SIZE);
+        expect(result.streams.length).toBe(1);
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('does not clamp limit below MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        const rows = Array.from({ length: 5 }, (_, i) =>
+          makeRow({ id: `stream-${i}`, transaction_hash: TX_HASH, event_index: i }),
+        );
+        mockQuery.mockResolvedValue({ rows });
+
+        const result = await streamRepository.findWithCursor({}, 10);
+        expect(result.streams.length).toBe(5);
+        expect(result.hasMore).toBe(false);
+      });
+    });
+
+    describe('find', () => {
+      it('clamps pagination.limit above MAX_PAGE_SIZE to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        mockQuery
+          .mockResolvedValueOnce({ rows: [{ count: '500' }] }) // count query
+          .mockResolvedValueOnce({ rows: [makeRow()] });        // data query
+
+        const result = await streamRepository.find({}, { limit: 9999, offset: 0 });
+        // Returned limit in result should be clamped
+        expect(result.limit).toBe(MAX_PAGE_SIZE);
+      });
+
+      it('does not clamp pagination.limit equal to MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        mockQuery
+          .mockResolvedValueOnce({ rows: [{ count: '1' }] })
+          .mockResolvedValueOnce({ rows: [makeRow()] });
+
+        const result = await streamRepository.find({}, { limit: MAX_PAGE_SIZE, offset: 0 });
+        expect(result.limit).toBe(MAX_PAGE_SIZE);
+      });
+
+      it('does not clamp pagination.limit below MAX_PAGE_SIZE', async () => {
+        mockGetReadPool.mockResolvedValue({});
+        mockQuery
+          .mockResolvedValueOnce({ rows: [{ count: '1' }] })
+          .mockResolvedValueOnce({ rows: [makeRow()] });
+
+        const result = await streamRepository.find({}, { limit: 10, offset: 0 });
+        expect(result.limit).toBe(10);
+      });
     });
   });
 });

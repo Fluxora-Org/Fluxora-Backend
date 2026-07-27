@@ -45,20 +45,54 @@ export const pgLastAutovacuumAgeSeconds =
 // ── Query ─────────────────────────────────────────────────────────────────────
 
 const VACUUM_STATS_SQL = `
+  WITH RECURSIVE tables AS (
+    SELECT oid, relname AS root_table, relname AS table_name
+    FROM pg_class
+    WHERE relname = ANY($1::text[]) AND relkind IN ('r', 'p')
+    UNION ALL
+    SELECT i.inhrelid, t.root_table, c.relname
+    FROM pg_inherits i
+    JOIN tables t ON t.oid = i.inhparent
+    JOIN pg_class c ON c.oid = i.inhrelid
+  )
   SELECT
-    relname          AS table_name,
-    n_dead_tup,
-    n_live_tup,
-    last_autovacuum
-  FROM pg_stat_user_tables
-  WHERE relname = ANY($1::text[])
+    t.root_table AS table_name,
+    SUM(s.n_dead_tup) AS n_dead_tup,
+    SUM(s.n_live_tup) AS n_live_tup,
+    MAX(s.last_autovacuum) AS last_autovacuum
+  FROM tables t
+  JOIN pg_stat_user_tables s ON s.relid = t.oid
+  GROUP BY t.root_table
 `;
+
 
 interface VacuumRow {
   table_name: string;
   n_dead_tup: string;
   n_live_tup: string;
   last_autovacuum: Date | null;
+}
+
+/**
+ * Map a raw `pg_stat_user_tables` aggregate row into a typed {@link VacuumRow}.
+ *
+ * Never pass `VacuumRow` (or any bare domain interface) as the generic argument
+ * to `pool.query<T>()` — pg requires `QueryResultRow`. Query with
+ * `Record<string, unknown>` and map through this helper instead.
+ * See `src/db/repositories/README.md`.
+ */
+export function rowToVacuumRow(row: Record<string, unknown>): VacuumRow {
+  return {
+    table_name: String(row['table_name'] ?? ''),
+    n_dead_tup: String(row['n_dead_tup'] ?? '0'),
+    n_live_tup: String(row['n_live_tup'] ?? '0'),
+    last_autovacuum:
+      row['last_autovacuum'] === null || row['last_autovacuum'] === undefined
+        ? null
+        : row['last_autovacuum'] instanceof Date
+          ? row['last_autovacuum']
+          : new Date(String(row['last_autovacuum'])),
+  };
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -72,8 +106,8 @@ export async function collectVacuumMetrics(pool: pg.Pool): Promise<void> {
   let rows: VacuumRow[];
 
   try {
-    const result = await pool.query<VacuumRow>(VACUUM_STATS_SQL, [MONITORED_TABLES]);
-    rows = result.rows;
+    const result = await pool.query<Record<string, unknown>>(VACUUM_STATS_SQL, [MONITORED_TABLES]);
+    rows = result.rows.map(rowToVacuumRow);
   } catch (err) {
     logger.warn('Vacuum metrics collection failed — skipping this interval', undefined, {
       error: err instanceof Error ? err.message : String(err),

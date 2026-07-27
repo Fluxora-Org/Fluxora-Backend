@@ -10,6 +10,8 @@
 import { createStreamHub, getStreamHub } from '../ws/hub.js';
 import type { Server } from 'http';
 import { info, warn } from '../utils/logger.js';
+import { addDrainableShutdownHook } from '../shutdown.js';
+
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -43,12 +45,18 @@ let hubInitialized = false;
  * @deprecated Use StreamHub directly for new code
  */
 export function attachWebSocketServer(httpServer: Server): void {
-  if (hubInitialized) return;
-  
-  // Always create a new hub for the given server
+  // If a StreamHub is already created, do nothing.
+  if (getStreamHub()) return;
+
+  // Always create a new hub for the given server.
   createStreamHub(httpServer);
-  hubInitialized = true;
-  
+  // Register graceful shutdown hook to notify clients of server shutdown
+  addDrainableShutdownHook({
+    async stop() {
+      const hub = getStreamHub();
+      if (hub) await hub.gracefulClose();
+    },
+  });
   warn('attachWebSocketServer is deprecated - use StreamHub directly for new code');
 }
 

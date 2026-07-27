@@ -96,6 +96,28 @@ Coverage is configured in `vitest.config.ts` with the v8 provider:
 -   **Output**: `./coverage/` (includes `lcov.info` for Codecov)
 -   **Thresholds**: 80% across lines, functions, branches, and statements
 
+### Per-path coverage gate (webhooks)
+
+The `src/webhooks/` module has an additional per-path coverage gate enforced
+by `scripts/check-webhooks-coverage.mjs`. This is the most safety-critical
+part of the codebase (delivery, retries, DLQ, signatures, SSRF), so a
+dedicated floor prevents silent degradation.
+
+-   **Thresholds** (aggregate for `src/webhooks/**`):
+    -   statements: **30%**
+    -   branches: **65%**
+    -   functions: **55%**
+-   **Enforcement**: CI runs the check after `pnpm test:coverage`. The gate
+    fails the build when aggregate coverage drops below the floor.
+-   **Local verification**:
+    ```bash
+    pnpm test:coverage
+    node scripts/check-webhooks-coverage.mjs
+    ```
+-   **Raising thresholds**: When new tests are added to the webhooks module,
+    update the `THRESHOLDS` object in `scripts/check-webhooks-coverage.mjs`
+    to reflect the new baseline.
+
 ## Test File Locations
 
 | Location | Contents |

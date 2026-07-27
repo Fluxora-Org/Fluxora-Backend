@@ -8,13 +8,16 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
-import { webhooksRouter } from './routes/webhooks.js';
+import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders } from './middleware/pii.js';
 import type { Config } from './config/env.js';
 import { loadConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
+import { createGrpcHealthServer, startGrpcHealthServer, stopGrpcHealthServer } from './health/grpcHealth.js';
 import { createRedisClient } from './redis/client.js';
+import { setDedupCache } from './services/streamEventService.js';
+import { RedisDedupCache, InMemoryDedupCache, HybridDedupCache } from './redis/dedup.js';
 import { RedisIdempotencyStore, NoOpIdempotencyStore } from './redis/idempotencyStore.js';
 import {
   createWebhookCircuitBreakerStore,
@@ -34,9 +37,20 @@ import {
   BODY_LIMIT_BYTES,
 } from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
+import { requireJsonContentType } from './middleware/contentType.js';
+import { requireJsonAccept } from './middleware/acceptNegotiation.js';
+import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
+import { canaryRoutingMiddleware } from './middleware/canaryRouting.ts';
+import { serverTimingMiddleware } from './middleware/serverTiming.js';
+import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
+import { drainSseEventBus } from './streams/sseEmitter.js';
+import { requestStopReplay } from './indexer/service.js';
+import { initializeIndexerLeaderElection, getIndexerLeaderElection } from './indexer/leaderElection.js';
+import { quitAllRedisClients } from './redis/client.js';
+import { initializeAdminStateLock } from './state/adminState.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createDeprecationMiddleware } from './middleware/deprecation.js';
 import { routeDeprecations } from './config/deprecations.js';
@@ -45,6 +59,8 @@ import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
+import { csrfMiddleware } from './middleware/csrf.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -131,6 +147,86 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
   }
 }
 
+async function wireStreamEventDedupCache(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info('Redis disabled — stream event dedup will use in-memory cache');
+    setDedupCache(new InMemoryDedupCache());
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const primary = new RedisDedupCache(redisClient);
+    const fallback = new InMemoryDedupCache();
+    const hybrid = new HybridDedupCache(primary, fallback, true);
+
+    setDedupCache(hybrid);
+    addShutdownHook(() => hybrid.close());
+
+    logger.info('Redis stream event dedup cache wired', undefined, {
+      component: 'stream-event-dedup',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for stream event dedup — falling back to in-memory cache',
+      undefined,
+      {
+        component: 'stream-event-dedup',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setDedupCache(new InMemoryDedupCache());
+  }
+}
+
+async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info('Redis disabled — inbound webhook dedup will use in-memory cache');
+    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    const primary = new RedisDedupCache(redisClient);
+    const fallback = new InMemoryDedupCache();
+    const hybrid = new HybridDedupCache(primary, fallback, true);
+
+    setInboundWebhookDedupCache(hybrid);
+    addShutdownHook(() => hybrid.close());
+
+    logger.info('Redis inbound webhook dedup cache wired', undefined, {
+      component: 'inbound-webhook-dedup',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for inbound webhook dedup — falling back to in-memory cache',
+      undefined,
+      {
+        component: 'inbound-webhook-dedup',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    setInboundWebhookDedupCache(new InMemoryDedupCache());
+  }
+}
+
 async function wireWebhookCircuitBreakerStore(config: Config): Promise<void> {
   if (!config.redisEnabled) {
     logger.warn(
@@ -172,6 +268,121 @@ async function wireWebhookCircuitBreakerStore(config: Config): Promise<void> {
   }
 }
 
+/**
+ * Initialize distributed locking for adminState pause flags.
+ *
+ * When `REDIS_ENABLED=true` (the default): wires a Redis-backed distributed lock
+ * that coordinates pause-flag writes across multiple processes.
+ * Falls back to file-based locking if Redis is unavailable.
+ *
+ * This function never rejects — all errors are caught and logged internally.
+ */
+async function wireAdminStateLock(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info(
+      'Redis disabled — adminState will use file-based locking for pause flags',
+      undefined,
+      { component: 'admin-state-lock' },
+    );
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    initializeAdminStateLock(redisClient);
+
+    logger.info('Redis adminState lock wired', undefined, {
+      component: 'admin-state-lock',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for adminState lock — falling back to file-based locking',
+      undefined,
+      {
+        component: 'admin-state-lock',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+}
+
+/**
+ * Blue/green deployment slot middleware.
+ *
+ * Emits `X-Fluxora-Deployment-Slot` on every response so that a front-side
+ * load balancer or the e2e suite can verify which slot answered a request
+ * during a blue/green cutover.
+ *
+ * The slot is read from `DEPLOYMENT_SLOT` env var at request time (not module
+ * load) so that the same binary can serve either slot depending on how it is
+ * launched. Defaults to `"blue"` when the env var is absent or empty.
+ *
+ * Security: the header value is constrained to alphanumeric + hyphens to
+ * prevent header injection. Any non-conforming value is replaced with `"blue"`.
+ */
+function deploymentSlotMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const raw = process.env.DEPLOYMENT_SLOT ?? 'blue';
+  // Sanitise: only allow [a-z0-9-] to prevent header injection.
+  const slot = /^[a-z0-9-]+$/i.test(raw) ? raw : 'blue';
+  res.setHeader('X-Fluxora-Deployment-Slot', slot);
+  next();
+}
+
+/**
+ * Wire Redis-backed distributed leader election for indexer replay.
+ *
+ * When `REDIS_ENABLED=true` (the default): wires a Redis-backed lease so only
+ * one replica runs indexer replay at a time in a multi-instance deployment.
+ * Falls back to the always-leader `NoOpLeaderElection` (today's single-process
+ * behaviour) when Redis is disabled or unreachable.
+ *
+ * This function never rejects — all errors are caught and logged internally.
+ */
+async function wireIndexerLeaderElection(config: Config): Promise<void> {
+  if (!config.redisEnabled) {
+    logger.info(
+      'Redis disabled — indexer replay leader election running in always-leader (single-instance) mode',
+      undefined,
+      { component: 'indexer-leader-election' },
+    );
+    return;
+  }
+
+  try {
+    const redisClient = await createRedisClient({
+      url: config.redisUrl,
+      enabled: config.redisEnabled,
+      mode: config.redisMode,
+      sentinelHosts: config.redisSentinelHosts,
+      sentinelName: config.redisSentinelName,
+      clusterNodes: config.redisClusterNodes,
+    });
+
+    initializeIndexerLeaderElection(redisClient);
+
+    logger.info('Redis indexer leader election wired', undefined, {
+      component: 'indexer-leader-election',
+    });
+  } catch (err) {
+    logger.warn(
+      'Redis connection failed for indexer leader election — falling back to always-leader mode',
+      undefined,
+      {
+        component: 'indexer-leader-election',
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+}
+
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
@@ -183,6 +394,18 @@ export function createApp(options: AppOptions = {}): Express {
   addShutdownHook(() => {
     stopRuntimeMetrics();
   });
+
+  // Shutdown hook ordering (runs after server.close() drains HTTP):
+  //   1. Drain SSE — close open event-stream responses with retry:0.
+  //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
+  //   3. Release the indexer leader-election lease — must happen before Redis
+  //      is closed, and after replay has been signalled to stop, so another
+  //      instance can take over promptly instead of waiting out the full lease.
+  //   4. Quit Redis — close all tracked Redis sockets.
+  addShutdownHook(() => drainSseEventBus(appConfig.sseDrainTimeoutMs));
+  addShutdownHook(() => requestStopReplay());
+  addShutdownHook(() => getIndexerLeaderElection().release());
+  addShutdownHook(() => quitAllRedisClients());
 
   // Expose the limiter on app.locals so index.ts can register a shutdown hook
   app.locals.rateLimiter = rateLimiter;
@@ -197,24 +420,64 @@ export function createApp(options: AppOptions = {}): Express {
 
   if (options.pool) {
     app.locals.vacuumInterval = startVacuumCollector(options.pool);
+    startBackgroundJobs(options.pool);
+    addShutdownHook(() => stopBackgroundJobs());
   }
 
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
+  void wireStreamEventDedupCache(appConfig);
+  void wireInboundWebhookDedupCache(appConfig);
   void wireWebhookCircuitBreakerStore(appConfig);
+  void wireAdminStateLock(appConfig);
+  void wireIndexerLeaderElection(appConfig);
+
+  // Configure mTLS enforcement for indexer worker connections.
+  // When INDEXER_MTLS_REQUIRED is true (default in production), non-TLS
+  // connections are rejected (fail-closed).
+  setMtlsRequired(appConfig.indexerMtlsRequired);
+
+  // Optional grpc.health.v1.Health service for Kubernetes-native gRPC probes,
+  // on a separate port from the HTTP server so it never competes with API
+  // traffic. Requires a healthManager (same dependency-check logic as
+  // /health/ready) — without one there is nothing meaningful to reuse.
+  if (options.healthManager && appConfig.grpcHealthEnabled) {
+    const grpcHealthServer = createGrpcHealthServer(options.healthManager);
+    app.locals.grpcHealthServer = grpcHealthServer;
+    startGrpcHealthServer(grpcHealthServer, appConfig.grpcHealthPort).catch((err) => {
+      logger.warn('gRPC health server failed to start', undefined, {
+        component: 'grpc-health',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    addShutdownHook(() => stopGrpcHealthServer(grpcHealthServer));
+  }
+
+  // Blue/green slot header — must run before any response can be sent.
+  app.use(deploymentSlotMiddleware);
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
+  // Correlation ID must run before express.json() so req.correlationId is available
+  // even when JSON parsing throws and the error handler fires immediately.
+  // It must also run before early-reject middlewares (body size, content type) 
+  // so that rejected requests still carry a correlation ID.
+  app.use(correlationIdMiddleware);
+  // Canary routing runs immediately after correlation-ID assignment so that
+  // every canary-tagged request carries a correlation ID end-to-end in logs.
+  app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
   app.use(bodySizeLimitMiddleware);
+  app.use('/api', requireJsonContentType);
+  app.use('/api', requireJsonAccept);
   app.use(express.json({ limit: BODY_LIMIT_BYTES }));
-  // Correlation ID must be first so all subsequent middleware/routes have req.correlationId.
-  app.use(correlationIdMiddleware);
+  app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(serverTimingMiddleware());
   app.use(httpMetrics);
   app.use(createDeprecationMiddleware(routeDeprecations));
   app.use(rateLimiter);
@@ -243,7 +506,7 @@ export function createApp(options: AppOptions = {}): Express {
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
-  app.use('/api/streams', streamsRouter);
+  app.use('/api/streams', csrfMiddleware, streamsRouter);
   app.use('/api/admin', adminRouter);
   app.use('/internal/indexer', indexerRouter);
   app.use('/internal/webhooks', webhooksRouter);
@@ -263,7 +526,7 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   app.use((req: Request, res: Response) => {
-    const requestId = req.id;
+    const requestId = req.correlationId;
     res.status(404).json(
       errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
     );

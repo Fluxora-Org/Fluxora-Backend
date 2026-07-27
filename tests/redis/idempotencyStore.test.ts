@@ -16,12 +16,13 @@
  *  - InMemoryIdempotencyStore full semantics
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   RedisIdempotencyStore,
   NoOpIdempotencyStore,
   InMemoryIdempotencyStore,
   IDEMPOTENCY_KEY_PREFIX,
+  ENVELOPE_VERSION,
   type IdempotentEntry,
 } from '../../src/redis/idempotencyStore.js';
 import { logger } from '../../src/logging/logger.js';
@@ -31,6 +32,7 @@ import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
 
 function makeEntry(overrides: Partial<IdempotentEntry> = {}): IdempotentEntry {
   return {
+    version: ENVELOPE_VERSION,
     requestFingerprint: 'fp-abc123',
     statusCode: 201,
     body: { data: { id: 'stream-1', status: 'active' }, meta: {} },
@@ -76,7 +78,9 @@ describe('RedisIdempotencyStore', () => {
     // Access the fake's internal string store via get() to confirm the prefix
     const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}my-key`);
     expect(raw).not.toBeNull();
-    expect(JSON.parse(raw!)).toEqual(entry);
+    const parsed = JSON.parse(raw!);
+    expect(parsed).toMatchObject(entry);
+    expect(parsed.version).toBe(ENVELOPE_VERSION);
   });
 
   it('forwards the TTL to the Redis client', async () => {
@@ -321,6 +325,129 @@ describe('RedisIdempotencyStore — structured logger', () => {
     );
   });
 
+});
+
+// ── RedisIdempotencyStore — envelope validation ───────────────────────────────
+
+describe('RedisIdempotencyStore — envelope validation', () => {
+  let fake: FakeRedisClient;
+  let store: RedisIdempotencyStore;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    fake = new FakeRedisClient();
+    store = new RedisIdempotencyStore(fake);
+    warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  async function seedRaw(key: string, value: unknown) {
+    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}${key}`, JSON.stringify(value), { ex: 3600 });
+  }
+
+  it('returns null and warns on version mismatch (old version)', async () => {
+    await seedRaw('k', { ...makeEntry(), version: 0 });
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: expect.stringContaining('version mismatch') }),
+    );
+  });
+
+  it('returns null and warns on future version', async () => {
+    await seedRaw('k', { ...makeEntry(), version: ENVELOPE_VERSION + 1 });
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: expect.stringContaining('version mismatch') }),
+    );
+  });
+
+  it('returns null and warns when version field is missing', async () => {
+    const { version: _v, ...noVersion } = makeEntry();
+    await seedRaw('k', noVersion);
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: 'missing version field' }),
+    );
+  });
+
+  it('returns null and warns when requestFingerprint is missing', async () => {
+    const { requestFingerprint: _fp, ...noFp } = makeEntry();
+    await seedRaw('k', noFp);
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: 'missing or invalid requestFingerprint' }),
+    );
+  });
+
+  it('returns null and warns when statusCode is missing', async () => {
+    const { statusCode: _sc, ...noSc } = makeEntry();
+    await seedRaw('k', noSc);
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: 'missing or invalid statusCode' }),
+    );
+  });
+
+  it('returns null and warns when body is missing', async () => {
+    const { body: _b, ...noBody } = makeEntry();
+    await seedRaw('k', noBody);
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: 'missing body' }),
+    );
+  });
+
+  it('returns null and warns on malformed (non-object) JSON', async () => {
+    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}k`, '"just a string"', { ex: 3600 });
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: 'envelope is not an object' }),
+    );
+  });
+
+  it('returns null and warns on invalid JSON bytes', async () => {
+    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}k`, '{bad json}', { ex: 3600 });
+    expect(await store.get('k')).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('envelope validation failed'),
+      expect.objectContaining({ reason: 'invalid JSON' }),
+    );
+  });
+
+  it('stamps ENVELOPE_VERSION on every set()', async () => {
+    const entry = makeEntry();
+    await store.set('k', entry, 60);
+    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}k`);
+    expect(JSON.parse(raw!).version).toBe(ENVELOPE_VERSION);
+  });
+
+  it('overwrites caller-supplied version with ENVELOPE_VERSION on set()', async () => {
+    const entry = makeEntry({ version: 99 } as Partial<IdempotentEntry>);
+    await store.set('k', entry, 60);
+    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}k`);
+    expect(JSON.parse(raw!).version).toBe(ENVELOPE_VERSION);
+  });
+
+  it('returns the entry when the stored envelope is fully valid', async () => {
+    const entry = makeEntry();
+    await store.set('k', entry, 60);
+    const result = await store.get('k');
+    expect(result).not.toBeNull();
+    expect(result?.requestFingerprint).toBe(entry.requestFingerprint);
+    expect(result?.statusCode).toBe(entry.statusCode);
+    expect(result?.version).toBe(ENVELOPE_VERSION);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
 });
 
 // ── RedisIdempotencyStore.close() ─────────────────────────────────────────────
