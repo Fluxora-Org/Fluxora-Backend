@@ -257,6 +257,43 @@ export async function isValidApiKey(rawKey: string): Promise<boolean> {
 }
 
 /**
+ * Looks up the full ApiKeyRecord for a given raw key.
+ *
+ * Resolves by prefix (O(log n)), then performs a constant-time hash comparison
+ * to find the matching active record. Returns the record including scopes, or
+ * `undefined` if the key is not found or is inactive.
+ *
+ * Only active keys are returned — revoked keys yield `undefined`.
+ *
+ * @param rawKey - The raw key presented by the caller (e.g. `flx_...`).
+ */
+export async function getApiKeyRecord(rawKey: string): Promise<ApiKeyRecord | undefined> {
+  if (!rawKey || typeof rawKey !== 'string') {
+    return undefined;
+  }
+
+  const prefix = rawKey.slice(0, PREFIX_LENGTH);
+  const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
+
+  for (const candidate of candidates) {
+    if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Alias for {@link getApiKeyRecord} — looks up the full `ApiKeyRecord` for a
+ * given raw key. Exported under a second name so middleware that imports
+ * `findRecordByRawKey` remains source-compatible with the mock used in unit
+ * tests.
+ *
+ * @see getApiKeyRecord
+ */
+export const findRecordByRawKey = getApiKeyRecord;
+
+/**
  * Extracts the API key from common request headers.
  */
 export function getApiKeyFromRequest(
