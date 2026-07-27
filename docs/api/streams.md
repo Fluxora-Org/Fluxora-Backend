@@ -109,6 +109,52 @@ Streams listing uses **cursor-based pagination** (keyset pagination), which is m
 
 **Important:** Cursors are opaque and may change between versions. Do not attempt to parse them; treat them as black-box tokens.
 
+### Pagination Validation Contract
+
+All query parameters are validated via Zod (`PaginationSchema`) **before** any database call is made. Invalid parameters return `400 VALIDATION_ERROR` with a descriptive message.
+
+| Parameter | Type | Validation Rules | Default | Error on Violation |
+| :--- | :--- | :--- | :--- | :--- |
+| `limit` | string → integer | Must be a positive integer string. Parsed to int, clamped to `[1, 100]`. | `50` | `400 VALIDATION_ERROR` |
+| `cursor` | string | Must be a non-empty string. Decoded from base64url; must be valid JSON with `{v: 1, lastId: string}` shape. | `undefined` (first page) | `400 VALIDATION_ERROR` |
+| `status` | string | Passed as-is to the DB filter. No enum validation at the route level. | `undefined` (no filter) | N/A |
+| `sender` | string | Passed as-is to the DB filter. | `undefined` (no filter) | N/A |
+| `recipient` | string | Passed as-is to the DB filter. | `undefined` (no filter) | N/A |
+| `include_total` | string | Must be `"true"` or `"false"` (exact string match). | `false` | `400 VALIDATION_ERROR` |
+
+#### Cursor structure
+
+Cursors are opaque base64url tokens. Internally they encode:
+
+```json
+{ "v": 1, "lastId": "stream-abc123-0" }
+```
+
+The `v` field is a version tag for forward compatibility. The `lastId` is the stream ID of the last item on the previous page. The cursor is **never** validated against the database — it is simply passed to `streamRepository.findWithCursor()` as the `afterId` parameter. If the cursor references a deleted or non-existent stream, the query returns results starting from the next valid ID (graceful degradation).
+
+#### Error responses
+
+| Condition | HTTP Status | Code | Message |
+| :--- | :--- | :--- | :--- |
+| `limit` is not a number string | 400 | VALIDATION_ERROR | `limit must be a positive integer` |
+| `limit` < 1 or > 100 | 400 | VALIDATION_ERROR | `limit must be at least 1` / `limit must be at most 100` |
+| `cursor` is empty or whitespace | 400 | VALIDATION_ERROR | `cursor must be a valid opaque pagination token` |
+| `cursor` is not valid base64url JSON | 400 | VALIDATION_ERROR | `cursor must be a valid opaque pagination token` |
+| `cursor` JSON lacks `v` or `lastId` | 400 | VALIDATION_ERROR | `cursor must be a valid opaque pagination token` |
+| `include_total` is not `"true"` or `"false"` | 400 | VALIDATION_ERROR | `include_total must be true or false` |
+| Database unavailable | 503 | SERVICE_UNAVAILABLE | `Stream list is temporarily unavailable.` |
+
+#### Regression surface
+
+The following behaviors must remain stable:
+
+1. **Default limit**: Omitting `limit` returns 20 results (not 50 as the query-param docs state — the Zod schema default overrides the route-level default).
+2. **Cursor opacity**: Clients must never construct cursors manually; they are server-generated and versioned.
+3. **`include_total` cost**: When `include_total=true`, an additional `COUNT(*)` query runs against the same filter. This is O(n) and should be used sparingly.
+4. **Empty page**: When no streams match the filter, `streams` is `[]`, `has_more` is `false`, and `next_cursor` is `null`.
+5. **Cache-Control**: Pages with all-terminal streams get `public, max-age=300`; mutable pages get `private, no-store`.
+6. **Read-your-writes**: Clients echoing `X-Fluxora-Write-Fence` from a prior write response are routed to the primary pool.
+
 ### Caching
 
 The `Cache-Control` header depends on stream status:
@@ -275,6 +321,85 @@ curl https://api.example.com/api/streams/stream-abc123-0/export.jsonld \
 | `401` | `UNAUTHORIZED` | Missing or invalid API key |
 | `403` | `FORBIDDEN` | API key lacks `streams:read` scope |
 | `404` | `NOT_FOUND` | Stream does not exist |
+| `503` | `SERVICE_UNAVAILABLE` | Database connection pool exhausted |
+
+## GET /api/streams/:id/poll
+
+Long-polling fallback endpoint for WebSocket-incapable clients or clients behind enterprise proxies that block WebSocket/SSE upgrades.
+Holds the connection open (bounded by a timeout) until a new event for the stream arrives or the timeout elapses. Returns the same event envelope shape used by the WebSocket/SSE hub.
+
+### Query Parameters
+
+| Name | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `since` | string | — | Optional. Event ID cursor to fetch missed events. Replays from the since point before holding for live updates. |
+| `timeout` | integer | 30 | Optional. Maximum duration in seconds to hold the connection open. Capped at a maximum of 30 seconds. |
+
+### Response Body
+
+#### If an event is found (either immediately or during the poll duration):
+Returns a standard event envelope:
+```json
+{
+  "success": true,
+  "data": {
+    "type": "stream_update",
+    "streamId": "stream-abc123-0",
+    "eventId": "evt-12345",
+    "payload": {
+      "id": "stream-abc123-0",
+      "depositAmount": "1000",
+      "streamedAmount": "100",
+      "remainingAmount": "900",
+      "ratePerSecond": "0.1",
+      "status": "active"
+    },
+    "correlationId": "req-98765"
+  },
+  "meta": {
+    "timestamp": "2024-01-15T10:30:00Z",
+    "requestId": "req-98765"
+  }
+}
+```
+
+#### If the timeout elapses with no new events:
+Returns a success envelope with `null` data:
+```json
+{
+  "success": true,
+  "data": null,
+  "meta": {
+    "timestamp": "2024-01-15T10:30:30Z",
+    "requestId": "req-98765"
+  }
+}
+```
+
+### Rate Limiting and Capacity Limits
+
+To prevent resource exhaustion, the long-poll endpoint enforces a dedicated limiter:
+- **Maximum hold duration**: 30 seconds.
+- **Per-IP concurrent connection cap**: Clamped by `LONG_POLL_MAX_CONNECTIONS_PER_IP` (default: `10`).
+- **Global concurrent connection cap**: Clamped by `LONG_POLL_MAX_GLOBAL_CONNECTIONS` (default: `1000`).
+
+Reaching these limits will return a `429 Too Many Requests` error with a `Retry-After` header.
+
+### Example
+
+```bash
+curl "http://localhost:3000/api/streams/stream-abc123-0/poll?since=evt-100&timeout=20" \
+  -H "X-API-Key: <your-api-key>"
+```
+
+### Error responses
+
+| Status | Code | Cause |
+| :--- | :--- | :--- |
+| `400` | `VALIDATION_ERROR` | Invalid `since` or `timeout` parameters, or stale cursor error |
+| `401` | `UNAUTHORIZED` | Missing or invalid authentication token |
+| `404` | `NOT_FOUND` | Stream does not exist |
+| `429` | `TOO_MANY_REQUESTS` | Active long-poll capacity limit exceeded |
 | `503` | `SERVICE_UNAVAILABLE` | Database connection pool exhausted |
 
 ## Method Overrides

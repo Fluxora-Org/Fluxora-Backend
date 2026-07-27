@@ -67,8 +67,9 @@ Fluxora can return a W3C-compatible `Server-Timing` response header for the stre
 ### How it works
 
 - Middleware creates a request-scoped registry attached to `res.locals` when `SERVER_TIMING_ENABLED=true`.
-- Route handlers record named phases for `db`, `stellar_rpc`, and `serialize` by pushing sanitized values into the registry.
+- Streams route handlers record named phases by pushing sanitized values into the registry. Current streams responses include `db` and `serialize`; paths that make Stellar RPC calls may also record `stellar_rpc`.
 - The final header is emitted once per response and contains only phase names and durations.
+- Responses without recorded phases omit the header, even when the feature is enabled.
 
 ### Security guarantees
 
@@ -353,16 +354,83 @@ SSE payloads and other stream-level data are not included in the log/metric labe
 
 ## Webhook Circuit Breaker Metrics
 
-We track state transitions for webhook circuit breakers to provide visibility into consumer endpoint health.
+Outbound webhook delivery uses a per-consumer-URL circuit breaker to avoid hammering failing endpoints.
+The `fluxora_webhook_circuit_breaker_transitions_total` counter tracks every state change so operators
+can build dashboards and alert on consumer endpoint degradation.
 
 ### `fluxora_webhook_circuit_breaker_transitions_total`
 
-A Prometheus counter tracking state transitions (`closed`, `open`, `half-open`).
+A Prometheus **Counter** that increments on every circuit-breaker state transition.
 
-Labels:
-- `from_state`: The previous state.
-- `to_state`: The new state.
-- `consumer_hash`: SHA256 hash of the consumer URL, truncated to 16 characters, to ensure bounded cardinality.
+| Label | Values | Description |
+|-------|--------|-------------|
+| `from_state` | `closed`, `open`, `half-open` | State before the transition |
+| `to_state` | `closed`, `open`, `half-open` | State after the transition |
+| `consumer_hash` | 16-char hex string | SHA-256 of the consumer URL, truncated to 16 hex characters |
+
+**Cardinality bounds:**
+The `consumer_hash` label is a fixed 16-character hex digest derived from `SHA-256(consumer_url)`.
+The raw URL is **never** exposed as a label, preventing:
+- Unbounded cardinality from arbitrary customer endpoint URLs
+- PII or credential leakage through metric labels
+
+Both the Redis-backed (`RedisWebhookCircuitBreakerStore`) and in-memory-fallback
+(`InMemoryWebhookCircuitBreakerStore`) code paths emit this metric, so counters remain
+accurate during a Redis outage.
+
+### State machine
+
+```
+closed ──(threshold reached)──▸ open
+ open  ──(reset period elapsed)──▸ half-open
+half-open ──(probe succeeds)──▸ closed
+half-open ──(probe fails)──▸ open
+```
+
+### PromQL examples
+
+**Total transitions into `open` state** (circuit breaker tripping rate):
+
+```promql
+sum(rate(fluxora_webhook_circuit_breaker_transitions_total{to_state="open"}[5m])) by (consumer_hash)
+```
+
+**Breakers currently in `open` state** (approximation — count recent open→half-open and closed→open transitions minus recoveries):
+
+```promql
+sum(increase(fluxora_webhook_circuit_breaker_transitions_total{to_state="open"}[1h])) by (consumer_hash)
+-
+sum(increase(fluxora_webhook_circuit_breaker_transitions_total{from_state="open"}[1h])) by (consumer_hash)
+```
+
+**Half-open probes succeeding vs failing** (recovery health):
+
+```promql
+sum(rate(fluxora_webhook_circuit_breaker_transitions_total{from_state="half-open",to_state="closed"}[5m]))
+sum(rate(fluxora_webhook_circuit_breaker_transitions_total{from_state="half-open",to_state="open"}[5m]))
+```
+
+### Alerting rules
+
+```yaml
+groups:
+  - name: webhook-circuit-breaker
+    rules:
+      - alert: WebhookCircuitBreakerOpenRateHigh
+        expr: sum(rate(fluxora_webhook_circuit_breaker_transitions_total{to_state="open"}[5m])) by (consumer_hash) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook circuit breaker tripping frequently for consumer {{ $labels.consumer_hash }}"
+
+      - alert: WebhookCircuitBreakerStuckOpen
+        expr: increase(fluxora_webhook_circuit_breaker_transitions_total{from_state="half-open",to_state="open"}[1h]) > 3
+        labels:
+          severity: critical
+        annotations:
+          summary: "Webhook consumer {{ $labels.consumer_hash }} circuit breaker repeatedly re-opening — endpoint may be down"
+```
 
 ### WebSocket Micro-Batching Metrics
 

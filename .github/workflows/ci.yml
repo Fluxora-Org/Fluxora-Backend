@@ -110,6 +110,42 @@ jobs:
         run: pnpm audit --audit-level=moderate
         continue-on-error: true
 
+  chaos:
+    name: Chaos tests (Toxiproxy)
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Start chaos stack
+        run: docker compose --profile chaos up -d --wait
+
+      - name: Run chaos tests
+        env:
+          CHAOS_ENABLED: "true"
+          TOXI_URL: "http://localhost:8474"
+          CHAOS_PG_PROXY_URL: "postgresql://chaos_user:chaos_password@localhost:5433/chaos_db"
+          CHAOS_REDIS_PROXY_URL: "redis://:chaos_password@localhost:6380"
+        run: pnpm test tests/incidents/toxiproxy.chaos.test.ts
+
+      - name: Tear down chaos stack
+        if: always()
+        run: docker compose --profile chaos down -v
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest

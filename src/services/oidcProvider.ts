@@ -247,7 +247,7 @@ export async function getJwks(
 /**
  * Validates the token to prevent replay attacks.
  */
-async function preventReplay(idToken: string, exp: number): Promise<void> {
+export async function preventReplay(idToken: string, exp: number): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const ttl = exp - now;
 
@@ -271,11 +271,10 @@ async function preventReplay(idToken: string, exp: number): Promise<void> {
   try {
     const redis = await getOidcRedisClient();
     if (redis) {
-      const exists = await redis.exists(replayKey);
-      if (exists) {
+      const added = await redis.setNx(replayKey, '1', ttl * 1000);
+      if (!added) {
         throw new Error('Token replay detected: this token has already been exchanged');
       }
-      await redis.set(replayKey, '1', { ex: ttl });
     }
   } catch (err) {
     if (err instanceof Error && err.message.includes('Token replay detected')) {

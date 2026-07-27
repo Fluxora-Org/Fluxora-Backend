@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { JobQueue } from '../../src/jobs/queue.js';
+import { JobQueue } from '../../src/jobs/queue.ts';
 import type { Job } from 'pg-boss';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────
@@ -245,5 +245,112 @@ describe('JobQueue singleton', () => {
     expect(mod.getJobQueue()).toBe(q);
     mod.setJobQueue(null);
     expect(mod.getJobQueue()).toBeNull();
+  });
+});
+
+// ── stopBackgroundJobs tests ──────────────────────────────────────────────
+
+describe('stopBackgroundJobs', () => {
+  beforeEach(async () => {
+    const { setJobQueue } = await import('../../src/jobs/queue.js');
+    setJobQueue(null);
+  });
+
+  it('stops the queue and clears the singleton when a queue is set', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    const mockBoss = createMockBoss();
+    const q = mod.JobQueue.withBoss(mockBoss as never);
+    // Register and start so workSubscriptions is populated
+    q.register('test-job', vi.fn());
+    await q.start();
+    expect(q.isStarted).toBe(true);
+    mod.setJobQueue(q);
+
+    await mod.stopBackgroundJobs();
+
+    expect(mockBoss.offWork).toHaveBeenCalledWith('test-job');
+    expect(mockBoss.stop).toHaveBeenCalledWith({ graceful: true, timeout: 30000 });
+    expect(mod.getJobQueue()).toBeNull();
+  });
+
+  it('handles the case when no queue is set gracefully', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    mod.setJobQueue(null);
+
+    // Should not throw when no queue exists
+    await expect(mod.stopBackgroundJobs()).resolves.toBeUndefined();
+    expect(mod.getJobQueue()).toBeNull();
+  });
+
+  it('handles stop errors gracefully without throwing', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    const mockBoss = createMockBoss();
+    mockBoss.stop.mockRejectedValueOnce(new Error('stop failed'));
+    const q = mod.JobQueue.withBoss(mockBoss as never);
+    q.register('test-job', vi.fn());
+    await q.start();
+    mod.setJobQueue(q);
+
+    // Should not throw even when boss.stop() rejects
+    await expect(mod.stopBackgroundJobs()).resolves.toBeUndefined();
+    // Singleton should still be cleared
+    expect(mod.getJobQueue()).toBeNull();
+  });
+});
+
+// ── startBackgroundJobs tests ─────────────────────────────────────────────
+
+describe('startBackgroundJobs', () => {
+  beforeEach(async () => {
+    const { setJobQueue } = await import('../../src/jobs/queue.js');
+    setJobQueue(null);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('registers partition-maintenance and job_dead_letter_queue handlers', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    
+    // We mock Pool
+    const mockPool = {
+      query: vi.fn().mockResolvedValue({ rowCount: 1 }),
+    } as any;
+
+    // Spy on register, start, schedule, send
+    const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
+    const startSpy = vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
+    
+    mod.startBackgroundJobs(mockPool);
+
+    expect(registerSpy).toHaveBeenCalledWith('partition-maintenance', expect.any(Function), expect.any(Object));
+    expect(registerSpy).toHaveBeenCalledWith('job_dead_letter_queue', expect.any(Function));
+    expect(startSpy).toHaveBeenCalled();
+
+    // Verify DLQ handler behavior
+    const dlqCall = registerSpy.mock.calls.find(c => c[0] === 'job_dead_letter_queue');
+    const dlqHandler = dlqCall![1];
+
+    const dlqCtx = {
+      id: 'dlq-id',
+      name: 'job_dead_letter_queue',
+      data: {
+        name: 'original-job',
+        id: 'orig-123',
+        data: { foo: 'bar' },
+        output: 'Some error occurred',
+        retryCount: 3,
+      }
+    };
+
+    await dlqHandler(dlqCtx as any);
+
+    expect(mockPool.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO job_dead_letter'),
+      ['original-job', 'orig-123', { foo: 'bar' }, 'Some error occurred', 3]
+    );
   });
 });

@@ -53,7 +53,6 @@ import { CORRELATION_ID_HEADER, isValidCorrelationId } from '../middleware/corre
 import {
   isValidStellarPublicKey,
   parseHandshakeSubscriptionFilter,
-  parseWsClientMessage,
   type SubscriptionFilter,
   type WsClientMessage,
   validateWebSocketMessage,
@@ -63,6 +62,7 @@ import {
   checkAndReserve,
   untrackConnection,
 } from './connectionLimiter.js';
+import { streamRepository } from '../db/repositories/streamRepository.js';
 import {
   collectWsBackpressureMetrics,
   removeWsClientBackpressureGauge,
@@ -698,7 +698,7 @@ export class StreamHub extends EventEmitter {
 
   // ── Message handling ───────────────────────────────────────────────────────
 
-  private handleMessage(ws: WebSocket, raw: string): void {
+  async handleMessage(ws: WebSocket, raw: string): Promise<void> {
     const result = validateWebSocketMessage(raw);
     if (!result.ok) {
       this.sendError(ws, result.code, result.message);
@@ -710,7 +710,7 @@ export class StreamHub extends EventEmitter {
       return;
     }
 
-    const authorized = this.authorizeSubscriptionFilter(ws, result.message.filter);
+    const authorized = await this.authorizeSubscriptionFilter(ws, result.message.filter);
     if (!authorized.ok) {
       this.sendError(ws, authorized.code, authorized.message);
       return;
@@ -746,16 +746,26 @@ export class StreamHub extends EventEmitter {
     this.removeSubscriptionFromIndexes(ws, existing);
   }
 
-  private authorizeSubscriptionFilter(
+  private async authorizeSubscriptionFilter(
     ws: WebSocket,
     filter: SubscriptionFilter
-  ): { ok: true; filter: SubscriptionFilter } | { ok: false; code: string; message: string } {
+  ): Promise<{ ok: true; filter: SubscriptionFilter } | { ok: false; code: string; message: string }> {
     const state = this.clients.get(ws);
     if (!state) {
       return { ok: false, code: 'UNAUTHORIZED', message: 'WebSocket client is not registered' };
     }
 
     if (filter.streamId !== undefined) {
+      const stream = await streamRepository.getById(filter.streamId);
+      if (!stream) {
+        return { ok: false, code: 'NOT_FOUND', message: 'Stream not found' };
+      }
+
+      const subject = state.authenticatedSubject;
+      if (!subject || (stream.sender !== subject && stream.recipient !== subject)) {
+        return { ok: false, code: 'FORBIDDEN', message: 'Not authorized for this stream' };
+      }
+
       return { ok: true, filter };
     }
 
