@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import { timingSafeEqual, randomBytes } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { errorResponse } from '../utils/response.js';
 import { ApiErrorCode } from './errorHandler.js';
 import { getApiKeyFromRequest } from '../lib/apiKey.js';
@@ -9,6 +9,14 @@ export const CSRF_COOKIE_NAME = 'fluxora_csrf';
 
 /** Header name expected on mutating browser-originated requests containing the CSRF token. */
 export const CSRF_HEADER_NAME = 'x-csrf-token';
+
+/**
+ * Fixed HMAC key used for constant-time CSRF token comparison.
+ * Matches the pattern in `src/webhooks/signature.ts` where both inputs are
+ * HMAC-hashed before comparison to eliminate timing side-channels from
+ * variable-length inputs.
+ */
+const CSRF_COMPARE_KEY = 'fluxora-csrf-compare';
 
 /**
  * Helper function to parse raw Cookie header string into a record of key-value pairs.
@@ -79,23 +87,19 @@ export function isCookieAuthenticated(req: Request): boolean {
 
 /**
  * Compares two CSRF token strings in constant time to protect against timing attacks.
- * Uses Node.js `crypto.timingSafeEqual` with byte-length pre-verification.
- * Matches the constant-time verification pattern used in `src/webhooks/signature.ts`.
+ * Both inputs are HMAC-SHA256-hashed before comparison using `crypto.timingSafeEqual`,
+ * matching the constant-time verification pattern used in `src/webhooks/signature.ts`.
+ * This eliminates timing side-channels from variable-length inputs.
  *
  * @param tokenA - First CSRF token string (e.g. from cookie)
  * @param tokenB - Second CSRF token string (e.g. from header)
- * @returns true if tokens are identical byte-for-byte in constant time, false otherwise
+ * @returns true if tokens are identical in constant time, false otherwise
  */
 export function safeCompareCsrfTokens(tokenA?: string, tokenB?: string): boolean {
   if (!tokenA || !tokenB) return false;
-  const bufA = Buffer.from(tokenA, 'utf8');
-  const bufB = Buffer.from(tokenB, 'utf8');
-
-  if (bufA.length !== bufB.length) {
-    return false;
-  }
-
-  return timingSafeEqual(bufA, bufB);
+  const hashA = createHmac('sha256', CSRF_COMPARE_KEY).update(tokenA).digest('hex');
+  const hashB = createHmac('sha256', CSRF_COMPARE_KEY).update(tokenB).digest('hex');
+  return timingSafeEqual(Buffer.from(hashA, 'utf8'), Buffer.from(hashB, 'utf8'));
 }
 
 /**
