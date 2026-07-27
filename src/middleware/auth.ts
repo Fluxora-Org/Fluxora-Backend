@@ -23,7 +23,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
   }
 
   try {
-    const record = await getApiKeyRecord(rawKey);
+    const record = await findRecordByRawKey(rawKey);
     
     if (!record) {
       warn('API key authentication failed — key not found', { requestId });
