@@ -23,7 +23,7 @@ import { WebhookService } from '../../src/webhooks/service.js';
 import { DEFAULT_RETRY_POLICY } from '../../src/webhooks/types.js';
 import { IndexerIngestionService } from '../../src/indexer/service.js';
 import { InMemoryContractEventStore } from '../../src/indexer/store.js';
-import { webhookDeliveryStore } from '../../src/webhooks/store.js';
+import { webhookDeliveryStore } from '../../src/webhooks/storeFactory.js';
 
 // Setup fresh metrics before each test in this suite
 beforeEach(() => {

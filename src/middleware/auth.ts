@@ -5,7 +5,7 @@ import { warn, info, debug } from '../utils/logger.js';
 import { z } from 'zod';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
 import { authJwtVerifyDurationSeconds } from '../metrics/businessMetrics.js';
-import { getApiKeyFromRequest, getApiKeyRecord } from '../lib/apiKey.js';
+import { getApiKeyFromRequest, findRecordByRawKey } from '../lib/apiKey.js';
 
 
 /**
@@ -15,40 +15,40 @@ import { getApiKeyFromRequest, getApiKeyRecord } from '../lib/apiKey.js';
  * If an invalid API key is present, returns 401.
  */
 export async function authenticateApiKey(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   const rawKey = getApiKeyFromRequest(req.headers);
 
   if (!rawKey) {
-    // No API key provided — proceed (may be authenticated via JWT instead)
     return next();
   }
 
   try {
-    const record = getApiKeyRecord(rawKey);
+    const record = await getApiKeyRecord(rawKey);
     
     if (!record) {
-      warn('API y authentication failed — key not found', { requestId });
-      return res.status(401).json({
+      warn('API key authentication failed — key not found', { requestId });
+      res.status(401).json({
         error: {
           code: ApiErrorCode.UNAUTHORIZED,
           message: 'Invalid API key',
           requestId,
         },
       });
+      return;
     }
 
     if (!record.active) {
       warn('API key authentication failed — key is revoked', { keyId: record.id, requestId });
-      return res.status(401).json({
+      res.status(401).json({
         error: {
           code: ApiErrorCode.UNAUTHORIZED,
           message: 'API key has been revoked',
           requestId,
         },
       });
+      return;
     }
 
-    // Attach scopes to request for scope middleware to check
     (req as any).keyScopes = record.scopes;
     (req as any).keyId = record.id;
     
@@ -59,13 +59,14 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
       error: error instanceof Error ? error.message : String(error), 
       requestId 
     });
-    return res.status(401).json({
+    res.status(401).json({
       error: {
-        code: ApiError.UNAUTHORIZED,
+        code: ApiErrorCode.UNAUTHORIZED,
         message: 'Authentication failed',
         requestId,
       },
     });
+    return;
   }
 }
 
@@ -111,21 +112,14 @@ const tokenSchema = z.object({
  * If a valid token is present, it attaches the user payload to `req.user`.
  * If an invalid token is present, it returns 401.
  * If no token is present, it proceeds without `req.user`.
- *
- * @security
- * - Verifies JWT signature first (cryptographic integrity)
- * - Checks Redis revocation list second (immediate invalidation)
- * - Validates token shape third (schema enforcement)
- * - Revoked tokens return 401 with code TOKEN_REVOKED
  */
 export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
 
   debug('Authentication middleware triggered', { hasAuthHeader: !!authHeader, requestId });
 
   if (!authHeader) {
-    // No credentials — proceed as anonymous
     return next();
   }
 
@@ -136,10 +130,6 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
   }
 
   try {
-    // 1. Verify signature and expiry (cryptographic check).
-    // Record latency around the verify call so p50/p95/p99 latency and the
-    // outcome split are observable from Prometheus. The outcome label is the
-    // ONLY label emitted; no token, jti, address, or subject is recorded.
     const endJwtVerifyTimer = authJwtVerifyDurationSeconds.startTimer();
     let jwtVerifyOutcome: 'success' | 'failure' = 'success';
     let payload: unknown;
@@ -152,7 +142,6 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
       endJwtVerifyTimer({ outcome: jwtVerifyOutcome });
     }
 
-    // 2. Check revocation list (immediate invalidation check)
     const jti = (payload as any)?.jti;
     if (jti) {
       const revoked = await isRevoked(jti);
@@ -169,7 +158,6 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
       }
     }
 
-    // 3. Validate token shape and permissions claim
     const parsed = tokenSchema.parse(payload);
     req.user = parsed as any;
     info('User authenticated via JWT', { address: parsed.address, requestId });
@@ -183,15 +171,12 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
         requestId,
       },
     });
+    return;
   }
 }
 
-/**
- * Middleware to require authentication.
- * Must be used after `authenticate` middleware.
- */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const requestId = req.id ?? req.correlationId;
+  const requestId = req.correlationId;
   if (!req.user) {
     warn('Anonymous access denied to protected route', { path: req.path, requestId });
     res.status(401).json({
@@ -206,14 +191,9 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   next();
 }
 
-/**
- * Require that the authenticated token includes a specific permission.
- * Must be used after `authenticate` and typically after `requireAuth`.
- */
 export function requirePermission(permission: Permission) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.id ?? req.correlationId;
-
+    const requestId = req.correlationId;
     if (!req.user) {
       warn('Permission check failed: no authenticated user', { path: req.path, requestId });
       res.status(401).json({
@@ -225,7 +205,6 @@ export function requirePermission(permission: Permission) {
       });
       return;
     }
-
     const permissions: string[] = (req.user as any).permissions ?? [];
     if (!Array.isArray(permissions) || !permissions.includes(permission)) {
       warn('Insufficient permissions', { required: permission, have: permissions, path: req.path, requestId });
@@ -238,43 +217,46 @@ export function requirePermission(permission: Permission) {
       });
       return;
     }
-
     next();
   };
 }
 
-/**
- * Require that the API key includes a specific scope.
- * Used for API key-based authentication (not JWT).
- * Must be used after the API key is authenticated and attached to req.
- * 
- * @param requiredScope - The scope required (e.g., 'streams:read', 'streams:write')
- * @returns Middleware function that enforces the scope
- */
 export function requireScope(...requiredScopes: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.id ?? req.correlationId;
-
-    // Check if API key scopes are attached to the request
-    const keyScopes: string[] = (req as any).keyScopes ?? [];
-
-    if (!Array.isArray(keyScopes) || keyScopes.length === 0) {
-      warn('Scope check failed: no API key scopes found', { path: req.path, requestId });
-      res.status(403).json({
+    const requestId = req.correlationId;
+    const isApiKeyAuth = (req as any).keyId !== undefined;
+    const isJwtAuth = req.user !== undefined;
+    if (!isApiKeyAuth && !isJwtAuth) {
+      warn('Scope check failed: no authenticated principal', { path: req.path, requestId });
+      res.status(401).json({
         error: {
-          code: ApiErrorCode.FORBIDDEN,
-          message: 'API key does not have required scopes',
+          code: ApiErrorCode.UNAUTHORIZED,
+          message: 'Authentication required to access this resource',
           requestId,
         },
       });
       return;
     }
-
-    // Check if the key has at least one of the required scopes
-    const hasRequiredScope = requiredScopes.some(scope => keyScopes.includes(scope));
-
+    let scopes: string[] = [];
+    if (isApiKeyAuth) {
+      scopes = (req as any).keyScopes ?? [];
+    } else if (isJwtAuth) {
+      scopes = (req.user as any).permissions ?? [];
+    }
+    if (!Array.isArray(scopes) || scopes.length === 0) {
+      warn('Scope check failed: no scopes found on principal', { path: req.path, requestId });
+      res.status(403).json({
+        error: {
+          code: ApiErrorCode.FORBIDDEN,
+          message: 'Principal does not have required scopes',
+          requestId,
+        },
+      });
+      return;
+    }
+    const hasRequiredScope = requiredScopes.some(scope => scopes.includes(scope));
     if (!hasRequiredScope) {
-      warn('Insufficient scopes', { required: requiredScopes, have: keyScopes, path: req.path, requestId });
+      warn('Insufficient scopes', { required: requiredScopes, have: scopes, path: req.path, requestId });
       res.status(403).json({
         error: {
           code: ApiErrorCode.FORBIDDEN,
@@ -284,7 +266,6 @@ export function requireScope(...requiredScopes: string[]) {
       });
       return;
     }
-
     next();
   };
 }

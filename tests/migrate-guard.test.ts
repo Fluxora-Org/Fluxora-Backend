@@ -18,6 +18,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { Pool } from 'pg';
 
 // ── fs mock ───────────────────────────────────────────────────────────────────
 vi.mock('fs', async (importOriginal) => {
@@ -102,6 +103,44 @@ describe('checkPendingMigrations', () => {
       process.env.DATABASE_URL = ORIGINAL_ENV
     }
   })
+
+describe('Database Migrations: 001_add_contract_events_replay_indexes', () => {
+  let pool: Pool;
+
+  beforeAll(() => {
+    // Ensure this runs against your test database
+    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  });
+
+  afterAll(async () => {
+    await pool.end();
+  });
+
+  it('should successfully create valid concurrent indexes', async () => {
+    // Query Postgres system catalogs to verify index existence and validity
+    const query = `
+      SELECT i.relname AS index_name, ix.indisvalid
+      FROM pg_class t
+      JOIN pg_index ix ON t.oid = ix.indrelid
+      JOIN pg_class i ON i.oid = ix.indexrelid
+      WHERE t.relname = 'contract_events'
+        AND i.relname IN (
+          'idx_contract_events_contract_ledger', 
+          'idx_contract_events_replay_null_ingested'
+        );
+    `;
+    
+    const { rows } = await pool.query(query);
+    
+    // Assert both indexes were found
+    expect(rows).toHaveLength(2);
+    
+    // Assert that neither index was left in an INVALID state by a failed concurrent build
+    for (const row of rows) {
+      expect(row.indisvalid).toBe(true); 
+    }
+  });
+})
 
   // ── Missing env var ─────────────────────────────────────────────────────────
 

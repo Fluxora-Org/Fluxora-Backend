@@ -66,6 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`streamRepository.getById` decryption** — `getById` was the only read path
+  that used a plain `SELECT *` instead of `streamSelectColumns(...)`.  When
+  pgcrypto encryption is active this caused `sender_address` and
+  `recipient_address` to be returned as raw ciphertext (BYTEA) rather than
+  decrypted Stellar addresses, diverging from every other read method
+  (`getByEvent`, `findWithCursor`, `find`).  The fix replaces `SELECT *` with
+  `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)}` and threads the
+  resolved pgcrypto keyset through as bound parameters, matching the contract
+  every other read honours.  Tracing via `enrichActiveSpanWithStream` now also
+  receives the correctly decrypted addresses.
+
 ### Planned Features
 - [ ] Persistent replay state (Redis/database) for multi-instance deployments
 - [ ] Pause/resume replay operations

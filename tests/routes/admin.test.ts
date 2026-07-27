@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../../src/app.js';
 import { _resetForTest } from '../../src/state/adminState.js';
+import { generateToken } from '../../src/lib/auth.js';
+import { initializeConfig } from '../../src/config/env.js';
 
 const ADMIN_KEY = 'test-admin-key-for-routes';
 
@@ -11,6 +13,10 @@ function authed(req: request.Test): request.Test {
 
 describe('admin routes', () => {
   let originalKey: string | undefined;
+
+  beforeAll(() => {
+    initializeConfig();
+  });
 
   beforeEach(() => {
     originalKey = process.env.ADMIN_API_KEY;
@@ -31,12 +37,11 @@ describe('admin routes', () => {
   it('rejects unauthenticated requests to admin routes', async () => {
     const res = await request(app).get('/api/admin/status');
     expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'Missing Authorization header.' });
   });
 
   it('rejects requests with bad credentials', async () => {
-    const res = await request(app)
-      .get('/api/admin/status')
-      .set('Authorization', 'Bearer wrong');
+    const res = await request(app).get('/api/admin/status').set('Authorization', 'Bearer wrong');
     expect(res.status).toBe(403);
   });
 
@@ -51,6 +56,88 @@ describe('admin routes', () => {
       ingestion: false,
     });
     expect(res.body.meta).toHaveProperty('timestamp');
+  });
+
+  it('keeps read-only status public when admin auth is unconfigured or invalid', async () => {
+    delete process.env.ADMIN_API_KEY;
+
+    const unconfigured = await request(app).get('/api/admin/status/read-only');
+    const malformed = await request(app)
+      .get('/api/admin/status/read-only')
+      .set('Authorization', 'Basic ignored-on-public-route');
+
+    expect(unconfigured.status).toBe(200);
+    expect(malformed.status).toBe(200);
+  });
+
+  it('fails protected routes closed with 503 when admin auth is unconfigured', async () => {
+    delete process.env.ADMIN_API_KEY;
+
+    const res = await request(app).get('/api/admin/status');
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({
+      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
+    });
+  });
+
+  it('protects other methods on the public read-only path', async () => {
+    const res = await request(app).post('/api/admin/status/read-only');
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'Missing Authorization header.' });
+  });
+
+  it('runs the guard before returning 404 for unknown admin paths', async () => {
+    const unauthenticated = await request(app).get('/api/admin/not-a-route');
+    const authenticated = await authed(request(app).get('/api/admin/not-a-route'));
+
+    expect(unauthenticated.status).toBe(401);
+    expect(authenticated.status).toBe(404);
+    expect(authenticated.body).toMatchObject({
+      success: false,
+      error: { code: 'NOT_FOUND' },
+    });
+  });
+
+  it.each(['admin', 'data-protection-officer'])(
+    'allows a valid JWT with the %s role through the route guard',
+    async (role) => {
+      const token = generateToken({ address: 'GADMIN', role, permissions: [] });
+      const res = await request(app)
+        .get('/api/admin/status')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+    }
+  );
+
+  it('rejects a valid non-admin JWT even when it carries an admin-named permission', async () => {
+    const token = generateToken({
+      address: 'GOPERATOR',
+      role: 'operator',
+      permissions: ['admin:pause'],
+    });
+    const res = await request(app).get('/api/admin/status').set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'Invalid admin credentials.' });
+  });
+
+  it('does not lock out a later retry with valid credentials', async () => {
+    await request(app).get('/api/admin/status').set('Authorization', 'Bearer wrong').expect(403);
+
+    const retry = await authed(request(app).get('/api/admin/status'));
+
+    expect(retry.status).toBe(200);
+  });
+
+  it('runs authorization before handler validation and mutation', async () => {
+    const rejected = await request(app).put('/api/admin/pause').send({ streamCreation: true });
+    const state = await authed(request(app).get('/api/admin/pause'));
+
+    expect(rejected.status).toBe(401);
+    expect(state.body.data).toEqual({ streamCreation: false, ingestion: false });
   });
 
   // ── GET /api/admin/status ──────────────────────────────────
@@ -89,9 +176,7 @@ describe('admin routes', () => {
 
   describe('PUT /api/admin/pause', () => {
     it('updates streamCreation flag in envelope', async () => {
-      const res = await authed(
-        request(app).put('/api/admin/pause').send({ streamCreation: true }),
-      );
+      const res = await authed(request(app).put('/api/admin/pause').send({ streamCreation: true }));
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('success', true);
       expect(res.body).toHaveProperty('data');
@@ -102,9 +187,7 @@ describe('admin routes', () => {
     });
 
     it('updates ingestion flag in envelope', async () => {
-      const res = await authed(
-        request(app).put('/api/admin/pause').send({ ingestion: true }),
-      );
+      const res = await authed(request(app).put('/api/admin/pause').send({ ingestion: true }));
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('success', true);
       expect(res.body.data.pauseFlags.ingestion).toBe(true);
@@ -112,9 +195,7 @@ describe('admin routes', () => {
 
     it('updates both flags at once in envelope', async () => {
       const res = await authed(
-        request(app)
-          .put('/api/admin/pause')
-          .send({ streamCreation: true, ingestion: true }),
+        request(app).put('/api/admin/pause').send({ streamCreation: true, ingestion: true })
       );
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('success', true);
@@ -123,9 +204,7 @@ describe('admin routes', () => {
     });
 
     it('returns 400 error envelope when body is empty', async () => {
-      const res = await authed(
-        request(app).put('/api/admin/pause').send({}),
-      );
+      const res = await authed(request(app).put('/api/admin/pause').send({}));
       expect(res.status).toBe(400);
       expect(res.body).toHaveProperty('success', false);
       expect(res.body).toHaveProperty('error');
@@ -136,7 +215,7 @@ describe('admin routes', () => {
 
     it('returns 400 error envelope when streamCreation is not boolean', async () => {
       const res = await authed(
-        request(app).put('/api/admin/pause').send({ streamCreation: 'yes' }),
+        request(app).put('/api/admin/pause').send({ streamCreation: 'yes' })
       );
       expect(res.status).toBe(400);
       expect(res.body).toHaveProperty('success', false);
@@ -144,9 +223,7 @@ describe('admin routes', () => {
     });
 
     it('returns 400 error envelope when ingestion is not boolean', async () => {
-      const res = await authed(
-        request(app).put('/api/admin/pause').send({ ingestion: 42 }),
-      );
+      const res = await authed(request(app).put('/api/admin/pause').send({ ingestion: 42 }));
       expect(res.status).toBe(400);
       expect(res.body).toHaveProperty('success', false);
       expect(res.body.error.message).toMatch(/boolean/i);

@@ -66,4 +66,52 @@ export const PaginationSchema = z.object({
   include_total: z.enum(['true', 'false']).optional(),
 });
 
+/**
+ * Zod schema for offset-based pagination query parameters used by
+ * webhook management and other list endpoints.
+ *
+ * Both `limit` and `offset` are coerced from strings (query params) to
+ * integers and validated as non-negative integers within sane bounds.
+ * `limit` is capped at {@link MAX_PAGE_LIMIT} to prevent unbounded
+ * in-memory slice / serialize operations.
+ *
+ * Each field is optional to allow route-specific defaults.
+ *
+ * @module validation/paginationSchema
+ */
+export const OffsetPaginationSchema = z.object({
+  /**
+   * Maximum number of results to return. Capped at MAX_PAGE_LIMIT (100).
+   * The string is coerced to an integer because query params arrive as strings.
+   */
+  limit: z
+    .string()
+    .regex(/^\d+$/, 'limit must be a positive integer')
+    .transform((v) => Number.parseInt(v, 10))
+    .pipe(
+      z
+        .number()
+        .int('limit must be an integer')
+        .min(MIN_PAGE_LIMIT, `limit must be at least ${MIN_PAGE_LIMIT}`)
+        .max(MAX_PAGE_LIMIT, `limit must be at most ${MAX_PAGE_LIMIT}`),
+    )
+    .optional(),
+
+  /**
+   * Number of results to skip. Must be non-negative.
+   * The string is coerced to an integer because query params arrive as strings.
+   */
+  offset: z
+    .string()
+    .regex(/^\d+$/, 'offset must be a non-negative integer')
+    .transform((v) => Number.parseInt(v, 10))
+    .pipe(
+      z
+        .number()
+        .int('offset must be an integer')
+        .min(0, 'offset must be non-negative'),
+    )
+    .optional(),
+});
+
 export type PaginationQuery = z.infer<typeof PaginationSchema>;

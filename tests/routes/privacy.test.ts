@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../../src/app.js';
 import {
@@ -140,6 +140,52 @@ describe('GET /api/privacy/policy', () => {
     }
   });
 
+  it('trustBoundaries array length matches TRUST_BOUNDARIES from policy module', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    expect(res.body.piiPolicy.trustBoundaries).toHaveLength(TRUST_BOUNDARIES.length);
+  });
+
+  it('trustBoundaries array content matches TRUST_BOUNDARIES from policy module exactly', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    expect(res.body.piiPolicy.trustBoundaries).toEqual(TRUST_BOUNDARIES);
+  });
+
+  it('each trust boundary has actor, description, allowed, and denied fields', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    for (const boundary of res.body.piiPolicy.trustBoundaries) {
+      expect(typeof boundary.actor).toBe('string');
+      expect(boundary.actor.length).toBeGreaterThan(0);
+      expect(typeof boundary.description).toBe('string');
+      expect(boundary.description.length).toBeGreaterThan(0);
+      expect(Array.isArray(boundary.allowed)).toBe(true);
+      expect(Array.isArray(boundary.denied)).toBe(true);
+    }
+  });
+
+  it('trustBoundaries allowed and denied entries are all strings', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    for (const boundary of res.body.piiPolicy.trustBoundaries) {
+      for (const entry of boundary.allowed) {
+        expect(typeof entry).toBe('string');
+      }
+      for (const entry of boundary.denied) {
+        expect(typeof entry).toBe('string');
+      }
+    }
+  });
+
+  it('trustBoundaries denied entries do not reference internal hostnames or IPs', async () => {
+    const res = await request(app).get('/api/privacy/policy');
+    const internalPatterns = [/localhost/, /127\.0\.0\.1/, /internal\./, /\.local\b/];
+    for (const boundary of res.body.piiPolicy.trustBoundaries) {
+      for (const entry of boundary.denied) {
+        for (const pattern of internalPatterns) {
+          expect(entry).not.toMatch(pattern);
+        }
+      }
+    }
+  });
+
   it('includes HATEOAS _links with self, retention, health, and streams', async () => {
     const res = await request(app).get('/api/privacy/policy');
     expect(res.body._links.self).toBe('/api/privacy/policy');
@@ -224,6 +270,86 @@ describe('GET /api/privacy/retention', () => {
     expect(res.status).toBe(405);
     expect(res.headers['allow']).toBe('GET, HEAD');
     expect(res.body.error.code).toBe('METHOD_NOT_ALLOWED');
+  });
+});
+
+// ── Method-restriction scoping for /erasure ─────────────────────
+//
+// The right-to-erasure route is the only privacy endpoint allowed to accept a
+// non-GET/HEAD method. That exemption must be keyed on the exact route+method
+// pair (DELETE /erasure/:recipientAddress) — never on the /erasure/* path
+// prefix alone — so a future route added under the prefix cannot silently
+// inherit an exemption from the method restriction.
+
+describe('method-restriction scoping for /api/privacy/erasure', () => {
+  const ADMIN_KEY = 'test-admin-key-method-scope';
+  let previousAdminKey: string | undefined;
+
+  beforeAll(() => {
+    previousAdminKey = process.env.ADMIN_API_KEY;
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+  });
+
+  afterAll(() => {
+    if (previousAdminKey === undefined) {
+      delete process.env.ADMIN_API_KEY;
+    } else {
+      process.env.ADMIN_API_KEY = previousAdminKey;
+    }
+  });
+
+  it('DELETE /erasure/:recipientAddress bypasses the method restriction and reaches the auth guard', async () => {
+    const res = await request(app).delete('/api/privacy/erasure/GDTESTADDRESS');
+    // 401 (missing Authorization) proves the request reached requireAdminAuth
+    // on the erasure route instead of being rejected as an unsupported method.
+    expect(res.status).toBe(401);
+  });
+
+  it.each(['post', 'put', 'patch'] as const)(
+    '%s /erasure/:recipientAddress is NOT exempted and returns 405 with Allow: DELETE',
+    async (method) => {
+      const res = await (request(app) as any)[method]('/api/privacy/erasure/foo');
+      expect(res.status).toBe(405);
+      expect(res.headers['allow']).toBe('DELETE');
+      expect(res.body.error.code).toBe('METHOD_NOT_ALLOWED');
+    },
+  );
+
+  it('GET /erasure/foo is still evaluated by the method restriction (405, not silently exempted)', async () => {
+    const res = await request(app).get('/api/privacy/erasure/foo');
+    expect(res.status).toBe(405);
+    expect(res.headers['allow']).toBe('DELETE');
+    expect(res.body.error.code).toBe('METHOD_NOT_ALLOWED');
+  });
+
+  it('non-DELETE methods on /erasure/:recipientAddress never reach the admin auth guard', async () => {
+    // Even with valid admin credentials, a POST to the erasure path must be
+    // rejected on method alone — the exemption is method-scoped, not path-scoped.
+    const res = await request(app)
+      .post('/api/privacy/erasure/GDTESTADDRESS')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
+    expect(res.status).toBe(405);
+    expect(res.headers['allow']).toBe('DELETE');
+  });
+
+  it('POST /erasure (bare prefix, no address) is not exempted — falls through to 404', async () => {
+    const res = await request(app).post('/api/privacy/erasure');
+    expect(res.status).toBe(404);
+  });
+
+  it('POST /erasure/a/b (deeper path under the prefix) is not exempted — falls through to 404', async () => {
+    const res = await request(app).post('/api/privacy/erasure/a/b');
+    expect(res.status).toBe(404);
+  });
+
+  it('DELETE on other privacy routes is still rejected with 405 (exemption does not leak by method)', async () => {
+    const policyRes = await request(app).delete('/api/privacy/policy');
+    expect(policyRes.status).toBe(405);
+    expect(policyRes.headers['allow']).toBe('GET, HEAD');
+
+    const retentionRes = await request(app).delete('/api/privacy/retention');
+    expect(retentionRes.status).toBe(405);
+    expect(retentionRes.headers['allow']).toBe('GET, HEAD');
   });
 });
 

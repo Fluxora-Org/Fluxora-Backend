@@ -154,6 +154,29 @@ export const StreamBatchCreateSchema = z.object({
 export type StreamBatchCreateInput = z.infer<typeof StreamBatchCreateSchema>;
 
 /**
+ * Schema for PUT /api/privacy/consent body.
+ *
+ * @remarks
+ * The address is validated at the API boundary, but route handlers must not
+ * persist or log the plaintext value. Consent rows are keyed by the same
+ * keyed HMAC address hash used for encrypted PII lookup.
+ */
+export const PrivacyConsentSchema = z.strictObject({
+  /** Stellar recipient public key used only to derive the stored address hash. */
+  address: stellarPublicKeyField('address'),
+  /** CCPA-style opt-out for analytics processing. */
+  analytics_optout: z.boolean({ error: 'analytics_optout must be a boolean' }),
+  /** CCPA-style opt-out for marketing communications or profiling. */
+  marketing_optout: z.boolean({ error: 'marketing_optout must be a boolean' }),
+  /** BIPA-style affirmative consent for biometric processing. */
+  biometric_processing_consent: z.boolean({
+    error: 'biometric_processing_consent must be a boolean',
+  }),
+});
+
+export type PrivacyConsentInput = z.infer<typeof PrivacyConsentSchema>;
+
+/**
  * Schema for GET /api/streams query parameters.
  */
 export const ListStreamsQuerySchema = z.object({
@@ -166,6 +189,43 @@ export const ListStreamsQuerySchema = z.object({
     error: 'include_total must be true or false',
   }).optional(),
 });
+
+/**
+ * Schema for POST /internal/indexer/events/replay body.
+ *
+ * Validates the parameters required to trigger a historical contract-event
+ * replay. These endpoints trigger expensive DB backfills — the schema
+ * enforces sane ranges to prevent absurd workloads from reaching the service.
+ *
+ * Rules:
+ * - contract_id: non-empty string
+ * - ledger: non-negative integer
+ * - from_block / to_block: optional non-negative integers where from <= to
+ */
+export const ReplayRequestSchema = z
+  .object({
+    contract_id: z
+      .string({ error: 'contract_id must be a string' })
+      .min(1, 'contract_id must be a non-empty string'),
+    ledger: nonNegativeIntegerField('ledger'),
+    from_block: nonNegativeIntegerField('from_block').optional(),
+    to_block: nonNegativeIntegerField('to_block').optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (
+      data.from_block !== undefined &&
+      data.to_block !== undefined &&
+      data.from_block > data.to_block
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['from_block'],
+        message: 'from_block must be less than or equal to to_block',
+      });
+    }
+  });
+
+export type ReplayRequestInput = z.infer<typeof ReplayRequestSchema>;
 
 /**
  * Schema for DLQ list query parameters.

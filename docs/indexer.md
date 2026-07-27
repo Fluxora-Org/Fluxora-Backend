@@ -275,6 +275,25 @@ Only one replay can run at a time to prevent:
 - Memory pressure from multiple large operations
 - Conflicting progress tracking
 
+This is enforced at two layers:
+1. **In-process** (`ReplayLock` in `src/indexer/service.ts`): rejects a second concurrent call within the same process instantly, no Redis round-trip required.
+2. **Cross-process** (`IndexerLeaderElection` in `src/indexer/leaderElection.ts`): a Redis-backed lease that ensures only one *replica* runs replay at a time in a multi-instance deployment. See "Multi-Replica Leader Election" below.
+
+### Multi-Replica Leader Election
+
+In a multi-replica deployment, every instance shares the same `replay_cursors` table but previously had no way to coordinate *which instance* should actually run a replay — the in-process `ReplayLock` only prevented two concurrent calls on the *same* process. `IndexerLeaderElection` (`src/indexer/leaderElection.ts`) closes that gap with a Redis-backed lease:
+
+- **Acquisition**: `SET NX PX` on a single fixed key (`indexer:leader-election:replay`) — whichever instance sets it first becomes leader for the lease duration (default 15s).
+- **Renewal**: the leader renews the lease on a heartbeat (default every `leaseMs / 3`) via `PEXPIRE`, but only after confirming via `GET` that it still holds the key. If another instance's value is found (meaning our lease already lapsed), or the `PEXPIRE` itself fails, we drop leadership immediately.
+- **Abort on lease loss**: `replayEvents()` checks `isLeader()` at every batch boundary (the same place it already checks the shutdown `_stopRequested` flag). If leadership is lost mid-replay — most likely because Redis was unreachable for a full lease period — the loop stops cleanly after the in-flight batch's transaction has committed. No connection is left open and no batch is left half-committed.
+- **Startup auto-resume**: `resumeIncompleteReplay()` (called once per process on startup) only proceeds if this instance is the leader, so replicas don't all race to resume the same incomplete cursor.
+- **Fail-safe default**: when Redis is disabled (`REDIS_ENABLED=false`) or unreachable, `NoOpLeaderElection` is used instead — every instance is always "leader", which is exactly today's single-process behaviour. Multi-replica coordination only activates once Redis is configured.
+- **Graceful shutdown**: the lease is released via a `shutdown.ts` hook (`src/app.ts`), after the replay-stop signal is sent but before Redis connections are closed, so another replica can take over promptly instead of waiting out the full lease TTL.
+
+**Operational note — Redis outage**: if Redis becomes unreachable, no instance can acquire or renew the lease, so replay simply does not run anywhere until Redis recovers. This is intentional (fail-safe, not fail-open) — no data is lost, since durable progress lives entirely in `replay_cursors.last_committed_offset`, independent of the lease.
+
+**Security note — non-atomic renew/release**: like the existing `RedisDistributedLock` (`src/state/adminStateLock.ts`), lease renewal and release are check-then-act sequences (`GET` then `PEXPIRE`/`DEL`), not Lua-atomic compare-and-swap. This is an accepted, pre-existing class of risk in this codebase, not a new one introduced here. The worst case is a brief window — bounded by `renewIntervalMs` — where two instances both believe they are leader. Because every batch INSERT already uses `ON CONFLICT (event_id) DO NOTHING` (see "Idempotency" above), a second instance briefly replaying the same range produces no duplicate rows, so this window cannot corrupt data — only cause temporarily duplicated (but harmless) work.
+
 ### Transaction Safety
 
 All replay operations run in transactions:
@@ -315,12 +334,42 @@ The test suite covers:
 - ✅ Empty replay sets
 - ✅ Batch processing with various sizes
 - ✅ Batch boundary alignment
-- ✅ Duplicate event handling
+- ✅ Duplicate event handling and `HybridDedupCache` downtime fallback
+- ✅ Property-based test suite verifying duplicate suppression invariants during Redis downtime
 - ✅ Concurrent replay prevention
 - ✅ Transaction rollback on errors
 - ✅ Progress tracking and estimation
 - ✅ Block range filtering
 - ✅ SQL injection prevention
+
+## Duplicate Event Suppression & Resiliency
+
+`streamEventService` ingests Soroban RPC streaming events and enforces strict duplicate suppression using an injectable `DedupCache` interface (`InMemoryDedupCache`, `RedisDedupCache`, or `HybridDedupCache`).
+
+### Hybrid Cache & Redis Downtime Fallback
+
+When configured with `HybridDedupCache`:
+1. **Primary Cache**: Interacts with Redis (`RedisDedupCache`) to track event keys (`fluxora:dedup:<streamId>:<eventId>`) across server restarts.
+2. **Fallback Cache**: Local in-memory cache (`InMemoryDedupCache`) tracking event arrivals.
+3. **Outage State Transitions (`available` → `unavailable` → `recovered`)**:
+   - **Normal Operation (`available`)**: Events are checked/added in Redis. On new additions, `HybridDedupCache` syncs to the local in-memory fallback cache.
+   - **Redis Outage (`unavailable`)**: If Redis throws connection errors mid-sequence, `HybridDedupCache` catches the error, logs a throttled fallback warning (`dedup:fallback`), increments Prometheus metric `dedup_redis_fallback_total`, and seamlessly uses the in-memory cache. Replay continues without throwing errors or dropping events.
+   - **Redis Recovery (`recovered`)**: When Redis becomes reachable again, `HybridDedupCache` checks the fallback cache first. Any event processed during the outage remains suppressed, preventing duplicate database writes upon Redis reconnection. New events sync to both primary and fallback caches.
+
+### Core Invariants
+
+The deduplication layer guarantees the following invariant regardless of event arrival order, duplicate burst frequency, or intermittent Redis downtime timing:
+
+> **"Each distinct `(transactionHash, eventIndex)` pair triggers at most one database write operation (upsert/update) and at most one WebSocket broadcast."**
+
+### Property-Based Testing
+
+Deduplication behavior and outage recovery are verified using property-based testing powered by `fast-check` in [streamEventService.dedup.test.ts](file:///c:/Users/ICT%20LASIEC/Fluxora-Backend/tests/services/streamEventService.dedup.test.ts):
+
+- **Randomized Replay Sequences**: Generates sequences of `StreamCreated`, `StreamUpdated`, and `StreamCancelled` events with randomized `transactionHash` and `eventIndex`.
+- **Dynamic Outage Simulation**: Mocks `HybridDedupCache` under fluctuating Redis states (`available`, `unavailable`, `recovered`) and interleaved duplicate bursts.
+- **Deterministic CI Configuration**: Configured with a fixed seed (`seed: 42`) and bounded runs (`numRuns: 100`) to ensure 100% reproducible test outcomes in CI without flaky behavior.
+- **Explicit Edge Case Coverage**: Includes unit tests for empty replays, single events, all duplicates, all unique events, duplicate bursts, alternating duplicates, pre-start outages, mid-sequence outages, full outages, and post-outage recoveries.
 
 ## Deployment
 
@@ -410,9 +459,134 @@ WHERE contract_id = 'contract-abc-123' AND ledger = 1;
 
 ## Future Enhancements
 
-- [ ] Persistent replay state (Redis/database) for multi-instance deployments
+- [x] Persistent replay state (Redis/database) for multi-instance deployments — see "Multi-Replica Leader Election" above
 - [ ] Pause/resume replay operations
 - [ ] Replay queue for multiple contracts
 - [ ] Webhook notifications on replay completion
 - [ ] Metrics export (Prometheus format)
 - [ ] Automatic retry on transient failures
+
+
+---
+
+## gRPC Transcoding Gateway
+
+The optional gRPC gateway (`src/indexer/grpcGateway.ts`) exposes the same
+replay and ingest operations as the HTTP routes, but over a binary gRPC
+transport.  It is designed for **in-cluster service-to-service** calls where
+lower overhead and strong typing are preferred.
+
+### Enabling the gateway
+
+The gateway is **off by default** so existing HTTP-only deployments are
+unaffected.  Set the following environment variables to enable it:
+
+| Variable | Default | Description |
+|---|---|---|
+| `GRPC_GATEWAY_ENABLED` | `false` | Set to `true` to start the gateway |
+| `GRPC_GATEWAY_PORT` | `50052` | Port the gRPC server binds to |
+
+```bash
+GRPC_GATEWAY_ENABLED=true
+GRPC_GATEWAY_PORT=50052
+```
+
+> **Note:** The gateway must **not** be exposed outside the cluster.
+> It binds to `0.0.0.0` and relies on network-level isolation (Kubernetes
+> NetworkPolicies, VPC security groups, etc.) for perimeter security.
+
+### Authentication
+
+Every RPC must include a `worker_token` metadata header containing the same
+secret as `INDEXER_WORKER_TOKEN`.  Tokens are compared with a **constant-time
+equality check** to prevent timing-oracle attacks.
+
+```bash
+# grpcurl example
+grpcurl \
+  -plaintext \
+  -H 'worker_token: <INDEXER_WORKER_TOKEN>' \
+  -d '{}' \
+  localhost:50052 \
+  fluxora.indexer.v1.IndexerService/GetReplayStatus
+```
+
+### Service definition (proto)
+
+The proto schema is kept inline in `src/indexer/grpcGateway.ts` (same pattern
+as `src/health/grpcHealth.ts`) so the production Docker image does not need to
+ship `.proto` files.
+
+```protobuf
+syntax = "proto3";
+package fluxora.indexer.v1;
+
+service IndexerService {
+  // Ingest a batch of contract events from the chain worker.
+  rpc IngestContractEvents(IngestContractEventsRequest)
+      returns (IngestContractEventsResponse);
+
+  // Replay stored events with optional filtering.
+  rpc GetEvents(GetEventsRequest) returns (GetEventsResponse);
+
+  // Trigger a historical DB backfill for a given contract/ledger range.
+  rpc ReplayEvents(ReplayEventsRequest) returns (ReplayEventsResponse);
+
+  // Return current replay progress.
+  rpc GetReplayStatus(GetReplayStatusRequest) returns (GetReplayStatusResponse);
+}
+```
+
+### RPC reference
+
+#### `IngestContractEvents`
+
+Ingests a batch of on-chain contract events.  Delegates to
+`indexerIngestionService.ingest()` — the same handler as
+`POST /internal/indexer/contract-events`.
+
+**Metadata:** `worker_token` required.
+
+#### `GetEvents`
+
+Paginated read of stored events.  Supports both cursor-based pagination
+(`after_event_id`) and offset-based pagination (`limit` / `offset`).
+Delegates to `indexerIngestionService.getEvents()`.
+
+**Metadata:** `worker_token` required.
+
+#### `ReplayEvents`
+
+Triggers a historical DB backfill.  The RPC returns immediately with the
+current progress snapshot; the actual replay runs asynchronously in the
+background, mirroring the fire-and-forget behaviour of
+`POST /internal/indexer/events/replay`.
+
+**Metadata:** `worker_token` required.
+
+#### `GetReplayStatus`
+
+Returns the extended replay progress (reads from the `replay_cursors` DB table
+when available, falls back to in-memory state).  Delegates to
+`indexerService.getReplayProgressExtended()`.
+
+**Metadata:** `worker_token` required.
+
+### Security considerations
+
+- The gateway **re-uses all existing validation and business logic** — no
+  duplicated code paths.
+- Input validation for `ReplayEvents` uses the same `ReplayRequestSchema` Zod
+  schema as the HTTP route; invalid input is rejected with
+  `INVALID_ARGUMENT`.
+- Token comparison is constant-time (`XOR` over char codes) to prevent
+  timing attacks.
+- The server binds with `ServerCredentials.createInsecure()`.  In-cluster
+  mTLS should be enforced at the service mesh layer (Istio / Linkerd) rather
+  than at the application level.
+
+### Shutdown
+
+The gateway participates in graceful shutdown via `stopGrpcGatewayServer()`,
+which mirrors the force-close fallback in `src/health/grpcHealth.ts`:
+in-flight calls have up to 5 s to drain before a forced shutdown.

@@ -57,7 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_streams_sender_id                ON streams (send
 CREATE INDEX IF NOT EXISTS idx_streams_contract_id              ON streams (contract_id, id);
 
 -- Offset pagination (find): status filter + ORDER BY created_at DESC
-CREATE INDEX IF NOT EXISTS idx_streams_status_created_at_desc   ON streams (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_streams_status_created_at_desc   ON streams (status, created_at DESC, id DESC);
 
 -- Standalone indexes for patterns not covered by composites above
 CREATE INDEX IF NOT EXISTS idx_streams_recipient   ON streams (recipient_address);

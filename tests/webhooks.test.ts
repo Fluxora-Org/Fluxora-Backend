@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WebhookService } from '../src/webhooks/service.js';
-import { webhookDeliveryStore } from '../src/webhooks/store.js';
+import { webhookDeliveryStore } from '../src/webhooks/storeFactory.js';
 import { webhookDispatcher } from '../src/webhooks/dispatcher.js';
 import { logger } from '../src/lib/logger.js';
 import { 

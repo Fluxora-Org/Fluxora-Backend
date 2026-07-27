@@ -141,6 +141,14 @@ Response:
 }
 ```
 
+### Scripted Database Operations & Partition Management
+
+Scripted database backup, restore, and partition retention operations are managed via `src/scripts/db-ops.ts`.
+- `backupDatabase` / `restoreDatabase`: Support local custom-format dumps as well as zero-disk S3 streaming.
+- `dropOldPartitions`: Detaches and drops range partitions older than a specified threshold. Runs in `dryRun = true` mode by default.
+
+For complete details on operator ergonomics, security controls, credential protection, and region resolution, see [docs/database.md](docs/database.md#scripted-database-operations--operator-ergonomics).
+
 ## 🧪 Testing
 
 ```bash
@@ -177,6 +185,10 @@ The test suite includes:
 | `DATABASE_URL` | - | PostgreSQL connection string (required) |
 | `REPLAY_BATCH_SIZE` | 1000 | Number of events per batch insert |
 | `PORT` | 3000 | HTTP server port |
+| `API_KEYS` | - | Comma-separated list of valid API keys |
+| `API_KEY_PEPPER` | - | Server-side pepper for API key hashing (**Required if API_KEYS is configured**) |
+| `WEBHOOK_DNS_TIMEOUT_MS` | 2000 | Webhook DNS lookup resolution timeout in milliseconds (fail-closed) |
+
 
 ### Batch Size Tuning
 

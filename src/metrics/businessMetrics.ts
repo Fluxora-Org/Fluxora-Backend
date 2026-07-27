@@ -118,11 +118,37 @@ export const sseConnectionsRejectedTotal =
     registers: [registry],
   });
 
+export const longPollActiveConnectionsGauge =
+  (registry.getSingleMetric('fluxora_longpoll_active_connections') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_longpoll_active_connections',
+    help: 'Current number of active long-polling fallback stream connections',
+    registers: [registry],
+  });
+
+export const longPollConnectionsRejectedTotal =
+  (registry.getSingleMetric('fluxora_longpoll_connections_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_longpoll_connections_rejected_total',
+    help: 'Total number of rejected long-polling connection attempts',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+export const webhookDeliveriesSuppressedTotal =
+  (registry.getSingleMetric('fluxora_webhook_deliveries_suppressed_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_deliveries_suppressed_total',
+    help: 'Number of webhook deliveries suppressed due to reorg',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
 export const webhookDeliveriesTotal =
   (registry.getSingleMetric('fluxora_webhook_deliveries_total') as Counter<'outcome'>) ||
   new Counter({
     name: 'fluxora_webhook_deliveries_total',
-    help: 'Total number of webhook deliveries',
+    help: 'Total number of webhook delivery attempts, labeled by outcome',
     labelNames: ['outcome'] as const,
     registers: [registry],
   });
@@ -196,6 +222,40 @@ export const sseEventListenersGauge =
   });
 
 /**
+ * Counter for exceptions thrown by live SSE subscriber callbacks.
+ *
+ * @security
+ * - No SSE payloads, user data, or correlation IDs are included in the labels.
+ * - Label set is bounded via `reason` enum to avoid cardinality blowup.
+ */
+export const sseSubscriberErrorsTotal =
+  (registry.getSingleMetric('fluxora_sse_subscriber_errors_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_sse_subscriber_errors_total',
+    help: 'Total number of errors thrown by live SSE subscriber callbacks',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for SSE connections dropped due to backpressure (buffer overflow).
+ *
+ * Fires when a slow consumer's per-connection buffer exceeds
+ * `SSE_MAX_BUFFERED_EVENTS` and the connection is severed to prevent
+ * unbounded memory growth (DoS vector).
+ *
+ * @security No payloads, IPs, or PII. Bounded cardinality (single series).
+ */
+export const sseBackpressureDropsTotal =
+  (registry.getSingleMetric('fluxora_sse_backpressure_drops_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_sse_backpressure_drops_total',
+    help: 'Total number of SSE connections dropped due to per-connection buffer overflow (slow consumer backpressure)',
+    registers: [registry],
+  });
+
+
+/**
  * Webhook outbox backlog gauge.
  *
  * Tracks the number of webhook deliveries pending in the outbox (waiting to be sent or retried).
@@ -253,6 +313,32 @@ export function syncWebhookMetrics(store: {
    webhookOutboxPendingItemsGauge.set(Math.max(0, metrics.outboxItems));
  }
 
+/**
+ * Counter for failed WebSocket token authentication attempts, labeled by failure reason.
+ *
+ * @security
+ * - Labels are a fixed enum (`MISSING_TOKEN` | `INVALID_TOKEN` | `AUTH_NOT_CONFIGURED`)
+ *   to prevent cardinality blowup. No token material is ever included.
+ */
+export const wsAuthFailureTotal =
+  (registry.getSingleMetric('fluxora_ws_auth_failure_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_ws_auth_failure_total',
+    help: 'Total failed WebSocket token authentication attempts, labeled by failure reason',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+export const adminReindexJobDurationSeconds =
+  (registry.getSingleMetric('fluxora_admin_reindex_job_duration_seconds') as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_admin_reindex_job_duration_seconds',
+    help: 'Duration of adminState.triggerReindex job in seconds, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60],
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
@@ -262,10 +348,17 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_connections_rejected_total');
   registry.removeSingleMetric('fluxora_webhook_deliveries_total');
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
+  registry.removeSingleMetric('fluxora_webhook_deliveries_suppressed_total');
   registry.removeSingleMetric('fluxora_webhook_dlq_items');
   registry.removeSingleMetric('fluxora_webhook_outbox_pending_items');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
   registry.removeSingleMetric('fluxora_sse_live_subscribers');
   registry.removeSingleMetric('fluxora_sse_event_listeners');
+  registry.removeSingleMetric('fluxora_sse_subscriber_errors_total');
+  registry.removeSingleMetric('fluxora_ws_auth_failure_total');
+  registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
+  registry.removeSingleMetric('fluxora_longpoll_active_connections');
+  registry.removeSingleMetric('fluxora_longpoll_connections_rejected_total');
 }
+

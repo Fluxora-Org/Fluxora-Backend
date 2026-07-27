@@ -8,15 +8,19 @@
  * - Handle errors and exceptions
  * - Link request logs to traces via correlation ID
  * - Propagate correlationId through async boundaries via AsyncLocalStorage
+ * - Parse inbound W3C traceparent headers to continue upstream traces
+ * - Attach outbound W3C traceparent headers on Stellar RPC and webhook calls
  *
- * Trust boundary: treats all incoming request headers as untrusted
- * (already validated by correlationId middleware). Sanitizes user
- * identity before recording in spans.
+ * Trust boundary: treats all incoming request headers as untrusted.
+ * The traceparent header is validated against the W3C Trace Context spec
+ * (version-traceId-parentId-flags) before use. Any malformed or oversized
+ * value is silently dropped and a new trace is started.
  *
  * Failure modes:
  * - If tracer is disabled, all operations are no-ops (zero overhead)
  * - If a tracer hook fails, the error is logged but doesn't propagate
  * - If OpenTelemetry is misconfigured, the app continues without it
+ * - If traceparent is missing/invalid, correlation-id fallback is used
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
@@ -24,6 +28,130 @@ import type { Request, Response, NextFunction } from 'express';
 import { getTracer } from './hooks.js';
 import { Span, type SpanContext } from './hooks.js';
 import { trace } from '@opentelemetry/api';
+
+// ── W3C Trace Context helpers ─────────────────────────────────────────────────
+
+/**
+ * Maximum allowed length for a traceparent header value.
+ *
+ * The W3C spec maximum for version 00 is exactly 55 chars:
+ *   00-<32hex>-<16hex>-<2hex>  = 2+1+32+1+16+1+2 = 55
+ * We add a small buffer for future spec versions with extra fields.
+ * Values longer than this cap are rejected without further parsing to
+ * prevent DoS via pathological regex backtracking.
+ */
+const MAX_TRACEPARENT_LENGTH = 200;
+
+/**
+ * W3C Trace Context version 00 regex.
+ * Format: version(2)-traceId(32)-parentId(16)-flags(2)
+ *
+ * Security: anchored with ^ and $ to prevent partial matching.
+ * The regex is constant-complexity (no backtracking) on valid inputs.
+ * Invalid version ff is reserved by the spec and must be rejected.
+ *
+ * Reference: https://www.w3.org/TR/trace-context/#traceparent-header
+ */
+const TRACEPARENT_REGEX = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
+
+/**
+ * All-zero trace IDs and span IDs are explicitly invalid per W3C spec §2.2.4.
+ */
+const ZERO_TRACE_ID = '0'.repeat(32);
+const ZERO_SPAN_ID = '0'.repeat(16);
+
+/**
+ * Parsed W3C traceparent fields.
+ */
+export interface TraceparentFields {
+  /** Version byte, e.g. "00". */
+  version: string;
+  /** 128-bit trace ID as 32 lowercase hex chars. */
+  traceId: string;
+  /** 64-bit parent span ID as 16 lowercase hex chars. */
+  parentId: string;
+  /** Trace flags as 2 hex chars (bit 0 = sampled). */
+  flags: string;
+  /** True when the sampled flag (bit 0) is set. */
+  sampled: boolean;
+}
+
+/**
+ * Parse and validate a W3C traceparent header value.
+ *
+ * Returns `null` for any invalid, missing, or spec-reserved value so callers
+ * can fall back gracefully to correlation-ID-only tracing.
+ *
+ * Security hardening:
+ * 1. Length-bounds check before regex (prevents ReDoS on pathological inputs).
+ * 2. Anchored regex — no partial match possible.
+ * 3. Reserved version ff → rejected.
+ * 4. All-zero traceId / parentId → rejected (spec §2.2.4).
+ * 5. Input always lower-cased so comparison is case-insensitive but stored
+ *    in canonical form.
+ *
+ * @param raw - Raw header value from the HTTP request (untrusted).
+ * @returns Parsed fields, or `null` if invalid.
+ */
+export function parseTraceparent(raw: unknown): TraceparentFields | null {
+  if (typeof raw !== 'string') return null;
+  if (raw.length > MAX_TRACEPARENT_LENGTH) return null;
+
+  const lower = raw.toLowerCase().trim();
+  const m = TRACEPARENT_REGEX.exec(lower);
+  if (!m) return null;
+
+  const [, version, traceId, parentId, flags] = m as unknown as [string, string, string, string, string];
+
+  // Reserved version — spec says receivers MUST NOT forward unknown versions
+  // without understanding them.
+  if (version === 'ff') return null;
+
+  // All-zero IDs are explicitly invalid (spec §2.2.4 / §2.2.5).
+  if (traceId === ZERO_TRACE_ID) return null;
+  if (parentId === ZERO_SPAN_ID) return null;
+
+  const flagByte = parseInt(flags, 16);
+  const sampled = (flagByte & 0x01) === 1;
+
+  return { version, traceId, parentId, flags, sampled };
+}
+
+/**
+ * Build a W3C traceparent header string from component parts.
+ *
+ * Always uses version "00" (the only defined version at time of writing).
+ *
+ * @param traceId  32 lowercase hex chars.
+ * @param parentId 16 lowercase hex chars (the span that is the parent of the
+ *                 outbound call's new child span).
+ * @param sampled  Whether to set the sampled flag.
+ * @returns        A spec-compliant traceparent string.
+ */
+export function buildTraceparent(
+  traceId: string,
+  parentId: string,
+  sampled: boolean = true,
+): string {
+  const flags = sampled ? '01' : '00';
+  return `00-${traceId}-${parentId}-${flags}`;
+}
+
+/**
+ * AsyncLocalStorage that carries the active trace context for outbound calls.
+ * Populated by tracingMiddleware and consumed by Stellar RPC / webhook helpers
+ * when building outbound traceparent headers.
+ */
+export const traceContextStore = new AsyncLocalStorage<TraceparentFields | null>();
+
+/**
+ * Retrieve the active W3C trace context from the current async scope.
+ * Returns `null` when no upstream traceparent was received or tracing is
+ * disabled.
+ */
+export function getActiveTraceContext(): TraceparentFields | null {
+  return traceContextStore.getStore() ?? null;
+}
 
 
 /**
@@ -124,23 +252,39 @@ export function tracingMiddleware(
   return (req: Request, res: Response, next: NextFunction): void => {
     const correlationId = req.correlationId ?? 'unknown';
 
+    // ── W3C traceparent parsing ──────────────────────────────────────────────
+    // Attempt to continue an upstream trace by parsing the inbound
+    // `traceparent` header.  On success, the upstream traceId is used for
+    // this request's span so all service-boundary hops share a single trace.
+    // On failure (missing / malformed header) we fall back to the local
+    // correlation ID as the traceId, preserving existing behaviour.
+    const inboundTraceparent = parseTraceparent(req.headers['traceparent']);
+
     if (!enabled) {
-      // Still propagate correlationId even when tracing is disabled.
-      return correlationStore.run(correlationId, () => next());
+      // Still propagate correlationId and traceContext even when tracing is disabled.
+      return correlationStore.run(correlationId, () =>
+        traceContextStore.run(inboundTraceparent, () => next())
+      );
     }
 
     correlationStore.run(correlationId, () => {
+      traceContextStore.run(inboundTraceparent, () => {
       try {
         const startTimeMs = Date.now();
 
-        // Determine if this request should be sampled
+        // Determine if this request should be sampled.
+        // If the upstream explicitly set the sampled flag, honour it.
         const sampleRate = config?.sampleRate ?? 1.0;
-        const shouldSample = Math.random() < sampleRate;
+        const shouldSample = inboundTraceparent?.sampled ?? (Math.random() < sampleRate);
+
+        // Use the upstream traceId when a valid traceparent was received so
+        // this span is part of the same distributed trace.
+        const effectiveTraceId = inboundTraceparent?.traceId ?? correlationId;
 
         // Create a span for this request.  Optional fields are only assigned
         // when defined to satisfy `exactOptionalPropertyTypes: true`.
         const startContext: Omit<SpanContext, 'spanId'> = {
-          traceId: correlationId,
+          traceId: effectiveTraceId,
           serviceName: 'fluxora-api',
           tags: {
             'http.method': req.method,
@@ -150,6 +294,17 @@ export function tracingMiddleware(
             'otel.enabled': shouldSample,
           },
         };
+
+        // When continuing an upstream trace, record the upstream parentId
+        // so the full parent→child chain is visible in trace UIs.
+        if (inboundTraceparent) {
+          startContext.parentSpanId = inboundTraceparent.parentId;
+          if (startContext.tags) {
+            startContext.tags['traceparent.version'] = inboundTraceparent.version;
+            startContext.tags['traceparent.flags'] = inboundTraceparent.flags;
+            startContext.tags['traceparent.sampled'] = inboundTraceparent.sampled;
+          }
+        }
 
         const streamId = extractStreamId(req);
         const sender = extractSenderAddress(req);
@@ -241,6 +396,7 @@ export function tracingMiddleware(
         // Tracing initialization error; continue without tracing
         next();
       }
+      });
     });
   };
 }

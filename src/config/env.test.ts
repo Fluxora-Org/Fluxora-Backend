@@ -176,6 +176,28 @@ describe('Environment Configuration', () => {
 
             expect(() => loadConfig()).toThrow(ConfigError);
         });
+
+        it('should parse WEBHOOK_DNS_TIMEOUT_MS with default value', () => {
+            process.env.NODE_ENV = 'development';
+            const config = loadConfig();
+
+            expect(config.webhookDnsTimeoutMs).toBe(2000);
+        });
+
+        it('should allow WEBHOOK_DNS_TIMEOUT_MS override', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.WEBHOOK_DNS_TIMEOUT_MS = '5000';
+            const config = loadConfig();
+
+            expect(config.webhookDnsTimeoutMs).toBe(5000);
+        });
+
+        it('should reject invalid WEBHOOK_DNS_TIMEOUT_MS', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.WEBHOOK_DNS_TIMEOUT_MS = '-100';
+
+            expect(() => loadConfig()).toThrow(ConfigError);
+        });
     });
 
     // -------------------------------------------------------------------------
@@ -281,6 +303,34 @@ describe('Environment Configuration', () => {
             const config = loadConfig();
 
             expect(config.horizonNetworkPassphrase).toBe('Custom Network ; 2024');
+        });
+    });
+    describe('OIDC configuration', () => {
+        it('should leave oidcIssuerUrl/oidcAudience undefined when not set', () => {
+            process.env.NODE_ENV = 'development';
+            delete process.env.OIDC_ISSUER_URL;
+            delete process.env.OIDC_AUDIENCE;
+            const config = loadConfig();
+
+            expect(config.oidcIssuerUrl).toBeUndefined();
+            expect(config.oidcAudience).toBeUndefined();
+        });
+
+        it('should surface OIDC_ISSUER_URL and OIDC_AUDIENCE on Config when set', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.OIDC_ISSUER_URL = 'https://idp.example.com';
+            process.env.OIDC_AUDIENCE = 'fluxora-dashboard';
+            const config = loadConfig();
+
+            expect(config.oidcIssuerUrl).toBe('https://idp.example.com');
+            expect(config.oidcAudience).toBe('fluxora-dashboard');
+        });
+
+        it('should reject an invalid OIDC_ISSUER_URL', () => {
+            process.env.NODE_ENV = 'development';
+            process.env.OIDC_ISSUER_URL = 'not-a-valid-url';
+
+            expect(() => loadConfig()).toThrow(ConfigError);
         });
     });
 });

@@ -26,6 +26,7 @@ function makeRow(overrides: Partial<Record<string, unknown>> = {}): Record<strin
     created_at: new Date('2024-01-01T00:00:00Z'),
     rotated_at: null,
     active: true,
+    scopes: ['streams:read', 'streams:write'],
     ...overrides,
   };
 }
@@ -40,6 +41,7 @@ function makeRecord(overrides: Partial<ApiKeyRecord> = {}): ApiKeyRecord {
     createdAt: '2024-01-01T00:00:00.000Z',
     rotatedAt: null,
     active: true,
+    scopes: ['streams:read', 'streams:write'],
     ...overrides,
   };
 }
@@ -58,7 +60,7 @@ describe('apiKeyRepository', () => {
       expect(sql).toContain('INSERT INTO api_keys');
       expect(params).toEqual([
         'key-1', 'service-a', 'a'.repeat(64), 'b'.repeat(32), 'flx_abcd',
-        '2024-01-01T00:00:00.000Z', null, true,
+        '2024-01-01T00:00:00.000Z', null, true, ['streams:read', 'streams:write'],
       ]);
     });
   });
@@ -122,12 +124,13 @@ describe('apiKeyRepository', () => {
         salt: 'e'.repeat(32),
         prefix: 'flx_newp',
         rotatedAt: '2024-03-03T00:00:00.000Z',
+        scopes: ['streams:read', 'streams:write'],
       });
 
       const [, sql, params] = mockQuery.mock.calls[0]!;
       expect(sql).toContain('UPDATE api_keys');
       expect(sql).toContain('RETURNING');
-      expect(params).toEqual(['key-1', 'd'.repeat(64), 'e'.repeat(32), 'flx_newp', '2024-03-03T00:00:00.000Z']);
+      expect(params).toEqual(['key-1', 'd'.repeat(64), 'e'.repeat(32), 'flx_newp', '2024-03-03T00:00:00.000Z', ['streams:read', 'streams:write']]);
       expect(updated!.prefix).toBe('flx_newp');
     });
 
@@ -135,8 +138,38 @@ describe('apiKeyRepository', () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       const updated = await apiKeyRepository.rotate('missing', {
         keyHash: 'x', salt: 'y', prefix: 'flx_zzzz', rotatedAt: 'now',
+        scopes: ['streams:read', 'streams:write'],
       });
       expect(updated).toBeUndefined();
+    });
+
+    it('persists custom scopes and round-trips through findActiveByPrefix', async () => {
+      const customScopes = ['admin:read'];
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: customScopes })],
+      });
+      const records = await apiKeyRepository.findActiveByPrefix('flx_abcd');
+      expect(records).toHaveLength(1);
+      expect(records[0]!.scopes).toEqual(customScopes);
+    });
+
+    it('updates scopes on rotate and returns the new value', async () => {
+      const newScopes = ['admin:read', 'admin:write'];
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: newScopes })],
+      });
+      const updated = await apiKeyRepository.rotate('key-1', {
+        keyHash: 'd'.repeat(64),
+        salt: 'e'.repeat(32),
+        prefix: 'flx_newp',
+        rotatedAt: '2024-03-03T00:00:00.000Z',
+        scopes: newScopes,
+      });
+      expect(updated).toBeDefined();
+      expect(updated!.scopes).toEqual(newScopes);
+
+      const [, , params] = mockQuery.mock.calls[0]!;
+      expect(params[5]).toEqual(newScopes);
     });
   });
 

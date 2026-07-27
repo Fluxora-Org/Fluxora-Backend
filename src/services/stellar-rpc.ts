@@ -20,6 +20,8 @@
 
 import { AsyncLocalStorage } from 'async_hooks';
 import { logger } from '../lib/logger.js';
+import { recordCircuitBreakerTransition } from '../tracing/hooks.js';
+import { getActiveTraceContext, buildTraceparent } from '../tracing/middleware.js';
 import {
   NoOpRpcFallbackCache,
   RedisRpcFallbackCache,
@@ -34,7 +36,10 @@ import {
   rpcFallbackCacheEarlyRefreshesTotal,
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,
+  rpcProviderHealthyGauge,
+  rpcProviderHealthCheckFailuresTotal,
 } from '../metrics/rpcMetrics.js';
+import { withJitteredRetry } from '../lib/retry.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -57,6 +62,10 @@ export interface RpcCallOptions {
   timeoutMs?: number;
   /** Optional AbortSignal to cancel the call externally. */
   signal?: AbortSignal;
+  /** Max retries for RPC calls. Default 3. */
+  maxRetries?: number;
+  /** Base delay for retries. Default 1000ms. */
+  retryDelayMs?: number;
 }
 
 export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCallOptions {
@@ -66,6 +75,12 @@ export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCall
   fallbackCache?: RpcFallbackCache;
   /** XFetch-style beta factor. Set to 0 to disable early-expiry reads. */
   fallbackCacheEarlyExpiryBeta?: number;
+  /** Interval (ms) for the background provider health-check loop. 0 disables it. */
+  healthCheckIntervalMs?: number;
+  /** Consecutive health-check failures before the provider is marked unhealthy. */
+  healthCheckFailureThreshold?: number;
+  /** Stable provider label for metrics (default "primary"). */
+  providerLabel?: string;
 }
 
 interface RpcRequestMetadata {
@@ -168,6 +183,8 @@ export class CircuitBreaker {
 
     if (this.state === 'OPEN') {
       if (Date.now() - this.openedAt >= this.resetTimeoutMs) {
+        // OPEN → HALF_OPEN: probe window has elapsed
+        recordCircuitBreakerTransition('OPEN', 'HALF_OPEN', this.failures.length);
         this.state = 'HALF_OPEN';
       } else {
         throw new CircuitOpenError();
@@ -179,19 +196,26 @@ export class CircuitBreaker {
       this.onSuccess();
       return result;
     } catch (err) {
-      this.onFailure();
+      this.onFailure(err);
       throw err;
     }
   }
 
   private onSuccess(): void {
+    const prev = this.state;
     this.failures = [];
     this.state = 'CLOSED';
+    // Only emit when there is an actual state change (HALF_OPEN → CLOSED recovery).
+    // Steady-state CLOSED successes produce no event.
+    if (prev !== 'CLOSED') {
+      recordCircuitBreakerTransition(prev, 'CLOSED', 0);
+    }
   }
 
-  private onFailure(): void {
+  private onFailure(err?: unknown): void {
     this.failures.push(Date.now());
     if (this.failures.length >= this.failureThreshold) {
+      const prev = this.state;
       this.state = 'OPEN';
       this.openedAt = Date.now();
       logger.warn('Stellar RPC circuit breaker tripped', undefined, {
@@ -199,6 +223,9 @@ export class CircuitBreaker {
         failureCount: this.failures.length,
         windowMs: this.windowMs,
       });
+      // CLOSED → OPEN or HALF_OPEN → OPEN
+      const failureKind = err !== undefined ? classifyError(err) : undefined;
+      recordCircuitBreakerTransition(prev, 'OPEN', this.failures.length, failureKind);
     }
   }
 
@@ -226,10 +253,21 @@ export interface RawRpcClient {
 export class StellarRpcService {
   private readonly breaker: CircuitBreaker;
   private readonly timeoutMs: number;
+  private readonly maxRetries: number;
+  private readonly retryDelayMs: number;
   private readonly fallbackCache: RpcFallbackCache;
   private readonly fallbackCacheTtlSeconds: number;
   private readonly fallbackCacheEarlyExpiryBeta: number;
   private readonly earlyRefreshes = new Map<string, Promise<void>>();
+
+  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private healthy = true;
+  private lastHealthyAt: number | null = null;
+  private lastHealthError: string | null = null;
+  private consecutiveHealthFailures = 0;
+  private readonly healthCheckIntervalMs: number;
+  private readonly healthCheckFailureThreshold: number;
+  private readonly providerLabel: string;
 
   constructor(
     private readonly getClient: () => RawRpcClient,
@@ -237,15 +275,94 @@ export class StellarRpcService {
   ) {
     this.breaker = new CircuitBreaker(opts);
     this.timeoutMs = opts.timeoutMs ?? 5_000;
+    this.maxRetries = opts.maxRetries ?? 3;
+    this.retryDelayMs = opts.retryDelayMs ?? 1_000;
     this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
     this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
     this.fallbackCacheEarlyExpiryBeta = Math.max(0, opts.fallbackCacheEarlyExpiryBeta ?? 0);
+    this.healthCheckIntervalMs = opts.healthCheckIntervalMs ?? 0;
+    this.healthCheckFailureThreshold = Math.max(1, opts.healthCheckFailureThreshold ?? 3);
+    this.providerLabel = opts.providerLabel ?? 'primary';
   }
 
   getCircuitState(): CircuitState { return this.breaker.getState(); }
 
   /** Reset the circuit breaker (manual recovery). */
   resetCircuit(): void { this.breaker.reset(); }
+
+  /**
+   * Snapshot of the background health-check posture, consumed by callers and
+   * the health endpoint to decide whether the provider should be used.
+   */
+  getProviderHealth(): {
+    healthy: boolean;
+    lastHealthyAt: number | null;
+    lastError: string | null;
+    consecutiveFailures: number;
+  } {
+    return {
+      healthy: this.healthy,
+      lastHealthyAt: this.lastHealthyAt,
+      lastError: this.lastHealthError,
+      consecutiveFailures: this.consecutiveHealthFailures,
+    };
+  }
+
+  isProviderHealthy(): boolean {
+    return this.healthy;
+  }
+
+  /**
+   * Start the background health-check loop. Every `healthCheckIntervalMs` the
+   * service pings `getLatestLedger` directly (bypassing the cache and circuit
+   * breaker so an OPEN breaker does not mask provider recovery). After
+   * `healthCheckFailureThreshold` consecutive failures the provider is marked
+   * unhealthy; a single successful ping flips it back to healthy. Passing 0
+   * (the default) disables the loop.
+   */
+  startHealthCheck(intervalMs: number = this.healthCheckIntervalMs): void {
+    this.stopHealthCheck();
+    if (intervalMs <= 0) return;
+
+    const tick = async (): Promise<void> => {
+      try {
+        await this.getClient().getLatestLedger();
+        this.consecutiveHealthFailures = 0;
+        this.healthy = true;
+        this.lastHealthyAt = Date.now();
+        this.lastHealthError = null;
+        rpcProviderHealthyGauge.set({ provider: this.providerLabel }, 1);
+      } catch (err) {
+        this.consecutiveHealthFailures += 1;
+        this.lastHealthError = err instanceof Error ? err.message : String(err);
+        const kind = classifyError(err);
+        rpcProviderHealthCheckFailuresTotal.inc({ provider: this.providerLabel, reason: kind });
+        if (this.consecutiveHealthFailures >= this.healthCheckFailureThreshold) {
+          if (this.healthy) {
+            logger.warn('Stellar RPC provider marked unhealthy by health check', undefined, {
+              event: 'rpc_provider_unhealthy',
+              consecutiveFailures: this.consecutiveHealthFailures,
+              error: this.lastHealthError,
+            });
+          }
+          this.healthy = false;
+          rpcProviderHealthyGauge.set({ provider: this.providerLabel }, 0);
+        }
+      }
+    };
+
+    // Probe once immediately so health is known without waiting a full interval.
+    void tick();
+    this.healthCheckTimer = setInterval(() => void tick(), intervalMs);
+  }
+
+  /** Stop the background health-check loop, if running. */
+  stopHealthCheck(): void {
+    if (this.healthCheckTimer !== null) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+  }
 
   /**
    * Snapshot of the current degradation posture, consumed by the
@@ -276,7 +393,15 @@ export class StellarRpcService {
     return this.callWithFallbackCache(
       'getLatestLedger',
       [],
-      () => this.getClient().getLatestLedger(),
+      () => withJitteredRetry(
+        () => this.getClient().getLatestLedger(),
+        {
+          baseDelayMs: this.retryDelayMs,
+          maxDelayMs: this.retryDelayMs * 5,
+          maxAttempts: this.maxRetries + 1,
+        },
+        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+      ),
       opts,
     );
   }
@@ -295,22 +420,46 @@ export class StellarRpcService {
     return this.callWithFallbackCache(
       'accountExists',
       [hashCachePart(address)],
-      async () => {
-        const client = this.getClient();
-        const base = (client.horizonUrl ?? '').replace(/\/$/, '');
-        if (!base) {
-          throw new RpcProviderError('horizonUrl not configured on RPC client', 'PROVIDER');
-        }
-        const url = `${base}/accounts/${encodeURIComponent(address)}`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs) });
-        if (res.status === 200) return true;
-        if (res.status === 404) return false;
-        throw new RpcProviderError(
-          `Horizon returned HTTP ${res.status} for account lookup`,
-          'PROVIDER',
-          res.status,
-        );
-      },
+      () => withJitteredRetry(
+        async () => {
+          const client = this.getClient();
+          const base = (client.horizonUrl ?? '').replace(/\/$/, '');
+          if (!base) {
+            throw new RpcProviderError('horizonUrl not configured on RPC client', 'PROVIDER');
+          }
+          const url = `${base}/accounts/${encodeURIComponent(address)}`;
+          // Attach outbound W3C traceparent so Stellar RPC / Horizon can
+          // continue the distributed trace.  The header is only added when an
+          // active trace context exists in the current async scope.
+          const rpcHeaders: Record<string, string> = {};
+          const activeTrace = getActiveTraceContext();
+          if (activeTrace) {
+            // Outbound parent ID = upstream parentId so the outbound span
+            // shares the same parent as this service's span.
+            rpcHeaders['traceparent'] = buildTraceparent(
+              activeTrace.traceId,
+              activeTrace.parentId,
+              activeTrace.sampled,
+            );
+          }
+          const res = await fetch(url, {
+            signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs),
+            headers: rpcHeaders,
+          });          if (res.status === 200) return true;
+          if (res.status === 404) return false;
+          throw new RpcProviderError(
+            `Horizon returned HTTP ${res.status} for account lookup`,
+            'PROVIDER',
+            res.status,
+          );
+        },
+        {
+          baseDelayMs: this.retryDelayMs,
+          maxDelayMs: this.retryDelayMs * 5,
+          maxAttempts: this.maxRetries + 1,
+        },
+        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+      ),
       opts,
     );
   }
@@ -539,10 +688,18 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
       resetTimeoutMs: parseInt(process.env.RPC_CB_RESET_TIMEOUT_MS ?? '60000', 10),
       timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
+      maxRetries: parseInt(process.env.STELLAR_RPC_MAX_RETRIES ?? '3', 10),
+      retryDelayMs: parseInt(process.env.STELLAR_RPC_RETRY_DELAY ?? '1000', 10),
       fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
       fallbackCacheEarlyExpiryBeta: parseFloat(process.env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA ?? '0'),
       fallbackCache: redisFallbackCache,
+      healthCheckIntervalMs: parseInt(process.env.RPC_HEALTH_CHECK_INTERVAL_MS ?? '0', 10),
+      healthCheckFailureThreshold: parseInt(process.env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD ?? '3', 10),
     });
+    const intervalMs = parseInt(process.env.RPC_HEALTH_CHECK_INTERVAL_MS ?? '0', 10);
+    if (intervalMs > 0) {
+      _service.startHealthCheck(intervalMs);
+    }
   }
   return _service;
 }

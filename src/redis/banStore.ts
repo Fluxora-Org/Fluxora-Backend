@@ -14,14 +14,17 @@
  * @module redis/banStore
  */
 
+import { createHash } from 'crypto';
 import type { RedisClient } from './client.js';
 import { logger } from '../lib/logger.js';
 
 export const BAN_KEY_PREFIX = 'fluxora:ws:ban:';
 
 /** Sanitise IP for use in Redis key (replace unsafe chars). */
+// Hash IP with SHA-256 to prevent collision from truncation (#833)
 export function sanitiseIp(ip: string): string {
-  return ip.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 256) || 'unknown';
+  if (!ip) return 'unknown';
+  return createHash('sha256').update(ip).digest('hex');
 }
 
 function buildKey(ip: string): string {
@@ -197,6 +200,8 @@ export class RedisBanStore implements BanStore {
  */
 export class HybridBanStore implements BanStore {
   usingFallback = false;
+  /** Number of times a Redis operation failed and the fallback was invoked. */
+  fallbackModeCount = 0;
   private readonly localCache = new InMemoryBanStore();
 
   constructor(
@@ -224,6 +229,7 @@ export class HybridBanStore implements BanStore {
     } catch (err) {
       this.onError?.(err, 'isBanned');
       this.usingFallback = true;
+      this.fallbackModeCount += 1;
       return this.fallback.isBanned(ip);
     }
   }
@@ -238,6 +244,7 @@ export class HybridBanStore implements BanStore {
     } catch (err) {
       this.onError?.(err, 'ban');
       this.usingFallback = true;
+      this.fallbackModeCount += 1;
       // Local cache already has it — fail safe
       await this.fallback.ban(options);
     }
@@ -269,4 +276,20 @@ export function createBanStore(
   const redisStore = new RedisBanStore(redisClient, onError);
   const memoryStore = new InMemoryBanStore();
   return new HybridBanStore(redisStore, memoryStore, onError);
+}
+
+let _globalBanStore: HybridBanStore | null = null;
+
+export function setGlobalHybridBanStore(store: HybridBanStore): void {
+  _globalBanStore = store;
+}
+
+export function getHybridBanStoreStatus(): { usingFallback: boolean; available: boolean } {
+  if (!_globalBanStore) {
+    return { usingFallback: false, available: false };
+  }
+  return {
+    usingFallback: _globalBanStore.usingFallback,
+    available: true,
+  };
 }

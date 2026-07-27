@@ -2,6 +2,7 @@ import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal, isValidRejectio
 
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP = 10;
 export const DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS = 1000;
+export const DEFAULT_SSE_MAX_CONNECTIONS_PER_API_KEY = 50;
 export const DEFAULT_SSE_MAX_CONNECTION_DURATION_MS = 30 * 60 * 1000;
 export const DEFAULT_SSE_RETRY_AFTER_SECONDS = 15;
 
@@ -9,10 +10,14 @@ const MAX_SSE_CONNECTION_LIMIT = 100_000;
 const MAX_SSE_CONNECTION_DURATION_MS = 86_400_000;
 const MAX_SSE_RETRY_AFTER_SECONDS = 86_400;
 
-export type SseConnectionRejectionReason = 'per_ip_limit' | 'global_limit';
+export type SseConnectionRejectionReason =
+  | 'per_ip_limit'
+  | 'per_key_limit'
+  | 'global_limit';
 
 export interface SseConnectionLimits {
   maxConnectionsPerIp: number;
+  maxConnectionsPerApiKey: number;
   maxGlobalConnections: number;
   maxConnectionDurationMs: number;
   retryAfterSeconds: number;
@@ -46,6 +51,13 @@ export type SseConnectionAttempt =
 
 const activeConnectionsByIp = new Map<string, number>();
 let activeConnections = 0;
+const activeConnectionsByApiKey = new Map<string, number>();
+
+function normalizeApiKey(apiKey: string | undefined): string | undefined {
+  if (apiKey === undefined) return undefined;
+  const normalized = apiKey.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
 
 function normalizeIp(ip: string): string {
   const normalized = ip.trim();
@@ -90,6 +102,13 @@ export function resolveSseConnectionLimits(
       1,
       MAX_SSE_CONNECTION_LIMIT,
     ),
+    maxConnectionsPerApiKey: readBoundedPositiveInteger(
+      env,
+      'SSE_MAX_CONNECTIONS_PER_API_KEY',
+      DEFAULT_SSE_MAX_CONNECTIONS_PER_API_KEY,
+      1,
+      MAX_SSE_CONNECTION_LIMIT,
+    ),
     maxGlobalConnections: readBoundedPositiveInteger(
       env,
       'SSE_MAX_GLOBAL_CONNECTIONS',
@@ -124,8 +143,10 @@ export function resolveSseConnectionLimits(
 export function tryAcquireSseConnection(
   ip: string,
   limits: SseConnectionLimits = resolveSseConnectionLimits(),
+  apiKey?: string,
 ): SseConnectionAttempt {
   const normalizedIp = normalizeIp(ip);
+  const normalizedKey = normalizeApiKey(apiKey);
   const activeConnectionsForIp = activeConnectionsByIp.get(normalizedIp) ?? 0;
 
   if (activeConnectionsForIp >= limits.maxConnectionsPerIp) {
@@ -141,6 +162,22 @@ export function tryAcquireSseConnection(
       activeConnections,
       activeConnectionsForIp,
     };
+  }
+
+  if (normalizedKey !== undefined) {
+    const activeForKey = activeConnectionsByApiKey.get(normalizedKey) ?? 0;
+    if (activeForKey >= limits.maxConnectionsPerApiKey) {
+      sseConnectionsRejectedTotal.inc({ reason: 'per_key_limit' });
+      return {
+        ok: false,
+        reason: 'per_key_limit',
+        message: 'Too many active SSE connections for this API key',
+        limits,
+        retryAfterSeconds: limits.retryAfterSeconds,
+        activeConnections,
+        activeConnectionsForIp,
+      };
+    }
   }
 
   if (activeConnections >= limits.maxGlobalConnections) {
@@ -160,6 +197,10 @@ export function tryAcquireSseConnection(
 
   activeConnectionsByIp.set(normalizedIp, activeConnectionsForIp + 1);
   activeConnections += 1;
+  if (normalizedKey !== undefined) {
+    const currentForKey = activeConnectionsByApiKey.get(normalizedKey) ?? 0;
+    activeConnectionsByApiKey.set(normalizedKey, currentForKey + 1);
+  }
   sseActiveConnectionsGauge.set(activeConnections);
 
   let released = false;
@@ -182,6 +223,15 @@ export function tryAcquireSseConnection(
           activeConnectionsByIp.set(normalizedIp, currentForIp - 1);
         }
 
+        if (normalizedKey !== undefined) {
+          const currentForKey = activeConnectionsByApiKey.get(normalizedKey) ?? 0;
+          if (currentForKey <= 1) {
+            activeConnectionsByApiKey.delete(normalizedKey);
+          } else {
+            activeConnectionsByApiKey.set(normalizedKey, currentForKey - 1);
+          }
+        }
+
         activeConnections = Math.max(0, activeConnections - 1);
         sseActiveConnectionsGauge.set(activeConnections);
       },
@@ -200,6 +250,7 @@ export function getActiveSseConnectionCountForIp(ip: string): number {
 /** Reset limiter state between tests without touching the rejection counter. */
 export function _resetSseConnectionLimiter(): void {
   activeConnectionsByIp.clear();
+  activeConnectionsByApiKey.clear();
   activeConnections = 0;
   sseActiveConnectionsGauge.set(0);
 }

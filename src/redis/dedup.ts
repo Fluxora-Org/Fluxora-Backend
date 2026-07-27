@@ -15,13 +15,13 @@ export const DEDUP_KEY_PREFIX = 'fluxora:dedup:';
 
 export interface DedupCache {
     has(streamId: string, eventId: string): Promise<boolean>;
-    add(streamId: string, eventId: string): Promise<void>;
+    add(streamId: string, eventId: string): Promise<boolean>;
     clear(): Promise<void>;
     close(): Promise<void>;
 }
 
 const DEDUP_TTL_SECONDS = 86400;
-const DEDUP_CACHE_MAX = 10_000;
+export const DEDUP_CACHE_MAX = 10_000;
 const FALLBACK_LOG_THROTTLE_MS = 5_000;
 
 let lastFallbackLog = 0;
@@ -30,7 +30,7 @@ function logFallback(operation: string, streamId: string, eventId: string): void
   const now = Date.now();
   if (now - lastFallbackLog >= FALLBACK_LOG_THROTTLE_MS) {
     lastFallbackLog = now;
-    logger.debug('dedup:fallback', { operation, streamId, eventId });
+    logger.debug('dedup:fallback', undefined, { operation, streamId, eventId });
   }
 }
 
@@ -39,20 +39,26 @@ export function __resetDedupForTest(): void {
 }
 
 export class InMemoryDedupCache implements DedupCache {
+    /** FIFO eviction: when size reaches DEDUP_CACHE_MAX, the oldest-inserted key is evicted.
+     * Under sustained load at capacity, this is a one-in-one-out FIFO.
+     * Trade-off: evicted keys will be treated as new (false negative) if replayed.
+     * This is the fallback for HybridDedupCache when Redis is unavailable;
+     * during a Redis outage, dedup degrades to best-effort on the most recent DEDUP_CACHE_MAX events. */
     private readonly seen = new Map<string, true>();
 
     async has(streamId: string, eventId: string): Promise<boolean> {
         return this.seen.has(`${streamId}:${eventId}`);
     }
 
-    async add(streamId: string, eventId: string): Promise<void> {
+    async add(streamId: string, eventId: string): Promise<boolean> {
         const key = `${streamId}:${eventId}`;
-        if (this.seen.has(key)) return;
+        if (this.seen.has(key)) return false;
         if (this.seen.size >= DEDUP_CACHE_MAX) {
             const oldest = this.seen.keys().next().value;
             if (oldest !== undefined) this.seen.delete(oldest);
         }
         this.seen.set(key, true);
+        return true;
     }
 
     async clear(): Promise<void> {
@@ -78,21 +84,22 @@ export class RedisDedupCache implements DedupCache {
     async has(streamId: string, eventId: string): Promise<boolean> {
         try {
             return await this.client.exists(this.buildKey(streamId, eventId));
-        } catch {
+        } catch (e) {
             dedupRedisErrorsTotal.inc({ operation: 'has' });
-            return false;
+            throw e;
         }
     }
 
-    async add(streamId: string, eventId: string): Promise<void> {
+    async add(streamId: string, eventId: string): Promise<boolean> {
         try {
-            await this.client.set(
+            return await this.client.setNx(
                 this.buildKey(streamId, eventId),
                 '1',
-                { ex: this.ttlSeconds }
+                this.ttlSeconds * 1000
             );
-        } catch {
+        } catch (e) {
             dedupRedisErrorsTotal.inc({ operation: 'add' });
+            throw e;
         }
     }
 
@@ -128,16 +135,25 @@ export class HybridDedupCache implements DedupCache {
         }
     }
 
-    async add(streamId: string, eventId: string): Promise<void> {
+    async add(streamId: string, eventId: string): Promise<boolean> {
         if (this.useRedis) {
             try {
-                await this.primary.add(streamId, eventId);
+                const inFallback = await this.fallback.has(streamId, eventId);
+                if (inFallback) {
+                    try {
+                        await this.primary.add(streamId, eventId);
+                    } catch {}
+                    return false;
+                }
+                const added = await this.primary.add(streamId, eventId);
+                if (added) await this.fallback.add(streamId, eventId);
+                return added;
             } catch {
                 dedupRedisFallbackTotal.inc({ operation: 'add' });
                 logFallback('add', streamId, eventId);
             }
         }
-        await this.fallback.add(streamId, eventId);
+        return await this.fallback.add(streamId, eventId);
     }
 
     async clear(): Promise<void> {

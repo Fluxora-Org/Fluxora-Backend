@@ -1,6 +1,6 @@
 import express from 'express';
 import request from 'supertest';
-import { corsAllowlistMiddleware } from '../src/middleware/cors';
+import { corsAllowlistMiddleware, isOriginAllowed } from '../src/middleware/cors';
 
 describe('CORS allowlist policy', () => {
   const app = express();
@@ -239,5 +239,86 @@ describe('CORS allowlist policy', () => {
 
     expect(res.status).toBe(200);
     expect(res.headers['access-control-allow-origin']).toBe('https://ops.fluxora.io');
+  });
+});
+
+describe('Strict origin validation', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalCorsAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS;
+
+  afterEach(() => {
+    process.env.NODE_ENV = originalNodeEnv;
+    if (originalCorsAllowedOrigins === undefined) {
+      delete process.env.CORS_ALLOWED_ORIGINS;
+    } else {
+      process.env.CORS_ALLOWED_ORIGINS = originalCorsAllowedOrigins;
+    }
+  });
+
+  it('rejects crafted lookalike origin (evil-fluxora.example.com vs fluxora.example.com)', () => {
+    const allowed = new Set(['https://fluxora.example.com']);
+    expect(isOriginAllowed('https://evil-fluxora.example.com', allowed)).toBe(false);
+  });
+
+  it('rejects origin with appended path (https://fluxora.io.evil.com)', () => {
+    const allowed = new Set(['https://fluxora.io']);
+    expect(isOriginAllowed('https://fluxora.io.evil.com', allowed)).toBe(false);
+  });
+
+  it('rejects origin that is a substring of allowed origin', () => {
+    const allowed = new Set(['https://fluxora.example.com']);
+    expect(isOriginAllowed('https://fluxora.example.co', allowed)).toBe(false);
+  });
+
+  it('allows exact match origin', () => {
+    const allowed = new Set(['https://app.fluxora.io']);
+    expect(isOriginAllowed('https://app.fluxora.io', allowed)).toBe(true);
+  });
+
+  it('allows wildcard subdomain when configured (*.fluxora.io matches https://app.fluxora.io)', () => {
+    const allowed = new Set(['*.fluxora.io']);
+    expect(isOriginAllowed('https://app.fluxora.io', allowed)).toBe(true);
+  });
+
+  it('rejects wildcard mismatch (*.fluxora.io does NOT match https://evilfluxora.io)', () => {
+    const allowed = new Set(['*.fluxora.io']);
+    expect(isOriginAllowed('https://evilfluxora.io', allowed)).toBe(false);
+  });
+
+  it('allows legitimate configured origin on non-preflight', async () => {
+    const app = express();
+    app.use(corsAllowlistMiddleware);
+    app.get('/health', (_req, res) => {
+      res.status(200).json({ status: 'ok' });
+    });
+
+    process.env.NODE_ENV = 'production';
+    process.env.CORS_ALLOWED_ORIGINS = 'https://app.fluxora.io';
+
+    const res = await request(app)
+      .get('/health')
+      .set('Origin', 'https://app.fluxora.io');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('https://app.fluxora.io');
+  });
+
+  it('rejects crafted origin on preflight with 403', async () => {
+    const app = express();
+    app.use(corsAllowlistMiddleware);
+    app.options('/api/streams', (_req, res) => {
+      res.sendStatus(204);
+    });
+
+    process.env.NODE_ENV = 'production';
+    process.env.CORS_ALLOWED_ORIGINS = 'https://app.fluxora.io';
+
+    const res = await request(app)
+      .options('/api/streams')
+      .set('Origin', 'https://app.fluxora.io.evil.com')
+      .set('Access-Control-Request-Method', 'POST');
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('CORS_ORIGIN_DENIED');
   });
 });

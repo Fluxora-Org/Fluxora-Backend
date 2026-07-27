@@ -284,3 +284,100 @@ describe('StreamHub subscription filtering', () => {
     });
   });
 });
+
+// ─── #437 WS auth observability ───────────────────────────────────────────────
+
+import { vi, beforeEach as bEach, afterEach as aEach, describe as d, it as t, expect as ex } from 'vitest';
+import { verifyWsToken } from '../../src/middleware/tokenAuth.js';
+import { wsAuthFailureTotal } from '../../src/metrics/businessMetrics.js';
+import { getAuditEntries, _resetAuditLog } from '../../src/lib/auditLog.js';
+
+// Stub logger so warnings don't pollute test output.
+vi.mock('../../src/lib/logger.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../src/lib/logger.js')>();
+  return { ...original, logger: { ...original.logger, warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() } };
+});
+
+d('#437 verifyWsToken observability', () => {
+  bEach(() => {
+    // Reset counter values between tests without deregistering (avoids stale references).
+    wsAuthFailureTotal.reset();
+    _resetAuditLog();
+  });
+
+  function makeReq(overrides: Partial<{ headers: Record<string, string>; url: string }> = {}) {
+    return {
+      headers: overrides.headers ?? {},
+      url: overrides.url ?? '/ws/streams',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as any;
+  }
+
+  t('MISSING_TOKEN: increments counter with reason=MISSING_TOKEN', async () => {
+    verifyWsToken(makeReq(), 'secret');
+    const val = await wsAuthFailureTotal.get();
+    const series = val.values.find((v) => (v.labels as any).reason === 'MISSING_TOKEN');
+    ex(series?.value).toBe(1);
+  });
+
+  t('MISSING_TOKEN: does not write an audit entry (not audit-worthy)', () => {
+    verifyWsToken(makeReq(), 'secret');
+    const entries = getAuditEntries().filter((e) => e.action === 'WS_AUTH_FAILURE');
+    ex(entries).toHaveLength(0);
+  });
+
+  t('INVALID_TOKEN: increments counter with reason=INVALID_TOKEN', async () => {
+    verifyWsToken(makeReq({ headers: { authorization: 'Bearer not-a-jwt' } }), 'secret');
+    const val = await wsAuthFailureTotal.get();
+    const series = val.values.find((v) => (v.labels as any).reason === 'INVALID_TOKEN');
+    ex(series?.value).toBe(1);
+  });
+
+  t('INVALID_TOKEN: writes an audit entry', () => {
+    verifyWsToken(makeReq({ headers: { authorization: 'Bearer bad' } }), 'secret');
+    const entries = getAuditEntries().filter((e) => e.action === 'WS_AUTH_FAILURE');
+    ex(entries).toHaveLength(1);
+    ex(entries[0]!.meta?.reason).toBe('INVALID_TOKEN');
+  });
+
+  t('AUTH_NOT_CONFIGURED: increments counter with reason=AUTH_NOT_CONFIGURED', async () => {
+    verifyWsToken(makeReq(), undefined);
+    const val = await wsAuthFailureTotal.get();
+    const series = val.values.find((v) => (v.labels as any).reason === 'AUTH_NOT_CONFIGURED');
+    ex(series?.value).toBe(1);
+  });
+
+  t('AUTH_NOT_CONFIGURED: writes an audit entry', () => {
+    verifyWsToken(makeReq(), undefined);
+    const entries = getAuditEntries().filter((e) => e.action === 'WS_AUTH_FAILURE');
+    ex(entries).toHaveLength(1);
+    ex(entries[0]!.meta?.reason).toBe('AUTH_NOT_CONFIGURED');
+  });
+
+  t('success: does not increment the failure counter', async () => {
+    const token = jwt.sign({ sub: 'user' }, 'test-secret');
+    verifyWsToken(makeReq({ headers: { authorization: `Bearer ${token}` } }), 'test-secret');
+    const val = await wsAuthFailureTotal.get();
+    ex(val.values.reduce((sum, v) => sum + (v.value as number), 0)).toBe(0);
+  });
+
+  t('no token material appears in counter label values', async () => {
+    const rawToken = jwt.sign({ sub: 'user' }, 'x');
+    verifyWsToken(makeReq({ headers: { authorization: `Bearer ${rawToken}` } }), 'different-secret');
+    const val = await wsAuthFailureTotal.get();
+    for (const v of val.values) {
+      for (const labelVal of Object.values(v.labels as Record<string, string>)) {
+        ex(labelVal).not.toContain(rawToken);
+      }
+    }
+  });
+
+  t('counter label set is limited to reason (no cardinality blowup)', async () => {
+    verifyWsToken(makeReq(), 'secret');
+    const val = await wsAuthFailureTotal.get();
+    for (const v of val.values) {
+      const extraLabels = Object.keys(v.labels as object).filter((k) => k !== 'reason');
+      ex(extraLabels).toHaveLength(0);
+    }
+  });
+});

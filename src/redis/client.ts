@@ -8,6 +8,16 @@
 
 import type { Redis, Cluster } from 'ioredis';
 import { logger } from '../logging/logger.js';
+import { calculateNextRetryDelay } from '../lib/retry.js';
+
+function defaultRetryStrategy(times: number): number | null {
+  const delay = calculateNextRetryDelay(times - 1, {
+    baseDelayMs: 50,
+    maxDelayMs: 2000,
+    maxAttempts: 10,
+  });
+  return delay === 0 ? null : delay;
+}
 
 export interface RedisConfig {
   url: string;
@@ -182,6 +192,7 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
       password,
       lazyConnect: true,
       maxRetriesPerRequest: 3,
+      retryStrategy: defaultRetryStrategy,
       enableReadyCheck: true,
       connectTimeout: 5000,
     });
@@ -215,6 +226,7 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
       password,
       lazyConnect: true,
       maxRetriesPerRequest: 3,
+      retryStrategy: defaultRetryStrategy,
       enableReadyCheck: true,
       connectTimeout: 5000,
     });
@@ -246,6 +258,7 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
         connectTimeout: 5000,
         maxRetriesPerRequest: 3,
       },
+      clusterRetryStrategy: defaultRetryStrategy,
       lazyConnect: true,
     });
     await client.connect();
@@ -267,17 +280,57 @@ export function getRedisClientFactory(): RedisClientFactory {
   return factory;
 }
 
+/** All clients created via {@link createRedisClient}. Used for shutdown drain. */
+const _activeClients = new Set<RedisClient>();
+
 export async function createRedisClient(config: RedisConfig): Promise<RedisClient> {
-  return factory.createClient(config);
+  const client = await factory.createClient(config);
+  _activeClients.add(client);
+  return client;
+}
+
+/**
+ * Quit all Redis clients that were created via {@link createRedisClient}.
+ * Called during graceful shutdown to close sockets cleanly.
+ */
+export async function quitAllRedisClients(): Promise<void> {
+  const clients = Array.from(_activeClients);
+  _activeClients.clear();
+  await Promise.all(
+    clients.map((c) =>
+      c.close().catch((err: unknown) => {
+        logger.warn('redis:quit_error', { error: (err as Error).message });
+      }),
+    ),
+  );
+}
+
+/** Reset the active-client registry — for testing only. */
+export function _resetRedisClientRegistry(): void {
+  _activeClients.clear();
 }
 
 // ---------------------------------------------------------------------------
 // NoOpRedisClient — used when Redis is disabled
+//
+// This is the single canonical no-op Redis client for "Redis unavailable"
+// scenarios (development, single-process, or when REDIS_ENABLED=false).
+//
+// Semantics:
+// - setNx() returns `true` (always succeeds) because in a single-process /
+//   no-Redis environment there is no other instance to contend with, so lock
+//   acquisition should succeed immediately. Callers that need single-process
+//   mutual exclusion (e.g. adminState) rely on in-process guards (fast-path
+//   status checks) in addition to this lock, so the "always succeeds" behaviour
+//   is correct and deliberate for this mode.
+// - exists() returns `false` (nothing exists in no-op storage).
+// - get() returns `null` (nothing stored).
 // ---------------------------------------------------------------------------
 
 export class NoOpRedisClient implements RedisClient {
   async get(): Promise<string | null> { return null; }
   async set(): Promise<void> { return; }
+  /** Always returns true — simulates an uncontended single-process lock. */
   async setNx(): Promise<boolean> { return true; }
   async del(): Promise<void> { return; }
   async exists(): Promise<boolean> { return false; }

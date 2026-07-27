@@ -100,11 +100,14 @@ export function gracefulShutdown(
         server.closeAllConnections();
       }
 
-      for (const hook of hooks) {
+      for (let i = 0; i < hooks.length; i++) {
+        const hook = hooks[i]!;
         try {
           await hook();
         } catch (err) {
           logger.error('Shutdown hook threw an error', undefined, {
+            hookIndex: i,
+            hookCount: hooks.length,
             error: err instanceof Error ? err.message : String(err),
           });
         }

@@ -24,14 +24,25 @@ import pg from 'pg';
 import { logger } from '../lib/logger.js';
 import { getPool, createPool, resolvePoolConfig } from './pool.js';
 import type { PoolConfig } from './pool.js';
+import { dbReplicationLagSeconds } from '../metrics/dbMetrics.js';
 
 const { Pool } = pg;
+
+function envInt(name: string, fallback: number): number {
+  const v = process.env[name];
+  if (!v) return fallback;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 // ── Internal state ────────────────────────────────────────────────────────────
 
 let _replicaPool: pg.Pool | null = null;
 let _replicaHealthy = false;
 let _healthCheckDone = false;
+let _lastLagCheckTime = 0;
+let _lastLagValue: number | null = null;
+const LAG_CHECK_INTERVAL_MS = 30000; // 30 seconds
 
 /**
  * Extract hostname from a connection string for safe logging.
@@ -52,6 +63,13 @@ function safeHostname(connectionString: string): string {
  * Build a PoolConfig for the read replica.
  * Inherits pool size / timeout settings from the primary config but uses
  * DATABASE_REPLICA_URL as the connection string.
+ *
+ * Replica-specific knobs (override primary defaults):
+ *   REPLICA_STATEMENT_TIMEOUT_MS — per-query timeout (default 30 000 ms).
+ *     Higher than primary because replica reads are often long analytical queries.
+ *     Set to 0 to disable. Cannot be overridden by client-supplied SQL.
+ *   REPLICA_QUEUE_LIMIT — max queued connection requests before fast-failing
+ *     (default 25). Keeps replica saturation observable separately from primary.
  */
 export function resolveReplicaPoolConfig(): PoolConfig | null {
   const replicaUrl = process.env['DATABASE_REPLICA_URL'];
@@ -70,6 +88,8 @@ export function resolveReplicaPoolConfig(): PoolConfig | null {
     ...primaryCfg,
     connectionString: replicaUrl,
     replicaStatementTimeoutMs,
+    queueLimit: envInt('REPLICA_QUEUE_LIMIT', 25),
+    poolName: 'replica',
   };
 }
 
@@ -78,11 +98,18 @@ export function resolveReplicaPoolConfig(): PoolConfig | null {
  *
  * On every new physical connection the hook atomically sets:
  *   1. `default_transaction_read_only = on`  — prevents accidental writes.
- *   2. `statement_timeout = <ms>`            — bounds runaway SELECTs.
+ *   2. `statement_timeout = <ms>`            — bounds runaway SELECTs. The value
+ *      comes from cfg.replicaStatementTimeoutMs (falling back to the primary
+ *      statementTimeoutMs) and is set server-side, so it cannot be overridden
+ *      by client-supplied SQL parameters.
  *
  * Both are applied in a single `client.query` call so they either both succeed
  * or both fail (the connection is destroyed on error, preventing a half-configured
  * client from entering the pool).
+ *
+ * A `_queueLimit` property is also stamped on the pool so callers using the shared
+ * `query()` helper fast-fail when the waiting queue is full, keeping replica
+ * saturation observable separately from the primary pool.
  *
  * @param config - Pool configuration. Uses resolveReplicaPoolConfig() when omitted.
  */
@@ -96,6 +123,9 @@ export function createReplicaPool(config?: PoolConfig): pg.Pool {
     connectionTimeoutMillis: cfg.connectionTimeoutMillis,
     idleTimeoutMillis: cfg.idleTimeoutMillis,
   });
+
+  // Store queueLimit on the pool instance (same pattern as primary pool).
+  (pool as pg.Pool & { _queueLimit?: number })._queueLimit = cfg.queueLimit;
 
   pool.on('connect', (client: pg.PoolClient) => {
     // Issue both SETs in one round-trip so the connection is either fully
@@ -144,7 +174,70 @@ export async function checkReplicaHealth(pool: pg.Pool): Promise<boolean> {
   }
 }
 
+// ── Replication lag check ─────────────────────────────────────────────────────
+
+/**
+ * Check the replication lag of the replica in seconds.
+ * Returns null if the lag check fails or no replica is available.
+ */
+export async function checkReplicationLag(): Promise<number | null> {
+  if (!_replicaPool || !_replicaHealthy) {
+    return null;
+  }
+
+  const now = Date.now();
+  if (now - _lastLagCheckTime < LAG_CHECK_INTERVAL_MS) {
+    return _lastLagValue;
+  }
+
+  try {
+    // Check using pg_last_xact_replay_timestamp which works in PostgreSQL 10+
+    const result = await _replicaPool.query(`
+      SELECT 
+        CASE 
+          WHEN pg_is_in_recovery() THEN 
+            EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))
+          ELSE 
+            0 
+        END AS lag_seconds
+    `);
+
+    const lagSeconds = result.rows[0]?.lag_seconds as number | null;
+    _lastLagValue = lagSeconds ?? null;
+    _lastLagCheckTime = now;
+
+    // Update the metric
+    if (_lastLagValue !== null) {
+      dbReplicationLagSeconds.set(_lastLagValue);
+    } else {
+      dbReplicationLagSeconds.set(NaN);
+    }
+
+    return _lastLagValue;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn('Failed to check replication lag', undefined, {
+      error: message,
+    });
+    _lastLagValue = null;
+    _lastLagCheckTime = now;
+    dbReplicationLagSeconds.set(NaN);
+    return null;
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Options for getting a read pool.
+ */
+export interface GetReadPoolOptions {
+  /**
+   * If true, force the query to use the primary pool instead of the replica.
+   * Use this when read-after-write consistency is required.
+   */
+  forcePrimary?: boolean;
+}
 
 /**
  * Return a pg.Pool suitable for read (SELECT) queries.
@@ -158,8 +251,17 @@ export async function checkReplicaHealth(pool: pg.Pool): Promise<boolean> {
  * Once resolved the decision is cached — the function becomes synchronous
  * on subsequent calls (returns the cached pool immediately via a resolved
  * promise).
+ *
+ * @param options - Options for pool selection.
  */
-export async function getReadPool(): Promise<pg.Pool> {
+export async function getReadPool(options: GetReadPoolOptions = {}): Promise<pg.Pool> {
+  const { forcePrimary = false } = options;
+
+  // If forced to primary, return primary immediately
+  if (forcePrimary) {
+    return getPool();
+  }
+
   // Fast path: already resolved.
   if (_healthCheckDone) {
     return _replicaHealthy && _replicaPool ? _replicaPool : getPool();
@@ -197,6 +299,8 @@ export function resetReplicaPool(): void {
   _replicaPool = null;
   _replicaHealthy = false;
   _healthCheckDone = false;
+  _lastLagCheckTime = 0;
+  _lastLagValue = null;
 }
 
 /** Replace the singleton replica pool (for tests only). */

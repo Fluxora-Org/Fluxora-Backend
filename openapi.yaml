@@ -385,7 +385,14 @@ paths:
             type: string
       responses:
         '200':
-          description: Cursor-paginated list of streams
+          description: |
+            Cursor-paginated list of streams.
+
+            **Ordering guarantee**: results are always returned in `created_at DESC, id DESC`
+            order. Because `id` is the primary key (unique), the composite key is unique and
+            the ordering is deterministic — even when multiple streams share the same
+            `created_at` timestamp (e.g. batch inserts). Clients can rely on a stable,
+            consistent page ordering across all requests.
           content:
             application/json:
               schema:
@@ -431,6 +438,98 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/streams/{streamId}/poll:
+    get:
+      summary: Long-polling fallback for real-time stream updates
+      description: >-
+        Long-polling fallback endpoint for enterprise clients behind proxies that block WebSocket upgrades.
+        Holds the HTTP connection open (bounded by a timeout) until a new event for the stream arrives or
+        the timeout elapses, returning the same event envelope shape used by the WebSocket hub.
+      operationId: pollStreamEvents
+      tags:
+        - Streams
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - name: streamId
+          in: path
+          required: true
+          description: Stream identifier
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          description: Event ID cursor for historical resumption replay
+          schema:
+            type: string
+        - name: timeout
+          in: query
+          required: false
+          description: Maximum hold duration in seconds (1 to 30, default 30)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Stream event update or null if timeout elapsed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    nullable: true
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                        example: stream_update
+                      streamId:
+                        type: string
+                        example: stream-123
+                      eventId:
+                        type: string
+                        example: evt-101
+                      payload:
+                        type: object
+                      correlationId:
+                        type: string
+                  meta:
+                    $ref: '#/components/schemas/ResponseMeta'
+        '400':
+          description: Invalid parameters or stale replay cursor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Too many concurrent long-poll connections
+          headers:
+            Retry-After:
+              description: Backoff duration in seconds
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -526,6 +625,71 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 
   /internal/indexer/events/replay:
+    post:
+      summary: Trigger historical contract-event DB replay
+      operationId: startIndexerReplay
+      tags:
+        - Internal
+      security:
+        - BearerAuth: []
+      description: |
+        Enqueues a historical backfill of `contract_events` from `historical_events`
+        for a given contract and ledger. The operation runs asynchronously; poll
+        `GET /internal/indexer/status` for progress.
+
+        Requires the `indexer:replay` permission. Triggers an expensive DB scan —
+        kept off the public CORS allowlist and behind the shared rate limiter.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - contract_id
+                - ledger
+              properties:
+                contract_id:
+                  type: string
+                  minLength: 1
+                  description: Contract identifier to replay events for.
+                ledger:
+                  type: integer
+                  minimum: 0
+                  description: Ledger number to replay.
+                from_block:
+                  type: integer
+                  minimum: 0
+                  description: Optional lower bound block height (inclusive).
+                to_block:
+                  type: integer
+                  minimum: 0
+                  description: Optional upper bound block height (inclusive). Must be >= from_block.
+      responses:
+        '202':
+          description: Replay accepted and running asynchronously
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: Validation error (invalid body)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Insufficient permissions (indexer:replay required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     get:
       summary: Cursor-based event replay from the event store
       operationId: replayIndexerEvents
@@ -611,6 +775,37 @@ paths:
                 $ref: '#/components/schemas/EventReplayResponse'
         '401':
           description: Missing or invalid internal worker credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/indexer/status:
+    get:
+      summary: Get current replay progress
+      operationId: getIndexerStatus
+      tags:
+        - Internal
+      security:
+        - BearerAuth: []
+      description: |
+        Returns the in-memory snapshot of the current (or last completed) DB replay run.
+        Requires the `indexer:replay` permission.
+      responses:
+        '200':
+          description: Replay progress snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          description: Missing or invalid authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Insufficient permissions (indexer:replay required)
           content:
             application/json:
               schema:

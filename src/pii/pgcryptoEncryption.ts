@@ -3,9 +3,21 @@
  *
  * This module centralizes the application-side pieces of the encryption
  * design so the repository layer can stay readable and safe.
+ *
+ * Single-row functions (`computeAddressHash`, `computeAddressHashes`) run
+ * synchronously on the main thread — ideal for the request-path where the
+ * overhead of worker IPC is not justified.
+ *
+ * Batch functions (`batchComputeAddressHashes`) offload HMAC computation to
+ * a bounded worker_threads pool for large row sets (export endpoint,
+ * data-retention purge jobs).  Falls back to synchronous execution when the
+ * row count is below the threshold or when worker startup fails.
  */
 
 import crypto from 'crypto';
+import { pathToFileURL } from 'url';
+import { WorkerPool, BATCH_HASH_THRESHOLD, resolveWorkerUrl, type WorkerPoolOptions } from './workerPool.js';
+import type { HashTaskMessage, HashResultMessage } from './pgcryptoWorker.js';
 
 export const PGCRYPTO_KEY_MIN_LENGTH = 32;
 export const PGP_SYM_ENCRYPT_OPTIONS = 'cipher-algo=aes256,compress-algo=0,armor';
@@ -70,4 +82,157 @@ export function buildEncryptedAddressFilter(
   }
   const hashCondition = hashClauses.length > 1 ? `(${hashClauses.join(' OR ')})` : hashClauses[0];
   return `(${hashCondition} OR ${column} = $${filterValueParamIndex})`;
+}
+
+export const DEFAULT_ERASURE_TOMBSTONE = '[REDACTED_GDPR_ERASURE]';
+
+/**
+ * Redaction helper: Permanently redacts encrypted PII columns for matching streams
+ * associated with a recipient address while preserving all financial and ledger data.
+ *
+ * @param queryExecutor - Database client or pool with a query method (supports transactions)
+ * @param recipientAddress - Plaintext address target for GDPR right-to-erasure
+ * @param tombstone - Tombstone value to write into address columns (default: '[REDACTED_GDPR_ERASURE]')
+ * @returns Promise resolving to an object containing `{ rowsErased, rowsSkippedLegalHold }`
+ *
+ * @security Uses parameterized queries ($1, $2) to prevent SQL injection.
+ * Does NOT delete or alter financial columns (`amount`, `ledger`, `tx_hash`, `stream_id`, etc.).
+ */
+export async function redactPiiForAddress(
+  queryExecutor: { query: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number | null; rows: any[] }> },
+  recipientAddress: string,
+  tombstone: string = DEFAULT_ERASURE_TOMBSTONE,
+): Promise<{ rowsErased: number; rowsSkippedLegalHold: number }> {
+  const updateResult = await queryExecutor.query(
+    `UPDATE streams
+        SET sender_address         = $1,
+            recipient_address      = $1,
+            sender_address_hash    = NULL,
+            recipient_address_hash = NULL
+      WHERE (recipient_address = $2 OR sender_address = $2)
+        AND COALESCE(legal_hold, FALSE) = FALSE`,
+    [tombstone, recipientAddress],
+  );
+
+  const rowsErased = updateResult.rowCount ?? 0;
+
+  const holdResult = await queryExecutor.query(
+    `SELECT COUNT(*) AS cnt
+       FROM streams
+      WHERE (recipient_address = $1 OR sender_address = $1)
+        AND legal_hold = TRUE`,
+    [recipientAddress],
+  );
+
+  const rowsSkippedLegalHold = parseInt(
+    (holdResult.rows[0] as { cnt: string } | undefined)?.cnt ?? '0',
+    10,
+  );
+
+  return { rowsErased, rowsSkippedLegalHold };
+}
+
+// ── Batch hashing via worker_threads pool ─────────────────────────────────
+
+/**
+ * Module-scoped lazy pool.  Initialized on first call to
+ * `batchComputeAddressHashes`.  Shared across all callers in the process so
+ * the pool is created once and reused.
+ */
+let _pool: WorkerPool | null = null;
+
+/**
+ * Resolve or create the singleton worker pool.  The pool is created lazily
+ * so single-row callers (the common request-path) never pay the cost of
+ * worker thread setup.
+ *
+ * SECURITY: The pool receives cryptographic keys via `workerData` (structured
+ * clone).  Keys are never read from `process.env` inside the pool — they are
+ * passed explicitly by the caller and exist only in worker-local heap memory.
+ */
+function getPool(): WorkerPool {
+  if (_pool === null) {
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), './pgcryptoWorker');
+    const poolOpts: WorkerPoolOptions = {};
+    _pool = new WorkerPool(workerUrl, poolOpts);
+
+    // Fallback: if all workers fail to start (e.g. sandboxed environment),
+    // degrade to synchronous in-thread execution.
+    _pool.setFallback((msg: unknown) => {
+      const task = msg as HashTaskMessage;
+      const current = computeAddressHash(task.address, task.keys.current);
+      const previous = task.keys.previous
+        ? computeAddressHash(task.address, task.keys.previous)
+        : undefined;
+      return { type: 'result', taskId: task.taskId, current, previous } as HashResultMessage;
+    });
+  }
+  return _pool;
+}
+
+/**
+ * Shut down the singleton worker pool.  Called during graceful process
+ * shutdown to terminate worker threads and free resources.
+ */
+export async function shutdownPgcryptoPool(): Promise<void> {
+  if (_pool !== null) {
+    await _pool.shutdown();
+    _pool = null;
+  }
+}
+
+/**
+ * Compute HMAC address hashes for a batch of addresses.
+ *
+ * - When `addresses.length >= BATCH_HASH_THRESHOLD` (50), work is dispatched
+ *   to the worker_threads pool, keeping the main event loop free for request
+ *   handling.
+ * - Below the threshold, computation runs synchronously on the main thread
+ *   to avoid worker IPC overhead.
+ * - If all workers fail to start, the pool degrades gracefully to
+ *   synchronous execution — callers never see errors from the pool itself.
+ *
+ * Results are returned in the same order as the input `addresses` array.
+ *
+ * @param addresses  Array of plaintext Stellar addresses to hash.
+ * @param keys       Current (and optional previous) pgcrypto key set.
+ * @param options    Optional overrides:
+ *   - `concurrency`: max parallel workers (default: pool default).
+ *   - `threshold`: override the batch threshold (default: 50).
+ * @returns Array of `{ current, previous }` hash pairs, one per input address.
+ *
+ * @security Cryptographic keys are passed to workers via `workerData`
+ * (structured clone) and exist only in worker-local memory.  They are never
+ * logged, serialized to disk, or re-read from environment variables.
+ */
+export async function batchComputeAddressHashes(
+  addresses: string[],
+  keys: PgcryptoKeySet,
+  options?: { concurrency?: number; threshold?: number },
+): Promise<Array<{ current: string; previous?: string }>> {
+  const threshold = options?.threshold ?? BATCH_HASH_THRESHOLD;
+
+  // Below threshold: synchronous on the main thread (no worker overhead).
+  if (addresses.length < threshold) {
+    return addresses.map((addr) => computeAddressHashes(addr, keys));
+  }
+
+  const pool = getPool();
+
+  // Dispatch all hashes as individual tasks.  The pool's bounded worker set
+  // naturally throttles concurrency — each worker processes one task at a
+  // time, so we never exceed `maxWorkers` concurrent HMAC computations.
+  const tasks = addresses.map((address, taskId): Promise<HashResultMessage> => {
+    const msg: HashTaskMessage = { type: 'hash', taskId, address, keys };
+    return pool.exec<HashResultMessage>(msg);
+  });
+
+  const results = await Promise.all(tasks);
+
+  // Restore original input order (worker dispatch may complete out of order,
+  // but `Promise.all` preserves order, and each result carries its `taskId`).
+  return results.map((r) => ({
+    current: r.current,
+    previous: r.previous,
+  }));
 }

@@ -24,6 +24,24 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import { payloadTooLarge, requestTimeout, validationError } from './errorHandler.js';
+import { requestBodyTooLargeTotal } from '../metrics/requestProtectionMetrics.js';
+
+/**
+ * Derive a normalized route path label for metrics.
+ *
+ * Uses `req.route.path` when Express has matched a route (most accurate), falling
+ * back to `req.path` when the middleware fires before routing (e.g. the fast-path
+ * Content-Length check). Raw `req.originalUrl` is never used — it would expose
+ * path parameters and query strings in the Prometheus label, causing cardinality
+ * explosion and potential data leakage.
+ *
+ * @internal
+ */
+function normalizedPath(req: Request): string {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+  const routePath = (req as unknown as { route?: { path?: string } }).route?.path;
+  return typeof routePath === 'string' ? routePath : req.path;
+}
 
 // ── Idempotency-Key constants ─────────────────────────────────────────────────
 
@@ -54,6 +72,12 @@ export function bodySizeLimitMiddleware(
   if (clHeader !== undefined) {
     const cl = parseInt(clHeader, 10);
     if (!Number.isNaN(cl) && cl > BODY_LIMIT_BYTES) {
+      /**
+       * Increment the oversized-body counter so SREs can alert on sudden spikes
+       * in 413 responses (potential DoS probe or misconfigured client).
+       * @see src/metrics/requestProtectionMetrics.ts
+       */
+      requestBodyTooLargeTotal.inc({ path: normalizedPath(req) });
       next(payloadTooLarge(`Request body exceeds the ${BODY_LIMIT_BYTES}-byte limit`));
       return;
     }
@@ -68,6 +92,11 @@ export function bodySizeLimitMiddleware(
     received += chunk.length;
     if (received > BODY_LIMIT_BYTES) {
       rejected = true;
+      /**
+       * Increment the oversized-body counter for the stream-based slow path.
+       * @see src/metrics/requestProtectionMetrics.ts
+       */
+      requestBodyTooLargeTotal.inc({ path: normalizedPath(req) });
       next(payloadTooLarge(`Request body exceeds the ${BODY_LIMIT_BYTES}-byte limit`));
       req.socket.destroy();
     }

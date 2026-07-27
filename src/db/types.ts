@@ -262,6 +262,10 @@ export interface StreamEventReplayFilter {
   limit?: number;
   /** Offset for pagination */
   offset?: number;
+  /** Only return events at or after this timestamp (inclusive, ISO-8601 string) */
+  fromHappenedAt?: string;
+  /** Only return events at or before this timestamp (inclusive, ISO-8601 string) */
+  toHappenedAt?: string;
   /**
    * Cursor-based replay: only return events that come strictly after this
    * eventId in the canonical (ledger ASC, eventId ASC) ordering.
