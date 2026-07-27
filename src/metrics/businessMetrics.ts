@@ -79,6 +79,23 @@ export const sseConnectionsRejectedTotal =
     registers: [registry],
   });
 
+export const longPollActiveConnectionsGauge =
+  (registry.getSingleMetric('fluxora_longpoll_active_connections') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_longpoll_active_connections',
+    help: 'Current number of active long-polling fallback stream connections',
+    registers: [registry],
+  });
+
+export const longPollConnectionsRejectedTotal =
+  (registry.getSingleMetric('fluxora_longpoll_connections_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_longpoll_connections_rejected_total',
+    help: 'Total number of rejected long-polling connection attempts',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
 export const webhookDeliveriesSuppressedTotal =
   (registry.getSingleMetric('fluxora_webhook_deliveries_suppressed_total') as Counter<'outcome'>) ||
   new Counter({
@@ -299,5 +316,7 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_sse_subscriber_errors_total');
   registry.removeSingleMetric('fluxora_ws_auth_failure_total');
   registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
+  registry.removeSingleMetric('fluxora_longpoll_active_connections');
+  registry.removeSingleMetric('fluxora_longpoll_connections_rejected_total');
 }
 
