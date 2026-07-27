@@ -117,14 +117,14 @@ function isDispatchAttached(): boolean {
 function ensureDispatchAttached(): void {
   if (!isDispatchAttached()) {
     sseEventBus.on(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
-    sseEventListenersGauge.set(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT));
+    sseEventListenersGauge.set(Math.max(0, sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)));
   }
 }
 
 function detachDispatchIfIdle(): void {
   if (totalLiveSubscriberCount() === 0) {
     sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
-    sseEventListenersGauge.set(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT));
+    sseEventListenersGauge.set(Math.max(0, sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)));
   }
 }
 
@@ -147,8 +147,8 @@ export function subscribeToSseStream(
   }
 
   subscribers.add(subscriber);
-  ensureDispatchAttached();
-  sseLiveSubscribersGauge.set(totalLiveSubscriberCount());
+   ensureDispatchAttached();
+   sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
 
   let unsubscribed = false;
   return () => {
@@ -163,7 +163,7 @@ export function subscribeToSseStream(
       liveSubscribersByStreamId.delete(streamId);
     }
     detachDispatchIfIdle();
-    sseLiveSubscribersGauge.set(totalLiveSubscriberCount());
+  sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
   };
 }
 

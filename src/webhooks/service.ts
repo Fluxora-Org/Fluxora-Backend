@@ -18,24 +18,9 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './storeFactory.js';
 import { computeWebhookSignature } from './signature.js';
-import {
-  calculateNextRetryTime,
-  scheduleWebhookOutboxRetry,
-  shouldRetry,
-  isRetryableStatusCode,
-  checkWebhookDeliveryGate,
-  attemptWebhookDeliveryWithRateLimit,
-  countsTowardCircuitBreaker,
-  type EnhancedRetryPolicy,
-} from './retry.js';
-import {
-  webhookDeliveriesTotal,
-  webhookDeliveryDurationSeconds,
-} from '../metrics/businessMetrics.js';
-import type {
-  WebhookCircuitBreakerStore,
-  CircuitBreakerPolicy,
-} from '../redis/webhookCircuitBreakerStore.js';
+import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
+import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds, safeObserveDuration } from '../metrics/businessMetrics.js';
+import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import type { IWebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
 import { TokenBucketRateLimiter } from './rate-limiter.js';
@@ -461,8 +446,7 @@ export class WebhookService {
       webhookDeliveryStore.store(delivery);
       webhookDeliveriesTotal.inc({ outcome: 'failed' });
     } finally {
-      const durationSeconds = (Date.now() - startTime) / 1000;
-      webhookDeliveryDurationSeconds.observe(durationSeconds);
+      safeObserveDuration(webhookDeliveryDurationSeconds, (Date.now() - startTime) / 1000);
     }
 
     return attempt;

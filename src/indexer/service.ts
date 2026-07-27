@@ -13,6 +13,10 @@ import {
   getIndexerLeaderElection,
   type IndexerLeaderElection,
 } from './leaderElection.js';
+import {
+  indexerEventsIngestedTotal,
+  indexerLagSeconds,
+} from '../metrics/businessMetrics.js';
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -1263,6 +1267,18 @@ export class IndexerIngestionService {
       debug('Indexer contract event ids processed', {
         requestId: context.requestId, insertedEventIds: result.insertedEventIds, duplicateEventIds: result.duplicateEventIds,
       });
+
+      if (result.insertedEventIds.length > 0) {
+        indexerEventsIngestedTotal.inc(result.insertedEventIds.length);
+
+        const latestHappenedAtMs = events.reduce((max, event) => {
+          const happenedAtMs = Date.parse(event.happenedAt);
+          return Number.isFinite(happenedAtMs) && happenedAtMs > max ? happenedAtMs : max;
+        }, 0);
+        if (latestHappenedAtMs > 0) {
+          indexerLagSeconds.set(Math.max(0, (Date.now() - latestHappenedAtMs) / 1000));
+        }
+      }
 
       return {
         insertedCount: result.insertedEventIds.length,

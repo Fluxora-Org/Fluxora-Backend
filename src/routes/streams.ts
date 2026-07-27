@@ -89,6 +89,7 @@ import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
 import { isTerminalStatus } from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
+import { isValidStreamStatus } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { recordServerTimingPhase } from '../middleware/serverTiming.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
@@ -973,7 +974,9 @@ streamsRouter.post(
       recipient:     normalizedInput.recipient,
     });
 
-    streamsCreatedTotal.inc({ status: stream.status });
+    if (isValidStreamStatus(stream.status)) {
+      streamsCreatedTotal.inc({ status: stream.status });
+    }
 
     // Issue a read-your-writes fence pin.  The client must echo this token in
     // the X-Fluxora-Write-Fence request header on its next GET /api/streams
