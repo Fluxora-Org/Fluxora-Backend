@@ -3,12 +3,42 @@ import type { BanStore, BanCheckResult } from '../redis/banStore.js';
 import { createBanStore } from '../redis/banStore.js';
 import type { RedisClient } from '../redis/client.js';
 import { getClientIp } from '../lib/ipExtraction.js';
+import { Gauge } from 'prom-client';
+import { registry } from '../metrics.js';
 
 export { getClientIp };
 
 // In-memory state (non-ban state)
 const connectionCounts = new Map<string, number>();
 const rejectionHistory = new Map<string, number[]>(); // IP -> timestamps of rejections
+
+// Graceful shutdown state
+let shuttingDown = false;
+let activeConnections = 0;
+
+// Prometheus metrics
+const activeConnectionsGauge = new Gauge({
+  name: 'websocket_connections_active',
+  help: 'Current number of active WebSocket connections',
+  registers: [registry],
+});
+
+const maxConnectionsGauge = new Gauge({
+  name: 'websocket_connections_max',
+  help: 'Maximum allowed WebSocket connections per IP',
+  registers: [registry],
+});
+
+// Update max connections gauge on startup
+function updateMaxConnectionsMetric() {
+  const maxPerIp = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
+  maxConnectionsGauge.set(maxPerIp);
+}
+updateMaxConnectionsMetric();
+
+function updateActiveConnectionsMetric() {
+  activeConnectionsGauge.set(activeConnections);
+}
 
 // Ban store (Redis-backed with local fallback)
 let banStore: BanStore = createBanStore();
@@ -30,30 +60,30 @@ export function getBanStore(): BanStore {
 
 /**
  * Atomically checks and reserves a connection slot for an IP.
- * 
+ *
  * SECURITY: This function prevents TOCTOU (time-of-check/time-of-use) race conditions
  * by reserving the slot BEFORE any async operations. The upgrade handler must ensure
  * the reservation is released exactly once, either:
  *   - On upgrade success: in onConnect when the WebSocket is established
  *   - On upgrade failure: via explicit cleanup before returning (auth failure, socket close)
- * 
+ *
  * ATOMIC OPERATION: Critical for preventing bypass of the per-IP connection cap.
  *   1. Check limit synchronously (before increment) — prevent TOCTOU
  *   2. Reserve slot (increment counter) — commit the reservation
  *   3. Check ban status (async, after reservation) — check if IP is banned
  *   4. Rollback reservation if banned (call untrackConnection) — release if banned
- * 
+ *
  * INVARIANT: If the function returns { allowed: true }, the caller MUST eventually call
  * untrackConnection exactly once (either in onConnect on success, or in cleanup on failure).
- * 
+ *
  * COUNTER LIFECYCLE:
  *   - checkAndReserve: Increments counter (and may rollback if banned)
  *   - onConnect: Takes ownership of the reservation (connection established)
  *   - onDisconnect: Decrements counter (connection closed)
- * 
+ *
  * This ordering ensures that concurrent upgrade requests cannot both pass the check
  * before the first is counted, even under burst load from attackers or misbehaving clients.
- * 
+ *
  * @param ip Client IP address
  * @returns { allowed: true } if slot reserved (caller must call untrackConnection exactly once)
  *          { allowed: false, code, reason } if rejected (caller should NOT call untrackConnection)
@@ -78,6 +108,11 @@ export function getBanStore(): BanStore {
  * ```
  */
 export async function checkAndReserve(ip: string): Promise<{ allowed: boolean; code?: number; reason?: string }> {
+  // Reject new connections during graceful shutdown
+  if (shuttingDown) {
+    return { allowed: false, code: 4029, reason: 'Server shutting down' };
+  }
+
   const now = Date.now();
   const maxConnections = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
 
@@ -90,6 +125,8 @@ export async function checkAndReserve(ip: string): Promise<{ allowed: boolean; c
 
   // Atomically reserve the connection slot before any async operations
   connectionCounts.set(ip, currentCount + 1);
+  activeConnections++;
+  updateActiveConnectionsMetric();
 
   // 2. Check if IP is currently banned (Redis + local cache)
   try {
@@ -145,14 +182,14 @@ export function trackConnection(ip: string): void {
 /**
  * Decrements the active connection count for an IP.
  * Safe against double-decrement (won't go negative; clamps at 0).
- * 
+ *
  * SECURITY NOTE: MUST be called exactly once per successful checkAndReserve.
  * - If called twice, it will still not underflow (safe), but the counter will be inaccurate.
  * - The upgrade handler uses a 'cleaned' flag to prevent accidental double-decrement.
  * - Called in two scenarios:
  *   1. Upgrade failure cleanup (if checkAndReserve returned { allowed: true } but upgrade failed)
  *   2. onDisconnect (when a successfully established WebSocket closes)
- * 
+ *
  * INVARIANT: counter never goes negative (min 0).
  */
 export function untrackConnection(ip: string): void {
@@ -161,6 +198,83 @@ export function untrackConnection(ip: string): void {
     connectionCounts.delete(ip);
   } else {
     connectionCounts.set(ip, current - 1);
+  }
+
+  // Decrement global active connections
+  if (activeConnections > 0) {
+    activeConnections--;
+    updateActiveConnectionsMetric();
+  }
+}
+
+/**
+ * Returns the current number of active WebSocket connections.
+ * Used for metrics and health checks.
+ */
+export function getActiveConnectionCount(): number {
+  return activeConnections;
+}
+
+/**
+ * Returns whether the server is in graceful shutdown mode.
+ */
+export function isShuttingDown(): boolean {
+  return shuttingDown;
+}
+
+/**
+ * Initiates graceful shutdown of WebSocket connections.
+ *
+ * - Sets shuttingDown flag to reject new connections
+ * - Sends close frame (code 1001, reason "Server restarting") to all active connections
+ * - Waits up to gracePeriodMs for connections to close naturally
+ * - Returns when all connections are closed or grace period expires
+ *
+ * @param wss WebSocketServer instance to close connections on
+ * @param gracePeriodMs Maximum time to wait for graceful drain (default 5000ms)
+ */
+export async function gracefulDrain(
+  wss: any, // WebSocketServer type from 'ws' package
+  gracePeriodMs: number = 5000
+): Promise<void> {
+  if (shuttingDown) {
+    logger.info('Graceful drain already in progress');
+    return;
+  }
+
+  shuttingDown = true;
+  logger.info(`Starting graceful shutdown with ${gracePeriodMs}ms grace period`, undefined, {
+    activeConnections,
+  });
+
+  // Send close frame to all active connections
+  if (wss && wss.clients) {
+    const closePayload = JSON.stringify({ reason: 'Server restarting' });
+    for (const client of wss.clients) {
+      if (client.readyState === 1) { // WebSocket.OPEN
+        try {
+          client.close(1001, closePayload);
+        } catch (err) {
+          logger.warn('Failed to send close frame to client', undefined, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+  }
+
+  // Wait for connections to close or grace period to expire
+  const startTime = Date.now();
+  while (activeConnections > 0 && Date.now() - startTime < gracePeriodMs) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  if (activeConnections > 0) {
+    logger.warn(`Grace period expired with ${activeConnections} connections still active`, undefined, {
+      remainingConnections: activeConnections,
+    });
+  } else {
+    logger.info('All connections drained gracefully');
   }
 }
 
@@ -171,6 +285,9 @@ export function untrackConnection(ip: string): void {
 export function _resetLimiter(): void {
   connectionCounts.clear();
   rejectionHistory.clear();
+  shuttingDown = false;
+  activeConnections = 0;
+  updateActiveConnectionsMetric();
   // Reset ban store state
   if (banStore) {
     void banStore.close();

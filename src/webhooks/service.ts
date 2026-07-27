@@ -18,26 +18,12 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './storeFactory.js';
 import { computeWebhookSignature } from './signature.js';
-import {
-  calculateNextRetryTime,
-  scheduleWebhookOutboxRetry,
-  shouldRetry,
-  isRetryableStatusCode,
-  checkWebhookDeliveryGate,
-  attemptWebhookDeliveryWithRateLimit,
-  countsTowardCircuitBreaker,
-  type EnhancedRetryPolicy,
-} from './retry.js';
-import {
-  webhookDeliveriesTotal,
-  webhookDeliveryDurationSeconds,
-} from '../metrics/businessMetrics.js';
-import type {
-  WebhookCircuitBreakerStore,
-  CircuitBreakerPolicy,
-} from '../redis/webhookCircuitBreakerStore.js';
+import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
+import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds, safeObserveDuration } from '../metrics/businessMetrics.js';
+import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
-import type { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
+import type { IWebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
+import { TokenBucketRateLimiter } from './rate-limiter.js';
 import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
 
 interface OutboxRow {
@@ -66,7 +52,7 @@ export interface WebhookDispatcherOptions {
   pool?: DbPool;
   policy?: EnhancedRetryPolicy;
   circuitBreakerStore?: WebhookCircuitBreakerStore;
-  rateLimiter?: WebhookRateLimiter;
+  rateLimiter?: IWebhookRateLimiter;
   rateLimitConfig?: RateLimitConfig;
 }
 
@@ -460,8 +446,7 @@ export class WebhookService {
       webhookDeliveryStore.store(delivery);
       webhookDeliveriesTotal.inc({ outcome: 'failed' });
     } finally {
-      const durationSeconds = (Date.now() - startTime) / 1000;
-      webhookDeliveryDurationSeconds.observe(durationSeconds);
+      safeObserveDuration(webhookDeliveryDurationSeconds, (Date.now() - startTime) / 1000);
     }
 
     return attempt;
@@ -691,7 +676,7 @@ export class WebhookDispatcher {
   private readonly policy: EnhancedRetryPolicy;
   private readonly service: WebhookService;
   private readonly circuitBreakerStore: WebhookCircuitBreakerStore;
-  private readonly rateLimiter?: WebhookRateLimiter;
+  private readonly rateLimiter?: IWebhookRateLimiter;
   private readonly rateLimitConfig: RateLimitConfig;
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
@@ -713,10 +698,11 @@ export class WebhookDispatcher {
     this.pool = options.pool ?? (getPool() as unknown as DbPool);
     this.policy = resolveWebhookRetryPolicy(options.policy);
     this.circuitBreakerStore = options.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
-    this.rateLimiter = options.rateLimiter;
+    this.rateLimiter = options.rateLimiter ?? new TokenBucketRateLimiter();
     this.rateLimitConfig = options.rateLimitConfig ?? {
       limit: parsePositiveInteger(process.env.WEBHOOK_RETRY_RPS, DEFAULT_WEBHOOK_RETRY_RPS),
       windowMs: 1000,
+      burst: parseNonNegativeInteger(process.env.WEBHOOK_RETRY_BURST, 0),
     };
     this.service = new WebhookService(this.policy, this.circuitBreakerStore);
   }

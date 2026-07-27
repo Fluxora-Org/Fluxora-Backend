@@ -2,7 +2,9 @@ import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resetConfig, initializeConfig } from '../config/env.js';
-import { verifyIdToken, _resetOidcProviderForTest } from './oidcProvider.js';
+import { verifyIdToken, _resetOidcProviderForTest, preventReplay } from './oidcProvider.js';
+import { FakeRedisClient } from '../redis/__test__/fakeRedisClient.js';
+import { setRedisClientFactory, DefaultRedisClientFactory, type RedisClientFactory } from '../redis/client.js';
 
 const ISSUER = 'https://idp.example.com';
 const AUDIENCE = 'fluxora-dashboard';
@@ -97,6 +99,45 @@ describe('OIDC provider — verifyIdToken (end-to-end, mocked JWKS)', () => {
 
     await verifyIdToken(idToken);
     await expect(verifyIdToken(idToken)).rejects.toThrow(/replay/i);
+  });
+
+  it('prevents token replay under concurrent requests with FakeRedisClient', async () => {
+    process.env.REDIS_ENABLED = 'true';
+    resetConfig();
+    initializeConfig();
+
+    const fakeRedis = new FakeRedisClient();
+    const fakeFactory: RedisClientFactory = {
+      createClient: async () => fakeRedis,
+    };
+    setRedisClientFactory(fakeFactory);
+    await _resetOidcProviderForTest();
+
+    const idToken = 'concurrent-test-token-unit-12345';
+    const exp = Math.floor(Date.now() / 1000) + 300;
+
+    let successCount = 0;
+    let failureCount = 0;
+    await Promise.all([
+      preventReplay(idToken, exp)
+        .then(() => { successCount++; })
+        .catch((err) => {
+          failureCount++;
+          expect(err.message).toContain('Token replay detected');
+        }),
+      preventReplay(idToken, exp)
+        .then(() => { successCount++; })
+        .catch((err) => {
+          failureCount++;
+          expect(err.message).toContain('Token replay detected');
+        }),
+    ]);
+
+    expect(successCount).toBe(1);
+    expect(failureCount).toBe(1);
+
+    setRedisClientFactory(new DefaultRedisClientFactory());
+    await _resetOidcProviderForTest();
   });
 
   it('throws clearly when OIDC is not configured', async () => {

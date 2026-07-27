@@ -80,14 +80,17 @@ function byteSizeToNumber(value: unknown): unknown {
 }
 
 function urlString(name: string) {
-  return z.string().min(1, `${name} is required`).refine((value) => {
-    try {
-      new URL(value);
-      return true;
-    } catch {
-      return false;
-    }
-  }, `${name} must be a valid URL`);
+  return z
+    .string()
+    .min(1, `${name} is required`)
+    .refine((value) => {
+      try {
+        new URL(value);
+        return true;
+      } catch {
+        return false;
+      }
+    }, `${name} must be a valid URL`);
 }
 
 function optionalUrlString(name: string) {
@@ -104,16 +107,18 @@ function optionalUrlString(name: string) {
           return false;
         }
       }, `${name} must be a valid URL`)
-      .optional(),
+      .optional()
   );
 }
 
 function integerEnv(name: string, min: number, max?: number) {
   const schema = z.preprocess(
     parseInteger,
-    z.number().int(`${name} must be an integer`).min(min, `${name} must be at least ${min}`),
+    z.number().int(`${name} must be an integer`).min(min, `${name} must be at least ${min}`)
   );
-  return max === undefined ? schema : schema.pipe(z.number().max(max, `${name} must be at most ${max}`));
+  return max === undefined
+    ? schema
+    : schema.pipe(z.number().max(max, `${name} must be at most ${max}`));
 }
 
 function booleanEnv() {
@@ -123,7 +128,7 @@ function booleanEnv() {
 function optionalString(name: string) {
   return z.preprocess(
     (value) => (value === '' ? undefined : value),
-    z.string().min(1, `${name} cannot be empty`).optional(),
+    z.string().min(1, `${name} cannot be empty`).optional()
   );
 }
 
@@ -136,17 +141,22 @@ function requiredStellarContractAddress(name: string) {
     .refine(isValidStellarContractAddress, `${name} must be a valid Stellar contract StrKey`);
 }
 
-function resolvedStellarNetwork(env: { NODE_ENV: NodeEnv; STELLAR_NETWORK?: PinnedStellarNetwork }): PinnedStellarNetwork {
+function resolvedStellarNetwork(env: {
+  NODE_ENV: NodeEnv;
+  STELLAR_NETWORK?: StellarNetwork;
+}): StellarNetwork {
   return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
 }
 
 function validatePinnedAddress(
   ctx: z.RefinementCtx,
-  network: PinnedStellarNetwork,
+  network: StellarNetwork,
   kind: PinnedStellarAddressKind,
   path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
-  address: string,
+  address: string
 ): void {
+  if (network === 'local') return;
+
   const pinnedNetwork = getPinnedAddressNetwork(kind, address);
 
   if (pinnedNetwork === network) return;
@@ -161,99 +171,90 @@ function validatePinnedAddress(
   });
 }
 
-export const EnvSchema = z.object({
-  NODE_ENV: z.enum(['development', 'staging', 'production', 'test']).default('development'),
-  PORT: integerEnv('PORT', 1, 65535).default(3000),
+export const EnvSchema = z
+  .object({
+    NODE_ENV: z.enum(['development', 'staging', 'production', 'test']).default('development'),
+    PORT: integerEnv('PORT', 1, 65535).default(3000),
 
-  DATABASE_URL: urlString('DATABASE_URL'),
-  DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
-  DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
-  DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
-  DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
-  DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
-  SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
-  STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
-  /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. 0 = disabled. */
-  REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
-  /** Max requests allowed to queue on the replica pool before fast-failing. */
-  REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(25),
+    DATABASE_URL: urlString('DATABASE_URL'),
+    DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
+    DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
+    DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
+    DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
+    DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
+    SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
+    STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+    /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. 0 = disabled. */
+    REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
+    /** Max requests allowed to queue on the replica pool before fast-failing. */
+    REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(25),
 
-  REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
-  REDIS_ENABLED: booleanEnv().default(true),
-  REDIS_MODE: z.enum(['standalone', 'sentinel', 'cluster']).default('standalone'),
-  // Comma-separated list of sentinel nodes: host:port,host:port
-  REDIS_SENTINEL_HOSTS: optionalString('REDIS_SENTINEL_HOSTS'),
-  // Sentinel master name (required when REDIS_MODE=sentinel)
-  REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
-  // Comma-separated list of cluster nodes: host:port,host:port
-  REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
+    REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
+    REDIS_ENABLED: booleanEnv().default(true),
+    REDIS_MODE: z.enum(['standalone', 'sentinel', 'cluster']).default('standalone'),
+    // Comma-separated list of sentinel nodes: host:port,host:port
+    REDIS_SENTINEL_HOSTS: optionalString('REDIS_SENTINEL_HOSTS'),
+    // Sentinel master name (required when REDIS_MODE=sentinel)
+    REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
+    // Comma-separated list of cluster nodes: host:port,host:port
+    REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
 
-  STELLAR_NETWORK: z.enum(['testnet', 'mainnet']).optional(),
-  STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
-  STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
-  HORIZON_URL: optionalUrlString('HORIZON_URL'),
-  HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
-  CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
-  STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
-  STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(10000),
-  STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(3),
-  STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
+    STELLAR_NETWORK: z.enum(['testnet', 'mainnet', 'local']).optional(),
+    STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
+    STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
+    HORIZON_URL: optionalUrlString('HORIZON_URL'),
+    HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
+    CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
+    STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
+    STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(10000),
+    STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(3),
+    STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
 
-  JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
-  PGCRYPTO_KEY: z.preprocess(
-    (value) => (value === '' ? undefined : value),
-    z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional(),
-  ),
-  PGCRYPTO_KEY_PREVIOUS: z.preprocess(
-    (value) => (value === '' ? undefined : value),
-    z.string().min(32, 'PGCRYPTO_KEY_PREVIOUS must be at least 32 characters').optional(),
-  ),
-  JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
-  API_KEYS: z.string().optional(),
-  /**
-   * Server-side pepper mixed into every API-key hash. Keeping it out of the
-   * database means a leaked `api_keys` table cannot be brute-forced offline.
-   * Optional so non-API-key deployments still boot; required at runtime by the
-   * hashing helpers, which fail closed when it is absent.
-   */
-  API_KEY_PEPPER: z.preprocess(
-    (value) => (value === '' ? undefined : value),
-    z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional(),
-  ),
-  INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
-  ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
+    JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+    PGCRYPTO_KEY: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional()
+    ),
+    PGCRYPTO_KEY_PREVIOUS: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'PGCRYPTO_KEY_PREVIOUS must be at least 32 characters').optional()
+    ),
+    JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
+    API_KEYS: z.string().optional(),
+    /**
+     * Server-side pepper mixed into every API-key hash. Keeping it out of the
+     * database means a leaked `api_keys` table cannot be brute-forced offline.
+     * Optional so non-API-key deployments still boot; required at runtime by the
+     * hashing helpers, which fail closed when it is absent.
+     */
+    API_KEY_PEPPER: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional()
+    ),
+    INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
+    ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
-  /** OIDC issuer base URL, e.g. https://accounts.example.com. JWKS is fetched
-   *  from `${OIDC_ISSUER_URL}/.well-known/jwks.json`. Unset disables OIDC login. */
-  OIDC_ISSUER_URL: optionalUrlString('OIDC_ISSUER_URL'),
-  /** Expected `aud` (client_id) claim on OIDC ID tokens. */
-  OIDC_AUDIENCE: optionalString('OIDC_AUDIENCE'),
+    /** OIDC issuer base URL, e.g. https://accounts.example.com. JWKS is fetched
+     *  from `${OIDC_ISSUER_URL}/.well-known/jwks.json`. Unset disables OIDC login. */
+    OIDC_ISSUER_URL: optionalUrlString('OIDC_ISSUER_URL'),
+    /** Expected `aud` (client_id) claim on OIDC ID tokens. */
+    OIDC_AUDIENCE: optionalString('OIDC_AUDIENCE'),
 
-  MAX_REQUEST_SIZE: z.preprocess(
-    byteSizeToNumber,
-    z.number().int('MAX_REQUEST_SIZE must resolve to whole bytes').positive('MAX_REQUEST_SIZE must be positive'),
-  ).default(1024 * 1024),
-  MAX_JSON_DEPTH: integerEnv('MAX_JSON_DEPTH', 1, 1000).default(20),
-  REQUEST_TIMEOUT_MS: integerEnv('REQUEST_TIMEOUT_MS', 1000, 300000).default(30000),
+    MAX_REQUEST_SIZE: z
+      .preprocess(
+        byteSizeToNumber,
+        z
+          .number()
+          .int('MAX_REQUEST_SIZE must resolve to whole bytes')
+          .positive('MAX_REQUEST_SIZE must be positive')
+      )
+      .default(1024 * 1024),
+    MAX_JSON_DEPTH: integerEnv('MAX_JSON_DEPTH', 1, 1000).default(20),
+    REQUEST_TIMEOUT_MS: integerEnv('REQUEST_TIMEOUT_MS', 1000, 300000).default(30000),
 
-  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-  METRICS_ENABLED: booleanEnv().default(true),
-  CORS_ALLOWED_ORIGINS: optionalString('CORS_ALLOWED_ORIGINS'),
-
-  TRACING_ENABLED: booleanEnv().default(false),
-  TRACING_SAMPLE_RATE: z.preprocess(
-    parseNumber,
-    z.number().min(0, 'TRACING_SAMPLE_RATE must be at least 0').max(1, 'TRACING_SAMPLE_RATE must be at most 1'),
-  ).default(1),
-  TRACING_SAMPLING_STRATEGY: z.enum(['head', 'tail', 'always', 'never']).default('head'),
-  TRACING_HEAD_SAMPLE_RATE: z.preprocess(
-    parseNumber,
-    z.number().min(0, 'TRACING_HEAD_SAMPLE_RATE must be at least 0').max(1, 'TRACING_HEAD_SAMPLE_RATE must be at most 1'),
-  ).optional(),
-  TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
-  TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
-  TRACING_OTEL_ENABLED: booleanEnv().default(false),
-  TRACING_LOG_EVENTS: booleanEnv().default(false),
+    LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+    METRICS_ENABLED: booleanEnv().default(true),
+    CORS_ALLOWED_ORIGINS: optionalString('CORS_ALLOWED_ORIGINS'),
 
   WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
   WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
@@ -266,153 +267,210 @@ export const EnvSchema = z.object({
   WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv('WEBHOOK_CIRCUIT_BREAKER_THRESHOLD', 0, 1000).default(0),
   WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(300_000),
   WEBHOOK_ALLOWED_HOSTS: optionalString('WEBHOOK_ALLOWED_HOSTS'),
-  WEBHOOK_MAX_RESPONSE_BYTES: z.preprocess(
-    byteSizeToNumber,
-    z.number().int('WEBHOOK_MAX_RESPONSE_BYTES must resolve to whole bytes').positive('WEBHOOK_MAX_RESPONSE_BYTES must be positive'),
-  ).default(64 * 1024),
-  WEBHOOK_DNS_TIMEOUT_MS: integerEnv('WEBHOOK_DNS_TIMEOUT_MS', 1).default(2000),
 
-  ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
-  ENABLE_RATE_LIMIT: booleanEnv().optional(),
-  REQUIRE_PARTNER_AUTH: booleanEnv().default(false),
-  PARTNER_API_TOKEN: optionalString('PARTNER_API_TOKEN'),
-  REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
-  ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
-  WS_AUTH_REQUIRED: booleanEnv().default(false),
-  SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
-  SSE_MAX_CONNECTIONS_PER_API_KEY: integerEnv('SSE_MAX_CONNECTIONS_PER_API_KEY', 1, 100_000).default(50),
-  SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
-  SSE_MAX_CONNECTION_DURATION_MS: integerEnv('SSE_MAX_CONNECTION_DURATION_MS', 1, 86_400_000).default(30 * 60 * 1000),
-  SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
-  /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
-  SSE_RETRY_MS: integerEnv('SSE_RETRY_MS', 100, 300_000).default(5000),
-   /** Interval in milliseconds between SSE heartbeat comments per connection. */
-   SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(30_000),
-   /** Milliseconds to wait for each SSE connection to drain during shutdown before force-closing. */
-   SSE_DRAIN_TIMEOUT_MS: integerEnv('SSE_DRAIN_TIMEOUT_MS', 1_000, 60_000).default(30_000),
-   INDEXER_ENABLED: booleanEnv().default(false),
-   WORKER_ENABLED: booleanEnv().default(false),
-   /** Per-checker timeout for HealthCheckManager. Must be strictly greater than 0. */
-   HEALTH_CHECK_TIMEOUT_MS: integerEnv('HEALTH_CHECK_TIMEOUT_MS', 1).default(5000),
-   /** Interval between background health-check runs. Must be strictly greater than 0. */
-   HEALTH_CHECK_INTERVAL_MS: integerEnv('HEALTH_CHECK_INTERVAL_MS', 1).default(30000),
-   /** Enables the grpc.health.v1.Health service for Kubernetes-native gRPC probes. */
-   GRPC_HEALTH_ENABLED: booleanEnv().default(false),
-   /** Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). */
-   GRPC_HEALTH_PORT: integerEnv('GRPC_HEALTH_PORT', 1, 65535).default(50051),
-   /** Enables the optional gRPC transcoding gateway for indexer communication. Default off. */
-   GRPC_GATEWAY_ENABLED: booleanEnv().default(false),
-   /** Port the gRPC indexer gateway binds to when enabled. */
-   GRPC_GATEWAY_PORT: integerEnv('GRPC_GATEWAY_PORT', 1, 65535).default(50052),
-   /** When true, reject non-TLS indexer worker connections (fail-closed). Defaults to true in production, false otherwise. */
-   INDEXER_MTLS_REQUIRED: booleanEnv().optional(),
-   INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(5 * 60 * 1000),
-   INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
-  DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
-  ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
-  RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
-  RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
-  RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
-  RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
-  IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
+    WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
+    WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
+    WEBHOOK_SECRET_PREVIOUS: optionalString('WEBHOOK_SECRET_PREVIOUS'),
+    FLUXORA_WEBHOOK_SECRET: optionalString('FLUXORA_WEBHOOK_SECRET'),
+    FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
+    WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
+    WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+    WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
+    WEBHOOK_RETRY_BURST: integerEnv('WEBHOOK_RETRY_BURST', 0).default(0),
+    WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv(
+      'WEBHOOK_CIRCUIT_BREAKER_THRESHOLD',
+      0,
+      1000
+    ).default(0),
+    WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(
+      300_000
+    ),
+    WEBHOOK_ALLOWED_HOSTS: optionalString('WEBHOOK_ALLOWED_HOSTS'),
+    WEBHOOK_MAX_RESPONSE_BYTES: z
+      .preprocess(
+        byteSizeToNumber,
+        z
+          .number()
+          .int('WEBHOOK_MAX_RESPONSE_BYTES must resolve to whole bytes')
+          .positive('WEBHOOK_MAX_RESPONSE_BYTES must be positive')
+      )
+      .default(64 * 1024),
+    WEBHOOK_DNS_TIMEOUT_MS: integerEnv('WEBHOOK_DNS_TIMEOUT_MS', 1).default(2000),
 
-  RATE_LIMIT_ENABLED: booleanEnv().default(true),
-  RATE_LIMIT_IP_WINDOW_MS: integerEnv('RATE_LIMIT_IP_WINDOW_MS', 1).optional(),
-  RATE_LIMIT_IP_MAX: integerEnv('RATE_LIMIT_IP_MAX', 1).optional(),
-  RATE_LIMIT_APIKEY_WINDOW_MS: integerEnv('RATE_LIMIT_APIKEY_WINDOW_MS', 1).optional(),
-  RATE_LIMIT_APIKEY_MAX: integerEnv('RATE_LIMIT_APIKEY_MAX', 1).optional(),
-  RATE_LIMIT_ADMIN_WINDOW_MS: integerEnv('RATE_LIMIT_ADMIN_WINDOW_MS', 1).optional(),
-  RATE_LIMIT_ADMIN_MAX: integerEnv('RATE_LIMIT_ADMIN_MAX', 1).optional(),
-  RATE_LIMIT_TRUST_PROXY: booleanEnv().default(true),
-  RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
-  AWS_REGION: optionalString('AWS_REGION'),
-  AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
+    ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
+    ENABLE_RATE_LIMIT: booleanEnv().optional(),
+    REQUIRE_PARTNER_AUTH: booleanEnv().default(false),
+    PARTNER_API_TOKEN: optionalString('PARTNER_API_TOKEN'),
+    REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
+    ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
+    WS_AUTH_REQUIRED: booleanEnv().default(false),
+    SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+    SSE_MAX_CONNECTIONS_PER_API_KEY: integerEnv(
+      'SSE_MAX_CONNECTIONS_PER_API_KEY',
+      1,
+      100_000
+    ).default(50),
+    SSE_MAX_GLOBAL_CONNECTIONS: integerEnv('SSE_MAX_GLOBAL_CONNECTIONS', 1, 100_000).default(1000),
+    SSE_MAX_CONNECTION_DURATION_MS: integerEnv(
+      'SSE_MAX_CONNECTION_DURATION_MS',
+      1,
+      86_400_000
+    ).default(30 * 60 * 1000),
+    SSE_RETRY_AFTER_SECONDS: integerEnv('SSE_RETRY_AFTER_SECONDS', 1, 86_400).default(15),
+    /** Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). */
+    SSE_RETRY_MS: integerEnv('SSE_RETRY_MS', 100, 300_000).default(5000),
+    /** Interval in milliseconds between SSE heartbeat comments per connection. */
+    SSE_HEARTBEAT_INTERVAL_MS: integerEnv('SSE_HEARTBEAT_INTERVAL_MS', 100, 300_000).default(
+      30_000
+    ),
+    /** Milliseconds to wait for each SSE connection to drain during shutdown before force-closing. */
+    SSE_DRAIN_TIMEOUT_MS: integerEnv('SSE_DRAIN_TIMEOUT_MS', 1_000, 60_000).default(30_000),
+    INDEXER_ENABLED: booleanEnv().default(false),
+    WORKER_ENABLED: booleanEnv().default(false),
+    /** Per-checker timeout for HealthCheckManager. Must be strictly greater than 0. */
+    HEALTH_CHECK_TIMEOUT_MS: integerEnv('HEALTH_CHECK_TIMEOUT_MS', 1).default(5000),
+    /** Interval between background health-check runs. Must be strictly greater than 0. */
+    HEALTH_CHECK_INTERVAL_MS: integerEnv('HEALTH_CHECK_INTERVAL_MS', 1).default(30000),
+    /** Enables the grpc.health.v1.Health service for Kubernetes-native gRPC probes. */
+    GRPC_HEALTH_ENABLED: booleanEnv().default(false),
+    /** Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). */
+    GRPC_HEALTH_PORT: integerEnv('GRPC_HEALTH_PORT', 1, 65535).default(50051),
+    /** Enables the optional gRPC transcoding gateway for indexer communication. Default off. */
+    GRPC_GATEWAY_ENABLED: booleanEnv().default(false),
+    /** Port the gRPC indexer gateway binds to when enabled. */
+    GRPC_GATEWAY_PORT: integerEnv('GRPC_GATEWAY_PORT', 1, 65535).default(50052),
+    /** When true, reject non-TLS indexer worker connections (fail-closed). Defaults to true in production, false otherwise. */
+    INDEXER_MTLS_REQUIRED: booleanEnv().optional(),
+    INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(
+      5 * 60 * 1000
+    ),
+    INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
+    DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
+    ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
+    RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
+    RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
+    RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
+    RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+    IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
-  // S3 Backup Retention Configuration
-  S3_BACKUP_BUCKET: optionalString('S3_BACKUP_BUCKET'),
-  S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
+    RATE_LIMIT_ENABLED: booleanEnv().default(true),
+    RATE_LIMIT_IP_WINDOW_MS: integerEnv('RATE_LIMIT_IP_WINDOW_MS', 1).optional(),
+    RATE_LIMIT_IP_MAX: integerEnv('RATE_LIMIT_IP_MAX', 1).optional(),
+    RATE_LIMIT_APIKEY_WINDOW_MS: integerEnv('RATE_LIMIT_APIKEY_WINDOW_MS', 1).optional(),
+    RATE_LIMIT_APIKEY_MAX: integerEnv('RATE_LIMIT_APIKEY_MAX', 1).optional(),
+    RATE_LIMIT_ADMIN_WINDOW_MS: integerEnv('RATE_LIMIT_ADMIN_WINDOW_MS', 1).optional(),
+    RATE_LIMIT_ADMIN_MAX: integerEnv('RATE_LIMIT_ADMIN_MAX', 1).optional(),
+    RATE_LIMIT_TRUST_PROXY: booleanEnv().default(true),
+    RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
+    AWS_REGION: optionalString('AWS_REGION'),
+    AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
 
-  FLUXORA_SHUTDOWN: booleanEnv().optional(),
+    // S3 Backup Retention Configuration
+    S3_BACKUP_BUCKET: optionalString('S3_BACKUP_BUCKET'),
+    S3_BACKUP_PREFIX: optionalString('S3_BACKUP_PREFIX'),
 
-  /**
-   * Tiered startup dependency probing.
-   *
-   * STARTUP_PROBE_BUDGET_MS          — total wall-clock budget for soft-tier
-   *                                    retries (Redis, Stellar RPC) before the
-   *                                    service falls back to degraded mode.
-   *                                    Default: 30 000 ms.
-   * STARTUP_PROBE_POSTGRES_TIMEOUT_MS — per-attempt timeout for the single
-   *                                    Postgres (hard-tier) probe.
-   *                                    Default: 5 000 ms.
-   * STARTUP_PROBE_REDIS_TIMEOUT_MS   — per-attempt timeout for each Redis
-   *                                    (soft-tier) retry attempt.
-   *                                    Default: 3 000 ms.
-   * STARTUP_PROBE_STELLAR_TIMEOUT_MS — per-attempt timeout for each Stellar
-   *                                    RPC (soft-tier) retry attempt.
-   *                                    Default: 5 000 ms.
-   */
-  STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1).default(30_000),
-  STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(5_000),
-  STARTUP_PROBE_REDIS_TIMEOUT_MS: integerEnv('STARTUP_PROBE_REDIS_TIMEOUT_MS', 1).default(3_000),
-  STARTUP_PROBE_STELLAR_TIMEOUT_MS: integerEnv('STARTUP_PROBE_STELLAR_TIMEOUT_MS', 1).default(5_000),
+    FLUXORA_SHUTDOWN: booleanEnv().optional(),
 
-  /**
-   * Percentage of traffic (0–100) to route through the canary code path.
-   * 0 disables canary tagging entirely (default). Set to e.g. 10 to tag
-   * 10 % of clients deterministically as canary based on a SHA-256 hash
-   * of their identity (API key or IP).
-   */
-  CANARY_TRAFFIC_PERCENT: integerEnv('CANARY_TRAFFIC_PERCENT', 0, 100).default(0),
-}).passthrough().superRefine((env, ctx) => {
-  const stellarNetwork = resolvedStellarNetwork(env);
-  const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
+    /**
+     * Tiered startup dependency probing.
+     *
+     * STARTUP_PROBE_BUDGET_MS          — total wall-clock budget for soft-tier
+     *                                    retries (Redis, Stellar RPC) before the
+     *                                    service falls back to degraded mode.
+     *                                    Default: 30 000 ms.
+     * STARTUP_PROBE_POSTGRES_TIMEOUT_MS — per-attempt timeout for the single
+     *                                    Postgres (hard-tier) probe.
+     *                                    Default: 5 000 ms.
+     * STARTUP_PROBE_REDIS_TIMEOUT_MS   — per-attempt timeout for each Redis
+     *                                    (soft-tier) retry attempt.
+     *                                    Default: 3 000 ms.
+     * STARTUP_PROBE_STELLAR_TIMEOUT_MS — per-attempt timeout for each Stellar
+     *                                    RPC (soft-tier) retry attempt.
+     *                                    Default: 5 000 ms.
+     */
+    STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1).default(30_000),
+    STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(
+      5_000
+    ),
+    STARTUP_PROBE_REDIS_TIMEOUT_MS: integerEnv('STARTUP_PROBE_REDIS_TIMEOUT_MS', 1).default(3_000),
+    STARTUP_PROBE_STELLAR_TIMEOUT_MS: integerEnv('STARTUP_PROBE_STELLAR_TIMEOUT_MS', 1).default(
+      5_000
+    ),
 
-  if (env.HORIZON_NETWORK_PASSPHRASE !== undefined && env.HORIZON_NETWORK_PASSPHRASE !== expectedPassphrase) {
-    ctx.addIssue({
-      code: 'custom',
-      path: ['HORIZON_NETWORK_PASSPHRASE'],
-      message: `HORIZON_NETWORK_PASSPHRASE must match ${stellarNetwork} passphrase`,
-    });
-  }
+    /**
+     * Percentage of traffic (0–100) to route through the canary code path.
+     * 0 disables canary tagging entirely (default). Set to e.g. 10 to tag
+     * 10 % of clients deterministically as canary based on a SHA-256 hash
+     * of their identity (API key or IP).
+     */
+    CANARY_TRAFFIC_PERCENT: integerEnv('CANARY_TRAFFIC_PERCENT', 0, 100).default(0),
+  })
+  .passthrough()
+  .superRefine((env, ctx) => {
+    const stellarNetwork = resolvedStellarNetwork(env);
+    const expectedPassphrase = STELLAR_NETWORK_PASSPHRASES[stellarNetwork];
 
-  validatePinnedAddress(ctx, stellarNetwork, 'contract', 'STELLAR_CONTRACT_ADDRESS', env.STELLAR_CONTRACT_ADDRESS);
-  validatePinnedAddress(ctx, stellarNetwork, 'token', 'STELLAR_TOKEN_ADDRESS', env.STELLAR_TOKEN_ADDRESS);
-
-  const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
-  if (hasApiKeys && env.API_KEY_PEPPER === undefined) {
-    ctx.addIssue({
-      code: 'custom',
-      path: ['API_KEY_PEPPER'],
-      message: 'API_KEY_PEPPER is required when API_KEYS is configured',
-    });
-  }
-
-  if (env.NODE_ENV === 'production') {
-    if (env.LOG_LEVEL === 'debug') {
+    if (
+      env.HORIZON_NETWORK_PASSPHRASE !== undefined &&
+      env.HORIZON_NETWORK_PASSPHRASE !== expectedPassphrase
+    ) {
       ctx.addIssue({
         code: 'custom',
-        path: ['LOG_LEVEL'],
-        message: 'LOG_LEVEL must not be "debug" in production',
+        path: ['HORIZON_NETWORK_PASSPHRASE'],
+        message: `HORIZON_NETWORK_PASSPHRASE must match ${stellarNetwork} passphrase`,
       });
     }
 
-    if (env.CORS_ALLOWED_ORIGINS !== undefined && env.CORS_ALLOWED_ORIGINS.includes('*')) {
+    validatePinnedAddress(
+      ctx,
+      stellarNetwork,
+      'contract',
+      'STELLAR_CONTRACT_ADDRESS',
+      env.STELLAR_CONTRACT_ADDRESS
+    );
+    validatePinnedAddress(
+      ctx,
+      stellarNetwork,
+      'token',
+      'STELLAR_TOKEN_ADDRESS',
+      env.STELLAR_TOKEN_ADDRESS
+    );
+
+    const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
+    if (hasApiKeys && env.API_KEY_PEPPER === undefined) {
       ctx.addIssue({
         code: 'custom',
-        path: ['CORS_ALLOWED_ORIGINS'],
-        message: 'CORS_ALLOWED_ORIGINS must not contain a wildcard "*" origin in production',
+        path: ['API_KEY_PEPPER'],
+        message: 'API_KEY_PEPPER is required when API_KEYS is configured',
       });
     }
 
-    if (env.PGCRYPTO_KEY === undefined || env.PGCRYPTO_KEY.length < 32) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['PGCRYPTO_KEY'],
-        message: 'PGCRYPTO_KEY is required in production (minimum 32 characters)',
-      });
+    if (env.NODE_ENV === 'production') {
+      if (env.LOG_LEVEL === 'debug') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['LOG_LEVEL'],
+          message: 'LOG_LEVEL must not be "debug" in production',
+        });
+      }
+
+      if (env.CORS_ALLOWED_ORIGINS !== undefined && env.CORS_ALLOWED_ORIGINS.includes('*')) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['CORS_ALLOWED_ORIGINS'],
+          message: 'CORS_ALLOWED_ORIGINS must not contain a wildcard "*" origin in production',
+        });
+      }
+
+      if (env.PGCRYPTO_KEY === undefined || env.PGCRYPTO_KEY.length < 32) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['PGCRYPTO_KEY'],
+          message: 'PGCRYPTO_KEY is required in production (minimum 32 characters)',
+        });
+      }
     }
-  }
-});
+  });
 
 type ParsedEnv = z.infer<typeof EnvSchema>;
 
@@ -488,9 +546,7 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
-  webhookAllowedHosts: string[] | undefined;
-  webhookMaxResponseBytes: number;
-  webhookDnsTimeoutMs: number;
+  webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -607,10 +663,6 @@ function resolveNetwork(env: ParsedEnv): StellarNetwork {
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
-  if (network !== 'testnet' && network !== 'mainnet') {
-    throw new EnvironmentError(`STELLAR_NETWORK: ${network} is not supported for pinned contract configuration`);
-  }
-
   return {
     streaming: env.STELLAR_CONTRACT_ADDRESS,
     contract: env.STELLAR_CONTRACT_ADDRESS,
@@ -691,8 +743,6 @@ function toConfig(env: ParsedEnv): Config {
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
       ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
       : undefined,
-    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
-    webhookDnsTimeoutMs: env.WEBHOOK_DNS_TIMEOUT_MS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
@@ -804,7 +854,12 @@ export interface HotConfig {
  * If any of these change between the startup snapshot and a SIGHUP, a WARN
  * is emitted but the new value is intentionally not applied.
  */
-const RESTART_ONLY_KEYS = ['DATABASE_URL', 'REDIS_URL', 'JWT_SECRET', 'INDEXER_WORKER_TOKEN'] as const;
+const RESTART_ONLY_KEYS = [
+  'DATABASE_URL',
+  'REDIS_URL',
+  'JWT_SECRET',
+  'INDEXER_WORKER_TOKEN',
+] as const;
 type RestartOnlyKey = (typeof RESTART_ONLY_KEYS)[number];
 
 /** Snapshot of restart-only env values captured at process startup. */
@@ -850,10 +905,9 @@ export function reloadHotConfig(): HotConfig {
     const original = startupEnvSnapshot![key];
     const current = process.env[key];
     if (current !== original) {
-      warn(
-        `SIGHUP: restart-only variable ${key} changed — restart required to apply`,
-        { variable: key },
-      );
+      warn(`SIGHUP: restart-only variable ${key} changed — restart required to apply`, {
+        variable: key,
+      });
     }
   }
 

@@ -13,6 +13,7 @@
 
 import { Router } from 'express';
 import type { Request, Response, NextFunction } from 'express';
+import express from 'express';
 import {
   STREAM_FIELD_POLICIES,
   REQUEST_FIELD_POLICIES,
@@ -34,12 +35,15 @@ import {
   notFound,
   serviceUnavailable,
   validationError,
+  tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { successResponse } from '../utils/response.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { recordAuditEventToDb, recordErasureAuditLog } from '../lib/auditLog.js';
+import { hashStringSHA256 } from '../lib/security.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
+import { requireJsonContentType } from '../middleware/contentType.js';
 
 export const privacyRouter = Router();
 
@@ -85,6 +89,10 @@ function privacyHeaders(_req: Request, res: Response, next: NextFunction): void 
 }
 
 privacyRouter.use(privacyHeaders);
+
+// Apply content-type enforcement and body-size limits to all privacy routes
+privacyRouter.use(requireJsonContentType);
+privacyRouter.use(express.json({ limit: '256kb' }));
 
 /** Build a route-scoped 405 handler with an explicit Allow header. */
 function rejectUnsupportedMethods(allowedMethods: string[]) {
@@ -441,7 +449,7 @@ privacyRouter.delete(
     const pool = getPool();
     const requesterUser = (req as any).user;
     const requesterRole = requesterUser?.role ?? 'admin';
-    const requestedBy = requesterUser?.address ?? (req.headers.authorization ?? '').substring(0, 16) + '…';
+    const requestedBy = requesterUser?.address ?? (req.headers.authorization ? hashStringSHA256(req.headers.authorization) : '');
 
     try {
       let rowsErased = 0;
@@ -546,3 +554,8 @@ privacyRouter.delete(
     }
   },
 );
+// The DELETE exemption from the router's GET/HEAD-only convention is scoped to
+// exactly this route+method pair. Any other method on /erasure/:recipientAddress
+// gets a 405, and a future route added under /erasure/* must register its own
+// method restriction rather than silently inheriting an exemption.
+privacyRouter.all('/erasure/:recipientAddress', rejectUnsupportedMethods(['DELETE']));

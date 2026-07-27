@@ -44,11 +44,11 @@ To protect browser-originated clients (such as dashboard applications) against C
    - **Cookie-Authenticated Sessions**: Requests that rely on ambient browser cookies (and do not supply Bearer or API-key credentials) MUST present both the `fluxora_csrf` cookie and matching `X-CSRF-Token` header.
 
 3. **Constant-Time Token Comparison**:
-   Token comparison is executed in constant time using Node.js `crypto.timingSafeEqual` with byte-length matching (identical to `src/webhooks/signature.ts`) to prevent timing side-channel attacks:
+   Token comparison is executed in constant time using the same HMAC-SHA256 approach as `src/webhooks/signature.ts`. Both inputs are HMAC-hashed before comparison with `crypto.timingSafeEqual` to eliminate timing side-channels from variable-length inputs:
    ```ts
-   const bufA = Buffer.from(cookieToken, 'utf8');
-   const bufB = Buffer.from(headerToken, 'utf8');
-   const isValid = bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+   const hashA = createHmac('sha256', key).update(cookieToken).digest('hex');
+   const hashB = createHmac('sha256', key).update(headerToken).digest('hex');
+   const isValid = timingSafeEqual(Buffer.from(hashA, 'utf8'), Buffer.from(hashB, 'utf8'));
    ```
 
 4. **Error Handling**:

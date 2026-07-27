@@ -150,20 +150,15 @@ Add to your environment configuration:
 ```bash
 # Optional: Restrict webhook delivery to specific hosts
 WEBHOOK_ALLOWED_HOSTS=api.example.com,*.trusted.com
-
-# Optional: Webhook DNS resolution timeout (in milliseconds)
-WEBHOOK_DNS_TIMEOUT_MS=2000
 ```
 
 ### Error handling
 
 SSRF validation failures are logged without exposing the full URL for security. The validation fails closed: any ambiguous or unresolvable target is rejected with a `WebhookTargetValidationError`.
 
-If DNS resolution times out or is aborted, it is rejected with a `WebhookTargetValidationError` containing a `DNS_TIMEOUT` code, which fails closed.
-
 ### Implementation details
 
 - Validation function: `validateWebhookTarget(url, options)` in `src/webhooks/ssrfGuard.ts`
 - Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
 - Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
-- DNS resolution: Uses Node.js `dns.promises.lookup()` wrapped with a custom timeout helper and `AbortController` bounded by `WEBHOOK_DNS_TIMEOUT_MS` (default `2000` ms).
+- DNS resolution: Uses Node.js `dns.promises.lookup()`

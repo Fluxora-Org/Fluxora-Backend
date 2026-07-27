@@ -25,6 +25,8 @@ declare global {
       isCanary?: boolean;
       /** Attached by authenticateApiKey middleware; the api_keys.id (cuid2). */
       keyId?: string;
+      /** Attached by authLockoutMiddleware; the AuthAttemptStore instance for recording auth failures. */
+      authAttemptStore?: import('../redis/authAttemptStore.js').AuthAttemptStore;
     }
   }
 }

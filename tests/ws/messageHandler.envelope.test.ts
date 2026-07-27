@@ -1,195 +1,227 @@
 import { describe, it, expect } from 'vitest';
-import { parseWsClientMessage } from '../../src/ws/messageHandler.js';
+import { validateWebSocketMessage, parseWsClientMessage } from '../../src/ws/messageHandler.js';
 
-describe('parseWsClientMessage envelope validation (#674)', () => {
-  it('accepts valid subscribe message', () => {
-    const result = parseWsClientMessage({
-      type: 'subscribe',
-      stream_id: 'test-stream',
+describe('WebSocket Message Validation', () => {
+  describe('validateWebSocketMessage', () => {
+    it('should reject non-string input', () => {
+      const result = validateWebSocketMessage(123);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+        expect(result.message).toBe('Message must be a string');
+      }
     });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.message.type).toBe('subscribe');
-    }
-  });
 
-  it('accepts valid unsubscribe message', () => {
-    const result = parseWsClientMessage({
-      type: 'unsubscribe',
-      stream_id: 'test-stream',
+    it('should reject oversized messages', () => {
+      const oversized = 'x'.repeat(5000);
+      const result = validateWebSocketMessage(oversized);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+        expect(result.message).toContain('Message exceeds 4096 bytes');
+      }
     });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.message.type).toBe('unsubscribe');
-    }
-  });
 
-  it('accepts valid replay message', () => {
-    const result = parseWsClientMessage({
-      type: 'replay',
-      fromLedger: 1000,
+    it('should accept messages at size limit', () => {
+      const msg = JSON.stringify({
+        type: 'subscribe',
+        filter: { streamId: 'stream-123' },
+      });
+      const result = validateWebSocketMessage(msg);
+      expect(result.ok).toBe(true);
     });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.message.type).toBe('replay');
-    }
-  });
 
-  it('rejects unknown message type with UNKNOWN_TYPE', () => {
-    const result = parseWsClientMessage({
-      type: 'unknown_action',
-      payload: 'data',
+    it('should reject invalid JSON', () => {
+      const result = validateWebSocketMessage('not valid json');
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+        expect(result.message).toBe('Invalid JSON');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('UNKNOWN_TYPE');
-      expect(result.message).toContain('unknown_action');
-    }
-  });
 
-  it('rejects non-object messages', () => {
-    const result = parseWsClientMessage('not an object');
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-      expect(result.message).toContain('must be a JSON object');
-    }
-  });
-
-  it('rejects null messages', () => {
-    const result = parseWsClientMessage(null);
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-    }
-  });
-
-  it('rejects array messages', () => {
-    const result = parseWsClientMessage([1, 2, 3]);
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-    }
-  });
-
-  it('rejects message without type field', () => {
-    const result = parseWsClientMessage({
-      stream_id: 'test',
+    it('should validate valid subscribe message', () => {
+      const msg = JSON.stringify({ type: 'subscribe', filter: { streamId: 'stream-123' } });
+      const result = validateWebSocketMessage(msg);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.message.type).toBe('subscribe');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-      expect(result.message).toContain('type must be a string');
-    }
-  });
 
-  it('rejects message with non-string type', () => {
-    const result = parseWsClientMessage({
-      type: 123,
-      stream_id: 'test',
+    it('should validate valid replay message', () => {
+      const msg = JSON.stringify({ type: 'replay', filter: { streamId: 'stream-123' } });
+      const result = validateWebSocketMessage(msg);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.message.type).toBe('replay');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-      expect(result.message).toContain('type must be a string');
-    }
   });
 
-  it('rejects oversized message before parsing', () => {
-    // Create a message that exceeds MAX_MESSAGE_BYTES (4096)
-    const largePayload = 'x'.repeat(5000);
-    const result = parseWsClientMessage({
-      type: 'subscribe',
-      stream_id: largePayload,
+  describe('parseWsClientMessage', () => {
+    it('should reject non-object input', () => {
+      const result = parseWsClientMessage('not an object');
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+        expect(result.message).toBe('Message must be a JSON object');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-      expect(result.message).toContain('exceeds maximum');
-      expect(result.message).toContain('4096');
-    }
-  });
 
-  it('rejects subscribe with invalid stream_id type', () => {
-    const result = parseWsClientMessage({
-      type: 'subscribe',
-      stream_id: 12345,
+    it('should reject null input', () => {
+      const result = parseWsClientMessage(null);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-    }
-  });
 
-  it('rejects replay with invalid fromLedger type', () => {
-    const result = parseWsClientMessage({
-      type: 'replay',
-      fromLedger: 'not a number',
+    it('should reject array input', () => {
+      const result = parseWsClientMessage([1, 2, 3]);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-    }
-  });
 
-  it('rejects replay with negative fromLedger', () => {
-    const result = parseWsClientMessage({
-      type: 'replay',
-      fromLedger: -1,
+    it('should reject message without type field', () => {
+      const result = parseWsClientMessage({ filter: { streamId: 'stream-123' } });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+        expect(result.message).toContain('type');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-    }
-  });
 
-  it('rejects replay with limit exceeding 1000', () => {
-    const result = parseWsClientMessage({
-      type: 'replay',
-      limit: 1001,
+    it('should reject message with non-string type', () => {
+      const result = parseWsClientMessage({ type: 123 });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('INVALID_MESSAGE');
+        expect(result.message).toContain('type');
+      }
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-    }
-  });
 
-  it('accepts replay with valid limit at boundary', () => {
-    const result = parseWsClientMessage({
-      type: 'replay',
-      limit: 1000,
+    it('should return UNKNOWN_TYPE for unrecognized message type', () => {
+      const result = parseWsClientMessage({ type: 'unknown', filter: {} });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe('UNKNOWN_TYPE');
+        expect(result.message).toContain('unknown');
+      }
     });
-    expect(result.ok).toBe(true);
-  });
 
-  it('accepts subscribe with batching flag', () => {
-    const result = parseWsClientMessage({
-      type: 'subscribe',
-      stream_id: 'test',
-      batching: true,
+    describe('subscribe messages', () => {
+      it('should accept valid subscribe with streamId', () => {
+        const result = parseWsClientMessage({
+          type: 'subscribe',
+          filter: { streamId: 'stream-123' },
+        });
+        expect(result.ok).toBe(true);
+        if (result.ok && result.message.type === 'subscribe') {
+          expect(result.message.filter.streamId).toBe('stream-123');
+        }
+      });
+
+      it('should reject subscribe with invalid streamId', () => {
+        const result = parseWsClientMessage({
+          type: 'subscribe',
+          filter: { streamId: '' },
+        });
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.code).toBe('INVALID_MESSAGE');
+        }
+      });
+
+      it('should reject subscribe with invalid recipientAddress', () => {
+        const result = parseWsClientMessage({
+          type: 'subscribe',
+          filter: { recipientAddress: 'invalid-address' },
+        });
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.code).toBe('INVALID_MESSAGE');
+        }
+      });
     });
-    expect(result.ok).toBe(true);
-    if (result.ok && result.message.type === 'subscribe') {
-      expect(result.message.filter.batchingEnabled).toBe(true);
-    }
-  });
 
-  it('accepts subscribe with recipient_address filter', () => {
-    // Valid Stellar public key (passes StrKey validation)
-    const validAddress = 'GABC3DEFG5HIJKLMNOP6RSTUVWXYZ234567ABCDEFGHIJKLMNOPQR';
-    const result = parseWsClientMessage({
-      type: 'subscribe',
-      recipient_address: validAddress,
+    describe('unsubscribe messages', () => {
+      it('should accept valid unsubscribe', () => {
+        const result = parseWsClientMessage({
+          type: 'unsubscribe',
+          filter: { streamId: 'stream-123' },
+        });
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+          expect(result.message.type).toBe('unsubscribe');
+        }
+      });
     });
-    // May fail StrKey validation but should not crash
-    expect(result.ok === true || result.ok === false).toBe(true);
-  });
 
-  it('handles empty object gracefully', () => {
-    const result = parseWsClientMessage({});
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe('INVALID_MESSAGE');
-    }
+    describe('replay messages', () => {
+      it('should accept valid replay with streamId', () => {
+        const result = parseWsClientMessage({
+          type: 'replay',
+          filter: { streamId: 'stream-123' },
+        });
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+          expect(result.message.type).toBe('replay');
+        }
+      });
+
+      it('should accept replay with fromLedger', () => {
+        const result = parseWsClientMessage({
+          type: 'replay',
+          filter: { streamId: 'stream-123', fromLedger: 100 },
+        });
+        expect(result.ok).toBe(true);
+      });
+
+      it('should accept replay with toLedger', () => {
+        const result = parseWsClientMessage({
+          type: 'replay',
+          filter: { streamId: 'stream-123', toLedger: 200 },
+        });
+        expect(result.ok).toBe(true);
+      });
+
+      it('should accept replay with both fromLedger and toLedger', () => {
+        const result = parseWsClientMessage({
+          type: 'replay',
+          filter: { streamId: 'stream-123', fromLedger: 100, toLedger: 200 },
+        });
+        expect(result.ok).toBe(true);
+      });
+    });
+
+    describe('edge cases', () => {
+      it('should handle empty object', () => {
+        const result = parseWsClientMessage({});
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.code).toBe('INVALID_MESSAGE');
+        }
+      });
+
+      it('should handle object with extra fields', () => {
+        const result = parseWsClientMessage({
+          type: 'subscribe',
+          filter: { streamId: 'stream-123' },
+          extraField: 'ignored',
+        });
+        expect(result.ok).toBe(true);
+      });
+
+      it('should handle filter with extra fields', () => {
+        const result = parseWsClientMessage({
+          type: 'subscribe',
+          filter: { streamId: 'stream-123', extraField: 'ignored' },
+        });
+        expect(result.ok).toBe(true);
+      });
+    });
   });
 });

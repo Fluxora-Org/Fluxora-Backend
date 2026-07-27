@@ -72,7 +72,6 @@ export class WebhookDispatcher {
     const enhancedPolicy = this.policy as EnhancedRetryPolicy;
 
     // Validate webhook target for SSRF protection before any network call
-    let validatedUrl = url;
     try {
       let allowlist: string[] | undefined;
       try {
@@ -81,7 +80,7 @@ export class WebhookDispatcher {
       } catch {
         // Config not initialized, proceed without allowlist
       }
-      validatedUrl = await validateWebhookTarget(url, {
+      await validateWebhookTarget(url, {
         allowlist,
       });
     } catch (error) {
@@ -100,7 +99,7 @@ export class WebhookDispatcher {
       throw error;
     }
 
-    const gate = await circuitBreakerStore.checkAndClaimAttempt(validatedUrl, enhancedPolicy);
+    const gate = await circuitBreakerStore.checkAndClaimAttempt(url, enhancedPolicy);
     if (!gate.allowed) {
       const nextRetryAt = resolveCircuitBreakerDeferral(gate, enhancedPolicy).getTime();
       logger.warn('Webhook delivery deferred by circuit breaker', undefined, {
@@ -550,9 +549,31 @@ async function followDispatchWebhookRedirects(
 
 export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void> {
   // Validate webhook target for SSRF protection before any network call
-  let validatedUrl = opts.url;
   try {
     let allowlist: string[] | undefined;
+    try {
+      const config = getConfig();
+      allowlist = config.webhookAllowedHosts;
+    } catch {
+      // Config not initialized, proceed without allowlist
+    }
+    await validateWebhookTarget(opts.url, {
+      allowlist,
+    });
+  } catch (error) {
+    if (error instanceof WebhookTargetValidationError) {
+      logger.error('Webhook target rejected by SSRF guard', undefined, {
+        reason: error.message,
+      });
+      throw error;
+    }
+    throw error;
+  }
+
+  // Optional reorg suppression: callers that pass a ledger number opt in to
+  // skipping delivery for ledgers the indexer has rolled back.  The import is
+  // dynamic so this helper has no hard dependency on the indexer module graph.
+  if (opts.ledger !== undefined) {
     try {
       const config = getConfig();
       allowlist = config.webhookAllowedHosts;
@@ -591,49 +612,23 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   const payloadStr = JSON.stringify(opts.payload);
   const signature = computeWebhookSignature(opts.secret, timestamp, payloadStr);
 
-  // Propagate correlation ID when available to preserve end-to-end tracing.
-  // Header name uses the shared correlation constant to avoid mismatches.
-  const effectiveCorrelationId = getCorrelationId();
-
   // Add AbortController timeout to prevent slow-loris attacks
-
   const controller = new AbortController();
   const timeoutMs = DEFAULT_RETRY_POLICY.timeoutMs;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'X-Fluxora-Event': opts.event,
-      'X-Fluxora-Signature': signature,
-      'X-Fluxora-Timestamp': timestamp,
-    };
-
-    // Only propagate the correlation ID; it is validated as a UUID-shaped value
-    // by the correlationId middleware.
-    if (effectiveCorrelationId && effectiveCorrelationId !== 'unknown') {
-      headers[CORRELATION_ID_HEADER] = effectiveCorrelationId;
-    }
-
-    // Attach outbound W3C traceparent for end-to-end distributed tracing.
-    const activeTrace = getActiveTraceContext();
-    if (activeTrace) {
-      headers['traceparent'] = buildTraceparent(
-        activeTrace.traceId,
-        activeTrace.parentId,
-        activeTrace.sampled,
-      );
-    }
-
-    await followDispatchWebhookRedirects(
-      validatedUrl,
-      {
-        method: 'POST',
-        headers,
-        body: payloadStr,
-        signal: controller.signal,
-      }
-    );
+    await fetch(opts.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Fluxora-Event': opts.event,
+        'X-Fluxora-Signature': signature,
+        'X-Fluxora-Timestamp': timestamp,
+      },
+      body: payloadStr,
+      signal: controller.signal,
+    });
   } finally {
     clearTimeout(timeoutId);
   }

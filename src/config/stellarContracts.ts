@@ -23,9 +23,10 @@ export const STELLAR_CONTRACT_ALLOWLIST: Record<
   },
 } as const;
 
-export const STELLAR_NETWORK_PASSPHRASES: Record<PinnedStellarNetwork, string> = {
+export const STELLAR_NETWORK_PASSPHRASES: Record<StellarNetwork, string> = {
   testnet: 'Test SDF Network ; September 2015',
   mainnet: 'Public Global Stellar Network ; September 2015',
+  local: 'Standalone Network ; February 2017',
 } as const;
 
 function decodeStellarBase32(value: string): number[] | null {
@@ -80,15 +81,15 @@ export function isValidStellarContractAddress(value: string): boolean {
 
   const payload = decoded.slice(0, STELLAR_STRKEY_PAYLOAD_LENGTH);
   const expectedChecksum = crc16XModem(payload);
-  const actualChecksum = decoded[STELLAR_STRKEY_PAYLOAD_LENGTH]!
-    | (decoded[STELLAR_STRKEY_PAYLOAD_LENGTH + 1]! << 8);
+  const actualChecksum =
+    decoded[STELLAR_STRKEY_PAYLOAD_LENGTH]! | (decoded[STELLAR_STRKEY_PAYLOAD_LENGTH + 1]! << 8);
 
   return expectedChecksum === actualChecksum;
 }
 
 export function getPinnedAddressNetwork(
   kind: PinnedStellarAddressKind,
-  address: string,
+  address: string
 ): PinnedStellarNetwork | null {
   for (const network of Object.keys(STELLAR_CONTRACT_ALLOWLIST) as PinnedStellarNetwork[]) {
     if (STELLAR_CONTRACT_ALLOWLIST[network][kind].includes(address)) {
