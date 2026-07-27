@@ -441,7 +441,7 @@ export async function dropOldPartitions(
     const pName = row.partition_name;
     const pBound = row.partition_bound;
     
-    if (pBound === 'DEFAULT') continue;
+    if (!pBound || pBound === 'DEFAULT') continue;
     
     // Bounds typically look like: FOR VALUES FROM ('2023-01-01 00:00:00+00') TO ('2023-02-01 00:00:00+00')
     // Note: literal parentheses in pg_get_expr output — no backslash escaping needed.
