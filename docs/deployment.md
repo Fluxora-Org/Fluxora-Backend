@@ -1,3 +1,11 @@
+# Deployment
+
+## Tiered startup dependency probing
+
+Fluxora checks dependencies before accepting traffic. Postgres is a hard dependency: one `SELECT 1` probe fails fast and terminates the process. Redis and Stellar RPC are soft dependencies: `PING` and `getLatestLedger` retry with jittered backoff, then the service starts degraded if their shared budget is consumed.
+
+`STARTUP_PROBE_BUDGET_MS` defaults to `30000` and is capped at `60000` ms. This is a shared soft-tier wall-clock budget; retry sleeps and the final in-flight attempt are capped to the remaining window. Set it below the container readiness timeout. `STARTUP_PROBE_POSTGRES_TIMEOUT_MS` (default `5000`), `STARTUP_PROBE_REDIS_TIMEOUT_MS` (default `3000`), and `STARTUP_PROBE_STELLAR_TIMEOUT_MS` (default `5000`) control individual attempts. Logs include the dependency tier and final action; errors are sanitised so credentials and URLs are not emitted.
+
 # Canary Routing Deployment
 
 ## Overview

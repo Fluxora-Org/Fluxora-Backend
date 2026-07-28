@@ -377,7 +377,7 @@ export const EnvSchema = z
      * STARTUP_PROBE_BUDGET_MS          — total wall-clock budget for soft-tier
      *                                    retries (Redis, Stellar RPC) before the
      *                                    service falls back to degraded mode.
-     *                                    Default: 30 000 ms.
+     *                                    Default: 30 000 ms. Maximum: 60 000 ms.
      * STARTUP_PROBE_POSTGRES_TIMEOUT_MS — per-attempt timeout for the single
      *                                    Postgres (hard-tier) probe.
      *                                    Default: 5 000 ms.
@@ -388,7 +388,7 @@ export const EnvSchema = z
      *                                    RPC (soft-tier) retry attempt.
      *                                    Default: 5 000 ms.
      */
-    STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1).default(30_000),
+    STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1, 60_000).default(30_000),
     STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(
       5_000
     ),
