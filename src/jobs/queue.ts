@@ -207,6 +207,12 @@ export class JobQueue {
    * logged, and re‑thrown to allow pg‑boss to retry according to the supplied options.
    */
   register(name: string, handler: JobHandler, options: JobRegistrationOptions = {}): void {
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new TypeError('register: name must be a non-empty string');
+    }
+    if (typeof handler !== 'function') {
+      throw new TypeError('register: handler must be a function');
+    }
     this.handlers.set(name, { handler, options });
   }
 
@@ -274,6 +280,9 @@ export class JobQueue {
    * it will be moved to the configured dead‑letter queue.
    */
   async send(name: string, data: unknown, options?: JobSendOptions): Promise<string | null> {
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new TypeError('send: name must be a non-empty string');
+    }
     const sendOpts = this.toSendOptions(options);
     return this.boss.send(name, data as object | null, sendOpts);
   }
@@ -290,6 +299,12 @@ export class JobQueue {
    * pg‑boss will apply the retry configuration before eventually moving it to the dead‑letter queue.
    */
   async schedule(name: string, cron: string, data?: unknown, options?: JobScheduleOptions): Promise<void> {
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new TypeError('schedule: name must be a non-empty string');
+    }
+    if (typeof cron !== 'string' || cron.trim() === '') {
+      throw new TypeError('schedule: cron must be a non-empty string');
+    }
     const schedOpts: Record<string, unknown> = {
       ...this.toSendOptions(options),
       ...(options?.tz ? { tz: options.tz } : {}),
@@ -313,16 +328,51 @@ export class JobQueue {
   private toSendOptions(opts?: JobSendOptions): Record<string, unknown> {
     const s: Record<string, unknown> = {};
     if (!opts) return s;
-    if (opts.retryLimit !== undefined) s.retryLimit = opts.retryLimit;
-    if (opts.retryDelay !== undefined) s.retryDelay = opts.retryDelay;
+    if (opts.retryLimit !== undefined) {
+      if (typeof opts.retryLimit !== 'number' || !Number.isFinite(opts.retryLimit) || opts.retryLimit < 0) {
+        throw new TypeError('toSendOptions: retryLimit must be a non-negative finite number');
+      }
+      s.retryLimit = opts.retryLimit;
+    }
+    if (opts.retryDelay !== undefined) {
+      if (typeof opts.retryDelay !== 'number' || !Number.isFinite(opts.retryDelay) || opts.retryDelay < 0) {
+        throw new TypeError('toSendOptions: retryDelay must be a non-negative finite number');
+      }
+      s.retryDelay = opts.retryDelay;
+    }
     if (opts.retryBackoff !== undefined) s.retryBackoff = opts.retryBackoff;
-    if (opts.retryDelayMax !== undefined) s.retryDelayMax = opts.retryDelayMax;
-    if (opts.expireInSeconds !== undefined) s.expireInSeconds = opts.expireInSeconds;
-    if (opts.deadLetter !== undefined) s.deadLetter = opts.deadLetter;
+    if (opts.retryDelayMax !== undefined) {
+      if (typeof opts.retryDelayMax !== 'number' || !Number.isFinite(opts.retryDelayMax) || opts.retryDelayMax < 0) {
+        throw new TypeError('toSendOptions: retryDelayMax must be a non-negative finite number');
+      }
+      s.retryDelayMax = opts.retryDelayMax;
+    }
+    if (opts.expireInSeconds !== undefined) {
+      if (typeof opts.expireInSeconds !== 'number' || !Number.isFinite(opts.expireInSeconds) || opts.expireInSeconds < 0) {
+        throw new TypeError('toSendOptions: expireInSeconds must be a non-negative finite number');
+      }
+      s.expireInSeconds = opts.expireInSeconds;
+    }
+    if (opts.deadLetter !== undefined) {
+      if (typeof opts.deadLetter !== 'string' || opts.deadLetter.trim() === '') {
+        throw new TypeError('toSendOptions: deadLetter must be a non-empty string');
+      }
+      s.deadLetter = opts.deadLetter;
+    }
     if (opts.startAfter !== undefined) s.startAfter = opts.startAfter;
     if (opts.singletonKey !== undefined) s.singletonKey = opts.singletonKey;
-    if (opts.singletonSeconds !== undefined) s.singletonSeconds = opts.singletonSeconds;
-    if (opts.priority !== undefined) s.priority = opts.priority;
+    if (opts.singletonSeconds !== undefined) {
+      if (typeof opts.singletonSeconds !== 'number' || !Number.isFinite(opts.singletonSeconds) || opts.singletonSeconds < 0) {
+        throw new TypeError('toSendOptions: singletonSeconds must be a non-negative finite number');
+      }
+      s.singletonSeconds = opts.singletonSeconds;
+    }
+    if (opts.priority !== undefined) {
+      if (typeof opts.priority !== 'number' || !Number.isFinite(opts.priority)) {
+        throw new TypeError('toSendOptions: priority must be a finite number');
+      }
+      s.priority = opts.priority;
+    }
     return s;
   }
 }
@@ -345,6 +395,14 @@ const DLQ_MAX_ERROR_BYTES = 2048;
  * pg JSONB can hold large documents, but we cap this to avoid runaway rows.
  */
 const DLQ_MAX_PAYLOAD_BYTES = 65536; // 64 KiB
+
+/**
+ * Default retention period in days for `job_dead_letter` entries.
+ * Entries older than this are eligible for purging by the partition‑maintenance
+ * job.  90 days keeps enough history for post‑mortem analysis while bounding
+ * table growth.
+ */
+export const DEFAULT_DLQ_RETENTION_DAYS = 90;
 
 /**
  * Singleton accessor for the JobQueue.
@@ -397,6 +455,19 @@ export function startBackgroundJobs(pool: Pool): void {
           behindSchedule: t.behindSchedule,
         })),
       });
+
+      // Purge expired dead‑letter entries alongside the daily maintenance
+      // to keep the DLQ table size bounded without a dedicated cron.
+      try {
+        const deleted = await purgeJobDeadLetter(pool, DEFAULT_DLQ_RETENTION_DAYS);
+        if (deleted > 0) {
+          logger.info('DLQ retention purge removed entries', ctx.id, { deletedCount: deleted });
+        }
+      } catch (dlqErr) {
+        logger.error('DLQ retention purge failed, continuing', ctx.id, {
+          error: dlqErr instanceof Error ? dlqErr.message : String(dlqErr),
+        });
+      }
     },
     {
       retryLimit: DEFAULT_RETRY_LIMIT,
@@ -531,4 +602,44 @@ export async function stopBackgroundJobs(): Promise<void> {
     // or tests can detect the queue is no longer active.
     setJobQueue(null);
   }
+}
+
+/**
+ * Purges expired entries from the `job_dead_letter` table.
+ *
+ * Deletes rows whose `failed_at` timestamp is older than `retentionDays`.
+ * This prevents unbounded growth of the dead-letter table while keeping
+ * recent entries available for post-mortem analysis.
+ *
+ * The function is called automatically by the partition-maintenance job;
+ * callers should not normally need to invoke it directly.
+ *
+ * @param pool - PostgreSQL pool to query against.
+ * @param retentionDays - Age threshold in days (defaults to `DEFAULT_DLQ_RETENTION_DAYS`).
+ * @returns The number of deleted rows.
+ *
+ * @throws {Error} If `pool` is null or the query fails.
+ */
+export async function purgeJobDeadLetter(
+  pool: Pool,
+  retentionDays: number = DEFAULT_DLQ_RETENTION_DAYS,
+): Promise<number> {
+  if (pool == null) {
+    throw new Error('purgeJobDeadLetter requires a valid PostgreSQL pool');
+  }
+  if (typeof retentionDays !== 'number' || !Number.isFinite(retentionDays) || retentionDays < 0) {
+    throw new TypeError('purgeJobDeadLetter: retentionDays must be a non-negative finite number');
+  }
+
+  const result = await pool.query(
+    `DELETE FROM job_dead_letter WHERE failed_at < NOW() - INTERVAL '1 day' * $1`,
+    [retentionDays],
+  );
+
+  const deletedCount = result.rowCount ?? 0;
+  logger.info('DLQ retention purge complete', undefined, {
+    deletedCount,
+    retentionDays,
+  });
+  return deletedCount;
 }
