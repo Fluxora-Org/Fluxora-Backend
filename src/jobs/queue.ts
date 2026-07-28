@@ -388,13 +388,31 @@ export const DEAD_LETTER_QUEUE = 'job_dead_letter_queue';
  * Maximum byte-length for persisted `error_message` in job_dead_letter.
  * Prevents oversized error strings from blowing the TEXT column budget.
  */
-const DLQ_MAX_ERROR_BYTES = 2048;
+export const DLQ_MAX_ERROR_BYTES = 2048;
 
 /**
  * Maximum byte-length for the serialised `payload` stored in job_dead_letter.
  * pg JSONB can hold large documents, but we cap this to avoid runaway rows.
  */
-const DLQ_MAX_PAYLOAD_BYTES = 65536; // 64 KiB
+export const DLQ_MAX_PAYLOAD_BYTES = 65536; // 64 KiB
+
+/**
+ * Safely truncates a UTF‑8 string to fit within `maxBytes` without breaking
+ * multi‑byte character boundaries.  Returns the original string if it already
+ * fits within the limit.
+ *
+ * @internal
+ */
+function truncateUtf8(str: string, maxBytes: number): string {
+  if (Buffer.byteLength(str, 'utf-8') <= maxBytes) return str;
+  let truncated = '';
+  for (const char of str) {
+    const next = truncated + char;
+    if (Buffer.byteLength(next, 'utf-8') > maxBytes) break;
+    truncated = next;
+  }
+  return truncated;
+}
 
 /**
  * Default retention period in days for `job_dead_letter` entries.
@@ -432,6 +450,9 @@ export function startBackgroundJobs(pool: Pool): void {
   // inside the DLQ handler when pool.query is eventually called.
   if (pool == null) {
     throw new Error('startBackgroundJobs requires a valid PostgreSQL pool');
+  }
+  if (typeof pool.query !== 'function') {
+    throw new TypeError('startBackgroundJobs: pool must expose a query method');
   }
 
   if (_jobQueue) {
@@ -527,6 +548,22 @@ export function startBackgroundJobs(pool: Pool): void {
         error: errorMessage,
       });
 
+      // Apply size budgets before persisting, so oversized entries don't
+      // cause INSERT failures or bloat the dead‑letter table.
+      const finalErrorMessage = truncateUtf8(errorMessage, DLQ_MAX_ERROR_BYTES);
+
+      let finalPayload: unknown = originalPayload;
+      if (finalPayload !== null) {
+        try {
+          const payloadJson = JSON.stringify(finalPayload);
+          if (Buffer.byteLength(payloadJson, 'utf-8') > DLQ_MAX_PAYLOAD_BYTES) {
+            finalPayload = { _truncated: true };
+          }
+        } catch {
+          finalPayload = { _truncated: true };
+        }
+      }
+
       // Increment the observable counter so on-call can alert on DLQ growth.
       jobDlqEntriesTotal.inc({ job_name: originalJobName });
 
@@ -537,7 +574,7 @@ export function startBackgroundJobs(pool: Pool): void {
         await pool.query(
           `INSERT INTO job_dead_letter (job_name, job_id, payload, error_message, retry_count)
            VALUES ($1, $2, $3, $4, $5)`,
-          [originalJobName, originalJobId, originalPayload, errorMessage, retryCount],
+          [originalJobName, originalJobId, finalPayload, finalErrorMessage, retryCount],
         );
       } catch (insertErr) {
         // Log but do not re-throw: the job is terminally failed.  A failed

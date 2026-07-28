@@ -742,6 +742,146 @@ describe('startBackgroundJobs', () => {
     const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
     expect(params[4]).toBe(0);
   });
+
+  // ── DLQ handler: error message truncation ─────────────────────────────────
+
+  describe('DLQ handler – error message truncation', () => {
+    it('truncates error message exceeding DLQ_MAX_ERROR_BYTES', async () => {
+      const mod = await import('../../src/jobs/queue.js');
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      const longError = 'x'.repeat(3000);
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-trunc', output: longError, retryCount: 1 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      expect((params[3] as string).length).toBe(mod.DLQ_MAX_ERROR_BYTES);
+    });
+
+    it('does NOT truncate error message within the byte limit', async () => {
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      const shortError = 'short error';
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-short', output: shortError, retryCount: 1 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      expect(params[3]).toBe('short error');
+    });
+
+    it('handles multi‑byte characters at the truncation boundary safely', async () => {
+      const mod = await import('../../src/jobs/queue.js');
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      // Each emoji is 4 bytes.  2050 bytes ÷ 4 = 512 emoji + 2 bytes remainder.
+      // The last full emoji that fits within 2048 bytes is at position 512.
+      const longError = '😀'.repeat(600); // 2400 bytes > 2048
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-emoji', output: longError, retryCount: 1 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      const stored = params[3] as string;
+      // Must be ≤ 2048 bytes
+      expect(Buffer.byteLength(stored, 'utf-8')).toBeLessThanOrEqual(mod.DLQ_MAX_ERROR_BYTES);
+      // Must not end with a partial multi‑byte character (should be an even number of emoji)
+      expect(stored.length % 2).toBe(0);
+    });
+  });
+
+  // ── DLQ handler: payload truncation ───────────────────────────────────────
+
+  describe('DLQ handler – payload truncation', () => {
+    it('replaces oversized payload with a truncated marker', async () => {
+      const mod = await import('../../src/jobs/queue.js');
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      // Payload > 64 KiB when serialized
+      const largePayload = { data: 'x'.repeat(70000) };
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-big', data: largePayload, output: 'err', retryCount: 0 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      expect(params[2]).toEqual({ _truncated: true });
+    });
+
+    it('preserves payload within the byte limit', async () => {
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      const smallPayload = { a: 1, b: 'hello' };
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-small', data: smallPayload, output: 'err', retryCount: 0 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      expect(params[2]).toEqual({ a: 1, b: 'hello' });
+    });
+
+    it('replaces payload that cannot be serialized (circular ref) with truncated marker', async () => {
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      const circular: Record<string, unknown> = { name: 'loop' };
+      circular.self = circular;
+
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-circ', data: circular, output: 'err', retryCount: 0 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      expect(params[2]).toEqual({ _truncated: true });
+    });
+
+    it('preserves null payload unchanged', async () => {
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-null', data: null, output: 'err', retryCount: 0 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      expect(params[2]).toBeNull();
+    });
+
+    it('preserves payload at exactly the byte limit', async () => {
+      const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+      const dlqHandler = await getDlqHandler(mockPool);
+
+      // Build a payload serializing to exactly (or just under) 65536 bytes
+      const exactPayload = { data: 'x'.repeat(65510) };
+      await dlqHandler({
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-exact', data: exactPayload, output: 'err', retryCount: 0 },
+      } as never);
+
+      const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      expect((params[2] as Record<string, unknown>)._truncated).toBeUndefined();
+    });
+  });
 });
 
 // ── DEAD_LETTER_QUEUE constant ────────────────────────────────────────────
@@ -1023,5 +1163,38 @@ describe('partition-maintenance DLQ purge integration', () => {
     await expect(
       handler({ id: 'pm-test', name: 'partition-maintenance', data: {} } as never),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ── startBackgroundJobs: pool validation ──────────────────────────────────
+
+describe('startBackgroundJobs – pool validation', () => {
+  beforeEach(async () => {
+    const { setJobQueue } = await import('../../src/jobs/queue.js');
+    setJobQueue(null);
+  });
+
+  it('throws TypeError when pool has no query method', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    expect(() => mod.startBackgroundJobs({} as never)).toThrow(TypeError);
+    expect(() => mod.startBackgroundJobs({} as never)).toThrow('pool must expose a query method');
+  });
+
+  it('does NOT throw for a pool with a valid query method', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    vi.spyOn(mod.JobQueue.prototype, 'register');
+    vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
+
+    expect(() => mod.startBackgroundJobs({ query: vi.fn() } as never)).not.toThrow();
+    // Cleanup: clear the singleton that was set
+    mod.setJobQueue(null);
+  });
+
+  it('still throws Error for null pool before the Type check', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    // null pool still throws Error
+    expect(() => mod.startBackgroundJobs(null as never)).toThrow('requires a valid PostgreSQL pool');
   });
 });
