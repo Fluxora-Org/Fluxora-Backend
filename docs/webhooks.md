@@ -82,6 +82,52 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 4. A deferred attempt returns `{ shouldRetry: true, rateLimited: true, retryAt: now + windowMs }`. The dispatcher re-inserts the outbox row with `created_at = retryAt`, so the deferral is durable in PostgreSQL.
 5. `WEBHOOK_RETRY_RPS` (default `10`) controls `limit`; `windowMs` is `1000 ms` (one second).
 
+### Burst configuration (token-bucket extension)
+
+To allow momentary spikes in retry traffic above the steady-state
+`WEBHOOK_RETRY_RPS` limit (e.g. a batch of stream creations), opt in to
+the token-bucket layer with `WEBHOOK_RETRY_BURST`. When the burst is
+exhausted the limiter reverts to the steady-state rate configured above.
+
+| Env var                | Default | Description                                                                                          |
+|------------------------|--------:|------------------------------------------------------------------------------------------------------|
+| `WEBHOOK_RETRY_BURST`  |     `0` | Token-bucket capacity per consumer. `0` keeps the legacy sliding-window behaviour (backward compat). |
+
+When `WEBHOOK_RETRY_BURST > 0`:
+
+- The bucket starts full with `burst` tokens. Each successful delivery
+  decrements the bucket by `1.0`.
+- Tokens refill at the steady-state rate `WEBHOOK_RETRY_RPS` tokens per
+  `windowMs` (default `10 / 1000 ms` = `0.01` tokens/ms), clamped to
+  `burst`.
+- When the bucket has fewer than `1.0` tokens, the attempt returns
+  `{ canAttempt: false, retryAfterMs: ceil((1.0 - tokens) / refillRateMs) }`
+  and the dispatcher defers it identically to the sliding-window path
+  (outbox row re-enqueued with `created_at = retryAt`).
+
+When `WEBHOOK_RETRY_BURST = 0` (default), the limiter is exactly the
+`WEBHOOK_RETRY_RPS` sliding-window described above — behaviour is
+unchanged for existing deployments.
+
+**Observability** — the bucket fill level per consumer is exported as
+the Prometheus gauge `fluxora_webhook_rate_limiter_bucket_fill{consumer_hash="…"}`
+(the `consumer_hash` label is the same SHA-256 prefix used as the
+Redis sliding-window key, so dashboards that already join by consumer
+continue to work). The gauge is updated on every
+`TokenBucketRateLimiter.checkLimit` call. See
+`src/metrics/requestProtectionMetrics.ts` for the label cardinality
+guarantees (one time-series per currently-tracked consumer, not per
+historical attempt).
+
+**Security** — the bucket only refills at the steady-state
+`WEBHOOK_RETRY_RPS`, so a configured `burst` cannot be abused to sustain
+an effective outbound rate above the configured limit. Bursts absorb
+instantaneous spikes; over a `windowMs` window the average rate is at
+most `WEBHOOK_RETRY_RPS`. Bucket entries from inactive consumers are
+cleaned up after `30 s` of idleness, so a long-burst-then-disconnect
+consumer does not pin a stale gauge series. See
+`src/webhooks/rate-limiter.ts` and `tests/webhooks/rate-limiter.test.ts`.
+
 ### Failure modes
 
 | Condition | Behaviour |
