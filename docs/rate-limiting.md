@@ -146,6 +146,78 @@ When Redis is unavailable, `store` is `"memory"` and `degraded` is `true`.
 
 ---
 
+## Per-tenant override administration
+
+The existing tenant override API is mounted at
+`/api/admin/rate-limits/overrides`:
+
+| Method | Path | Success |
+|---|---|---|
+| `POST` | `/api/admin/rate-limits/overrides` | `201` with the created override |
+| `GET` | `/api/admin/rate-limits/overrides` | `200` with an array (including expired records) |
+| `DELETE` | `/api/admin/rate-limits/overrides/{id}` | `204` with no body |
+
+### Permission boundary
+
+Every method is protected by `requireAdminAuth`, both when the override router
+is mounted by the main admin router and when it is mounted independently.
+The authorization behavior remains:
+
+- a Bearer token equal to `ADMIN_API_KEY` is accepted;
+- a verified JWT with role `admin` or `data-protection-officer` is accepted;
+- a missing header returns `401`;
+- malformed Bearer syntax returns `401`;
+- invalid credentials or any other JWT role return `403`;
+- an unset `ADMIN_API_KEY` fails closed with `503`, including for JWT callers.
+
+Authentication runs before body validation and before any override service
+call. Existing authentication error bodies remain unchanged for backward
+compatibility.
+
+### Create request and validation
+
+```json
+{
+  "keyId": "tenant-key-id",
+  "maxRequests": 5000,
+  "windowMs": 60000,
+  "expiresAt": "2026-08-01T00:00:00.000Z"
+}
+```
+
+- `keyId` must be a non-empty string.
+- `maxRequests` must be a positive integer.
+- `windowMs` must be an integer of at least `1000`.
+- `expiresAt` is optional and, when present, must be a valid ISO-8601
+  datetime accepted by the existing Zod schema.
+- Unknown fields continue to be ignored and stripped before the service call.
+
+Validation failures return `400` with code `VALIDATION_ERROR`. Creating a
+second override for the same `keyId` returns `409` with code `CONFLICT`.
+The same `409` is returned when concurrent creates race at the database unique
+constraint, so a retried create has deterministic behavior.
+
+Expiry disables an override for request limiting; it does not delete the
+stored record. Expired records remain visible in `GET` and retain the unique
+`keyId`. Delete an expired record before creating another override for that
+same key.
+
+### Temporary failures and observability
+
+If the database pool is exhausted, all three operations return `503` with code
+`SERVICE_UNAVAILABLE` and `Retry-After: 1`. Unexpected asynchronous failures
+are forwarded to the application error handler instead of being left as
+unhandled promise rejections.
+
+Create, list, delete, validation, conflict, not-found, and pool-exhaustion
+outcomes emit structured logs with the request correlation ID. Logs include
+only operation metadata and override identifiers; the Authorization
+credential is never logged. JSON responses include the same request ID in
+their standard envelope, while `204` responses remain correlatable through
+the `X-Request-ID` response header.
+
+---
+
 ## Security
 
 - **API key hashing** — raw API key material is never written to Redis. The middleware hashes the key with SHA-256 before constructing the store key.

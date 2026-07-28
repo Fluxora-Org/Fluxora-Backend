@@ -69,7 +69,7 @@ export interface DeadLetterQueueItem {
 export type OutboxItemStatus = 'pending' | 'in_flight' | 'delivered' | 'failed';
 
 export interface ClaimOptions {
-  workerId: string;
+  workerId?: string;
   lockTimeoutMs?: number;
   now?: number;
 }

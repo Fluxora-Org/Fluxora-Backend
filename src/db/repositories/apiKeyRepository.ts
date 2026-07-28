@@ -20,22 +20,25 @@ import type { ApiKeyRecord } from '../types.js';
 
 /** Map a raw pg row to a typed {@link ApiKeyRecord}. */
 function rowToRecord(row: Record<string, unknown>): ApiKeyRecord {
-  const scopes = Array.isArray(row['scopes'])
+  // Resolve scopes defensively: pg may return an array, a JSON string, or null.
+  // The final assignment always uses the resolved variable — never the raw column
+  // — so the default fallback is never silently discarded.
+  const scopes: string[] = Array.isArray(row['scopes'])
     ? (row['scopes'] as string[])
     : typeof row['scopes'] === 'string'
-      ? JSON.parse(row['scopes'] as string)
+      ? (JSON.parse(row['scopes'] as string) as string[])
       : ['streams:read', 'streams:write'];
 
   return {
-    id:        row['id']     as string,
-    name:      row['name']   as string,
+    id:        row['id']       as string,
+    name:      row['name']     as string,
     keyHash:   row['key_hash'] as string,
-    salt:      row['salt']   as string,
-    prefix:    row['prefix'] as string,
+    salt:      row['salt']     as string,
+    prefix:    row['prefix']   as string,
     createdAt: (row['created_at'] as Date).toISOString(),
     rotatedAt: row['rotated_at'] ? (row['rotated_at'] as Date).toISOString() : null,
-    active:    row['active'] as boolean,
-    scopes:   (row['scopes'] as string[]) || [],
+    active:    row['active']   as boolean,
+    scopes,
   };
 }
 
@@ -70,8 +73,14 @@ export const apiKeyRepository = {
    * one only on the rare prefix collision, which callers disambiguate with a
    * constant-time hash comparison. Driven by the `api_keys_prefix_active_idx`
    * index, so this never scans the whole table.
+   *
+   * Returns an empty array immediately for a blank prefix so we never execute a
+   * `WHERE prefix = ''` query that would touch every row with an empty prefix.
    */
   async findActiveByPrefix(prefix: string): Promise<ApiKeyRecord[]> {
+    if (!prefix || !prefix.trim()) {
+      return [];
+    }
     const pool = getPool();
     const result = await query<Record<string, unknown>>(
       pool,

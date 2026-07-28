@@ -216,6 +216,12 @@ export async function runRetentionPurge(options: PurgeJobOptions = {}): Promise<
  *
  * Processes rows in batches, committing each batch atomically.
  * Returns a per-rule summary.
+ *
+ * The column-existence check (does this table have a `legal_hold` column?)
+ * is performed **once before the batch loop** via a standalone
+ * `information_schema.columns` query.  The result is used to statically
+ * branch the row-fetch SQL, avoiding a correlated subquery that would
+ * otherwise re-check the catalog for every candidate row.
  */
 async function purgeRule(
   rule: PurgeableRetentionRule,
@@ -228,6 +234,16 @@ async function purgeRule(
   const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
   const cutoffDate = cutoff.toISOString();
 
+  // ── Hoisted column-existence check ───────────────────────────────────────
+  // Run ONCE per rule (not once per row or once per batch).
+  const schemaClient = await pool.connect();
+  let hasLegalHold: boolean;
+  try {
+    hasLegalHold = await tableHasColumn(schemaClient, rule.table, 'legal_hold');
+  } finally {
+    schemaClient.release();
+  }
+
   let rowsPurged = 0;
   let rowsSkipped = 0;
   let batchIndex = 0;
@@ -238,6 +254,7 @@ async function purgeRule(
     ageColumn: rule.ageColumn,
     cutoffDate,
     dryRun,
+    hasLegalHold,
   });
 
   while (hasMore) {
@@ -248,6 +265,7 @@ async function purgeRule(
       pool,
       correlationId,
       dryRun,
+      hasLegalHold,
     });
 
     rowsPurged += purged;
@@ -296,9 +314,10 @@ async function processBatch(
     pool: Pool;
     correlationId: string | undefined;
     dryRun: boolean;
+    hasLegalHold: boolean;
   }
 ): Promise<{ purged: number; skipped: number }> {
-  const { cutoff, batchSize, batchIndex, pool, correlationId, dryRun } = options;
+  const { cutoff, batchSize, batchIndex, pool, correlationId, dryRun, hasLegalHold } = options;
 
   const client = await pool.connect();
   let purged = 0;
@@ -309,7 +328,7 @@ async function processBatch(
 
     // Fetch candidates, locking the rows to prevent concurrent purge workers
     // from processing the same rows simultaneously.
-    const candidates = await fetchCandidateRows(client, rule, cutoff, batchSize);
+    const candidates = await fetchCandidateRows(client, rule, cutoff, batchSize, hasLegalHold);
 
     if (candidates.length === 0) {
       await client.query('COMMIT');
@@ -367,56 +386,64 @@ async function processBatch(
 }
 
 /**
+ * Check whether a table has a specific column in `information_schema.columns`.
+ *
+ * This is hoisted out of the per-row query so the schema-catalog lookup
+ * runs **at most once per rule** per purge run instead of once per
+ * candidate row.
+ */
+async function tableHasColumn(
+  client: PoolClient,
+  table: string,
+  column: string
+): Promise<boolean> {
+  const result = await client.query<{ column_name: string }>(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_name = $1
+        AND column_name = $2
+      LIMIT 1`,
+    [table, column]
+  );
+  return result.rows.length > 0;
+}
+
+/**
  * Fetch candidate rows from the target table.
  *
  * Uses `SELECT … FOR UPDATE SKIP LOCKED` so concurrent purge workers or
  * operators modifying legal_hold do not block each other.
  *
- * NOTE: `audit_logs` and `webhook_outbox` do not have a `legal_hold`
- * column — we handle this by coalescing to FALSE in the query so the job
- * works correctly for tables both with and without the column.  The
- * `legal_hold` column is only required on the `streams` table (where
- * operator-managed legal holds are meaningful).
- *
- * For audit_logs and webhook_outbox the `legal_hold` value will always
- * be coalesced to FALSE (no hold semantics) unless those tables gain the
- * column in a future migration.
+ * The SQL is **statically branched** based on `hasLegalHold` (determined
+ * once per rule by {@link tableHasColumn}).  Tables that lack the column
+ * use `FALSE AS legal_hold`; tables that have it reference the column
+ * directly.  This avoids a per-row correlated subquery to
+ * `information_schema.columns`.
  */
 async function fetchCandidateRows(
   client: PoolClient,
   rule: PurgeableRetentionRule,
   cutoff: Date,
-  batchSize: number
+  batchSize: number,
+  hasLegalHold: boolean
 ): Promise<Array<Record<string, unknown>>> {
   // Use a safe identifier quoting helper to prevent SQL-injection via
   // developer-controlled table/column names (defence-in-depth).
   const tableId = quoteIdentifier(rule.table);
   const ageColId = quoteIdentifier(rule.ageColumn);
 
-  // We use a column existence check approach: coalesce to false when the
-  // column doesn't exist (for tables that have no legal_hold concept).
-  // This is accomplished with a subquery that catches the missing column
-  // and defaults to FALSE.  A cleaner alternative is to always add the
-  // column, but we keep this compatible with tables added before the
-  // legal_hold migration.
+  // Static branch: tables with the column reference it directly; tables
+  // without it get a constant FALSE so the rest of the pipeline
+  // (legal_hold check in processBatch) works uniformly.
+  const legalHoldExpr = hasLegalHold ? 'legal_hold' : 'FALSE AS legal_hold';
+
   const result = await client.query<Record<string, unknown>>(
-    `
-    SELECT *, COALESCE(
-      (SELECT legal_hold FROM ${tableId} t2
-       WHERE t2.ctid = ${tableId}.ctid
-         AND (SELECT column_name
-              FROM information_schema.columns
-              WHERE table_name = $2
-                AND column_name = 'legal_hold'
-              LIMIT 1) IS NOT NULL),
-      FALSE
-    ) AS legal_hold
-    FROM ${tableId}
-    WHERE ${ageColId} < $1
-    LIMIT $3
-    FOR UPDATE SKIP LOCKED
-    `,
-    [cutoff.toISOString(), rule.table, batchSize]
+    `SELECT *, ${legalHoldExpr}
+       FROM ${tableId}
+      WHERE ${ageColId} < $1
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED`,
+    [cutoff.toISOString(), batchSize]
   );
 
   return result.rows;

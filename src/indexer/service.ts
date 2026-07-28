@@ -791,8 +791,9 @@ export class IndexerService {
       params.push(request.to_block);
     }
 
-    const result = await client.query<{ count: string }>(query, params);
-    return parseInt(result.rows[0]?.count ?? '0', 10);
+    const result = await client.query<Record<string, unknown>>(query, params);
+    const first = result.rows[0];
+    return parseInt(String(first?.['count'] ?? '0'), 10);
   }
 
   /**
@@ -904,7 +905,7 @@ export class IndexerService {
 
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.last_committed_cursor, c.contract_id, c.ledger, c.from_block, c.to_block
           FROM indexer_replay_progress p
           JOIN replay_cursors c ON p.last_committed_cursor = c.id
@@ -920,28 +921,31 @@ export class IndexerService {
 
       const row = result.rows[0];
       const request: ReplayRequest = {
-        contract_id: row.contract_id,
-        ledger: row.ledger,
-        from_block: row.from_block ?? undefined,
-        to_block: row.to_block ?? undefined,
+        contract_id: row['contract_id'] as string,
+        ledger: Number(row['ledger']),
+        from_block: row['from_block'] != null ? Number(row['from_block']) : undefined,
+        to_block: row['to_block'] != null ? Number(row['to_block']) : undefined,
       };
 
       logger.info('Resuming incomplete replay from checkpoint', undefined, {
         event: 'replay_resume_startup',
         contract_id: request.contract_id,
         ledger: request.ledger,
-        cursor_id: row.last_committed_cursor,
+        cursor_id: row['last_committed_cursor'] as string,
       });
 
       // Start the replay asynchronously so we do not block startup.
       this.replayEvents(request).catch((err) => {
-        logger.error('Resumed replay failed', err, {
+        logger.error('Resumed replay failed', undefined, {
           contract_id: request.contract_id,
           ledger: request.ledger,
+          error: err instanceof Error ? err.message : String(err),
         });
       });
     } catch (err) {
-      logger.error('Failed to check for incomplete replays on startup', err as Error);
+      logger.error('Failed to check for incomplete replays on startup', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }
@@ -961,7 +965,7 @@ export class IndexerService {
 
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.status, p.total, p.started_at, p.updated_at,
                c.contract_id, c.ledger, c.id as cursor_id, c.last_committed_offset
           FROM indexer_replay_progress p
@@ -971,22 +975,26 @@ export class IndexerService {
       `);
       if (result.rows.length > 0) {
         const row = result.rows[0];
+        const lastCommittedOffset = Number(row['last_committed_offset']);
+        const total = Number(row['total']);
         return {
-          isReplaying: row.status === 'in-progress',
-          rowsReplayed: row.last_committed_offset,
-          rowsRemaining: Math.max(0, row.total - row.last_committed_offset),
-          totalRows: row.total,
+          isReplaying: row['status'] === 'in-progress',
+          rowsReplayed: lastCommittedOffset,
+          rowsRemaining: Math.max(0, total - lastCommittedOffset),
+          totalRows: total,
           estimatedCompletion: null,
-          startedAt: row.started_at,
-          contractId: row.contract_id,
-          ledger: row.ledger,
-          replayCursorId: row.cursor_id,
-          currentOffset: row.last_committed_offset,
-          status: row.status,
+          startedAt: row['started_at'] != null ? asDate(row['started_at']) : null,
+          contractId: row['contract_id'] as string,
+          ledger: Number(row['ledger']),
+          replayCursorId: row['cursor_id'] as string,
+          currentOffset: lastCommittedOffset,
+          status: row['status'] as string,
         };
       }
     } catch (err) {
-      logger.error('Failed to fetch replay progress from database', err as Error);
+      logger.error('Failed to fetch replay progress from database', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }

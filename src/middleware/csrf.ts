@@ -3,6 +3,7 @@ import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { errorResponse } from '../utils/response.js';
 import { ApiErrorCode } from './errorHandler.js';
 import { getApiKeyFromRequest } from '../lib/apiKey.js';
+import { warn } from '../utils/logger.js';
 
 /** Cookie name used to deliver the double-submit CSRF token to browser clients. */
 export const CSRF_COOKIE_NAME = 'fluxora_csrf';
@@ -243,7 +244,7 @@ export function csrfMiddleware(req: Request, res: Response, next: NextFunction):
     return next();
   }
 
-  const requestId = req.correlationId ?? req.id;
+  const requestId = req.id ?? req.correlationId;
 
   // 3. Extract cookie token and header token
   const cookies = parseCookies(req.headers.cookie);
@@ -253,10 +254,15 @@ export function csrfMiddleware(req: Request, res: Response, next: NextFunction):
   const headerTokenRaw = req.headers[CSRF_HEADER_NAME] ?? req.headers['x-csrf-token'];
   const headerToken = Array.isArray(headerTokenRaw) ? headerTokenRaw[0] : headerTokenRaw;
 
-  // 4. Validate presence and well-formedness of both tokens
-  //    isValidCsrfToken also rejects oversized values (> CSRF_TOKEN_MAX_LENGTH)
-  //    and tokens containing null bytes or ASCII control characters.
-  if (!isValidCsrfToken(cookieToken) || !isValidCsrfToken(headerToken)) {
+  // 4. Trim whitespace from extracted token values to prevent whitespace-only
+  //    tokens from passing presence checks (a whitespace-only string is truthy
+  //    but is not a valid token).
+  const cookieTokenTrimmed = cookieToken?.trim();
+  const headerTokenTrimmed = headerToken?.trim();
+
+  // 5. Validate presence of both tokens (after trimming)
+  if (!cookieTokenTrimmed || !headerTokenTrimmed) {
+    warn('CSRF token missing', { requestId, method: req.method, path: req.path, ip: req.ip });
     res.status(403).json(
       errorResponse(
         ApiErrorCode.FORBIDDEN,
@@ -268,8 +274,9 @@ export function csrfMiddleware(req: Request, res: Response, next: NextFunction):
     return;
   }
 
-  // 5. Compare tokens in constant time
-  if (!safeCompareCsrfTokens(cookieToken, headerToken)) {
+  // 6. Compare tokens in constant time
+  if (!safeCompareCsrfTokens(cookieTokenTrimmed, headerTokenTrimmed)) {
+    warn('CSRF token mismatch', { requestId, method: req.method, path: req.path, ip: req.ip });
     res.status(403).json(
       errorResponse(
         ApiErrorCode.FORBIDDEN,
