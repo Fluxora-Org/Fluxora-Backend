@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { JobQueue } from '../../src/jobs/queue.js';
+import { JobQueue } from '../../src/jobs/queue.ts';
 import type { Job } from 'pg-boss';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────

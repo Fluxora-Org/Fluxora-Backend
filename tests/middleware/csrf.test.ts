@@ -547,6 +547,28 @@ describe('csrfMiddleware integration — token format edge cases', () => {
     expect(res.status).toBe(403);
     expect(res.body.error.message).toContain('CSRF token mismatch');
   });
+
+  it('blocks when X-CSRF-Token header is present but empty string', async () => {
+    const token = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${token}`)
+      .set('X-CSRF-Token', '')
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
+
+  it('blocks when fluxora_csrf cookie value is empty string', async () => {
+    const headerToken = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=`)
+      .set('X-CSRF-Token', headerToken)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
 });
 
 describe('csrfMiddleware integration — correlationId in error responses', () => {

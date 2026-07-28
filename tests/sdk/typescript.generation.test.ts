@@ -760,6 +760,42 @@ describe('Idempotency utilities (src/idempotency.ts)', () => {
     const h2 = await hashBody({ a: 2, z: 1 });
     expect(h1).toBe(h2);
   });
+
+  // Edge case: hashBody handles empty objects
+  it('hashBody handles empty objects', async () => {
+    const hash = await hashBody({});
+    expect(typeof hash).toBe('string');
+    expect(hash).toHaveLength(64);
+    expect(hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  // Edge case: hashBody handles deeply nested structures
+  it('hashBody handles deeply nested structures', async () => {
+    const payload = {
+      level1: {
+        level2: {
+          level3: {
+            level4: {
+              value: 'deep'
+            }
+          }
+        }
+      }
+    };
+    const hash = await hashBody(payload);
+    expect(typeof hash).toBe('string');
+    expect(hash).toHaveLength(64);
+  });
+
+  // Edge case: hashBody handles arrays with mixed types
+  it('hashBody handles arrays with mixed types', async () => {
+    const payload = {
+      items: [1, 'two', null, true, { nested: 'object' }]
+    };
+    const hash = await hashBody(payload);
+    expect(typeof hash).toBe('string');
+    expect(hash).toHaveLength(64);
+  });
 });
 
 

@@ -219,11 +219,22 @@ export async function listApiKeys(): Promise<ApiKeyRecord[]> {
 }
 
 /**
- * Validates a raw API key.
+ * Resolves a raw API key to its full active {@link ApiKeyRecord} (including
+ * scopes and key id), or `undefined` if the key is unknown, malformed, or
+ * inactive.
  *
- * Resolves candidate active rows by the indexed key prefix (O(log n)) and then
- * performs a constant-time comparison against each candidate's salted/peppered
- * hash. Returns `true` on the first match.
+ * This is the single repository-boundary lookup: it resolves candidate active
+ * rows by the indexed key prefix (O(log n) — see
+ * {@link apiKeyRepository.findActiveByPrefix}, which filters `active = true`
+ * at the SQL level so revoked keys never surface as candidates) and then
+ * performs a constant-time comparison against every candidate's
+ * salted/peppered hash, never early-returning, so timing does not reveal
+ * which row (if any) matched within a colliding prefix bucket.
+ *
+ * Both {@link isValidApiKey} (boolean check) and `authenticateApiKey`
+ * (needs the full record to attach `keyScopes`/`keyId` to the request for
+ * {@link requireScope} to enforce) are built on this function so there is
+ * exactly one code path that ever touches key material.
  *
  * Latency is recorded in the `fluxora_auth_apikey_lookup_duration_seconds`
  * histogram, labelled only by `outcome` (`success` | `failure`). No key id,
@@ -233,28 +244,85 @@ export async function listApiKeys(): Promise<ApiKeyRecord[]> {
  *
  * @param rawKey - The raw key presented by the caller.
  */
-export async function isValidApiKey(rawKey: string): Promise<boolean> {
+export async function findRecordByRawKey(rawKey: string): Promise<ApiKeyRecord | undefined> {
   const endTimer = authApiKeyLookupDurationSeconds.startTimer();
 
   if (!rawKey || typeof rawKey !== 'string') {
     endTimer({ outcome: 'failure' });
-    return false;
+    return undefined;
   }
 
   const prefix = rawKey.slice(0, PREFIX_LENGTH);
   const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
 
-  let matched = false;
+  let matchedRecord: ApiKeyRecord | undefined;
   for (const candidate of candidates) {
     // Compare every candidate (do not early-return) so timing does not reveal
     // which row, if any, matched within a colliding prefix bucket.
     if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
-      matched = true;
+      matchedRecord = candidate;
     }
   }
-  endTimer({ outcome: matched ? 'success' : 'failure' });
-  return matched;
+  endTimer({ outcome: matchedRecord ? 'success' : 'failure' });
+  return matchedRecord;
 }
+
+/**
+ * @deprecated Alias for {@link findRecordByRawKey}, kept so existing callers
+ * and tests written against the older name keep working unchanged.
+ */
+export const getApiKeyRecord = findRecordByRawKey;
+
+/**
+ * Validates a raw API key.
+ *
+ * Thin wrapper over {@link findRecordByRawKey} — a key is valid iff a
+ * matching active record is found. Delegating here (rather than duplicating
+ * the prefix-lookup/hash-comparison loop) guarantees `isValidApiKey` and the
+ * record-returning lookup used by the auth middleware can never drift apart.
+ *
+ * @param rawKey - The raw key presented by the caller.
+ */
+export async function isValidApiKey(rawKey: string): Promise<boolean> {
+  return (await findRecordByRawKey(rawKey)) !== undefined;
+}
+
+/**
+ * Looks up the full ApiKeyRecord for a given raw key.
+ *
+ * Resolves by prefix (O(log n)), then performs a constant-time hash comparison
+ * to find the matching active record. Returns the record including scopes, or
+ * `undefined` if the key is not found or is inactive.
+ *
+ * Only active keys are returned — revoked keys yield `undefined`.
+ *
+ * @param rawKey - The raw key presented by the caller (e.g. `flx_...`).
+ */
+export async function getApiKeyRecord(rawKey: string): Promise<ApiKeyRecord | undefined> {
+  if (!rawKey || typeof rawKey !== 'string') {
+    return undefined;
+  }
+
+  const prefix = rawKey.slice(0, PREFIX_LENGTH);
+  const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
+
+  for (const candidate of candidates) {
+    if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Alias for {@link getApiKeyRecord} — looks up the full `ApiKeyRecord` for a
+ * given raw key. Exported under a second name so middleware that imports
+ * `findRecordByRawKey` remains source-compatible with the mock used in unit
+ * tests.
+ *
+ * @see getApiKeyRecord
+ */
+export const findRecordByRawKey = getApiKeyRecord;
 
 /**
  * Extracts the API key from common request headers.

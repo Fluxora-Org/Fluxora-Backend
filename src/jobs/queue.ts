@@ -328,6 +328,38 @@ export class JobQueue {
 }
 
 /**
+ * Default retry configuration used for built-in background jobs.
+ *
+ * These constants are intentionally exported so callers and tests can
+ * reference the same values without duplicating magic numbers.
+ *
+ * @internal
+ */
+export const DEFAULT_RETRY_LIMIT = 3;
+export const DEFAULT_RETRY_DELAY = 30;   // seconds
+export const DEFAULT_RETRY_BACKOFF = true;
+export const DEFAULT_EXPIRE_SECONDS = 900; // 15 minutes
+
+/**
+ * Constant used for the dead‑letter queue name.
+ *
+ * pg‑boss routes jobs that exceed their retry limit to this queue.
+ */
+export const DEAD_LETTER_QUEUE = 'job_dead_letter_queue';
+
+/**
+ * Maximum byte-length for persisted `error_message` in job_dead_letter.
+ * Prevents oversized error strings from blowing the TEXT column budget.
+ */
+const DLQ_MAX_ERROR_BYTES = 2048;
+
+/**
+ * Maximum byte-length for the serialised `payload` stored in job_dead_letter.
+ * pg JSONB can hold large documents, but we cap this to avoid runaway rows.
+ */
+const DLQ_MAX_PAYLOAD_BYTES = 65536; // 64 KiB
+
+/**
  * Singleton accessor for the JobQueue.
  *
  * The singleton is set during application startup via `setJobQueue`.
@@ -347,8 +379,16 @@ export function setJobQueue(queue: JobQueue | null): void {
  *
  * Keeps the existing signature so callers in `src/app.ts` continue to work.
  * Should be called once at startup with the application's Postgres pool.
+ *
+ * @throws {Error} If `pool` is null or undefined — callers must supply a valid pool.
  */
 export function startBackgroundJobs(pool: Pool): void {
+  // Guard: a missing pool is a programming error that would cause a silent crash
+  // inside the DLQ handler when pool.query is eventually called.
+  if (pool == null) {
+    throw new Error('startBackgroundJobs requires a valid PostgreSQL pool');
+  }
+
   if (_jobQueue) {
     logger.warn('Background jobs already started, skipping duplicate init');
     return;
@@ -496,10 +536,3 @@ export async function stopBackgroundJobs(): Promise<void> {
     setJobQueue(null);
   }
 }
-
-/**
- * Constant used for the dead‑letter queue name.
- *
- * pg‑boss routes jobs that exceed their retry limit to this queue.
- */
-export const DEAD_LETTER_QUEUE = 'job_dead_letter_queue';

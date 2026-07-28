@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { requestLoggerMiddleware } from '../src/middleware/requestLogger.js';
-import { logger, _resetLoggerForTest } from '../src/logging/logger.js';
+import { logger } from '../src/logging/logger.js';
 
 interface MockReq {
   method: string;
@@ -35,7 +35,6 @@ describe('requestLogger middleware', () => {
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    _resetLoggerForTest();
     infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
     errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
   });
@@ -72,17 +71,23 @@ describe('requestLogger middleware', () => {
     expect(errorSpy.mock.calls[0][0]).toBe('request failed');
   });
 
-  it('includes correlationId on structured metadata', () => {
+  it('includes correlationId as the second argument and metadata as the third', () => {
     const req = createReq({ correlationId: 'req-abc' });
     const res = createRes(204);
 
     requestLoggerMiddleware(req, res, vi.fn());
     res.emit('finish');
 
-    const receivedMeta = infoSpy.mock.calls[0][1] as Record<string, unknown>;
-    const completedMeta = infoSpy.mock.calls[1][1] as Record<string, unknown>;
-    expect(receivedMeta.correlationId).toBe('req-abc');
-    expect(completedMeta.correlationId).toBe('req-abc');
+    expect(infoSpy).toHaveBeenCalledTimes(2);
+    expect(infoSpy.mock.calls[0][1]).toBe('req-abc');
+    expect(infoSpy.mock.calls[1][1]).toBe('req-abc');
+
+    const receivedMeta = infoSpy.mock.calls[0][2] as Record<string, unknown>;
+    const completedMeta = infoSpy.mock.calls[1][2] as Record<string, unknown>;
+    expect(receivedMeta.method).toBe('GET');
+    expect(receivedMeta.path).toBe('/health');
+    expect(completedMeta.method).toBe('GET');
+    expect(completedMeta.path).toBe('/health');
   });
 
   it('does not include ip or authorization data in emitted metadata', () => {
@@ -92,8 +97,8 @@ describe('requestLogger middleware', () => {
     requestLoggerMiddleware(req, res, vi.fn());
     res.emit('finish');
 
-    const receivedMeta = infoSpy.mock.calls[0][1] as Record<string, unknown>;
-    const completedMeta = infoSpy.mock.calls[1][1] as Record<string, unknown>;
+    const receivedMeta = infoSpy.mock.calls[0][2] as Record<string, unknown>;
+    const completedMeta = infoSpy.mock.calls[1][2] as Record<string, unknown>;
 
     expect(Object.prototype.hasOwnProperty.call(receivedMeta, 'ip')).toBe(false);
     expect(Object.prototype.hasOwnProperty.call(receivedMeta, 'authorization')).toBe(false);
@@ -112,7 +117,7 @@ describe('requestLogger middleware', () => {
     requestLoggerMiddleware(req, res, vi.fn());
     res.emit('finish');
 
-    const completedMeta = infoSpy.mock.calls[1][1] as Record<string, unknown>;
+    const completedMeta = infoSpy.mock.calls[1][2] as Record<string, unknown>;
     expect(completedMeta.statusCode).toBe(201);
     expect(completedMeta.durationMs).toBe(45);
 
