@@ -1899,7 +1899,27 @@ registry.registerPath({
 
 /**
  * Build and return the complete OpenAPI 3.1 document.
- * Called once at startup; the result is cached by the docs route.
+ *
+ * This function is **intentionally free of runtime-reloadable configuration**.
+ * It reads only from:
+ *   - The module-level `registry` (statically populated at import time)
+ *   - Hardcoded Zod schemas and string literals
+ *
+ * It does NOT read feature flags (`getFlags`, `isEnabled`), environment
+ * variables, or any other state modified by `reloadFlags()` / SIGHUP.
+ *
+ * Because of this, the cache in `src/routes/docs.ts` is correctly
+ * process-lifetime — invalidating it on config reloads would be wasted work.
+ *
+ * ⚠️  FUTURE CONTRIBUTORS — if you add feature-flag-gated content here
+ * (e.g. `if (isEnabled('some-flag', 'system')) registry.registerPath(...)`)
+ * you MUST update `src/routes/docs.ts` to call `resetSpecCache()` after each
+ * successful `reloadFlags()` call, and update `src/routes/docs.test.ts` to
+ * cover the dynamic path. See the module-level comment in docs.ts for the
+ * full checklist.
+ *
+ * Called once on first `/openapi.json` request; the result is cached by
+ * `getSpec()` in the docs route for the remainder of the process lifetime.
  */
 export function buildOpenApiSpec(): Record<string, unknown> {
   const generator = new OpenApiGeneratorV31(registry.definitions);
