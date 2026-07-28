@@ -85,6 +85,14 @@ const recipientAddressSchema = z
   .regex(STELLAR_PUBLIC_KEY_REGEX, 'recipient_address must be a valid Stellar public key')
   .refine(isValidStellarPublicKey, 'recipient_address must be a valid Stellar StrKey public key');
 
+/**
+ * WebSocket Envelope Schemas
+ *
+ * We do not use `.passthrough()` on these schemas. By default, Zod strips any unknown fields.
+ * This ensures the message shape is explicitly locked down inside the backend, preserving backward
+ * compatibility for clients sending extra unrecognized fields (which will simply be stripped
+ * rather than failing the validation), while preventing accidental bleeding of unvalidated data.
+ */
 const subscriptionFilterSchema = z.object({
   stream_id: streamIdSchema.optional(),
   streamId: streamIdSchema.optional(),
@@ -92,7 +100,7 @@ const subscriptionFilterSchema = z.object({
   recipientAddress: recipientAddressSchema.optional(),
   /** Opt-in micro-batching: coalesce rapid events for this stream into a single frame. */
   batching: z.boolean().optional(),
-}).passthrough();
+});
 
 const subscriptionMessageSchema = z.object({
   type: z.enum(['subscribe', 'unsubscribe']),
@@ -103,7 +111,16 @@ const subscriptionMessageSchema = z.object({
   /** Opt-in micro-batching: coalesce rapid events for this stream into a single frame. */
   batching: z.boolean().optional(),
   filter: subscriptionFilterSchema.optional(),
-}).passthrough();
+});
+
+const replayFilterSchema = z.object({
+  afterEventId: z.string().trim().min(1).optional(),
+  fromLedger: z.number().int().nonnegative().optional(),
+  toledger: z.number().int().nonnegative().optional(),
+  contractId: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
+  topic: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
+  limit: z.number().int().positive().max(1000).optional(),
+});
 
 const replayMessageSchema = z.object({
   type: z.literal('replay'),
@@ -113,7 +130,8 @@ const replayMessageSchema = z.object({
   contractId: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
   topic: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
   limit: z.number().int().positive().max(1000).optional(),
-}).passthrough();
+  filter: replayFilterSchema.optional(),
+});
 
 export interface SubscriptionFilter {
   streamId?: string;
@@ -199,12 +217,12 @@ function normalizeSubscriptionFilter(
 
 function normalizeReplayFilter(value: z.infer<typeof replayMessageSchema>): StreamEventReplayFilter {
   return {
-    ...(value.afterEventId !== undefined ? { afterEventId: value.afterEventId } : {}),
-    ...(value.fromLedger !== undefined ? { fromLedger: value.fromLedger } : {}),
-    ...(value.toledger !== undefined ? { toledger: value.toledger } : {}),
-    ...(value.contractId !== undefined ? { contractId: value.contractId } : {}),
-    ...(value.topic !== undefined ? { topic: value.topic } : {}),
-    ...(value.limit !== undefined ? { limit: value.limit } : {}),
+    ...((value.afterEventId ?? value.filter?.afterEventId) !== undefined ? { afterEventId: (value.afterEventId ?? value.filter?.afterEventId) } : {}),
+    ...((value.fromLedger ?? value.filter?.fromLedger) !== undefined ? { fromLedger: (value.fromLedger ?? value.filter?.fromLedger) } : {}),
+    ...((value.toledger ?? value.filter?.toledger) !== undefined ? { toledger: (value.toledger ?? value.filter?.toledger) } : {}),
+    ...((value.contractId ?? value.filter?.contractId) !== undefined ? { contractId: (value.contractId ?? value.filter?.contractId) } : {}),
+    ...((value.topic ?? value.filter?.topic) !== undefined ? { topic: (value.topic ?? value.filter?.topic) } : {}),
+    ...((value.limit ?? value.filter?.limit) !== undefined ? { limit: (value.limit ?? value.filter?.limit) } : {}),
   };
 }
 
