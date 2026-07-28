@@ -49,6 +49,7 @@ export function resolveWorkerUrl(base: URL, basename: string): URL {
   } catch {
     // .js not found — fall back to .ts (Node 25+ type-stripping).
     return new URL(`${basename}.ts`, base);
+
   }
 }
 
@@ -60,7 +61,7 @@ export interface WorkerPoolOptions {
    * When omitted, derived from `os.availableParallelism()` with a cap.
    */
   maxWorkers?: number;
-
+ 
   /**
    * Data passed to every worker via `workerData` (structured clone).
    * Must not contain non-cloneable values (functions, symbols, handles).
@@ -72,6 +73,7 @@ export class PoolShutdownError extends Error {
   constructor() {
     super('WorkerPool has been shut down');
     this.name = 'PoolShutdownError';
+    
   }
 }
 

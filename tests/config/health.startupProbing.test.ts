@@ -335,6 +335,25 @@ describe('probeStartupDependencies — budget enforcement', () => {
     expect(callCount).toBeGreaterThanOrEqual(1);
   });
 
+  it('caps a hanging soft probe to the shared startup budget', async () => {
+    const probe: StartupProbeConfig = {
+      name: 'stellar_rpc',
+      tier: 'soft',
+      timeoutMs: 5_000,
+      probe: vi.fn(() => new Promise<void>(() => { /* never resolves */ })),
+    };
+    const start = Date.now();
+    const results = await probeStartupDependencies({
+      probes: [probe],
+      budgetMs: 50,
+      baseRetryMs: 1,
+      maxRetryMs: 5,
+    });
+
+    expect(results[0]!.outcome).toBe('degraded');
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
   it('returns latencyMs and attempts in the degraded result', async () => {
     const probe = makeFailProbe('redis', 'soft');
 
@@ -678,6 +697,11 @@ describe('Startup probe env-var configuration defaults', () => {
 
   it('rejects STARTUP_PROBE_BUDGET_MS = 0 (minimum is 1)', () => {
     process.env.STARTUP_PROBE_BUDGET_MS = '0';
+    expect(() => loadConfig()).toThrow();
+  });
+
+  it('rejects a startup budget above the 60 second orchestration bound', () => {
+    process.env.STARTUP_PROBE_BUDGET_MS = '60001';
     expect(() => loadConfig()).toThrow();
   });
 

@@ -83,6 +83,15 @@ interface MockClientConfig {
   /** Throw on the Nth query() call (0-indexed). */
   failAtIndex?: number;
   failError?: Error;
+  /**
+   * Override the information_schema return for this client.
+   * - `true`  (default) — report `legal_hold` column exists
+   * - `false`           — report `legal_hold` column does NOT exist
+   *
+   * When `false`, the row-fetch SQL uses `FALSE AS legal_hold` and every
+   * candidate row has `legal_hold === false` regardless of fixture values.
+   */
+  hasLegalHold?: boolean;
 }
 
 function makeMockClient(cfg: MockClientConfig = {}) {
@@ -100,6 +109,16 @@ function makeMockClient(cfg: MockClientConfig = {}) {
         throw cfg.failError ?? new Error('mock DB error');
       }
       if (/^\s*SELECT/i.test(sql)) {
+        // information_schema queries (hoisted column-existence check) should
+        // NOT consume row fixtures.  Report column existence based on the
+        // optional `hasLegalHold` config flag (defaults to `true` so that
+        // per-row legal_hold values from fixtures are honoured).
+        if (/information_schema/i.test(sql)) {
+          const exists = cfg.hasLegalHold !== undefined ? cfg.hasLegalHold : true;
+          return exists
+            ? { rows: [{ column_name: 'legal_hold' }], rowCount: 1 }
+            : { rows: [], rowCount: 0 };
+        }
         const batch = cfg.rows?.[selectIdx] ?? [];
         selectIdx++;
         return { rows: batch, rowCount: batch.length };
@@ -138,12 +157,34 @@ function row(overrides: Partial<Record<string, unknown>> = {}): Record<string, u
 
 const FIXED_NOW = new Date('2026-07-24T00:00:00.000Z');
 
-/** Build base PurgeJobOptions with injected pool. */
+/**
+ * Build base PurgeJobOptions with injected pool.
+ *
+ * Pads the clients array so there are at least 2 × N clients for N schedule
+ * rules (one for the hoisted schema check + one for the batch per rule).
+ * The first two slots are filled with `clients[0]` so the first rule's
+ * batch work lands on the first client (matching the assertion pattern
+ * in most tests).
+ */
 function opts(clients: MockClient[], extra: Partial<PurgeJobOptions> = {}): PurgeJobOptions {
+  const needPerRule = 2; // 1 schema-check connect + 1 batch connect per rule
+  const needed = PURGEABLE_RETENTION_SCHEDULE.length * needPerRule;
+  const padded: MockClient[] = [];
+  // First rule: schema + batch both use clients[0] so tests asserting on
+  // clients[0].queries still see batch operations.
+  if (clients.length >= 1) {
+    padded.push(clients[0]); // first rule schema check
+    padded.push(clients[0]); // first rule batch
+  }
+  // Remaining slots: cycle through remaining clients, repeat last if exhausted.
+  for (let i = 2; i < needed; i++) {
+    const idx = Math.min(i, clients.length - 1);
+    padded.push(clients[Math.max(1, idx)]);
+  }
   return {
     now: FIXED_NOW,
     batchSize: 10,
-    pool: makeMockPool(clients) as unknown as PurgeJobOptions['pool'],
+    pool: makeMockPool(padded) as unknown as PurgeJobOptions['pool'],
     correlationId: 'test-corr-id',
     ...extra,
   };
@@ -481,11 +522,15 @@ describe('runRetentionPurge() — redact purge action', () => {
     const rule = PURGEABLE_RETENTION_SCHEDULE.find((r) => r.table === 'streams');
     expect(rule?.purgeAction).toBe('redact');
 
-    const c0 = makeMockClient({ rows: [[row({ id: 's1', legal_hold: false })], []] });
-    const c1 = makeMockClient({ rows: [[]] });
+    // First client handles audit_logs (rule 1) with no data.
+    // Second client handles streams (rule 2) with a held row — it's reused for
+    // webhook_outbox (rule 3) which gets no data.
+    const c0 = makeMockClient({ rows: [[]] });
+    const c1 = makeMockClient({ rows: [[row({ id: 's1', legal_hold: false })], []] });
     await runRetentionPurge(opts([c0, c1]));
 
-    const updates = c0.queries.filter((q) => /^\bUPDATE\b/i.test(q.sql));
+    // Streams runs on c1 (second client).
+    const updates = c1.queries.filter((q) => /^\bUPDATE\b/i.test(q.sql));
     expect(updates).toHaveLength(1);
     expect(updates[0].sql).toContain('sender_address');
     expect(updates[0].sql).toContain('recipient_address');
@@ -500,7 +545,7 @@ describe('runRetentionPurge() — error handling', () => {
   it('rolls back on SELECT failure', async () => {
     const c0 = makeMockClient({
       rows: [[row()]],
-      failAtIndex: 0, // Fail on the SELECT itself
+      failAtIndex: 2, // Fail on the batch-SELECT (index 0=info_schema, 1=BEGIN)
       failError: new Error('connection lost'),
     });
     const c1 = makeMockClient({ rows: [[]] });
@@ -510,10 +555,10 @@ describe('runRetentionPurge() — error handling', () => {
   });
 
   it('rolls back on DELETE failure', async () => {
-    // SELECT succeeds (index 0), then DELETE fails (index 1)
+    // Schema check (0), BEGIN (1), batch SELECT (2), then DELETE fails (3)
     const c0 = makeMockClient({
       rows: [[row({ id: 'fail-row' })]],
-      failAtIndex: 2, // Fail on DELETE (after BEGIN=0, SELECT=1)
+      failAtIndex: 3, // Fail on DELETE
       failError: new Error('foreign key violation'),
     });
     const c1 = makeMockClient({ rows: [[]] });
@@ -524,7 +569,7 @@ describe('runRetentionPurge() — error handling', () => {
 
   it('releases the pool client even on failure', async () => {
     const c0 = makeMockClient({
-      failAtIndex: 0,
+      failAtIndex: 1, // Fail on BEGIN (index 0=info_schema schema check, 1=BEGIN)
       failError: new Error('boom'),
     });
     const c1 = makeMockClient({ rows: [[]] });
@@ -533,9 +578,9 @@ describe('runRetentionPurge() — error handling', () => {
   });
 
   it('continues processing remaining rules after one rule fails', async () => {
-    // First rule's client fails on SELECT
+    // First rule's client fails on the batch SELECT
     const c0 = makeMockClient({
-      failAtIndex: 0,
+      failAtIndex: 2, // Fail on batch SELECT (0=info_schema, 1=BEGIN)
       failError: new Error('first rule error'),
     });
     // Second rule's client works
@@ -558,7 +603,10 @@ describe('runRetentionPurge() — multiple batches', () => {
     const cb = makeMockClient({ rows: [batch2, []] });
     const cc = makeMockClient({ rows: [[]] });
     const c1 = makeMockClient({ rows: [[]] });
-    const pool = makeMockPool([ca, cb, cc, c1]) as unknown as PurgeJobOptions['pool'];
+    // Pool must supply 2 clients per rule (1 schema + 1 batch).
+    // Rule 1 needs 3 batch connects to drain (2+1+0): ca(s), ca(b1), cb(b2), cc(b3)
+    // Rules 2-3 reuse c1 for schema+batch.
+    const pool = makeMockPool([ca, ca, cb, cc, c1, c1]) as unknown as PurgeJobOptions['pool'];
     const result = await runRetentionPurge({ now: FIXED_NOW, batchSize, pool });
     expect(result.results[0].rowsPurged).toBe(3);
   });
@@ -569,7 +617,8 @@ describe('runRetentionPurge() — multiple batches', () => {
     const ca = makeMockClient({ rows: [batch1, []] });
     const cb = makeMockClient({ rows: [[]] });
     const c1 = makeMockClient({ rows: [[]] });
-    const pool = makeMockPool([ca, cb, c1]) as unknown as PurgeJobOptions['pool'];
+    // Pool: [ca(schema), ca(batch), cb(schema), cb(batch), c1(...)]
+    const pool = makeMockPool([ca, ca, cb, cb, c1, c1]) as unknown as PurgeJobOptions['pool'];
     await runRetentionPurge({ now: FIXED_NOW, batchSize, pool });
     const begins = ca.queries.filter((q) => q.sql.trim().toUpperCase() === 'BEGIN');
     const commits = ca.queries.filter((q) => q.sql.trim().toUpperCase() === 'COMMIT');
@@ -596,7 +645,8 @@ describe('runRetentionPurge() — multiple rules', () => {
   it('aggregates totals across all rules', async () => {
     const c0 = makeMockClient({ rows: [[row({ id: 'a1' }), row({ id: 'a2' })], []] });
     const c1 = makeMockClient({ rows: [[row({ id: 'w1' })], []] });
-    const pool = makeMockPool([c0, c1]) as unknown as PurgeJobOptions['pool'];
+    // Pool: c0(schema)+c0(batch) for rule 1, then c1(schema)+c1(batch) for rules 2-3
+    const pool = makeMockPool([c0, c0, c1, c1, c1, c1]) as unknown as PurgeJobOptions['pool'];
     const result = await runRetentionPurge({ now: FIXED_NOW, batchSize: 10, pool });
     expect(result.totalRowsPurged).toBe(3);
   });
@@ -750,9 +800,13 @@ describe('runRetentionPurge() — SQL structure', () => {
     const c0 = makeMockClient({ rows: [[row()], []] });
     const c1 = makeMockClient({ rows: [[]] });
     await runRetentionPurge(opts([c0, c1]));
-    const selects = c0.queries.filter((q) => /^\s*SELECT/i.test(q.sql));
-    expect(selects.length).toBeGreaterThanOrEqual(1);
-    for (const s of selects) {
+    // Exclude information_schema queries (the hoisted column-existence check)
+    // which are plain catalog lookups without row locking.
+    const rowFetchSelects = c0.queries.filter(
+      (q) => /^\s*SELECT/i.test(q.sql) && !/information_schema/i.test(q.sql)
+    );
+    expect(rowFetchSelects.length).toBeGreaterThanOrEqual(1);
+    for (const s of rowFetchSelects) {
       expect(s.sql.toUpperCase()).toContain('FOR UPDATE SKIP LOCKED');
     }
   });
@@ -853,6 +907,12 @@ function makeStatefulClient(store: TableStore) {
       queries.push({ sql: trimmed, params });
 
       if (/^\s*SELECT/i.test(trimmed)) {
+        // information_schema queries (hoisted column-existence check) should
+        // NOT count toward the batch SELECT counter.  Always report the
+        // column exists so legal_hold values from fixtures are honoured.
+        if (/information_schema/i.test(trimmed)) {
+          return { rows: [{ column_name: 'legal_hold' }], rowCount: 1 };
+        }
         selectCalls += 1;
         // First SELECT of this client connection → current table snapshot.
         // Subsequent SELECTs → empty (job expects drain when batch < batchSize).
@@ -1074,5 +1134,106 @@ describe('runRetentionPurge() — dry-run write isolation (#832)', () => {
 
     expect(c0.queries.filter((q) => /^\s*UPDATE/i.test(q.sql))).toHaveLength(0);
     expect(store.has('r1')).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 18. Query-count regression — information_schema runs at most once per rule
+//
+// Verifies that the hoisted column-existence check (tableHasColumn) is NOT
+// issued as a correlated subquery inside the row-fetch SQL and that the
+// standalone information_schema.columns query runs at most once per batch
+// (i.e. once per rule for a single-batch table).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('runRetentionPurge() — query-count regression (#information_schema)', () => {
+  it('issues at most one information_schema query per rule execution', async () => {
+    // Use stateful clients so we can inspect every query across all rules.
+    const stores = PURGEABLE_RETENTION_SCHEDULE.map(() =>
+      makeTableStore([row({ id: 'r1', legal_hold: false })])
+    );
+    const clients = stores.map((s) => makeStatefulClient(s));
+
+    // Duplicate each client so one gets the schema check and one the batch
+    // (2 connects per rule: 1 schema + 1 batch).
+    const poolClients: MockClient[] = [];
+    for (const c of clients) {
+      poolClients.push(c as unknown as MockClient);
+      poolClients.push(c as unknown as MockClient);
+    }
+    const pool = makeMockPool(poolClients);
+    const result = await runRetentionPurge({
+      now: FIXED_NOW,
+      batchSize: 10,
+      pool: pool as unknown as PurgeJobOptions['pool'],
+    });
+
+    expect(result.totalRowsPurged).toBe(PURGEABLE_RETENTION_SCHEDULE.length);
+
+    // Every rule should issue exactly one information_schema query on its
+    // dedicated client (the first of the pair handles schema, the second
+    // handles the batch).
+    for (let i = 0; i < PURGEABLE_RETENTION_SCHEDULE.length; i++) {
+      const infoSchemaQueries = clients[i].queries.filter((q) =>
+        /information_schema/i.test(q.sql)
+      );
+      expect(infoSchemaQueries).toHaveLength(1);
+    }
+  });
+
+  it('never embeds information_schema in the row-fetch SELECT SQL', async () => {
+    const c0 = makeMockClient({ rows: [[row({ id: 'r1', legal_hold: false })], []] });
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+    await runRetentionPurge(opts([c0, ...rest]));
+
+    // The row-fetch SELECT should NOT contain information_schema
+    const fetchSelects = c0.queries.filter(
+      (q) => /^\s*SELECT/i.test(q.sql) && !/information_schema/i.test(q.sql)
+    );
+    for (const s of fetchSelects) {
+      expect(s.sql.toUpperCase()).not.toContain('INFORMATION_SCHEMA');
+      expect(s.sql.toUpperCase()).not.toContain('COALESCE');
+    }
+  });
+
+  it('still correctly handles legal_hold=true for tables with the column', async () => {
+    vi.mocked(recordAuditEventToDb).mockClear();
+    const c0 = makeMockClient({
+      rows: [[row({ id: 'h1', legal_hold: true })], []],
+    });
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+    const result = await runRetentionPurge(opts([c0, ...rest]));
+
+    expect(result.totalRowsSkipped).toBe(1);
+    expect(recordAuditEventToDb).toHaveBeenCalledWith(
+      'PURGE_SKIPPED_LEGAL_HOLD',
+      expect.any(String),
+      'h1',
+      expect.any(String),
+      expect.objectContaining({ reason: 'legal_hold = TRUE' })
+    );
+  });
+
+  it('uses FALSE AS legal_hold when the table lacks the column', async () => {
+    // Simulate a table WITHOUT a legal_hold column (hasLegalHold: false).
+    const c0 = makeMockClient({
+      rows: [[{ id: 'r1', legal_hold: 'should-be-ignored' }], []],
+      hasLegalHold: false,
+    });
+    const rest = emptyRuleClients(PURGEABLE_RETENTION_SCHEDULE.length - 1);
+    const result = await runRetentionPurge(opts([c0, ...rest]));
+
+    // Row should be purged (no legal_hold means no hold can apply).
+    expect(result.totalRowsPurged).toBe(1);
+    expect(result.totalRowsSkipped).toBe(0);
+
+    // The row-fetch SELECT should contain FALSE AS legal_hold, not a
+    // direct column reference or information_schema subquery.
+    const fetchSelect = c0.queries.find(
+      (q) => /^\s*SELECT/i.test(q.sql) && !/information_schema/i.test(q.sql)
+    );
+    expect(fetchSelect).toBeDefined();
+    expect(fetchSelect!.sql.toUpperCase()).toContain('FALSE AS LEGAL_HOLD');
+    expect(fetchSelect!.sql.toUpperCase()).not.toContain('INFORMATION_SCHEMA');
   });
 });

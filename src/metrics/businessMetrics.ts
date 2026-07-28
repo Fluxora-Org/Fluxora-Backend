@@ -390,27 +390,69 @@ export const adminReindexJobDurationSeconds =
     registers: [registry],
   });
 
-/** Safely resets values across all business counters, histograms, and gauges without removing them from the registry. */
-export function resetBusinessMetrics(): void {
-  authJwtVerifyDurationSeconds.reset();
-  authApiKeyLookupDurationSeconds.reset();
-  streamsCreatedTotal.reset();
-  sseActiveConnectionsGauge.reset();
-  sseConnectionsRejectedTotal.reset();
-  webhookDeliveriesSuppressedTotal.reset();
-  webhookDeliveriesTotal.reset();
-  webhookDeliveryDurationSeconds.reset();
-  indexerEventsIngestedTotal.reset();
-  indexerLagSeconds.reset();
-  sseLiveSubscribersGauge.reset();
-  webhookDlqItemsGauge.reset();
-  sseEventListenersGauge.reset();
-  sseSubscriberErrorsTotal.reset();
-  sseBackpressureDropsTotal.reset();
-  webhookOutboxPendingItemsGauge.reset();
-  wsAuthFailureTotal.reset();
-  adminReindexJobDurationSeconds.reset();
-}
+/**
+ * Counter for jobs that have been permanently routed to the dead-letter queue.
+ *
+ * Each increment represents one terminal job failure that was persisted to
+ * `job_dead_letter`.  Labelled by `job_name` so operators can see which
+ * specific job types are failing most frequently without requiring a DB query.
+ *
+ * @security
+ * - Label cardinality is bounded: job_name values come from developer-controlled
+ *   `register()` call sites, not from user input.
+ */
+export const jobDlqEntriesTotal =
+  (registry.getSingleMetric('fluxora_job_dlq_entries_total') as Counter<'job_name'>) ||
+  new Counter({
+    name: 'fluxora_job_dlq_entries_total',
+    help: 'Total number of jobs permanently moved to the dead-letter queue, labelled by job name',
+    labelNames: ['job_name'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for monthly partitions created by the partition-maintenance job.
+ *
+ * Each increment represents one `CREATE TABLE ... PARTITION OF` that
+ * actually created a new partition (idempotent no-ops are not counted).
+ * Labelled by `table` so operators can distinguish `contract_events` from
+ * `audit_logs` activity without a DB query.
+ *
+ * @security
+ * - `table` values come from the developer-controlled `CANDIDATE_TABLES`
+ *   constant in `src/jobs/partitionMaintenance.ts`, not from user input.
+ */
+export const partitionsCreatedTotal =
+  (registry.getSingleMetric('fluxora_partitions_created_total') as Counter<'table'>) ||
+  new Counter({
+    name: 'fluxora_partitions_created_total',
+    help: 'Total number of monthly partitions created by the partition-maintenance job, labelled by table',
+    labelNames: ['table'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for partition-maintenance runs that discovered the current
+ * month's partition missing (i.e. an earlier scheduled run failed or was
+ * skipped).
+ *
+ * Any increment means rows for the current month may have already landed
+ * in the unindexed `DEFAULT` partition before this run self-healed the
+ * situation. Alert on `increase(...) > 0` — a healthy deployment should
+ * never increment this counter.
+ *
+ * @see docs/database.md#partition-pre-creation
+ */
+export const partitionMaintenanceBehindScheduleTotal =
+  (registry.getSingleMetric(
+    'fluxora_partition_maintenance_behind_schedule_total'
+  ) as Counter<'table'>) ||
+  new Counter({
+    name: 'fluxora_partition_maintenance_behind_schedule_total',
+    help: 'Total number of partition-maintenance runs where the current-month partition was found missing, labelled by table',
+    labelNames: ['table'] as const,
+    registers: [registry],
+  });
 
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
@@ -434,4 +476,7 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
   registry.removeSingleMetric('fluxora_longpoll_active_connections');
   registry.removeSingleMetric('fluxora_longpoll_connections_rejected_total');
+  registry.removeSingleMetric('fluxora_job_dlq_entries_total');
+  registry.removeSingleMetric('fluxora_partitions_created_total');
+  registry.removeSingleMetric('fluxora_partition_maintenance_behind_schedule_total');
 }

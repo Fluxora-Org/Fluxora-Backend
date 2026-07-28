@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import express, { Request, Response } from 'express';
 import request from 'supertest';
 import {
@@ -12,6 +12,14 @@ import {
   CSRF_HEADER_NAME,
 } from '../../src/middleware/csrf.js';
 import { errorHandler } from '../../src/middleware/errorHandler.js';
+
+// Spy on the warn logger — all modules import from src/lib/logger.ts, which
+// is re-exported through src/utils/logger.ts.
+vi.mock('../../src/utils/logger.js', async () => {
+  const actual = await vi.importActual('../../src/utils/logger.js');
+  return { ...(actual as object), warn: vi.fn(), error: vi.fn() };
+});
+const { warn: warnSpy } = await import('../../src/utils/logger.js');
 
 // ---------------------------------------------------------------------------
 // Helper — build a minimal Express app wired with csrfMiddleware
@@ -547,6 +555,50 @@ describe('csrfMiddleware integration — token format edge cases', () => {
     expect(res.status).toBe(403);
     expect(res.body.error.message).toContain('CSRF token mismatch');
   });
+
+  it('blocks when X-CSRF-Token header is present but empty string', async () => {
+    const token = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${token}`)
+      .set('X-CSRF-Token', '')
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
+
+  it('blocks when fluxora_csrf cookie value is empty string', async () => {
+    const headerToken = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=`)
+      .set('X-CSRF-Token', headerToken)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
+
+  it('blocks when fluxora_csrf cookie value is whitespace-only', async () => {
+    const headerToken = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=   `)
+      .set('X-CSRF-Token', headerToken)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
+
+  it('blocks when X-CSRF-Token header value is whitespace-only', async () => {
+    const token = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${token}`)
+      .set('X-CSRF-Token', '   ')
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
 });
 
 describe('csrfMiddleware integration — correlationId in error responses', () => {
@@ -617,6 +669,129 @@ describe('csrfMiddleware integration — correlationId in error responses', () =
     expect(res.status).toBe(403);
     // requestId should be undefined / not present when no id was assigned
     expect(res.body.error.requestId).toBeUndefined();
+  });
+});
+
+describe('csrfMiddleware integration — security logging on violations', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('logs a warning when CSRF tokens are missing (cookie session, no tokens)', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', 'session=abc')
+      .send({});
+    expect(res.status).toBe(403);
+    expect(warnSpy).toHaveBeenCalled();
+    const callArgs = (warnSpy as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(callArgs[0]).toBe('CSRF token missing');
+    expect(callArgs[1]).toMatchObject({ method: 'POST', path: '/api/streams' });
+  });
+
+  it('logs a warning when CSRF tokens mismatch', async () => {
+    const app = buildApp();
+    const cookieToken = generateCsrfToken();
+    const headerToken = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${cookieToken}`)
+      .set('X-CSRF-Token', headerToken)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(warnSpy).toHaveBeenCalled();
+    const callArgs = (warnSpy as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(callArgs[0]).toBe('CSRF token mismatch');
+    expect(callArgs[1]).toMatchObject({ method: 'POST', path: '/api/streams' });
+  });
+
+  it('does NOT log a warning when CSRF enforcement passes', async () => {
+    const app = buildApp();
+    const token = generateCsrfToken();
+    await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${token}`)
+      .set('X-CSRF-Token', token)
+      .send({});
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT log a warning when API auth bypasses CSRF (Bearer token)', async () => {
+    const app = buildApp();
+    await request(app)
+      .post('/api/streams')
+      .set('Authorization', 'Bearer valid.jwt')
+      .set('Cookie', 'session=abc')
+      .send({});
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT log a warning for safe methods even with cookies', async () => {
+    const app = buildApp();
+    await request(app)
+      .get('/api/streams')
+      .set('Cookie', 'session=abc');
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT log a warning when no cookie is present', async () => {
+    const app = buildApp();
+    await request(app)
+      .post('/api/streams')
+      .send({});
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('csrfMiddleware integration — requestId edge cases', () => {
+  it('uses req.id over req.correlationId when both are present', async () => {
+    const token = generateCsrfToken();
+    const app = express();
+    app.use(express.json());
+    app.use((req: Request, _res: Response, next) => {
+      (req as any).id = 'hardcoded-req-id';
+      (req as any).correlationId = 'should-not-be-used';
+      next();
+    });
+    app.use(csrfMiddleware);
+    app.post('/api/streams', (_req: Request, res: Response) => res.json({ ok: true }));
+    app.use(errorHandler);
+
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${token}`)
+      .set('X-CSRF-Token', generateCsrfToken())
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.requestId).toBe('hardcoded-req-id');
+  });
+
+  it('includes requestId in 403 body when req.correlationId is set and req.id is absent', async () => {
+    const token = generateCsrfToken();
+    const correlationId = 'csrf-err-corr-001';
+    const app = express();
+    app.use(express.json());
+    app.use((req: Request, _res: Response, next) => {
+      (req as any).correlationId = correlationId;
+      // req.id is deliberately NOT set — verify fallback to correlationId
+      next();
+    });
+    app.use(csrfMiddleware);
+    app.post('/api/streams', (_req: Request, res: Response) => res.json({ ok: true }));
+    app.use(errorHandler);
+
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${token}`)
+      .set('X-CSRF-Token', generateCsrfToken())
+      .send({});
+
+    expect(res.status).toBe(403);
+    // requestId resolves to req.id first, falls back to req.correlationId
+    // Since req.id is not set, correlationId is used
+    expect(res.body.error.requestId).toBe(correlationId);
   });
 });
 

@@ -166,11 +166,78 @@ The `contract_events` table is partitioned by `happened_at` to ensure bounded gr
 
 ### Partition Pre-creation
 
-To avoid rows landing in the unindexed `DEFAULT` partition, partitions for the next 3 months are pre-created by the background job `src/jobs/partitionMaintenance.ts`.
+To avoid rows landing in the unindexed `DEFAULT` partition, the background job `src/jobs/partitionMaintenance.ts` pre-creates monthly partitions ahead of schedule for every range-partitioned table it manages.
 
-1. The job runs every 24 hours.
-2. It uses `pg_try_advisory_lock` to prevent concurrent execution.
-3. If partition creation falls behind, the job logs an error and should be monitored for alerting.
+#### Managed tables
+
+| Table | Managed today? | Notes |
+|---|---|---|
+| `contract_events` | Yes | Range-partitioned since `20260627000000_contract_events_partitioning.ts` |
+| `audit_logs` | Not yet | Currently a plain table (see `1774715200000_audit-and-webhook-outbox.ts`). The job detects partitioning automatically at runtime — once `audit_logs` is migrated to `PARTITION BY RANGE`, this job starts managing it with no code change required. |
+
+The job checks each table via `pg_class.relkind = 'p'` + `pg_partitioned_table.partstrat = 'r'` before touching it; a table that is not range-partitioned is skipped silently (logged at `debug`, not an error).
+
+#### Partition naming
+
+Monthly partitions are named `<table>_y<YYYY>m<MM>` (e.g. `contract_events_y2026m07`), matching the convention already used by `tests/db/contractEvents.partitionPruning.test.ts` and `tests/db/vacuumCollector.collect.test.ts`. Month boundaries are computed in **UTC** (`Date.UTC(...)`) to avoid off-by-one errors near midnight on a server running in a non-UTC timezone.
+
+#### Schedule and idempotency
+
+1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus the next `monthsAhead` months (default `3`, see `DEFAULT_MONTHS_AHEAD` in `src/jobs/partitionMaintenance.ts`).
+2. It acquires a single **non-blocking** advisory lock (`pg_try_advisory_lock(123456789)`, exported as `PARTITION_MAINTENANCE_LOCK_ID`) before doing any work. If another instance already holds the lock, the run is a no-op — it does not wait or retry, so overlapping cron + manual invocations across multiple app instances never race to create the same partition.
+3. Every `CREATE TABLE` uses `IF NOT EXISTS`, so re-running the job when all partitions already exist performs zero DDL and is always a safe no-op — the defining idempotency property required of this job.
+4. The lock is released in a `finally` block, so a failure partway through (e.g. one table's DDL fails) never leaves the lock held for subsequent runs.
+
+#### Behind-schedule alerting
+
+Every run checks whether the **current month's** partition already existed *before* this run created it. Since the job pre-creates months in advance, the current month's partition should already exist by the time it becomes current — if it's still missing, an earlier scheduled run was missed or failed, and rows for today may have already been landing in the unindexed `DEFAULT` partition.
+
+When this happens, the job:
+
+- Emits a structured `error`-level log:
+  ```json
+  {
+    "event": "partition_maintenance_behind_schedule",
+    "table": "contract_events",
+    "partition": "contract_events_y2026m07",
+    "level": "error",
+    "message": "Partition maintenance fell behind schedule: current-month partition was missing"
+  }
+  ```
+- Increments the `fluxora_partition_maintenance_behind_schedule_total{table="..."}` counter.
+- Still creates the missing partition immediately afterward (self-healing) — the alert reports a `DEFAULT`-partition risk window that already occurred, it does not prevent the fix.
+
+##### Recommended alert
+
+```yaml
+- alert: PartitionMaintenanceBehindSchedule
+  expr: increase(fluxora_partition_maintenance_behind_schedule_total[1d]) > 0
+  severity: critical
+  annotations:
+    summary: "A scheduled partition pre-creation run was missed — rows may have landed in the DEFAULT partition"
+```
+
+#### Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted) |
+| `fluxora_partition_maintenance_behind_schedule_total` | Counter | `table` | Incremented when the current-month partition was found missing (see above) |
+
+#### Security
+
+- Table names come exclusively from the developer-controlled `CANDIDATE_TABLES` constant, never from user input.
+- Partition names are derived deterministically from the table name and a UTC year/month, and are additionally passed through `quoteIdentifier()` before being interpolated into DDL (defence-in-depth against a future change widening the input surface).
+- Partition bound literals are ISO-8601 UTC timestamps produced by `Date#toISOString()`, validated against a strict regex before interpolation — the `pg` driver cannot parameterize DDL bound expressions, so this validation substitutes for parameterization.
+- The job's DB principal needs `CREATE` on the parent table only; no superuser privileges are required.
+
+#### Tests
+
+`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), behind-schedule detection and metrics, and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+
+```bash
+pnpm test tests/jobs/partitionMaintenance.test.ts
+```
 
 ### Recommended alert thresholds
 

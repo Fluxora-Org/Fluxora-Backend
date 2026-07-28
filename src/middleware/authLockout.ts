@@ -20,28 +20,34 @@ export async function authLockoutMiddleware(
   const ip = getClientIp(req);
   const address = req.body?.address as string | undefined;
 
-  if (ip && ip !== 'unknown') {
-    const ipLockout = await authAttemptStore.isLockedOut(ip);
-    if (ipLockout > 0) {
-      res.setHeader('Retry-After', String(ipLockout));
-      res.status(429).json({
-        success: false,
-        message: 'Too many failed attempts, try again later',
-      });
-      return;
+  try {
+    if (ip && ip !== 'unknown') {
+      const ipLockout = await authAttemptStore.isLockedOut(ip);
+      if (ipLockout > 0) {
+        res.setHeader('Retry-After', String(ipLockout));
+        res.status(429).json({
+          success: false,
+          message: 'Too many failed attempts, try again later',
+        });
+        return;
+      }
     }
-  }
 
-  if (address) {
-    const addrLockout = await authAttemptStore.isLockedOut(address);
-    if (addrLockout > 0) {
-      res.setHeader('Retry-After', String(addrLockout));
-      res.status(429).json({
-        success: false,
-        message: 'Too many failed attempts, try again later',
-      });
-      return;
+    if (address) {
+      const addrLockout = await authAttemptStore.isLockedOut(address);
+      if (addrLockout > 0) {
+        res.setHeader('Retry-After', String(addrLockout));
+        res.status(429).json({
+          success: false,
+          message: 'Too many failed attempts, try again later',
+        });
+        return;
+      }
     }
+  } catch (err) {
+    // Forward store errors to the Express error handler so they produce a
+    // deterministic 500 response rather than an unhandled rejection.
+    return next(err);
   }
 
   req.authAttemptStore = authAttemptStore;

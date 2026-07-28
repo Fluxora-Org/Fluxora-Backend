@@ -66,21 +66,25 @@ export const PaginationSchema = z.object({
 
   /**
    * Filter by stream status.
-   * Only the known status values are accepted: active, paused, completed, cancelled.
-   * Unknown values are rejected with a 400 VALIDATION_ERROR before any DB call.
+   * Pass-through string — no enum validation is applied so the DB drives the
+   * filtering.  Invalid status values produce an empty result set (not an
+   * error).  Valid statuses: active, paused, completed, cancelled.
    */
-  status: z
-    .enum(STREAM_STATUS_VALUES, {
-      errorMap: () => ({
-        message: `status must be one of: ${STREAM_STATUS_VALUES.join(', ')}`,
-      }),
-    })
-    .optional(),
+  status: z.string().optional(),
 
-  /** Filter by sender Stellar address. */
+  /**
+   * Filter by sender Stellar address.
+   * Pass-through string — validated by the DB query layer via parameterised
+   * arguments.  No Zod-level format check (G… public key pattern) to keep
+   * the query-param validation fast; malformed addresses simply match zero
+   * rows.
+   */
   sender: z.string().optional(),
 
-  /** Filter by recipient Stellar address. */
+  /**
+   * Filter by recipient Stellar address.
+   * Same pass-through behaviour as `sender`.
+   */
   recipient: z.string().optional(),
 
   /** When 'true', include total count of matching rows in the response. */
