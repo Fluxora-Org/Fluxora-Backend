@@ -41,7 +41,10 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
   pgm.createIndex('streams', 'contract_id');
   pgm.createIndex('streams', 'created_at');
 
-  // Contract events table for the indexer service
+  // Contract events table for the indexer service.
+  // ledger_hash is the SHA-256 hash of the ledger header — required for reorg
+  // detection (getLedgerHash) and replay projection (getEvents).  Nullable so
+  // rows inserted by legacy code before this migration remain valid.
   pgm.createTable('contract_events', {
     event_id: { type: 'text', primaryKey: true },
     ledger: { type: 'integer', notNull: true },
@@ -53,6 +56,8 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
     event_index: { type: 'integer', notNull: true },
     payload: { type: 'jsonb', notNull: true },
     happened_at: { type: 'timestamp with time zone', notNull: true },
+    // Hash of the Stellar ledger header; used for reorg detection.
+    ledger_hash: { type: 'text', notNull: false },
     ingested_at: {
       type: 'timestamp with time zone',
       notNull: true,

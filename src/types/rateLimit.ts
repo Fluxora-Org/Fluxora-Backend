@@ -13,6 +13,12 @@ export interface RouteRateLimitConfig {
   exempt: boolean;
 }
 
+export interface RateLimitStore {
+  increment(key: string, windowMs: number, limit: number): Promise<{ count: number; resetAt: number }>;
+  getCount(key: string, windowMs: number): Promise<{ count: number; resetAt: number }>;
+  close(): Promise<void>;
+}
+
 export interface RateLimitStatus {
   identifier: string;
   identifierType: 'ip' | 'apiKey';
@@ -22,6 +28,8 @@ export interface RateLimitStatus {
   window: string;
   route?: string;
   method?: string;
+  store?: 'redis' | 'memory';
+  degraded?: boolean;
 }
 
 export interface RateLimitErrorBody {

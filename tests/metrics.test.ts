@@ -1,30 +1,50 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
-import { app } from '../src/index.js';
+import { app } from '../src/app.js';
 import { registry, httpRequestsTotal, httpRequestDurationSeconds } from '../src/metrics.js';
 
+const ADMIN_KEY = 'test-metrics-admin-key';
+
 describe('GET /metrics', () => {
+  let originalKey: string | undefined;
+
   beforeEach(async () => {
+    originalKey = process.env.ADMIN_API_KEY;
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
     httpRequestsTotal.reset();
     httpRequestDurationSeconds.reset();
   });
 
+  afterEach(() => {
+    if (originalKey !== undefined) {
+      process.env.ADMIN_API_KEY = originalKey;
+    } else {
+      delete process.env.ADMIN_API_KEY;
+    }
+  });
+
   it('returns 200 with Prometheus content type', async () => {
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/plain|application\/openmetrics-text/);
   });
 
   it('includes default Node.js process metrics', async () => {
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.text).toContain('process_cpu_');
     expect(res.text).toContain('nodejs_heap_size_total_bytes');
   });
 
   it('includes the service label', async () => {
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.text).toContain('service="fluxora-backend"');
   });
@@ -33,7 +53,9 @@ describe('GET /metrics', () => {
     // Fire a request so the counter is incremented
     await request(app).get('/health');
 
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.text).toContain('http_requests_total');
     expect(res.text).toMatch(/method="GET".*route="\/health"/);
@@ -42,7 +64,9 @@ describe('GET /metrics', () => {
   it('includes http_request_duration_seconds histogram', async () => {
     await request(app).get('/health');
 
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.text).toContain('http_request_duration_seconds_bucket');
     expect(res.text).toContain('http_request_duration_seconds_sum');
@@ -50,10 +74,15 @@ describe('GET /metrics', () => {
   });
 
   it('tracks different routes independently', async () => {
-    await request(app).get('/health');
-    await request(app).get('/');
+    const r1 = await request(app).get('/health');
+    console.log('HEALTH RESPONSE STATUS:', r1.status);
+    console.log('HEALTH RESPONSE BODY:', r1.body);
+    const r2 = await request(app).get('/');
+    console.log('ROOT RESPONSE STATUS:', r2.status);
 
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.text).toMatch(/http_requests_total\{.*route="\/health".*\}/);
     expect(res.text).toMatch(/http_requests_total\{.*route="\/".*\}/);
@@ -64,7 +93,9 @@ describe('GET /metrics', () => {
     // us a deterministic non-2xx status without depending on a live DB.
     await request(app).get('/health/ready');
 
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.text).toMatch(/http_requests_total\{.*status_code="[45]\d\d".*\}/);
   });
@@ -79,7 +110,9 @@ describe('GET /metrics', () => {
         role: 'operator',
       });
 
-    const res = await request(app).get('/metrics');
+    const res = await request(app)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
 
     expect(res.text).toMatch(/http_requests_total\{.*method="POST".*\}/);
   });

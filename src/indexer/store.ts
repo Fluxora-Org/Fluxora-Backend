@@ -3,6 +3,17 @@ import { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } f
 
 export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
 
+export const STALE_CURSOR_ERROR_CODE = 'STALE_CURSOR';
+
+export class StaleCursorError extends Error {
+  public readonly code = STALE_CURSOR_ERROR_CODE;
+
+  constructor(public readonly afterEventId: string) {
+    super(`Replay cursor '${afterEventId}' no longer exists; resync from fromLedger`);
+    this.name = 'StaleCursorError';
+  }
+}
+
 /** Record of a chain reorg that evicted previously stored events. */
 export interface ReorgRecord {
   /** The ledger at which the fork occurred — all events at or above this were evicted. */
@@ -90,8 +101,7 @@ export class InMemoryContractEventStore implements ContractEventStore {
     if (filter.afterEventId !== undefined) {
       const idx = results.findIndex((r) => r.eventId === filter.afterEventId);
       if (idx === -1) {
-        // Unknown cursor — treat as "past end of store", return empty
-        results = [];
+        throw new StaleCursorError(filter.afterEventId);
       } else {
         results = results.slice(idx + 1);
       }
@@ -109,6 +119,15 @@ export class InMemoryContractEventStore implements ContractEventStore {
     if (filter.topic !== undefined) {
       results = results.filter((r) => r.topic === filter.topic);
     }
+    if (filter.fromHappenedAt !== undefined) {
+      const fromMs = new Date(filter.fromHappenedAt).getTime();
+      results = results.filter((r) => new Date(r.happenedAt).getTime() >= fromMs);
+    }
+    if (filter.toHappenedAt !== undefined) {
+      const toMs = new Date(filter.toHappenedAt).getTime();
+      results = results.filter((r) => new Date(r.happenedAt).getTime() <= toMs);
+    }
+
 
     const total = results.length;
     const slice = filter.afterEventId !== undefined
@@ -166,14 +185,28 @@ export class PostgresContractEventStore implements ContractEventStore {
   public readonly kind: IndexerStoreKind = 'postgres';
   constructor(private readonly client: PgClientLike, private readonly tableName = 'contract_events') {}
 
+  /**
+   * Inserts multiple contract events into the database.
+   *
+   * Enforces server-authoritative ingest timestamps:
+   * - If `ingestedAt` is omitted, null, or undefined on an event record, the insert uses the
+   *   database-level DEFAULT `now()` value, making the PostgreSQL server the authoritative
+   *   source for ingestion timestamps.
+   * - If an explicit `ingestedAt` timestamp is provided, it will override the database default.
+   * - This ensures existing database entries and legacy writes can define explicit timestamps
+   *   if needed, but default writes rely on the database server time.
+   *
+   * @param events List of contract events to insert.
+   * @returns List of successfully inserted and duplicate event IDs.
+   */
   async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
     if (events.length === 0) {
       return { insertedEventIds: [], duplicateEventIds: [] };
     }
 
     const values: unknown[] = [];
-    const placeholders = events.map((event, index) => {
-      const offset = index * 11;
+    let placeholderOffset = 1;
+    const placeholders = events.map((event) => {
       values.push(
         event.eventId,
         event.ledger,
@@ -188,16 +221,45 @@ export class PostgresContractEventStore implements ContractEventStore {
         event.ledgerHash
       );
 
-      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}::jsonb, $${offset + 10}::timestamptz, $${offset + 11})`;
+      const basePlaceholders = [
+        `$${placeholderOffset}`,
+        `$${placeholderOffset + 1}`,
+        `$${placeholderOffset + 2}`,
+        `$${placeholderOffset + 3}`,
+        `$${placeholderOffset + 4}`,
+        `$${placeholderOffset + 5}`,
+        `$${placeholderOffset + 6}`,
+        `$${placeholderOffset + 7}`,
+        `$${placeholderOffset + 8}::jsonb`,
+        `$${placeholderOffset + 9}::timestamptz`,
+        `$${placeholderOffset + 10}`,
+      ];
+
+      placeholderOffset += 11;
+
+      if (event.ingestedAt !== undefined && event.ingestedAt !== null) {
+        values.push(event.ingestedAt);
+        basePlaceholders.push(`$${placeholderOffset}::timestamptz`);
+        placeholderOffset += 1;
+      } else {
+        basePlaceholders.push('DEFAULT');
+      }
+
+      return `(${basePlaceholders.join(', ')})`;
     });
 
+    // The contract_events table is range-partitioned by happened_at.
+    // The PRIMARY KEY is (happened_at, event_id), so the ON CONFLICT target
+    // must include both columns. Using just (event_id) would fail with
+    // "there is no unique or exclusion constraint matching the ON CONFLICT
+    // specification" on a partitioned table.
     const sql = `
       INSERT INTO ${this.tableName} (
         event_id, ledger, contract_id, topic, tx_hash,
-        tx_index, operation_index, event_index, payload, happened_at, ledger_hash
+        tx_index, operation_index, event_index, payload, happened_at, ledger_hash, ingested_at
       )
       VALUES ${placeholders.join(', ')}
-      ON CONFLICT (event_id) DO NOTHING
+      ON CONFLICT (happened_at, event_id) DO NOTHING
       RETURNING event_id
     `;
 
@@ -246,6 +308,14 @@ export class PostgresContractEventStore implements ContractEventStore {
       values.push(filter.topic);
       conditions.push(`topic = $${values.length}`);
     }
+    if (filter.fromHappenedAt !== undefined) {
+      values.push(filter.fromHappenedAt);
+      conditions.push(`happened_at >= $${values.length}::timestamptz`);
+    }
+    if (filter.toHappenedAt !== undefined) {
+      values.push(filter.toHappenedAt);
+      conditions.push(`happened_at <= $${values.length}::timestamptz`);
+    }
 
     // Cursor: translate afterEventId into a (ledger, event_id) boundary
     if (filter.afterEventId !== undefined) {
@@ -254,17 +324,16 @@ export class PostgresContractEventStore implements ContractEventStore {
         `SELECT ledger FROM ${this.tableName} WHERE event_id = $1 LIMIT 1`,
         [filter.afterEventId],
       );
-      if (cursorResult.rows.length > 0) {
-        const cursorRow = cursorResult.rows[0];
-        if (cursorRow) {
-          const cursorLedger = cursorRow.ledger;
-          values.push(cursorLedger, filter.afterEventId);
-          conditions.push(
-            `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
-          );
-        }
+      const cursorRow = cursorResult.rows[0];
+      if (!cursorRow) {
+        throw new StaleCursorError(filter.afterEventId);
       }
-      // If cursor row not found, return empty (cursor is past the end of the store)
+
+      const cursorLedger = cursorRow.ledger;
+      values.push(cursorLedger, filter.afterEventId);
+      conditions.push(
+        `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
+      );
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';

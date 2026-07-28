@@ -389,6 +389,49 @@ test('verifyWebhookSignature respects custom maxBodyBytes', () => {
 
 // ── constant-time signature compare ──────────────────────────────────────────
 
+test('verifyWebhookSignature rejects empty string signature without throwing', () => {
+  const result = verifyWebhookSignature({
+    secret: 'topsecret',
+    deliveryId: 'deliv_empty_sig',
+    timestamp: '1710000000',
+    signature: '',
+    rawBody: '{}',
+    now: 1710000000,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'missing_signature');
+});
+
+test('verifyWebhookSignature rejects very long signature without throwing', () => {
+  const longSig = 'a'.repeat(256);
+  const result = verifyWebhookSignature({
+    secret: 'topsecret',
+    deliveryId: 'deliv_long_sig',
+    timestamp: '1710000000',
+    signature: longSig,
+    rawBody: '{}',
+    now: 1710000000,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'signature_mismatch');
+});
+
+test('verifyWebhookSignature rejects signature with special characters', () => {
+  const result = verifyWebhookSignature({
+    secret: 'topsecret',
+    deliveryId: 'deliv_special',
+    timestamp: '1710000000',
+    signature: 'abc\x00def\xff\xfe',
+    rawBody: '{}',
+    now: 1710000000,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'signature_mismatch');
+});
+
 test('verifyWebhookSignature rejects signature mismatches', () => {
   const result = verifyWebhookSignature({
     secret: 'topsecret',

@@ -27,11 +27,12 @@ The Fluxora backend guarantees:
   initialBackoffMs: 1000,            // First retry after 1 second
   backoffMultiplier: 2,              // Exponential backoff multiplier
   maxBackoffMs: 60000,               // Cap backoff at 60 seconds
-  jitterPercent: 10,                 // ±10% jitter to prevent thundering herd
+  jitterPercent: 10,                 // Set to 0 to disable jitter
   timeoutMs: 30000,                  // 30 second timeout per attempt
   retryableStatusCodes: [408, 429, 500, 502, 503, 504],
   backoffStrategy: 'exponential',    // exponential | linear | fixed
   jitterAlgorithm: 'full',           // full | equal | decorrelated
+  previousDelayMs: 2000,             // Optional state for decorrelated jitter
   deadLetterAfterMs: 3600000,        // Send to DLQ after 1 hour (optional)
   circuitBreakerThreshold: 10,       // Open circuit after 10 failures (optional)
   circuitBreakerResetMs: 300000      // Reset circuit after 5 minutes (optional)
@@ -57,14 +58,16 @@ The Fluxora backend guarantees:
 #### Full Jitter (Default)
 - Random delay between 0 and calculated backoff
 - Prevents thundering herd effectively
+- Honors maxBackoffMs because the raw backoff is capped before jitter
 
 #### Equal Jitter
 - Delay = (backoff/2) + random(0, backoff/2)
 - Balances load spreading and promptness
 
 #### Decorrelated Jitter
-- Delay = random(0, backoff * 3)
+- Delay = random(initialBackoffMs, min(maxBackoffMs, previousDelayMs * 3))
 - Adapts to varying load conditions
+- generateRetrySchedule() carries previousDelayMs forward between attempts; direct calculateNextRetryTime() callers can pass previousDelayMs when they need deterministic decorrelated chaining.
 
 ### Backoff Schedule
 

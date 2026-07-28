@@ -4,6 +4,7 @@ import type { RateLimiter } from '../middleware/rateLimiter.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import {
   getRuntimeRateLimitConfig,
+  MAX_WINDOW_MS,
   setRuntimeRateLimitConfig,
 } from '../config/rateLimits.js';
 import type { RateLimitConfig } from '../types/rateLimit.js';
@@ -15,6 +16,9 @@ function validateConfigPatch(obj: unknown): string | null {
   if (windowMs !== undefined) {
     if (typeof windowMs !== 'number' || !Number.isInteger(windowMs) || windowMs < 1000) {
       return 'windowMs must be an integer >= 1000';
+    }
+    if (windowMs > MAX_WINDOW_MS) {
+      return `windowMs must not exceed ${MAX_WINDOW_MS} (24 hours)`;
     }
   }
   if (max !== undefined) {
@@ -41,17 +45,24 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
    * Returns the caller's current rate-limit status.
    * Optional query parameters: path, method - returns status for specific route
    */
-  rateLimitsRouter.get('/', (req: Request, res: Response) => {
+  rateLimitsRouter.get('/', async (req: Request, res: Response) => {
     const { identifier, identifierType } = limiter.extractClientIdentifier(req);
     const path = typeof req.query.path === 'string' ? req.query.path : undefined;
     const method = typeof req.query.method === 'string' ? req.query.method.toUpperCase() : undefined;
-    const status = limiter.getStatus(identifier, identifierType, path, method);
+
+    // getStatus now queries the live Redis store (or in-memory fallback).
+    // Pass the authenticated identity (keyId) so per-tenant overrides are reflected.
+    const keyId = req.keyId;
+    const status = await limiter.getStatus(identifier, identifierType, path, method, keyId);
 
     res.setHeader('X-RateLimit-Limit', String(status.limit));
     res.setHeader('X-RateLimit-Remaining', String(status.remaining));
     res.setHeader('X-RateLimit-Reset', String(Math.ceil(new Date(status.resetsAt).getTime() / 1000)));
+    if (status.store) res.setHeader('X-RateLimit-Store', status.store);
 
-    res.json(status);
+    // Include degraded flag in body when falling back to in-memory store
+    const body = status.degraded ? { ...status, degraded: true } : status;
+    res.json(body);
   });
 
   /**

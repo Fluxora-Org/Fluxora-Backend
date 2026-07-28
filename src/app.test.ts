@@ -78,3 +78,28 @@ describe('app error envelopes', () => {
     expect(data.error['code']).toBe('INTERNAL_ERROR');
   });
 });
+
+describe('X-Request-ID header on errors', () => {
+  it('sets X-Request-ID on 404 error responses', async () => {
+    const res = await fetch(`${baseUrl}/does-not-exist`);
+    expect(res.headers.get('x-request-id')).toBeTruthy();
+    const data = (await res.json()) as { error: Record<string, unknown> };
+    expect(data.error['requestId']).toBe(res.headers.get('x-request-id'));
+  });
+
+  it('sets X-Request-ID on 400 validation errors', async () => {
+    const res = await fetch(`${baseUrl}/api/streams`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"sender":',
+    });
+    expect(res.headers.get('x-request-id')).toBeTruthy();
+  });
+
+  it('sets X-Request-ID on 500 internal errors', async () => {
+    const res = await fetch(`${baseUrl}/__test/error`);
+    expect(res.headers.get('x-request-id')).toBeTruthy();
+    const data = (await res.json()) as { error: Record<string, unknown> };
+    expect(data.error['requestId']).toBe(res.headers.get('x-request-id'));
+  });
+});

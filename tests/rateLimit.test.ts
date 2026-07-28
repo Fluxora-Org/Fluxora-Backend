@@ -2,6 +2,7 @@ import request from 'supertest';
 import { describe, it, expect } from 'vitest';
 import express from 'express';
 import { createRateLimiter } from '../src/middleware/rateLimiter.js';
+import { InMemoryStore } from '../src/redis/rateLimitStore.js';
 
 function buildApp(max: number) {
   const app = express();
@@ -9,7 +10,7 @@ function buildApp(max: number) {
     RATE_LIMIT_ENABLED: 'true',
     RATE_LIMIT_IP_WINDOW_MS: '60000',
     RATE_LIMIT_IP_MAX: String(max),
-  }));
+  }, new InMemoryStore()));
   app.get('/ping', (_req, res) => res.json({ ok: true }));
   return app;
 }

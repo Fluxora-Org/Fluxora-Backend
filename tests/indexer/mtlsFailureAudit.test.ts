@@ -1,93 +1,170 @@
-import { expect, test, vi, beforeEach } from 'vitest';
-import { PeerCertificate } from 'tls';
-import { logMtlsValidationFailure, parseAuthorizationError } from '../../src/indexer/mtlsAudit.js';
-import * as auditLog from '../../src/lib/auditLog.js';
-import { indexerMtlsValidationFailuresTotal } from '../../src/metrics.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { Request, Response } from 'express';
+import { TLSSocket } from 'tls';
+import { mtlsValidationMiddleware } from '../../src/indexer/mtls.js';
+import { getAuditEntries, _resetAuditLog } from '../../src/lib/auditLog.js';
+import { indexerMtlsValidationFailuresTotal } from '../../src/metrics/indexerMetrics.js';
+import { registry } from '../../src/metrics.js';
 
-vi.mock('../../src/lib/auditLog.js', () => ({
-  recordAuditEvent: vi.fn(),
-}));
+describe('mTLS Validation Failure Audit', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+  let next: ReturnType<typeof vi.fn>;
+  let statusMock: ReturnType<typeof vi.fn>;
+  let jsonMock: ReturnType<typeof vi.fn>;
 
-vi.mock('../../src/metrics.js', () => {
-  const inc = vi.fn();
-  const labels = vi.fn(() => ({ inc }));
-  return {
-    indexerMtlsValidationFailuresTotal: {
-      labels
-    }
-  };
-});
+  beforeEach(() => {
+    _resetAuditLog();
+    indexerMtlsValidationFailuresTotal.reset();
 
-beforeEach(() => {
-  vi.clearAllMocks();
-});
+    next = vi.fn();
+    jsonMock = vi.fn();
+    statusMock = vi.fn().mockReturnValue({ json: jsonMock });
 
-test('parseAuthorizationError maps certificate expired', () => {
-  expect(parseAuthorizationError('CERT_HAS_EXPIRED')).toBe('EXPIRED_CERT');
-});
+    res = {
+      status: statusMock as unknown as Response['status'],
+    };
+  });
 
-test('parseAuthorizationError maps unknown CA', () => {
-  expect(parseAuthorizationError('unable to verify the first certificate')).toBe('UNKNOWN_CA');
-  expect(parseAuthorizationError('self signed certificate')).toBe('UNKNOWN_CA');
-});
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
-test('parseAuthorizationError maps invalid subject', () => {
-  expect(parseAuthorizationError('hostname/IP does not match certificate subject alt name')).toBe('INVALID_SUBJECT');
-});
+  it('bypasses mTLS checks if not a TLSSocket', () => {
+    req = { socket: {} as any };
+    mtlsValidationMiddleware(req as Request, res as Response, next);
+    
+    expect(next).toHaveBeenCalledOnce();
+    expect(statusMock).not.toHaveBeenCalled();
+    expect(getAuditEntries()).toHaveLength(0);
+  });
 
-test('logMtlsValidationFailure logs audit entry and increments metric', () => {
-  const cert: PeerCertificate = {
-    subject: { CN: 'bad-client' } as any,
-    issuer: { CN: 'bad-ca' } as any,
-    serialNumber: '12345',
-    valid_from: '2023-01-01',
-    valid_to: '2024-01-01',
-    fingerprint256: 'AB:CD',
-    // Mock private key and other things to ensure they are filtered
-    privateKey: 'SECRET_KEY',
-  } as any;
+  it('calls next() if socket is authorized', () => {
+    req = {
+      socket: {
+        authorized: true,
+      } as unknown as TLSSocket,
+    };
+    Object.setPrototypeOf(req.socket, TLSSocket.prototype);
 
-  logMtlsValidationFailure('CERT_HAS_EXPIRED', cert, 'conn-123');
+    mtlsValidationMiddleware(req as Request, res as Response, next);
+    
+    expect(next).toHaveBeenCalledOnce();
+    expect(statusMock).not.toHaveBeenCalled();
+    expect(getAuditEntries()).toHaveLength(0);
+  });
 
-  expect(indexerMtlsValidationFailuresTotal.labels).toHaveBeenCalledWith({ reason: 'EXPIRED_CERT' });
-  const incMock = vi.mocked(indexerMtlsValidationFailuresTotal.labels({ reason: 'EXPIRED_CERT' }).inc);
-  expect(incMock).toHaveBeenCalled();
+  it('audits and rejects with 401 if certificate is missing', async () => {
+    const socket = {
+      authorized: false,
+      authorizationError: null,
+      getPeerCertificate: () => null,
+    } as unknown as TLSSocket;
+    Object.setPrototypeOf(socket, TLSSocket.prototype);
 
-  expect(auditLog.recordAuditEvent).toHaveBeenCalledWith(
-    'MTLS_VALIDATION_FAILED',
-    'indexer_connection',
-    'conn-123',
-    'conn-123',
-    expect.objectContaining({
-      reason: 'EXPIRED_CERT',
-      authError: 'CERT_HAS_EXPIRED',
-      subject: cert.subject,
-      issuer: cert.issuer,
-      serialNumber: cert.serialNumber,
-      valid_from: cert.valid_from,
-      valid_to: cert.valid_to,
-      fingerprint256: cert.fingerprint256,
-    })
-  );
+    req = { socket, ip: '127.0.0.1' };
+    
+    mtlsValidationMiddleware(req as Request, res as Response, next);
 
-  const auditCall = vi.mocked(auditLog.recordAuditEvent).mock.calls[0];
-  const metaObj = auditCall[4] as Record<string, unknown>;
-  expect(metaObj.privateKey).toBeUndefined(); // MUST NOT log private key material
-});
+    expect(next).not.toHaveBeenCalled();
+    expect(statusMock).toHaveBeenCalledWith(401);
+    expect(jsonMock).toHaveBeenCalledWith(expect.objectContaining({
+      error: expect.objectContaining({
+        code: 'UNAUTHORIZED',
+        message: 'mTLS client-certificate validation failed',
+      })
+    }));
 
-test('logMtlsValidationFailure handles null certificate gracefully', () => {
-  logMtlsValidationFailure(undefined, null, 'conn-456');
+    const entries = getAuditEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      action: 'INDEXER_MTLS_FAILURE',
+      resourceType: 'indexer_worker',
+      resourceId: '127.0.0.1',
+      meta: {
+        reason: 'missing_cert',
+      }
+    });
 
-  expect(indexerMtlsValidationFailuresTotal.labels).toHaveBeenCalledWith({ reason: 'NO_CERTIFICATE' });
+    // Check Prometheus counter
+    const metrics = await registry.getMetricsAsJSON();
+    const mtlsMetric = metrics.find((m) => m.name === 'indexer_mtls_validation_failures_total');
+    expect(mtlsMetric).toBeDefined();
+    
+    const countData = mtlsMetric?.values.find((v) => v.labels.reason === 'missing_cert');
+    expect(countData?.value).toBe(1);
+  });
 
-  expect(auditLog.recordAuditEvent).toHaveBeenCalledWith(
-    'MTLS_VALIDATION_FAILED',
-    'indexer_connection',
-    'conn-456',
-    'conn-456',
-    expect.objectContaining({
-      reason: 'NO_CERTIFICATE',
-      authError: undefined,
-    })
-  );
+  it('audits and rejects with 403 for expired certificate', async () => {
+    const socket = {
+      authorized: false,
+      authorizationError: new Error('certificate has expired'),
+      getPeerCertificate: () => ({
+        subject: { CN: 'worker' },
+        issuer: { CN: 'ca' },
+        serialNumber: '12345',
+        // Should not be logged, but simulate a big object
+        raw: Buffer.from('fake'),
+      }),
+    } as unknown as TLSSocket;
+    Object.setPrototypeOf(socket, TLSSocket.prototype);
+
+    req = { socket, ip: '192.168.1.10', correlationId: 'req-123' } as unknown as Request;
+    
+    mtlsValidationMiddleware(req as Request, res as Response, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(statusMock).toHaveBeenCalledWith(403);
+    
+    const entries = getAuditEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      action: 'INDEXER_MTLS_FAILURE',
+      resourceId: '192.168.1.10',
+      correlationId: 'req-123',
+      meta: {
+        reason: 'expired',
+        subject: { CN: 'worker' },
+        issuer: { CN: 'ca' },
+        serialNumber: '12345',
+        error: 'certificate has expired',
+      }
+    });
+    // Ensure raw buffer is not present
+    expect((entries[0].meta as any).raw).toBeUndefined();
+
+    // Check Prometheus counter
+    const metrics = await registry.getMetricsAsJSON();
+    const mtlsMetric = metrics.find((m) => m.name === 'indexer_mtls_validation_failures_total');
+    const countData = mtlsMetric?.values.find((v) => v.labels.reason === 'expired');
+    expect(countData?.value).toBe(1);
+  });
+
+  it('audits and rejects with 403 for unknown CA', () => {
+    const socket = {
+      authorized: false,
+      authorizationError: new Error('unable to get local issuer certificate'),
+      getPeerCertificate: () => ({
+        subject: { CN: 'hacker' },
+        issuer: { CN: 'hacker-ca' },
+        serialNumber: '99999',
+      }),
+    } as unknown as TLSSocket;
+    Object.setPrototypeOf(socket, TLSSocket.prototype);
+
+    req = { socket, ip: '10.0.0.5' } as unknown as Request;
+    
+    mtlsValidationMiddleware(req as Request, res as Response, next);
+
+    expect(statusMock).toHaveBeenCalledWith(403);
+    
+    const entries = getAuditEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].meta).toMatchObject({
+      reason: 'unknown_ca',
+      subject: { CN: 'hacker' },
+      issuer: { CN: 'hacker-ca' },
+      serialNumber: '99999',
+    });
+  });
 });

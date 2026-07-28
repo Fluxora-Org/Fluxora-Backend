@@ -51,9 +51,11 @@ import {
 import { errorHandler } from '../src/middleware/errorHandler.js';
 import { requestIdMiddleware } from '../src/errors.js';
 import { correlationIdMiddleware } from '../src/middleware/correlationId.js';
+import { serverTimingMiddleware } from '../src/middleware/serverTiming.js';
 import { generateToken } from '../src/lib/auth.js';
 import { authenticate } from '../src/middleware/auth.js';
 import { initializeConfig } from '../src/config/env.js';
+import { requireJsonAccept } from '../src/middleware/acceptNegotiation.js';
 
 // Initialize config before any test module code runs (upstream requirement)
 initializeConfig();
@@ -89,7 +91,9 @@ function createTestApp() {
   const app = express();
   app.use(requestIdMiddleware);
   app.use(correlationIdMiddleware);
+  app.use(serverTimingMiddleware());
   app.use(express.json());
+  app.use('/api', requireJsonAccept);
   app.use(authenticate);
   app.use('/api/streams', streamsRouter);
   app.use(errorHandler);
@@ -525,6 +529,30 @@ describe('Streams API - Decimal String Serialization', () => {
       }
     });
 
+    it('emits a Server-Timing header with db and serialize phases when enabled', async () => {
+      const previous = process.env.SERVER_TIMING_ENABLED;
+      process.env.SERVER_TIMING_ENABLED = 'true';
+
+      try {
+        const response = await request(app)
+          .get('/api/streams')
+          .set('Authorization', `Bearer ${testToken}`)
+          .expect(200);
+
+        expect(response.headers['server-timing']).toBeDefined();
+        expect(response.headers['server-timing']).toContain('db;dur=');
+        expect(response.headers['server-timing']).toContain('serialize;dur=');
+        expect(response.headers['server-timing']).not.toContain('localhost');
+        expect(response.headers['server-timing']).not.toContain('query');
+      } finally {
+        if (previous === undefined) {
+          delete process.env.SERVER_TIMING_ENABLED;
+        } else {
+          process.env.SERVER_TIMING_ENABLED = previous;
+        }
+      }
+    });
+
     it('should return streams array with pagination metadata', async () => {
       const response = await request(app)
         .get('/api/streams')
@@ -547,7 +575,7 @@ describe('Streams API - Decimal String Serialization', () => {
       expect(response.body.data.streams.length).toBe(3);
       expect(response.body.data.has_more).toBe(false);
       expect(response.body.data.total).toBeUndefined();
-      expect(response.body.data.next_cursor).toBeUndefined();
+      expect(response.body.data.next_cursor).toBeNull();
     });
 
     it('should support limit parameter', async () => {
@@ -586,7 +614,7 @@ describe('Streams API - Decimal String Serialization', () => {
       expect(secondPage.body.data.streams.length).toBe(1);
       expect(secondPage.body.data.has_more).toBe(false);
       expect(secondPage.body.data.total).toBeUndefined();
-      expect(secondPage.body.data.next_cursor).toBeUndefined();
+      expect(secondPage.body.data.next_cursor).toBeNull();
     });
 
     it('should treat total as response-time metadata instead of a cursor snapshot guarantee', async () => {
@@ -935,5 +963,139 @@ describe('Stream Status Transitions', () => {
       const res = await request(app).delete(`/api/streams/${id}`).set('Authorization', auth);
       expect(res.status).toBe(200);
     });
+  });
+});
+
+// ─── Content-Type Negotiation Tests ──────────────────────────────────────────
+
+/**
+ * Verifies that GET /api/streams enforces HTTP content negotiation (RFC 7231
+ * §5.3.2) by returning 406 Not Acceptable when the client signals it cannot
+ * accept application/json via the Accept header.
+ *
+ * Security note: the 406 response body uses the standard error envelope and
+ * does NOT reflect the raw Accept header value to prevent header-injection.
+ */
+describe('Content-Type Negotiation — GET /api/streams', () => {
+  let app: ReturnType<typeof createTestApp>;
+
+  beforeEach(() => {
+    app = createTestApp();
+    streams.length = 0;
+    setStreamListingDependencyState('healthy');
+    setIdempotencyDependencyState('healthy');
+    resetStreamIdempotencyStore();
+
+    vi.clearAllMocks();
+    mockFindWithCursor.mockResolvedValue({ streams: [], hasMore: false });
+  });
+
+  it('returns 200 with Accept: application/json', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'application/json')
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.headers['content-type']).toMatch(/application\/json/);
+  });
+
+  it('returns 200 with Accept: */*', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', '*/*')
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it('returns 200 with no Accept header (implicit */*)', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it('returns 406 with Accept: application/xml', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'application/xml')
+      .expect(406);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('NOT_ACCEPTABLE');
+    expect(res.body.error.message).toBeDefined();
+    // Security: raw Accept header value must not be reflected in the response
+    expect(JSON.stringify(res.body)).not.toContain('application/xml');
+  });
+
+  it('returns 406 with Accept: text/html', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'text/html')
+      .expect(406);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('NOT_ACCEPTABLE');
+  });
+
+  it('returns 406 with Accept: text/plain', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'text/plain')
+      .expect(406);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('NOT_ACCEPTABLE');
+  });
+
+  it('returns 200 when Accept lists application/json alongside xml (json is acceptable)', async () => {
+    // The server CAN satisfy application/json even if XML is listed first at
+    // equal or higher quality — it should serve JSON and return 200.
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'application/xml, application/json;q=0.9')
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it('returns 406 when XML is exclusively preferred over JSON via quality values', async () => {
+    // q=1.0 for xml, q=0.0 for json means the client cannot accept JSON.
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'application/xml;q=1.0, application/json;q=0.0')
+      .expect(406);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('NOT_ACCEPTABLE');
+  });
+
+  it('returns 200 with Accept: application/* (application wildcard)', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'application/*')
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it('406 response uses standard error envelope without exposing internals', async () => {
+    const res = await request(app)
+      .get('/api/streams')
+      .set('Accept', 'application/xml')
+      .set('X-Request-ID', 'negotiation-test-id')
+      .expect(406);
+
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'NOT_ACCEPTABLE',
+        message: expect.any(String),
+      },
+    });
+    // requestId propagation
+    expect(res.body.error.requestId).toBe('negotiation-test-id');
   });
 });

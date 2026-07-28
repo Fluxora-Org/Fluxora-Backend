@@ -34,15 +34,26 @@ Stellar Soroban contract.  All list / get / create / cancel operations go throug
 
 ### Indexes
 
-| Index                    | Column(s)          | Purpose                        |
-|--------------------------|--------------------|--------------------------------|
-| `idx_streams_status`     | `status`           | Filter by status               |
-| `idx_streams_sender`     | `sender_address`   | Sender lookups                 |
-| `idx_streams_recipient`  | `recipient_address`| Recipient lookups              |
-| `idx_streams_contract`   | `contract_id`      | Contract-scoped queries        |
-| `idx_streams_created_at` | `created_at`       | Time-based ordering            |
-| `idx_streams_start_time` | `start_time`       | Time-range filtering           |
-| `idx_streams_end_time`   | `end_time`         | Time-range filtering           |
+Composite indexes match the filter+order patterns issued by `streamRepository`:
+
+| Index                              | Column(s)                    | Repository method | Query pattern                                |
+|------------------------------------|------------------------------|-------------------|----------------------------------------------|
+| `idx_streams_status_id`            | `(status, id)`               | `findWithCursor`  | `WHERE status = $1 … ORDER BY id ASC`        |
+| `idx_streams_sender_id`            | `(sender_address, id)`       | `findWithCursor`  | `WHERE sender_address = $1 … ORDER BY id ASC`|
+| `idx_streams_contract_id`          | `(contract_id, id)`          | `findWithCursor`  | `WHERE contract_id = $1 … ORDER BY id ASC`    |
+| `idx_streams_status_created_at_desc`| `(status, created_at DESC)` | `find`            | `WHERE status = $1 ORDER BY created_at DESC` |
+| `idx_streams_recipient`            | `recipient_address`          | `findWithCursor`  | Recipient filter (single-column)             |
+| `idx_streams_created_at`           | `created_at`                 | `find`            | Unfiltered `ORDER BY created_at DESC`        |
+| `idx_streams_start_time`           | `start_time`                 | `find`            | `start_time` range filters                   |
+| `idx_streams_end_time`             | `end_time`                   | `find`            | `end_time` range filters                     |
+
+Existing deployments receive these indexes via `migrations/20260622000000_streams_composite_pagination_indexes.ts`
+using `CREATE INDEX CONCURRENTLY` (non-transactional migration — no write locks during build).
+Redundant single-column indexes (`idx_streams_status`, `idx_streams_sender`, `idx_streams_contract`) are dropped
+once the composites exist because their leading column is a left-prefix of the new indexes.
+
+**Security:** Index additions do not change which rows are visible. Address columns are equality-filtered only;
+no index sorts by encrypted/hashed address values, so no timing side-channel is introduced.
 
 ---
 
@@ -142,11 +153,28 @@ List streams with cursor-based pagination.
 
 **Indexed filters:**
 
-The `status`, `sender`, and `recipient` filters map directly to database indexes (`idx_streams_status`, `idx_streams_sender`, `idx_streams_recipient`). Combining filters with cursor pagination is safe — the cursor position is relative to the filtered result set.
+The `status`, `sender`, and `contract_id` cursor filters use composite indexes
+(`idx_streams_status_id`, `idx_streams_sender_id`, `idx_streams_contract_id`) so filtered pages
+avoid full-table sorts. The `recipient` filter uses `idx_streams_recipient`. Offset pagination with
+a `status` filter uses `idx_streams_status_created_at_desc`. Combining filters with cursor pagination
+is safe — the cursor position is relative to the filtered result set.
 
 ### GET /api/streams/:id
 
 Get a single stream by ID.
+
+**Responses:** `200 OK` | `404 NOT_FOUND` | `503 SERVICE_UNAVAILABLE`
+
+### HEAD /api/streams/:id
+
+Check whether a stream exists without fetching the full record.
+
+**Success response:** `200 OK`
+
+**Headers:**
+
+- `ETag` - Weak validator derived from the stream ID and last update timestamp
+- `Last-Modified` - Timestamp of the last DB update for the stream
 
 **Responses:** `200 OK` | `404 NOT_FOUND` | `503 SERVICE_UNAVAILABLE`
 
@@ -203,7 +231,7 @@ At the DB layer, `upsertStream` uses `INSERT … ON CONFLICT DO NOTHING` on
 
 | Client Type        | Access                                    | Auth required |
 |--------------------|-------------------------------------------|---------------|
-| Public users       | `GET /api/streams`, `GET /api/streams/:id`| No            |
+| Public users       | `GET /api/streams`, `GET /api/streams/:id`, `HEAD /api/streams/:id`| No            |
 | Authenticated users| `POST`, `DELETE`, `PATCH /status`         | JWT Bearer    |
 | Internal workers   | Indexer ingestion via `upsertStream`      | Service account|
 

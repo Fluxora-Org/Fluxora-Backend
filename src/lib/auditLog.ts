@@ -5,13 +5,16 @@
  * occurs (stream create, stream cancel). Entries are append-only; nothing
  * in this module mutates or removes existing records.
  *
- * Two write paths:
+ * Three write paths:
  *  1. `recordAuditEvent`          – in-memory only; never throws; used by
  *                                   non-transactional callers (admin routes, etc.)
  *  2. `buildAuditEntry` +
  *     `writeAuditEntryToDb`       – used inside DB transactions so the audit
  *                                   row is committed or rolled back atomically
  *                                   with the primary stream operation.
+ *  3. `recordAuditEventToDb`       – non-transactional helper that writes to
+ *                                   the shared Postgres audit table and then
+ *                                   mirrors the entry into the in-memory log.
  *
  * Trust boundaries
  * - Internal workers call `recordAuditEvent` or the transactional helpers.
@@ -25,8 +28,10 @@
  */
 
 import { logger } from './logger.js';
+import { getPool, query } from '../db/pool.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'MTLS_VALIDATION_FAILED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE' | 'ADMIN_BULK_ACTION' | 'INDEXER_MTLS_FAILURE' | 'PURGE_INITIATED' | 'PURGE_SKIPPED_LEGAL_HOLD' | 'PII_ERASURE_REQUESTED' | 'BACKUP_RESTORE_QUEUED' | 'BACKUP_RESTORE_STARTED' | 'BACKUP_RESTORE_COMPLETED' | 'BACKUP_RESTORE_FAILED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'STREAM_BROADCAST' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE' | 'ADMIN_BULK_ACTION' | 'INDEXER_MTLS_FAILURE' | 'PURGE_INITIATED' | 'PURGE_SKIPPED_LEGAL_HOLD' | 'PII_ERASURE_REQUESTED' | 'GDPR_ERASURE' | 'BACKUP_RESTORE_QUEUED' | 'BACKUP_RESTORE_STARTED' | 'BACKUP_RESTORE_COMPLETED' | 'BACKUP_RESTORE_FAILED';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.
@@ -60,7 +65,18 @@ const AUDIT_LOG_KEY = '__FLUXORA_AUDIT_LOG__';
 if (!(globalThis as Record<string, unknown>)[AUDIT_LOG_KEY]) {
   (globalThis as Record<string, unknown>)[AUDIT_LOG_KEY] = [];
 }
-const auditLog: AuditEntry[] = (globalThis as Record<string, unknown>)[AUDIT_LOG_KEY] as AuditEntry[];
+const auditLog: AuditEntry[] = (globalThis as Record<string, unknown>)[
+  AUDIT_LOG_KEY
+] as AuditEntry[];
+
+function appendAuditEntry(entry: AuditEntry): void {
+  auditLog.push(entry);
+  logger.info('Audit event recorded', entry.correlationId, {
+    action: entry.action,
+    resourceType: entry.resourceType,
+    resourceId: entry.resourceId,
+  });
+}
 
 // ── In-memory path (non-transactional) ───────────────────────────────────────
 
@@ -73,7 +89,7 @@ export function recordAuditEvent(
   resourceType: string,
   resourceId: string,
   correlationId?: string,
-  meta?: Record<string, unknown>,
+  meta?: Record<string, unknown>
 ): void {
   try {
     const entry: AuditEntry = {
@@ -85,8 +101,7 @@ export function recordAuditEvent(
       ...(correlationId !== undefined ? { correlationId } : {}),
       ...(meta !== undefined ? { meta } : {}),
     };
-    auditLog.push(entry);
-    logger.info('Audit event recorded', correlationId, { action, resourceType, resourceId });
+    appendAuditEntry(entry);
   } catch (err) {
     // Audit must never block the primary operation.
     logger.error('Failed to record audit event', undefined, {
@@ -109,7 +124,7 @@ export function buildAuditEntry(
   resourceType: string,
   resourceId: string,
   correlationId?: string,
-  meta?: Record<string, unknown>,
+  meta?: Record<string, unknown>
 ): AuditEntry {
   return {
     seq: ++seq,
@@ -126,32 +141,91 @@ export function buildAuditEntry(
  * Write a pre-built AuditEntry to the `audit_logs` table using the supplied
  * DB connection (which must already be inside a transaction).
  *
+ * seq is omitted from the INSERT so the column default (nextval('audit_seq'))
+ * is used — this guarantees uniqueness under concurrent writes without any
+ * application-level coordination.
+ *
  * Throws on DB error so the caller's transaction rolls back atomically.
  * Also mirrors the entry into the in-memory log for GET /api/audit.
  */
 export function writeAuditEntryToDb(db: AuditDbConnection, entry: AuditEntry): void {
   db.prepare(
     `INSERT INTO audit_logs
-       (seq, timestamp, action, resource_type, resource_id, correlation_id, meta)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (timestamp, action, resource_type, resource_id, correlation_id, meta)
+     VALUES (?, ?, ?, ?, ?, ?)`
   ).run(
-    entry.seq,
     entry.timestamp,
     entry.action,
     entry.resourceType,
     entry.resourceId,
     entry.correlationId ?? null,
-    entry.meta !== undefined ? JSON.stringify(entry.meta) : null,
+    entry.meta !== undefined ? JSON.stringify(entry.meta) : null
   );
 
   // Mirror into in-memory log so GET /api/audit reflects transactional writes.
-  auditLog.push(entry);
-  logger.info('Audit entry written to DB', entry.correlationId, {
-    action: entry.action,
-    resourceType: entry.resourceType,
-    resourceId: entry.resourceId,
-  });
+  appendAuditEntry(entry);
 }
+
+/**
+ * Build and persist an audit entry using the shared Postgres pool.
+ * Intended for non-transactional admin actions that still need durable audit
+ * logging in the `audit_logs` table.
+ *
+ * seq is intentionally omitted from the INSERT — the column default
+ * (nextval('audit_seq')) ensures concurrent callers never collide.
+ */
+export async function recordAuditEventToDb(
+  action: AuditAction,
+  resourceType: string,
+  resourceId: string,
+  correlationId?: string,
+  meta?: Record<string, unknown>
+): Promise<AuditEntry> {
+  const entry = buildAuditEntry(action, resourceType, resourceId, correlationId, meta);
+
+  await query(
+    getPool(),
+    `INSERT INTO audit_logs
+       (timestamp, action, resource_type, resource_id, correlation_id, meta)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      entry.timestamp,
+      entry.action,
+      entry.resourceType,
+      entry.resourceId,
+      entry.correlationId ?? null,
+      entry.meta !== undefined ? JSON.stringify(entry.meta) : null,
+    ]
+  );
+
+  appendAuditEntry(entry);
+  return entry;
+}
+
+/**
+ * Audit helper: Record a GDPR Right-to-Erasure entry in the database audit log.
+ *
+ * @param action - The audit action type ('GDPR_ERASURE' or 'PII_ERASURE_REQUESTED')
+ * @param resourceType - Affected database table (e.g. 'streams')
+ * @param recipientAddress - Plaintext address which is safely truncated to avoid logging PII
+ * @param correlationId - Trace correlation identifier from HTTP request
+ * @param meta - Audit metadata containing requester identity, role, outcome, and affected row count
+ * @returns Promise resolving to the created AuditEntry
+ *
+ * @security Never stores full recipient PII inside the audit log. Address is truncated
+ * to an 8-character prefix followed by an ellipsis.
+ */
+export async function recordErasureAuditLog(
+  action: AuditAction,
+  resourceType: string,
+  recipientAddress: string,
+  correlationId?: string,
+  meta?: Record<string, unknown>
+): Promise<AuditEntry> {
+  const truncatedId = recipientAddress.length > 8 ? recipientAddress.substring(0, 8) + '…' : recipientAddress;
+  return recordAuditEventToDb(action, resourceType, truncatedId, correlationId, meta);
+}
+
 
 // ── Queries ───────────────────────────────────────────────────────────────────
 

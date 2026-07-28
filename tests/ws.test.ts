@@ -1032,6 +1032,20 @@ describe('StreamHub.replayFromCursor — event store replay', () => {
     ws.close();
   });
 
+  it('sends STALE_CURSOR when afterEventId has been evicted', async () => {
+    await store.insertMany([makeStoreRecord('e1', 100)]);
+
+    const ws = await connect(port);
+    const msgPromise = nextMessage(ws);
+    send(ws, { type: 'replay', afterEventId: 'evicted-cursor' });
+    const msg = await msgPromise;
+
+    expect((msg as any).type).toBe('error');
+    expect((msg as any).code).toBe('STALE_CURSOR');
+
+    ws.close();
+  });
+
   it('sends stream_replay_complete immediately when store is empty', async () => {
     const ws = await connect(port);
     const msgsPromise = collectMessages(ws, 1);

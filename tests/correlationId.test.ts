@@ -1,14 +1,60 @@
 import http from 'http';
 import { once } from 'node:events';
+import express from 'express';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { app } from '../src/app';
-import { correlationIdMiddleware, CORRELATION_ID_HEADER, isValidCorrelationId } from '../src/middleware/correlationId';
+
+vi.mock('../src/ws/messageHandler', () => ({
+  isValidStellarPublicKey: (value: string) => value.startsWith('G'),
+  parseHandshakeSubscriptionFilter: () => ({ ok: true, filter: null }),
+  parseWsClientMessage: (message: { type?: string; streamId?: string; stream_id?: string }) => {
+    if (message.type === 'subscribe' || message.type === 'unsubscribe') {
+      return {
+        ok: true,
+        message: {
+          type: message.type,
+          filter: { streamId: message.streamId ?? message.stream_id },
+        },
+      };
+    }
+
+    return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${message.type}` };
+  },
+}));
+
+import {
+  correlationIdMiddleware,
+  CORRELATION_ID_HEADER,
+  REQUEST_ID_HEADER,
+  isValidCorrelationId,
+  MAX_CORRELATION_ID_LENGTH,
+} from '../src/middleware/correlationId';
 import { correlationStore, getCorrelationId } from '../src/tracing/middleware';
 import { StreamHub } from '../src/ws/hub';
 import { webhookDispatcher } from '../src/webhooks/dispatcher';
+import { logger } from '../src/lib/logger.js';
+
+function createCorrelationIdTestApp() {
+  const app = express();
+
+  app.use(express.json());
+  app.use(correlationIdMiddleware);
+  app.get('/', (_req, res) => res.json({ ok: true }));
+  app.get('/health', (_req, res) => res.json({ ok: true }));
+  app.get('/api/streams', (_req, res) => res.json({ streams: [] }));
+  app.post('/api/streams', (_req, res) => res.status(201).json({ ok: true }));
+
+  return app;
+}
+
+const app = createCorrelationIdTestApp();
 
 describe('correlationId middleware', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   describe('ID generation', () => {
     it('generates a correlation ID when none is provided', async () => {
       const res = await request(app).get('/health');
@@ -43,10 +89,18 @@ describe('correlationId middleware', () => {
       expect(res.headers[CORRELATION_ID_HEADER]).toBe(clientId);
     });
 
-    it('trims whitespace from incoming header', async () => {
-      const clientId = '  22222222-2222-4222-8222-222222222222  ';
-      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, clientId);
-      expect(res.headers[CORRELATION_ID_HEADER]).toBe('22222222-2222-4222-8222-222222222222');
+    it('rejects whitespace-padded values exceeding max raw length', () => {
+      // Raw length (incl. whitespace) > 36 → rejected by raw-length gate before trim.
+      // Uses direct middleware call because supertest/Express may trim HTTP headers.
+      const padded = '  22222222-2222-4222-8222-222222222222  ';
+      const req = { headers: { [CORRELATION_ID_HEADER]: padded } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(padded);
+        expect(req.correlationId).not.toBe('22222222-2222-4222-8222-222222222222');
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
     });
 
     it('generates a new ID when incoming header is an empty string', async () => {
@@ -61,6 +115,111 @@ describe('correlationId middleware', () => {
       expect(id).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
       );
+    });
+
+    it('generates a new ID when incoming header is malformed', async () => {
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, 'not-a-uuid');
+      const id = res.headers[CORRELATION_ID_HEADER] as string;
+      expect(id).not.toBe('not-a-uuid');
+      expect(isValidCorrelationId(id)).toBe(true);
+    });
+
+    it('rejects oversized inbound correlation IDs at unit level', () => {
+      const oversized = '1'.repeat(MAX_CORRELATION_ID_LENGTH + 1);
+      expect(isValidCorrelationId(oversized)).toBe(false);
+    });
+
+    it('rejects oversized raw value via middleware (raw length > 36)', async () => {
+      const oversized = '1'.repeat(MAX_CORRELATION_ID_LENGTH + 1);
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, oversized);
+      const id = res.headers[CORRELATION_ID_HEADER] as string;
+      expect(id).not.toBe(oversized);
+      expect(isValidCorrelationId(id)).toBe(true);
+    });
+
+    it('rejects control-character-bearing inbound within 36-char limit (charset reject)', () => {
+      // Raw length is exactly 36 so raw-length gate passes; charset gate catches the \t.
+      const withTab = '11111111-1111-4111-\t111-111111111111';
+      const req = { headers: { [CORRELATION_ID_HEADER]: withTab } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(withTab);
+        expect(req.correlationId).not.toContain('\t');
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
+    });
+
+    it('rejects control-character-only inbound', () => {
+      const ctrlOnly = '\x00\x01\x02';
+      const req = { headers: { [CORRELATION_ID_HEADER]: ctrlOnly } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(ctrlOnly);
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
+    });
+
+    it('rejection logs the fact but never the raw value (oversized)', () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      const oversized = '1'.repeat(MAX_CORRELATION_ID_LENGTH + 1);
+      const req = { headers: { [CORRELATION_ID_HEADER]: oversized } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(warnSpy).toHaveBeenCalledWith(
+          'Correlation ID rejected (oversized raw length), generating new ID',
+        );
+      });
+    });
+
+    it('rejection logs the fact but never the raw value (invalid format)', () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      const malformed = 'not-a-valid-uuid';
+      const req = { headers: { [CORRELATION_ID_HEADER]: malformed } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(warnSpy).toHaveBeenCalledWith(
+          'Correlation ID rejected (invalid format), generating new ID',
+        );
+      });
+    });
+
+    it('does not log a warning for missing or empty headers', () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+      // Missing header
+      const req1 = { headers: {} } as any;
+      const res1 = { setHeader: vi.fn() } as any;
+      correlationIdMiddleware(req1, res1, () => {
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(isValidCorrelationId(req1.correlationId)).toBe(true);
+      });
+
+      // Empty header
+      const req2 = { headers: { [CORRELATION_ID_HEADER]: '' } } as any;
+      const res2 = { setHeader: vi.fn() } as any;
+      correlationIdMiddleware(req2, res2, () => {
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(isValidCorrelationId(req2.correlationId)).toBe(true);
+      });
+    });
+
+    it('regenerates oversized control-character-bearing inbound IDs', () => {
+      // Raw length > 36: caught by the raw-length gate.
+      const maliciousId = '11111111-1111-4111-8111-111111111111\nlog=forged';
+      const req = { headers: { [CORRELATION_ID_HEADER]: maliciousId } } as any;
+      const res = { setHeader: vi.fn() } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(req.correlationId).not.toBe(maliciousId);
+        expect(req.correlationId).not.toContain('\n');
+        expect(isValidCorrelationId(req.correlationId)).toBe(true);
+      });
     });
   });
 
@@ -86,6 +245,42 @@ describe('correlationId middleware', () => {
         .set('Idempotency-Key', 'correlation-id-post-test')
         .send({ sender: 'A', recipient: 'B', depositAmount: '100', ratePerSecond: '1', startTime: 0 });
       expect(res.headers[CORRELATION_ID_HEADER]).toBeDefined();
+    });
+  });
+
+  describe('X-Request-ID header', () => {
+    it('sets X-Request-ID on a success (200) response', async () => {
+      const res = await request(app).get('/health');
+      expect(res.headers[REQUEST_ID_HEADER]).toBeDefined();
+      expect(typeof res.headers[REQUEST_ID_HEADER]).toBe('string');
+    });
+
+    it('X-Request-ID matches x-correlation-id on success responses', async () => {
+      const res = await request(app).get('/');
+      expect(res.headers[REQUEST_ID_HEADER]).toBe(res.headers[CORRELATION_ID_HEADER]);
+    });
+
+    it('X-Request-ID matches provided x-correlation-id when valid', async () => {
+      const clientId = 'aaaaaaaa-bbbb-4bbb-8bbb-cccccccccccc';
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, clientId);
+      expect(res.headers[REQUEST_ID_HEADER]).toBe(clientId);
+      expect(res.headers[REQUEST_ID_HEADER]).toBe(res.headers[CORRELATION_ID_HEADER]);
+    });
+
+    it('X-Request-ID is a valid UUID when inbound header is rejected', async () => {
+      const res = await request(app).get('/health').set(CORRELATION_ID_HEADER, 'bad-id');
+      expect(isValidCorrelationId(res.headers[REQUEST_ID_HEADER] as string)).toBe(true);
+    });
+
+    it('middleware sets X-Request-ID synchronously via setHeader', () => {
+      const req = { headers: {} } as any;
+      const setHeader = vi.fn();
+      const res = { setHeader } as any;
+
+      correlationIdMiddleware(req, res, () => {
+        expect(setHeader).toHaveBeenCalledWith(REQUEST_ID_HEADER, req.correlationId);
+        expect(setHeader).toHaveBeenCalledWith(CORRELATION_ID_HEADER, req.correlationId);
+      });
     });
   });
 });
@@ -241,5 +436,40 @@ describe('correlation ID propagation across transports', () => {
 
     const headers = captured?.headers as Record<string, string>;
     expect(headers[CORRELATION_ID_HEADER]).toBe('webhook-corr-123');
+  });
+
+  it('propagates a regenerated ID to downstream webhooks after rejecting a bad inbound ID', async () => {
+    let captured: RequestInit | undefined;
+    const maliciousId = '11111111-1111-4111-8111-111111111111\nlog=forged';
+    const req = { headers: { [CORRELATION_ID_HEADER]: maliciousId } } as any;
+    const res = { setHeader: vi.fn() } as any;
+
+    global.fetch = (async (_url: string, options?: RequestInit) => {
+      captured = options;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await new Promise<void>((resolve, reject) => {
+      correlationIdMiddleware(req, res, () => {
+        void webhookDispatcher.dispatch({
+          url: 'https://example.com/webhook',
+          secret: 'secret',
+          payload: JSON.stringify({ foo: 'bar' }),
+          deliveryId: 'deliv-bad-correlation-id',
+          eventType: 'stream.created',
+        }).then((result) => {
+          expect(result.success).toBe(true);
+          resolve();
+        }, reject);
+      });
+    });
+
+    const regeneratedId = req.correlationId as string;
+    const headers = captured?.headers as Record<string, string>;
+    expect(regeneratedId).not.toBe(maliciousId);
+    expect(regeneratedId).not.toContain('\n');
+    expect(isValidCorrelationId(regeneratedId)).toBe(true);
+    expect(res.setHeader).toHaveBeenCalledWith(CORRELATION_ID_HEADER, regeneratedId);
+    expect(headers[CORRELATION_ID_HEADER]).toBe(regeneratedId);
   });
 });

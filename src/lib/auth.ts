@@ -5,6 +5,7 @@ import { warn } from '../utils/logger.js';
 export interface UserPayload {
   address: string;
   role: string;
+  permissions?: string[];
 }
 
 /**
@@ -23,7 +24,29 @@ export function generateToken(payload: UserPayload): string {
     // duration strings like "24h" / "7d" which are runtime-equivalent.
     options.expiresIn = jwtExpiresIn as NonNullable<SignOptions['expiresIn']>;
   }
-  return jwt.sign(payload, jwtSecret, options);
+  // Backfill a permissions claim for legacy callers that only set a role.
+  // This keeps existing tests and callers working while encouraging
+  // explicit permissions in production tokens.
+  const derived = { ...payload } as UserPayload;
+  if (!Array.isArray(derived.permissions)) {
+    if (derived.role === 'operator') {
+      derived.permissions = [
+        'streams:read',
+        'streams:write',
+        'dlq:list',
+        'dlq:read',
+        'dlq:replay',
+        'dlq:delete',
+        'dlq:consumer:resume',
+        'audit:read',
+      ];
+    } else {
+      // viewer or unknown role -> minimal read-only permissions
+      derived.permissions = ['streams:read'];
+    }
+  }
+
+  return jwt.sign(derived, jwtSecret, options);
 }
 
 /**

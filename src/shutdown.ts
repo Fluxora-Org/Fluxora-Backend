@@ -24,6 +24,10 @@ import { logger } from './lib/logger.js';
 let shuttingDown = false;
 const hooks: Array<() => Promise<void> | void> = [];
 
+export interface DrainableService {
+  stop(): Promise<void> | void;
+}
+
 /**
  * Returns true if a graceful shutdown is currently in progress.
  */
@@ -37,6 +41,14 @@ export function isShuttingDown(): boolean {
  */
 export function addShutdownHook(fn: () => Promise<void> | void): void {
   hooks.push(fn);
+}
+
+/**
+ * Register a service that must stop accepting new work and drain in-flight
+ * operations during graceful shutdown.
+ */
+export function addDrainableShutdownHook(service: DrainableService): void {
+  addShutdownHook(() => service.stop());
 }
 
 /**
@@ -88,11 +100,14 @@ export function gracefulShutdown(
         server.closeAllConnections();
       }
 
-      for (const hook of hooks) {
+      for (let i = 0; i < hooks.length; i++) {
+        const hook = hooks[i]!;
         try {
           await hook();
         } catch (err) {
           logger.error('Shutdown hook threw an error', undefined, {
+            hookIndex: i,
+            hookCount: hooks.length,
             error: err instanceof Error ? err.message : String(err),
           });
         }

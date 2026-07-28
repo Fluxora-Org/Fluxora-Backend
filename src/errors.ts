@@ -1,22 +1,45 @@
 import { randomUUID } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
-import { ApiError as MiddlewareApiError } from './middleware/errorHandler.js';
 
 export class ApiError extends Error {
-  status: number;
-  code: string;
-  details: Record<string, unknown> | undefined;
-  expose: boolean;
+  /**
+   * HTTP status code returned to the client.
+   */
+  public readonly statusCode: number;
+
+  /**
+   * Application-specific error code.
+   */
+  public readonly code?: string;
+
+  /**
+   * Optional structured details that may be exposed to the client.
+   */
+  public readonly details?: unknown;
+
+  /**
+   * Indicates whether details may be exposed to clients.
+   *
+   * expose=true:
+   * - validation errors
+   * - user-facing business rule failures
+   *
+   * expose=false:
+   * - internal errors
+   * - database failures
+   * - infrastructure failures
+   */
+  public readonly expose: boolean;
 
   constructor(
-    status: number,
-    code: string,
+    statusCode: number,
+    code: string | undefined,
     message: string,
-    details?: Record<string, unknown>,
+    details?: unknown,
     expose = true,
   ) {
     super(message);
-    this.status = status;
+    this.statusCode = statusCode;
     this.code = code;
     this.details = details;
     this.expose = expose;
@@ -53,11 +76,6 @@ function normalizeExpressError(error: unknown): ApiError {
   }
   if (error instanceof ApiError) return error;
 
-  // Also handle ApiError from middleware/errorHandler (streams route)
-  if (error instanceof MiddlewareApiError) {
-    return new ApiError(error.statusCode, error.code, error.message, undefined, true);
-  }
-
   return new ApiError(500, 'internal_error', 'Internal server error', undefined, false);
 }
 
@@ -72,7 +90,7 @@ export function errorHandler(
 
   const log = {
     requestId,
-    status: normalized.status,
+    statusCode: normalized.statusCode,
     code: normalized.code,
     method: req.method,
     path: req.originalUrl,
@@ -80,7 +98,7 @@ export function errorHandler(
     details: normalized.details,
   };
 
-  if (normalized.status >= 500) {
+  if (normalized.statusCode >= 500) {
     console.error('API error', log);
   } else {
     console.warn('API error', log);
@@ -89,12 +107,12 @@ export function errorHandler(
   const errorBody: Record<string, unknown> = {
     code: normalized.code,
     message: normalized.message,
-    status: normalized.status,
+    statusCode: normalized.statusCode,
     requestId,
   };
   if (normalized.details !== undefined) {
     errorBody['details'] = normalized.details;
   }
 
-  res.status(normalized.status).json({ error: errorBody });
+  res.status(normalized.statusCode).json({ error: errorBody });
 }

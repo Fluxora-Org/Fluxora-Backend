@@ -26,8 +26,10 @@
  *   - Same key + diff body  → 409 CONFLICT
  *   - Missing / bad key     → 400 VALIDATION_ERROR
  *
- * The idempotency store is in-memory (Map) for this iteration.  In production
- * it should be backed by Redis with a 24-hour TTL.
+ * The idempotency store defaults to in-memory at module load and is replaced
+ * at startup with a RedisIdempotencyStore when Redis is available
+ * (REDIS_ENABLED=true, the default).  TTL is driven by IDEMPOTENCY_TTL_SECONDS
+ * (default 86 400 s / 24 h).  See src/app.ts wireIdempotencyStore().
  *
  * Failure modes
  * -------------
@@ -42,39 +44,116 @@
  * - Duplicate cancel         → 409 CONFLICT
  * - DB unavailable           → 503 SERVICE_UNAVAILABLE
  * - Idempotency store down   → 503 SERVICE_UNAVAILABLE
+ * - Address not on-chain     → 422 UNPROCESSABLE_ENTITY
  *
  * @module routes/streams
  */
 import { Router } from 'express';
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
+import { loadConfig } from '../config/env.js';
 import {
+  compareDecimalStringToZero,
   validateDecimalString,
   validateAmountFields,
 } from '../serialization/decimal.js';
+import { ApiError } from '../errors.js';
 import {
-  ApiError,
   ApiErrorCode,
   notFound,
   validationError,
   serviceUnavailable,
   asyncHandler,
+  tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
+import { canonicalizeBody } from '../middleware/idempotency.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
+import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { successResponse, idempotentReplayResponse } from '../utils/response.js';
-import { streamRepository } from '../db/repositories/streamRepository.js';
+import { sendEarlyHints } from '../utils/earlyHints.js';
+import { streamRepository, StatusConflictError } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
+import {
+  issueWriteFencePin,
+  shouldForcePrimaryFromHeaders,
+  WRITE_FENCE_HEADER,
+} from '../db/writeFencePin.js';
 import {
   CreateStreamSchema,
   parseBody,
   formatZodIssues,
 } from '../validation/schemas.js';
-import type { StreamStatus, StreamFilter } from '../db/types.js';
-
+import { PaginationSchema } from '../validation/paginationSchema.js';
+import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
+import { isTerminalStatus } from '../streams/status.js';
+import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
+import { isValidStreamStatus } from '../metrics/businessMetrics.js';
+import { verifyWsToken } from '../middleware/tokenAuth.js';
+import { recordServerTimingPhase } from '../middleware/serverTiming.js';
+import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
+import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
+import { getClientIp } from '../ws/connectionLimiter.js';
+import {
+  eventMatchesStreamId,
+  SSE_STREAM_UPDATE_EVENT,
+  SSE_CLOSE_EVENT,
+  SSE_CLOSE_REASONS,
+  subscribeToSseStream,
+  registerSseShutdownCallback,
+  type LiveSseStreamUpdateEvent,
+} from '../streams/sseEmitter.js';
+import {
+  resolveSseConnectionLimits,
+  tryAcquireSseConnection,
+} from '../streams/sseConnectionLimiter.js';
+import {
+  resolveLongPollConnectionLimits,
+  tryAcquireLongPollConnection,
+} from '../streams/longPoll.js';
+import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
+import {
+  RedisIdempotencyStore,
+  NoOpIdempotencyStore,
+  InMemoryIdempotencyStore,
+  type IdempotencyStore,
+} from '../redis/idempotencyStore.js';
+import { toStreamJsonLd } from '../serialization/jsonld.js';
 export const streamsRouter = Router();
+
+/**
+ * Validate and sanitise the Last-Event-ID header value.
+ *
+ * Security: rejects control characters (CR/LF/NUL), whitespace-only values,
+ * and values exceeding 200 characters. The allowed character set is printable
+ * ASCII 0x21–0x7E which excludes space (0x20) and all control characters.
+ *
+ * Returns the trimmed, validated value or throws a validationError.
+ * Returns `undefined` when the header is absent (no replay requested).
+ *
+ * Exported for unit testing — the HTTP parser strips control characters from
+ * headers in transit, so integration tests cannot cover CR/LF/NUL paths.
+ */
+export function parseLastEventIdHeader(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string') {
+    throw validationError('Last-Event-ID must be a string');
+  }
+  // Validate the raw value BEFORE trimming so control characters in the value
+  // (CR, LF, NUL, etc.) are caught — trim() would strip trailing CR/LF.
+  if (raw.trim() === '') {
+    throw validationError('Last-Event-ID must not be empty or whitespace-only');
+  }
+  if (!/^[\x21-\x7E]+$/.test(raw)) {
+    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length > 200) {
+    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
+  }
+  return trimmed;
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -84,6 +163,8 @@ export interface Stream {
   sender: string;
   recipient: string;
   depositAmount: string;
+  streamedAmount: string;
+  remainingAmount: string;
   ratePerSecond: string;
   startTime: number;
   endTime: number;
@@ -102,21 +183,24 @@ type NormalizedCreateInput = {
   endTime: number;
 };
 
-type StoredIdempotentResponse = {
-  requestFingerprint: string;
-  statusCode: number;
-  body: ReturnType<typeof successResponse<Stream>>;
-};
-
 const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
+const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
+const NO_STORE_STREAM_HEADERS = 'private, no-store';
+const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
 const streamListingDependency = { state: 'healthy' as DependencyState };
 const idempotencyDependency   = { state: 'healthy' as DependencyState };
 
-// In-memory idempotency store (Redis-backed in production; sufficient for now)
-const idempotencyStore = new Map<string, StoredIdempotentResponse>();
+// Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
+// by wireIdempotencyStore() in app.ts with a RedisIdempotencyStore when Redis
+// is available (REDIS_ENABLED=true).
+let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>>> =
+  new InMemoryIdempotencyStore();
+
+// TTL for idempotency entries — overridden in tests and set from config at startup
+let idempotencyTtlSeconds = 86400;
 
 /**
  * Legacy shim — audit.test.ts and streams.test.ts reference this array.
@@ -132,17 +216,35 @@ export function setStreamListingDependencyState(state: DependencyState): void {
 export function setIdempotencyDependencyState(state: DependencyState): void {
   idempotencyDependency.state = state;
 }
+
+/**
+ * Reset the idempotency store to a fresh in-memory instance.
+ * Used in tests to get a clean slate with full idempotency semantics
+ * (no Redis required).
+ */
 export function resetStreamIdempotencyStore(): void {
-  idempotencyStore.clear();
+  idempotencyStore = new InMemoryIdempotencyStore();
+}
+
+/**
+ * Replace the idempotency store implementation.
+ * Called at startup with a RedisIdempotencyStore, and in tests with a
+ * FakeRedisClient-backed store or a NoOpIdempotencyStore.
+ *
+ * The parameter is typed as `IdempotencyStore<unknown>` so callers do not
+ * need to import the route's private `Stream` / `successResponse` types.
+ * The cast below is safe because the route handler always stores and reads
+ * values of the correct shape.
+ */
+export function setIdempotencyStore(
+  store: IdempotencyStore<unknown>,
+  ttlSeconds?: number,
+): void {
+  idempotencyStore = store as IdempotencyStore<ReturnType<typeof successResponse<Stream>>>;
+  if (ttlSeconds !== undefined) idempotencyTtlSeconds = ttlSeconds;
 }
 
 // ── DB → API mapper ───────────────────────────────────────────────────────────
-
-/**
- * Map a StreamRecord (snake_case DB row) to the public Stream shape (camelCase).
- * Preserves decimal-string amounts exactly as stored.
- */
-import type { StreamRecord } from '../db/types.js';
 
 function toApiStream(record: StreamRecord): Stream {
   return {
@@ -150,11 +252,81 @@ function toApiStream(record: StreamRecord): Stream {
     sender:        record.sender_address,
     recipient:     record.recipient_address,
     depositAmount: record.amount,
+    streamedAmount: record.streamed_amount,
+    remainingAmount: record.remaining_amount,
     ratePerSecond: record.rate_per_second,
     startTime:     record.start_time,
     endTime:       record.end_time,
     status:        record.status,
   };
+}
+
+/**
+ * Resolve a stable rollout identity for feature flag bucketing.
+ *
+ * @security API-key authenticated requests prefer the server-side key id. When
+ * that is not available, raw X-API-Key header material is used only as input to
+ * the feature flag hash and is never logged or included in responses.
+ */
+export function getFeatureFlagRequesterId(req: Request): string {
+  const keyId = (req as Request & { keyId?: unknown }).keyId;
+  if (typeof keyId === 'string' && keyId.trim() !== '') {
+    return `key:${keyId}`;
+  }
+
+  const rawApiKey = req.headers['x-api-key'];
+  const apiKey = Array.isArray(rawApiKey) ? rawApiKey[0] : rawApiKey;
+  if (typeof apiKey === 'string' && apiKey.trim() !== '') {
+    return `api-key:${apiKey.trim()}`;
+  }
+
+  return `ip:${req.ip ?? 'anonymous'}`;
+}
+
+type StreamResourceMetadata = {
+  id: string;
+  updated_at: string;
+};
+
+function streamEntityTag(metadata: StreamResourceMetadata): string {
+  const fingerprint = crypto
+    .createHash('sha256')
+    .update(`${metadata.id}:${metadata.updated_at}`)
+    .digest('base64url');
+  return `W/"${fingerprint}"`;
+}
+
+function setStreamResourceHeaders(
+  res: Response,
+  metadata: StreamResourceMetadata,
+): void {
+  res.set('ETag', streamEntityTag(metadata));
+  res.set('Last-Modified', new Date(metadata.updated_at).toUTCString());
+}
+
+/**
+ * RFC 7232 §3.2 weak comparison for If-None-Match.
+ *
+ * The `*` wildcard matches any current representation.
+ * Otherwise the field value is a comma-separated list of entity-tags and the
+ * recipient uses the weak comparison function (strip `W/` prefix before
+ * character-for-character comparison of the opaque-tag, including DQUOTES).
+ *
+ * @param ifNoneMatch - raw value of the If-None-Match request header
+ * @param etag - the server-computed ETag for the current representation
+ * @returns `true` when any entry in the list matches
+ */
+function matchesIfNoneMatch(ifNoneMatch: string, etag: string): boolean {
+  const trimmed = ifNoneMatch.trim();
+  if (trimmed === '*') return true;
+
+  const normalize = (tag: string): string => tag.replace(/^W\//i, '');
+  const normalizedEtag = normalize(etag);
+
+  return trimmed
+    .split(',')
+    .map((t) => normalize(t.trim()))
+    .some((t) => t === normalizedEtag);
 }
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
@@ -164,11 +336,12 @@ function encodeCursor(lastId: string): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-function decodeCursor(cursor: string): StreamsCursor {
+function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
-  } catch {
+  } catch (err) {
+    warn('Cursor decode failed', { error: err instanceof Error ? err.message : String(err), requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
   if (
@@ -178,6 +351,7 @@ function decodeCursor(cursor: string): StreamsCursor {
     typeof (parsed as { lastId?: unknown }).lastId !== 'string' ||
     (parsed as { lastId: string }).lastId.trim() === ''
   ) {
+    warn('Cursor payload invalid', { parsed, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
   return parsed as StreamsCursor;
@@ -185,32 +359,13 @@ function decodeCursor(cursor: string): StreamsCursor {
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
 
-function parseLimit(limitParam: unknown): number {
-  if (limitParam === undefined) return 50;
-  if (Array.isArray(limitParam) || typeof limitParam !== 'string' || !/^\d+$/.test(limitParam)) {
-    throw validationError('limit must be an integer between 1 and 100');
-  }
-  const n = Number.parseInt(limitParam, 10);
-  if (n < 1 || n > 100) throw validationError('limit must be an integer between 1 and 100');
-  return n;
-}
-
-function parseCursor(cursorParam: unknown): StreamsCursor | undefined {
+function parseCursor(cursorParam: unknown, requestId?: string): StreamsCursor | undefined {
   if (cursorParam === undefined) return undefined;
   if (Array.isArray(cursorParam) || typeof cursorParam !== 'string' || cursorParam.trim() === '') {
+    warn('Cursor shape invalid (not a string)', { cursorParam, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
-  return decodeCursor(cursorParam);
-}
-
-function parseIncludeTotal(includeTotalParam: unknown): boolean {
-  if (includeTotalParam === undefined) return false;
-  if (Array.isArray(includeTotalParam) || typeof includeTotalParam !== 'string') {
-    throw validationError('include_total must be true or false');
-  }
-  if (includeTotalParam === 'true') return true;
-  if (includeTotalParam === 'false') return false;
-  throw validationError('include_total must be true or false');
+  return decodeCursor(cursorParam, requestId);
 }
 
 // ── Body normaliser ───────────────────────────────────────────────────────────
@@ -221,14 +376,15 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   if (!parseResult.success) {
     const formatted = formatZodIssues(parseResult.issues);
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       formatted[0]?.message ?? 'Validation failed',
-      400,
       formatted.map((e) => e.message).join('; '),
     );
   }
 
-  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = parseResult.data;
+  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } =
+    parseResult.data as NormalizedCreateInput;
 
   const amountValidation = validateAmountFields(
     { depositAmount, ratePerSecond } as Record<string, unknown>,
@@ -236,22 +392,22 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   );
   if (!amountValidation.valid) {
     throw new ApiError(
+      400,
       ApiErrorCode.VALIDATION_ERROR,
       'Invalid decimal string format for amount fields',
-      400,
       { errors: amountValidation.errors.map((e) => ({ field: e.field, code: e.code, message: e.message })) },
     );
   }
 
   const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && parseFloat(validatedDeposit) <= 0) {
+  if (compareDecimalStringToZero(validatedDeposit) <= 0) {
     throw validationError('depositAmount must be greater than zero');
   }
 
   const rateResult = validateDecimalString(ratePerSecond ?? '0', 'ratePerSecond');
   const validatedRate = rateResult.valid && rateResult.value ? rateResult.value : '0';
-  if (ratePerSecond !== undefined && parseFloat(validatedRate) < 0) {
+  if (ratePerSecond !== undefined && compareDecimalStringToZero(validatedRate) < 0) {
     throw validationError('ratePerSecond cannot be negative');
   }
 
@@ -265,8 +421,8 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   };
 }
 
-function fingerprintInput(input: NormalizedCreateInput): string {
-  return JSON.stringify(input);
+export function fingerprintInput(input: NormalizedCreateInput): string {
+  return crypto.createHash('sha256').update(canonicalizeBody(input)).digest('hex');
 }
 
 /** Wrap DB errors so pool exhaustion surfaces as 503. */
@@ -279,10 +435,9 @@ function wrapDbError(err: unknown): never {
 
 // ── API status state machine ──────────────────────────────────────────────────
 
-type ApiStreamStatus = 'scheduled' | 'active' | 'paused' | 'completed' | 'cancelled';
+type ApiStreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
 
 const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
-  scheduled:  ['active', 'cancelled'],
   active:     ['paused', 'completed', 'cancelled'],
   paused:     ['active', 'cancelled'],
   completed:  [],
@@ -304,12 +459,30 @@ function assertValidApiTransition(
 // ── Test helpers (no-op in production) ───────────────────────────────────────
 
 /**
- * Reset test state.
- * In the DB-backed model this only clears the in-memory idempotency store.
- * Tests that need a clean DB should truncate the table directly.
+ * Middleware to enforce stream visibility based on JWT roles and addresses.
+ * Must be used within the router group scope.
+ * @param req Express request object, expected to contain `req.user` from `authenticate` middleware.
+ * @param res Express response object.
+ * @param next Express next middleware function.
  */
-export function _resetStreams(): void {
-  idempotencyStore.clear();
+export function enforceStreamScope(req: Request, res: Response, next: NextFunction): void {
+    // Check if the user is authenticated and if the role requires scoping.
+    if (!req.user || req.user.role === 'operator') {
+        // Operator role bypasses scoping checks.
+        return next();
+    }
+
+    const callerAddress = req.user.address as string | undefined;
+    if (!callerAddress) {
+        // Should not happen if authenticate middleware is working, but safe fail.
+        return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    }
+
+    // Attach caller address to the request object for repository consumption.
+    req.callerAddress = callerAddress;
+
+    // Move to the next handler which will use req.callerAddress
+    next();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -317,36 +490,70 @@ export function _resetStreams(): void {
 /**
  * GET /api/streams
  * List streams with cursor-based pagination.
+ *
+ * Query params are validated via PaginationSchema (Zod). Invalid params
+ * return 400 VALIDATION_ERROR before any DB call is made.
  */
 streamsRouter.get(
   '/',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id as string | undefined;
-    const limit = parseLimit(req.query.limit);
-    const cursor = parseCursor(req.query.cursor);
-    const includeTotal = parseIncludeTotal(req.query.include_total);
+    const requestId = req.correlationId as string | undefined;
 
-    // Indexed filters (parsed and forwarded into the repository query).
-    const statusFilter    = typeof req.query.status === 'string' ? req.query.status : undefined;
-    const senderFilter    = typeof req.query.sender === 'string' ? req.query.sender : undefined;
-    const recipientFilter = typeof req.query.recipient === 'string' ? req.query.recipient : undefined;
+    // Validate all query params in one pass via Zod
+    const parsed = PaginationSchema.safeParse(req.query);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      warn('Stream list pagination validation failed', { error: first?.message, requestId });
+      throw validationError(first?.message ?? 'Invalid query parameters');
+    }
+    const { limit, cursor: rawCursor, status: statusFilter, sender: senderFilter,
+            recipient: recipientFilter, include_total } = parsed.data;
+
+    const cursor       = rawCursor !== undefined ? parseCursor(rawCursor, requestId) : undefined;
+    const includeTotal = include_total === 'true';
 
     if (streamListingDependency.state !== 'healthy') {
       warn('Stream listing dependency unavailable', { dependency: 'stream-list-view', requestId });
+      res.setHeader('Retry-After', '30');
       throw serviceUnavailable('Stream list is temporarily unavailable. Retry when dependency health is restored.');
     }
 
+    // Read-your-writes: if the client echoes a valid, unexpired write-fence
+    // pin, route this read to the primary pool so the client sees its own
+    // recent write even if the replica is lagging.
+    const forcePrimary = shouldForcePrimaryFromHeaders(
+      req.headers as Record<string, string | string[] | undefined>,
+    );
+
     let result: { streams: Stream[]; hasMore: boolean; total?: number };
+    const dbStart = process.hrtime.bigint();
     try {
       const filter: StreamFilter = {};
       if (statusFilter !== undefined) filter.status = statusFilter as NonNullable<StreamFilter['status']>;
       if (senderFilter !== undefined) filter.sender_address = senderFilter;
       if (recipientFilter !== undefined) filter.recipient_address = recipientFilter;
+      
+      if (req.callerAddress) {
+        if (!senderFilter && !recipientFilter) {
+          throw forbidden('Scoped users must filter by sender or recipient matching their address');
+        }
+        if (senderFilter && senderFilter !== req.callerAddress) {
+          throw forbidden('You are not authorized to query streams for this sender');
+        }
+        if (recipientFilter && recipientFilter !== req.callerAddress) {
+          throw forbidden('You are not authorized to query streams for this recipient');
+        }
+      }
+
       const dbResult = await streamRepository.findWithCursor(
         filter,
         limit,
         cursor?.lastId,
         includeTotal,
+        { forcePrimary },
       );
       result = {
         streams: dbResult.streams.map(toApiStream),
@@ -355,27 +562,161 @@ streamsRouter.get(
       };
     } catch (err) {
       wrapDbError(err);
+    } finally {
+      const durationMs = Number(process.hrtime.bigint() - dbStart) / 1e6;
+      recordServerTimingPhase(res, 'db', durationMs);
     }
 
     const pageStreams = result!.streams;
     const hasMore     = result!.hasMore;
     const nextCursor  = hasMore && pageStreams.length > 0
       ? encodeCursor(pageStreams[pageStreams.length - 1]!.id)
-      : undefined;
+      : null;
 
     info('Listing streams', { limit, returned: pageStreams.length, hasMore, requestId });
+
+    // Send HTTP 103 Early Hints with Link header for next page, if available.
+    // This allows HTTP/2 clients to prefetch DNS/TLS for the next page URL
+    // while the server is preparing the current response. The hint is sent
+    // asynchronously and does not block the main response.
+    if (hasMore && nextCursor) {
+      const queryParams: Record<string, string> = {};
+      if (statusFilter) queryParams.status = statusFilter as string;
+      if (senderFilter) queryParams.sender = senderFilter;
+      if (recipientFilter) queryParams.recipient = recipientFilter;
+      if (include_total === 'true') queryParams.include_total = 'true';
+
+      sendEarlyHints(res, {
+        baseUrl: '/api/streams',
+        hasMore: true,
+        nextCursor,
+        queryParams,
+      });
+    }
 
     const response: {
       streams: Stream[];
       has_more: boolean;
+      next_cursor: string | null;
       total?: number;
-      next_cursor?: string;
-    } = { streams: pageStreams, has_more: hasMore };
+      _meta?: { enhanced: boolean };
+    } = { streams: pageStreams, has_more: hasMore, next_cursor: nextCursor };
 
-    if (includeTotal && result!.total !== undefined) response.total       = result!.total;
-    if (nextCursor)                                  response.next_cursor = nextCursor;
+    if (includeTotal && result!.total !== undefined) response.total = result!.total;
 
-    res.json(successResponse(response, requestId));
+    // Feature flag: streams_enhanced_response — add _meta field for opted-in requesters.
+    const requesterId = getFeatureFlagRequesterId(req);
+    if (isFlagEnabled(STREAMS_ENHANCED_RESPONSE_FLAG, requesterId)) {
+      response._meta = { enhanced: true };
+    }
+
+    // Cache only when every stream on the page is in a terminal state.
+    // An empty page is treated as all-terminal (nothing mutable present).
+    const allTerminal = pageStreams.every((s) => isTerminalStatus(s.status as ApiStreamStatus));
+    res.set(
+      'Cache-Control',
+      allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
+    );
+
+    const serializeStart = process.hrtime.bigint();
+    const responseEnvelope = successResponse(response, requestId);
+    const serialized = JSON.stringify(responseEnvelope);
+    const durationMs = Number(process.hrtime.bigint() - serializeStart) / 1e6;
+    recordServerTimingPhase(res, 'serialize', durationMs);
+
+    res.type('application/json');
+    res.send(serialized);
+  }),
+);
+
+/**
+ * GET /api/streams/export
+ * Export streams in NDJSON format.
+ * Includes a resumption cursor in the final line if interrupted.
+ */
+streamsRouter.get(
+  '/export',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  enforceStreamScope,
+  asyncHandler(async (req: Request, res: Response) => {
+    const requestId = req.correlationId as string | undefined;
+    
+    let resumeFrom = req.query.resume_from;
+    if (Array.isArray(resumeFrom) || (resumeFrom !== undefined && typeof resumeFrom !== 'string')) {
+      warn('Export pagination validation failed', { error: 'resume_from must be a string', requestId });
+      throw validationError('resume_from must be a single valid opaque pagination token');
+    }
+    
+    let cursor = resumeFrom ? parseCursor(resumeFrom, requestId) : undefined;
+    const limit = 100;
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-store');
+
+    try {
+      if (req.callerAddress) {
+        throw forbidden('Scoped users are not authorized to use the full export endpoint');
+      }
+
+      while (true) {
+        const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        
+        for (const record of dbResult.streams) {
+          res.write(JSON.stringify(toApiStream(record)) + '\n');
+        }
+
+        if (dbResult.streams.length > 0) {
+          cursor = { v: 1, lastId: dbResult.streams[dbResult.streams.length - 1]!.id };
+          res.write(JSON.stringify({ resumption_cursor: encodeCursor(cursor.lastId) }) + '\n');
+        }
+
+        if (!dbResult.hasMore) {
+          res.end();
+          break;
+        }
+      }
+      info('Stream export completed', { requestId });
+    } catch (err) {
+      warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
+      wrapDbError(err);
+    }
+  }),
+);
+
+/**
+ * HEAD /api/streams/:id
+ * Lightweight existence check with cache validators only.
+ */
+streamsRouter.head(
+  '/:id',
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    if (!id) {
+      res.status(404).end();
+      return;
+    }
+
+    debug('Checking stream existence', { id });
+
+    let record;
+    try {
+      record = await streamRepository.existsById(id);
+    } catch (err) {
+      if (err instanceof PoolExhaustedError) {
+        res.status(503).end();
+        return;
+      }
+      throw err;
+    }
+
+    if (!record) {
+      res.status(404).end();
+      return;
+    }
+
+    setStreamResourceHeaders(res, { id, updated_at: record.updated_at });
+    res.status(200).end();
   }),
 );
 
@@ -385,9 +726,11 @@ streamsRouter.get(
  */
 streamsRouter.get(
   '/:id',
+  authenticateApiKey,
+  requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -401,7 +744,109 @@ streamsRouter.get(
     }
 
     if (!record) throw notFound('Stream', id);
-    res.json(successResponse({ stream: toApiStream(record!) }, requestId));
+
+    // Conditional GET (RFC 7232 §3.2)
+    const etag = streamEntityTag(record!);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record!.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
+    const stream = toApiStream(record!);
+    setStreamResourceHeaders(res, record!);
+    res.set(
+      'Cache-Control',
+      isTerminalStatus(stream.status as ApiStreamStatus)
+        ? CACHEABLE_STREAM_HEADERS
+        : NO_STORE_STREAM_HEADERS,
+    );
+    res.json(successResponse({ stream }, requestId));
+  }),
+);
+
+/**
+ * GET /api/streams/:id/export.jsonld
+ *
+ * Export a single stream as a JSON-LD document for data portability.
+ *
+ * The response body is a raw JSON-LD object (not wrapped in the standard
+ * `successResponse` envelope) so that linked-data processors can consume it
+ * directly without unwrapping.
+ *
+ * Headers
+ * ───────
+ * - Content-Type: application/ld+json
+ * - ETag / Last-Modified: identical to GET /:id for cache validators
+ * - Cache-Control: public,max-age=300 for terminal streams; private,no-store otherwise
+ * - Link: <https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"
+ *
+ * Authentication: API key + streams:read scope (same as GET /:id).
+ * Rate limiting: inherits the global rate-limiter applied to all /api/* routes.
+ */
+streamsRouter.get(
+  '/:id/export.jsonld',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.correlationId;
+
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+
+    debug('Exporting stream as JSON-LD', { id, requestId });
+
+    let record: StreamRecord | undefined | null;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      wrapDbError(err);
+    }
+
+    if (!record) throw notFound('Stream', id);
+
+    // Conditional GET — reuse the same ETag fingerprint as GET /:id so that
+    // clients which already validated the plain-JSON representation can skip
+    // re-fetching the JSON-LD document unconditionally.
+    const etag = streamEntityTag(record);
+    const rawIfNoneMatch = req.headers['if-none-match'];
+    if (rawIfNoneMatch !== undefined) {
+      const header = Array.isArray(rawIfNoneMatch)
+        ? rawIfNoneMatch.join(', ')
+        : rawIfNoneMatch;
+      if (matchesIfNoneMatch(header, etag)) {
+        res.set('ETag', etag);
+        res.set('Last-Modified', new Date(record.updated_at).toUTCString());
+        res.status(304).end();
+        return;
+      }
+    }
+
+    const jsonLdDoc = toStreamJsonLd(record);
+
+    setStreamResourceHeaders(res, record);
+    res.set(
+      'Cache-Control',
+      isTerminalStatus(record.status as ApiStreamStatus)
+        ? CACHEABLE_STREAM_HEADERS
+        : NO_STORE_STREAM_HEADERS,
+    );
+    // Advertise the context document per the JSON-LD HTTP spec (§4.1).
+    res.set(
+      'Link',
+      '<https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    );
+    res.type('application/ld+json');
+    res.send(JSON.stringify(jsonLdDoc));
   }),
 );
 
@@ -416,9 +861,11 @@ streamsRouter.post(
   '/',
   authenticate,
   requireAuth,
+  authenticateApiKey,
+  requireScope('streams:write'),
   requireIdempotencyKey,
   asyncHandler(async (req: Request, res: Response) => {
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const correlationId = req.correlationId;
     const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
 
@@ -451,7 +898,7 @@ streamsRouter.post(
     }
 
     const requestFingerprint = fingerprintInput(normalizedInput);
-    const existingResponse   = idempotencyStore.get(idempotencyKey);
+    const existingResponse   = await idempotencyStore.get(idempotencyKey);
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
@@ -463,9 +910,9 @@ streamsRouter.post(
           action: 'conflict',
         });
         throw new ApiError(
+          409,
           ApiErrorCode.CONFLICT,
           'Idempotency-Key has already been used for a different request payload',
-          409,
           { hint: 'Use a new Idempotency-Key or retry with the original request body' },
         );
       }
@@ -512,7 +959,11 @@ streamsRouter.post(
 
     const stream = toApiStream(upsertResult!.stream);
     const responseEnvelope = successResponse(stream, requestId);
-    idempotencyStore.set(idempotencyKey, { requestFingerprint, statusCode: 201, body: responseEnvelope });
+    await idempotencyStore.set(
+      idempotencyKey,
+      { requestFingerprint, statusCode: 201, body: responseEnvelope },
+      idempotencyTtlSeconds,
+    );
 
     SerializationLogger.amountSerialized(2, requestId);
     info('Stream created', { id: stream.id, requestId, correlationId, action: 'created' });
@@ -522,6 +973,25 @@ streamsRouter.post(
       sender:        normalizedInput.sender,
       recipient:     normalizedInput.recipient,
     });
+
+    if (isValidStreamStatus(stream.status)) {
+      streamsCreatedTotal.inc({ status: stream.status });
+    }
+
+    // Issue a read-your-writes fence pin.  The client must echo this token in
+    // the X-Fluxora-Write-Fence request header on its next GET /api/streams
+    // call to ensure the read is routed to the primary pool while the replica
+    // may still be lagging.  The pin expires after RYW_PIN_TTL_SECONDS (default
+    // 30 s) and is ignored if missing, malformed, or expired.
+    try {
+      res.set(WRITE_FENCE_HEADER, issueWriteFencePin());
+    } catch (pinErr) {
+      // Never let a pin-issuance failure break stream creation — log and skip.
+      warn('Failed to issue write-fence pin', {
+        error: pinErr instanceof Error ? pinErr.message : String(pinErr),
+        requestId,
+      });
+    }
 
     res.set('Idempotency-Key', idempotencyKey);
     res.set('Idempotency-Replayed', 'false');
@@ -537,9 +1007,11 @@ streamsRouter.delete(
   '/:id',
   authenticate,
   requireAuth,
+  authenticateApiKey,
+  requireScope('streams:write'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     if (!id) {
       throw notFound('Stream', '');
     }
@@ -556,7 +1028,7 @@ streamsRouter.delete(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
       });
@@ -565,6 +1037,18 @@ streamsRouter.delete(
     try {
       await streamRepository.updateStream(id, { status: 'cancelled' }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          409,
+          ApiErrorCode.CONFLICT,
+          err.message,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: 'cancelled',
+          },
+        );
+      }
       wrapDbError(err);
     }
 
@@ -587,16 +1071,16 @@ streamsRouter.patch(
   '/:id/status',
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
     const { status: newStatus } = req.body ?? {};
 
     if (!id) {
       throw notFound('Stream', '');
     }
 
-    const validStatuses: ApiStreamStatus[] = ['scheduled', 'active', 'paused', 'completed', 'cancelled'];
+    const validStatuses: ApiStreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
     if (typeof newStatus !== 'string' || !validStatuses.includes(newStatus as ApiStreamStatus)) {
-      throw validationError('status must be one of: scheduled, active, paused, completed, cancelled');
+      throw validationError('status must be one of: active, paused, completed, cancelled');
     }
 
     let record;
@@ -610,7 +1094,7 @@ streamsRouter.patch(
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, newStatus as ApiStreamStatus);
     if (!guard.ok) {
-      throw new ApiError(ApiErrorCode.CONFLICT, guard.message, 409, {
+      throw new ApiError(409, ApiErrorCode.CONFLICT, guard.message, {
         streamId: id,
         currentStatus: record!.status,
         requestedStatus: newStatus,
@@ -619,10 +1103,21 @@ streamsRouter.patch(
 
     let updated;
     try {
-      // 'scheduled' is an API-only concept; map to 'active' in DB
-      const dbStatus = newStatus === 'scheduled' ? 'active' : newStatus as StreamStatus;
+      const dbStatus = newStatus as StreamStatus;
       updated = await streamRepository.updateStream(id, { status: dbStatus }, requestId ?? '');
     } catch (err) {
+      if (err instanceof StatusConflictError) {
+        throw new ApiError(
+          409,
+          ApiErrorCode.CONFLICT,
+          err.message,
+          {
+            streamId: id,
+            currentStatus: record!.status,
+            requestedStatus: newStatus,
+          },
+        );
+      }
       wrapDbError(err);
     }
 
@@ -632,3 +1127,640 @@ streamsRouter.patch(
     res.json(successResponse(toApiStream(updated!), requestId));
   }),
 );
+
+/**
+ * GET /api/streams/:id/events
+ *
+ * Server-Sent Events (SSE) endpoint to receive real-time stream updates.
+ * Supporting standard JWT authentication and Last-Event-ID resumption.
+ */
+streamsRouter.get(
+  '/:id/events',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.correlationId;
+
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+
+    // 1. JWT Authentication and Authorization
+    const wsAuthRequired = process.env.WS_AUTH_REQUIRED === 'true';
+    const jwtSecret = process.env.JWT_SECRET;
+    const authResult = verifyWsToken(req, jwtSecret);
+
+    if (wsAuthRequired && !authResult.ok) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: `Authentication required: ${authResult.code}`,
+          requestId,
+        },
+      });
+      return;
+    } else if (!wsAuthRequired && !authResult.ok && authResult.code === 'INVALID_TOKEN') {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Invalid or expired authentication token',
+          requestId,
+        },
+      });
+      return;
+    }
+
+    // 2. Reserve bounded SSE capacity before repository work or header flush.
+    const clientIp = getClientIp(req);
+    const sseLimits = resolveSseConnectionLimits();
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits, apiKey);
+
+    if (!connectionAttempt.ok) {
+      res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
+      warn('SSE connection rejected by limiter', {
+        id,
+        requestId,
+        ip: clientIp,
+        reason: connectionAttempt.reason,
+        activeConnections: connectionAttempt.activeConnections,
+        activeConnectionsForIp: connectionAttempt.activeConnectionsForIp,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+      });
+      throw tooManyRequests(connectionAttempt.message, {
+        reason: connectionAttempt.reason,
+        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
+        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        retryAfterSeconds: connectionAttempt.retryAfterSeconds,
+      });
+    }
+
+    const sseConnection = connectionAttempt.connection;
+    let cleanedUp = false;
+    let unsubscribeLiveUpdates: (() => void) | undefined;
+    let heartbeatInterval: NodeJS.Timeout | undefined;
+    let maxDurationTimer: NodeJS.Timeout | undefined;
+
+    function detachLifecycleHandlers(): void {
+      res.off('close', onResponseClose);
+      res.off('error', onResponseError);
+      req.off('aborted', onRequestAborted);
+    }
+
+    /**
+     * Idempotent cleanup for every SSE termination path. The active-connection
+     * handle owns the Map/Gauge decrement, so close/error/timeout signals cannot
+     * double-decrement or leave EventEmitter listeners behind. Lifecycle listeners
+     * are also detached so pre-header failures do not retain route closures longer
+     * than the response object itself.
+     */
+    function cleanup(reason: string): void {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      detachLifecycleHandlers();
+
+      if (heartbeatInterval !== undefined) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = undefined;
+      }
+      if (maxDurationTimer !== undefined) {
+        clearTimeout(maxDurationTimer);
+        maxDurationTimer = undefined;
+      }
+      if (unsubscribeLiveUpdates !== undefined) {
+        unsubscribeLiveUpdates();
+        unsubscribeLiveUpdates = undefined;
+      }
+
+      sseConnection.release();
+      debug('SSE connection cleaned up', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        reason,
+        durationMs: Date.now() - sseConnection.acceptedAt,
+      });
+    }
+
+    function onResponseClose(): void {
+      cleanup('client_close');
+    }
+
+    function onResponseError(err: Error): void {
+      warn('SSE response error', {
+        id,
+        requestId,
+        ip: sseConnection.ip,
+        error: err.message,
+      });
+      cleanup('response_error');
+    }
+
+    function onRequestAborted(): void {
+      cleanup('client_aborted');
+    }
+
+    const writeSse = (frame: string): boolean => {
+      if (cleanedUp || res.destroyed || res.writableEnded) return false;
+      try {
+        res.write(frame);
+        return true;
+      } catch (err) {
+        warn('SSE write failed; closing connection', {
+          id,
+          requestId,
+          ip: sseConnection.ip,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        cleanup('write_error');
+        try {
+          res.end();
+        } catch {
+          // best-effort shutdown only
+        }
+        return false;
+      }
+    };
+
+    res.once('close', onResponseClose);
+    res.once('error', onResponseError);
+    req.once('aborted', onRequestAborted);
+
+    // 3. Verify stream existence after reserving capacity so over-limit attempts
+    // are rejected before they can fan out into repository work.
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      cleanup('db_error');
+      wrapDbError(err);
+    }
+
+    if (cleanedUp) return;
+
+    if (!record) {
+      cleanup('not_found');
+      throw notFound('Stream', id);
+    }
+
+    // 4. Validate Last-Event-ID before establishing the SSE stream so that
+    // invalid values produce a standard JSON 400 response (not SSE framing).
+    const rawLastEventId = req.headers['last-event-id'];
+    let lastEventId: string | undefined;
+    try {
+      lastEventId = parseLastEventIdHeader(rawLastEventId);
+    } catch (err) {
+      cleanup('validation_error');
+      throw err;
+    }
+
+    try {
+      // 5. Establish Server-Sent Events stream.
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+    } catch (err) {
+      cleanup('flush_error');
+      throw err;
+    }
+
+    // Send connection ok comment + retry hint so browser EventSource knows the
+    // reconnect interval (ms). This is the SSE-spec mechanism for communicating
+    // the backoff to the client.
+    const sseConfig = loadConfig();
+    if (!writeSse(`: ok\n\nretry: ${sseConfig.sseRetryMs}\n\n`)) return;
+
+    // Periodic heartbeat to prevent proxies and load balancers from closing the connection.
+    heartbeatInterval = setInterval(() => {
+      writeSse(': heartbeat\n\n');
+    }, sseConfig.sseHeartbeatIntervalMs);
+    heartbeatInterval.unref?.();
+
+    // Bound long-lived SSE streams. Browser EventSource clients reconnect automatically.
+    // Emits a typed `event: close` frame before ending the response so clients
+    // can distinguish a deliberate server-side rotation (max_duration) from a
+    // network drop and reconnect promptly rather than applying error back-off.
+    // @security payload contains only the reason string — no stream data or PII.
+    maxDurationTimer = setTimeout(() => {
+      if (cleanedUp) return;
+      writeSse(`event: ${SSE_CLOSE_EVENT}\ndata: ${JSON.stringify({ reason: SSE_CLOSE_REASONS.MAX_DURATION })}\n\n`);
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
+      cleanup('max_duration');
+    }, sseLimits.maxConnectionDurationMs);
+    maxDurationTimer.unref?.();
+
+    // 6. Handle Last-Event-ID Resumption Replay.
+    // At this point the header has already been validated; replay runs inside
+    // the SSE connection so we can stream historical events before live updates.
+    if (lastEventId) {
+      const hub = getStreamHub();
+      const eventStore = hub?.getEventStore();
+      if (eventStore) {
+        try {
+          let cursor: string | undefined = lastEventId;
+          // Bound the replay to at most SSE_REPLAY_MAX_PAGES pages so a
+          // client-supplied cursor cannot force a full-table scan.
+          const SSE_REPLAY_MAX_PAGES = 10;
+          let pagesRead = 0;
+          do {
+            if (cleanedUp) break;
+            const result = await eventStore.getEvents({
+              afterEventId: cursor,
+              limit: 100,
+            });
+
+            for (const event of result.events) {
+              if (cleanedUp) break;
+              if (eventMatchesStreamId(event, id)) {
+                const written = writeSse(
+                  `id: ${event.eventId}\n` +
+                  `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+                  `data: ${JSON.stringify({
+                    type: 'stream_update',
+                    streamId: id,
+                    eventId: event.eventId,
+                    payload: event.payload,
+                    correlationId: req.correlationId,
+                  })}\n\n`,
+                );
+                if (!written) break;
+              }
+            }
+
+            cursor = result.nextCursor;
+            pagesRead++;
+          } while (cursor !== undefined && !cleanedUp && pagesRead < SSE_REPLAY_MAX_PAGES);
+        } catch (err) {
+          if (err instanceof StaleCursorError) {
+            writeSse(
+              `event: error\ndata: ${JSON.stringify({
+                code: STALE_CURSOR_ERROR_CODE,
+                message: 'Replay cursor no longer exists; resync from fromLedger',
+              })}\n\n`,
+            );
+            warn('SSE replay cursor is stale', {
+              afterEventId: err.afterEventId,
+              requestId,
+            });
+            res.end();
+            cleanup('stale_cursor');
+            return;
+          }
+
+          warn('Failed to replay SSE events from store', {
+            error: err instanceof Error ? err.message : String(err),
+            requestId,
+          });
+        }
+      }
+    }
+
+    if (cleanedUp) return;
+
+    // 6. Subscribe to Real-Time Updates.
+    const listener = (event: StreamUpdateEvent) => {
+      if (event.streamId === id) {
+        writeSse(
+          `id: ${event.eventId}\n` +
+          `event: ${SSE_STREAM_UPDATE_EVENT}\n` +
+          `data: ${JSON.stringify({
+            type: 'stream_update',
+            streamId: event.streamId,
+            eventId: event.eventId,
+            payload: event.payload,
+            correlationId: req.correlationId || event.correlationId,
+          })}\n\n`,
+        );
+      }
+    };
+
+    unsubscribeLiveUpdates = subscribeToSseStream(id, listener);
+
+    // Register a shutdown drain callback so drainSseEventBus() can close this
+    // response cleanly with a retry:0 directive instead of an abrupt socket close.
+    // A forceClose callback is also registered so that when the per-connection
+    // drain timeout is exceeded the underlying socket is destroyed immediately.
+    const deregisterShutdown = registerSseShutdownCallback(
+      async () => {
+        try {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write('retry: 0\n\n');
+            res.end();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
+        }
+        cleanup('shutdown_drain');
+      },
+      () => {
+        try {
+          if (!res.destroyed) {
+            res.destroy();
+          }
+        } catch {
+          // Best-effort — the socket may already be gone.
+        }
+      },
+    );
+    const origUnsubscribe = unsubscribeLiveUpdates;
+    unsubscribeLiveUpdates = () => {
+      origUnsubscribe();
+      deregisterShutdown();
+    };
+  }),
+);
+
+/**
+ * GET /api/streams/:id/poll?since=&timeout=
+ *
+ * Long-polling fallback endpoint for clients behind proxies that block WebSockets/SSE.
+ * Holds the HTTP connection open (bounded by a timeout) until a new event for the stream
+ * arrives or the timeout elapses. Returns the same event envelope shape used by the
+ * WebSocket hub.
+ */
+streamsRouter.get(
+  '/:id/poll',
+  authenticateApiKey,
+  requireScope('streams:read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params['id'];
+    const requestId = req.id;
+
+    if (!id) {
+      throw notFound('Stream', '');
+    }
+
+    // 1. JWT Authentication and Authorization
+    const wsAuthRequired = process.env.WS_AUTH_REQUIRED === 'true';
+    const jwtSecret = process.env.JWT_SECRET;
+    const authResult = verifyWsToken(req, jwtSecret);
+
+    if (wsAuthRequired && !authResult.ok) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: `Authentication required: ${authResult.code}`,
+          requestId,
+        },
+      });
+      return;
+    } else if (!wsAuthRequired && !authResult.ok && authResult.code === 'INVALID_TOKEN') {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Invalid or expired authentication token',
+          requestId,
+        },
+      });
+      return;
+    }
+
+    // 2. Reserve connection capacity from longPollConnectionLimiter
+    const clientIp = getClientIp(req);
+    const longPollLimits = resolveLongPollConnectionLimits();
+    const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
+    const connectionAttempt = tryAcquireLongPollConnection(clientIp, longPollLimits, apiKey);
+
+    if (!connectionAttempt.ok) {
+      res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
+      warn('Long-poll connection rejected by limiter', {
+        id,
+        requestId,
+        ip: clientIp,
+        reason: connectionAttempt.reason,
+        activeConnections: connectionAttempt.activeConnections,
+        activeConnectionsForIp: connectionAttempt.activeConnectionsForIp,
+        maxConnectionsPerIp: longPollLimits.maxConnectionsPerIp,
+        maxGlobalConnections: longPollLimits.maxGlobalConnections,
+      });
+      throw tooManyRequests(connectionAttempt.message, {
+        reason: connectionAttempt.reason,
+        maxConnectionsPerIp: longPollLimits.maxConnectionsPerIp,
+        maxGlobalConnections: longPollLimits.maxGlobalConnections,
+        retryAfterSeconds: connectionAttempt.retryAfterSeconds,
+      });
+    }
+
+    const longPollConnection = connectionAttempt.connection;
+    let cleanedUp = false;
+    let unsubscribeLiveUpdates: (() => void) | undefined;
+    let pollTimer: NodeJS.Timeout | undefined;
+
+    function detachLifecycleHandlers(): void {
+      res.off('close', onResponseClose);
+      res.off('error', onResponseError);
+      req.off('aborted', onRequestAborted);
+    }
+
+    function cleanup(reason: string): void {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      detachLifecycleHandlers();
+
+      if (pollTimer !== undefined) {
+        clearTimeout(pollTimer);
+        pollTimer = undefined;
+      }
+      if (unsubscribeLiveUpdates !== undefined) {
+        unsubscribeLiveUpdates();
+        unsubscribeLiveUpdates = undefined;
+      }
+
+      longPollConnection.release();
+      debug('Long-poll connection cleaned up', {
+        id,
+        requestId,
+        ip: longPollConnection.ip,
+        reason,
+        durationMs: Date.now() - longPollConnection.acceptedAt,
+      });
+    }
+
+    function onResponseClose(): void {
+      cleanup('client_close');
+    }
+
+    function onResponseError(err: Error): void {
+      warn('Long-poll response error', {
+        id,
+        requestId,
+        ip: longPollConnection.ip,
+        error: err.message,
+      });
+      cleanup('response_error');
+    }
+
+    function onRequestAborted(): void {
+      cleanup('client_aborted');
+    }
+
+    res.once('close', onResponseClose);
+    res.once('error', onResponseError);
+    req.once('aborted', onRequestAborted);
+
+    // 3. Verify stream existence in DB
+    let record;
+    try {
+      record = await streamRepository.getById(id);
+    } catch (err) {
+      cleanup('db_error');
+      wrapDbError(err);
+    }
+
+    if (cleanedUp) return;
+
+    if (!record) {
+      cleanup('not_found');
+      throw notFound('Stream', id);
+    }
+
+    // 4. Validate query parameters
+    const rawSince = req.query['since'];
+    let sinceEventId: string | undefined;
+    if (rawSince !== undefined) {
+      try {
+        sinceEventId = parseLastEventIdHeader(rawSince);
+      } catch (err) {
+        cleanup('validation_error');
+        throw err;
+      }
+    }
+
+    const rawTimeout = req.query['timeout'];
+    let timeoutMs = 30_000; // Default 30s
+    if (rawTimeout !== undefined) {
+      if (typeof rawTimeout !== 'string' || !/^\d+$/.test(rawTimeout)) {
+        cleanup('validation_error');
+        throw validationError('timeout must be a positive integer');
+      }
+      const parsedTimeout = Number.parseInt(rawTimeout, 10);
+      if (parsedTimeout < 1) {
+        cleanup('validation_error');
+        throw validationError('timeout must be at least 1 second');
+      }
+      timeoutMs = parsedTimeout > 1000 ? parsedTimeout : parsedTimeout * 1000;
+    }
+    // Bound timeout by max hold duration & longPollLimits
+    const MAX_LONG_POLL_HOLD_MS = 30_000;
+    timeoutMs = Math.min(timeoutMs, MAX_LONG_POLL_HOLD_MS, longPollLimits.maxConnectionDurationMs);
+
+    // 5. Check historical replay if `since` was supplied
+    if (sinceEventId) {
+      const hub = getStreamHub();
+      const eventStore = hub?.getEventStore();
+      if (eventStore) {
+        try {
+          const result = await eventStore.getEvents({
+            afterEventId: sinceEventId,
+            limit: 100,
+          });
+
+          for (const event of result.events) {
+            if (cleanedUp) break;
+            if (eventMatchesStreamId(event, id)) {
+              const envelope = {
+                type: 'stream_update',
+                streamId: id,
+                eventId: event.eventId,
+                payload: event.payload,
+                correlationId: req.correlationId,
+              };
+              cleanup('replay_event_found');
+              res.json(successResponse(envelope, requestId));
+              return;
+            }
+          }
+        } catch (err) {
+          if (err instanceof StaleCursorError || (err as any)?.name === 'StaleCursorError') {
+            cleanup('stale_cursor');
+            throw validationError(
+              'Replay cursor no longer exists; resync from fromLedger',
+              { code: STALE_CURSOR_ERROR_CODE },
+            );
+          }
+
+          warn('Failed to replay event for long-poll', {
+            error: err instanceof Error ? err.message : String(err),
+            requestId,
+          });
+        }
+      }
+    }
+
+    if (cleanedUp) return;
+
+    // 6. Subscribe to live updates via sseEmitter event bus
+    const sendEventAndFinish = (event: LiveSseStreamUpdateEvent) => {
+      if (cleanedUp || res.destroyed || res.writableEnded) return;
+
+      const envelope = {
+        type: 'stream_update',
+        streamId: event.streamId,
+        eventId: event.eventId,
+        payload: event.payload,
+        correlationId: req.correlationId || event.correlationId,
+      };
+
+      cleanup('event_delivered');
+      res.json(successResponse(envelope, requestId));
+    };
+
+    const listener = (event: LiveSseStreamUpdateEvent) => {
+      if (event.streamId === id) {
+        sendEventAndFinish(event);
+      }
+    };
+
+    unsubscribeLiveUpdates = subscribeToSseStream(id, listener);
+
+    // Register shutdown drain callback
+    const deregisterShutdown = registerSseShutdownCallback(
+      async () => {
+        try {
+          if (!res.writableEnded && !res.destroyed) {
+            res.json(successResponse(null, requestId));
+          }
+        } catch {
+          // Best-effort
+        }
+        cleanup('shutdown_drain');
+      },
+      () => {
+        try {
+          if (!res.destroyed) {
+            res.destroy();
+          }
+        } catch {
+          // Best-effort
+        }
+      },
+    );
+
+    const origUnsubscribe = unsubscribeLiveUpdates;
+    unsubscribeLiveUpdates = () => {
+      origUnsubscribe();
+      deregisterShutdown();
+    };
+
+    // 7. Start hold timer
+    pollTimer = setTimeout(() => {
+      if (cleanedUp || res.destroyed || res.writableEnded) return;
+      cleanup('timeout_elapsed');
+      res.json(successResponse(null, requestId));
+    }, timeoutMs);
+
+    pollTimer.unref?.();
+  }),
+);
+
+export function _resetStreams(): void {}

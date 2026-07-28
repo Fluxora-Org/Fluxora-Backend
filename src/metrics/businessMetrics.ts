@@ -1,0 +1,437 @@
+import { Counter, Histogram, Gauge } from 'prom-client';
+import { registry } from '../metrics.js';
+
+export type StreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+export type WebhookDeliveryOutcome = 'success' | 'failed';
+export type SseConnectionRejectionReason = 'per_ip_limit' | 'global_limit';
+
+const VALID_STREAM_STATUSES: readonly StreamStatus[] = [
+  'active',
+  'paused',
+  'completed',
+  'cancelled',
+];
+const VALID_OUTCOMES: readonly WebhookDeliveryOutcome[] = ['success', 'failed'];
+const VALID_REJECTION_REASONS: readonly SseConnectionRejectionReason[] = [
+  'per_ip_limit',
+  'global_limit',
+];
+
+/**
+ * Returns true if the value is a known StreamStatus label value.
+ */
+export function isValidStreamStatus(value: string): value is StreamStatus {
+  return (VALID_STREAM_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known webhook delivery outcome label value.
+ */
+export function isValidDeliveryOutcome(value: string): value is WebhookDeliveryOutcome {
+  return (VALID_OUTCOMES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known SSE connection rejection reason.
+ */
+export function isValidRejectionReason(value: string): value is SseConnectionRejectionReason {
+  return (VALID_REJECTION_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * Observes a duration into the histogram, clamping NaN and negative values to 0.
+ *
+ * Prevents metric corruption from clock skew, negative deltas, or uninitialized
+ * timers while keeping the happy-path label set unchanged.
+ */
+export function safeObserveDuration(histogram: Histogram, durationSeconds: number): void {
+  histogram.observe(Number.isFinite(durationSeconds) && durationSeconds >= 0 ? durationSeconds : 0);
+}
+
+/**
+ * Histogram tracking JWT verification latency in seconds.
+ *
+ * Auth runs on every protected request path. When the JWT verifier or the
+ * revocation-store lookup becomes a bottleneck, this histogram exposes the
+ * p50/p95/p99 distribution. Buckets are tuned for an in-process cryptographic
+ * verify plus an optional Redis revocation check — sub-millisecond through
+ * 1s — so the typical tail is visible without overcounting microseconds.
+ *
+ * @security
+ * - Label set is intentionally limited to `outcome` (`success` | `failure`)
+ *   to avoid emitting high-cardinality or credential-bearing labels
+ *   (no `jti`, `address`, `subject`, `kid`, etc.).
+ */
+export const authJwtVerifyDurationSeconds =
+  (registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds') as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_auth_jwt_verify_duration_seconds',
+    help: 'Duration of JWT signature verification in seconds, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [registry],
+  });
+
+/**
+ * Histogram tracking API-key lookup latency in seconds.
+ *
+ * Records every API-key auth attempt that resolves a raw key against the
+ * key store (per-service keys via {@link isValidApiKey}) or against the
+ * admin env-var key ({@link requireAdminAuth}). The store is currently
+ * in-memory, so buckets are skewed to sub-millisecond values to expose
+ * regressions if a future DB-backed store is introduced.
+ *
+ * @security
+ * - Label set is intentionally limited to `outcome` (`success` | `failure`)
+ *   to avoid emitting high-cardinality or credential-bearing labels
+ *   (no key id, key prefix, hash, or raw key material).
+ */
+export const authApiKeyLookupDurationSeconds =
+  (registry.getSingleMetric(
+    'fluxora_auth_apikey_lookup_duration_seconds'
+  ) as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_auth_apikey_lookup_duration_seconds',
+    help: 'Duration of API key lookup in seconds, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    buckets: [0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05],
+    registers: [registry],
+  });
+
+export const streamsCreatedTotal =
+  (registry.getSingleMetric('fluxora_streams_created_total') as Counter<'status'>) ||
+  new Counter({
+    name: 'fluxora_streams_created_total',
+    help: 'Total number of treasury streams created',
+    labelNames: ['status'] as const,
+    registers: [registry],
+  });
+
+export const sseActiveConnectionsGauge =
+  (registry.getSingleMetric('fluxora_sse_active_connections') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_active_connections',
+    help: 'Current number of active Server-Sent Events stream connections',
+    registers: [registry],
+  });
+
+export const sseConnectionsRejectedTotal =
+  (registry.getSingleMetric('fluxora_sse_connections_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_sse_connections_rejected_total',
+    help: 'Total number of rejected Server-Sent Events stream connection attempts',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+export const longPollActiveConnectionsGauge =
+  (registry.getSingleMetric('fluxora_longpoll_active_connections') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_longpoll_active_connections',
+    help: 'Current number of active long-polling fallback stream connections',
+    registers: [registry],
+  });
+
+export const longPollConnectionsRejectedTotal =
+  (registry.getSingleMetric('fluxora_longpoll_connections_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_longpoll_connections_rejected_total',
+    help: 'Total number of rejected long-polling connection attempts',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+export const webhookDeliveriesSuppressedTotal =
+  (registry.getSingleMetric('fluxora_webhook_deliveries_suppressed_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_deliveries_suppressed_total',
+    help: 'Number of webhook deliveries suppressed due to reorg',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
+export const webhookDeliveriesTotal =
+  (registry.getSingleMetric('fluxora_webhook_deliveries_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_deliveries_total',
+    help: 'Total number of webhook delivery attempts, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
+export const webhookDeliveryDurationSeconds =
+  (registry.getSingleMetric('fluxora_webhook_delivery_duration_seconds') as Histogram) ||
+  new Histogram({
+    name: 'fluxora_webhook_delivery_duration_seconds',
+    help: 'Duration of webhook delivery attempts in seconds',
+    buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    registers: [registry],
+  });
+
+export const indexerEventsIngestedTotal =
+  (registry.getSingleMetric('fluxora_indexer_events_ingested_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_indexer_events_ingested_total',
+    help: 'Total number of contract events ingested by the indexer',
+    registers: [registry],
+  });
+
+export const indexerLagSeconds =
+  (registry.getSingleMetric('fluxora_indexer_lag_seconds') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_indexer_lag_seconds',
+    help: 'Ingestion lag of the indexer in seconds',
+    registers: [registry],
+  });
+
+/**
+ * Total live SSE subscribers across all stream IDs.
+ * Updated on every subscribe/unsubscribe call.
+ */
+export const sseLiveSubscribersGauge =
+  (registry.getSingleMetric('fluxora_sse_live_subscribers') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_live_subscribers',
+    help: 'Total number of live SSE subscriber callbacks registered across all streams',
+    registers: [registry],
+  });
+
+/**
+ * Webhook Dead-Letter Queue (DLQ) depth gauge.
+ *
+ * Tracks the number of webhook deliveries that have failed permanently and are queued for
+ * manual review/processing. High values indicate delivery failures are accumulating.
+ *
+ * Suggested alert threshold: > 100 items (or adjusted based on your SLA)
+ *
+ * @see https://github.com/Fluxora-Org/Fluxora-Backend/docs/webhooks.md for DLQ documentation
+ */
+export const webhookDlqItemsGauge =
+  (registry.getSingleMetric('fluxora_webhook_dlq_items') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_webhook_dlq_items',
+    help: 'Number of webhook deliveries in the dead-letter queue (permanently failed)',
+    registers: [registry],
+  });
+
+/**
+ * Current EventEmitter listener count on SSE_STREAM_UPDATE_EVENT.
+ * Should be 0 (idle) or 1 (dispatcher attached). Spikes above 1 indicate a
+ * regression that reintroduces per-connection listeners.
+ */
+export const sseEventListenersGauge =
+  (registry.getSingleMetric('fluxora_sse_event_listeners') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_sse_event_listeners',
+    help: 'Number of EventEmitter listeners on SSE_STREAM_UPDATE_EVENT (expected 0 or 1)',
+    registers: [registry],
+  });
+
+/**
+ * Counter for exceptions thrown by live SSE subscriber callbacks.
+ *
+ * @security
+ * - No SSE payloads, user data, or correlation IDs are included in the labels.
+ * - Label set is bounded via `reason` enum to avoid cardinality blowup.
+ */
+export const sseSubscriberErrorsTotal =
+  (registry.getSingleMetric('fluxora_sse_subscriber_errors_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_sse_subscriber_errors_total',
+    help: 'Total number of errors thrown by live SSE subscriber callbacks',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for SSE connections dropped due to backpressure (buffer overflow).
+ *
+ * Fires when a slow consumer's per-connection buffer exceeds
+ * `SSE_MAX_BUFFERED_EVENTS` and the connection is severed to prevent
+ * unbounded memory growth (DoS vector).
+ *
+ * @security No payloads, IPs, or PII. Bounded cardinality (single series).
+ */
+export const sseBackpressureDropsTotal =
+  (registry.getSingleMetric('fluxora_sse_backpressure_drops_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_sse_backpressure_drops_total',
+    help: 'Total number of SSE connections dropped due to per-connection buffer overflow (slow consumer backpressure)',
+    registers: [registry],
+  });
+
+/**
+ * Webhook outbox backlog gauge.
+ *
+ * Tracks the number of webhook deliveries pending in the outbox (waiting to be sent or retried).
+ * This gauge helps detect when the delivery pipeline is stalled or backed up.
+ *
+ * High values may indicate:
+ * - External endpoint is slow or unresponsive
+ * - Network issues or connectivity problems
+ * - The delivery processor is not running or is stuck
+ *
+ * Suggested alert threshold: > 1000 items (or adjusted based on your expected throughput)
+ *
+ * @see https://github.com/Fluxora-Org/Fluxora-Backend/docs/webhooks.md for outbox documentation
+ */
+export const webhookOutboxPendingItemsGauge =
+  (registry.getSingleMetric('fluxora_webhook_outbox_pending_items') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_webhook_outbox_pending_items',
+    help: 'Number of webhook deliveries pending in the outbox (awaiting delivery or retry)',
+    registers: [registry],
+  });
+
+/**
+ * Sanitize a store-reported gauge value into a non-negative finite integer.
+ *
+ * Edge-case contract (regression-locked by tests):
+ * - Non-numbers (`null`, `undefined`, strings, objects) → `0`
+ * - Non-finite numbers (`NaN`, `±Infinity`) → `0`
+ * - Negatives → `0`
+ * - Fractional values → `Math.floor` (counts are whole deliveries)
+ * - Values above `Number.MAX_SAFE_INTEGER` → clamped to `Number.MAX_SAFE_INTEGER`
+ *
+ * Prevents NaN/Infinity/negative pollution of Prometheus gauges scraped via `/metrics`.
+ */
+function sanitizeMetricGaugeValue(val: unknown): number {
+  if (typeof val !== 'number' || !Number.isFinite(val)) {
+    return 0;
+  }
+  const floored = Math.floor(val);
+  if (floored <= 0) {
+    return 0;
+  }
+  return floored > Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : floored;
+}
+
+/**
+ * Sync webhook metrics (DLQ depth and outbox backlog) from the store into Prometheus gauges.
+ *
+ * Called on every authenticated `/metrics` scrape so Prometheus sees current queue depth
+ * without a separate polling loop. Failures never throw — gauges fall back to `0` so a
+ * store outage cannot break metrics exposure or auth-gated scrapes.
+ *
+ * Edge-case contract (regression-locked by tests):
+ * - `undefined` / `null` store → gauges set to `0`
+ * - Missing or non-function `getMetrics` → gauges set to `0`
+ * - `getMetrics()` throws → gauges set to `0` (error swallowed)
+ * - `getMetrics()` returns `null` / `undefined` / partial objects → missing fields sanitize to `0`
+ * - Invalid numeric fields → sanitized via {@link sanitizeMetricGaugeValue}
+ * - Negative values → clamped to `0`
+ * - Large values → clamped to `Number.MAX_SAFE_INTEGER`
+ *
+ * @param store - WebhookDeliveryStore-like object to read metrics from
+ *
+ * @see webhookDlqItemsGauge
+ * @see webhookOutboxPendingItemsGauge
+ */
+export function syncWebhookMetrics(
+  store?: {
+    getMetrics?: () => {
+      totalDeliveries?: number;
+      successfulDeliveries?: number;
+      failedDeliveries?: number;
+      dlqItems?: number;
+      outboxItems?: number;
+    } | null;
+  } | null
+): void {
+  // Explicit validation: store must be a non-null object with a callable getMetrics
+  if (!store || typeof store.getMetrics !== 'function') {
+    webhookDlqItemsGauge.set(0);
+    webhookOutboxPendingItemsGauge.set(0);
+    return;
+  }
+
+  try {
+    const metrics = store.getMetrics();
+    // Explicit null/undefined check on returned metrics object
+    if (!metrics || typeof metrics !== 'object') {
+      webhookDlqItemsGauge.set(0);
+      webhookOutboxPendingItemsGauge.set(0);
+      return;
+    }
+    webhookDlqItemsGauge.set(sanitizeMetricGaugeValue(metrics.dlqItems));
+    webhookOutboxPendingItemsGauge.set(sanitizeMetricGaugeValue(metrics.outboxItems));
+  } catch {
+    // Observability must not fail closed: never let store errors 500 the scrape path.
+    webhookDlqItemsGauge.set(0);
+    webhookOutboxPendingItemsGauge.set(0);
+  }
+}
+
+/**
+ * Counter for failed WebSocket token authentication attempts, labeled by failure reason.
+ *
+ * @security
+ * - Labels are a fixed enum (`MISSING_TOKEN` | `INVALID_TOKEN` | `AUTH_NOT_CONFIGURED`)
+ *   to prevent cardinality blowup. No token material is ever included.
+ */
+export const wsAuthFailureTotal =
+  (registry.getSingleMetric('fluxora_ws_auth_failure_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_ws_auth_failure_total',
+    help: 'Total failed WebSocket token authentication attempts, labeled by failure reason',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+export const adminReindexJobDurationSeconds =
+  (registry.getSingleMetric(
+    'fluxora_admin_reindex_job_duration_seconds'
+  ) as Histogram<'outcome'>) ||
+  new Histogram({
+    name: 'fluxora_admin_reindex_job_duration_seconds',
+    help: 'Duration of adminState.triggerReindex job in seconds, labeled by outcome',
+    labelNames: ['outcome'] as const,
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60],
+    registers: [registry],
+  });
+
+/** Safely resets values across all business counters, histograms, and gauges without removing them from the registry. */
+export function resetBusinessMetrics(): void {
+  authJwtVerifyDurationSeconds.reset();
+  authApiKeyLookupDurationSeconds.reset();
+  streamsCreatedTotal.reset();
+  sseActiveConnectionsGauge.reset();
+  sseConnectionsRejectedTotal.reset();
+  webhookDeliveriesSuppressedTotal.reset();
+  webhookDeliveriesTotal.reset();
+  webhookDeliveryDurationSeconds.reset();
+  indexerEventsIngestedTotal.reset();
+  indexerLagSeconds.reset();
+  sseLiveSubscribersGauge.reset();
+  webhookDlqItemsGauge.reset();
+  sseEventListenersGauge.reset();
+  sseSubscriberErrorsTotal.reset();
+  sseBackpressureDropsTotal.reset();
+  webhookOutboxPendingItemsGauge.reset();
+  wsAuthFailureTotal.reset();
+  adminReindexJobDurationSeconds.reset();
+}
+
+/** Clean helper to de-register metrics between test runs. */
+export function deRegisterBusinessMetrics(): void {
+  registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
+  registry.removeSingleMetric('fluxora_auth_apikey_lookup_duration_seconds');
+  registry.removeSingleMetric('fluxora_streams_created_total');
+  registry.removeSingleMetric('fluxora_sse_active_connections');
+  registry.removeSingleMetric('fluxora_sse_connections_rejected_total');
+  registry.removeSingleMetric('fluxora_webhook_deliveries_total');
+  registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
+  registry.removeSingleMetric('fluxora_webhook_deliveries_suppressed_total');
+  registry.removeSingleMetric('fluxora_webhook_dlq_items');
+  registry.removeSingleMetric('fluxora_webhook_outbox_pending_items');
+  registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
+  registry.removeSingleMetric('fluxora_indexer_lag_seconds');
+  registry.removeSingleMetric('fluxora_sse_live_subscribers');
+  registry.removeSingleMetric('fluxora_sse_event_listeners');
+  registry.removeSingleMetric('fluxora_sse_subscriber_errors_total');
+  registry.removeSingleMetric('fluxora_sse_backpressure_drops_total');
+  registry.removeSingleMetric('fluxora_ws_auth_failure_total');
+  registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
+  registry.removeSingleMetric('fluxora_longpoll_active_connections');
+  registry.removeSingleMetric('fluxora_longpoll_connections_rejected_total');
+}

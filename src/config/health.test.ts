@@ -1,12 +1,40 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { loadConfig, ConfigError } from '../../src/config/env.js';
 import {
-  HealthCheckManager,
-  type HealthChecker,
-  type DependencyHealth,
-  createDatabaseHealthChecker,
-  createRedisHealthChecker,
-  createHorizonHealthChecker,
+HealthCheckManager,
+type HealthChecker,
+type DependencyHealth,
+createDatabaseHealthChecker,
+createRedisHealthChecker,
+createHorizonHealthChecker,
 } from './health.js';
+
+describe('Health Check Environment Configuration', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  afterAll(() => {
+    process.env = originalEnv;
+  });
+
+  it('should use default values if environment variables are omitted', () => {
+    delete process.env.HEALTH_CHECK_TIMEOUT_MS;
+    delete process.env.HEALTH_CHECK_INTERVAL_MS;
+    const config = loadConfig();
+
+    expect(config.healthCheckTimeoutMs).toBe(5000);
+    expect(config.healthCheckIntervalMs).toBe(30000);
+  });
+
+  it('should reject zero or negative timeout values via parseIntEnv min limit', () => {
+    process.env.HEALTH_CHECK_TIMEOUT_MS = '0';
+    expect(() => loadConfig()).toThrow(ConfigError);
+    expect(() => loadConfig()).toThrow(/at least 1|below minimum 1/);
+  });
+});
 
 const makeChecker = (name: string, error?: string): HealthChecker => ({
   name,

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest';
 import {
   resolvePoolConfig,
   createPool,
@@ -6,8 +6,11 @@ import {
   setPool,
   query,
   getPoolMetrics,
+  extractTableHint,
+  withClient,
   PoolExhaustedError,
   DuplicateEntryError,
+  QueryTimeoutError,
 } from './pool';
 import type pg from 'pg';
 
@@ -91,9 +94,9 @@ describe('query', () => {
     expect(result.rows).toEqual([]);
   });
 
-  it('throws PoolExhaustedError when pool is full and requests are waiting', async () => {
-    const pool = makePool({ totalCount: 10, idleCount: 0, waitingCount: 1 });
-    await expect(query(pool, 'SELECT 1')).rejects.toBeInstanceOf(PoolExhaustedError);
+  it('throws PoolExhaustedError when waiting queue reaches the queue limit', async () => {
+    const pool = makePool({ totalCount: 10, idleCount: 0, waitingCount: 50 });
+    await expect(query(pool, 'SELECT 1', undefined, 50)).rejects.toBeInstanceOf(PoolExhaustedError);
   });
 
   it('throws DuplicateEntryError on unique constraint violation', async () => {
@@ -157,5 +160,124 @@ describe('createPool', () => {
     });
     expect(() => pool.emit('error', new Error('test error'))).not.toThrow();
     pool.end();
+  });
+});
+
+// ── extractTableHint ─────────────────────────────────────────────────────────────
+
+describe('extractTableHint', () => {
+  it('extracts table name from SELECT', () => {
+    expect(extractTableHint('SELECT * FROM users')).toBe('users');
+  });
+
+  it('extracts table name from INSERT', () => {
+    expect(extractTableHint('INSERT INTO accounts (id) VALUES ($1)')).toBe('accounts');
+  });
+
+  it('extracts table name from UPDATE', () => {
+    expect(extractTableHint('UPDATE orders SET status = $1')).toBe('orders');
+  });
+
+  it('extracts table name from JOIN', () => {
+    expect(extractTableHint('SELECT * FROM a JOIN b ON a.id = b.id')).toBe('a');
+  });
+
+  it('returns unknown for SQL without table reference', () => {
+    expect(extractTableHint('SELECT 1')).toBe('unknown');
+  });
+});
+
+// ── query helper: error mapping ──────────────────────────────────────────────────
+
+describe('query — error mapping', () => {
+  function makePool(overrides: Partial<pg.Pool> = {}): pg.Pool {
+    return {
+      totalCount: 0,
+      idleCount: 1,
+      waitingCount: 0,
+      options: { max: 10 },
+      query: vi.fn<() => Promise<pg.QueryResult>>().mockResolvedValue({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] }),
+      on: vi.fn(),
+      ...overrides,
+    } as unknown as pg.Pool;
+  }
+
+  it('throws QueryTimeoutError on PG error code 57014', async () => {
+    const pgError = Object.assign(new Error('cancelled'), { code: '57014' });
+    const pool = makePool({
+      query: vi.fn<() => Promise<never>>().mockRejectedValue(pgError),
+    });
+    await expect(query(pool, 'SELECT 1')).rejects.toBeInstanceOf(QueryTimeoutError);
+  });
+
+  it('throws DuplicateEntryError on PG error code 23505', async () => {
+    const pgError = Object.assign(new Error('dup'), { code: '23505', detail: 'Key (id)=(1) already exists.' });
+    const pool = makePool({
+      query: vi.fn<() => Promise<never>>().mockRejectedValue(pgError),
+    });
+    await expect(query(pool, 'INSERT INTO t VALUES ($1)', [1])).rejects.toBeInstanceOf(DuplicateEntryError);
+  });
+});
+
+// ── query helper: slow query logging ─────────────────────────────────────────────
+
+describe('query — slow query logging', () => {
+  function makePool(overrides: Partial<pg.Pool> = {}): pg.Pool {
+    return {
+      totalCount: 0,
+      idleCount: 1,
+      waitingCount: 0,
+      options: { max: 10 },
+      query: vi.fn<() => Promise<pg.QueryResult>>().mockResolvedValue({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] }),
+      on: vi.fn(),
+      ...overrides,
+    } as unknown as pg.Pool;
+  }
+
+  it('logs slow query when latency exceeds threshold', async () => {
+    let call = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (call++ === 0 ? 1000 : 2001));
+    const pool = makePool();
+    await query(pool, 'SELECT * FROM large_table', undefined, 500);
+    nowSpy.mockRestore();
+  });
+});
+
+// ── withClient ───────────────────────────────────────────────────────────────────
+
+describe('withClient', () => {
+  it('acquires client, runs fn, and releases client', async () => {
+    const mockClient = {
+      query: vi.fn().mockResolvedValue({ rows: [{ id: 1 }] }),
+      release: vi.fn(),
+    };
+    const mockPool = {
+      connect: vi.fn().mockResolvedValue(mockClient),
+    } as unknown as pg.Pool;
+
+    const result = await withClient(mockPool, async (client) => {
+      const res = await client.query('SELECT 1');
+      return res.rows[0];
+    });
+
+    expect(result).toEqual({ id: 1 });
+    expect(mockPool.connect).toHaveBeenCalled();
+    expect(mockClient.release).toHaveBeenCalled();
+  });
+
+  it('releases client even when fn throws', async () => {
+    const mockClient = {
+      query: vi.fn(),
+      release: vi.fn(),
+    };
+    const mockPool = {
+      connect: vi.fn().mockResolvedValue(mockClient),
+    } as unknown as pg.Pool;
+
+    await expect(withClient(mockPool, async () => {
+      throw new Error('boom');
+    })).rejects.toThrow('boom');
+
+    expect(mockClient.release).toHaveBeenCalled();
   });
 });

@@ -2,6 +2,11 @@ import type { Request, Response, NextFunction } from 'express';
 import { DecimalSerializationError } from '../serialization/decimal.js';
 import { SerializationLogger, error as logError } from '../utils/logger.js';
 import { errorResponse } from '../utils/response.js';
+import { QueryTimeoutError } from '../db/pool.js';
+import { REQUEST_ID_HEADER } from './correlationId.js';
+import { ApiError } from '../errors.js';
+
+export { ApiError } from '../errors.js';
 
 export interface ApiErrorResponse {
   success: false;
@@ -18,20 +23,12 @@ export enum ApiErrorCode {
   PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
   TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
   METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
+  REQUEST_TIMEOUT = 'REQUEST_TIMEOUT',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
-}
-
-export class ApiError extends Error {
-  constructor(
-    public readonly code: ApiErrorCode,
-    message: string,
-    public readonly statusCode: number = 500,
-    public readonly details?: unknown,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
+  UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
+  UNSUPPORTED_MEDIA_TYPE = 'UNSUPPORTED_MEDIA_TYPE',
+  GATEWAY_TIMEOUT = 'GATEWAY_TIMEOUT',
 }
 
 /**
@@ -43,7 +40,20 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  const requestId = req.id ?? (res.locals['requestId'] as string | undefined);
+  const requestId = req.correlationId ?? (res.locals['requestId'] as string | undefined);
+
+  // Ensure X-Request-ID is present even if correlationId middleware ran before
+  // the route that set it, or if something cleared it.
+  if (requestId && !res.headersSent) {
+    res.setHeader(REQUEST_ID_HEADER, requestId);
+  }
+
+  if (err instanceof QueryTimeoutError) {
+    res.status(504).json(
+      errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
+    );
+    return;
+  }
 
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
@@ -60,9 +70,17 @@ export function errorHandler(
 
   if (err instanceof ApiError) {
     logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
-    res.status(err.statusCode).json(
-      errorResponse(err.code, err.message, err.details, requestId)
-    );
+
+    if (err.expose) {
+      res.status(err.statusCode).json(
+        errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
+      );
+    } else {
+      res.status(err.statusCode).json({
+        success: false,
+        message: 'Internal server error',
+      });
+    }
     return;
   }
 
@@ -98,14 +116,10 @@ export function errorHandler(
     requestId,
   });
 
-  res.status(500).json(
-    errorResponse(
-      ApiErrorCode.INTERNAL_ERROR,
-      'An unexpected error occurred. Please try again later.',
-      undefined,
-      requestId
-    )
-  );
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+  });
 }
 
 /** Async handler wrapper */
@@ -118,33 +132,41 @@ export function asyncHandler(
 }
 
 export function notFound(resource: string, id?: string): ApiError {
-  return new ApiError(ApiErrorCode.NOT_FOUND, id !== undefined ? `${resource} '${id}' not found` : `${resource} not found`, 404);
+  return new ApiError(404, ApiErrorCode.NOT_FOUND, id !== undefined ? `${resource} '${id}' not found` : `${resource} not found`);
 }
 
 export function validationError(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.VALIDATION_ERROR, message, 400, details);
+  return new ApiError(400, ApiErrorCode.VALIDATION_ERROR, message, details);
 }
 
 export function conflictError(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.CONFLICT, message, 409, details);
+  return new ApiError(409, ApiErrorCode.CONFLICT, message, details);
 }
 
 export function serviceUnavailable(message: string): ApiError {
-  return new ApiError(ApiErrorCode.SERVICE_UNAVAILABLE, message, 503);
+  return new ApiError(503, ApiErrorCode.SERVICE_UNAVAILABLE, message);
 }
 
 export function unauthorized(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.UNAUTHORIZED, message, 401, details);
+  return new ApiError(401, ApiErrorCode.UNAUTHORIZED, message, details);
 }
 
 export function forbidden(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.FORBIDDEN, message, 403, details);
+  return new ApiError(403, ApiErrorCode.FORBIDDEN, message, details);
 }
 
 export function payloadTooLarge(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.PAYLOAD_TOO_LARGE, message, 413, details);
+  return new ApiError(413, ApiErrorCode.PAYLOAD_TOO_LARGE, message, details);
 }
 
 export function tooManyRequests(message: string, details?: unknown): ApiError {
-  return new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, message, 429, details);
+  return new ApiError(429, ApiErrorCode.TOO_MANY_REQUESTS, message, details);
+}
+
+export function requestTimeout(message: string): ApiError {
+  return new ApiError(408, ApiErrorCode.REQUEST_TIMEOUT, message);
+}
+
+export function gatewayTimeout(message: string): ApiError {
+  return new ApiError(504, ApiErrorCode.GATEWAY_TIMEOUT, message);
 }

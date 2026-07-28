@@ -246,6 +246,7 @@ Every error response uses this envelope:
 | `UNAUTHORIZED` | 401 | Missing or invalid authentication token |
 | `FORBIDDEN` | 403 | Authenticated but insufficient permissions |
 | `PAYLOAD_TOO_LARGE` | 413 | Request body exceeds 256 KiB |
+| `REQUEST_TIMEOUT` | 408 | Request socket timed out before the server completed a response |
 | `TOO_MANY_REQUESTS` | 429 | Rate limit exceeded |
 | `METHOD_NOT_ALLOWED` | 405 | HTTP method not supported on this path |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |

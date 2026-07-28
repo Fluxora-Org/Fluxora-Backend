@@ -1,10 +1,55 @@
 /**
- * Enhanced webhook delivery store with durable storage, outbox pattern, and dead-letter queue
- * In production, this would be backed by a database like PostgreSQL
+ * @module webhooks/store
+ *
+ * ## Two webhook storage subsystems — relationship and rationale
+ *
+ * This codebase contains **two distinct webhook-related storage paths**:
+ *
+ * ### 1. `WebhookDeliveryStore` (this file)
+ *
+ * Backs the *management/inspection HTTP routes* in `src/routes/webhooks.ts`:
+ * - `GET /internal/webhooks/deliveries` — delivery tracking records
+ * - `GET /internal/webhooks/outbox`     — outbound items queued via `/queue`
+ * - `GET /internal/webhooks/dlq`        — dead-letter queue for failed deliveries
+ * - `POST /internal/webhooks/queue`     — enqueue a new delivery for HTTP push
+ *
+ * The **default implementation** (`WebhookDeliveryStore`) is fully in-memory
+ * and is intentionally kept for **development / test environments** where
+ * zero infrastructure dependencies is more valuable than durability.
+ *
+ * In production, set `WEBHOOK_DELIVERY_STORE=postgres` to activate
+ * `PgWebhookDeliveryStore` (see `src/webhooks/pgStore.ts`), which persists
+ * outbox items and DLQ entries in Postgres so they survive restarts and are
+ * visible across all replicas.  A startup warning is emitted when the
+ * process boots with `NODE_ENV=production` and this flag is absent or set to
+ * `"memory"`.
+ *
+ * ### 2. `WebhookDispatcher` / `webhook_outbox` Postgres table
+ *
+ * Lives in `src/webhooks/service.ts` (`WebhookDispatcher` class) and is a
+ * completely separate subsystem.  It implements a transactional outbox pattern
+ * for **stream-event fanout**: when a stream event is written to Postgres, a
+ * corresponding row is inserted into `webhook_outbox` in the *same
+ * transaction*.  The dispatcher polls that table and pushes the events to
+ * registered consumer endpoints via HTTPS.
+ *
+ * This path is durable by design — it was the DB-backed outbox all along.
+ * `WebhookDeliveryStore` is *not* a replacement for it; it handles a
+ * different, higher-level concern (delivery status tracking and the operator
+ * DLQ/inspection surface).
+ *
+ * ### Summary
+ *
+ * | Path                   | Backed by               | Durable? | Purpose                          |
+ * |------------------------|-------------------------|----------|----------------------------------|
+ * | `WebhookDeliveryStore` | In-memory Maps (default)| ❌ / ✅*  | Mgmt routes: track, DLQ, queue   |
+ * | `PgWebhookDeliveryStore`| Postgres tables        | ✅        | Same, but durable across restarts|
+ * | `WebhookDispatcher`    | `webhook_outbox` table  | ✅        | Stream-event fanout via Postgres  |
+ *
+ * *Set `WEBHOOK_DELIVERY_STORE=postgres` to switch to the durable path.
  */
 
-import type { WebhookDelivery, WebhookDeliveryStatus } from './types.js';
-import type { EnhancedRetryPolicy } from './retry.js';
+import type { WebhookDelivery, WebhookDeliveryStatus, DLQReasonCode } from './types.js';
 import { logger } from '../lib/logger.js';
 
 export interface DeadLetterQueueItem {
@@ -16,8 +61,17 @@ export interface DeadLetterQueueItem {
   payload: string;
   originalDelivery: WebhookDelivery;
   failureReason: string;
+  reasonCode: DLQReasonCode;
   createdAt: number;
   processedAt?: number;
+}
+
+export type OutboxItemStatus = 'pending' | 'in_flight' | 'delivered' | 'failed';
+
+export interface ClaimOptions {
+  workerId: string;
+  lockTimeoutMs?: number;
+  now?: number;
 }
 
 export interface OutboxItem {
@@ -33,17 +87,68 @@ export interface OutboxItem {
   scheduledFor: number;
   attempts: number;
   maxAttempts: number;
+  /** Defaults to `'pending'` when not provided to `addToOutbox`. */
+  status?: OutboxItemStatus;
+  lockedAt?: number;
+  lockedBy?: string;
 }
 
-export interface CircuitBreakerState {
-  endpointUrl: string;
-  state: 'closed' | 'open' | 'half-open';
-  failureCount: number;
-  lastFailureTime: number;
-  nextAttemptTime: number;
+export const DEFAULT_CLAIM_LOCK_TIMEOUT_MS = 30_000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IWebhookDeliveryStore — shared interface implemented by both the in-memory
+// store (development) and the Postgres-backed store (production).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Contract for webhook delivery storage.  Both `WebhookDeliveryStore`
+ * (in-memory) and `PgWebhookDeliveryStore` (Postgres) implement this
+ * interface, allowing callers (service.ts, routes/webhooks.ts) to be
+ * storage-agnostic.
+ */
+export interface IWebhookDeliveryStore {
+  store(delivery: WebhookDelivery): void;
+  get(id: string): WebhookDelivery | undefined;
+  getByDeliveryId(deliveryId: string): WebhookDelivery | undefined;
+  updateStatus(id: string, status: WebhookDeliveryStatus): void;
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string;
+  getReadyOutboxItems(now?: number): OutboxItem[];
+  removeFromOutbox(id: string): boolean;
+  updateOutboxItemAttempt(id: string, attempts: number): void;
+  claimReadyOutboxItems(opts?: ClaimOptions): OutboxItem[];
+  reclaimStuckItems(opts?: ClaimOptions): OutboxItem[];
+  releaseOutboxItem(id: string, workerId: string): boolean;
+  markOutboxItemDelivered(id: string, workerId: string): boolean;
+  addToDeadLetterQueue(delivery: WebhookDelivery, failureReason: string, reasonCode?: DLQReasonCode): string;
+  getDeadLetterQueueItems(limit?: number): DeadLetterQueueItem[];
+  processDeadLetterQueueItem(id: string, processedAt?: number): boolean;
+  getPendingRetries(now?: number): WebhookDelivery[];
+  getByEventId(eventId: string): WebhookDelivery[];
+  registerDeliveryId(deliveryId: string): void;
+  isDuplicateDelivery(deliveryId: string): boolean;
+  getMetrics(): { totalDeliveries: number; successfulDeliveries: number; failedDeliveries: number; dlqItems: number; outboxItems: number };
+  cleanup(olderThanMs?: number): { cleaned: number; errors: string[] };
+  clear(): void;
+  getAll(): WebhookDelivery[];
+  getAllOutboxItems(): OutboxItem[];
 }
 
-export class WebhookDeliveryStore {
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory implementation (development / test default)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * In-memory implementation of `IWebhookDeliveryStore`.
+ *
+ * Suitable for **development and testing** where infrastructure dependencies
+ * should be minimal.  All state is lost on process restart.
+ *
+ * **Do not use in production** — set `WEBHOOK_DELIVERY_STORE=postgres` to
+ * activate the durable Postgres-backed implementation instead.  A startup
+ * warning is logged automatically when this implementation is active in a
+ * production environment.
+ */
+export class WebhookDeliveryStore implements IWebhookDeliveryStore {
   // Main delivery storage
   private deliveries: Map<string, WebhookDelivery> = new Map();
   private deliveryIdIndex: Map<string, string> = new Map();
@@ -54,9 +159,6 @@ export class WebhookDeliveryStore {
 
   // Dead-letter queue for failed deliveries
   private deadLetterQueue: Map<string, DeadLetterQueueItem> = new Map();
-
-  // Circuit breaker state per endpoint
-  private circuitBreakers: Map<string, CircuitBreakerState> = new Map();
 
   // Metrics
   private metrics = {
@@ -74,7 +176,7 @@ export class WebhookDeliveryStore {
     this.deliveries.set(delivery.id, delivery);
     this.deliveryIdIndex.set(delivery.deliveryId, delivery.id);
     this.metrics.totalDeliveries++;
-    
+
     logger.debug('Webhook delivery stored', undefined, {
       deliveryId: delivery.deliveryId,
       status: delivery.status,
@@ -124,47 +226,77 @@ export class WebhookDeliveryStore {
   /**
    * Add item to outbox for reliable delivery
    */
-  addToOutbox(item: Omit<OutboxItem, 'id'>): string {
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string {
     const id = `outbox_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const outboxItem: OutboxItem = { ...item, id };
-    
+    const outboxItem: OutboxItem = { ...item, id, status: 'pending' };
+
     this.outbox.set(id, outboxItem);
-    
+
     // Add to priority queue
     const priority = outboxItem.priority;
     if (!this.outboxPriorityQueue.has(priority)) {
       this.outboxPriorityQueue.set(priority, []);
     }
     this.outboxPriorityQueue.get(priority)!.push(outboxItem);
-    
+
     this.metrics.outboxItems++;
-    
+
     logger.info('Item added to webhook outbox', undefined, {
       outboxId: id,
       deliveryId: item.deliveryId,
       priority,
       scheduledFor: new Date(item.scheduledFor).toISOString(),
     });
-    
+
     return id;
   }
 
   /**
-   * Get items from outbox that are ready for processing
+   * Hydrate a full outbox item (with pre-existing id and status) into the
+   * in-memory mirror.  Used by `PgWebhookDeliveryStore.hydrate()` to
+   * restore persisted rows on startup.
+   *
+   * This method intentionally accepts the complete `OutboxItem` including
+   * `id` and `status` — it is **not** a general-purpose enqueue and
+   * should only be called during hydration.
+   */
+  hydrateOutboxItem(item: OutboxItem): string {
+    this.outbox.set(item.id, item);
+
+    const priority = item.priority;
+    if (!this.outboxPriorityQueue.has(priority)) {
+      this.outboxPriorityQueue.set(priority, []);
+    }
+    this.outboxPriorityQueue.get(priority)!.push(item);
+
+    this.metrics.outboxItems++;
+
+    return item.id;
+  }
+
+  /**
+   * Get items from outbox that are ready for processing (pending status only).
+   * Items claimed by a worker (in_flight) are excluded.
    */
   getReadyOutboxItems(now: number = Date.now()): OutboxItem[] {
     const readyItems: OutboxItem[] = [];
-    
+
     // Process by priority: high -> normal -> low
     const priorities = ['high', 'normal', 'low'];
-    
+
     for (const priority of priorities) {
       const items = this.outboxPriorityQueue.get(priority) || [];
-      const ready = items.filter(item => item.scheduledFor <= now && item.attempts < item.maxAttempts);
+      const ready = items
+        .filter((item) =>
+          item.status === 'pending' &&
+          item.scheduledFor <= now &&
+          item.attempts < item.maxAttempts
+        )
+        .sort((a, b) => a.scheduledFor - b.scheduledFor);
       readyItems.push(...ready);
     }
-    
-    return readyItems.sort((a, b) => a.scheduledFor - b.scheduledFor);
+
+    return readyItems;
   }
 
   /**
@@ -173,18 +305,18 @@ export class WebhookDeliveryStore {
   removeFromOutbox(id: string): boolean {
     const item = this.outbox.get(id);
     if (!item) return false;
-    
+
     this.outbox.delete(id);
-    
+
     // Remove from priority queue
     const priorityItems = this.outboxPriorityQueue.get(item.priority);
     if (priorityItems) {
-      const index = priorityItems.findIndex(i => i.id === id);
+      const index = priorityItems.findIndex((i) => i.id === id);
       if (index !== -1) {
         priorityItems.splice(index, 1);
       }
     }
-    
+
     this.metrics.outboxItems--;
     return true;
   }
@@ -200,11 +332,146 @@ export class WebhookDeliveryStore {
   }
 
   /**
+   * Atomically claim ready outbox items for a specific worker.
+   *
+   * Finds items with `status = 'pending'` that are due (scheduledFor ≤ now
+   * and attempts < maxAttempts), then marks them `in_flight` with the
+   * given `workerId` and a `lockedAt` timestamp.  Multiple workers calling
+   * this method on the same store will never both claim the same row
+   * because the `pending` → `in_flight` transition is synchronous — once
+   * the first caller mutates the status, subsequent callers skip the row.
+   *
+   * @returns  The list of items successfully claimed by this worker.
+   */
+  claimReadyOutboxItems(opts: ClaimOptions = { workerId: 'default-worker' }): OutboxItem[] {
+    const workerId = opts.workerId ?? 'default-worker';
+    const lockTimeoutMs = opts.lockTimeoutMs ?? DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
+    const now = opts.now ?? Date.now();
+
+    const reclaimWindow = now - lockTimeoutMs;
+    const claimed: OutboxItem[] = [];
+
+    const priorities: ('high' | 'normal' | 'low')[] = ['high', 'normal', 'low'];
+
+    for (const priority of priorities) {
+      const items = this.outboxPriorityQueue.get(priority) || [];
+      for (const item of items) {
+        if (item.attempts >= item.maxAttempts) continue;
+
+        // Claim eligible items: pending or stuck in_flight with expired lock
+        const isPending = item.status === 'pending' && item.scheduledFor <= now;
+        const isStuck = item.status === 'in_flight' &&
+          item.lockedAt != null &&
+          item.lockedAt < reclaimWindow;
+
+        if (!isPending && !isStuck) continue;
+
+        item.status = 'in_flight';
+        item.lockedAt = now;
+        item.lockedBy = workerId;
+        claimed.push(item);
+      }
+    }
+
+    return claimed;
+  }
+
+  /**
+   * Reclaim stuck in-flight items whose lock has expired.
+   *
+   * Finds items with `status = 'in_flight'` where
+   * `lockedAt + lockTimeoutMs < now` and reassigns the lock to the
+   * requesting worker.  This is a subset of what {@link claimReadyOutboxItems}
+   * does (which also handles `pending` items), but is exposed as a
+   * separate method for observability and targeted use cases.
+   */
+  reclaimStuckItems(opts: ClaimOptions = { workerId: 'default-worker' }): OutboxItem[] {
+    const workerId = opts.workerId ?? 'default-worker';
+    const lockTimeoutMs = opts.lockTimeoutMs ?? DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
+    const now = opts.now ?? Date.now();
+
+    const reclaimWindow = now - lockTimeoutMs;
+    const reclaimed: OutboxItem[] = [];
+
+    for (const item of this.outbox.values()) {
+      if (
+        item.status === 'in_flight' &&
+        item.lockedAt != null &&
+        item.lockedAt < reclaimWindow
+      ) {
+        item.status = 'in_flight';
+        item.lockedAt = now;
+        item.lockedBy = workerId;
+        reclaimed.push(item);
+      }
+    }
+
+    return reclaimed;
+  }
+
+  /**
+   * Release a claimed outbox item so it can be claimed by another worker.
+   *
+   * Only the worker that currently holds the lock can release it (verified
+   * via `lockedBy`).  Resets status to `pending` and clears lock fields.
+   *
+   * @returns `true` if the item was released, `false` if not found or
+   *          the caller does not hold the lock.
+   */
+  releaseOutboxItem(id: string, workerId: string): boolean {
+    const item = this.outbox.get(id);
+    if (!item) return false;
+    if (item.lockedBy !== workerId) return false;
+
+    item.status = 'pending';
+    item.lockedAt = undefined;
+    item.lockedBy = undefined;
+    return true;
+  }
+
+  /**
+   * Mark a claimed outbox item as delivered and remove it from the queue.
+   *
+   * Only the locking worker may mark the item as delivered.
+   *
+   * @returns `true` if the item was delivered, `false` if not found or
+   *          the caller does not hold the lock.
+   */
+  markOutboxItemDelivered(id: string, workerId: string): boolean {
+    const item = this.outbox.get(id);
+    if (!item) return false;
+    if (item.lockedBy !== workerId) return false;
+
+    item.status = 'delivered';
+    item.lockedAt = undefined;
+    item.lockedBy = undefined;
+
+    // Remove from outbox Map
+    this.outbox.delete(id);
+
+    // Remove from priority queue so it won't appear in future queries
+    const priorityItems = this.outboxPriorityQueue.get(item.priority);
+    if (priorityItems) {
+      const index = priorityItems.findIndex((i) => i.id === id);
+      if (index !== -1) {
+        priorityItems.splice(index, 1);
+      }
+    }
+
+    this.metrics.outboxItems--;
+    return true;
+  }
+
+  /**
    * Add failed delivery to dead-letter queue
    */
-  addToDeadLetterQueue(delivery: WebhookDelivery, failureReason: string): string {
+  addToDeadLetterQueue(
+    delivery: WebhookDelivery,
+    failureReason: string,
+    reasonCode: DLQReasonCode = 'other'
+  ): string {
     const id = `dlq_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+
     const dlqItem: DeadLetterQueueItem = {
       id,
       deliveryId: delivery.deliveryId,
@@ -214,19 +481,21 @@ export class WebhookDeliveryStore {
       payload: delivery.payload,
       originalDelivery: delivery,
       failureReason,
+      reasonCode,
       createdAt: Date.now(),
     };
-    
+
     this.deadLetterQueue.set(id, dlqItem);
     this.metrics.dlqItems++;
-    
+
     logger.error('Webhook delivery moved to dead-letter queue', undefined, {
       dlqId: id,
       deliveryId: delivery.deliveryId,
       failureReason,
+      reasonCode,
       attemptCount: delivery.attempts.length,
     });
-    
+
     return id;
   }
 
@@ -244,95 +513,23 @@ export class WebhookDeliveryStore {
   processDeadLetterQueueItem(id: string, processedAt: number = Date.now()): boolean {
     const item = this.deadLetterQueue.get(id);
     if (!item) return false;
-    
+
     item.processedAt = processedAt;
     this.deadLetterQueue.delete(id);
     this.metrics.dlqItems--;
-    
+
     logger.info('Dead-letter queue item processed', undefined, {
       dlqId: id,
       deliveryId: item.deliveryId,
       processedAt: new Date(processedAt).toISOString(),
     });
-    
+
     return true;
   }
 
   /**
-   * Get circuit breaker state for endpoint
-   */
-  getCircuitBreakerState(endpointUrl: string): CircuitBreakerState | undefined {
-    return this.circuitBreakers.get(endpointUrl);
-  }
-
-  /**
-   * Update circuit breaker state
-   */
-  updateCircuitBreakerState(
-    endpointUrl: string,
-    success: boolean,
-    policy: EnhancedRetryPolicy,
-  ): CircuitBreakerState {
-    const now = Date.now();
-    let state = this.circuitBreakers.get(endpointUrl);
-    
-    if (!state) {
-      state = {
-        endpointUrl,
-        state: 'closed',
-        failureCount: 0,
-        lastFailureTime: 0,
-        nextAttemptTime: 0,
-      };
-      this.circuitBreakers.set(endpointUrl, state);
-    }
-    
-    if (success) {
-      // Reset on success
-      state.failureCount = 0;
-      state.state = 'closed';
-    } else {
-      state.failureCount++;
-      state.lastFailureTime = now;
-      
-      // Check if we should open the circuit breaker
-      if (policy.circuitBreakerThreshold && 
-          state.failureCount >= policy.circuitBreakerThreshold) {
-        state.state = 'open';
-        state.nextAttemptTime = now + (policy.circuitBreakerResetMs || 300000); // Default 5 minutes
-      }
-    }
-    
-    return state;
-  }
-
-  /**
-   * Check if endpoint is available (circuit breaker logic)
-   */
-  isEndpointAvailable(endpointUrl: string): boolean {
-    const state = this.circuitBreakers.get(endpointUrl);
-    if (!state) return true;
-    
-    const now = Date.now();
-    
-    switch (state.state) {
-      case 'closed':
-        return true;
-      case 'open':
-        if (now >= state.nextAttemptTime) {
-          state.state = 'half-open';
-          return true;
-        }
-        return false;
-      case 'half-open':
-        return true;
-      default:
-        return true;
-    }
-  }
-
-  /**
-   * Get all pending deliveries that are ready for retry
+   * Get all pending deliveries that are ready for retry.
+   * Circuit-breaker gating is applied by {@link WebhookService.processPendingRetries}.
    */
   getPendingRetries(now: number = Date.now()): WebhookDelivery[] {
     const retries: WebhookDelivery[] = [];
@@ -340,10 +537,7 @@ export class WebhookDeliveryStore {
       if (delivery.status === 'pending') {
         const lastAttempt = delivery.attempts[delivery.attempts.length - 1];
         if (lastAttempt?.nextRetryAt && lastAttempt.nextRetryAt <= now) {
-          // Check circuit breaker
-          if (this.isEndpointAvailable(delivery.endpointUrl)) {
-            retries.push(delivery);
-          }
+          retries.push(delivery);
         }
       }
     }
@@ -435,8 +629,7 @@ export class WebhookDeliveryStore {
     this.outbox.clear();
     this.outboxPriorityQueue.clear();
     this.deadLetterQueue.clear();
-    this.circuitBreakers.clear();
-    
+
     this.metrics = {
       totalDeliveries: 0,
       successfulDeliveries: 0,
@@ -459,13 +652,4 @@ export class WebhookDeliveryStore {
   getAllOutboxItems(): OutboxItem[] {
     return Array.from(this.outbox.values());
   }
-
-  /**
-   * Get all circuit breaker states (for monitoring)
-   */
-  getAllCircuitBreakerStates(): CircuitBreakerState[] {
-    return Array.from(this.circuitBreakers.values());
-  }
 }
-
-export const webhookDeliveryStore = new WebhookDeliveryStore();

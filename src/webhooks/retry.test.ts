@@ -95,22 +95,55 @@ test('calculateNextRetryTime: applies jitter within bounds', () => {
   };
 
   // Run multiple times to verify jitter is applied
-  const retries = Array.from({ length: 10 }, () =>
-    calculateNextRetryTime(0, policy, now),
-  );
+  const retries = Array.from({ length: 10 }, () => calculateNextRetryTime(0, policy, now));
 
-  // All should be within ±10% of 1000ms
-  const minExpected = now + 900;
-  const maxExpected = now + 1100;
+  // Full jitter schedules within the full [0, raw backoff] window.
+  const minExpected = now;
+  const maxExpected = now + 1000;
 
   for (const retry of retries) {
-    assert.ok(retry >= minExpected && retry <= maxExpected,
-      `Retry ${retry} outside bounds [${minExpected}, ${maxExpected}]`);
+    assert.ok(
+      retry >= minExpected && retry <= maxExpected,
+      `Retry ${retry} outside bounds [${minExpected}, ${maxExpected}]`
+    );
   }
 
   // Should have some variation (not all the same)
   const uniqueRetries = new Set(retries);
   assert.ok(uniqueRetries.size > 1, 'Jitter should produce variation');
+});
+
+test('calculateNextRetryTime: supports deterministic full jitter', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    initialBackoffMs: 1000,
+    backoffMultiplier: 2,
+    maxBackoffMs: 60000,
+    jitterAlgorithm: 'full' as const,
+    random: () => 0.25,
+  };
+
+  const retry = calculateNextRetryTime(1, policy, now);
+
+  assert.equal(retry, now + 500);
+});
+
+test('calculateNextRetryTime: decorrelated jitter uses previous delay state', () => {
+  const now = 1000000;
+  const policy = {
+    ...DEFAULT_RETRY_POLICY,
+    initialBackoffMs: 1000,
+    backoffMultiplier: 2,
+    maxBackoffMs: 5000,
+    jitterAlgorithm: 'decorrelated' as const,
+    previousDelayMs: 2000,
+    random: () => 0.5,
+  };
+
+  const retry = calculateNextRetryTime(2, policy, now);
+
+  assert.equal(retry, now + 3000);
 });
 
 test('isRetryableStatusCode: retries on 5xx errors', () => {
