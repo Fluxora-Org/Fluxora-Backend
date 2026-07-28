@@ -145,7 +145,7 @@ export const wsBroadcastBatchFlushLatencySeconds = metric(
  * Helper to record batch flush latency in seconds.
  */
 export function recordWsBroadcastBatchFlushLatency(durationSeconds: number): void {
-  if (durationSeconds >= 0) {
+  if (typeof durationSeconds === 'number' && isFinite(durationSeconds) && durationSeconds >= 0) {
     wsBroadcastBatchFlushLatencySeconds.observe(durationSeconds);
   }
 }
@@ -254,4 +254,8 @@ export function resetWsBackpressureMetrics(): void {
   wsMaxBufferedBytes.reset();
   wsSlowClients.reset();
   wsStreamSubscriberCount.reset();
+  wsBatchFlushTotal.reset();
+  wsBatchEventsCoalescedTotal.reset();
+  wsBatchSizeExceededTotal.reset();
+  wsBroadcastBatchFlushLatencySeconds.reset();
 }
