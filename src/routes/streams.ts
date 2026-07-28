@@ -191,7 +191,7 @@ const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 // ── Dependency state (injectable for tests) ───────────────────────────────────
 
 const streamListingDependency = { state: 'healthy' as DependencyState };
-const idempotencyDependency   = { state: 'healthy' as DependencyState };
+const idempotencyDependency = { state: 'healthy' as DependencyState };
 
 // Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
 // by wireIdempotencyStore() in app.ts with a RedisIdempotencyStore when Redis
@@ -248,16 +248,16 @@ export function setIdempotencyStore(
 
 function toApiStream(record: StreamRecord): Stream {
   return {
-    id:            record.id,
-    sender:        record.sender_address,
-    recipient:     record.recipient_address,
+    id: record.id,
+    sender: record.sender_address,
+    recipient: record.recipient_address,
     depositAmount: record.amount,
     streamedAmount: record.streamed_amount,
     remainingAmount: record.remaining_amount,
     ratePerSecond: record.rate_per_second,
-    startTime:     record.start_time,
-    endTime:       record.end_time,
-    status:        record.status,
+    startTime: record.start_time,
+    endTime: record.end_time,
+    status: record.status,
   };
 }
 
@@ -412,12 +412,12 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
   }
 
   return {
-    sender:        sender.trim(),
-    recipient:     recipient.trim(),
+    sender: sender.trim(),
+    recipient: recipient.trim(),
     depositAmount: validatedDeposit,
     ratePerSecond: validatedRate,
-    startTime:     startTime ?? Math.floor(Date.now() / 1000),
-    endTime:       endTime   ?? 0,
+    startTime: startTime ?? Math.floor(Date.now() / 1000),
+    endTime: endTime ?? 0,
   };
 }
 
@@ -438,10 +438,10 @@ function wrapDbError(err: unknown): never {
 type ApiStreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
 
 const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
-  active:     ['paused', 'completed', 'cancelled'],
-  paused:     ['active', 'cancelled'],
-  completed:  [],
-  cancelled:  [],
+  active: ['paused', 'completed', 'cancelled'],
+  paused: ['active', 'cancelled'],
+  completed: [],
+  cancelled: [],
 };
 
 function assertValidApiTransition(
@@ -466,23 +466,23 @@ function assertValidApiTransition(
  * @param next Express next middleware function.
  */
 export function enforceStreamScope(req: Request, res: Response, next: NextFunction): void {
-    // Check if the user is authenticated and if the role requires scoping.
-    if (!req.user || req.user.role === 'operator') {
-        // Operator role bypasses scoping checks.
-        return next();
-    }
+  // Check if the user is authenticated and if the role requires scoping.
+  if (!req.user || req.user.role === 'operator') {
+    // Operator role bypasses scoping checks.
+    return next();
+  }
 
-    const callerAddress = req.user.address as string | undefined;
-    if (!callerAddress) {
-        // Should not happen if authenticate middleware is working, but safe fail.
-        return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
-    }
+  const callerAddress = req.user.address as string | undefined;
+  if (!callerAddress) {
+    // Should not happen if authenticate middleware is working, but safe fail.
+    return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+  }
 
-    // Attach caller address to the request object for repository consumption.
-    req.callerAddress = callerAddress;
+  // Attach caller address to the request object for repository consumption.
+  req.callerAddress = callerAddress;
 
-    // Move to the next handler which will use req.callerAddress
-    next();
+  // Move to the next handler which will use req.callerAddress
+  next();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -510,9 +510,9 @@ streamsRouter.get(
       throw validationError(first?.message ?? 'Invalid query parameters');
     }
     const { limit, cursor: rawCursor, status: statusFilter, sender: senderFilter,
-            recipient: recipientFilter, include_total } = parsed.data;
+      recipient: recipientFilter, include_total } = parsed.data;
 
-    const cursor       = rawCursor !== undefined ? parseCursor(rawCursor, requestId) : undefined;
+    const cursor = rawCursor !== undefined ? parseCursor(rawCursor, requestId) : undefined;
     const includeTotal = include_total === 'true';
 
     if (streamListingDependency.state !== 'healthy') {
@@ -535,7 +535,7 @@ streamsRouter.get(
       if (statusFilter !== undefined) filter.status = statusFilter as NonNullable<StreamFilter['status']>;
       if (senderFilter !== undefined) filter.sender_address = senderFilter;
       if (recipientFilter !== undefined) filter.recipient_address = recipientFilter;
-      
+
       if (req.callerAddress) {
         if (!senderFilter && !recipientFilter) {
           throw forbidden('Scoped users must filter by sender or recipient matching their address');
@@ -568,8 +568,8 @@ streamsRouter.get(
     }
 
     const pageStreams = result!.streams;
-    const hasMore     = result!.hasMore;
-    const nextCursor  = hasMore && pageStreams.length > 0
+    const hasMore = result!.hasMore;
+    const nextCursor = hasMore && pageStreams.length > 0
       ? encodeCursor(pageStreams[pageStreams.length - 1]!.id)
       : null;
 
@@ -641,13 +641,13 @@ streamsRouter.get(
   enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
     const requestId = req.correlationId as string | undefined;
-    
+
     let resumeFrom = req.query.resume_from;
     if (Array.isArray(resumeFrom) || (resumeFrom !== undefined && typeof resumeFrom !== 'string')) {
       warn('Export pagination validation failed', { error: 'resume_from must be a string', requestId });
       throw validationError('resume_from must be a single valid opaque pagination token');
     }
-    
+
     let cursor = resumeFrom ? parseCursor(resumeFrom, requestId) : undefined;
     const limit = 100;
 
@@ -661,7 +661,7 @@ streamsRouter.get(
 
       while (true) {
         const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
-        
+
         for (const record of dbResult.streams) {
           res.write(JSON.stringify(toApiStream(record)) + '\n');
         }
@@ -898,7 +898,7 @@ streamsRouter.post(
     }
 
     const requestFingerprint = fingerprintInput(normalizedInput);
-    const existingResponse   = await idempotencyStore.get(idempotencyKey);
+    const existingResponse = await idempotencyStore.get(idempotencyKey);
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
@@ -941,17 +941,17 @@ streamsRouter.post(
     try {
       upsertResult = await streamRepository.upsertStream({
         id,
-        sender_address:    normalizedInput.sender,
+        sender_address: normalizedInput.sender,
         recipient_address: normalizedInput.recipient,
-        amount:            normalizedInput.depositAmount,
-        streamed_amount:   '0',
-        remaining_amount:  normalizedInput.depositAmount,
-        rate_per_second:   normalizedInput.ratePerSecond,
-        start_time:        normalizedInput.startTime,
-        end_time:          normalizedInput.endTime,
-        contract_id:       'api-created',
-        transaction_hash:  idHash,
-        event_index:       0,
+        amount: normalizedInput.depositAmount,
+        streamed_amount: '0',
+        remaining_amount: normalizedInput.depositAmount,
+        rate_per_second: normalizedInput.ratePerSecond,
+        start_time: normalizedInput.startTime,
+        end_time: normalizedInput.endTime,
+        contract_id: 'api-created',
+        transaction_hash: idHash,
+        event_index: 0,
       }, requestId);
     } catch (err) {
       wrapDbError(err);
@@ -970,8 +970,8 @@ streamsRouter.post(
     recordAuditEvent('STREAM_CREATED', 'stream', stream.id, correlationId ?? '', {
       depositAmount: normalizedInput.depositAmount,
       ratePerSecond: normalizedInput.ratePerSecond,
-      sender:        normalizedInput.sender,
-      recipient:     normalizedInput.recipient,
+      sender: normalizedInput.sender,
+      recipient: normalizedInput.recipient,
     });
 
     if (isValidStreamStatus(stream.status)) {
@@ -1492,7 +1492,7 @@ streamsRouter.get(
   requireScope('streams:read'),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
-    const requestId = req.id;
+    const requestId = req.correlationId;
 
     if (!id) {
       throw notFound('Stream', '');
@@ -1636,10 +1636,31 @@ streamsRouter.get(
       }
     }
 
+    // Long-poll `timeout` query param semantics (locked down for #1065):
+    //
+    //   - A raw value STRICTLY GREATER THAN this threshold is interpreted as
+    //     milliseconds (e.g. ?timeout=5000 -> 5s).
+    //   - A raw value at or below this threshold is interpreted as seconds
+    //     (e.g. ?timeout=5 -> 5s; ?timeout=1000 -> 1000s, then clamped below).
+    //
+    // This dual interpretation is a pre-existing, intentionally preserved
+    // contract for backward compatibility with existing clients. It is now
+    // a named constant (rather than an inline magic number) so the rule is
+    // documented once and cannot silently drift between call sites.
+    const TIMEOUT_MS_INTERPRETATION_THRESHOLD = 1000;
+    // Guard against pathological input (e.g. a 300-digit numeric string)
+    // before it ever reaches Number.parseInt / arithmetic, so the deterministic
+    // interpretation above can never be bypassed by an out-of-range value.
+    const MAX_TIMEOUT_INPUT_DIGITS = 15;
+
     const rawTimeout = req.query['timeout'];
     let timeoutMs = 30_000; // Default 30s
     if (rawTimeout !== undefined) {
-      if (typeof rawTimeout !== 'string' || !/^\d+$/.test(rawTimeout)) {
+      if (
+        typeof rawTimeout !== 'string' ||
+        !/^\d+$/.test(rawTimeout) ||
+        rawTimeout.length > MAX_TIMEOUT_INPUT_DIGITS
+      ) {
         cleanup('validation_error');
         throw validationError('timeout must be a positive integer');
       }
@@ -1648,12 +1669,14 @@ streamsRouter.get(
         cleanup('validation_error');
         throw validationError('timeout must be at least 1 second');
       }
-      timeoutMs = parsedTimeout > 1000 ? parsedTimeout : parsedTimeout * 1000;
+      timeoutMs =
+        parsedTimeout > TIMEOUT_MS_INTERPRETATION_THRESHOLD
+          ? parsedTimeout
+          : parsedTimeout * 1000;
     }
     // Bound timeout by max hold duration & longPollLimits
     const MAX_LONG_POLL_HOLD_MS = 30_000;
     timeoutMs = Math.min(timeoutMs, MAX_LONG_POLL_HOLD_MS, longPollLimits.maxConnectionDurationMs);
-
     // 5. Check historical replay if `since` was supplied
     if (sinceEventId) {
       const hub = getStreamHub();
@@ -1763,4 +1786,4 @@ streamsRouter.get(
   }),
 );
 
-export function _resetStreams(): void {}
+export function _resetStreams(): void { }
