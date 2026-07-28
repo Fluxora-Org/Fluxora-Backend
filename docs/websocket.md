@@ -499,6 +499,11 @@ that occur **during** the fan-out iteration:
 - Pending batch-accumulator timers for the disconnected client are cancelled
   by `onDisconnect`, preventing stale frame delivery.
 
+_(Regression coverage: `tests/ws/ws.concurrency.test.ts` exercises both abrupt
+`ws.terminate()` and clean `ws.close()` occurring mid-broadcast on a 5-client
+fan-out, asserting `BackpressureMetrics` integrity and absence of escaped
+exceptions.)_
+
 ## Broadcast Authorization & Audit
 
 All WebSocket broadcasts originate from the blockchain indexer service, not from HTTP API endpoints. This section documents the broadcast trigger surface and authorization model.
