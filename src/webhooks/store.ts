@@ -23,7 +23,7 @@ export interface DeadLetterQueueItem {
 export type OutboxItemStatus = 'pending' | 'in_flight' | 'delivered' | 'failed';
 
 export interface ClaimOptions {
-  workerId: string;
+  workerId?: string;
   lockTimeoutMs?: number;
   now?: number;
 }
@@ -126,7 +126,7 @@ export class WebhookDeliveryStore {
   /**
    * Add item to outbox for reliable delivery
    */
-  addToOutbox(item: Omit<OutboxItem, 'id'>): string {
+  addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string {
     const id = `outbox_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const outboxItem: OutboxItem = { status: 'pending', ...item, id };
 
