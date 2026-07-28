@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../../src/app.js';
 import { _resetForTest } from '../../src/state/adminState.js';
+import { _resetApiKeyStoreForTest } from '../../src/lib/apiKey.js';
 
 const ADMIN_KEY = 'test-admin-key-for-routes';
 
@@ -16,6 +17,7 @@ describe('admin routes', () => {
     originalKey = process.env.ADMIN_API_KEY;
     process.env.ADMIN_API_KEY = ADMIN_KEY;
     _resetForTest();
+    _resetApiKeyStoreForTest();
   });
 
   afterEach(() => {
@@ -168,6 +170,85 @@ describe('admin routes', () => {
       expect(res.status).toBe(200);
       expect(res.body.status).toBe('completed');
       expect(res.body.processedItems).toBe(5);
+    });
+  });
+
+  // ── API Key Management ─────────────────────────────────────
+
+  describe('API Key Management', () => {
+    it('creates a new API key and records an audit event', async () => {
+      const res = await authed(
+        request(app).post('/api/admin/api-keys').send({ name: 'test-service' }),
+      );
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty('id');
+      expect(res.body).toHaveProperty('key');
+      expect(res.body.name).toBe('test-service');
+    });
+
+    it('lists created API keys', async () => {
+      await authed(request(app).post('/api/admin/api-keys').send({ name: 'test-service-1' }));
+      const res = await authed(request(app).get('/api/admin/api-keys'));
+      expect(res.status).toBe(200);
+      expect(res.body.apiKeys.length).toBeGreaterThan(0);
+      // Raw key should not be returned in list
+      expect(res.body.apiKeys[0]).not.toHaveProperty('key');
+    });
+
+    it('rotates an API key', async () => {
+      const createRes = await authed(
+        request(app).post('/api/admin/api-keys').send({ name: 'rotate-me' }),
+      );
+      const id = createRes.body.id;
+      const originalKey = createRes.body.key;
+
+      const rotateRes = await authed(
+        request(app).post(`/api/admin/api-keys/${id}/rotate`),
+      );
+      expect(rotateRes.status).toBe(200);
+      expect(rotateRes.body.id).toBe(id);
+      expect(rotateRes.body.key).not.toBe(originalKey);
+    });
+
+    it('revokes an API key', async () => {
+      const createRes = await authed(
+        request(app).post('/api/admin/api-keys').send({ name: 'revoke-me' }),
+      );
+      const id = createRes.body.id;
+
+      const deleteRes = await authed(
+        request(app).delete(`/api/admin/api-keys/${id}`),
+      );
+      expect(deleteRes.status).toBe(204);
+
+      // Verify rotation fails on revoked key
+      const rotateRes = await authed(
+        request(app).post(`/api/admin/api-keys/${id}/rotate`),
+      );
+      expect(rotateRes.status).toBe(400); // Bad Request (revoked)
+      expect(rotateRes.body.error).toMatch(/revoked/i);
+    });
+
+    it('returns 400 if name is missing when creating API key', async () => {
+      const res = await authed(request(app).post('/api/admin/api-keys').send({}));
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/name.*required/i);
+    });
+
+    it('returns 404 when rotating a non-existent API key', async () => {
+      const res = await authed(
+        request(app).post('/api/admin/api-keys/does-not-exist/rotate'),
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.error).toMatch(/not found/i);
+    });
+
+    it('returns 404 when revoking a non-existent API key', async () => {
+      const res = await authed(
+        request(app).delete('/api/admin/api-keys/does-not-exist'),
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.error).toMatch(/not found/i);
     });
   });
 });
