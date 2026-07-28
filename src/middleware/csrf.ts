@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import { timingSafeEqual, randomBytes } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { errorResponse } from '../utils/response.js';
 import { ApiErrorCode } from './errorHandler.js';
 import { getApiKeyFromRequest } from '../lib/apiKey.js';
@@ -9,6 +9,14 @@ export const CSRF_COOKIE_NAME = 'fluxora_csrf';
 
 /** Header name expected on mutating browser-originated requests containing the CSRF token. */
 export const CSRF_HEADER_NAME = 'x-csrf-token';
+
+/**
+ * Fixed HMAC key used for constant-time CSRF token comparison.
+ * Matches the pattern in `src/webhooks/signature.ts` where both inputs are
+ * HMAC-hashed before comparison to eliminate timing side-channels from
+ * variable-length inputs.
+ */
+const CSRF_COMPARE_KEY = 'fluxora-csrf-compare';
 
 /**
  * Helper function to parse raw Cookie header string into a record of key-value pairs.
@@ -47,28 +55,42 @@ export function parseCookies(cookieHeader?: string): Record<string, string> {
  * requests do not use ambient browser cookies and MUST NOT be subjected to CSRF checks.
  *
  * Evaluation Rules:
- * 1. If request includes an Authorization header (e.g., Bearer JWT), return false.
- * 2. If request includes an X-API-Key header or query parameter, return false.
- * 3. If request includes cookies in req.headers.cookie, return true.
- * 4. Otherwise, return false.
+ * 1. If the request includes a non-blank Authorization header (e.g., `Bearer <jwt>`),
+ *    the request is API-authenticated → return false.
+ * 2. If the request includes an `X-API-Key` **header**, return false.
+ * 3. If the request includes an `x-api-key` **query parameter**, return false.
+ * 4. If the request carries at least one cookie in `req.headers.cookie`, return true.
+ * 5. Otherwise return false (no credential, no cookie = unauthenticated entirely).
+ *
+ * Note on rule 1: an Authorization header that is present but consists only of
+ * whitespace is treated as absent, so such requests are not bypassed by this rule
+ * and continue to rules 2-5.
  *
  * @param req - Express Request object
  * @returns boolean indicating if request is cookie-session authenticated
  */
 export function isCookieAuthenticated(req: Request): boolean {
-  // Check for Bearer / Authorization header
+  // Rule 1 — Bearer / Authorization header (non-blank)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.trim().length > 0) {
     return false;
   }
 
-  // Check for API Key (header or query)
-  const apiKey = getApiKeyFromRequest(req.headers);
-  if (apiKey) {
+  // Rule 2 — API Key in request headers (e.g. X-API-Key: flx_...)
+  const apiKeyFromHeader = getApiKeyFromRequest(req.headers);
+  if (apiKeyFromHeader) {
     return false;
   }
 
-  // Check for presence of cookies
+  // Rule 3 — API Key supplied as a query parameter (?x-api-key=flx_...)
+  // req.query values are strings or string arrays after Express URL parsing.
+  const queryApiKey = req.query?.['x-api-key'];
+  const normalizedQueryKey = Array.isArray(queryApiKey) ? queryApiKey[0] : queryApiKey;
+  if (normalizedQueryKey && typeof normalizedQueryKey === 'string' && normalizedQueryKey.trim().length > 0) {
+    return false;
+  }
+
+  // Rule 4 — Presence of at least one cookie → treat as browser/cookie-session request
   const cookieHeader = req.headers.cookie;
   if (!cookieHeader || cookieHeader.trim().length === 0) {
     return false;
@@ -79,23 +101,19 @@ export function isCookieAuthenticated(req: Request): boolean {
 
 /**
  * Compares two CSRF token strings in constant time to protect against timing attacks.
- * Uses Node.js `crypto.timingSafeEqual` with byte-length pre-verification.
- * Matches the constant-time verification pattern used in `src/webhooks/signature.ts`.
+ * Both inputs are HMAC-SHA256-hashed before comparison using `crypto.timingSafeEqual`,
+ * matching the constant-time verification pattern used in `src/webhooks/signature.ts`.
+ * This eliminates timing side-channels from variable-length inputs.
  *
  * @param tokenA - First CSRF token string (e.g. from cookie)
  * @param tokenB - Second CSRF token string (e.g. from header)
- * @returns true if tokens are identical byte-for-byte in constant time, false otherwise
+ * @returns true if tokens are identical in constant time, false otherwise
  */
 export function safeCompareCsrfTokens(tokenA?: string, tokenB?: string): boolean {
   if (!tokenA || !tokenB) return false;
-  const bufA = Buffer.from(tokenA, 'utf8');
-  const bufB = Buffer.from(tokenB, 'utf8');
-
-  if (bufA.length !== bufB.length) {
-    return false;
-  }
-
-  return timingSafeEqual(bufA, bufB);
+  const hashA = createHmac('sha256', CSRF_COMPARE_KEY).update(tokenA).digest('hex');
+  const hashB = createHmac('sha256', CSRF_COMPARE_KEY).update(tokenB).digest('hex');
+  return timingSafeEqual(Buffer.from(hashA, 'utf8'), Buffer.from(hashB, 'utf8'));
 }
 
 /**

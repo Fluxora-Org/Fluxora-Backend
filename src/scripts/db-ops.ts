@@ -24,6 +24,7 @@ import { execFile, spawn } from 'child_process'
 import { pipeline } from 'stream/promises'
 import { promisify } from 'util'
 import { PassThrough, Readable } from 'stream'
+import { logger } from '../lib/logger.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -83,6 +84,55 @@ function validatePath(p: string, label: string): { valid: boolean; reason?: stri
   }
   if (/[\0`$|;&<>]/.test(p)) {
     return { valid: false, reason: `${label} path contains invalid characters.` }
+  }
+  return { valid: true }
+}
+
+/**
+ * Redact the credentials portion of a PostgreSQL connection string for safe
+ * logging. Never log a raw DATABASE_URL — it may contain a password.
+ */
+function redactDatabaseUrl(url: string): string {
+  try {
+    const parsed = new URL(url)
+    if (parsed.password) parsed.password = '***'
+    if (parsed.username) parsed.username = '***'
+    return parsed.toString()
+  } catch {
+    return '[unparseable connection string]'
+  }
+}
+
+/**
+ * Validate the retention window for dropOldPartitions.
+ * Must be a finite, positive number of days.
+ */
+function validateOlderThanDays(days: number): { valid: boolean; reason?: string } {
+  if (typeof days !== 'number' || !Number.isFinite(days) || days <= 0) {
+    return { valid: false, reason: 'olderThanDays must be a finite number greater than 0.' }
+  }
+  return { valid: true }
+}
+
+/**
+ * Validate that a value is a safe, plain SQL identifier — used for both the
+ * parent table name (query parameter, already safe) and, defensively, for
+ * partition names read back from pg_catalog before they are interpolated
+ * into a DROP TABLE statement.
+ */
+function isSafeIdentifier(name: string): boolean {
+  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)
+}
+
+/**
+ * Validate the parent table name for dropOldPartitions.
+ */
+function validateParentTable(name: string): { valid: boolean; reason?: string } {
+  if (!name || name.trim() === '') {
+    return { valid: false, reason: 'parentTable is required but was not provided.' }
+  }
+  if (!isSafeIdentifier(name.trim())) {
+    return { valid: false, reason: 'parentTable must be a valid SQL identifier.' }
   }
   return { valid: true }
 }
@@ -173,12 +223,19 @@ export async function backupDatabase(
 
   const urlCheck = validateDatabaseUrl(normalizedDatabaseUrl)
   if (!urlCheck.valid) {
+    logger.warn('backupDatabase validation failed', undefined, { reason: urlCheck.reason })
     return { success: false, message: urlCheck.reason! }
   }
+
+  logger.info('backupDatabase started', undefined, {
+    databaseUrl: redactDatabaseUrl(normalizedDatabaseUrl),
+    target: s3Target ? `s3://${s3Target.bucket}/${s3Target.key}` : normalizedOutputPath,
+  })
 
   if (!s3Target) {
     const pathCheck = validatePath(normalizedOutputPath, 'Output')
     if (!pathCheck.valid) {
+      logger.warn('backupDatabase validation failed', undefined, { reason: pathCheck.reason })
       return { success: false, message: pathCheck.reason! }
     }
   }
@@ -209,13 +266,18 @@ export async function backupDatabase(
       await uploadPromise
 
       if (exitCode !== 0) {
+        const errorDetail = stderrOutput || `pg_dump exited with code ${exitCode}`
+        logger.error('backupDatabase failed', undefined, { error: errorDetail })
         return {
           success: false,
           message: 'Backup failed',
-          error: stderrOutput || `pg_dump exited with code ${exitCode}`,
+          error: errorDetail,
         }
       }
 
+      logger.info('backupDatabase succeeded', undefined, {
+        target: `s3://${s3Target.bucket}/${s3Target.key}`,
+      })
       return {
         success: true,
         message: `Backup successfully streamed to s3://${s3Target.bucket}/${s3Target.key}`,
@@ -232,6 +294,7 @@ export async function backupDatabase(
 
       await execFileAsync('pg_dump', args)
 
+      logger.info('backupDatabase succeeded', undefined, { target: normalizedOutputPath })
       return {
         success: true,
         message: `Backup successfully written to ${normalizedOutputPath}`,
@@ -243,6 +306,7 @@ export async function backupDatabase(
       err.stderr?.trim() ||
       err.message ||
       'Unknown error occurred during pg_dump'
+    logger.error('backupDatabase failed', undefined, { error: errorMsg })
     return { success: false, message: 'Backup failed', error: errorMsg }
   }
 }
@@ -290,12 +354,19 @@ export async function restoreDatabase(
 
   const urlCheck = validateDatabaseUrl(normalizedDatabaseUrl)
   if (!urlCheck.valid) {
+    logger.warn('restoreDatabase validation failed', undefined, { reason: urlCheck.reason })
     return { success: false, message: urlCheck.reason! }
   }
+
+  logger.info('restoreDatabase started', undefined, {
+    databaseUrl: redactDatabaseUrl(normalizedDatabaseUrl),
+    source: s3Source ? `s3://${s3Source.bucket}/${s3Source.key}` : normalizedInputPath,
+  })
 
   if (!s3Source) {
     const pathCheck = validatePath(normalizedInputPath, 'Input')
     if (!pathCheck.valid) {
+      logger.warn('restoreDatabase validation failed', undefined, { reason: pathCheck.reason })
       return { success: false, message: pathCheck.reason! }
     }
   }
@@ -335,10 +406,12 @@ export async function restoreDatabase(
       ) as { Body?: Readable }
 
       if (!response.Body) {
+        const errorDetail = `S3 object s3://${s3Source.bucket}/${s3Source.key} returned an empty body`
+        logger.error('restoreDatabase failed', undefined, { error: errorDetail })
         return {
           success: false,
           message: 'Restore failed',
-          error: `S3 object s3://${s3Source.bucket}/${s3Source.key} returned an empty body`,
+          error: errorDetail,
         }
       }
 
@@ -367,13 +440,18 @@ export async function restoreDatabase(
       })
 
       if (exitCode !== 0) {
+        const errorDetail = stderrOutput || `pg_restore exited with code ${exitCode}`
+        logger.error('restoreDatabase failed', undefined, { error: errorDetail })
         return {
           success: false,
           message: 'Restore failed',
-          error: stderrOutput || `pg_restore exited with code ${exitCode}`,
+          error: errorDetail,
         }
       }
 
+      logger.info('restoreDatabase succeeded', undefined, {
+        source: `s3://${s3Source.bucket}/${s3Source.key}`,
+      })
       return {
         success: true,
         message: `Restore successfully completed from s3://${s3Source.bucket}/${s3Source.key}`,
@@ -390,6 +468,7 @@ export async function restoreDatabase(
 
       await execFileAsync('pg_restore', args)
 
+      logger.info('restoreDatabase succeeded', undefined, { source: normalizedInputPath })
       return {
         success: true,
         message: `Restore successfully completed from ${normalizedInputPath}`,
@@ -401,6 +480,7 @@ export async function restoreDatabase(
       err.stderr?.trim() ||
       err.message ||
       'Unknown error occurred during pg_restore'
+    logger.error('restoreDatabase failed', undefined, { error: errorMsg })
     return { success: false, message: 'Restore failed', error: errorMsg }
   }
 }
@@ -421,7 +501,21 @@ export async function dropOldPartitions(
   parentTable: string,
   olderThanDays: number,
   dryRun = true
-): Promise<{ droppedPartitions: string[]; message: string }> {
+): Promise<{ success: boolean; droppedPartitions: string[]; message: string }> {
+  const tableCheck = validateParentTable(parentTable)
+  if (!tableCheck.valid) {
+    logger.warn('dropOldPartitions validation failed', undefined, { reason: tableCheck.reason })
+    return { success: false, droppedPartitions: [], message: tableCheck.reason! }
+  }
+
+  const daysCheck = validateOlderThanDays(olderThanDays)
+  if (!daysCheck.valid) {
+    logger.warn('dropOldPartitions validation failed', undefined, { reason: daysCheck.reason })
+    return { success: false, droppedPartitions: [], message: daysCheck.reason! }
+  }
+
+  logger.info('dropOldPartitions started', undefined, { parentTable, olderThanDays, dryRun })
+
   const query = `
     SELECT
       c.relname AS partition_name,
@@ -434,6 +528,7 @@ export async function dropOldPartitions(
   
   const res = await pool.query(query, [parentTable]);
   const droppedPartitions: string[] = [];
+  const skippedUnsafeNames: string[] = [];
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
   
@@ -441,7 +536,7 @@ export async function dropOldPartitions(
     const pName = row.partition_name;
     const pBound = row.partition_bound;
     
-    if (pBound === 'DEFAULT') continue;
+    if (!pBound || pBound === 'DEFAULT') continue;
     
     // Bounds typically look like: FOR VALUES FROM ('2023-01-01 00:00:00+00') TO ('2023-02-01 00:00:00+00')
     // Note: literal parentheses in pg_get_expr output — no backslash escaping needed.
@@ -449,6 +544,13 @@ export async function dropOldPartitions(
     if (toMatch && toMatch[1]) {
       const toDate = new Date(toMatch[1]);
       if (toDate < cutoffDate) {
+        // Defense-in-depth: pName comes from pg_catalog, not raw user input,
+        // but we still refuse to interpolate anything that isn't a plain
+        // SQL identifier before it reaches a DROP TABLE statement.
+        if (!isSafeIdentifier(pName)) {
+          skippedUnsafeNames.push(pName)
+          continue
+        }
         if (!dryRun) {
           // Explicitly require admin role or let it fail if insufficient perms.
           await pool.query(`DROP TABLE IF EXISTS ${pName}`);
@@ -457,16 +559,29 @@ export async function dropOldPartitions(
       }
     }
   }
+
+  if (skippedUnsafeNames.length > 0) {
+    logger.warn('dropOldPartitions skipped partitions with unsafe names', undefined, {
+      parentTable,
+      skippedUnsafeNames,
+    })
+  }
   
   if (dryRun) {
+    const message = `[DRY RUN] Would drop ${droppedPartitions.length} old partitions for ${parentTable}`
+    logger.info('dropOldPartitions completed', undefined, { parentTable, dryRun, count: droppedPartitions.length })
     return {
+      success: true,
       droppedPartitions,
-      message: `[DRY RUN] Would drop ${droppedPartitions.length} old partitions for ${parentTable}`
+      message
     };
   }
   
+  const message = `Dropped ${droppedPartitions.length} old partitions for ${parentTable}`
+  logger.info('dropOldPartitions completed', undefined, { parentTable, dryRun, count: droppedPartitions.length })
   return {
+    success: true,
     droppedPartitions,
-    message: `Dropped ${droppedPartitions.length} old partitions for ${parentTable}`
+    message
   };
 }

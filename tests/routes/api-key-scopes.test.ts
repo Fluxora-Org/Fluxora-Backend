@@ -11,15 +11,17 @@
  */
 
 import request from 'supertest';
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { initializeConfig } from '../../src/config/env.js';
+import { generateToken } from '../../src/lib/auth.js';
 import type { ApiKeyRecord } from '../../src/db/types.js';
 
-vi.mock('../../src/config/env.js', () => ({
-  getConfig: () => ({
-    apiKeyPepper: 'test-pepper-32-chars-long-secret-key-pepper!',
-  }),
-}));
-
+// Deliberately does NOT mock '../../src/config/env.js': app.ts's createApp()
+// needs the real loadConfig() (not just getConfig()) to build a working
+// Express app, and tests/setup.ts already seeds API_KEY_PEPPER and friends
+// for every test process. A partial mock here previously replaced the whole
+// module and broke `loadConfig`, which silently took this entire suite
+// offline (see issue #1063).
 const inMemoryKeys = new Map<string, ApiKeyRecord>();
 
 vi.mock('../../src/db/repositories/apiKeyRepository.js', () => ({
@@ -61,6 +63,14 @@ import {
 } from '../../src/lib/apiKey.js';
 
 describe('API Key Scopes & getApiKeyRecord', () => {
+  beforeAll(() => {
+    // createApiKey()/isValidApiKey() read the API_KEY_PEPPER via getConfig(),
+    // which requires the singleton config to have been initialized once per
+    // test file (tests/setup.ts seeds the env var, but does not itself call
+    // initializeConfig()).
+    initializeConfig();
+  });
+
   beforeEach(() => {
     inMemoryKeys.clear();
   });
@@ -157,12 +167,16 @@ describe('API Key Scopes & getApiKeyRecord', () => {
       expect(response.body.error?.message).toContain('scopes');
     });
 
-    it('should allow request without API key (anonymous)', async () => {
+    it('should deny a fully anonymous request (no API key, no JWT)', async () => {
+      // requireScope() rejects before any controller logic runs when neither
+      // an API key (`req.keyId`) nor a JWT (`req.user`) principal is present
+      // — scoped routes never fall open to anonymous callers.
       const response = await request(app)
         .get('/api/streams')
         .query({ limit: 10 });
 
-      expect(response.status).not.toBe(401);
+      expect(response.status).toBe(401);
+      expect(response.body.error?.code).toBe('UNAUTHORIZED');
     });
 
     it('should deny request with invalid API key', async () => {
@@ -178,10 +192,17 @@ describe('API Key Scopes & getApiKeyRecord', () => {
 
   describe('POST /api/streams with API key', () => {
     it('should deny request with API key missing streams:write scope', async () => {
+      // POST is gated by both `requireAuth` (a JWT principal) and
+      // `requireScope('streams:write')`. Attach an operator JWT so the
+      // request clears `requireAuth` and actually reaches the scope check —
+      // requireScope() prefers API-key scopes over JWT permissions once a
+      // key is present, so the read-only key is what triggers the 403 here.
+      const jwt = generateToken({ address: 'GOPERATOR000000000000000000000000000000000000', role: 'operator' });
       const apiKey = await createApiKey('read-only-key', ['streams:read']);
-      
+
       const response = await request(app)
         .post('/api/streams')
+        .set('Authorization', `Bearer ${jwt}`)
         .set('X-API-Key', apiKey.key)
         .set('Idempotency-Key', 'test-key-1')
         .send({
@@ -220,10 +241,14 @@ describe('API Key Scopes & getApiKeyRecord', () => {
 
   describe('DELETE /api/streams/:id with API key', () => {
     it('should deny request with API key missing streams:write scope', async () => {
+      // Same reasoning as the POST case above: DELETE also requires
+      // `requireAuth`, so a JWT is needed to reach the scope check at all.
+      const jwt = generateToken({ address: 'GOPERATOR000000000000000000000000000000000000', role: 'operator' });
       const apiKey = await createApiKey('read-only-key', ['streams:read']);
-      
+
       const response = await request(app)
         .delete('/api/streams/stream-123')
+        .set('Authorization', `Bearer ${jwt}`)
         .set('X-API-Key', apiKey.key);
 
       expect(response.status).toBe(403);

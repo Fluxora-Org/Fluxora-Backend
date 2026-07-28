@@ -606,3 +606,118 @@ pnpm run migrate
 ### Tests
 
 Unit tests for the queue are in `tests/jobs/queue.test.ts`. They mock pg-boss using `vi.mock()` to test the `JobQueue` class independently of a real database.
+
+---
+
+## Scripted Database Operations & Operator Ergonomics
+
+### Overview & Architecture
+
+Script-based database operations reside in [`src/scripts/db-ops.ts`](../src/scripts/db-ops.ts). This module provides production-grade wrappers around PostgreSQL utilities (`pg_dump` and `pg_restore`) as well as SQL partition cleanup utilities (`dropOldPartitions`).
+
+The design prioritizes zero-disk footprint (streaming dumps directly to/from S3), strict shell injection safety, credential isolation, and fail-safe operator defaults.
+
+```
+                  ┌──────────────────────────────────────────────┐
+                  │              src/scripts/db-ops.ts           │
+                  └──────┬───────────────────────────────┬───────┘
+                         │                               │
+             ┌───────────▼───────────┐       ┌───────────▼───────────┐
+             │    backupDatabase     │       │    restoreDatabase    │
+             └─────┬───────────┬─────┘       └─────┬───────────┬─────┘
+                   │           │                   │           │
+           (Local) │           │ (S3 Stream)  (Local)│           │ (S3 Stream)
+                   ▼           ▼                   ▼           ▼
+             execFile       spawn               execFile     spawn
+            "pg_dump"     "pg_dump"            "pg_restore" "pg_restore"
+             └─► Disk      └─► S3 Upload         ▲           ▲
+                                                 │           │
+                                                Disk       S3 Stream
+```
+
+### Core Operations Reference
+
+#### 1. `backupDatabase(databaseUrl, outputPath, s3Target?)`
+
+Generates a custom-format PostgreSQL database backup (`--format=custom`).
+
+- **Local Mode** (`s3Target` omitted): Executes `pg_dump` via `execFile`, writing output directly to `outputPath`.
+- **S3 Streaming Mode** (`s3Target` provided): Spawns `pg_dump` stdout stream piped into a `PassThrough` stream to AWS S3 using `@aws-sdk/lib-storage` `Upload`. The dump streams directly to S3 without creating temporary files on the local filesystem.
+- **Return Type**: `Promise<DbOperationResult>` where:
+  ```typescript
+  export interface DbOperationResult {
+    success: boolean;
+    message: string;
+    /** Raw stderr / error detail — never contains connection passwords or AWS keys */
+    error?: string;
+  }
+  ```
+
+#### 2. `restoreDatabase(databaseUrl, inputPath, s3Source?)`
+
+Restores a custom-format PostgreSQL database dump using `pg_restore`.
+
+- **Local Mode** (`s3Source` omitted): Executes `pg_restore` via `execFile` from `inputPath`.
+- **S3 Streaming Mode** (`s3Source` provided): Downloads object body via S3 `GetObjectCommand` and streams `response.Body` directly into `pg_restore` standard input (`stdin`).
+- **Flags Used**:
+  - `--clean`: Drops database objects before restoring them.
+  - `--no-owner`: Skips restoration of original object ownership, enabling portable restores across environments with different database roles.
+  - `--no-password`: Prevents prompt hanging when credentials are missing or invalid.
+
+> [!WARNING]
+> `--clean` drops existing database tables/objects before recreating them. Ensure active database connections are closed or quieted before invoking `restoreDatabase` in production.
+
+#### 3. `dropOldPartitions(pool, parentTable, olderThanDays, dryRun = true)`
+
+Performs retention-based partition pruning for range-partitioned tables such as `contract_events`.
+
+- **Bound Extraction**: Queries `pg_inherits` and `pg_class`, extracting upper bound date strings using `/TO \('([^']+)'\)/` from `pg_get_expr(c.relpartbound, c.oid)`.
+- **Default Partition Handling**: Automatically skips the `DEFAULT` partition (`partition_bound === 'DEFAULT'`).
+- **Dry-Run Safety**: Defaults `dryRun = true`. Operators must explicitly pass `dryRun = false` to execute `DROP TABLE IF EXISTS`.
+
+### Security & Credential Protection
+
+1. **Input Validation**:
+   - Connection strings: Validated against `^postgre(?:s|sql):\/\/` before spawning subprocesses. Rejects empty strings, whitespace, and non-postgres schemes (`mysql://`, `redis://`, etc.).
+   - File paths: Validated to reject empty strings and shell control characters (`[\0`$|;&<>]`).
+2. **Subprocess Isolation**:
+   - Uses Node.js `execFile` (array form) and `spawn` with explicit argument vectors.
+   - Arguments are never concatenated into a shell string, eliminating shell injection vectors.
+3. **Password & Credential Masking**:
+   - `DATABASE_URL` credentials and AWS secrets are consumed strictly from environment variables or argument inputs.
+   - Raw database passwords are never printed to console or leaked inside `DbOperationResult.error` strings during error conditions.
+4. **AWS Credential Isolation**:
+   - Uses AWS SDK v3 environment provider chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+   - S3 credentials are never logged or stored in job results.
+
+### Decimal-String Serialization Guarantee
+
+Financial and numerical fields in Fluxora (e.g. event stream amounts, token balances) are stored as decimal strings in database `TEXT` or `NUMERIC` columns.
+
+The `db-ops` module processes backup and restore operations purely as binary/text byte streams. No JSON coercion or numeric parsing is applied to table records, guaranteeing zero loss of precision for monetary values.
+
+### Operator Ergonomics & Safety Controls
+
+| Ergonomic Control | Behavior | Benefit |
+|---|---|---|
+| **Default Dry Run** | `dropOldPartitions` defaults `dryRun = true` | Prevents accidental data deletion if invoked without arguments |
+| **Lazy AWS SDK Loading** | Dynamic `import('@aws-sdk/client-s3')` and `import('@aws-sdk/lib-storage')` | `db-ops.ts` runs in local-only mode even when `@aws-sdk` packages are not installed |
+| **AWS Region Resolution** | `s3Target.region` ➔ `AWS_REGION` ➔ `AWS_DEFAULT_REGION` ➔ `'us-east-1'` | Flexible environment configuration across AWS ECS, Lambda, and local environments |
+| **Whitespace Normalization** | Trims leading/trailing whitespace from `databaseUrl`, `outputPath`, and `inputPath` | Prevents spurious validation failures from whitespace in config files or CLI input |
+| **Clean Output Interface** | `DbOperationResult` standardizes `{ success, message, error }` | Simplifies caller code, logging, and error handling |
+
+### Regression Surface & Edge-Case Matrix
+
+| Component / Function | Input / Condition | Expected Behavior | Failure Mode / Mitigation |
+|---|---|---|---|
+| `backupDatabase` | Empty or whitespace `databaseUrl` | Returns `{ success: false, message: 'DATABASE_URL is required...' }` | Fast failure before subprocess creation |
+| `backupDatabase` | Non-postgres scheme (`mysql://`) | Returns `{ success: false, message: 'DATABASE_URL must be a valid PostgreSQL...' }` | Fast failure before subprocess creation |
+| `backupDatabase` | File path with `;` or `` ` `` | Returns `{ success: false, message: 'Output path contains invalid characters.' }` | Rejection of unsafe path inputs |
+| `backupDatabase` | Local mode, `pg_dump` fails | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | Error captured without password leakage |
+| `backupDatabase` | S3 mode, AWS SDK missing | Throws Error: `'AWS SDK v3 is not installed...'` | Clear diagnostic message asking user to install SDK |
+| `backupDatabase` | S3 mode, `pg_dump` non-zero exit | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | S3 upload discarded, error reported |
+| `restoreDatabase` | S3 mode, S3 object body null/empty | Returns `{ success: false, message: 'Restore failed', error: 'S3 object ... returned an empty body' }` | Prevents hanging `pg_restore` on empty input |
+| `dropOldPartitions` | Table has `DEFAULT` partition | `DEFAULT` partition is skipped; never dropped | Prevents dropping catch-all partition |
+| `dropOldPartitions` | Unparseable partition bound | Partition is skipped without throwing | Log/continue without breaking retention task |
+| `dropOldPartitions` | `dryRun = true` | Returns list of partition names in `droppedPartitions`; no `DROP TABLE` query issued | Safe audit before execution |
+

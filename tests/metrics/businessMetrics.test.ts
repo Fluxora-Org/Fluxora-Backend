@@ -13,13 +13,28 @@ import {
   syncWebhookMetrics,
   authJwtVerifyDurationSeconds,
   authApiKeyLookupDurationSeconds,
+  resetBusinessMetrics,
   deRegisterBusinessMetrics,
+  safeObserveDuration,
+  isValidStreamStatus,
+  isValidDeliveryOutcome,
+  isValidRejectionReason,
+  sseLiveSubscribersGauge,
+  sseEventListenersGauge,
+  sseActiveConnectionsGauge,
 } from '../../src/metrics/businessMetrics.js';
 import { WebhookService } from '../../src/webhooks/service.js';
 import { DEFAULT_RETRY_POLICY } from '../../src/webhooks/types.js';
 import { IndexerIngestionService } from '../../src/indexer/service.js';
 import { InMemoryContractEventStore } from '../../src/indexer/store.js';
 import { webhookDeliveryStore } from '../../src/webhooks/storeFactory.js';
+
+async function readGaugeValue(gauge: {
+  get: () => Promise<{ values: Array<{ value: number }> }> | { values: Array<{ value: number }> };
+}): Promise<number> {
+  const snap = await gauge.get();
+  return snap.values[0]?.value ?? 0;
+}
 
 // Setup fresh metrics before each test in this suite
 beforeEach(() => {
@@ -37,7 +52,7 @@ beforeEach(() => {
   } catch {
     // no-op if already de-registered
   }
-  
+
   // Clear webhook store between tests
   webhookDeliveryStore.clear();
 });
@@ -55,6 +70,10 @@ describe('Business Metrics Integration', () => {
       global.fetch = vi.fn().mockResolvedValue({
         ok: true,
         status: 200,
+        headers: {
+          get: (name: string) => (name === 'content-type' ? 'application/json' : null),
+        },
+        body: null,
       } as Response);
 
       const service = new WebhookService();
@@ -154,14 +173,12 @@ describe('Business Metrics Integration', () => {
 
   // 2. Webhook DLQ and Outbox Metrics
   describe('Webhook DLQ and Outbox metrics', () => {
-    it('syncs DLQ items gauge from store when empty', () => {
+    it('syncs DLQ items gauge from store when empty', async () => {
       syncWebhookMetrics(webhookDeliveryStore);
-      
-      const dlqMetric = webhookDlqItemsGauge.get().values[0];
-      expect(dlqMetric?.value).toBe(0);
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
     });
 
-    it('syncs DLQ items gauge from store with items', () => {
+    it('syncs DLQ items gauge from store with items', async () => {
       // Add a delivery to the DLQ via the store
       const delivery = {
         id: 'test-delivery-1',
@@ -175,25 +192,21 @@ describe('Business Metrics Integration', () => {
         updatedAt: Date.now(),
         payload: JSON.stringify({ test: 'data' }),
       };
-      
+
       webhookDeliveryStore.store(delivery);
       webhookDeliveryStore.addToDeadLetterQueue(delivery, 'Max retries exceeded');
       webhookDeliveryStore.addToDeadLetterQueue(delivery, 'Endpoint unreachable');
-      
+
       syncWebhookMetrics(webhookDeliveryStore);
-      
-      const dlqMetric = webhookDlqItemsGauge.get().values[0];
-      expect(dlqMetric?.value).toBe(2);
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(2);
     });
 
-    it('syncs outbox pending items gauge from store when empty', () => {
+    it('syncs outbox pending items gauge from store when empty', async () => {
       syncWebhookMetrics(webhookDeliveryStore);
-      
-      const outboxMetric = webhookOutboxPendingItemsGauge.get().values[0];
-      expect(outboxMetric?.value).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
     });
 
-    it('syncs outbox pending items gauge from store with items', () => {
+    it('syncs outbox pending items gauge from store with items', async () => {
       // Add items to outbox
       const outboxId1 = webhookDeliveryStore.addToOutbox({
         deliveryId: 'deliv-1',
@@ -224,23 +237,17 @@ describe('Business Metrics Integration', () => {
       });
 
       syncWebhookMetrics(webhookDeliveryStore);
-      
-      const outboxMetric = webhookOutboxPendingItemsGauge.get().values[0];
-      expect(outboxMetric?.value).toBe(2);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(2);
 
       // Remove one item and verify gauge updates
       webhookDeliveryStore.removeFromOutbox(outboxId1);
       syncWebhookMetrics(webhookDeliveryStore);
-      
-      const updatedOutboxMetric = webhookOutboxPendingItemsGauge.get().values[0];
-      expect(updatedOutboxMetric?.value).toBe(1);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(1);
 
       // Remove the other and verify it goes back to 0
       webhookDeliveryStore.removeFromOutbox(outboxId2);
       syncWebhookMetrics(webhookDeliveryStore);
-      
-      const finalOutboxMetric = webhookOutboxPendingItemsGauge.get().values[0];
-      expect(finalOutboxMetric?.value).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
     });
 
     it('exposes DLQ depth gauge in /metrics endpoint with admin auth', async () => {
@@ -261,9 +268,7 @@ describe('Business Metrics Integration', () => {
       webhookDeliveryStore.addToDeadLetterQueue(delivery, 'Endpoint timeout');
 
       const adminKey = 'test-admin-key-12345';
-      const res = await request(app)
-        .get('/metrics')
-        .set('Authorization', `Bearer ${adminKey}`);
+      const res = await request(app).get('/metrics').set('Authorization', `Bearer ${adminKey}`);
 
       // Note: This will fail without proper env setup, so we expect 403
       // In a real test environment with ADMIN_API_KEY set, this would return 200
@@ -271,30 +276,23 @@ describe('Business Metrics Integration', () => {
       expect([200, 403, 503]).toContain(res.status);
     });
 
-    it('handles negative values safely (edge case protection)', () => {
-      // Create a mock store that returns negative values (shouldn't happen, but defensive)
+    it('handles negative values safely (edge case protection)', async () => {
       const mockStore = {
         getMetrics: () => ({
           totalDeliveries: 100,
           successfulDeliveries: 50,
           failedDeliveries: 25,
-          dlqItems: -5, // Invalid negative value
-          outboxItems: -10, // Invalid negative value
+          dlqItems: -5,
+          outboxItems: -10,
         }),
       };
 
       syncWebhookMetrics(mockStore);
-
-      const dlqMetric = webhookDlqItemsGauge.get().values[0];
-      const outboxMetric = webhookOutboxPendingItemsGauge.get().values[0];
-
-      // Verify both are clamped to 0
-      expect(dlqMetric?.value).toBe(0);
-      expect(outboxMetric?.value).toBe(0);
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
     });
 
-    it('handles large queue depths gracefully', () => {
-      // Create a mock store with large values
+    it('handles large queue depths gracefully', async () => {
       const mockStore = {
         getMetrics: () => ({
           totalDeliveries: 1000000,
@@ -306,12 +304,164 @@ describe('Business Metrics Integration', () => {
       };
 
       syncWebhookMetrics(mockStore);
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(50000);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(250000);
+    });
 
-      const dlqMetric = webhookDlqItemsGauge.get().values[0];
-      const outboxMetric = webhookOutboxPendingItemsGauge.get().values[0];
+    it('sets gauges to 0 when store is null or undefined', async () => {
+      webhookDlqItemsGauge.set(99);
+      webhookOutboxPendingItemsGauge.set(88);
 
-      expect(dlqMetric?.value).toBe(50000);
-      expect(outboxMetric?.value).toBe(250000);
+      syncWebhookMetrics(undefined);
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+
+      webhookDlqItemsGauge.set(99);
+      webhookOutboxPendingItemsGauge.set(88);
+
+      syncWebhookMetrics(null);
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('sets gauges to 0 when getMetrics is missing or not a function', async () => {
+      webhookDlqItemsGauge.set(42);
+      webhookOutboxPendingItemsGauge.set(42);
+
+      syncWebhookMetrics({});
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+
+      syncWebhookMetrics({ getMetrics: 'not-a-function' as unknown as () => never });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('sets gauges to 0 when getMetrics throws', async () => {
+      webhookDlqItemsGauge.set(7);
+      webhookOutboxPendingItemsGauge.set(7);
+
+      syncWebhookMetrics({
+        getMetrics: () => {
+          throw new Error('store unavailable');
+        },
+      });
+
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('sanitizes null, NaN, Infinity, and fractional store values', async () => {
+      syncWebhookMetrics({
+        getMetrics: () => ({
+          dlqItems: null as unknown as number,
+          outboxItems: undefined,
+        }),
+      });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+
+      syncWebhookMetrics({
+        getMetrics: () => ({
+          dlqItems: Number.NaN,
+          outboxItems: Number.POSITIVE_INFINITY,
+        }),
+      });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+
+      syncWebhookMetrics({
+        getMetrics: () => ({
+          dlqItems: 3.9,
+          outboxItems: 10.1,
+        }),
+      });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(3);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(10);
+    });
+
+    it('clamps values above MAX_SAFE_INTEGER', async () => {
+      syncWebhookMetrics({
+        getMetrics: () => ({
+          dlqItems: Number.MAX_SAFE_INTEGER + 100,
+          outboxItems: Number.MAX_SAFE_INTEGER + 1,
+        }),
+      });
+
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(Number.MAX_SAFE_INTEGER);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(Number.MAX_SAFE_INTEGER);
+    });
+
+    it('does not throw when getMetrics returns null', async () => {
+      expect(() =>
+        syncWebhookMetrics({
+          getMetrics: () => null,
+        })
+      ).not.toThrow();
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('handles getMetrics returning undefined', async () => {
+      expect(() =>
+        syncWebhookMetrics({
+          getMetrics: () => undefined,
+        })
+      ).not.toThrow();
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('handles getMetrics returning non-object (primitive)', async () => {
+      expect(() =>
+        syncWebhookMetrics({
+          getMetrics: () => 'not-an-object' as unknown,
+        })
+      ).not.toThrow();
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('handles getMetrics returning array', async () => {
+      expect(() =>
+        syncWebhookMetrics({
+          getMetrics: () => [] as unknown,
+        })
+      ).not.toThrow();
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('handles getMetrics returning object with only dlqItems', async () => {
+      syncWebhookMetrics({
+        getMetrics: () => ({ dlqItems: 42 }),
+      });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(42);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('handles getMetrics returning object with only outboxItems', async () => {
+      syncWebhookMetrics({
+        getMetrics: () => ({ outboxItems: 100 }),
+      });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(100);
+    });
+
+    it('handles getMetrics returning object with string numeric values', async () => {
+      syncWebhookMetrics({
+        getMetrics: () => ({ dlqItems: '50' as unknown, outboxItems: '75' as unknown }),
+      });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    });
+
+    it('handles getMetrics returning object with boolean values', async () => {
+      syncWebhookMetrics({
+        getMetrics: () => ({ dlqItems: true as unknown, outboxItems: false as unknown }),
+      });
+      expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+      expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
     });
   });
 
@@ -363,9 +513,7 @@ describe('Business Metrics Integration', () => {
     try {
       streamsCreatedTotal.inc({ status: 'active' });
 
-      const res = await request(app)
-        .get('/metrics')
-        .set('Authorization', `Bearer ${ADMIN_KEY}`);
+      const res = await request(app).get('/metrics').set('Authorization', `Bearer ${ADMIN_KEY}`);
       expect(res.status).toBe(200);
       expect(res.text).toContain('fluxora_streams_created_total');
       expect(res.text).toContain('status="active"');
@@ -378,35 +526,88 @@ describe('Business Metrics Integration', () => {
     }
   });
 
-  // 5. Double Registration & De-registration protection
-  it('guards against duplicate registration on multiple loads and supports de-registration', () => {
-    // Attempting to look up or get standard metrics returns the exact instances
-    const streamsMetric = registry.getSingleMetric('fluxora_streams_created_total');
-    expect(streamsMetric).toBe(streamsCreatedTotal);
+  it('syncs webhook queue gauges into authenticated /metrics scrape', async () => {
+    const ADMIN_KEY = 'test-metrics-admin-key';
+    const originalKey = process.env.ADMIN_API_KEY;
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
 
-    // Verify the new DLQ and outbox gauges exist
-    const dlqMetric = registry.getSingleMetric('fluxora_webhook_dlq_items');
-    expect(dlqMetric).toBe(webhookDlqItemsGauge);
+    const delivery = {
+      id: 'metrics-scrape-dlq',
+      deliveryId: 'deliv-scrape',
+      eventId: 'evt-scrape',
+      eventType: 'stream.created',
+      endpointUrl: 'https://example.com/webhook',
+      status: 'pending' as const,
+      attempts: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      payload: JSON.stringify({ test: 'data' }),
+    };
 
-    const outboxMetric = registry.getSingleMetric('fluxora_webhook_outbox_pending_items');
-    expect(outboxMetric).toBe(webhookOutboxPendingItemsGauge);
+    webhookDeliveryStore.store(delivery);
+    webhookDeliveryStore.addToDeadLetterQueue(delivery, 'Endpoint timeout');
+    webhookDeliveryStore.addToOutbox({
+      deliveryId: 'deliv-outbox',
+      eventId: 'evt-outbox',
+      eventType: 'stream.created',
+      endpointUrl: 'https://example.com/webhook',
+      payload: JSON.stringify({ data: 'test' }),
+      secret: 'secret',
+      priority: 'normal',
+      createdAt: Date.now(),
+      scheduledFor: Date.now() + 1000,
+      attempts: 0,
+      maxAttempts: 3,
+    });
 
-    // Verify calling deRegister removes all metrics including the new ones
-    deRegisterBusinessMetrics();
-    expect(registry.getSingleMetric('fluxora_streams_created_total')).toBeUndefined();
-    expect(registry.getSingleMetric('fluxora_webhook_dlq_items')).toBeUndefined();
-    expect(registry.getSingleMetric('fluxora_webhook_outbox_pending_items')).toBeUndefined();
+    try {
+      const res = await request(app).get('/metrics').set('Authorization', `Bearer ${ADMIN_KEY}`);
+
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('fluxora_webhook_dlq_items');
+      expect(res.text).toContain('fluxora_webhook_outbox_pending_items');
+      expect(res.text).toMatch(/fluxora_webhook_dlq_items(?:\{[^}]+\})?\s+1(?:\.0+)?\s/);
+      expect(res.text).toMatch(/fluxora_webhook_outbox_pending_items(?:\{[^}]+\})?\s+1(?:\.0+)?\s/);
+    } finally {
+      if (originalKey !== undefined) {
+        process.env.ADMIN_API_KEY = originalKey;
+      } else {
+        delete process.env.ADMIN_API_KEY;
+      }
+    }
   });
 
-  // 6. Security: No PII in labels
-  it('verifies webhook metrics have no user-input labels that could leak PII', () => {
-    const dlqMetricData = webhookDlqItemsGauge.get();
-    expect(dlqMetricData.values).toHaveLength(1);
-    expect(dlqMetricData.values[0]?.labels).toEqual({}); // No labels at all
+  // 5. Security: No PII in labels
+  it('verifies webhook metrics have no user-input labels that could leak PII', async () => {
+    webhookDlqItemsGauge.set(1);
+    webhookOutboxPendingItemsGauge.set(1);
 
-    const outboxMetricData = webhookOutboxPendingItemsGauge.get();
+    const dlqMetricData = await webhookDlqItemsGauge.get();
+    expect(dlqMetricData.values).toHaveLength(1);
+    expect(dlqMetricData.values[0]?.labels).toEqual({});
+
+    const outboxMetricData = await webhookOutboxPendingItemsGauge.get();
     expect(outboxMetricData.values).toHaveLength(1);
-    expect(outboxMetricData.values[0]?.labels).toEqual({}); // No labels at all
+    expect(outboxMetricData.values[0]?.labels).toEqual({});
+  });
+
+  it('resetBusinessMetrics clears all business metric values without deregistering', async () => {
+    streamsCreatedTotal.inc({ status: 'active' });
+    webhookDeliveriesTotal.inc({ outcome: 'success' });
+    webhookDlqItemsGauge.set(5);
+    webhookOutboxPendingItemsGauge.set(9);
+    authJwtVerifyDurationSeconds.observe({ outcome: 'success' }, 0.01);
+
+    resetBusinessMetrics();
+
+    expect((await streamsCreatedTotal.get()).values).toHaveLength(0);
+    expect((await webhookDeliveriesTotal.get()).values).toHaveLength(0);
+    expect(await readGaugeValue(webhookDlqItemsGauge)).toBe(0);
+    expect(await readGaugeValue(webhookOutboxPendingItemsGauge)).toBe(0);
+    expect((await authJwtVerifyDurationSeconds.get()).values).toHaveLength(0);
+
+    expect(registry.getSingleMetric('fluxora_streams_created_total')).toBe(streamsCreatedTotal);
+    expect(registry.getSingleMetric('fluxora_webhook_dlq_items')).toBe(webhookDlqItemsGauge);
   });
 });
 
@@ -416,9 +617,9 @@ describe('Business Metrics Integration', () => {
 describe('Auth Latency Histograms (issue #361)', () => {
   describe('fluxora_auth_jwt_verify_duration_seconds', () => {
     it('registers the histogram on the Prometheus registry', () => {
-      expect(
-        registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds'),
-      ).toBe(authJwtVerifyDurationSeconds);
+      expect(registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds')).toBe(
+        authJwtVerifyDurationSeconds
+      );
     });
 
     it('declares outcome as the only label (no high-cardinality labels)', () => {
@@ -441,26 +642,34 @@ describe('Auth Latency Histograms (issue #361)', () => {
       expect(upperBounds[upperBounds.length - 1]).toBeGreaterThanOrEqual(1);
     });
 
-    it('records an outcome=success observation and only emits the outcome label', () => {
+    it('records an outcome=success observation and only emits the outcome label', async () => {
+      const ADMIN_KEY = 'test-metrics-admin-key';
+      const originalKey = process.env.ADMIN_API_KEY;
+      process.env.ADMIN_API_KEY = ADMIN_KEY;
+
       authJwtVerifyDurationSeconds.reset();
       authJwtVerifyDurationSeconds.observe({ outcome: 'success' }, 0.012);
 
-      // Verify via /metrics endpoint
-      return request(app)
-        .get('/metrics')
-        .expect(200)
-        .then((res) => {
-          expect(res.text).toContain('fluxora_auth_jwt_verify_duration_seconds');
-          expect(res.text).toContain('outcome="success"');
-        });
+      try {
+        const res = await request(app).get('/metrics').set('Authorization', `Bearer ${ADMIN_KEY}`);
+        expect(res.status).toBe(200);
+        expect(res.text).toContain('fluxora_auth_jwt_verify_duration_seconds');
+        expect(res.text).toContain('outcome="success"');
+      } finally {
+        if (originalKey !== undefined) {
+          process.env.ADMIN_API_KEY = originalKey;
+        } else {
+          delete process.env.ADMIN_API_KEY;
+        }
+      }
     });
   });
 
   describe('fluxora_auth_apikey_lookup_duration_seconds', () => {
     it('registers the histogram on the Prometheus registry', () => {
-      expect(
-        registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds'),
-      ).toBe(authApiKeyLookupDurationSeconds);
+      expect(registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds')).toBe(
+        authApiKeyLookupDurationSeconds
+      );
     });
 
     it('declares outcome as the only label (no high-cardinality labels)', () => {
@@ -486,10 +695,10 @@ describe('Auth Latency Histograms (issue #361)', () => {
       authApiKeyLookupDurationSeconds.observe({ outcome: 'failure' }, 0.0005);
 
       const val = await authApiKeyLookupDurationSeconds.get();
-      // Only one labelled series, and the labels are exactly { outcome }
       expect(val.values.some((v) => v.labels.outcome === 'failure' && v.value === 1)).toBe(true);
       for (const v of val.values) {
-        expect(Object.keys(v.labels)).toEqual(['outcome']);
+        expect(v.labels.outcome).toBeDefined();
+        expect(Object.keys(v.labels).every((key) => key === 'outcome' || key === 'le')).toBe(true);
       }
     });
 
@@ -508,11 +717,178 @@ describe('Auth Latency Histograms (issue #361)', () => {
     });
   });
 
-  describe('de-registration', () => {
-    it('removes both auth histograms from the registry', () => {
+  // ───────────────────────────────────────────────────────────────────────────────
+  // Business metrics registry lifecycle
+  // ───────────────────────────────────────────────────────────────────────────────
+  describe('Business metrics registry lifecycle', () => {
+    it('guards against duplicate registration on multiple loads and supports de-registration', () => {
+      const streamsMetric = registry.getSingleMetric('fluxora_streams_created_total');
+      expect(streamsMetric).toBe(streamsCreatedTotal);
+
+      const dlqMetric = registry.getSingleMetric('fluxora_webhook_dlq_items');
+      expect(dlqMetric).toBe(webhookDlqItemsGauge);
+
+      const outboxMetric = registry.getSingleMetric('fluxora_webhook_outbox_pending_items');
+      expect(outboxMetric).toBe(webhookOutboxPendingItemsGauge);
+
       deRegisterBusinessMetrics();
+      expect(registry.getSingleMetric('fluxora_streams_created_total')).toBeUndefined();
+      expect(registry.getSingleMetric('fluxora_webhook_dlq_items')).toBeUndefined();
+      expect(registry.getSingleMetric('fluxora_webhook_outbox_pending_items')).toBeUndefined();
       expect(registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds')).toBeUndefined();
-      expect(registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds')).toBeUndefined();
+      expect(
+        registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds')
+      ).toBeUndefined();
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────────
+  // Issue #1099 — Edge-case hardening for business metrics
+  // ───────────────────────────────────────────────────────────────────────────────
+  describe('business metrics edge-case hardening (issue #1099)', () => {
+    describe('safeObserveDuration', () => {
+      it('ignores NaN by observing 0 instead', () => {
+        webhookDeliveryDurationSeconds.reset();
+        safeObserveDuration(webhookDeliveryDurationSeconds, NaN);
+        const val = webhookDeliveryDurationSeconds.get();
+        expect(val.values.some((v) => v.value > 0)).toBe(true);
+      });
+
+      it('ignores negative durations by observing 0 instead', () => {
+        webhookDeliveryDurationSeconds.reset();
+        safeObserveDuration(webhookDeliveryDurationSeconds, -1.5);
+        const val = webhookDeliveryDurationSeconds.get();
+        expect(val.values.some((v) => v.value > 0)).toBe(true);
+      });
+
+      it('observes Infinity as 0', () => {
+        webhookDeliveryDurationSeconds.reset();
+        safeObserveDuration(webhookDeliveryDurationSeconds, Infinity);
+        const val = webhookDeliveryDurationSeconds.get();
+        // Infinity mapped to 0 still produces a zero-bucket sample
+        const zeroBucket = val.values.find((v) => v.value > 0);
+        expect(zeroBucket).toBeDefined();
+      });
+
+      it('passes through valid positive durations unchanged', () => {
+        webhookDeliveryDurationSeconds.reset();
+        safeObserveDuration(webhookDeliveryDurationSeconds, 0.025);
+        const val = webhookDeliveryDurationSeconds.get();
+        expect(val.values.some((v) => v.value === 1)).toBe(true);
+      });
+    });
+
+    describe('isValidStreamStatus', () => {
+      it('accepts known stream statuses', () => {
+        expect(isValidStreamStatus('active')).toBe(true);
+        expect(isValidStreamStatus('paused')).toBe(true);
+        expect(isValidStreamStatus('completed')).toBe(true);
+        expect(isValidStreamStatus('cancelled')).toBe(true);
+      });
+
+      it('rejects unknown or unexpected status strings', () => {
+        expect(isValidStreamStatus('unknown')).toBe(false);
+        expect(isValidStreamStatus('')).toBe(false);
+        expect(isValidStreamStatus('active ')).toBe(false);
+        expect(isValidStreamStatus('ACTIVE')).toBe(false);
+      });
+    });
+
+    describe('isValidDeliveryOutcome', () => {
+      it('accepts known outcome values', () => {
+        expect(isValidDeliveryOutcome('success')).toBe(true);
+        expect(isValidDeliveryOutcome('failed')).toBe(true);
+      });
+
+      it('rejects unknown or unexpected outcome strings', () => {
+        expect(isValidDeliveryOutcome('unknown')).toBe(false);
+        expect(isValidDeliveryOutcome('')).toBe(false);
+        expect(isValidDeliveryOutcome('SUCCESS')).toBe(false);
+        expect(isValidDeliveryOutcome('pending')).toBe(false);
+      });
+    });
+
+    describe('isValidRejectionReason', () => {
+      it('accepts known rejection reasons', () => {
+        expect(isValidRejectionReason('per_ip_limit')).toBe(true);
+        expect(isValidRejectionReason('global_limit')).toBe(true);
+      });
+
+      it('rejects unknown or unexpected reason strings', () => {
+        expect(isValidRejectionReason('unknown')).toBe(false);
+        expect(isValidRejectionReason('')).toBe(false);
+        expect(isValidRejectionReason('rate_limit')).toBe(false);
+      });
+    });
+
+    describe('gauge non-negativity invariants', () => {
+      it('sseLiveSubscribersGauge never goes below 0', async () => {
+        const { _resetSseSubscriptionsForTest } = await import('../../src/streams/sseEmitter.js');
+        _resetSseSubscriptionsForTest();
+        const gauge = sseLiveSubscribersGauge;
+        const val = await gauge.get();
+        expect(val.values[0]?.value).toBeGreaterThanOrEqual(0);
+      });
+
+      it('sseEventListenersGauge never goes below 0', async () => {
+        const { _resetSseSubscriptionsForTest } = await import('../../src/streams/sseEmitter.js');
+        _resetSseSubscriptionsForTest();
+        const gauge = sseEventListenersGauge;
+        const val = await gauge.get();
+        expect(val.values[0]?.value).toBeGreaterThanOrEqual(0);
+      });
+
+      it('sseActiveConnectionsGauge never goes below 0', async () => {
+        const val = await sseActiveConnectionsGauge.get();
+        expect(val.values[0]?.value).toBeGreaterThanOrEqual(0);
+      });
+    });
+
+    describe('syncWebhookMetrics guards', () => {
+      it('clamps negative DLQ items to 0', () => {
+        const mockStore = {
+          getMetrics: () => ({
+            totalDeliveries: 0,
+            successfulDeliveries: 0,
+            failedDeliveries: 0,
+            dlqItems: -999,
+            outboxItems: 0,
+          }),
+        };
+        syncWebhookMetrics(mockStore);
+        const dlqMetric = webhookDlqItemsGauge.get().values[0];
+        expect(dlqMetric?.value).toBe(0);
+      });
+
+      it('clamps negative outbox items to 0', () => {
+        const mockStore = {
+          getMetrics: () => ({
+            totalDeliveries: 0,
+            successfulDeliveries: 0,
+            failedDeliveries: 0,
+            dlqItems: 0,
+            outboxItems: -500,
+          }),
+        };
+        syncWebhookMetrics(mockStore);
+        const outboxMetric = webhookOutboxPendingItemsGauge.get().values[0];
+        expect(outboxMetric?.value).toBe(0);
+      });
+
+      it('allows large positive DLQ and outbox values unchanged', () => {
+        const mockStore = {
+          getMetrics: () => ({
+            totalDeliveries: 0,
+            successfulDeliveries: 0,
+            failedDeliveries: 0,
+            dlqItems: 99999,
+            outboxItems: 88888,
+          }),
+        };
+        syncWebhookMetrics(mockStore);
+        expect(webhookDlqItemsGauge.get().values[0]?.value).toBe(99999);
+        expect(webhookOutboxPendingItemsGauge.get().values[0]?.value).toBe(88888);
+      });
     });
   });
 });
