@@ -328,19 +328,6 @@ export class JobQueue {
 }
 
 /**
- * Default retry configuration used for built-in background jobs.
- *
- * These constants are intentionally exported so callers and tests can
- * reference the same values without duplicating magic numbers.
- *
- * @internal
- */
-export const DEFAULT_RETRY_LIMIT = 3;
-export const DEFAULT_RETRY_DELAY = 30;   // seconds
-export const DEFAULT_RETRY_BACKOFF = true;
-export const DEFAULT_EXPIRE_SECONDS = 900; // 15 minutes
-
-/**
  * Constant used for the dead‑letter queue name.
  *
  * pg‑boss routes jobs that exceed their retry limit to this queue.
@@ -399,8 +386,17 @@ export function startBackgroundJobs(pool: Pool): void {
   queue.register(
     'partition-maintenance',
     async (ctx) => {
-      logger.info('Running partition maintenance job', undefined, { jobId: ctx.id });
-      await runPartitionMaintenance(pool);
+      logger.info('Running partition maintenance job', ctx.id, { jobId: ctx.id });
+      const result = await runPartitionMaintenance(pool, { correlationId: ctx.id });
+      logger.info('Partition maintenance job finished', ctx.id, {
+        lockAcquired: result.lockAcquired,
+        tables: result.tables.map((t) => ({
+          table: t.table,
+          managed: t.managed,
+          created: t.partitionsCreated.length,
+          behindSchedule: t.behindSchedule,
+        })),
+      });
     },
     {
       retryLimit: DEFAULT_RETRY_LIMIT,
