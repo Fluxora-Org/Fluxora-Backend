@@ -31,20 +31,41 @@
  * (REDIS_ENABLED=true, the default).  TTL is driven by IDEMPOTENCY_TTL_SECONDS
  * (default 86 400 s / 24 h).  See src/app.ts wireIdempotencyStore().
  *
+ * Pagination contract (GET /api/streams)
+ * --------------------------------------
+ * - **Default page size**: 20 (MIN=1, MAX=100).
+ * - **Ordering**: deterministic `ORDER BY id ASC` within the DB.
+ * - **Cursor format**: opaque base64url-encoded JSON `{ v: 1, lastId: <id> }`.
+ *   Clients must treat cursors as black boxes; only the server produces them.
+ * - **Determinism**: the same cursor always returns the same page for the
+ *   same underlying dataset.  Insertions/deletions between requests shift the
+ *   page boundaries (the cursor is an exclusive lower bound on `id`, not a
+ *   snapshot offset).
+ * - **Filters** (`status`, `sender`, `recipient`): pass-through strings — no
+ *   Zod enum validation is applied.  Invalid filter values produce an empty
+ *   result set, not a validation error.
+ * - **`include_total`**: when `true`, a separate `COUNT(*)` query runs.
+ *   The total is a best-effort snapshot (not cursor-consistent) and should
+ *   not be used for offset calculations.
+ * - **Cache-Control**: when every stream on the page is in a terminal state
+ *   (completed or cancelled) the response is marked `public, max-age=300,
+ *   stale-while-revalidate=60`.  Otherwise `private, no-store`.
+ *
  * Failure modes
  * -------------
- * - Missing Idempotency-Key  → 400 VALIDATION_ERROR
- * - Invalid Idempotency-Key  → 400 VALIDATION_ERROR
- * - Invalid decimal string   → 400 VALIDATION_ERROR
- * - Missing required field   → 400 VALIDATION_ERROR
- * - Missing authentication   → 401 UNAUTHORIZED
- * - Invalid token            → 401 UNAUTHORIZED
- * - Stream not found         → 404 NOT_FOUND
- * - Key reuse / diff payload → 409 CONFLICT
- * - Duplicate cancel         → 409 CONFLICT
- * - DB unavailable           → 503 SERVICE_UNAVAILABLE
- * - Idempotency store down   → 503 SERVICE_UNAVAILABLE
- * - Address not on-chain     → 422 UNPROCESSABLE_ENTITY
+ * - Missing Idempotency-Key   → 400 VALIDATION_ERROR
+ * - Invalid Idempotency-Key   → 400 VALIDATION_ERROR
+ * - Invalid decimal string    → 400 VALIDATION_ERROR
+ * - Missing required field    → 400 VALIDATION_ERROR
+ * - Missing authentication    → 401 UNAUTHORIZED
+ * - Invalid token             → 401 UNAUTHORIZED
+ * - Missing/invalid scope     → 403 FORBIDDEN
+ * - Stream not found          → 404 NOT_FOUND
+ * - Key reuse / diff payload  → 409 CONFLICT
+ * - Duplicate cancel          → 409 CONFLICT
+ * - DB unavailable            → 503 SERVICE_UNAVAILABLE
+ * - Idempotency store down    → 503 SERVICE_UNAVAILABLE
+ * - Address not on-chain      → 422 UNPROCESSABLE_ENTITY
  *
  * @module routes/streams
  */
@@ -65,6 +86,7 @@ import {
   serviceUnavailable,
   asyncHandler,
   tooManyRequests,
+  forbidden,
 } from '../middleware/errorHandler.js';
 import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
 import { canonicalizeBody } from '../middleware/idempotency.js';

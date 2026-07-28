@@ -78,14 +78,14 @@ function parseHostPorts(raw: string): Array<{ host: string; port: number }> {
 
 /** Attach structured log listeners to any ioredis client (Redis | Cluster). */
 function attachLogListeners(client: Redis | Cluster, mode: string): void {
-  client.on('connect', () => logger.info('redis:connect', { mode }));
-  client.on('ready', () => logger.info('redis:ready', { mode }));
-  client.on('reconnecting', () => logger.warn('redis:reconnecting', { mode }));
+  client.on('connect', () => logger.info('redis:connect', undefined, { mode }));
+  client.on('ready', () => logger.info('redis:ready', undefined, { mode }));
+  client.on('reconnecting', () => logger.warn('redis:reconnecting', undefined, { mode }));
   client.on('error', (err: Error) =>
-    logger.error('redis:error', { mode, error: err.message }),
+    logger.error('redis:error', undefined, { mode, error: err.message }),
   );
-  client.on('close', () => logger.warn('redis:close', { mode }));
-  client.on('end', () => logger.warn('redis:end', { mode }));
+  client.on('close', () => logger.warn('redis:close', undefined, { mode }));
+  client.on('end', () => logger.warn('redis:end', undefined, { mode }));
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +299,7 @@ export async function quitAllRedisClients(): Promise<void> {
   await Promise.all(
     clients.map((c) =>
       c.close().catch((err: unknown) => {
-        logger.warn('redis:quit_error', { error: (err as Error).message });
+        logger.warn('redis:quit_error', undefined, { error: (err as Error).message });
       }),
     ),
   );

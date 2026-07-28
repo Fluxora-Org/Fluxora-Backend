@@ -15,7 +15,7 @@ import { getApiKeyFromRequest, findRecordByRawKey } from '../lib/apiKey.js';
  * If an invalid API key is present, returns 401.
  */
 export async function authenticateApiKey(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const requestId = req.correlationId;
+  const requestId = req.id ?? req.correlationId;
   const rawKey = getApiKeyFromRequest(req.headers);
 
   if (!rawKey) {
@@ -23,7 +23,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
   }
 
   try {
-    const record = await getApiKeyRecord(rawKey);
+    const record = await findRecordByRawKey(rawKey);
     
     if (!record) {
       warn('API key authentication failed — key not found', { requestId });
@@ -176,7 +176,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 }
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const requestId = req.correlationId;
+  const requestId = req.id ?? req.correlationId;
   if (!req.user) {
     warn('Anonymous access denied to protected route', { path: req.path, requestId });
     res.status(401).json({
@@ -193,7 +193,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 
 export function requirePermission(permission: Permission) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.correlationId;
+    const requestId = req.id ?? req.correlationId;
     if (!req.user) {
       warn('Permission check failed: no authenticated user', { path: req.path, requestId });
       res.status(401).json({
@@ -223,7 +223,7 @@ export function requirePermission(permission: Permission) {
 
 export function requireScope(...requiredScopes: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.correlationId;
+    const requestId = req.id ?? req.correlationId;
     const isApiKeyAuth = (req as any).keyId !== undefined;
     const isJwtAuth = req.user !== undefined;
     if (!isApiKeyAuth && !isJwtAuth) {

@@ -32,7 +32,7 @@ export function requestLogger(req: Request, res: Response, next: NextFunction): 
 
   res.on('finish', () => {
     const duration = Date.now() - start;
-    logger.info('http request', {
+    logger.info('http request', req.correlationId as string, {
       method: req.method,
       path: req.path,
       status: res.statusCode,
@@ -51,11 +51,11 @@ export function requestLogger(req: Request, res: Response, next: NextFunction): 
  */
 export function safeErrorHandler(
   err: Error,
-  _req: Request,
+  req: Request,
   res: Response,
   _next: NextFunction,
 ): void {
-  logger.error('unhandled error', {
+  logger.error('unhandled error', req.correlationId as string, {
     error: redactKeysInString(err.message),
     stack: process.env.NODE_ENV === 'production' ? undefined : redactKeysInString(err.stack || ''),
   });

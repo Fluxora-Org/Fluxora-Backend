@@ -916,7 +916,8 @@ export function reloadHotConfig(): HotConfig {
   const parseOptionalInt = (raw: string | undefined): number | undefined => {
     if (raw === undefined || raw === '') return undefined;
     const n = Number.parseInt(raw, 10);
-    return Number.isFinite(n) ? n : undefined;
+    if (!Number.isFinite(n) || n <= 0) return undefined; // Reject non-positive values
+    return n;
   };
 
   const parseFloat01 = (raw: string | undefined, fallback: number): number => {
