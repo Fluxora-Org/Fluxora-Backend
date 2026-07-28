@@ -619,4 +619,101 @@ describe('dropOldPartitions', () => {
     expect(result.droppedPartitions).not.toContain('contract_events_null');
     expect(result.droppedPartitions).not.toContain('contract_events_empty');
   })
+
+  // ── Validation ─────────────────────────────────────────────────────────────
+
+  it('fails when parentTable is empty', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, '', 30, true);
+
+    expect(result.success).toBe(false);
+    expect(result.droppedPartitions).toEqual([]);
+    expect(result.message).toContain('parentTable is required');
+    expect(fakePool.query).not.toHaveBeenCalled();
+  })
+
+  it('fails when parentTable contains SQL-unsafe characters', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events; DROP TABLE users;--', 30, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('valid SQL identifier');
+    expect(fakePool.query).not.toHaveBeenCalled();
+  })
+
+  it('fails when olderThanDays is negative', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', -5, true);
+
+    expect(result.success).toBe(false);
+    expect(result.droppedPartitions).toEqual([]);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+    expect(fakePool.query).not.toHaveBeenCalled();
+  })
+
+  it('fails when olderThanDays is zero', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 0, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+  })
+
+  it('fails when olderThanDays is NaN', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', NaN, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+  })
+
+  it('fails when olderThanDays is Infinity', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', Infinity, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+  })
+
+  // ── success field ──────────────────────────────────────────────────────────
+
+  it('returns success: true on a normal dry-run result', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_old', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, true);
+
+    expect(result.success).toBe(true);
+  })
+
+  // ── Unsafe identifier defense-in-depth ────────────────────────────────────
+
+  it('skips a partition whose name is not a safe SQL identifier and does not attempt to drop it', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_old; DROP TABLE users;--', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, false);
+
+    expect(result.droppedPartitions).toEqual([]);
+    expect(result.success).toBe(true);
+    const queryCalls = (fakePool.query as ReturnType<typeof vi.fn>).mock.calls as [string, ...unknown[]][];
+    const dropCalls = queryCalls.filter(([sql]) => /DROP TABLE/i.test(sql));
+    expect(dropCalls).toHaveLength(0);
+  })
 })
