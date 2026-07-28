@@ -177,7 +177,7 @@ export function csrfMiddleware(req: Request, res: Response, next: NextFunction):
     return next();
   }
 
-  const requestId = req.correlationId ?? req.id;
+  const requestId = req.id ?? req.correlationId;
 
   // 3. Extract cookie token and header token
   const cookies = parseCookies(req.headers.cookie);
