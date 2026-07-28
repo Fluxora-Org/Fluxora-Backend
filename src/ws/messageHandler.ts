@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { STELLAR_PUBLIC_KEY_REGEX } from '../validation/schemas.js';
+import { logger } from '../lib/logger.js';
 
 const MAX_FILTER_VALUE_LENGTH = 256;
 const MAX_INBOUND_MESSAGE_BYTES = 4_096;
@@ -221,13 +222,15 @@ function validationMessage(issues: z.ZodIssue[]): string {
  * @param raw Parsed JSON value from the client frame.
  * @returns The normalized WebSocket client message or a validation error.
  */
-export function validateWebSocketMessage(data: unknown): WsMessageParseResult {
+export function validateWebSocketMessage(data: unknown, correlationId?: string): WsMessageParseResult {
   if (typeof data !== 'string') {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'not_string' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a string' };
   }
 
   const byteLength = Buffer.byteLength(data, 'utf8');
   if (byteLength > MAX_INBOUND_MESSAGE_BYTES) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'payload_too_large', byteLength });
     return {
       ok: false,
       code: 'INVALID_MESSAGE',
@@ -239,16 +242,18 @@ export function validateWebSocketMessage(data: unknown): WsMessageParseResult {
   try {
     parsed = JSON.parse(data);
   } catch {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'malformed_json' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Invalid JSON' };
   }
 
-  return parseWsClientMessage(parsed);
+  return parseWsClientMessage(parsed, correlationId);
 }
 
-export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
+export function parseWsClientMessage(raw: unknown, correlationId?: string): WsMessageParseResult {
   // Reject oversized payloads before any parsing (issue #674)
   const rawString = typeof raw === 'string' ? raw : JSON.stringify(raw);
   if (rawString && rawString.length > MAX_MESSAGE_BYTES) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'oversized_payload', size: rawString.length });
     return { 
       ok: false, 
       code: 'INVALID_MESSAGE', 
@@ -257,16 +262,19 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
   }
 
   if (!isObject(raw)) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'not_object' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a JSON object' };
   }
 
   if (typeof raw.type !== 'string') {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'missing_or_invalid_type' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'type must be a string' };
   }
 
   if (raw.type === 'subscribe' || raw.type === 'unsubscribe') {
     const result = subscriptionMessageSchema.safeParse(raw);
     if (!result.success) {
+      logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'schema_validation', type: raw.type, issues: result.error.issues.map(i => i.message) });
       return { ok: false, code: 'INVALID_MESSAGE', message: validationMessage(result.error.issues) };
     }
 
@@ -279,6 +287,7 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
         },
       };
     } catch (error) {
+      logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'normalize_error', type: raw.type });
       return {
         ok: false,
         code: 'INVALID_MESSAGE',
@@ -290,6 +299,7 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
   if (raw.type === 'replay') {
     const result = replayMessageSchema.safeParse(raw);
     if (!result.success) {
+      logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'schema_validation', type: 'replay', issues: result.error.issues.map(i => i.message) });
       return { ok: false, code: 'INVALID_MESSAGE', message: validationMessage(result.error.issues) };
     }
 
@@ -302,10 +312,11 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
     };
   }
 
+  logger.warn('ws_envelope_reject', correlationId, { code: 'UNKNOWN_TYPE', type: raw.type });
   return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${raw.type}` };
 }
 
-export function parseHandshakeSubscriptionFilter(url: string): HandshakeSubscriptionParseResult {
+export function parseHandshakeSubscriptionFilter(url: string, correlationId?: string): HandshakeSubscriptionParseResult {
   const params = new URL(url, 'ws://localhost').searchParams;
   const streamId = params.get('stream_id') ?? params.get('streamId');
   const recipientAddress = params.get('recipient_address') ?? params.get('recipientAddress');
@@ -320,8 +331,9 @@ export function parseHandshakeSubscriptionFilter(url: string): HandshakeSubscrip
   if (streamId !== null) input['stream_id'] = streamId;
   if (recipientAddress !== null) input['recipient_address'] = recipientAddress;
 
-  const result = parseWsClientMessage(input);
+  const result = parseWsClientMessage(input, correlationId);
   if (!result.ok) {
+    logger.warn('ws_handshake_reject', correlationId, { reason: result.message });
     return { ok: false, message: result.message };
   }
 

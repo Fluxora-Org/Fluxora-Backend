@@ -20,10 +20,9 @@ export function requestLoggerMiddleware(req: Request, res: Response, next: NextF
   const { correlationId } = req;
   const startMs = Date.now();
 
-  logger.info('request received', {
+  logger.info('request received', correlationId as string, {
     method: req.method,
     path: req.path,
-    correlationId,
   });
 
   res.on('finish', () => {
@@ -32,15 +31,14 @@ export function requestLoggerMiddleware(req: Request, res: Response, next: NextF
       path: req.path,
       statusCode: res.statusCode,
       durationMs: Date.now() - startMs,
-      correlationId,
     };
 
     if (res.statusCode >= 500) {
-      logger.error('request failed', meta);
+      logger.error('request failed', correlationId as string, meta);
       return;
     }
 
-    logger.info('request completed', meta);
+    logger.info('request completed', correlationId as string, meta);
   });
 
   next();
