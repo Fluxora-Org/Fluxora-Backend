@@ -8,8 +8,10 @@ import {
   safeCompareCsrfTokens,
   generateCsrfToken,
   setCsrfCookie,
+  isValidCsrfToken,
   CSRF_COOKIE_NAME,
   CSRF_HEADER_NAME,
+  CSRF_TOKEN_MAX_LENGTH,
 } from '../../src/middleware/csrf.js';
 import { errorHandler } from '../../src/middleware/errorHandler.js';
 
@@ -636,5 +638,271 @@ describe('csrfMiddleware integration — no-cookie requests', () => {
     const res = await request(app)
       .delete('/api/streams/s_1');
     expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isValidCsrfToken — unit tests
+// ---------------------------------------------------------------------------
+describe('isValidCsrfToken', () => {
+  it('accepts a normal 64-char hex token', () => {
+    expect(isValidCsrfToken('a'.repeat(64))).toBe(true);
+  });
+
+  it('accepts a short non-empty string', () => {
+    expect(isValidCsrfToken('abc')).toBe(true);
+  });
+
+  it('accepts a token exactly at the max length limit', () => {
+    expect(isValidCsrfToken('x'.repeat(CSRF_TOKEN_MAX_LENGTH))).toBe(true);
+  });
+
+  it('rejects a token one character over the max length', () => {
+    expect(isValidCsrfToken('x'.repeat(CSRF_TOKEN_MAX_LENGTH + 1))).toBe(false);
+  });
+
+  it('rejects a very long token (potential DoS)', () => {
+    expect(isValidCsrfToken('a'.repeat(100_000))).toBe(false);
+  });
+
+  it('rejects an empty string', () => {
+    expect(isValidCsrfToken('')).toBe(false);
+  });
+
+  it('rejects undefined', () => {
+    expect(isValidCsrfToken(undefined)).toBe(false);
+  });
+
+  it('rejects null', () => {
+    expect(isValidCsrfToken(null)).toBe(false);
+  });
+
+  it('rejects a token containing a null byte', () => {
+    expect(isValidCsrfToken('valid\x00token')).toBe(false);
+  });
+
+  it('rejects a token containing a carriage-return character', () => {
+    expect(isValidCsrfToken('valid\rtoken')).toBe(false);
+  });
+
+  it('rejects a token containing a newline character', () => {
+    expect(isValidCsrfToken('valid\ntoken')).toBe(false);
+  });
+
+  it('rejects a token consisting only of control characters', () => {
+    expect(isValidCsrfToken('\x01\x02\x03')).toBe(false);
+  });
+
+  it('rejects a token containing the DEL character (0x7F)', () => {
+    expect(isValidCsrfToken('tok\x7Fen')).toBe(false);
+  });
+
+  it('accepts a token with printable non-hex characters (e.g. UUID-style)', () => {
+    expect(isValidCsrfToken('550e8400-e29b-41d4-a716-446655440000')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// csrfMiddleware — token length and control-character hardening
+// ---------------------------------------------------------------------------
+describe('csrfMiddleware integration — token hardening', () => {
+  let app: express.Express;
+  beforeEach(() => { app = buildApp(); });
+
+  it('blocks POST when cookie token exceeds max length (DoS defense)', async () => {
+    const hugeToken = 'a'.repeat(CSRF_TOKEN_MAX_LENGTH + 1);
+    const goodToken = generateCsrfToken();
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${hugeToken}`)
+      .set('X-CSRF-Token', goodToken)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+    // Message should indicate missing (not mismatch) since oversized token is treated as absent
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
+
+  it('blocks POST when header token exceeds max length (DoS defense)', async () => {
+    const goodToken = generateCsrfToken();
+    const hugeToken = 'a'.repeat(CSRF_TOKEN_MAX_LENGTH + 1);
+    const res = await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${goodToken}`)
+      .set('X-CSRF-Token', hugeToken)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
+
+  it('blocks POST when cookie token contains a null byte', async () => {
+    const goodToken = generateCsrfToken();
+    // embed null byte into cookie value (URL-encode so the HTTP layer passes it)
+    const maliciousToken = 'abc%00def';
+    const res = await request(app)
+      .post('/api/streams')
+      // Use raw cookie header construction to include percent-encoded null byte
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${maliciousToken}`)
+      .set('X-CSRF-Token', goodToken)
+      .send({});
+    // After parseCookies URI-decodes, cookieToken will contain \x00 → rejected
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks POST when header token contains a newline character', async () => {
+    const goodToken = generateCsrfToken();
+    // Inject via the inner-middleware pattern (Express strips headers at network layer)
+    const innerApp = express();
+    innerApp.use(express.json());
+    innerApp.use((req, _res, next) => {
+      (req.headers as Record<string, string | string[]>)[CSRF_HEADER_NAME] =
+        `${goodToken}\nsomething`;
+      next();
+    });
+    innerApp.use(csrfMiddleware);
+    innerApp.post('/api/streams', (_req, res) => res.json({ ok: true }));
+
+    const res = await request(innerApp)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${goodToken}`)
+      .send({});
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks POST when header token contains a carriage-return character', async () => {
+    const goodToken = generateCsrfToken();
+    const innerApp = express();
+    innerApp.use(express.json());
+    innerApp.use((req, _res, next) => {
+      (req.headers as Record<string, string | string[]>)[CSRF_HEADER_NAME] =
+        `${goodToken}\rintruder`;
+      next();
+    });
+    innerApp.use(csrfMiddleware);
+    innerApp.post('/api/streams', (_req, res) => res.json({ ok: true }));
+
+    const res = await request(innerApp)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${goodToken}`)
+      .send({});
+    expect(res.status).toBe(403);
+  });
+
+  it('blocks POST when array-valued header contains only empty strings', async () => {
+    // ['', ''] → first element is '' → isValidCsrfToken('') === false
+    const goodToken = generateCsrfToken();
+    const innerApp = express();
+    innerApp.use(express.json());
+    innerApp.use((req, _res, next) => {
+      (req.headers as Record<string, string | string[]>)[CSRF_HEADER_NAME] = ['', ''];
+      next();
+    });
+    innerApp.use(csrfMiddleware);
+    innerApp.post('/api/streams', (_req, res) => res.json({ ok: true }));
+
+    const res = await request(innerApp)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${goodToken}`)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token missing');
+  });
+
+  it('allows POST when a token exactly at max length is used consistently', async () => {
+    const token = 'a'.repeat(CSRF_TOKEN_MAX_LENGTH);
+    const innerApp = express();
+    innerApp.use(express.json());
+    innerApp.use((req, _res, next) => {
+      (req.headers as Record<string, string | string[]>)[CSRF_HEADER_NAME] = token;
+      next();
+    });
+    innerApp.use(csrfMiddleware);
+    innerApp.post('/api/streams', (_req, res) => res.json({ ok: true }));
+
+    const res = await request(innerApp)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${encodeURIComponent(token)}`)
+      .send({});
+    expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setCsrfCookie — HttpOnly absence documented and verified
+// ---------------------------------------------------------------------------
+describe('setCsrfCookie — HttpOnly must NOT be set', () => {
+  function makeRes(): { headers: Record<string, string[]>; append: (n: string, v: string) => void } {
+    const headers: Record<string, string[]> = {};
+    return {
+      headers,
+      append(name: string, value: string) {
+        const lower = name.toLowerCase();
+        headers[lower] = headers[lower] ?? [];
+        headers[lower].push(value);
+      },
+    };
+  }
+
+  it('does not include HttpOnly in the Set-Cookie header (cookie must be JS-readable)', () => {
+    const res = makeRes();
+    setCsrfCookie(res as unknown as Response, 'my-token');
+    const cookie = res.headers['set-cookie']?.[0] ?? '';
+    expect(cookie.toLowerCase()).not.toContain('httponly');
+  });
+
+  it('does not include HttpOnly even with secure=true', () => {
+    const res = makeRes();
+    setCsrfCookie(res as unknown as Response, 'my-token', { secure: true });
+    const cookie = res.headers['set-cookie']?.[0] ?? '';
+    expect(cookie.toLowerCase()).not.toContain('httponly');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isCookieAuthenticated — x-api-key array with empty-string first element
+// ---------------------------------------------------------------------------
+describe('isCookieAuthenticated — array query param edge cases', () => {
+  it('does NOT bypass CSRF for x-api-key array whose first element is empty string', () => {
+    // The first element '' is falsy / blank → rule 3 does NOT fire → cookie-auth path applies
+    const req = {
+      headers: { cookie: 'session=abc' },
+      query: { 'x-api-key': ['', 'flx_second'] },
+    } as unknown as Request;
+    // normalizedQueryKey = '' → trim().length === 0 → rule 3 does not fire → returns true
+    expect(isCookieAuthenticated(req)).toBe(true);
+  });
+
+  it('does NOT bypass CSRF for x-api-key array where all elements are whitespace', () => {
+    const req = {
+      headers: { cookie: 'session=abc' },
+      query: { 'x-api-key': ['   ', '  '] },
+    } as unknown as Request;
+    expect(isCookieAuthenticated(req)).toBe(true);
+  });
+
+  it('DOES bypass CSRF for x-api-key array with a valid first element', () => {
+    const req = {
+      headers: { cookie: 'session=abc' },
+      query: { 'x-api-key': ['flx_valid_key', 'flx_second'] },
+    } as unknown as Request;
+    expect(isCookieAuthenticated(req)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseCookies — empty cookie value edge case
+// ---------------------------------------------------------------------------
+describe('parseCookies — empty values', () => {
+  it('stores empty string for a cookie set as name= (value absent after =)', () => {
+    // idx > 0 ensures the key exists; value may legitimately be empty
+    const result = parseCookies(`${CSRF_COOKIE_NAME}=; session=abc`);
+    expect(CSRF_COOKIE_NAME in result).toBe(true);
+    expect(result[CSRF_COOKIE_NAME]).toBe('');
+  });
+
+  it('stores empty string for a lone key= at end of header', () => {
+    const result = parseCookies(`session=abc; ${CSRF_COOKIE_NAME}=`);
+    expect(result[CSRF_COOKIE_NAME]).toBe('');
   });
 });
