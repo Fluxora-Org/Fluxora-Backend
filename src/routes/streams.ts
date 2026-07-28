@@ -336,6 +336,9 @@ function encodeCursor(lastId: string): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
+/** Maximum permitted length for the `lastId` field inside a decoded cursor payload. */
+const CURSOR_LAST_ID_MAX_LENGTH = 200;
+
 function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
   let parsed: unknown;
   try {
@@ -354,7 +357,12 @@ function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
     warn('Cursor payload invalid', { parsed, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
-  return parsed as StreamsCursor;
+  const candidate = parsed as StreamsCursor;
+  if (candidate.lastId.length > CURSOR_LAST_ID_MAX_LENGTH) {
+    warn('Cursor lastId exceeds maximum length', { length: candidate.lastId.length, requestId });
+    throw validationError('cursor must be a valid opaque pagination token');
+  }
+  return candidate;
 }
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
