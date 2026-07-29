@@ -178,6 +178,30 @@ describe('backupDatabase', () => {
     expect(result.message).toContain('invalid characters')
   })
 
+  it('fails when S3 bucket is empty', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: '', key: 'dump.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 bucket path is required')
+  })
+
+  it('fails when S3 key is empty', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: 'my-backups', key: '' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 key path is required')
+  })
+
+  it('fails when S3 bucket contains shell metacharacters', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: 'my;rm -rf /', key: 'dump.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('invalid characters')
+  })
+
+  it('fails when S3 key contains shell metacharacters', async () => {
+    const result = await backupDatabase(VALID_URL, '', { bucket: 'my-backups', key: 'dump`whoami`.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('invalid characters')
+  })
+
   // ── Local file backup ─────────────────────────────────────────────────────
 
   it('calls execFile with pg_dump args and returns success', async () => {
@@ -268,6 +292,82 @@ describe('backupDatabase', () => {
     expect(result.message).toBe('Backup failed')
     expect(result.error).toContain('S3 upload failed')
   })
+
+  it('resolves AWS region according to priority hierarchy (target.region > AWS_REGION > AWS_DEFAULT_REGION > us-east-1)', async () => {
+    const { S3Client } = await import('@aws-sdk/client-s3') as { S3Client: MockInstance }
+
+    const originalRegion = process.env.AWS_REGION
+    const originalDefaultRegion = process.env.AWS_DEFAULT_REGION
+
+    try {
+      // 1. Explicit target region takes top priority
+      process.env.AWS_REGION = 'eu-west-1'
+      process.env.AWS_DEFAULT_REGION = 'ap-southeast-1'
+
+      const fakeChild1 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild1)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1', region: 'ca-central-1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'ca-central-1' })
+
+      // 2. AWS_REGION env var takes second priority when target region is omitted
+      const fakeChild2 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild2)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'eu-west-1' })
+
+      // 3. AWS_DEFAULT_REGION env var takes third priority
+      delete process.env.AWS_REGION
+      const fakeChild3 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild3)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'ap-southeast-1' })
+
+      // 4. Default fallback is 'us-east-1'
+      delete process.env.AWS_DEFAULT_REGION
+      const fakeChild4 = makeFakeChild(0)
+      ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild4)
+
+      await backupDatabase(VALID_URL, '', { bucket: 'b1', key: 'k1' })
+      expect(S3Client).toHaveBeenLastCalledWith({ region: 'us-east-1' })
+    } finally {
+      process.env.AWS_REGION = originalRegion
+      process.env.AWS_DEFAULT_REGION = originalDefaultRegion
+    }
+  })
+
+  it('handles child process error event (e.g. pg_dump ENOENT)', async () => {
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const stdin = new PassThrough()
+    stdout.end()
+
+    const fakeChild: Record<string, unknown> = {
+      stdout,
+      stderr,
+      stdin,
+      on: vi.fn((event: string, cb: (err: Error) => void) => {
+        if (event === 'error') {
+          Promise.resolve().then(() => {
+            cb(new Error('spawn pg_dump ENOENT'))
+          })
+        }
+        return fakeChild
+      }),
+    }
+    ;(childProcess.spawn as unknown as MockInstance).mockReturnValue(fakeChild)
+
+    const result = await backupDatabase(VALID_URL, '', {
+      bucket: 'my-backups',
+      key: 'fluxora/enoent.dump',
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.message).toBe('Backup failed')
+    expect(result.error).toContain('spawn pg_dump ENOENT')
+  })
 })
 
 // ── restoreDatabase ───────────────────────────────────────────────────────────
@@ -307,6 +407,18 @@ describe('restoreDatabase', () => {
     const result = await restoreDatabase(VALID_URL, './dump|cat /etc/passwd')
     expect(result.success).toBe(false)
     expect(result.message).toContain('invalid characters')
+  })
+
+  it('fails when S3 bucket is empty', async () => {
+    const result = await restoreDatabase(VALID_URL, '', { bucket: '', key: 'dump.dump' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 bucket path is required')
+  })
+
+  it('fails when S3 key is empty', async () => {
+    const result = await restoreDatabase(VALID_URL, '', { bucket: 'my-backups', key: '' })
+    expect(result.success).toBe(false)
+    expect(result.message).toContain('S3 key path is required')
   })
 
   // ── Local file restore ────────────────────────────────────────────────────
@@ -507,5 +619,166 @@ describe('dropOldPartitions', () => {
     // The first query gets the partitions, but DROP TABLE is never called
     expect(fakePool.query).toHaveBeenCalledTimes(1);
     expect(fakePool.query).toHaveBeenCalledWith(expect.stringContaining('SELECT'), ['contract_events']);
+  })
+
+  // ── Input validation ─────────────────────────────────────────────────
+
+  it('rejects empty parentTable', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, '', 30, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('parentTable is required')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects whitespace-only parentTable', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, '   ', 30, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('parentTable is required')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects negative olderThanDays', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', -1, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('non-negative')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects NaN olderThanDays', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', NaN, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('non-negative')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('rejects Infinity olderThanDays', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', Infinity, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('non-negative')
+    expect(fakePool.query).not.toHaveBeenCalled()
+  })
+
+  it('handles pool.query rejection gracefully', async () => {
+    const fakePool = {
+      query: vi.fn().mockRejectedValue(new Error('connection refused')),
+    } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, true)
+    expect(result.droppedPartitions).toHaveLength(0)
+    expect(result.message).toContain('Failed to query partitions')
+    expect(result.message).toContain('connection refused')
+  })
+
+  it('accepts olderThanDays of 0 (drops everything before today)', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'ce_old', partition_bound: "FOR VALUES FROM ('2020-01-01') TO ('2020-02-01')" },
+        ]
+      })
+    } as unknown as import('pg').Pool
+    const result = await dropOldPartitions(fakePool, 'contract_events', 0, true)
+    expect(result.droppedPartitions).toContain('ce_old')
+  })
+
+  // ── Validation ─────────────────────────────────────────────────────────────
+
+  it('fails when parentTable is empty', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, '', 30, true);
+
+    expect(result.success).toBe(false);
+    expect(result.droppedPartitions).toEqual([]);
+    expect(result.message).toContain('parentTable is required');
+    expect(fakePool.query).not.toHaveBeenCalled();
+  })
+
+  it('fails when parentTable contains SQL-unsafe characters', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events; DROP TABLE users;--', 30, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('valid SQL identifier');
+    expect(fakePool.query).not.toHaveBeenCalled();
+  })
+
+  it('fails when olderThanDays is negative', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', -5, true);
+
+    expect(result.success).toBe(false);
+    expect(result.droppedPartitions).toEqual([]);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+    expect(fakePool.query).not.toHaveBeenCalled();
+  })
+
+  it('fails when olderThanDays is zero', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 0, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+  })
+
+  it('fails when olderThanDays is NaN', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', NaN, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+  })
+
+  it('fails when olderThanDays is Infinity', async () => {
+    const fakePool = { query: vi.fn() } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', Infinity, true);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('olderThanDays must be a finite number greater than 0');
+  })
+
+  // ── success field ──────────────────────────────────────────────────────────
+
+  it('returns success: true on a normal dry-run result', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_old', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, true);
+
+    expect(result.success).toBe(true);
+  })
+
+  // ── Unsafe identifier defense-in-depth ────────────────────────────────────
+
+  it('skips a partition whose name is not a safe SQL identifier and does not attempt to drop it', async () => {
+    const fakePool = {
+      query: vi.fn().mockResolvedValue({
+        rows: [
+          { partition_name: 'contract_events_old; DROP TABLE users;--', partition_bound: "FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-02-01 00:00:00+00')" }
+        ]
+      })
+    } as unknown as import('pg').Pool;
+
+    const result = await dropOldPartitions(fakePool, 'contract_events', 30, false);
+
+    expect(result.droppedPartitions).toEqual([]);
+    expect(result.success).toBe(true);
+    const queryCalls = (fakePool.query as ReturnType<typeof vi.fn>).mock.calls as [string, ...unknown[]][];
+    const dropCalls = queryCalls.filter(([sql]) => /DROP TABLE/i.test(sql));
+    expect(dropCalls).toHaveLength(0);
   })
 })

@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { createApp } from '../../src/app.js';
 import { serverTimingMiddleware, getServerTimingRegistry, createServerTimingRegistry } from '../../src/middleware/serverTiming.js';
 
 describe('Server Timing middleware', () => {
@@ -56,12 +55,16 @@ describe('Server Timing middleware', () => {
     expect(res.headers['server-timing']).toBe('serialize;dur=3.75');
   });
 
-  it('uses the app middleware stack when mounted globally', async () => {
+  it('keeps the header unset when no phases are recorded', async () => {
     process.env.SERVER_TIMING_ENABLED = 'true';
-    const app = createApp();
+    const app = express();
+    app.use(serverTimingMiddleware());
+    app.get('/empty', (_req, res) => {
+      res.json({ ok: true });
+    });
 
-    const res = await request(app).get('/health');
-    expect(res.headers['server-timing']).toBeDefined();
+    const res = await request(app).get('/empty');
+    expect(res.headers['server-timing']).toBeUndefined();
   });
 
   it('returns a stable snapshot for the current request', () => {

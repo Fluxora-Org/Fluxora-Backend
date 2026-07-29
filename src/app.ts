@@ -41,7 +41,7 @@ import { requireJsonContentType } from './middleware/contentType.js';
 import { requireJsonAccept } from './middleware/acceptNegotiation.js';
 import { methodOverrideMiddleware } from './middleware/methodOverride.js';
 import { httpMetrics } from './middleware/httpMetrics.js';
-import { canaryRoutingMiddleware } from './middleware/canaryRouting.js';
+import { canaryRoutingMiddleware } from './middleware/canaryRouting.ts';
 import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
@@ -56,8 +56,10 @@ import { createDeprecationMiddleware } from './middleware/deprecation.js';
 import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
-import { successResponse, errorResponse } from './utils/response.js';
+import { successResponse } from './utils/response.js';
+import { ApiError } from './errors.js';
 import { docsRouter } from './routes/docs.js';
+import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
@@ -515,6 +517,9 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/admin/dlq', dlqRouter);
   app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
 
+  // Experimental GraphQL federation gateway — feature-flagged off by default.
+  app.use('/api/graphql', graphqlGatewayRouter);
+
   app.get('/', (_req: Request, res: Response) => {
     res.json(
       successResponse({
@@ -525,11 +530,8 @@ export function createApp(options: AppOptions = {}): Express {
     );
   });
 
-  app.use((req: Request, res: Response) => {
-    const requestId = req.correlationId;
-    res.status(404).json(
-      errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
-    );
+  app.use((_req: Request, _res: Response, next: NextFunction) => {
+    next(new ApiError(404, 'NOT_FOUND', 'The requested resource was not found'));
   });
 
   app.use(errorHandler);

@@ -205,6 +205,51 @@ export const dlqRepository = {
     return result.rowCount ?? 0;
   },
 
+  /**
+   * Purge terminal-state DLQ entries older than the given cutoff date.
+   *
+   * Terminal states:
+   *   - `status = 'replayed'` — explicitly resolved by an operator replay.
+   *   - `status = 'dead'` with `last_failed_at < cutoff` — entries that have
+   *     been sitting dead beyond the retention window.  Because the
+   *     dead_letter_queue table has no `max_attempts` column, the age-based
+   *     heuristic serves as the "permanently failed" signal: if an entry has
+   *     been dead for longer than the retention window, no operator or worker
+   *     is actively retrying it.
+   *
+   * This method is called by the scheduled `dlq-purge` job in bounded
+   * batches to avoid long-held locks on `dead_letter_queue`.
+   *
+   * **Security**: Only targets rows in terminal states; pending entries
+   * (`status = 'dead'` with recent `last_failed_at`) are never touched.
+   *
+   * @param batchSize  — Maximum rows to delete in a single call.
+   * @param cutoffDate — ISO-8601 timestamp; entries older than this are eligible.
+   * @returns The number of rows deleted.
+   */
+  async purgeTerminalEntries(batchSize: number, cutoffDate: string): Promise<number> {
+    const pool = getPool();
+    const result = await query(
+      pool,
+      `DELETE FROM dead_letter_queue
+       WHERE id IN (
+         SELECT id FROM dead_letter_queue
+          WHERE (
+            -- Resolved: explicitly replayed by an operator
+            status = 'replayed'
+            OR
+            -- Exhausted: dead entries beyond retention window;
+            -- recent last_failed_at implies still pending/in-flight.
+            (status = 'dead' AND last_failed_at < $2)
+          )
+          ORDER BY last_failed_at ASC
+          LIMIT $1
+       )`,
+      [batchSize, cutoffDate],
+    );
+    return result.rowCount ?? 0;
+  },
+
   async replayEntry(id: string, patch: Partial<Pick<DlqEntry, 'attempts' | 'lastFailedAt'>>): Promise<boolean> {
     const pool = getPool();
     const sets: string[] = [];

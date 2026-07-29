@@ -251,16 +251,16 @@ async function probeSoft(
     budgetMs: number;
     baseRetryMs: number;
     maxRetryMs: number;
+    deadlineMs: number;
   },
 ): Promise<StartupProbeResult> {
   const timeoutMs = cfg.timeoutMs ?? 5_000;
-  const probeStart = Date.now();
   let attempts = 0;
   let lastError: string | undefined;
   let lastLatency = 0;
 
   /** True when we have already consumed more wall-clock time than the budget. */
-  const budgetExhausted = (): boolean => Date.now() - probeStart >= opts.budgetMs;
+  const budgetExhausted = (): boolean => Date.now() >= opts.deadlineMs;
 
   try {
     await withJitteredRetry(
@@ -272,12 +272,16 @@ async function probeSoft(
           dependency: cfg.name,
           tier: 'soft',
           attempt,
-          timeoutMs,
-          budgetRemainingMs: Math.max(0, opts.budgetMs - (Date.now() - probeStart)),
+          timeoutMs: Math.min(timeoutMs, Math.max(1, opts.deadlineMs - Date.now())),
+          budgetRemainingMs: Math.max(0, opts.deadlineMs - Date.now()),
         });
 
         try {
-          await probeWithTimeout(cfg.probe, timeoutMs, cfg.name);
+          await probeWithTimeout(
+            cfg.probe,
+            Math.min(timeoutMs, Math.max(1, opts.deadlineMs - Date.now())),
+            cfg.name,
+          );
           lastLatency = Date.now() - attemptStart;
           lastError = undefined;
 
@@ -300,7 +304,7 @@ async function probeSoft(
             outcome: 'retry',
             latencyMs: lastLatency,
             error: lastError,
-            budgetRemainingMs: Math.max(0, opts.budgetMs - (Date.now() - probeStart)),
+            budgetRemainingMs: Math.max(0, opts.deadlineMs - Date.now()),
           });
 
           throw err; // re-throw to trigger retry logic in withJitteredRetry
@@ -309,6 +313,7 @@ async function probeSoft(
       {
         baseDelayMs: opts.baseRetryMs,
         maxDelayMs: opts.maxRetryMs,
+        maxDelayForAttemptMs: () => Math.max(0, opts.deadlineMs - Date.now()),
         // A large cap; actual stopping is done via the isRetryable predicate
         maxAttempts: 1_000,
       },
@@ -397,9 +402,10 @@ export async function probeStartupDependencies(
 
   // ── Phase 2: Soft probes (concurrent, retry-with-backoff) ───────────────
   const softProbes = opts.probes.filter((p) => p.tier === 'soft');
+  const deadlineMs = Date.now() + budgetMs;
   const softResults = await Promise.all(
     softProbes.map((probe) =>
-      probeSoft(probe, { budgetMs, baseRetryMs, maxRetryMs }),
+      probeSoft(probe, { budgetMs, baseRetryMs, maxRetryMs, deadlineMs }),
     ),
   );
   results.push(...softResults);

@@ -323,6 +323,85 @@ curl https://api.example.com/api/streams/stream-abc123-0/export.jsonld \
 | `404` | `NOT_FOUND` | Stream does not exist |
 | `503` | `SERVICE_UNAVAILABLE` | Database connection pool exhausted |
 
+## GET /api/streams/:id/poll
+
+Long-polling fallback endpoint for WebSocket-incapable clients or clients behind enterprise proxies that block WebSocket/SSE upgrades.
+Holds the connection open (bounded by a timeout) until a new event for the stream arrives or the timeout elapses. Returns the same event envelope shape used by the WebSocket/SSE hub.
+
+### Query Parameters
+
+| Name | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `since` | string | — | Optional. Event ID cursor to fetch missed events. Replays from the since point before holding for live updates. |
+| `timeout` | integer | 30 | Optional. Maximum duration in seconds to hold the connection open. Capped at a maximum of 30 seconds. |
+
+### Response Body
+
+#### If an event is found (either immediately or during the poll duration):
+Returns a standard event envelope:
+```json
+{
+  "success": true,
+  "data": {
+    "type": "stream_update",
+    "streamId": "stream-abc123-0",
+    "eventId": "evt-12345",
+    "payload": {
+      "id": "stream-abc123-0",
+      "depositAmount": "1000",
+      "streamedAmount": "100",
+      "remainingAmount": "900",
+      "ratePerSecond": "0.1",
+      "status": "active"
+    },
+    "correlationId": "req-98765"
+  },
+  "meta": {
+    "timestamp": "2024-01-15T10:30:00Z",
+    "requestId": "req-98765"
+  }
+}
+```
+
+#### If the timeout elapses with no new events:
+Returns a success envelope with `null` data:
+```json
+{
+  "success": true,
+  "data": null,
+  "meta": {
+    "timestamp": "2024-01-15T10:30:30Z",
+    "requestId": "req-98765"
+  }
+}
+```
+
+### Rate Limiting and Capacity Limits
+
+To prevent resource exhaustion, the long-poll endpoint enforces a dedicated limiter:
+- **Maximum hold duration**: 30 seconds.
+- **Per-IP concurrent connection cap**: Clamped by `LONG_POLL_MAX_CONNECTIONS_PER_IP` (default: `10`).
+- **Global concurrent connection cap**: Clamped by `LONG_POLL_MAX_GLOBAL_CONNECTIONS` (default: `1000`).
+
+Reaching these limits will return a `429 Too Many Requests` error with a `Retry-After` header.
+
+### Example
+
+```bash
+curl "http://localhost:3000/api/streams/stream-abc123-0/poll?since=evt-100&timeout=20" \
+  -H "X-API-Key: <your-api-key>"
+```
+
+### Error responses
+
+| Status | Code | Cause |
+| :--- | :--- | :--- |
+| `400` | `VALIDATION_ERROR` | Invalid `since` or `timeout` parameters, or stale cursor error |
+| `401` | `UNAUTHORIZED` | Missing or invalid authentication token |
+| `404` | `NOT_FOUND` | Stream does not exist |
+| `429` | `TOO_MANY_REQUESTS` | Active long-poll capacity limit exceeded |
+| `503` | `SERVICE_UNAVAILABLE` | Database connection pool exhausted |
+
 ## Method Overrides
 
 For legacy infrastructure or middleboxes that can only issue `POST` requests, Fluxora supports HTTP Method Override. You can submit a `POST` request and specify the target HTTP method using:

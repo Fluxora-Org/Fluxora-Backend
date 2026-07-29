@@ -1,5 +1,5 @@
 /**
- * Property-based and unit tests for streamEventService duplicate suppression (Issue #924).
+ * Property-based and unit tests for streamEventService duplicate suppression (Issue #923).
  *
  * Verifies that duplicate event suppression remains strictly correct under randomized
  * replay sequences, duplicate bursts, retries, and intermittent Redis outages when
@@ -22,11 +22,9 @@ import fc from "fast-check";
 import {
   streamEventService,
   setDedupCache,
-  getDedupCache,
   _resetDedupCache,
   StreamCreatedEvent,
   StreamUpdatedEvent,
-  StreamCancelledEvent,
   StreamEvent,
 } from "../../src/services/streamEventService.js";
 import { streamRepository } from "../../src/db/repositories/streamRepository.js";
@@ -37,7 +35,7 @@ import {
   RedisDedupCache,
   HybridDedupCache,
 } from "../../src/redis/dedup.js";
-import type { RedisClient } from "../../src/redis/client.js";
+import type { RedisClient, RedisPipeline } from "../../src/redis/client.js";
 
 vi.mock("../../src/db/repositories/streamRepository.js", () => ({
   streamRepository: {
@@ -56,8 +54,17 @@ vi.mock("../../src/tracing/hooks.js", () => ({
   traceSpan: vi.fn((_name, _cid, _tags, fn) => fn()),
 }));
 
+vi.mock("../../src/lib/auditLog.js", () => ({
+  recordAuditEvent: vi.fn(),
+}));
+
 /**
  * Controllable Redis client mock that simulates intermittent Redis network outages.
+ *
+ * Implements the full RedisClient interface (see src/redis/client.ts). Only the
+ * string operations used by RedisDedupCache (exists, setNx) carry meaningful
+ * behavior; the sorted-set / pipeline members satisfy the interface and are
+ * unused by the dedup path.
  */
 class TestFailableRedisClient implements RedisClient {
   public isAvailable = true;
@@ -83,16 +90,7 @@ class TestFailableRedisClient implements RedisClient {
     this.store.set(key, value);
   }
 
-  async exists(key: string): Promise<boolean> {
-    this.totalOperationAttempts++;
-    if (!this.isAvailable) {
-      this.totalFailuresEncountered++;
-      throw new Error("Redis outage (simulated exists failure)");
-    }
-    return this.store.has(key);
-  }
-
-  async setNx(key: string, value: string, _ttlMs?: number): Promise<boolean> {
+  async setNx(key: string, value: string, _pxMs: number): Promise<boolean> {
     this.totalOperationAttempts++;
     if (!this.isAvailable) {
       this.totalFailuresEncountered++;
@@ -105,19 +103,41 @@ class TestFailableRedisClient implements RedisClient {
     return true;
   }
 
-  async del(key: string): Promise<number> {
+  async del(key: string): Promise<void> {
     this.totalOperationAttempts++;
     if (!this.isAvailable) {
       this.totalFailuresEncountered++;
       throw new Error("Redis outage (simulated del failure)");
     }
-    const had = this.store.has(key);
     this.store.delete(key);
-    return had ? 1 : 0;
+  }
+
+  async exists(key: string): Promise<boolean> {
+    this.totalOperationAttempts++;
+    if (!this.isAvailable) {
+      this.totalFailuresEncountered++;
+      throw new Error("Redis outage (simulated exists failure)");
+    }
+    return this.store.has(key);
   }
 
   async close(): Promise<void> {
     this.store.clear();
+  }
+
+  multi(): RedisPipeline {
+    const noop: RedisPipeline = {
+      zadd() { return noop; },
+      zremrangebyscore() { return noop; },
+      zcard() { return noop; },
+      pexpire() { return noop; },
+      async exec() { return []; },
+    };
+    return noop;
+  }
+
+  async zcount(): Promise<number> {
+    return 0;
   }
 }
 
@@ -165,7 +185,7 @@ function setupMockRepository() {
   });
 }
 
-describe("streamEventService duplicate-event suppression (Issue #924)", () => {
+describe("streamEventService duplicate-event suppression (Issue #923)", () => {
   const mockHub = {
     broadcast: vi.fn().mockResolvedValue(undefined),
   };
@@ -182,9 +202,9 @@ describe("streamEventService duplicate-event suppression (Issue #924)", () => {
     await _resetDedupCache();
   });
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ---------------------------------------------------------------------------
   // 1. Property-Based Testing Suite with Fast-Check
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ---------------------------------------------------------------------------
 
   describe("Property-Based Tests: Invariant Verification during Randomized Replays & Outages", () => {
     /**
@@ -312,9 +332,9 @@ describe("streamEventService duplicate-event suppression (Issue #924)", () => {
     });
   });
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ---------------------------------------------------------------------------
   // 2. Explicit Edge Cases Suite (12 Specific Scenarios)
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ---------------------------------------------------------------------------
 
   describe("Explicit Edge Case Scenarios", () => {
     beforeEach(() => {

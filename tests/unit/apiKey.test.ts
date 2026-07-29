@@ -51,6 +51,7 @@ import {
   revokeApiKey,
   listApiKeys,
   getApiKeyRecord,
+  findRecordByRawKey,
   isValidApiKey,
   getApiKeyFromRequest,
   DEFAULT_SCOPES,
@@ -70,6 +71,32 @@ describe('src/lib/apiKey.ts unit tests', () => {
       expect((apiKeyModule as any).getApiKeyScopes).toBeUndefined();
       expect((apiKeyModule as any).hasScope).toBeUndefined();
       expect((apiKeyModule as any)._resetApiKeyStoreForTest).toBeUndefined();
+    });
+  });
+
+  // Regression coverage for issue #1063: `src/middleware/auth.ts` imports
+  // `findRecordByRawKey`, while other callers/tests still use the older
+  // `getApiKeyRecord` name. Both names must resolve to the exact same
+  // repository-boundary lookup so the two call sites can never drift apart
+  // again the way they did when this broke (import said one name, the call
+  // site referenced the other, and neither was actually exported).
+  describe('findRecordByRawKey / getApiKeyRecord aliasing (issue #1063)', () => {
+    it('exports findRecordByRawKey as a function', () => {
+      expect(typeof findRecordByRawKey).toBe('function');
+    });
+
+    it('getApiKeyRecord is the exact same function reference as findRecordByRawKey', () => {
+      expect(getApiKeyRecord).toBe(findRecordByRawKey);
+    });
+
+    it('both names resolve an active key to an identical record', async () => {
+      const created = await createApiKey('alias-check', ['streams:read']);
+
+      const viaOldName = await getApiKeyRecord(created.key);
+      const viaNewName = await findRecordByRawKey(created.key);
+
+      expect(viaOldName).toEqual(viaNewName);
+      expect(viaOldName?.id).toBe(created.id);
     });
   });
 

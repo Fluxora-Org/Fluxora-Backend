@@ -269,5 +269,6 @@ export function getIndexerHealth() {
       requests: INDEXER_RATE_LIMIT_REQUESTS,
       windowMs: INDEXER_RATE_LIMIT_WINDOW_MS,
     },
+    catchupTelemetry: indexerIngestionService.getCatchupTelemetry(),
   };
 }

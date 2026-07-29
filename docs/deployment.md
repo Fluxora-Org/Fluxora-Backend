@@ -1,811 +1,109 @@
-# Deployment Guide
+# Deployment
 
-## Tiered Startup Dependency Probing
+## Tiered startup dependency probing
 
-Before Fluxora accepts any HTTP traffic it runs a two-tier connectivity check
-against every external dependency. This bounds the startup delay and surfaces
-misconfiguration failures early so on-call engineers see a clear structured log
-entry — not a cryptic 503 from the load balancer — within seconds of a bad
-deploy.
+Fluxora checks dependencies before accepting traffic. Postgres is a hard dependency: one `SELECT 1` probe fails fast and terminates the process. Redis and Stellar RPC are soft dependencies: `PING` and `getLatestLedger` retry with jittered backoff, then the service starts degraded if their shared budget is consumed.
 
-### Tiers
+`STARTUP_PROBE_BUDGET_MS` defaults to `30000` and is capped at `60000` ms. This is a shared soft-tier wall-clock budget; retry sleeps and the final in-flight attempt are capped to the remaining window. Set it below the container readiness timeout. `STARTUP_PROBE_POSTGRES_TIMEOUT_MS` (default `5000`), `STARTUP_PROBE_REDIS_TIMEOUT_MS` (default `3000`), and `STARTUP_PROBE_STELLAR_TIMEOUT_MS` (default `5000`) control individual attempts. Logs include the dependency tier and final action; errors are sanitised so credentials and URLs are not emitted.
 
-| Tier | Dependencies | Failure behaviour |
-|------|-------------|------------------|
-| **hard** | PostgreSQL | Single probe attempt. On failure the process **exits immediately** with exit code 1. The structured `startup_probe:fatal` log includes the sanitised error and `"action": "process will exit"`. |
-| **soft** | Redis, Stellar RPC | Retried with **decorrelated-jitter backoff** until either the probe succeeds or the total wall-clock budget (`STARTUP_PROBE_BUDGET_MS`) is exhausted. On budget exhaustion the service starts in **degraded mode** and the `startup_probe:degraded` log indicates which dependencies are unavailable. |
+# Canary Routing Deployment
 
-### Why this design?
+## Overview
+The **canary routing middleware** enables a deterministic, percentage-based traffic split for canary deployments. It tags a configurable portion of requests as canary by computing a stable hash of the client identity (API key or IP address) combined with a dedicated salt. This ensures:
 
-- **Postgres is hard**: every write and read path requires a live pool
-  connection. A misconfigured `DATABASE_URL` must be caught immediately — not
-  after a readiness probe timeout that delays container restart.
-- **Redis is soft**: rate-limiting, idempotency, and session stores fall back to
-  in-memory or no-op implementations. A transient Redis restart during a rolling
-  deploy should not kill the process.
-- **Stellar RPC is soft**: the RPC tier has its own circuit breaker and cached
-  fallbacks. Brief unavailability is tolerable; the service degrades gracefully
-  rather than refusing all traffic.
+- **Deterministic routing**: The same client always lands in the same bucket for the lifetime of a deployment.
+- **Independence from feature flags**: Uses its own salt (`CANARY_SALT`) to avoid correlation with feature-flag rollout hashes.
+- **Graceful degradation**: Clients without determinable identity are skipped without error.
+- **End-to-end traceability**: Canary decisions are logged with the request's correlation ID, making them traceable through the structured logging pipeline.
 
-### Configuration
+## Configuration
 
-All timeouts and the budget are configurable via environment variables:
+| Variable | Description | Default | Range |
+|----------|-------------|---------|-------|
+| `CANARY_TRAFFIC_PERCENT` | Percentage of requests to tag as canary (0–100). | `0` | 0–100 |
+| `CANARY_SALT` | Salt to isolate canary hashing from other rollout mechanisms. | `canary-routing-v1` | Arbitrary string |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `STARTUP_PROBE_BUDGET_MS` | `30000` | Total wall-clock budget (ms) for soft-tier retries. Set this below your container-orchestrator readiness timeout. |
-| `STARTUP_PROBE_POSTGRES_TIMEOUT_MS` | `5000` | Per-attempt timeout (ms) for the single Postgres hard probe. |
-| `STARTUP_PROBE_REDIS_TIMEOUT_MS` | `3000` | Per-attempt timeout (ms) for each Redis soft-probe retry attempt. |
-| `STARTUP_PROBE_STELLAR_TIMEOUT_MS` | `5000` | Per-attempt timeout (ms) for each Stellar RPC soft-probe retry attempt. |
+### Environment Setup
+```bash
+# Enable 10% canary traffic
+export CANARY_TRAFFIC_PERCENT=10
 
-All values must be strictly greater than 0. The Zod schema rejects 0 or
-negative values at boot with a `ConfigError`.
-
-### Kubernetes readiness/liveness alignment
-
-Set `STARTUP_PROBE_BUDGET_MS` to a value **lower** than your pod's
-`initialDelaySeconds` so Fluxora can reach its degraded-or-healthy state before
-the kubelet starts counting readiness failures.
-
-```yaml
-# Example: 30 s budget, probe starts after 35 s
-readinessProbe:
-  httpGet:
-    path: /health
-    port: 3000
-  initialDelaySeconds: 35
-  periodSeconds: 10
-  failureThreshold: 3
+# Use a custom salt (recommended for multi‑tenant or multi‑experiment setups)
+export CANARY_SALT="my‑team‑canary‑v2"
 ```
 
-```
-STARTUP_PROBE_BUDGET_MS=30000   # 30 s — leaves 5 s margin before kubelet checks
-```
+The middleware reads these values at request time via `loadConfig()` so they can be changed without restarting the process (provided the process handles hot‑reloaded configuration).
 
-### Log events
+## How It Works
 
-Every stage emits a structured JSON log entry. Fields are always present in
-each event; optional fields are marked with `?`.
+1. **Identity Resolution**  
+   - Preference order: `X-API-Key` header → `req.ip` (Express‑resolved, respects `trust proxy`).  
+   - If neither is present, the request is not tagged as canary.
 
-#### `startup_probe:begin`
-```json
-{
-  "level": "info",
-  "message": "startup_probe:begin",
-  "dependencies": [
-    { "name": "postgres", "tier": "hard" },
-    { "name": "redis",    "tier": "soft" },
-    { "name": "stellar_rpc", "tier": "soft" }
-  ],
-  "budgetMs": 30000
-}
-```
+2. **Hashing**  
+   - Computes `SHA‑256(CANARY_SALT + ':' + clientIdentity)`.  
+   - Takes the first 8 hex characters of the digest, interprets as a uint32.  
+   - Maps to a bucket in `[0, 100)` via modulo operation.
 
-#### `startup_probe:attempt`
-```json
-{
-  "level": "info",
-  "message": "startup_probe:attempt",
-  "dependency": "postgres",
-  "tier": "hard",
-  "attempt": 1,
-  "timeoutMs": 5000,
-  "budgetRemainingMs": 29800    // soft tier only
-}
-```
+3. **Decision**  
+   - If `bucket < CANARY_TRAFFIC_PERCENT`, the request is marked as canary (`req.isCanary = true`).  
+   - A response header `X-Fluxora-Canary: true` is added for canary requests.
 
-#### `startup_probe:success`
-```json
-{
-  "level": "info",
-  "message": "startup_probe:success",
-  "dependency": "postgres",
-  "tier": "hard",
-  "attempt": 1,
-  "outcome": "success",
-  "latencyMs": 42
-}
-```
+4. **Logging**  
+   - Debug‑level logs include the correlation ID, bucket number, and traffic percent when a request is tagged as canary.
 
-#### `startup_probe:retry` *(soft tier only)*
-```json
-{
-  "level": "warn",
-  "message": "startup_probe:retry",
-  "dependency": "redis",
-  "tier": "soft",
-  "attempt": 2,
-  "outcome": "retry",
-  "latencyMs": 3001,
-  "error": "redis timed out after 3000 ms",
-  "budgetRemainingMs": 24000
-}
-```
+## Integration Points
 
-#### `startup_probe:degraded` *(soft tier only)*
-```json
-{
-  "level": "warn",
-  "message": "startup_probe:degraded",
-  "dependency": "stellar_rpc",
-  "tier": "soft",
-  "attempts": 5,
-  "outcome": "degraded",
-  "latencyMs": 5002,
-  "error": "stellar_rpc startup probe timed out after 5000 ms",
-  "action": "service will start in degraded mode"
-}
-```
+- **Correlation ID**: Must run **after** `correlationIdMiddleware` so `req.correlationId` is available.
+- **Placement in middleware stack**: Typically placed early, after correlation ID and before business logic handlers.
+- **Express compatibility**: Works with any Express app; no special routing requirements.
 
-#### `startup_probe:fatal` *(hard tier only)*
-```json
-{
-  "level": "error",
-  "message": "startup_probe:fatal",
-  "dependency": "postgres",
-  "tier": "hard",
-  "attempt": 1,
-  "outcome": "fatal",
-  "latencyMs": 5001,
-  "error": "connect ECONNREFUSED [redacted-url]",
-  "action": "process will exit"
-}
-```
+## Security Considerations
 
-#### `startup_probe:complete`
-```json
-{
-  "level": "info",
-  "message": "startup_probe:complete",
-  "outcome": "degraded",
-  "degradedDependencies": ["stellar_rpc"],
-  "results": [
-    { "name": "postgres",    "tier": "hard", "outcome": "success",  "attempts": 1, "latencyMs": 42 },
-    { "name": "redis",       "tier": "soft", "outcome": "success",  "attempts": 3, "latencyMs": 12 },
-    { "name": "stellar_rpc", "tier": "soft", "outcome": "degraded", "attempts": 5, "latencyMs": 5002 }
-  ]
-}
-```
+- **Identity Privacy**: Raw client IP and API keys are never logged; only the derived bucket decision is logged.
+- **Salt Protection**: `CANARY_SALT` is stored in environment variables and never written to logs or response bodies.
+- **Header Injection**: The middleware sanitizes the `X-Fluxora-Canary` header value (`true`) to prevent header injection attacks.
+- **Rate Limiting**: Because the decision is deterministic, canary traffic can be rate‑limited using standard IP‑based or API‑key‑based limits without risk of uneven distribution.
 
-### Security
+## Testing
 
-- All error messages emitted in logs are passed through `sanitiseErrorMessage()`
-  (`src/health/checkers.ts`). Connection strings (e.g.
-  `postgresql://user:pass@host/db`, `redis://admin:secret@host:6379`),
-  passwords, and hostnames embedded in error strings are replaced with
-  `[redacted-url]` or `[redacted-credentials]` before any log is written.
-- The probe functions use transient, short-lived clients that are torn down
-  immediately after each attempt — no connection pool pollution.
-- `STARTUP_PROBE_*` timeout values are validated against a minimum of 1 by the
-  Zod schema so they cannot be set to 0 to disable the timeout silently.
+The existing test suite (`tests/middleware/canaryRouting.test.ts`) covers:
 
-### On-call triage quick reference
+- Deterministic bucket calculation (`computeCanaryBucket`).
+- Identity resolution (`resolveClientIdentity`).
+- Middleware behavior for enabled/disabled traffic, header echo, and `req.isCanary` setting.
+- Environment variable overrides for traffic percent and salt.
+- Correlation‑ID integration.
+- Security checks (no raw secrets logged).
 
-| Log event | Meaning | Action |
-|-----------|---------|--------|
-| `startup_probe:fatal` | Postgres unreachable | Check `DATABASE_URL`, network policy, DB status |
-| `startup_probe:degraded` for `redis` | Redis unreachable after budget | Check `REDIS_URL`, Redis cluster health |
-| `startup_probe:degraded` for `stellar_rpc` | Stellar RPC unreachable after budget | Check `STELLAR_RPC_URL`, network egress |
-| `startup_probe:complete` with `outcome: healthy` | All dependencies reachable | Normal startup |
-| `startup_probe:complete` with `outcome: degraded` | One or more soft deps unavailable | Service started; investigate degraded deps |
-
----
-
-## Docker Health Check Tuning
-
-Fluxora's Docker container features parameterised health checks to accommodate different deployment environments.
-
-**Build Arguments (Dockerfile):**
-- `HEALTH_INTERVAL` (Default: `30s`): Time between Docker daemon health probes.
-- `HEALTH_TIMEOUT` (Default: `5s`): Time before a Docker daemon probe fails.
-
-**Runtime Environment Variables (App Level):**
-- `HEALTH_CHECK_INTERVAL_MS` (Default: `30000`): Internal application polling interval.
-- `HEALTH_CHECK_TIMEOUT_MS` (Default: `5000`): Maximum time allowed for internal liveness checks.
-
-*Note: Runtime timeout values must be strictly greater than 0.*
-
-## Blue/Green Deployment
-
-Fluxora achieves zero-downtime deployments by running two parallel application
-slots — **blue** and **green** — against the **same** PostgreSQL database and
-the **same** Redis instance. Traffic is directed to one active slot at a time;
-the inactive slot receives the new release, passes health checks, and then the
-load balancer is flipped atomically.
-
-### Architecture
-
-```
-                        ┌─────────────────────────────────────┐
-                        │  Front-side Load Balancer / ALB      │
-                        │  (routes 100 % of traffic to one     │
-                        │   slot at a time during steady state) │
-                        └────────────┬────────────────────────┘
-                                     │
-              ┌──────────────────────┼──────────────────────┐
-              ▼                                             ▼
-  ┌──────────────────────┐                    ┌──────────────────────┐
-  │  app-blue  :3000     │                    │  app-green :3001     │
-  │  DEPLOYMENT_SLOT=blue│                    │  DEPLOYMENT_SLOT=    │
-  │                      │                    │    green             │
-  │  X-Fluxora-           │                    │  X-Fluxora-          │
-  │  Deployment-Slot:    │                    │  Deployment-Slot:    │
-  │    blue              │                    │    green             │
-  └──────────┬───────────┘                    └──────────┬──────────┘
-             │                                           │
-             └──────────────────┬────────────────────────┘
-                                │
-               ┌────────────────┴─────────────────┐
-               │                                  │
-     ┌─────────▼──────────┐           ┌───────────▼────────┐
-     │  PostgreSQL :5432  │           │  Redis :6379        │
-     │  (shared schema)   │           │  (shared state)     │
-     └────────────────────┘           └────────────────────┘
-```
-
-**Key properties:**
-
-| Property | Detail |
-|---|---|
-| Shared database | Both slots use the same `DATABASE_URL`; schema is always consistent |
-| Shared Redis | Idempotency keys, rate-limit counters, circuit-breaker state, and leader-election leases are consistent across slots during a cutover |
-| Slot identifier | `DEPLOYMENT_SLOT` env var (`blue` or `green`) — read at request time, never cached |
-| Identification header | `X-Fluxora-Deployment-Slot` on every HTTP response |
-| Port mapping | blue → 3000, green → 3001 (host); both listen on container port 3000 |
-
----
-
-### The `X-Fluxora-Deployment-Slot` Response Header
-
-Every HTTP response carries this header, regardless of status code (2xx, 4xx,
-5xx). Its purpose is to let a front-side load balancer or e2e test suite assert
-which slot handled a specific request — particularly useful during the brief
-window when traffic is being shifted.
-
-**Implementation (`src/app.ts`):**
-
-```typescript
-/**
- * deploymentSlotMiddleware
- *
- * Emits `X-Fluxora-Deployment-Slot` on every response so that a front-side
- * load balancer or the e2e suite can verify which slot answered a request
- * during a blue/green cutover.
- *
- * @security The header value is constrained to /^[a-z0-9-]+$/i to prevent
- *           header injection. Any non-conforming value is replaced with "blue".
- */
-function deploymentSlotMiddleware(req, res, next) {
-  const raw = process.env.DEPLOYMENT_SLOT ?? 'blue';
-  const slot = /^[a-z0-9-]+$/i.test(raw) ? raw : 'blue';
-  res.setHeader('X-Fluxora-Deployment-Slot', slot);
-  next();
-}
-```
-
-The middleware runs at the top of the Express middleware stack — before body
-parsing, authentication, and routing — so no code path can send a response
-without the header.
-
-**Behaviour summary:**
-
-| `DEPLOYMENT_SLOT` value | Header value |
-|---|---|
-| `blue` | `blue` |
-| `green` | `green` |
-| `canary-1`, `release-2025` | passed through unchanged |
-| *(unset)* or `""` | `blue` (default) |
-| Contains CRLF, spaces, or special chars | `blue` (sanitised) |
-
----
-
-### Shared State Considerations
-
-Because both slots target the same Redis instance, the following subsystems
-remain consistent during a cutover:
-
-| Subsystem | Redis key prefix | Behaviour during cutover |
-|---|---|---|
-| Idempotency store | `idempotency:` | A key written by the blue slot is visible to green; no duplicate deliveries |
-| Rate limiter | `rl:` | Sliding-window counters are shared; clients cannot bypass limits by hitting the new slot |
-| Webhook circuit breaker | `cbk:` | Breaker state is propagated across slots; a tripped breaker on blue is also open on green |
-| Indexer leader election | `indexer:leader` | Only one slot holds the leader lease at a time; the other defers replay |
-| Admin-state lock | `admin:lock:` | Pause flags are consistent across both slots |
-
-> **Rule:** When deploying a change that alters Redis key structure or TTL
-> semantics, apply the migration in a backwards-compatible way (e.g. write the
-> new key alongside the old key) and only remove the old key after both slots
-> have been running the new code for the full key TTL.
-
----
-
-### Shared Database and Migration Safety
-
-Both slots point at the same `DATABASE_URL`.  The migration runner
-(`src/db/migrate.ts`) wraps every migration in a PostgreSQL advisory lock
-(`pg_advisory_lock`) so concurrent executions of `pnpm run migrate` are safe:
-
-```
-Slot A: acquires advisory lock → applies migration M1 → releases lock
-Slot B: blocks on advisory lock → sees M1 already in pgmigrations → skips → releases lock
-```
-
-The `pgmigrations` table records each applied migration by name.
-`checkPendingMigrations()` reads this table at startup and throws
-`PendingMigrationsError` if any migration file on disk is not yet recorded,
-preventing a slot from starting against a stale schema.
-
-#### Migration decision tree
-
-```
-Is the DDL change additive (new column with default, new table, new index)?
-├── YES → Safe to deploy without a migration window.
-│         1. Add the migration file.
-│         2. docker-compose exec app-green pnpm run migrate
-│         3. Promote green slot.
-│         4. app-blue automatically sees the new schema on next request.
-└── NO  → Requires a multi-step deploy:
-          Step 1: Deploy a backwards-compatible version of the code that can
-                  work with both the old and new schema simultaneously.
-          Step 2: Apply the migration.
-          Step 3: Deploy the final version of the code.
-          Step 4: Remove compatibility shims.
-```
-
----
-
-### Starting Both Slots Locally
+Run tests with:
 
 ```bash
-# Build and start everything (postgres + redis + app-blue + app-green)
-docker-compose up -d
-
-# Confirm both slots are healthy
-curl -s http://localhost:3000/health | jq .status   # blue slot
-curl -s http://localhost:3001/health | jq .status   # green slot
-
-# Confirm slot identification headers
-curl -sI http://localhost:3000/health | grep X-Fluxora
-# X-Fluxora-Deployment-Slot: blue
-
-curl -sI http://localhost:3001/health | grep X-Fluxora
-# X-Fluxora-Deployment-Slot: green
+npx vitest run
 ```
 
----
+## NatSpec Documentation (Source)
 
-### Cutover Procedure — Manual (nginx / docker-compose)
+The middleware includes full NatSpec‑style comments that describe each public API:
 
-> **Pre-condition:** Active slot is `blue` (port 3000). New release goes to
-> `green` (port 3001).
+- `computeCanaryBucket(salt, identity, modulus)` – core hashing logic.
+- `resolveClientIdentity(req)` – identity selection rules.
+- `createCanaryRoutingMiddleware(options)` – middleware factory.
+- `canaryRoutingMiddleware` – pre‑configured middleware instance.
 
-**1. Build and start the inactive slot with the new image:**
-```bash
-docker-compose up -d --no-deps --build app-green
-```
+These comments are parsed by documentation generators and provide inline guidance for developers and operators.
 
-**2. Wait for the green slot to pass health checks:**
-```bash
-# Poll until HTTP 200 is returned
-until curl -sf http://localhost:3001/health > /dev/null; do
-  echo "Waiting for green slot…"; sleep 2
-done
-echo "Green slot is healthy"
-```
+## Deployment Checklist
 
-**3. Run database migrations (idempotent — safe to run while blue is live):**
-```bash
-docker-compose exec app-green pnpm run migrate
-```
+- [ ] `CANARY_TRAFFIC_PERCENT` set appropriately in the environment for the target deployment.
+- [ ] `CANARY_SALT` set to a value that distinguishes this canary effort from other rollouts.
+- [ ] Verify that `correlationIdMiddleware` is mounted **before** the canary middleware.
+- [ ] Confirm that logs include `canary-routing` debug entries for canary‑tagged requests.
+- [ ] Run the middleware test suite in CI to ensure no regressions.
+- [ ] Document the chosen salt and traffic percent in release notes or runbooks.
 
-> `checkPendingMigrations()` in `src/db/migrate.ts` will throw on startup if
-> the migration is not applied; the green slot will refuse to start, protecting
-> you from accidentally promoting an incompatible schema.
+## See Also
 
-**4. Verify the deployment slot header on the green slot:**
-```bash
-curl -sI http://localhost:3001/health | grep -i x-fluxora
-# Expected: X-Fluxora-Deployment-Slot: green
-```
-
-**5. Switch the nginx upstream:**
-```nginx
-# /etc/nginx/conf.d/fluxora.conf
-upstream fluxora_backend {
-  server localhost:3001;  # ← was 3000 (blue), now 3001 (green)
-}
-```
-```bash
-nginx -t && nginx -s reload
-```
-
-**6. Confirm live traffic is hitting the green slot:**
-```bash
-curl -sI https://your-api-domain.com/health | grep -i x-fluxora
-# Expected: X-Fluxora-Deployment-Slot: green
-```
-
-**7. Soak period — leave the blue slot running for 10–15 minutes:**
-This preserves an instant rollback path without requiring a rebuild.
-
-**8. Decommission the old slot:**
-```bash
-docker-compose stop app-blue
-```
-
----
-
-### Cutover Procedure — Automated (AWS ALB + ECS)
-
-This procedure uses weighted target groups to shift traffic gradually.
-
-**Pre-condition:** Blue target group is at 100 %, green is at 0 %.
-
-```bash
-# 1. Register the new green task and confirm health checks pass
-aws ecs update-service \
-  --cluster fluxora \
-  --service fluxora-green \
-  --force-new-deployment
-
-# 2. Wait for green tasks to reach RUNNING + healthy
-aws ecs wait services-stable \
-  --cluster fluxora \
-  --services fluxora-green
-
-# 3. Apply migrations (run from any task; advisory lock prevents conflicts)
-aws ecs run-task \
-  --cluster fluxora \
-  --task-definition fluxora-migrate \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[subnet-xxx],securityGroups=[sg-xxx]}"
-
-# 4. Gradually shift traffic: 90/10 → 50/50 → 0/100
-aws elbv2 modify-listener \
-  --listener-arn arn:aws:elasticloadbalancing:... \
-  --default-actions '[
-    {"Type":"forward","ForwardConfig":{"TargetGroups":[
-      {"TargetGroupArn":"arn:...blue","Weight":90},
-      {"TargetGroupArn":"arn:...green","Weight":10}
-    ]}}
-  ]'
-
-# (repeat with 50/50 then 0/100 after monitoring)
-
-# 5. Verify the slot header on a sampled request
-curl -sI https://your-api-domain.com/health | grep -i x-fluxora
-```
-
----
-
-### Cutover Procedure — Automated (HAProxy)
-
-```
-# haproxy.cfg
-backend fluxora_backend
-  server blue  localhost:3000 check weight 0   # being drained
-  server green localhost:3001 check weight 100 # receiving all traffic
-
-# Reload without dropping connections
-haproxy -f /etc/haproxy/haproxy.cfg -sf $(pidof haproxy)
-```
-
-Steps:
-1. Deploy to the inactive slot; wait for HAProxy health checks to turn green.
-2. Set the new slot's weight to 100 and the old slot's weight to 0 (or any
-   weighted distribution for a canary release).
-3. Reload HAProxy (`-sf` for soft reload — no connection drops).
-4. After the drain period (tracked via `X-Fluxora-Deployment-Slot` in access
-   logs), stop the old slot.
-
----
-
-**Integration Tests**
-
-- **Redis-backed adminStateLock integration:** Set `REDIS_INTEGRATION=true` and point `REDIS_TEST_URL` at a test Redis instance (for example a locally running `redis-server` or the compose `redis` service). Then run the specific test file:
-
-```bash
-REDIS_INTEGRATION=true REDIS_TEST_URL=redis://:fluxora_redis_password@127.0.0.1:6379 pnpm test tests/state/adminStateLock.concurrentReindex.test.ts
-```
-
-- Security: tests use transient Redis clients that are torn down after each test. Do not run against production Redis instances — use an isolated test instance only.
-
----
-
-### Rollback Procedure
-
-> Use this if errors are detected **after** cutover.  The old slot remains
-> running during the soak period specifically to make this instant.
-
-**1. Redirect traffic back to the old slot immediately:**
-
-nginx:
-```bash
-# Restore the old upstream port
-sed -i 's/server localhost:3001/server localhost:3000/' /etc/nginx/conf.d/fluxora.conf
-nginx -t && nginx -s reload
-```
-
-AWS ALB:
-```bash
-aws elbv2 modify-listener \
-  --listener-arn arn:aws:elasticloadbalancing:... \
-  --default-actions '[{"Type":"forward","TargetGroupArn":"arn:...blue"}]'
-```
-
-**2. Verify the old slot is serving traffic:**
-```bash
-curl -sI https://your-api-domain.com/health | grep -i x-fluxora
-# Expected: X-Fluxora-Deployment-Slot: blue
-```
-
-**3. Stop the failed slot to prevent accidental traffic leakage:**
-```bash
-docker-compose stop app-green
-# or: aws ecs update-service --cluster fluxora --service fluxora-green --desired-count 0
-```
-
-**4. Investigate the failed slot's logs:**
-```bash
-docker-compose logs app-green --tail=200
-# or: aws logs filter-log-events --log-group-name /ecs/fluxora-green
-```
-
-**5. Roll back the migration (only if the migration was destructive):**
-
-> ⚠️  Only required if the schema change is not backwards-compatible with the
-> old application code (rare — avoid destructive migrations in production).
-
-```bash
-# node-pg-migrate supports down migrations
-docker-compose exec app-blue \
-  npx node-pg-migrate down --count 1
-```
-
-**6. Fix and re-deploy to the inactive slot before the next cutover attempt.**
-
----
-
-### Operational Runbook — Quick Reference
-
-| Situation | Indicator | Action |
-|---|---|---|
-| New slot starts but health check fails | `GET /health` → non-200 | Check logs: `docker-compose logs app-green` |
-| Cutover causes 5xx spike | Error-rate alert fires | Rollback: redirect LB back to old slot |
-| Migration fails on green slot | `PendingMigrationsError` in logs | Fix migration file; rerun `pnpm run migrate` |
-| Both slots healthy but wrong header in prod | `X-Fluxora-Deployment-Slot: blue` after promoting green | Verify LB upstream was updated and reloaded |
-| Redis unavailable during cutover | `startup_probe:degraded redis` in logs | Both slots fall back to in-process/no-op; service continues degraded |
-| Postgres advisory lock contention | Slow migration observed | Expected during concurrent `pnpm run migrate`; one slot will wait |
-| Old slot not stopped after soak | Two slots receiving traffic | Acceptable; LB sends 100 % to new slot; stop old slot when ready |
-
----
-
-### Security Assumptions
-
-| Assumption | Detail |
-|---|---|
-| `DEPLOYMENT_SLOT` is untrusted input | Value is read from env at request time and sanitised to `[a-z0-9-]` before being placed in a response header to prevent header injection |
-| Clients cannot spoof the header | `res.setHeader()` always overwrites any client-supplied value of the same name |
-| Redis password must be rotated in non-local environments | The `docker-compose.yml` default (`fluxora_redis_password`) is a local-dev-only value; use a secrets manager in staging and production |
-| Migration runs require privileged DB access | Only the application's `DATABASE_URL` user needs `CREATE TABLE` / `ALTER TABLE` rights; restrict this for the replicas in read-heavy setups |
-| Port 3001 (green) must be firewalled in production | Expose only the active slot's port to public traffic; the inactive slot should be accessible only from the load balancer's health-check IP range |
-
----
-
-### Testing
-
-The full blue/green test suite lives in `tests/app.blueGreen.test.ts`.
-
-**Run the tests:**
-```bash
-pnpm test tests/app.blueGreen.test.ts
-# Or with coverage:
-pnpm test:coverage
-```
-
-**What is covered (≥ 95 % line/branch coverage):**
-
-| Test group | Scenarios |
-|---|---|
-| Default / fallback | Absent env var, empty string |
-| Explicit slots | `blue`, `green` |
-| Custom slot names | `canary-1`, `release-2025`, `hotfix`, `BLUE` |
-| Header injection prevention | CRLF, LF, null byte, spaces, semicolons, angle brackets, unicode |
-| Request-time reading | Env var mutation between requests on the same app instance |
-| HTTP methods | GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE |
-| Response status codes | 200 (root, health), 404 (unknown route), 500 (thrown error via `__test/error`) |
-| Concurrent requests | 10 simultaneous requests return the same slot |
-| Client spoof prevention | Client-supplied header value is overwritten by the server |
-| Module exports | `createApp()` and the default `app` export both serve the header |
-| Header casing | Lowercase key accessible via `x-fluxora-deployment-slot` |
-
-### gRPC Health Check (Kubernetes-native probes)
-
-Kubernetes' built-in gRPC probes (`livenessProbe.grpc` / `readinessProbe.grpc`, and the standalone `grpc-health-probe` binary) speak the standard `grpc.health.v1.Health` protocol rather than plain HTTP. Fluxora can expose this alongside the existing HTTP `/health` endpoints, on a separate port so it never competes with API traffic.
-
-**Runtime Environment Variables (App Level):**
-- `GRPC_HEALTH_ENABLED` (Default: `false`): Enables the gRPC health service.
-- `GRPC_HEALTH_PORT` (Default: `50051`): Port the gRPC health service binds to. Must differ from `PORT` (the HTTP port).
-
-The service reuses the exact same `HealthCheckManager` dependency checks as `/health/ready` (`src/config/health.ts`) — it does not re-implement or duplicate any check logic, so the two surfaces cannot drift out of sync. `healthy` and `degraded` both map to `SERVING` (matching `/health/ready`'s 200 response for both statuses); `unhealthy` maps to `NOT_SERVING`.
-
-**Security note:** like the internal HTTP endpoints documented above, the gRPC health port is intentionally unauthenticated — Kubernetes probes and `grpc-health-probe` don't send credentials. This port must **not** be exposed outside the cluster network (no public LoadBalancer/Ingress); bind it only to a `ClusterIP` service or rely on the pod's default internal-only networking.
-
-**Example — `grpc-health-probe` (manual check):**
-```bash
-grpc-health-probe -addr=localhost:50051
-```
-
-**Example — Kubernetes probe configuration:**
-```yaml
-livenessProbe:
-  grpc:
-    port: 50051
-readinessProbe:
-  grpc:
-    port: 50051
-  periodSeconds: 10
-```
-
-
----
-
-## Canary Routing
-
-Fluxora supports a deterministic, header-based canary traffic split. A
-configurable percentage of requests are tagged as canary by setting
-`req.isCanary = true` on the Express request object and echoing an
-`X-Fluxora-Canary: true` response header. This lets operators route, observe,
-and roll back canary builds without any client-side changes.
-
-### How it works
-
-The `canaryRoutingMiddleware` (`src/middleware/canaryRouting.ts`) runs
-immediately after the correlation-ID middleware so every canary-tagged request
-carries a traceable `x-correlation-id` through logs and metrics.
-
-**Decision algorithm (per request):**
-
-1. **Identify the client.** Prefers the `X-API-Key` request header (stable
-   across proxy/CDN topologies). Falls back to `req.ip` when no API key is
-   present.
-2. **Hash the identity.** Computes `SHA-256(CANARY_SALT + ':' + clientIdentity)`.
-3. **Derive a bucket.** Takes the first 8 hex digits of the digest, interprets
-   them as a `uint32`, and applies `% 100` to yield a value in `[0, 100)`.
-4. **Apply the threshold.** Tags the request as canary when
-   `bucket < CANARY_TRAFFIC_PERCENT`.
-
-The decision is a pure function of `(clientIdentity, CANARY_SALT,
-CANARY_TRAFFIC_PERCENT)` — the same client always lands in the same bucket for
-the lifetime of a deployment.
-
-### Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CANARY_TRAFFIC_PERCENT` | `0` | Integer `0–100`. Percentage of clients to route to the canary path. `0` disables canary tagging entirely. |
-| `CANARY_SALT` | `canary-routing-v1` | Arbitrary string used to namespace the hash. Change this between unrelated experiments to avoid correlated bucketing. **Never log this value.** |
-
-The `CANARY_TRAFFIC_PERCENT` value is validated by the Zod config schema
-(`src/config/env.ts`) to be an integer in `[0, 100]`. Out-of-range values
-cause a `ConfigError` at startup.
-
-### Observability
-
-**Response header** — `X-Fluxora-Canary: true` is set on every canary-tagged
-response. Absent on non-canary responses. Useful for:
-- Load-balancer routing rules (e.g. route `X-Fluxora-Canary: true` to the
-  canary upstream).
-- Integration test assertions.
-- Browser devtools or curl inspection during manual verification.
-
-**Structured logs** — The middleware emits a `debug`-level log for every
-canary-tagged request:
-
-```json
-{
-  "level": "debug",
-  "message": "Canary routing: request tagged as canary",
-  "correlationId": "<uuid>",
-  "component": "canary-routing",
-  "bucket": 23,
-  "trafficPercent": 30
-}
-```
-
-The `bucket` field enables operators to verify the distribution is as expected.
-The raw client identity (API key or IP) is **never** included in logs.
-
-**Prometheus metrics** — The existing `http_requests_total` and
-`http_request_duration_seconds` counters (emitted by `httpMetrics`) record
-all requests regardless of canary status. To split metrics by canary, add a
-custom label in your route handlers using `req.isCanary`:
-
-```typescript
-import type { Request, Response } from 'express';
-
-router.get('/api/feature', (req: Request, res: Response) => {
-  myCounter.inc({ canary: String(req.isCanary ?? false) });
-  // ...
-});
-```
-
-### Security considerations
-
-- The **raw client identity** (API key or IP address) is hashed before the
-  bucket computation and is **never stored or logged** by the middleware.
-- The **salt** (`CANARY_SALT`) is read from the environment and never
-  reflected in any log record or response header.
-- The salt is **intentionally different** from any feature-flag hash salt to
-  prevent correlated bucketing between independent experiments. Using the same
-  salt for two experiments means the same clients opt-in to both, which
-  confounds A/B measurement.
-- The `X-Fluxora-Canary` response header reveals only the canary decision
-  (`true`), not the client identity or bucket value.
-
-### Operator runbook
-
-#### Enable canary for 10 % of traffic
-
-```bash
-# Rolling deploy — set on the canary pod only
-CANARY_TRAFFIC_PERCENT=10
-CANARY_SALT=canary-routing-v1   # keep default unless running two experiments
-```
-
-Verify with:
-
-```bash
-# Find a client that lands in the canary bucket
-curl -I https://api.example.com/health -H 'X-API-Key: <key>'
-# Look for: X-Fluxora-Canary: true
-```
-
-#### Increase to 50 %
-
-```bash
-CANARY_TRAFFIC_PERCENT=50
-```
-
-Because the hash is stable, clients already in the canary set at 10 % remain
-in the canary set at 50 %. No client "flips" unexpectedly.
-
-#### Disable canary (full rollback)
-
-```bash
-CANARY_TRAFFIC_PERCENT=0
-```
-
-Setting to `0` short-circuits the hash computation entirely. All requests get
-`req.isCanary = false` with zero overhead.
-
-#### Run a second, independent experiment
-
-Use a different salt so the two experiments' buckets are uncorrelated:
-
-```bash
-# Experiment A — already running
-CANARY_TRAFFIC_PERCENT=20
-CANARY_SALT=experiment-a-v1
-
-# Experiment B — independent
-# Deploy a separate flag or use a different env variable pattern
-CANARY_SALT=experiment-b-v1
-```
-
-### Testing
-
-The middleware's unit and integration tests live in
-`tests/middleware/canaryRouting.test.ts`. Run them with:
-
-```bash
-pnpm test tests/middleware/canaryRouting.test.ts
-```
-
-Key assertions:
-- `computeCanaryBucket` is deterministic and matches the reference formula.
-- `resolveClientIdentity` prefers API key over IP.
-- `req.isCanary` is set correctly for the disabled, partial, and full-split cases.
-- `X-Fluxora-Canary` header is echoed only on canary responses.
-- Raw client identity and salt are never present in log calls.
-- `createApp()` integration confirms the header is visible on real HTTP responses.
+- `src/middleware/correlationId.ts` – request correlation ID handling.
+- `src/middleware/httpMetrics.ts` – metrics instrumentation for canary traffic.
+- Feature flag rollout patterns – keep canary and feature‑flag spaces independent.

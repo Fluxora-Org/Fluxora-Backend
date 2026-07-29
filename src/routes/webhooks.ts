@@ -530,6 +530,7 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
     res.status(result.status).json(
       errorResponse(result.code, result.message, undefined, requestId)
     );
+    return;
   }
 
   res.json(successResponse({

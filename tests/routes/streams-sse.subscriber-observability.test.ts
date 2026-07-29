@@ -166,8 +166,7 @@ describe('SSE subscriber observability', () => {
   it('logs + meters thrown SSE subscriber callbacks while isolating other subscribers', async () => {
     const before = await getMetricValue(sseSubscriberErrorsTotal, { reason: 'subscriber_callback_throw' });
 
-    const errorLineRegex = /^{.*}$/;
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined as any);
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
     const throwingSubscriber = () => {
       throw new Error('kaboom');
@@ -210,18 +209,19 @@ describe('SSE subscriber observability', () => {
       const after = await getMetricValue(sseSubscriberErrorsTotal, { reason: 'subscriber_callback_throw' });
       expect(after).toBe(before + 1);
 
-      // Structured log should be emitted via logger.error -> console.error
-      expect(consoleSpy).toHaveBeenCalled();
-      const firstCallArg = (consoleSpy.mock.calls[0] as any[])[0];
-      expect(errorLineRegex.test(String(firstCallArg))).toBe(true);
+      // Structured log should be emitted via logger.error -> process.stderr.write
+      expect(stderrSpy).toHaveBeenCalled();
+      const stderrCalls = stderrSpy.mock.calls.map((c) => String(c[0]));
+      const matchingCall = stderrCalls.find((line) => line.includes('SSE subscriber callback threw'));
+      expect(matchingCall).toBeDefined();
 
-      const parsed = JSON.parse(String(firstCallArg));
+      const parsed = JSON.parse(matchingCall!);
       expect(parsed.streamId).toBe(streamId);
       expect(parsed.subscriberError?.name).toBe('Error');
       expect(parsed.subscriberError?.message).toBe('kaboom');
 
       // Security: ensure SSE payload isn't present in the log entry
-      const lineStr = String(firstCallArg);
+      const lineStr = matchingCall!;
       expect(lineStr).not.toContain('DO_NOT_LOG');
       expect(lineStr).not.toContain('payload');
     } finally {
@@ -231,6 +231,42 @@ describe('SSE subscriber observability', () => {
 
     // sanity: SSE slot not leaked by direct subscriber registration
     expect(getActiveSseConnectionCount()).toBe(0);
+  });
+
+  it('threads correlationId into logger.error when provided on event', async () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    const throwingSubscriber = () => {
+      throw new Error('callback error with correlation');
+    };
+
+    const streamId = 'stream-corr-456';
+    const correlationId = 'test-correlation-id-789';
+
+    const { subscribeToSseStream } = await import('../../src/streams/sseEmitter.js');
+    const unsub = subscribeToSseStream(streamId, throwingSubscriber as any);
+
+    try {
+      sseEventBus.emit(SSE_STREAM_UPDATE_EVENT, {
+        streamId,
+        eventId: 'evt-2',
+        payload: { test: true },
+        correlationId,
+      });
+
+      await delay(10);
+
+      const stderrCalls = stderrSpy.mock.calls.map((c) => String(c[0]));
+      const matchingCall = stderrCalls.find((line) => line.includes('SSE subscriber callback threw'));
+      expect(matchingCall).toBeDefined();
+
+      const parsed = JSON.parse(matchingCall!);
+      expect(parsed.streamId).toBe(streamId);
+      expect(parsed.correlationId).toBe(correlationId);
+      expect(parsed.subscriberError?.message).toBe('callback error with correlation');
+    } finally {
+      unsub();
+    }
   });
 });
 

@@ -485,12 +485,39 @@ export class IndexerService {
         }
 
         // Acquire a fresh connection for this batch.
-        const batchResult = await this.processBatch(
-          cursor.id,
-          request,
-          offset,
-          batchIndex,
-        );
+        //
+        // RED instrumentation wraps *only* this call so the histogram measures
+        // the batch processing step itself (fetch → insert → cursor advance →
+        // COMMIT) and nothing else. The loop guards above are control flow, not
+        // work, and deliberately stay outside the measurement.
+        const batchStartedAt = process.hrtime.bigint();
+        let batchResult: { rowsFetched: number };
+        try {
+          batchResult = await this.processBatch(
+            cursor.id,
+            request,
+            offset,
+            batchIndex,
+          );
+        } catch (batchError) {
+          const classification = recordIndexerBatchFailure(
+            request.contract_id,
+            elapsedSecondsSince(batchStartedAt),
+            batchError,
+          );
+          logger.warn('replay_batch_failed', undefined, {
+            event: 'replay_batch_failed',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            batch_index: batchIndex,
+            offset,
+            error_source: classification.source,
+            error_type: classification.type,
+          });
+          throw batchError;
+        }
+        recordIndexerBatchSuccess(request.contract_id, elapsedSecondsSince(batchStartedAt));
 
         if (batchResult.rowsFetched === 0) {
           // Source exhausted ahead of totalRows count — safe to stop.
@@ -818,8 +845,9 @@ export class IndexerService {
       params.push(request.to_block);
     }
 
-    const result = await client.query<{ count: string }>(query, params);
-    return parseInt(result.rows[0]?.count ?? '0', 10);
+    const result = await client.query<Record<string, unknown>>(query, params);
+    const first = result.rows[0];
+    return parseInt(String(first?.['count'] ?? '0'), 10);
   }
 
   /**
@@ -931,7 +959,7 @@ export class IndexerService {
 
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.last_committed_cursor, c.contract_id, c.ledger, c.from_block, c.to_block
           FROM indexer_replay_progress p
           JOIN replay_cursors c ON p.last_committed_cursor = c.id
@@ -947,28 +975,31 @@ export class IndexerService {
 
       const row = result.rows[0];
       const request: ReplayRequest = {
-        contract_id: row.contract_id,
-        ledger: row.ledger,
-        from_block: row.from_block ?? undefined,
-        to_block: row.to_block ?? undefined,
+        contract_id: row['contract_id'] as string,
+        ledger: Number(row['ledger']),
+        from_block: row['from_block'] != null ? Number(row['from_block']) : undefined,
+        to_block: row['to_block'] != null ? Number(row['to_block']) : undefined,
       };
 
       logger.info('Resuming incomplete replay from checkpoint', undefined, {
         event: 'replay_resume_startup',
         contract_id: request.contract_id,
         ledger: request.ledger,
-        cursor_id: row.last_committed_cursor,
+        cursor_id: row['last_committed_cursor'] as string,
       });
 
       // Start the replay asynchronously so we do not block startup.
       this.replayEvents(request).catch((err) => {
-        logger.error('Resumed replay failed', err, {
+        logger.error('Resumed replay failed', undefined, {
           contract_id: request.contract_id,
           ledger: request.ledger,
+          error: err instanceof Error ? err.message : String(err),
         });
       });
     } catch (err) {
-      logger.error('Failed to check for incomplete replays on startup', err as Error);
+      logger.error('Failed to check for incomplete replays on startup', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }
@@ -988,7 +1019,7 @@ export class IndexerService {
 
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.status, p.total, p.started_at, p.updated_at,
                c.contract_id, c.ledger, c.id as cursor_id, c.last_committed_offset
           FROM indexer_replay_progress p
@@ -998,22 +1029,26 @@ export class IndexerService {
       `);
       if (result.rows.length > 0) {
         const row = result.rows[0];
+        const lastCommittedOffset = Number(row['last_committed_offset']);
+        const total = Number(row['total']);
         return {
-          isReplaying: row.status === 'in-progress',
-          rowsReplayed: row.last_committed_offset,
-          rowsRemaining: Math.max(0, row.total - row.last_committed_offset),
-          totalRows: row.total,
+          isReplaying: row['status'] === 'in-progress',
+          rowsReplayed: lastCommittedOffset,
+          rowsRemaining: Math.max(0, total - lastCommittedOffset),
+          totalRows: total,
           estimatedCompletion: null,
-          startedAt: row.started_at,
-          contractId: row.contract_id,
-          ledger: row.ledger,
-          replayCursorId: row.cursor_id,
-          currentOffset: row.last_committed_offset,
-          status: row.status,
+          startedAt: row['started_at'] != null ? asDate(row['started_at']) : null,
+          contractId: row['contract_id'] as string,
+          ledger: Number(row['ledger']),
+          replayCursorId: row['cursor_id'] as string,
+          currentOffset: lastCommittedOffset,
+          status: row['status'] as string,
         };
       }
     } catch (err) {
-      logger.error('Failed to fetch replay progress from database', err as Error);
+      logger.error('Failed to fetch replay progress from database', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }
@@ -1071,6 +1106,12 @@ type IndexerState = {
   lastSafeLedger: number;
   reorgDetected: boolean;
   reorgHeight?: number;
+  // Catch-up telemetry state
+  lastIndexedLedger: number;
+  ledgerLag: number;
+  catchupEtaSeconds: number | null;
+  ledgerThroughputSamples: number[]; // Rolling window of ledgers/second samples
+  lastLedgerLagUpdateAt: number | null;
 };
 
 const rolledBackLedgers = new Set<number>();
@@ -1180,6 +1221,12 @@ export class IndexerIngestionService {
       duplicateEventCount: 0,
       lastSafeLedger: 0,
       reorgDetected: false,
+      // Catch-up telemetry initialization
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     };
   }
 
@@ -1208,6 +1255,12 @@ export class IndexerIngestionService {
       lastSafeLedger: 0,
       reorgDetected: false,
       reorgHeight: undefined,
+      // Reset catch-up telemetry state
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     });
     rolledBackLedgers.clear();
   }
@@ -1225,6 +1278,105 @@ export class IndexerIngestionService {
       lastSafeLedger: this.state.lastSafeLedger,
       reorgDetected: this.state.reorgDetected,
     };
+  }
+
+  /**
+   * Get catch-up telemetry including ledger lag and ETA.
+   * This provides visibility into how far behind the indexer is and
+   * estimated time to catch up when lagging.
+   */
+  getCatchupTelemetry(): {
+    ledgerLag: number;
+    catchupEtaSeconds: number | null;
+    lastIndexedLedger: number;
+    lastLedgerLagUpdateAt: string | null;
+  } {
+    return {
+      ledgerLag: this.state.ledgerLag,
+      catchupEtaSeconds: this.state.catchupEtaSeconds,
+      lastIndexedLedger: this.state.lastIndexedLedger,
+      lastLedgerLagUpdateAt: this.state.lastLedgerLagUpdateAt
+        ? new Date(this.state.lastLedgerLagUpdateAt).toISOString()
+        : null,
+    };
+  }
+
+  /**
+   * Compute ledger lag and ETA using the Stellar RPC tip.
+   * This should be called periodically (e.g., on each successful ingest)
+   * to update catch-up telemetry without making redundant RPC calls.
+   *
+   * Uses a rolling average of ledger throughput samples to estimate ETA,
+   * avoiding naive linear extrapolation from a single sample.
+   */
+  private async updateCatchupTelemetry(maxLedger: number): Promise<void> {
+    try {
+      const rpcService = getStellarRpcService();
+      const tip = await rpcService.getLatestLedger();
+      const tipLedger = tip.sequence;
+
+      // Store previous values before updating
+      const previousLedger = this.state.lastIndexedLedger;
+      const previousUpdateTime = this.state.lastLedgerLagUpdateAt;
+
+      // Compute ledger lag (tip - last indexed)
+      const lag = Math.max(0, tipLedger - maxLedger);
+      this.state.ledgerLag = lag;
+      this.state.lastIndexedLedger = maxLedger;
+      const now = Date.now();
+      this.state.lastLedgerLagUpdateAt = now;
+
+      // Update Prometheus gauge
+      indexerLedgerLag.set(lag);
+
+      // Compute ETA if lagging and we have throughput data
+      if (lag > 0) {
+        // Calculate throughput if we have previous data
+        if (previousUpdateTime && previousLedger > 0) {
+          const timeSinceLastUpdate = (now - previousUpdateTime) / 1000; // seconds
+          
+          if (timeSinceLastUpdate > 0) {
+            const ledgersProcessed = maxLedger - previousLedger;
+            const throughput = ledgersProcessed / timeSinceLastUpdate; // ledgers/second
+
+            // Maintain rolling window of last 10 samples
+            this.state.ledgerThroughputSamples.push(throughput);
+            if (this.state.ledgerThroughputSamples.length > 10) {
+              this.state.ledgerThroughputSamples.shift();
+            }
+
+            // Compute average throughput from samples
+            const avgThroughput =
+              this.state.ledgerThroughputSamples.reduce((sum, sample) => sum + sample, 0) /
+              this.state.ledgerThroughputSamples.length;
+
+            // Estimate ETA using average throughput
+            if (avgThroughput > 0) {
+              const etaSeconds = lag / avgThroughput;
+              this.state.catchupEtaSeconds = etaSeconds;
+              indexerCatchupEtaSeconds.set(etaSeconds);
+            } else {
+              this.state.catchupEtaSeconds = null;
+              indexerCatchupEtaSeconds.set(0);
+            }
+          }
+        } else {
+          // Not enough data for ETA estimation yet
+          this.state.catchupEtaSeconds = null;
+          indexerCatchupEtaSeconds.set(0);
+        }
+      } else {
+        // Caught up - reset ETA
+        this.state.catchupEtaSeconds = null;
+        indexerCatchupEtaSeconds.set(0);
+      }
+    } catch (err) {
+      // If RPC fails, we can't compute lag - log but don't fail the ingest
+      warn('Failed to update catch-up telemetry (RPC error)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Don't update telemetry on RPC failure - keep last known values
+    }
   }
 
   private enforceRateLimit(actor: string): void {
@@ -1294,6 +1446,22 @@ export class IndexerIngestionService {
       debug('Indexer contract event ids processed', {
         requestId: context.requestId, insertedEventIds: result.insertedEventIds, duplicateEventIds: result.duplicateEventIds,
       });
+
+      if (result.insertedEventIds.length > 0) {
+        indexerEventsIngestedTotal.inc(result.insertedEventIds.length);
+
+        const latestHappenedAtMs = events.reduce((max, event) => {
+          const happenedAtMs = Date.parse(event.happenedAt);
+          return Number.isFinite(happenedAtMs) && happenedAtMs > max ? happenedAtMs : max;
+        }, 0);
+        if (latestHappenedAtMs > 0) {
+          indexerLagSeconds.set(Math.max(0, (Date.now() - latestHappenedAtMs) / 1000));
+        }
+
+        // Update catch-up telemetry (ledger lag and ETA)
+        // This uses the same Stellar RPC tip-fetching path to avoid redundant calls
+        await this.updateCatchupTelemetry(maxLedger);
+      }
 
       return {
         insertedCount: result.insertedEventIds.length,

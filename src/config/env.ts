@@ -256,30 +256,17 @@ export const EnvSchema = z
     METRICS_ENABLED: booleanEnv().default(true),
     CORS_ALLOWED_ORIGINS: optionalString('CORS_ALLOWED_ORIGINS'),
 
-    TRACING_ENABLED: booleanEnv().default(false),
-    TRACING_SAMPLE_RATE: z
-      .preprocess(
-        parseNumber,
-        z
-          .number()
-          .min(0, 'TRACING_SAMPLE_RATE must be at least 0')
-          .max(1, 'TRACING_SAMPLE_RATE must be at most 1')
-      )
-      .default(1),
-    TRACING_SAMPLING_STRATEGY: z.enum(['head', 'tail', 'always', 'never']).default('head'),
-    TRACING_HEAD_SAMPLE_RATE: z
-      .preprocess(
-        parseNumber,
-        z
-          .number()
-          .min(0, 'TRACING_HEAD_SAMPLE_RATE must be at least 0')
-          .max(1, 'TRACING_HEAD_SAMPLE_RATE must be at most 1')
-      )
-      .optional(),
-    TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
-    TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
-    TRACING_OTEL_ENABLED: booleanEnv().default(false),
-    TRACING_LOG_EVENTS: booleanEnv().default(false),
+  WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
+  WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
+  WEBHOOK_SECRET_PREVIOUS: optionalString('WEBHOOK_SECRET_PREVIOUS'),
+  FLUXORA_WEBHOOK_SECRET: optionalString('FLUXORA_WEBHOOK_SECRET'),
+  FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
+  WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
+  WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+  WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
+  WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv('WEBHOOK_CIRCUIT_BREAKER_THRESHOLD', 0, 1000).default(0),
+  WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(300_000),
+  WEBHOOK_ALLOWED_HOSTS: optionalString('WEBHOOK_ALLOWED_HOSTS'),
 
     WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
     WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
@@ -390,7 +377,7 @@ export const EnvSchema = z
      * STARTUP_PROBE_BUDGET_MS          — total wall-clock budget for soft-tier
      *                                    retries (Redis, Stellar RPC) before the
      *                                    service falls back to degraded mode.
-     *                                    Default: 30 000 ms.
+     *                                    Default: 30 000 ms. Maximum: 60 000 ms.
      * STARTUP_PROBE_POSTGRES_TIMEOUT_MS — per-attempt timeout for the single
      *                                    Postgres (hard-tier) probe.
      *                                    Default: 5 000 ms.
@@ -401,7 +388,7 @@ export const EnvSchema = z
      *                                    RPC (soft-tier) retry attempt.
      *                                    Default: 5 000 ms.
      */
-    STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1).default(30_000),
+    STARTUP_PROBE_BUDGET_MS: integerEnv('STARTUP_PROBE_BUDGET_MS', 1, 60_000).default(30_000),
     STARTUP_PROBE_POSTGRES_TIMEOUT_MS: integerEnv('STARTUP_PROBE_POSTGRES_TIMEOUT_MS', 1).default(
       5_000
     ),
@@ -417,6 +404,21 @@ export const EnvSchema = z
      * of their identity (API key or IP).
      */
     CANARY_TRAFFIC_PERCENT: integerEnv('CANARY_TRAFFIC_PERCENT', 0, 100).default(0),
+
+    /**
+     * Retention period in days for dead_letter_queue entries.
+     * Entries in a terminal state (status = 'replayed' or permanently failed)
+     * older than this many days are eligible for automatic purge.
+     * Defaults to 30 days.  Set to 0 to disable the purge job entirely.
+     */
+    DLQ_RETENTION_DAYS: integerEnv('DLQ_RETENTION_DAYS', 1, 365).default(30),
+
+    /**
+     * Maximum rows to delete per batch in the DLQ retention purge job.
+     * Keeps lock duration short on the dead_letter_queue table.
+     * Defaults to 500.
+     */
+    DLQ_PURGE_BATCH_SIZE: integerEnv('DLQ_PURGE_BATCH_SIZE', 1, 5000).default(500),
   })
   .passthrough()
   .superRefine((env, ctx) => {
@@ -559,10 +561,7 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
-  webhookRetryBurst: number;
-  webhookAllowedHosts: string[] | undefined;
-  webhookMaxResponseBytes: number;
-  webhookDnsTimeoutMs: number;
+  webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
@@ -626,6 +625,18 @@ export interface Config {
    * 0 means no canary tagging. Sourced from CANARY_TRAFFIC_PERCENT.
    */
   canaryTrafficPercent: number;
+
+  /**
+   * Retention period in days for dead_letter_queue entries in terminal state.
+   * Defaults to 30. Set to 0 to disable the DLQ retention purge job.
+   */
+  dlqRetentionDays: number;
+
+  /**
+   * Maximum rows to delete per batch in the DLQ retention purge job.
+   * Defaults to 500.
+   */
+  dlqPurgeBatchSize: number;
 }
 
 export class ConfigError extends Error {
@@ -756,14 +767,9 @@ function toConfig(env: ParsedEnv): Config {
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
     webhookRetryRps: env.WEBHOOK_RETRY_RPS,
-    webhookRetryBurst: env.WEBHOOK_RETRY_BURST,
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
-      ? env.WEBHOOK_ALLOWED_HOSTS.split(',')
-          .map((h) => h.trim())
-          .filter((h) => h.length > 0)
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
       : undefined,
-    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
-    webhookDnsTimeoutMs: env.WEBHOOK_DNS_TIMEOUT_MS,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
@@ -802,6 +808,9 @@ function toConfig(env: ParsedEnv): Config {
     startupProbeStellarTimeoutMs: env.STARTUP_PROBE_STELLAR_TIMEOUT_MS,
 
     canaryTrafficPercent: env.CANARY_TRAFFIC_PERCENT,
+
+    dlqRetentionDays: env.DLQ_RETENTION_DAYS,
+    dlqPurgeBatchSize: env.DLQ_PURGE_BATCH_SIZE,
   };
 }
 
@@ -937,7 +946,8 @@ export function reloadHotConfig(): HotConfig {
   const parseOptionalInt = (raw: string | undefined): number | undefined => {
     if (raw === undefined || raw === '') return undefined;
     const n = Number.parseInt(raw, 10);
-    return Number.isFinite(n) ? n : undefined;
+    if (!Number.isFinite(n) || n <= 0) return undefined; // Reject non-positive values
+    return n;
   };
 
   const parseFloat01 = (raw: string | undefined, fallback: number): number => {

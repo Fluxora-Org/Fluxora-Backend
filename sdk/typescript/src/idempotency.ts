@@ -14,12 +14,48 @@
  * - `hashBody()` — computes a SHA-256 hex digest matching the server-side
  *   `fingerprintInput()` in `src/routes/streams.ts`.
  *
+ * ## Idempotency Contract
+ *
+ * ### Key Format and Validation
+ * - Keys must be 1–128 characters matching `[A-Za-z0-9:_-]`.
+ * - UUID v4 format is recommended but not required.
+ * - The server validates key format via `requireIdempotencyKey` middleware.
+ * - Invalid or missing keys return `400 VALIDATION_ERROR`.
+ *
+ * ### Conflict Detection
+ * - Same key + same body hash → cached response replayed (201 with `Idempotency-Replayed: true`).
+ * - Same key + different body hash → `409 CONFLICT` with `stored_hash` and `incoming_hash`.
+ * - Different keys → always treated as separate operations (no collision).
+ *
+ * ### Retry Behavior
+ * - Generate a **new key per logical operation**.
+ * - Reuse the **same key** when retrying a failed request to make it idempotent.
+ * - Do not reuse keys across different logical operations.
+ * - The SDK does not retry requests internally; retry logic is application-level.
+ *
+ * ### Cache TTL
+ * - Idempotency entries expire after `IDEMPOTENCY_TTL_SECONDS` (default 24 hours).
+ * - After expiry, the same key can be reused safely for a new operation.
+ * - TTL is server-side configured; clients cannot control it.
+ *
  * ## Security
  * - Keys are generated with `crypto.randomUUID()` (WebCrypto) where available,
  *   with a `Math.random`-based UUID v4 fallback for older environments.
  * - `hashBody()` uses `crypto.subtle.digest` (WebCrypto) with a Node.js
  *   `node:crypto` `createHash` fallback.
  * - Key values are never logged or echoed in error responses.
+ * - Only key length is logged server-side for debugging.
+ *
+ * ## Error Handling
+ * - `hashBody()` throws `Error` when no crypto API is available.
+ * - Conflict errors include both hashes for debugging mismatched payloads.
+ * - Network errors from `fetch` bubble up unchanged; retry with the same key.
+ *
+ * ## Observability
+ * - Successful responses include `Idempotency-Key` header echoing the submitted key.
+ * - Replayed responses include `Idempotency-Replayed: true` header.
+ * - Fresh responses include `Idempotency-Replayed: false` header.
+ * - Request IDs (from `X-Request-ID`) correlate client and server logs.
  *
  * @module @fluxora/sdk/idempotency
  */
@@ -136,5 +172,127 @@ export async function hashBody(body: unknown): Promise<string> {
     return createHash('sha256').update(canonical).digest('hex');
   } catch {
     throw new Error('Crypto API unavailable: cannot compute SHA-256 hash');
+  }
+}
+
+// ── Idempotency Helper ────────────────────────────────────────────────────────
+
+export interface CacheEntry<T> {
+  response: T;
+  statusCode: number;
+}
+
+export interface ICacheStore {
+  get<T>(key: string): Promise<CacheEntry<T> | null>;
+  set<T>(key: string, entry: CacheEntry<T>, ttlSeconds?: number): Promise<void>;
+  /** Returns false if the lock is already held */
+  acquireLock(key: string, ttlSeconds: number): Promise<boolean>;
+  releaseLock(key: string): Promise<void>;
+}
+
+export interface IdempotencyOptions {
+  /** The unique idempotency key provided by the client */
+  idempotencyKey: string;
+  /** The identifier of the authenticated caller (e.g. user ID or API key ID) */
+  callerId: string;
+  /** TTL for the idempotency cache in seconds (default: 86400 / 24h) */
+  ttlSeconds?: number;
+}
+
+/**
+ * Helper contract notes:
+ * - Validation: both the idempotency key and caller ID must be non-empty strings.
+ * - Retry semantics: a replay with the same key and caller context returns the cached response;
+ *   a concurrent attempt for the same logical request is rejected with CONCURRENT_REQUEST.
+ * - caller-scoped cache keys: entries are stored under `idempotency:${callerId}:${idempotencyKey}`
+ *   to avoid cross-tenant collisions.
+ * - observability hooks: the logger receives info/warn/error events for validation, cache hits,
+ *   lock contention, fresh execution, and failures.
+ */
+
+export interface Logger {
+  info(message: string, meta?: any): void;
+  warn(message: string, meta?: any): void;
+  error(message: string, meta?: any): void;
+}
+
+export class IdempotencyError extends Error {
+  constructor(public code: string, message: string) {
+    super(message);
+    this.name = 'IdempotencyError';
+  }
+}
+
+export class IdempotencyHelper {
+  constructor(
+    private store: ICacheStore,
+    private logger: Logger = console
+  ) {}
+
+  /**
+   * Executes an operation idempotently.
+   *
+   * The helper enforces the current contract for SDK-facing idempotency handling:
+   * - validation fails fast for empty key/caller values;
+   * - retry semantics use a caller-scoped cache key plus a short-lived lock to
+   *   guarantee that a replay returns the original outcome while concurrent requests
+   *   are rejected rather than executing twice;
+   * - observability hooks emit warnings and errors for invalid input, cache hits,
+   *   lock contention, fresh execution, and operation failures.
+   *
+   * @param options Idempotency settings including the key and caller context.
+   * @param operation The business logic to execute if this is a fresh request.
+   * @returns The result of the operation or the cached result.
+   */
+  async execute<T>(
+    options: IdempotencyOptions,
+    operation: () => Promise<{ response: T; statusCode: number }>
+  ): Promise<{ response: T; statusCode: number; cached: boolean }> {
+    const { idempotencyKey, callerId, ttlSeconds = 86400 } = options;
+
+    if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') {
+      this.logger.warn('Idempotency validation failed: Invalid idempotency key', { idempotencyKey, callerId });
+      throw new IdempotencyError('INVALID_KEY', 'Idempotency key is required and must be a valid string.');
+    }
+
+    if (!callerId || typeof callerId !== 'string' || callerId.trim() === '') {
+      this.logger.warn('Idempotency validation failed: Invalid caller ID', { idempotencyKey, callerId });
+      throw new IdempotencyError('INVALID_CALLER', 'Caller ID is required and must be a valid string.');
+    }
+
+    // Isolate keys per caller to prevent cross-tenant collisions
+    const scopedKey = `idempotency:${callerId}:${idempotencyKey}`;
+
+    // 1. Check if we already have a completed response
+    const cached = await this.store.get<T>(scopedKey);
+    if (cached) {
+      this.logger.info('Idempotency cache hit', { idempotencyKey, callerId });
+      return { ...cached, cached: true };
+    }
+
+    // 2. Acquire a lock to prevent concurrent processing of the same key
+    const lockKey = `${scopedKey}:lock`;
+    const lockAcquired = await this.store.acquireLock(lockKey, 30); // 30 second lock
+    if (!lockAcquired) {
+      this.logger.warn('Concurrent request collision', { idempotencyKey, callerId });
+      throw new IdempotencyError('CONCURRENT_REQUEST', 'A request with this idempotency key is already in progress.');
+    }
+
+    try {
+      // 3. Execute the operation
+      this.logger.info('Executing fresh operation', { idempotencyKey, callerId });
+      const result = await operation();
+
+      // 4. Cache the result for future replays
+      await this.store.set(scopedKey, result, ttlSeconds);
+      
+      return { ...result, cached: false };
+    } catch (error) {
+      this.logger.error('Operation failed during idempotent execution', { idempotencyKey, callerId, error });
+      throw error;
+    } finally {
+      // 5. Release the lock
+      await this.store.releaseLock(lockKey);
+    }
   }
 }

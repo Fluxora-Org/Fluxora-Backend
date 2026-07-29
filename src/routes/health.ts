@@ -2,11 +2,12 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { assessIndexerHealth, DEFAULT_INDEXER_STALL_THRESHOLD_MS } from '../indexer/stall.js';
 import { HealthCheckManager, type HealthStatus, type DependencyHealth } from '../config/health.js';
-import { Logger } from '../config/logger.js';
+import type { Logger } from '../config/logger.js';
 import { Config } from '../config/env.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { isShuttingDown } from '../shutdown.js';
 import { getIndexerHealth } from './indexer.js';
+import { buildDeploymentChecklistReport } from '../config/deployment.js';
 
 export const healthRouter = Router();
 
@@ -56,6 +57,7 @@ healthRouter.get('/', (req: Request, res: Response) => {
     dependencies: {
       indexer: indexerHealth,
     },
+    catchupTelemetry: indexerHealth.catchupTelemetry,
   });
 });
 
@@ -108,7 +110,7 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
     }
 
     if (report.status === 'unhealthy') {
-      logger?.warn('Readiness check failed', {
+      logger?.warn('Readiness check failed', req.correlationId, {
         dependencies: report.dependencies.map((d: DependencyHealth) => ({
           name: d.name,
           status: d.status,
@@ -133,7 +135,9 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
       dependencies,
     });
   } catch (err) {
-    logger?.error('Readiness check error', err as Error);
+    logger?.error('Readiness check error', req.correlationId, {
+      error: err instanceof Error ? err.message : String(err),
+    });
     res.status(503).json(errorResponse('HEALTH_CHECK_ERROR', 'Health check failed'));
   }
 });
@@ -154,7 +158,42 @@ healthRouter.get('/live', async (req: Request, res: Response) => {
       : { status: 'healthy', version: '0.1.0', timestamp: new Date().toISOString(), uptime: 0, dependencies: [] };
     res.json(successResponse({ report }));
   } catch (err) {
-    logger?.error('Failed to get health report', err as Error);
+    logger?.error('Failed to get health report', req.correlationId, {
+      error: err instanceof Error ? err.message : String(err),
+    });
     res.status(500).json(errorResponse('HEALTH_CHECK_ERROR', 'Failed to get health report'));
   }
 });
+
+/**
+ * GET /health/deployment - Staging-to-prod deployment parity report
+ *
+ * Checks configured auth, Redis, background workers, indexer, dependency readiness,
+ * and operator metrics to report deployment parity.
+ */
+healthRouter.get('/deployment', async (req: Request, res: Response) => {
+  const config = req.app.locals.config as Config | undefined;
+  const healthManager = req.app.locals.healthManager as HealthCheckManager | undefined;
+  const logger = req.app.locals.logger as Logger | undefined;
+
+  if (!config) {
+    res.status(503).json(errorResponse('HEALTH_CHECK_ERROR', 'Config not loaded'));
+    return;
+  }
+
+  try {
+    const dependencyHealth = healthManager
+      ? await healthManager.checkAll()
+      : { status: 'healthy' as HealthStatus, version: '0.1.0', timestamp: new Date().toISOString(), uptime: 0, dependencies: [] };
+    const indexerHealth = getIndexerHealth();
+    const report = buildDeploymentChecklistReport({ config, dependencyHealth, indexerHealth });
+    const statusCode = report.status === 'fail' ? 503 : 200;
+    res.status(statusCode).json({ report });
+  } catch (err) {
+    logger?.error('Failed to generate deployment report', req.correlationId, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json(errorResponse('HEALTH_CHECK_ERROR', 'Failed to generate deployment report'));
+  }
+});
+

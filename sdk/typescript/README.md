@@ -19,6 +19,7 @@ Zero external runtime dependencies; uses the standard Web `fetch` API.
 | **Typed error hierarchy** | `FluxoraApiError`, `IdempotencyConflictError`, `ValidationError` |
 | **Client-side validation** | Input guards throw `ValidationError` before any network round-trip |
 | **Auth support** | Bearer JWT + static API key |
+| **Deterministic dispatch** | No hidden retries; query params and JSON bodies are sent in caller insertion order |
 
 ---
 
@@ -98,8 +99,10 @@ try {
 POST /api/streams requires an `Idempotency-Key` header. The SDK handles this automatically:
 
 - If you omit `idempotencyKey`, the SDK auto-generates a UUID v4.
-- If you supply a key, reuse the **same key when retrying** to prevent duplicate creation.
+- The SDK does **not** retry requests internally. If your application retries, supply and reuse the **same key** for every attempt of the same logical create operation.
 - Reusing a key with a **different body** throws `IdempotencyConflictError`.
+- The helper uses caller-scoped cache keys to avoid cross-tenant collisions and keeps the retry semantics explicit: replayed requests return the cached result, while concurrent requests for the same logical operation fail fast with `CONCURRENT_REQUEST`.
+- Observability hooks emit info, warn, and error events for validation, cache hits, lock contention, fresh execution, and operation failures.
 
 ```typescript
 const key = generateIdempotencyKey(); // UUID v4
@@ -113,10 +116,26 @@ const same = await client.createStream(payload, key); // replays cached response
 ## Security notes
 
 - Bearer tokens and API keys are stored in memory only and never logged.
-- The `Authorization` header is only added when a credential is present.
+- The `Authorization` and `X-API-Key` headers are only added when non-empty credentials are present; runtime setters trim surrounding whitespace.
 - Client-side input validation rejects obviously invalid values before network dispatch.
+- Per-request SDK headers override constructor headers. Runtime credentials override any user-supplied `Authorization` or `X-API-Key` constructor headers.
 - TLS certificate validation is performed by the platform's `fetch` implementation.
 - Idempotency key values are never echoed in error bodies or logs (server-side guarantee).
+
+---
+
+## SDK Generation Contract
+
+The TypeScript SDK is generated from `openapi.yaml` and its compatibility
+surface is intentionally small:
+
+- Public exports remain `types`, `errors`, `idempotency`, `pagination`, and `client`.
+- `FluxoraClient` methods preserve the current backend envelopes and unwrap only the documented stream convenience shapes.
+- Requests use native `fetch` once per SDK method call. Network failures from `fetch` are allowed to bubble unchanged.
+- Query parameters omit only `undefined` and `null` values; `false`, `0`, and empty strings are serialized.
+- JSON responses are parsed when possible. Empty successful responses resolve to `{}`; text error bodies become `FluxoraApiError` messages.
+- Request IDs are read from `X-Request-ID` first, then response envelope metadata, then nested error objects.
+- Generated output must pass `pnpm check:sdk:ts`; drift is treated as a regression.
 
 ---
 

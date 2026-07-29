@@ -198,6 +198,30 @@ describe('authenticate', () => {
     expect(req.user).toBeUndefined();
   });
 
+  it('proceeds as anonymous for Bearer with only whitespace token', async () => {
+    // "Bearer   " → split produces ['Bearer', '', ''] → rest is '  ' → trimmed to ''
+    const req = mockReq({ authHeader: 'Bearer   ' }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(req.user).toBeUndefined();
+  });
+
+  it('proceeds as anonymous for Bearer with empty token (just "Bearer")', async () => {
+    // "Bearer" → split produces ['Bearer'] → token undefined → proceeds as anonymous
+    const req = mockReq({ authHeader: 'Bearer' }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(req.user).toBeUndefined();
+  });
+
   // ── Schema validation ──
 
   it('returns 401 for token with invalid shape', async () => {
@@ -341,6 +365,32 @@ describe('requirePermission', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
+  it('returns 403 when permissions is not an array (non-array hardening)', () => {
+    const req = {
+      user: { permissions: 'streams:read' as unknown as string[] },
+    } as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requirePermission(Permission.STREAMS_READ)(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when permissions is null (null hardening)', () => {
+    const req = {
+      user: { permissions: null as unknown as string[] },
+    } as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requirePermission(Permission.STREAMS_READ)(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
   it('returns 401 when no user is present', () => {
     const req = {} as Request;
     const res = mockRes() as Response;
@@ -421,5 +471,148 @@ describe('authenticateApiKey (issue #836)', () => {
     await authenticateApiKey(req, res, next);
 
     expect(next).toHaveBeenCalled();
+  });
+});
+
+// ── requireScope edge cases ───────────────────────────────────────────────────
+
+import { requireScope } from '../../../src/middleware/auth.js';
+
+function mockReqForScope(opts: {
+  keyId?: string;
+  keyScopes?: string[];
+  user?: { permissions?: string[] };
+} = {}): Partial<Request> {
+  const req: any = {
+    path: '/test',
+    id: 'req-scope',
+    correlationId: 'req-scope',
+  };
+  if (opts.keyId !== undefined) req.keyId = opts.keyId;
+  if (opts.keyScopes !== undefined) req.keyScopes = opts.keyScopes;
+  if (opts.user !== undefined) req.user = opts.user;
+  return req;
+}
+
+describe('requireScope — unauthenticated principal', () => {
+  it('returns 401 when neither JWT user nor API key is present', () => {
+    const req = mockReqForScope() as Request; // no user, no keyId
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:read')(req, res, next);
+
+    expect(res.statusCode).toBe(401);
+    expect((res as any).jsonBody.error.code).toBe('UNAUTHORIZED');
+    expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('requireScope — API key authenticated', () => {
+  it('returns 403 when keyScopes is an empty array', () => {
+    const req = mockReqForScope({ keyId: 'key-1', keyScopes: [] }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:read')(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect((res as any).jsonBody.error.code).toBe('FORBIDDEN');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when keyScopes does not include the required scope', () => {
+    const req = mockReqForScope({ keyId: 'key-1', keyScopes: ['streams:read'] }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:write')(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect((res as any).jsonBody.error.code).toBe('FORBIDDEN');
+  });
+
+  it('calls next() when keyScopes includes the required scope', () => {
+    const req = mockReqForScope({ keyId: 'key-1', keyScopes: ['streams:read', 'streams:write'] }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:write')(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('calls next() when any one of multiple required scopes matches', () => {
+    const req = mockReqForScope({ keyId: 'key-1', keyScopes: ['admin:pause'] }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:write', 'admin:pause')(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('prefers keyScopes over user.permissions when both keyId and user are present', () => {
+    // Both auth methods set: API key takes precedence (isApiKeyAuth checked first)
+    const req = mockReqForScope({
+      keyId: 'key-1',
+      keyScopes: ['streams:read'], // has read
+      user: { permissions: ['streams:write'] }, // has write — should be ignored
+    }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:write')(req, res, next);
+
+    // API key scopes are used; 'streams:write' is not in keyScopes → 403
+    expect(res.statusCode).toBe(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('requireScope — JWT authenticated', () => {
+  it('returns 403 when user.permissions is an empty array', () => {
+    const req = mockReqForScope({ user: { permissions: [] } }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:read')(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect((res as any).jsonBody.error.code).toBe('FORBIDDEN');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when user.permissions does not include required scope', () => {
+    const req = mockReqForScope({ user: { permissions: ['streams:read'] } }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:write')(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('calls next() when user.permissions includes the required scope', () => {
+    const req = mockReqForScope({ user: { permissions: ['streams:read', 'streams:write'] } }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:write')(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('returns 403 when user has no permissions property (undefined)', () => {
+    // user object exists but permissions is missing (should default to [])
+    const req = mockReqForScope({ user: {} }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requireScope('streams:read')(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect(next).not.toHaveBeenCalled();
   });
 });

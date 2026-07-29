@@ -2,6 +2,8 @@ export interface JitteredRetryOptions {
   baseDelayMs: number;
   maxDelayMs: number;
   maxAttempts: number;
+  /** Optional dynamic cap for a retry sleep, used to honour external deadlines. */
+  maxDelayForAttemptMs?: () => number;
 }
 
 /**
@@ -51,7 +53,8 @@ export async function withJitteredRetry<T>(
       const delay = Math.round(Math.min(options.maxDelayMs, nextDelay));
       
       previousDelayMs = delay;
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      const boundedDelay = Math.max(0, Math.min(delay, options.maxDelayForAttemptMs?.() ?? delay));
+      await new Promise((resolve) => setTimeout(resolve, boundedDelay));
     }
   }
 }
