@@ -174,6 +174,98 @@ Response:
 }
 ```
 
+## System Diagnostics
+
+### `GET /api/admin/diagnostics`
+
+Returns an aggregated system diagnostics snapshot for fast operator triage.
+Aggregates DB pool stats, Redis connectivity, Stellar RPC circuit-breaker state,
+and current indexer ledger lag into a single JSON response. Each sub-check is
+individually timeout-bounded (default 5 seconds) so a single hung dependency
+cannot stall the whole endpoint.
+
+Response (200):
+
+```json
+{
+  "success": true,
+  "data": {
+    "timestamp": "2026-07-29T12:00:00.000Z",
+    "dbPool": {
+      "status": "ok",
+      "latencyMs": 2,
+      "value": {
+        "active": 3,
+        "idle": 5,
+        "waiting": 0
+      }
+    },
+    "redis": {
+      "status": "ok",
+      "latencyMs": 1,
+      "value": {
+        "pingMs": 0.5
+      }
+    },
+    "circuitBreaker": {
+      "status": "ok",
+      "latencyMs": 0,
+      "value": {
+        "state": "CLOSED",
+        "transitionedAt": null,
+        "failureCount": 0,
+        "degraded": false
+      }
+    },
+    "indexer": {
+      "status": "ok",
+      "latencyMs": 0,
+      "value": {
+        "lagSeconds": 0,
+        "isReplaying": false,
+        "rowsReplayed": 0,
+        "totalRows": 0
+      }
+    }
+  },
+  "meta": {
+    "timestamp": "2026-07-29T12:00:00.000Z",
+    "requestId": "req-abc-123"
+  }
+}
+```
+
+Each sub-check status is one of:
+- `"ok"` — check succeeded
+- `"error"` — check failed with an error
+- `"timeout"` — check exceeded its timeout
+
+When a sub-check fails, a sanitised `error` field is included (connection
+strings and credentials are redacted).
+
+Error response (503):
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "DIAGNOSTICS_ERROR",
+    "message": "Diagnostics check failed",
+    "requestId": "req-abc-123"
+  }
+}
+```
+
+Security notes:
+
+- The endpoint is admin-only and fails closed when `ADMIN_API_KEY` is unset.
+- Error messages are sanitised — connection URLs, passwords, and hostnames are
+  stripped before being returned.
+- No authentication tokens, API keys, or session identifiers are ever included
+  in diagnostics output.
+- Each sub-check runs with its own timeout so a single hung dependency cannot
+  stall the entire endpoint (DoS protection).
+
 ## Related admin endpoints
 
 - `GET /api/admin/status`
@@ -181,6 +273,7 @@ Response:
 - `PUT /api/admin/pause`
 - `GET /api/admin/reindex`
 - `POST /api/admin/reindex`
+- `GET /api/admin/diagnostics`
 - `GET /api/admin/api-keys`
 - `POST /api/admin/api-keys`
 - `POST /api/admin/api-keys/:id/rotate`
