@@ -29,6 +29,14 @@
  *   indexer_mtls_validation_failures_total
  *     Counter: total number of mTLS client-certificate validation failures.
  *     Labels: reason (e.g. 'expired', 'unknown_ca', 'missing_cert').
+ *
+ *   indexer_replay_integrity_gaps_total
+ *     Counter: total ledger gaps detected across all replay integrity checks.
+ *     Labels: contract_id.
+ *
+ *   indexer_replay_integrity_duplicates_total
+ *     Counter: total duplicate event entries detected across all replay
+ *     integrity checks.  Labels: contract_id.
  */
 
 import { Counter, Gauge, Histogram } from 'prom-client';
@@ -87,6 +95,26 @@ export const indexerReplayDurationSeconds =
     registers: [registry],
   });
 
+// ── Integrity-check counters ──────────────────────────────────────────────────
+
+export const indexerReplayIntegrityGapsTotal =
+  (registry.getSingleMetric('indexer_replay_integrity_gaps_total') as Counter<'contract_id'>) ||
+  new Counter({
+    name: 'indexer_replay_integrity_gaps_total',
+    help: 'Total number of ledger gaps detected across all post-replay integrity checks',
+    labelNames: ['contract_id'] as const,
+    registers: [registry],
+  });
+
+export const indexerReplayIntegrityDuplicatesTotal =
+  (registry.getSingleMetric('indexer_replay_integrity_duplicates_total') as Counter<'contract_id'>) ||
+  new Counter({
+    name: 'indexer_replay_integrity_duplicates_total',
+    help: 'Total number of duplicate event entries detected across all post-replay integrity checks',
+    labelNames: ['contract_id'] as const,
+    registers: [registry],
+  });
+
 // ── Deregister (for test isolation) ──────────────────────────────────────────
 
 export function deRegisterIndexerMetrics(): void {
@@ -95,4 +123,6 @@ export function deRegisterIndexerMetrics(): void {
   registry.removeSingleMetric('indexer_replay_rows_per_second');
   registry.removeSingleMetric('indexer_replay_duration_seconds');
   registry.removeSingleMetric('indexer_mtls_validation_failures_total');
+  registry.removeSingleMetric('indexer_replay_integrity_gaps_total');
+  registry.removeSingleMetric('indexer_replay_integrity_duplicates_total');
 }

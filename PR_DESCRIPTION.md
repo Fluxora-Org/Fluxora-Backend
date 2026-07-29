@@ -1,127 +1,136 @@
-# feat(ws): add per-client buffered-bytes backpressure gauge
+# feat: add post-replay ledger-sequence integrity check
 
-## 📌 Description
+**Closes #1216**
 
-`src/ws/hub.ts` tracks global `BackpressureMetrics` (drops / terminates) but did
-not expose per-client buffered bytes. When a single slow client accumulated a
-large send buffer, there was no metric to identify the offending connection
-*before* the hub dropped or terminated it — global counters only told you that
-something was slow, not which client it was.
+## Summary
 
-This PR emits a per-client Prometheus gauge so operators can pinpoint the
-backed-up connection while it is still recoverable.
+After a manual reindex or replay triggered via `/api/admin/reindex` or `POST /events/replay`, there was no automated check that the resulting `contract_events` rows form a contiguous, gap-free ledger sequence per contract. Silently skipped ledgers (e.g. from a dropped RPC page mid-replay) could go unnoticed.
 
-## ✨ What's new
+This PR adds a **post-replay integrity check** that runs asynchronously after every successful replay, verifying ledger-sequence contiguity and flagging gaps or duplicate event entries via structured audit logging and Prometheus counters.
 
-| Metric | Type | Labels | Purpose |
-|---|---|---|---|
-| `fluxora_ws_backpressure_buffered_bytes` | Gauge | `connection_id` (UUID v4) | Current `ws.bufferedAmount` per connected `/ws/streams` client. |
-| `fluxora_ws_max_buffered_bytes` | Gauge | — | Max `bufferedAmount` across all live clients at the most recent sample. |
-| `fluxora_ws_slow_clients` | Gauge | — | Count of live clients whose `bufferedAmount` exceeds a configurable slow threshold (default 1 MiB). |
+---
 
-A 5 s `setInterval` collector inside `StreamHub` updates the gauges; the
-hub removes the per-client series in `onDisconnect` via
-`Gauge.remove({ connection_id })`. The collector can be disabled or tuned
-through a new `StreamHubOptions.backpressureCollector` field.
+## Changes
 
-## 📁 Files
+### New files
 
-- `src/metrics/wsBackpressure.ts` — gauge definitions + collector helpers (new)
-- `src/ws/hub.ts` — start collector after `WebSocketServer`, clean up on
-  disconnect, expose `_getClients()` for the collector, clear the timer on
-  `close()`
-- `tests/ws/hub.perClientGauge.test.ts` — integration tests using the
-  existing slow-client fixture (new)
-- `tests/ws/hub.backpressureGauge.unit.test.ts` — stub-based unit tests that
-  reliably exercise the rise / disconnect-clear invariant without depending on
-  the `createSlowClient` fixture (new)
-- `docs/observability.md` — new "WebSocket Backpressure Gauges" section with
-  metric definitions, PromQL examples, thresholding strategy, and the
-  bounded-cardinality / security rationale
+| File | Purpose |
+|---|---|
+| `src/indexer/replayIntegrity.ts` | Core module — `checkReplayIntegrity()` function with gap detection, duplicate detection, audit logging, and Prometheus counter integration |
+| `tests/indexer/replayIntegrity.test.ts` | 22 comprehensive unit tests covering all edge cases |
+| `docs/indexer.md` | User-facing documentation for the integrity check feature |
+| `PR_DESCRIPTION.md` | This PR description |
 
-> **Note on file path:** the inlined PR template suggested
-> `src/metrics/index.ts`. The codebase organises metrics into
-> `businessMetrics.ts` / `pool.ts` / `runtimeMetrics.ts` / etc., so the new
-> file is `src/metrics/wsBackpressure.ts` for consistency with that pattern.
+### Modified files
 
-## 🔒 Security notes
+| File | Change |
+|---|---|
+| `src/indexer/service.ts` | Imported `checkReplayIntegrity`; added fire-and-forget integrity check call after `replayEvents()` completes; added `runPostReplayIntegrityCheck()` private helper using a ±1000 ledger window |
+| `src/metrics/indexerMetrics.ts` | Added `indexerReplayIntegrityGapsTotal` and `indexerReplayIntegrityDuplicatesTotal` Prometheus counters (both with `contract_id` label); added deregistration in `deRegisterIndexerMetrics()` |
+| `src/lib/auditLog.ts` | Added `REPLAY_INTEGRITY_ISSUE` to the `AuditAction` union type |
 
-Label cardinality is **bounded**:
+---
 
-- The only label on the per-client gauge is `connection_id`, a
-  **server-generated UUID v4** produced in `StreamHub.onConnect` via
-  `randomUUID()` from `node:crypto`.
-- It never carries client IP, JWT subject / claim, `correlationId`, or any
-  other client-controlled input.
-- Series for disconnected clients are explicitly removed in
-  `onDisconnect` so the cardinality is bounded by **peak concurrent
-  connections**, not by the total number of historical connections.
-- An attacker that repeatedly reconnects cannot inflate the metric label
-  set indefinitely — each reconnect simply replaces the prior series for
-  that seat.
-- `fluxora_ws_max_buffered_bytes` and `fluxora_ws_slow_clients` are
-  labelless — they contribute zero additional cardinality.
+## Design
 
-The `removeWsClientBackpressureGauge` helper wraps `Gauge.remove(...)`,
-which is a no-op in `prom-client@15` if the series is already gone, so it is
-safe to call defensively.
+### How the check works
 
-## 🧪 Tests
+1. **Trigger**: After `IndexerService.replayEvents()` marks the cursor as complete and records metrics, it fires `runPostReplayIntegrityCheck()` asynchronously via `.catch()`. The replay response path is never blocked.
 
-Two test files:
+2. **Scope**: The check runs against a ±1000 ledger window around the replayed ledger (not using `from_block`/`to_block`, which are block-height filters on the source `historical_events` table, not ledger numbers on `contract_events`). A separate hard cap of 100 000 ledgers (`MAX_INTEGRITY_RANGE`) prevents OOM from `generate_series` on pathological ranges.
 
-1. `tests/ws/hub.perClientGauge.test.ts` — end-to-end tests using the
-   `createSlowClient` fixture. These cover the full `StreamHub ↔ Gauge`
-   interaction but exercise the broken fixture in this environment.
-2. `tests/ws/hub.backpressureGauge.unit.test.ts` — **stub-based unit
-   tests** that drive the collector against a hand-built hub stand-in with
-   three synthetic `WebSocket`s. Six tests cover the rise-then-clear
-   invariant the PR template explicitly requires, the disconnect cleanup,
-   the `readyState !== OPEN` skip, the custom slow threshold, and the
-   defensive `bufferedAmount`-undefined fallback. **All six pass in 467 ms.**
+3. **Gap detection**: Uses `generate_series` to materialise the expected ledger list for the contract within the range, then LEFT JOINs with the distinct ledgers actually present in `contract_events`. Missing ledgers are reported as gaps.
 
-The unit-test file is the load-bearing coverage in CI; the integration
-tests are supplementary.
+4. **Duplicate detection**: Groups `contract_events` rows by `(event_id, ledger)` and reports any group with `COUNT(*) > 1`. Although the INSERT uses `ON CONFLICT DO NOTHING`, this catches corner cases like concurrent races or batch-boundary bugs.
 
-## ⚙️ Configuration
+5. **On detection**: A structured `REPLAY_INTEGRITY_ISSUE` entry is written to the `audit_logs` table via `recordAuditEventToDb()`, Prometheus counters are incremented, and a structured warning is logged.
 
-| `StreamHubOptions.backpressureCollector` field | Default | Description |
+6. **Failure mode**: The check **never throws**. DB errors are caught, logged at warn level, and returned in the result's `error` field. Audit write failures are caught and logged internally.
+
+### SQL queries (all parameterized — no injection vectors)
+
+| Query | Purpose |
+|---|---|
+| `RANGE_QUERY` | `SELECT MIN(ledger), MAX(ledger) … WHERE contract_id = $1 AND ledger BETWEEN $2 AND $3` |
+| `GAP_QUERY` | CTE with `generate_series($1, $2)` LEFT JOINed against `SELECT DISTINCT ledger …` to find missing ledgers |
+| `DUPLICATE_QUERY` | `SELECT event_id, ledger, COUNT(*) … GROUP BY event_id, ledger HAVING COUNT(*) > 1` |
+
+### Security
+
+- All SQL queries use positional parameters (`$1`, `$2`, …) — no user-supplied values are ever interpolated into query strings.
+- The `contract_id` label on Prometheus counters is truncated to 64 characters to prevent metric cardinality blowup.
+- The audit entry meta field is limited to 100 gap entries and 50 duplicate entries to prevent oversized log payloads.
+- The `MAX_INTEGRITY_RANGE` cap (100 000 ledgers) prevents `generate_series` from exhausting memory or causing slow queries.
+
+---
+
+## Test coverage
+
+**22 tests** across 11 describe blocks in `tests/indexer/replayIntegrity.test.ts`:
+
+| Category | Tests | What's covered |
 |---|---|---|
-| `intervalMs` | `5000` | Poll interval. Set to `0` to disable the periodic collector entirely. |
-| `slowThresholdBytes` | `1_048_576` (1 MiB) | Threshold above which a client is counted in `fluxora_ws_slow_clients`. |
+| Clean pass | 2 | Contiguous gap-free range, single event |
+| Gap detection | 4 | Single gap, multiple gaps, per-contract scoping, multiple events per ledger (no false positives) |
+| Duplicate detection | 3 | Single duplicate, multiple duplicates, unique events on same ledger (no false positives) |
+| Empty range | 1 | No events for contract → `hasIssues: false` |
+| Range clamping | 1 | Range > 100K → warning logged, check still runs on clamped tail |
+| DB error handling | 2 | Error caught and returned in `error` field, warning logged |
+| Audit event | 3 | Entry written on gap detection, not written on clean pass, safe on audit write failure |
+| Prometheus counters | 3 | Gap counter incremented, duplicate counter incremented, neither incremented on clean pass |
+| Contract ID label | 1 | Long contract_id truncated to 64 chars in metric labels |
+| IndexerService integration | 1 | `runPostReplayIntegrityCheck` called after `replayEvents` completes |
 
-## 📊 Useful PromQL
+All tests pass: `22 passed, 0 failed`
 
-Top-5 clients by current buffered bytes:
+---
 
-```promql
-topk(5, fluxora_ws_backpressure_buffered_bytes)
-```
+## Monitoring & Observability
 
-Alert: any client above 4 MiB (terminate threshold minus 1 MiB headroom):
+### New Prometheus metrics
 
-```promql
-max(fluxora_ws_backpressure_buffered_bytes) > 4194304
-```
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `indexer_replay_integrity_gaps_total` | Counter | `contract_id` | Total ledger gaps detected |
+| `indexer_replay_integrity_duplicates_total` | Counter | `contract_id` | Total duplicate event entries detected |
 
-Sustained slow-client count:
+### New audit action
 
-```promql
-fluxora_ws_slow_clients > 5
-```
+| Action | Resource type | When emitted |
+|---|---|---|
+| `REPLAY_INTEGRITY_ISSUE` | `contract_events` | When gaps or duplicates are detected after a replay |
 
-## ✅ Acceptance criteria
+### Structured log events
 
-- [x] Gauge reflects per-client buffered bytes
-- [x] Label cardinality is bounded **and documented** (in
-      `docs/observability.md` and in the TSDoc on the gauge)
-- [x] Gauge clears on disconnect (`onDisconnect` calls
-      `removeWsClientBackpressureGauge`)
-- [x] Test asserts rise + clear with slow / disconnected client
-      (`tests/ws/hub.backpressureGauge.unit.test.ts`)
+| Event | Level | Description |
+|---|---|---|
+| `replay_integrity_issues_detected` | `warn` | Gaps/duplicates found — includes count, range, and sample entries |
+| `replay_integrity_range_clamped` | `warn` | Range exceeded 100K limit and was clamped |
+| `replay_integrity_query_failed` | `warn` | DB query error (transient, caught) |
+| `replay_integrity_audit_failed` | `warn` | Audit write failed (caught, non-blocking) |
+| `post_replay_integrity_check_failed` | `warn` | Integrity check itself threw unexpectedly (safety net) |
 
-## 📝 Commit message
+---
 
-```
-feat(ws): add per-client buffered-bytes backpressure gauge
-```
+## Backward compatibility
+
+- **Fully backward-compatible**. Existing replays continue to work identically.
+- The integrity check only runs **after a successful replay completes** (not on existing data).
+- No new database migrations required — the check queries the existing `contract_events` table.
+- No new configuration variables introduced.
+
+---
+
+## Checklist
+
+- [x] New module: `src/indexer/replayIntegrity.ts`
+- [x] Modified: `src/indexer/service.ts` — integration
+- [x] Modified: `src/metrics/indexerMetrics.ts` — Prometheus counters
+- [x] Modified: `src/lib/auditLog.ts` — audit action type
+- [x] New tests: `tests/indexer/replayIntegrity.test.ts` — 22 tests, all passing
+- [x] New docs: `docs/indexer.md` — user-facing documentation
+- [x] TypeScript: `tsc --noEmit` — no errors in modified files
+- [x] SQL injection safety: all queries parameterized
+- [x] Metric cardinality: contract_id truncated to 64 chars
+- [x] Range safety: capped at 100 000 ledgers
+- [x] Fire-and-forget: never blocks request/response cycle

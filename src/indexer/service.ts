@@ -13,6 +13,7 @@ import {
   getIndexerLeaderElection,
   type IndexerLeaderElection,
 } from './leaderElection.js';
+import { checkReplayIntegrity } from './replayIntegrity.js';
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -553,6 +554,16 @@ export class IndexerService {
         total_rows: totalRows,
         duration_sec: Math.round(durationSec * 100) / 100,
       });
+
+      // ── Post-replay integrity check (fire-and-forget) ────────────────────
+      // Scoped to the affected ledger range — never a full-table scan.
+      // Runs asynchronously so the response path is never blocked.
+      this.runPostReplayIntegrityCheck(request).catch((err) => {
+        logger.warn('post_replay_integrity_check_failed', undefined, {
+          event: 'post_replay_integrity_check_failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     } catch (error) {
       replayState.endReplay();
       indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);
@@ -710,6 +721,26 @@ export class IndexerService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Run the post-replay ledger-sequence integrity check in a fire-and-forget
+   * manner.  This method is called inside the main `try` block of
+   * `replayEvents` after the cursor has been marked complete, so it runs
+   * outside any in-flight batch transaction.
+   *
+   * The check is scoped to a window around the replayed ledger (not using
+   * `from_block`/`to_block`, which are block-height filters on the source
+   * table).  A window of ±1000 ledgers ensures the check is efficient without
+   * being a full-table scan.  It NEVER throws — all errors are caught and
+   * logged internally.
+   */
+  private async runPostReplayIntegrityCheck(request: ReplayRequest): Promise<void> {
+    const INTEGRITY_WINDOW_SIZE = 1000;
+    const fromLedger = Math.max(0, request.ledger - INTEGRITY_WINDOW_SIZE);
+    const toLedger = request.ledger + INTEGRITY_WINDOW_SIZE;
+
+    await checkReplayIntegrity(this.pool, request.contract_id, fromLedger, toLedger);
   }
 
   /**
