@@ -11,9 +11,10 @@
  *  - Non-blocking behavior (setImmediate)
  */
 
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import express, { Express, Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import {
   buildLinkHeader,
   buildPaginationUrl,
@@ -24,7 +25,6 @@ import {
 } from '../../src/utils/earlyHints.js';
 import { streamsRouter } from '../../src/routes/streams.js';
 import { errorHandler } from '../../src/middleware/errorHandler.js';
-import { requestIdMiddleware } from '../../src/errors.js';
 import { initializeConfig } from '../../src/config/env.js';
 
 initializeConfig();
@@ -397,6 +397,17 @@ function makeRow(id: string) {
     created_at: new Date('2024-01-01'),
     updated_at: new Date('2024-01-01'),
   };
+}
+
+/**
+ * Lightweight middleware to set x-request-id on every request.
+ * Replaces the removed requestIdMiddleware from src/errors.ts.
+ */
+function requestIdMiddleware(req: express.Request, _res: express.Response, next: express.NextFunction): void {
+  const requestId = req.header('x-request-id') ?? randomUUID();
+  _res.locals['requestId'] = requestId;
+  _res.setHeader('x-request-id', requestId);
+  next();
 }
 
 function makeApp() {
