@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { revoke, isRevoked, closeRevocationStore } from '../../../src/redis/jwtRevocationStore.js';
+import { revoke, isRevoked, closeRevocationStore, JwtRevocationError } from '../../../src/redis/jwtRevocationStore.js';
 
 // ── Mocks ──
 
@@ -250,16 +250,30 @@ describe('revoke', () => {
     );
   });
 
-  it('throws when Redis SET fails during revocation (revoke-path failure)', async () => {
+  it('throws a typed JwtRevocationError when Redis SET fails during revocation', async () => {
     mockRedis.set.mockRejectedValue(new Error('ECONNREFUSED'));
 
+    await expect(revoke('jti-fail', 3600)).rejects.toThrow(JwtRevocationError);
     await expect(revoke('jti-fail', 3600)).rejects.toThrow('ECONNREFUSED');
   });
 
-  it('throws when Redis connection times out during revocation', async () => {
+  it('throws a typed JwtRevocationError when Redis connection times out during revocation', async () => {
     mockRedis.set.mockRejectedValue(new Error('ETIMEDOUT'));
 
+    await expect(revoke('jti-timeout', 3600)).rejects.toThrow(JwtRevocationError);
     await expect(revoke('jti-timeout', 3600)).rejects.toThrow('ETIMEDOUT');
+  });
+
+  it('logs a warning when Redis SET fails during revocation', async () => {
+    mockRedis.set.mockRejectedValue(new Error('ECONNREFUSED'));
+    const { warn } = await import('../../../src/utils/logger.js');
+
+    await expect(revoke('jti-log', 3600)).rejects.toThrow();
+
+    expect(warn).toHaveBeenCalledWith(
+      'Failed to revoke JWT — Redis error',
+      expect.objectContaining({ jti: 'jti-log', error: 'ECONNREFUSED' }),
+    );
   });
 });
 
