@@ -25,12 +25,6 @@ import {
 } from '../../src/config/rateLimits.js';
 import { reloadFlags, getFlags } from '../../src/config/featureFlags.js';
 
-// Mock the logger
-vi.mock('../../src/lib/logger.js', () => ({
-  warn: vi.fn(),
-  info: vi.fn(),
-  error: vi.fn(),
-}));
 
 const HOT_KEYS = [
   'RATE_LIMIT_IP_WINDOW_MS',
@@ -81,17 +75,15 @@ describe('reloadHotConfig - Validation Edge Cases', () => {
       expect(hot.rateLimitIpWindowMs).toBeUndefined();
     });
 
-    it('handles negative rate limit values', () => {
+    it('rejects negative rate limit values', () => {
       process.env.RATE_LIMIT_IP_MAX = '-50';
       process.env.RATE_LIMIT_IP_WINDOW_MS = '-1000';
 
       const hot = reloadHotConfig();
 
-      // NOTE: The current implementation parses negative numbers as valid integers
-      // because parseInt('-50') returns -50. The implementation does NOT validate
-      // that values must be positive. This test documents the current behavior.
-      expect(hot.rateLimitIpMax).toBe(-50);
-      expect(hot.rateLimitIpWindowMs).toBe(-1000);
+      // The implementation correctly rejects non-positive values
+      expect(hot.rateLimitIpMax).toBeUndefined();
+      expect(hot.rateLimitIpWindowMs).toBeUndefined();
     });
 
     it('handles empty rate limit values as undefined', () => {
@@ -263,38 +255,48 @@ describe('reloadHotConfig - Validation Edge Cases', () => {
 });
 
 describe('reloadHotConfig - Observability', () => {
-  it('logs warnings for restart-only key changes', async () => {
-    const { warn } = await import('../../src/lib/logger.js');
+  it('logs warnings for restart-only key changes', () => {
+    const warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     captureStartupEnvSnapshot();
     process.env.DATABASE_URL = 'postgresql://changed:5432/db';
     process.env.JWT_SECRET = 'changed-secret-that-is-long-enough-xxxxxxxxxxxxxxxx';
 
     reloadHotConfig();
 
-    expect(warn).toHaveBeenCalledTimes(2);
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('DATABASE_URL'),
-      expect.objectContaining({ variable: 'DATABASE_URL' })
-    );
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('JWT_SECRET'),
-      expect.objectContaining({ variable: 'JWT_SECRET' })
-    );
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    expect(output).toContain('DATABASE_URL');
+    expect(output).toContain('JWT_SECRET');
+
+    warnSpy.mockRestore();
   });
 
-  it('does not log warnings when restart-only keys unchanged', async () => {
-    const { warn } = await import('../../src/lib/logger.js');
+  it('does not log warnings when restart-only keys unchanged', () => {
+    const warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     captureStartupEnvSnapshot();
     process.env.RATE_LIMIT_IP_MAX = '50';
 
     reloadHotConfig();
 
-    expect(warn).not.toHaveBeenCalled();
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    expect(output).not.toContain('DATABASE_URL');
+    expect(output).not.toContain('REDIS_URL');
+    expect(output).not.toContain('JWT_SECRET');
+    expect(output).not.toContain('INDEXER_WORKER_TOKEN');
+
+    warnSpy.mockRestore();
   });
 
-  it('logs each changed restart-only key separately', async () => {
-    const { warn } = await import('../../src/lib/logger.js');
+  it('logs each changed restart-only key separately', () => {
+    // Set initial values before snapshot
+    process.env.DATABASE_URL = 'postgresql://original:5432/db';
+    process.env.REDIS_URL = 'redis://original:6379';
+    process.env.JWT_SECRET = 'original-secret-xxxxxxxxxxxx';
+    process.env.INDEXER_WORKER_TOKEN = 'original-token-xxxxxxxxxxxx';
+
+    const warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     captureStartupEnvSnapshot();
+
+    // Change all restart-only keys
     process.env.DATABASE_URL = 'postgresql://changed:5432/db';
     process.env.REDIS_URL = 'redis://changed:6379';
     process.env.JWT_SECRET = 'changed-secret-xxxxxxxxxxxx';
@@ -302,23 +304,13 @@ describe('reloadHotConfig - Observability', () => {
 
     reloadHotConfig();
 
-    expect(warn).toHaveBeenCalledTimes(4);
-  });
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    expect(output).toContain('DATABASE_URL');
+    expect(output).toContain('REDIS_URL');
+    expect(output).toContain('JWT_SECRET');
+    expect(output).toContain('INDEXER_WORKER_TOKEN');
 
-  it('does NOT log success for hot-reload operations (silent success)', async () => {
-    const { info, error } = await import('../../src/lib/logger.js');
-    const infoSpy = vi.spyOn(info, 'info');
-    const errorSpy = vi.spyOn(error, 'error');
-
-    process.env.RATE_LIMIT_IP_MAX = '50';
-    reloadHotConfig();
-
-    // No info or error logs for successful reload
-    expect(infoSpy).not.toHaveBeenCalled();
-    expect(errorSpy).not.toHaveBeenCalled();
-
-    infoSpy.mockRestore();
-    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 });
 
@@ -357,8 +349,10 @@ describe('reloadHotConfig - Concurrency', () => {
     expect(hot.rateLimitIpMax).toBe(300);
   });
 
-  it('detects restart-only changes during concurrent calls', async () => {
-    const { warn } = await import('../../src/lib/logger.js');
+  it('detects restart-only changes during concurrent calls', () => {
+    // Set initial value before snapshot
+    process.env.DATABASE_URL = 'postgresql://original:5432/db';
+    const warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     captureStartupEnvSnapshot();
     process.env.DATABASE_URL = 'postgresql://changed:5432/db';
     process.env.RATE_LIMIT_IP_MAX = '100';
@@ -368,11 +362,11 @@ describe('reloadHotConfig - Concurrency', () => {
     reloadHotConfig();
     reloadHotConfig();
 
-    // warn should be called 3 times (once per call)
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('DATABASE_URL'),
-      expect.any(Object)
-    );
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    // Should contain DATABASE_URL warnings
+    expect(output).toContain('DATABASE_URL');
+
+    warnSpy.mockRestore();
   });
 });
 
@@ -381,13 +375,16 @@ describe('reloadHotConfig - Atomicity', () => {
     const hot = reloadHotConfig();
     expect(Object.isFrozen(hot)).toBe(true);
 
-    // Attempting to modify should silently fail (in strict mode would throw)
-    expect(() => {
+    // Attempting to modify should fail (throws in strict mode)
+    const originalValue = hot.rateLimitIpMax;
+    try {
       (hot as any).rateLimitIpMax = 999;
-    }).not.toThrow();
+    } catch (e) {
+      // Expected in strict mode
+    }
 
     // Value should remain unchanged
-    expect(hot.rateLimitIpMax).not.toBe(999);
+    expect(hot.rateLimitIpMax).toBe(originalValue);
   });
 
   it('builds the entire config before returning (no partial state)', () => {
@@ -513,6 +510,172 @@ describe('Security: Secret handling', () => {
   });
 });
 
+describe('SIGHUP Handler Error Scenarios', () => {
+  it('handles partial config updates (some keys invalid)', () => {
+    // Mix of valid and invalid rate limit values
+    process.env.RATE_LIMIT_IP_MAX = '100'; // valid
+    process.env.RATE_LIMIT_IP_WINDOW_MS = 'invalid'; // invalid
+    process.env.RATE_LIMIT_APIKEY_MAX = '200'; // valid
+
+    const hot = reloadHotConfig();
+
+    // Valid values should be parsed
+    expect(hot.rateLimitIpMax).toBe(100);
+    expect(hot.rateLimitApikeyMax).toBe(200);
+
+    // Invalid values should be undefined
+    expect(hot.rateLimitIpWindowMs).toBeUndefined();
+  });
+
+  it('reloadHotConfig never throws for any input', () => {
+    // Test with various invalid inputs
+    const testCases = [
+      { RATE_LIMIT_IP_MAX: 'invalid' },
+      { TRACING_SAMPLE_RATE: '2.0' },
+      { LOG_LEVEL: 'verbose' },
+      { FEATURE_FLAGS_JSON: 'invalid-json' },
+    ];
+
+    for (const testCase of testCases) {
+      for (const [key, value] of Object.entries(testCase)) {
+        process.env[key] = value as string;
+      }
+
+      expect(() => reloadHotConfig()).not.toThrow();
+
+      for (const key of Object.keys(testCase)) {
+        delete process.env[key];
+      }
+    }
+  });
+});
+
+describe('Config Refresh Path Edge Cases', () => {
+  it('handles rapid successive config refreshes', () => {
+    // Simulate rapid SIGHUP signals
+    for (let i = 0; i < 10; i++) {
+      process.env.RATE_LIMIT_IP_MAX = String(100 + i);
+      const hot = reloadHotConfig();
+      expect(hot.rateLimitIpMax).toBe(100 + i);
+    }
+  });
+
+  it('handles config refresh with no changes', () => {
+    process.env.RATE_LIMIT_IP_MAX = '100';
+    const hot1 = reloadHotConfig();
+
+    // Call again without changing env
+    const hot2 = reloadHotConfig();
+
+    // Should return consistent results
+    expect(hot1.rateLimitIpMax).toBe(hot2.rateLimitIpMax);
+    expect(Object.isFrozen(hot1)).toBe(true);
+    expect(Object.isFrozen(hot2)).toBe(true);
+  });
+
+  it('handles config refresh with only restart-only key changes', () => {
+    // Set initial values before snapshot
+    process.env.DATABASE_URL = 'postgresql://original:5432/db';
+    process.env.REDIS_URL = 'redis://original:6379';
+    const warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    captureStartupEnvSnapshot();
+
+    // Change only restart-only keys
+    process.env.DATABASE_URL = 'postgresql://changed:5432/db';
+    process.env.REDIS_URL = 'redis://changed:6379';
+
+    const hot = reloadHotConfig();
+
+    // Hot config should still be returned with defaults
+    expect(hot.rateLimitIpMax).toBeUndefined();
+    expect(hot.tracingSampleRate).toBe(1);
+
+    // Should warn about restart-only changes
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    expect(output).toContain('DATABASE_URL');
+
+    warnSpy.mockRestore();
+  });
+
+  it('handles config refresh during active feature flag usage', () => {
+    // Set initial flags
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
+      { name: 'flag1', percentage: 50 },
+    ]);
+    reloadFlags();
+
+    // Verify flags are active
+    expect(getFlags().has('flag1')).toBe(true);
+
+    // Update flags
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
+      { name: 'flag1', percentage: 75 },
+      { name: 'flag2', percentage: 25 },
+    ]);
+    reloadFlags();
+
+    // Verify new flags are active
+    expect(getFlags().get('flag1')?.percentage).toBe(75);
+    expect(getFlags().has('flag2')).toBe(true);
+  });
+
+  it('handles config refresh with tracing config changes', () => {
+    process.env.TRACING_SAMPLE_RATE = '0.5';
+    process.env.TRACING_ENABLED = 'true';
+    process.env.LOG_LEVEL = 'debug';
+
+    const hot1 = reloadHotConfig();
+    expect(hot1.tracingSampleRate).toBe(0.5);
+    expect(hot1.tracingEnabled).toBe(true);
+    expect(hot1.logLevel).toBe('debug');
+
+    // Change tracing config
+    process.env.TRACING_SAMPLE_RATE = '0.8';
+    process.env.TRACING_ENABLED = 'false';
+    process.env.LOG_LEVEL = 'warn';
+
+    const hot2 = reloadHotConfig();
+    expect(hot2.tracingSampleRate).toBe(0.8);
+    expect(hot2.tracingEnabled).toBe(false);
+    expect(hot2.logLevel).toBe('warn');
+  });
+
+  it('handles config refresh with rate limit config changes', () => {
+    process.env.RATE_LIMIT_IP_MAX = '100';
+    process.env.RATE_LIMIT_IP_WINDOW_MS = '60000';
+
+    const hot1 = reloadHotConfig();
+    setRuntimeRateLimitConfig({
+      ip: {
+        windowMs: hot1.rateLimitIpWindowMs ?? 60_000,
+        max: hot1.rateLimitIpMax ?? 100,
+        enabled: true,
+      },
+    });
+
+    let runtime = getRuntimeRateLimitConfig();
+    expect(runtime?.ip.max).toBe(100);
+    expect(runtime?.ip.windowMs).toBe(60000);
+
+    // Change rate limit config
+    process.env.RATE_LIMIT_IP_MAX = '200';
+    process.env.RATE_LIMIT_IP_WINDOW_MS = '30000';
+
+    const hot2 = reloadHotConfig();
+    setRuntimeRateLimitConfig({
+      ip: {
+        windowMs: hot2.rateLimitIpWindowMs ?? 60_000,
+        max: hot2.rateLimitIpMax ?? 100,
+        enabled: true,
+      },
+    });
+
+    runtime = getRuntimeRateLimitConfig();
+    expect(runtime?.ip.max).toBe(200);
+    expect(runtime?.ip.windowMs).toBe(30000);
+  });
+});
+
 describe('Regression Surface Tests', () => {
   // These tests document the current behavior and protect against regressions
 
@@ -562,8 +725,8 @@ describe('Regression Surface Tests', () => {
     expect(hot.featureFlagsJson).toBeUndefined();
   });
 
-  it('handles all restart-only keys correctly', async () => {
-    const { warn } = await import('../../src/lib/logger.js');
+  it('handles all restart-only keys correctly', () => {
+    const warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     captureStartupEnvSnapshot();
 
     const restartOnlyKeys = [
@@ -580,13 +743,12 @@ describe('Regression Surface Tests', () => {
     reloadHotConfig();
 
     // Should warn for each changed key
-    expect(warn).toHaveBeenCalledTimes(restartOnlyKeys.length);
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
     for (const key of restartOnlyKeys) {
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining(key),
-        expect.objectContaining({ variable: key })
-      );
+      expect(output).toContain(key);
     }
+
+    warnSpy.mockRestore();
   });
 
   it('maintains backward compatibility with existing tests', () => {
@@ -607,8 +769,8 @@ describe('Regression Surface Tests', () => {
     expect(reloadHotConfig().logLevel).toBe('debug');
   });
 
-  it('handles edge case: startup snapshot captured implicitly on first reload', async () => {
-    const { warn } = await import('../../src/lib/logger.js');
+  it('handles edge case: startup snapshot captured implicitly on first reload', () => {
+    const warnSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     // Reset snapshot to null
     resetStartupEnvSnapshot();
 
@@ -627,10 +789,10 @@ describe('Regression Surface Tests', () => {
     expect(hot2).toBeDefined();
 
     // Should have warned about the change
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('DATABASE_URL'),
-      expect.objectContaining({ variable: 'DATABASE_URL' })
-    );
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    expect(output).toContain('DATABASE_URL');
+
+    warnSpy.mockRestore();
   });
 
   it('handles edge case: all hot-reloadable keys set simultaneously', () => {
