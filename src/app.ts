@@ -59,6 +59,7 @@ import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse } from './utils/response.js';
 import { ApiError } from './errors.js';
 import { docsRouter } from './routes/docs.js';
+import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
@@ -515,6 +516,9 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/api/privacy', privacyRouter);
   app.use('/admin/dlq', dlqRouter);
   app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
+
+  // Experimental GraphQL federation gateway — feature-flagged off by default.
+  app.use('/api/graphql', graphqlGatewayRouter);
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(

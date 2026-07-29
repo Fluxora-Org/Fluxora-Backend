@@ -17,6 +17,11 @@ import {
   indexerEventsIngestedTotal,
   indexerLagSeconds,
 } from '../metrics/businessMetrics.js';
+import {
+  indexerLedgerLag,
+  indexerCatchupEtaSeconds,
+} from '../metrics/indexerLag.js';
+import { getStellarRpcService } from '../services/stellar-rpc.js';
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -488,12 +493,39 @@ export class IndexerService {
         }
 
         // Acquire a fresh connection for this batch.
-        const batchResult = await this.processBatch(
-          cursor.id,
-          request,
-          offset,
-          batchIndex,
-        );
+        //
+        // RED instrumentation wraps *only* this call so the histogram measures
+        // the batch processing step itself (fetch → insert → cursor advance →
+        // COMMIT) and nothing else. The loop guards above are control flow, not
+        // work, and deliberately stay outside the measurement.
+        const batchStartedAt = process.hrtime.bigint();
+        let batchResult: { rowsFetched: number };
+        try {
+          batchResult = await this.processBatch(
+            cursor.id,
+            request,
+            offset,
+            batchIndex,
+          );
+        } catch (batchError) {
+          const classification = recordIndexerBatchFailure(
+            request.contract_id,
+            elapsedSecondsSince(batchStartedAt),
+            batchError,
+          );
+          logger.warn('replay_batch_failed', undefined, {
+            event: 'replay_batch_failed',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            batch_index: batchIndex,
+            offset,
+            error_source: classification.source,
+            error_type: classification.type,
+          });
+          throw batchError;
+        }
+        recordIndexerBatchSuccess(request.contract_id, elapsedSecondsSince(batchStartedAt));
 
         if (batchResult.rowsFetched === 0) {
           // Source exhausted ahead of totalRows count — safe to stop.
@@ -1052,6 +1084,12 @@ type IndexerState = {
   lastSafeLedger: number;
   reorgDetected: boolean;
   reorgHeight?: number;
+  // Catch-up telemetry state
+  lastIndexedLedger: number;
+  ledgerLag: number;
+  catchupEtaSeconds: number | null;
+  ledgerThroughputSamples: number[]; // Rolling window of ledgers/second samples
+  lastLedgerLagUpdateAt: number | null;
 };
 
 const rolledBackLedgers = new Set<number>();
@@ -1161,6 +1199,12 @@ export class IndexerIngestionService {
       duplicateEventCount: 0,
       lastSafeLedger: 0,
       reorgDetected: false,
+      // Catch-up telemetry initialization
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     };
   }
 
@@ -1189,6 +1233,12 @@ export class IndexerIngestionService {
       lastSafeLedger: 0,
       reorgDetected: false,
       reorgHeight: undefined,
+      // Reset catch-up telemetry state
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     });
     rolledBackLedgers.clear();
   }
@@ -1206,6 +1256,105 @@ export class IndexerIngestionService {
       lastSafeLedger: this.state.lastSafeLedger,
       reorgDetected: this.state.reorgDetected,
     };
+  }
+
+  /**
+   * Get catch-up telemetry including ledger lag and ETA.
+   * This provides visibility into how far behind the indexer is and
+   * estimated time to catch up when lagging.
+   */
+  getCatchupTelemetry(): {
+    ledgerLag: number;
+    catchupEtaSeconds: number | null;
+    lastIndexedLedger: number;
+    lastLedgerLagUpdateAt: string | null;
+  } {
+    return {
+      ledgerLag: this.state.ledgerLag,
+      catchupEtaSeconds: this.state.catchupEtaSeconds,
+      lastIndexedLedger: this.state.lastIndexedLedger,
+      lastLedgerLagUpdateAt: this.state.lastLedgerLagUpdateAt
+        ? new Date(this.state.lastLedgerLagUpdateAt).toISOString()
+        : null,
+    };
+  }
+
+  /**
+   * Compute ledger lag and ETA using the Stellar RPC tip.
+   * This should be called periodically (e.g., on each successful ingest)
+   * to update catch-up telemetry without making redundant RPC calls.
+   *
+   * Uses a rolling average of ledger throughput samples to estimate ETA,
+   * avoiding naive linear extrapolation from a single sample.
+   */
+  private async updateCatchupTelemetry(maxLedger: number): Promise<void> {
+    try {
+      const rpcService = getStellarRpcService();
+      const tip = await rpcService.getLatestLedger();
+      const tipLedger = tip.sequence;
+
+      // Store previous values before updating
+      const previousLedger = this.state.lastIndexedLedger;
+      const previousUpdateTime = this.state.lastLedgerLagUpdateAt;
+
+      // Compute ledger lag (tip - last indexed)
+      const lag = Math.max(0, tipLedger - maxLedger);
+      this.state.ledgerLag = lag;
+      this.state.lastIndexedLedger = maxLedger;
+      const now = Date.now();
+      this.state.lastLedgerLagUpdateAt = now;
+
+      // Update Prometheus gauge
+      indexerLedgerLag.set(lag);
+
+      // Compute ETA if lagging and we have throughput data
+      if (lag > 0) {
+        // Calculate throughput if we have previous data
+        if (previousUpdateTime && previousLedger > 0) {
+          const timeSinceLastUpdate = (now - previousUpdateTime) / 1000; // seconds
+          
+          if (timeSinceLastUpdate > 0) {
+            const ledgersProcessed = maxLedger - previousLedger;
+            const throughput = ledgersProcessed / timeSinceLastUpdate; // ledgers/second
+
+            // Maintain rolling window of last 10 samples
+            this.state.ledgerThroughputSamples.push(throughput);
+            if (this.state.ledgerThroughputSamples.length > 10) {
+              this.state.ledgerThroughputSamples.shift();
+            }
+
+            // Compute average throughput from samples
+            const avgThroughput =
+              this.state.ledgerThroughputSamples.reduce((sum, sample) => sum + sample, 0) /
+              this.state.ledgerThroughputSamples.length;
+
+            // Estimate ETA using average throughput
+            if (avgThroughput > 0) {
+              const etaSeconds = lag / avgThroughput;
+              this.state.catchupEtaSeconds = etaSeconds;
+              indexerCatchupEtaSeconds.set(etaSeconds);
+            } else {
+              this.state.catchupEtaSeconds = null;
+              indexerCatchupEtaSeconds.set(0);
+            }
+          }
+        } else {
+          // Not enough data for ETA estimation yet
+          this.state.catchupEtaSeconds = null;
+          indexerCatchupEtaSeconds.set(0);
+        }
+      } else {
+        // Caught up - reset ETA
+        this.state.catchupEtaSeconds = null;
+        indexerCatchupEtaSeconds.set(0);
+      }
+    } catch (err) {
+      // If RPC fails, we can't compute lag - log but don't fail the ingest
+      warn('Failed to update catch-up telemetry (RPC error)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Don't update telemetry on RPC failure - keep last known values
+    }
   }
 
   private enforceRateLimit(actor: string): void {
@@ -1286,6 +1435,10 @@ export class IndexerIngestionService {
         if (latestHappenedAtMs > 0) {
           indexerLagSeconds.set(Math.max(0, (Date.now() - latestHappenedAtMs) / 1000));
         }
+
+        // Update catch-up telemetry (ledger lag and ETA)
+        // This uses the same Stellar RPC tip-fetching path to avoid redundant calls
+        await this.updateCatchupTelemetry(maxLedger);
       }
 
       return {

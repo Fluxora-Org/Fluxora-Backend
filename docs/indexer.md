@@ -406,6 +406,71 @@ This will:
 4. **Database Load**: CPU, memory, connection count during replay
 5. **Query Performance**: Slow query log analysis
 
+### Catch-up Telemetry
+
+When the indexer falls behind the Stellar RPC ledger tip (after a restart or extended stall), the following telemetry provides visibility into catch-up progress:
+
+#### Prometheus Metrics
+
+- **`indexer_ledger_lag`** (Gauge): Current ledger lag in ledgers (tip - last_indexed_ledger). 0 when caught up.
+- **`indexer_catchup_eta_seconds`** (Gauge): Estimated seconds until catch-up completion. 0 when not lagging or insufficient data.
+
+#### Health Endpoint Response
+
+The `/health` endpoint includes catch-up telemetry in the response:
+
+```json
+{
+  "status": "ok",
+  "service": "fluxora-backend",
+  "timestamp": "2026-07-29T18:30:00.000Z",
+  "indexer": {
+    "status": "healthy",
+    "stalled": false,
+    "thresholdMs": 300000,
+    "lastSuccessfulSyncAt": "2026-07-29T18:29:00.000Z",
+    "lagMs": 60000,
+    "summary": "Indexer checkpoint is within the allowed freshness threshold"
+  },
+  "dependencies": {
+    "indexer": {
+      "dependency": "healthy",
+      "store": "memory",
+      "lastSuccessfulIngestAt": "2026-07-29T18:29:00.000Z",
+      "isReplaying": false,
+      "catchupTelemetry": {
+        "ledgerLag": 50,
+        "catchupEtaSeconds": 300,
+        "lastIndexedLedger": 950,
+        "lastLedgerLagUpdateAt": "2026-07-29T18:30:00.000Z"
+      }
+    }
+  },
+  "catchupTelemetry": {
+    "ledgerLag": 50,
+    "catchupEtaSeconds": 300,
+    "lastIndexedLedger": 950,
+    "lastLedgerLagUpdateAt": "2026-07-29T18:30:00.000Z"
+  }
+}
+```
+
+#### Fields
+
+- **`ledgerLag`**: Number of ledgers the indexer is behind the Stellar RPC tip
+- **`catchupEtaSeconds`**: Estimated seconds until catch-up completion (null if not lagging or insufficient data)
+- **`lastIndexedLedger`**: The last ledger sequence number successfully indexed
+- **`lastLedgerLagUpdateAt`**: ISO-8601 timestamp of the last ledger lag computation
+
+#### ETA Estimation
+
+The ETA is computed using a rolling average of recently indexed ledgers/second (last 10 samples), not a naive linear extrapolation from a single sample. This provides more accurate estimates that smooth out temporary throughput variations.
+
+**Note**: ETA is `null` when:
+- The indexer is caught up (ledgerLag = 0)
+- Insufficient throughput data exists (first ingest after restart)
+- RPC calls fail (graceful degradation - keeps last known values)
+
 ### Example Monitoring Query
 
 ```sql

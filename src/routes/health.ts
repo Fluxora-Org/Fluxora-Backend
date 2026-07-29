@@ -57,6 +57,7 @@ healthRouter.get('/', (req: Request, res: Response) => {
     dependencies: {
       indexer: indexerHealth,
     },
+    catchupTelemetry: indexerHealth.catchupTelemetry,
   });
 });
 

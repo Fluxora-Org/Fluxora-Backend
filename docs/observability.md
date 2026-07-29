@@ -437,3 +437,132 @@ groups:
 | Metric Name | Type | Description | Buckets / Labels |
 | :--- | :--- | :--- | :--- |
 | `fluxora_ws_broadcast_batch_flush_seconds` | Histogram | Latency in seconds from enqueuing the oldest event in a batch to flushing the batch frame over the WebSocket. | `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]` |
+
+---
+
+## Indexer Batch RED Metrics
+
+The indexer's per-ledger-batch processing step in `src/indexer/service.ts` is
+instrumented with a Rate / Errors / Duration triad defined in
+`src/metrics/indexerRed.ts`. It deliberately mirrors the HTTP RED metrics
+(`http_requests_total` / `http_request_duration_seconds`) so an indexer
+dashboard can reuse the same PromQL shapes and panel layouts as the HTTP one.
+
+### Metric-to-metric parity with HTTP
+
+| Concern | HTTP | Indexer batch |
+| :--- | :--- | :--- |
+| Rate | `http_requests_total` | `indexer_batches_processed_total` |
+| Errors | 5xx slice of `http_requests_total` | `indexer_batch_errors_total` |
+| Duration | `http_request_duration_seconds` | `indexer_batch_duration_seconds` |
+| "which work" label | `route` | `contract_id` |
+| "what happened" label | `status_code` | `outcome` |
+
+### Metrics
+
+| Metric Name | Type | Description | Labels / Buckets |
+| :--- | :--- | :--- | :--- |
+| `indexer_batches_processed_total` | Counter | Every batch processing step executed, successful or not. | `contract_id`, `outcome` (`success` \| `error`) |
+| `indexer_batch_errors_total` | Counter | Batch processing steps that threw. | `contract_id`, `error_source` (`stellar_rpc` \| `local`), `error_type` |
+| `indexer_batch_duration_seconds` | Histogram | Wall-clock duration of one batch processing step. | `contract_id`, `outcome`; buckets `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]` |
+
+**What counts as one batch processing step?** One iteration of the `replayEvents`
+loop body that calls `processBatch` — fetch the batch, insert into
+`contract_events`, advance the cursor, `COMMIT`. Loop guards (shutdown,
+leadership, replay budget) run *outside* the timer, so the histogram measures
+work rather than control flow.
+
+A batch that fetched zero rows (source exhausted ahead of the counted total) is
+still recorded as one `success`: a unit of work was performed. This is the one
+place where `indexer_batches_processed_total` can exceed the pre-existing
+`indexer_replay_batches_committed_total`, which counts only batches that reached
+`COMMIT`.
+
+### `error_source` — upstream vs. local failures
+
+The `error_source` label answers "is this our problem or the RPC provider's?"
+without opening a log.
+
+| `error_source` | Origin | `error_type` values |
+| :--- | :--- | :--- |
+| `stellar_rpc` | A call into `src/services/stellar-rpc.ts` failed. Retrying the indexer will not help until the provider recovers. | `timeout`, `network`, `provider`, `circuit_open`, `cancelled` |
+| `local` | The failure was raised inside the indexer process. Actionable by the indexer owner. | `db_pool_exhausted`, `db_query_timeout`, `db_duplicate_entry`, `db_error`, `unknown` |
+
+`error_type` for `stellar_rpc` mirrors the `RpcFailureKind` union exported by
+`src/services/stellar-rpc.ts` (lower-snake-cased). Classification is structural
+— it matches on the error's `name` and `kind`, so a `RpcProviderError` rethrown
+by an intermediate layer is still attributed to `stellar_rpc`.
+
+Every increment of `indexer_batch_errors_total` is paired with an
+`outcome="error"` increment of `indexer_batches_processed_total`, so the error
+ratio is well-defined against either denominator.
+
+### Dashboard queries
+
+```promql
+# Rate — batches/sec being processed, per contract
+sum(rate(indexer_batches_processed_total[5m])) by (contract_id)
+
+# Errors — overall error ratio
+sum(rate(indexer_batch_errors_total[5m]))
+  / sum(rate(indexer_batches_processed_total[5m]))
+
+# Errors — is it us or the provider?
+sum(rate(indexer_batch_errors_total[5m])) by (error_source, error_type)
+
+# Duration — p50 / p95 / p99 of a batch
+histogram_quantile(0.50, sum(rate(indexer_batch_duration_seconds_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(indexer_batch_duration_seconds_bucket[5m])) by (le))
+histogram_quantile(0.99, sum(rate(indexer_batch_duration_seconds_bucket[5m])) by (le))
+```
+
+### Suggested alerts
+
+```yaml
+groups:
+  - name: indexer-red
+    rules:
+      - alert: IndexerBatchErrorRateHigh
+        expr: |
+          sum(rate(indexer_batch_errors_total[5m]))
+            / sum(rate(indexer_batches_processed_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of indexer batches are failing"
+
+      - alert: IndexerUpstreamRpcDegraded
+        expr: sum(rate(indexer_batch_errors_total{error_source="stellar_rpc"}[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Indexer batches failing on Stellar RPC ({{ $labels.error_type }}) — upstream, not local"
+
+      - alert: IndexerBatchLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(indexer_batch_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 indexer batch duration above 10s — replays will miss their budget"
+```
+
+### Cardinality and data-safety notes
+
+- `contract_id` is trimmed and truncated to 64 characters (the same convention
+  as `indexer_replay_*`), and blank/absent ids collapse to `unknown`. A
+  malformed replay request cannot mint an unbounded label value.
+- Replay is reachable only via `POST /api/indexer/events/replay`, which requires
+  a JWT carrying `Permission.INDEXER_REPLAY`, so `contract_id` values are not
+  attacker-supplied from unauthenticated traffic.
+- `error_source` and `error_type` are drawn from closed unions in
+  `src/metrics/indexerRed.ts`. **Raw error messages are never used as label
+  values**, so an error carrying user input, credentials, or PII cannot leak
+  into the `/metrics` payload or inflate cardinality.
+- The classifier is total: a thrown string, `null`, or an unrecognised object
+  yields `local` / `unknown` rather than throwing. Metric recording can never
+  mask the original batch failure — the error is always rethrown to the caller.
