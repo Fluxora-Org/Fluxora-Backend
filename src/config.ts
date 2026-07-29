@@ -45,6 +45,12 @@ export const config = {
      */
     replayBudgetMs: envInt('INDEXER_REPLAY_BUDGET_MS', 0),
   },
+  dlq: {
+    /** Retention in days for terminal dead_letter_queue entries. Default 30. */
+    retentionDays: envInt('DLQ_RETENTION_DAYS', 30),
+    /** Max rows deleted per purge batch. Default 500. */
+    purgeBatchSize: envInt('DLQ_PURGE_BATCH_SIZE', 500),
+  },
   database: {
     url: process.env.DATABASE_URL || 'postgresql://localhost/fluxora',
   },

@@ -404,6 +404,21 @@ export const EnvSchema = z
      * of their identity (API key or IP).
      */
     CANARY_TRAFFIC_PERCENT: integerEnv('CANARY_TRAFFIC_PERCENT', 0, 100).default(0),
+
+    /**
+     * Retention period in days for dead_letter_queue entries.
+     * Entries in a terminal state (status = 'replayed' or permanently failed)
+     * older than this many days are eligible for automatic purge.
+     * Defaults to 30 days.  Set to 0 to disable the purge job entirely.
+     */
+    DLQ_RETENTION_DAYS: integerEnv('DLQ_RETENTION_DAYS', 1, 365).default(30),
+
+    /**
+     * Maximum rows to delete per batch in the DLQ retention purge job.
+     * Keeps lock duration short on the dead_letter_queue table.
+     * Defaults to 500.
+     */
+    DLQ_PURGE_BATCH_SIZE: integerEnv('DLQ_PURGE_BATCH_SIZE', 1, 5000).default(500),
   })
   .passthrough()
   .superRefine((env, ctx) => {
@@ -610,6 +625,18 @@ export interface Config {
    * 0 means no canary tagging. Sourced from CANARY_TRAFFIC_PERCENT.
    */
   canaryTrafficPercent: number;
+
+  /**
+   * Retention period in days for dead_letter_queue entries in terminal state.
+   * Defaults to 30. Set to 0 to disable the DLQ retention purge job.
+   */
+  dlqRetentionDays: number;
+
+  /**
+   * Maximum rows to delete per batch in the DLQ retention purge job.
+   * Defaults to 500.
+   */
+  dlqPurgeBatchSize: number;
 }
 
 export class ConfigError extends Error {
@@ -781,6 +808,9 @@ function toConfig(env: ParsedEnv): Config {
     startupProbeStellarTimeoutMs: env.STARTUP_PROBE_STELLAR_TIMEOUT_MS,
 
     canaryTrafficPercent: env.CANARY_TRAFFIC_PERCENT,
+
+    dlqRetentionDays: env.DLQ_RETENTION_DAYS,
+    dlqPurgeBatchSize: env.DLQ_PURGE_BATCH_SIZE,
   };
 }
 

@@ -7,6 +7,7 @@ import type {
 import { logger } from '../lib/logger.js';
 import { resolvePoolConfig } from '../db/pool.js';
 import { runPartitionMaintenance } from './partitionMaintenance.js';
+import { runDlqPurge } from './dlqPurge.js';
 import { jobDlqEntriesTotal } from '../metrics/businessMetrics.js';
 
 // ── Retry / expiry defaults ───────────────────────────────────────────────────
@@ -487,6 +488,21 @@ export function startBackgroundJobs(pool: Pool): void {
       } catch (dlqErr) {
         logger.error('DLQ retention purge failed, continuing', ctx.id, {
           error: dlqErr instanceof Error ? dlqErr.message : String(dlqErr),
+        });
+      }
+
+      // Purge terminal-state dead_letter_queue entries beyond retention window.
+      try {
+        const dlqResult = await runDlqPurge({ correlationId: ctx.id });
+        if (dlqResult.rowsPurged > 0) {
+          logger.info('DLQ retention purge: cleared terminal dead_letter_queue entries', ctx.id, {
+            rowsPurged: dlqResult.rowsPurged,
+            cutoffDate: dlqResult.cutoffDate,
+          });
+        }
+      } catch (dlqPurgeErr) {
+        logger.error('DLQ retention purge of dead_letter_queue failed, continuing', ctx.id, {
+          error: dlqPurgeErr instanceof Error ? dlqPurgeErr.message : String(dlqPurgeErr),
         });
       }
     },
