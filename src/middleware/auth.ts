@@ -123,9 +123,15 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     return next();
   }
 
-  const [type, token] = authHeader.split(' ');
-  if (type !== 'Bearer' || !token) {
-    warn('Invalid Authorization header format', { requestId });
+  const [type, ...rest] = authHeader.split(' ');
+  if (type !== 'Bearer') {
+    warn('Invalid Authorization header format — non-Bearer scheme', { scheme: type, requestId });
+    return next();
+  }
+
+  const token = rest.join(' ').trim();
+  if (!token) {
+    warn('Invalid Authorization header format — empty Bearer token', { requestId });
     return next();
   }
 
@@ -205,8 +211,19 @@ export function requirePermission(permission: Permission) {
       });
       return;
     }
-    const permissions: string[] = (req.user as any).permissions ?? [];
-    if (!Array.isArray(permissions) || !permissions.includes(permission)) {
+    const permissions: unknown = (req.user as any).permissions ?? [];
+    if (!Array.isArray(permissions)) {
+      warn('Permission check failed: non-array permissions on principal', { path: req.path, requestId });
+      res.status(403).json({
+        error: {
+          code: ApiErrorCode.FORBIDDEN,
+          message: 'Insufficient permissions to access this resource',
+          requestId,
+        },
+      });
+      return;
+    }
+    if (!permissions.includes(permission)) {
       warn('Insufficient permissions', { required: permission, have: permissions, path: req.path, requestId });
       res.status(403).json({
         error: {

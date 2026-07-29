@@ -744,6 +744,23 @@ describe('csrfMiddleware integration — security logging on violations', () => 
       .send({});
     expect(warnSpy).not.toHaveBeenCalled();
   });
+
+  it('logs a warning when CSRF token is malformed (oversized)', async () => {
+    const app = buildApp();
+    const hugeToken = 'a'.repeat(CSRF_TOKEN_MAX_LENGTH + 1);
+    const goodToken = generateCsrfToken();
+    await request(app)
+      .post('/api/streams')
+      .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${hugeToken}`)
+      .set('X-CSRF-Token', goodToken)
+      .send({});
+    expect(warnSpy).toHaveBeenCalled();
+    const callArgs = (warnSpy as ReturnType<typeof vi.fn>).mock.calls.find(
+      (args: unknown[]) => args[0] === 'CSRF token malformed',
+    );
+    expect(callArgs).toBeDefined();
+    expect(callArgs[1]).toMatchObject({ method: 'POST', path: '/api/streams' });
+  });
 });
 
 describe('csrfMiddleware integration — requestId edge cases', () => {
@@ -894,8 +911,7 @@ describe('csrfMiddleware integration — token hardening', () => {
       .send({});
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('FORBIDDEN');
-    // Message should indicate missing (not mismatch) since oversized token is treated as absent
-    expect(res.body.error.message).toContain('CSRF token missing');
+    expect(res.body.error.message).toContain('CSRF token malformed');
   });
 
   it('blocks POST when header token exceeds max length (DoS defense)', async () => {
@@ -908,7 +924,7 @@ describe('csrfMiddleware integration — token hardening', () => {
       .send({});
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('FORBIDDEN');
-    expect(res.body.error.message).toContain('CSRF token missing');
+    expect(res.body.error.message).toContain('CSRF token malformed');
   });
 
   it('blocks POST when cookie token contains a null byte', async () => {
@@ -921,8 +937,9 @@ describe('csrfMiddleware integration — token hardening', () => {
       .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${maliciousToken}`)
       .set('X-CSRF-Token', goodToken)
       .send({});
-    // After parseCookies URI-decodes, cookieToken will contain \x00 → rejected
+    // After parseCookies URI-decodes, cookieToken will contain \x00 → rejected by isValidCsrfToken
     expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token malformed');
   });
 
   it('blocks POST when header token contains a newline character', async () => {
@@ -943,6 +960,7 @@ describe('csrfMiddleware integration — token hardening', () => {
       .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${goodToken}`)
       .send({});
     expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token malformed');
   });
 
   it('blocks POST when header token contains a carriage-return character', async () => {
@@ -962,6 +980,7 @@ describe('csrfMiddleware integration — token hardening', () => {
       .set('Cookie', `session=abc; ${CSRF_COOKIE_NAME}=${goodToken}`)
       .send({});
     expect(res.status).toBe(403);
+    expect(res.body.error.message).toContain('CSRF token malformed');
   });
 
   it('blocks POST when array-valued header contains only empty strings', async () => {

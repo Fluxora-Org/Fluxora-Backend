@@ -198,6 +198,30 @@ describe('authenticate', () => {
     expect(req.user).toBeUndefined();
   });
 
+  it('proceeds as anonymous for Bearer with only whitespace token', async () => {
+    // "Bearer   " → split produces ['Bearer', '', ''] → rest is '  ' → trimmed to ''
+    const req = mockReq({ authHeader: 'Bearer   ' }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(req.user).toBeUndefined();
+  });
+
+  it('proceeds as anonymous for Bearer with empty token (just "Bearer")', async () => {
+    // "Bearer" → split produces ['Bearer'] → token undefined → proceeds as anonymous
+    const req = mockReq({ authHeader: 'Bearer' }) as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    await authenticate(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(req.user).toBeUndefined();
+  });
+
   // ── Schema validation ──
 
   it('returns 401 for token with invalid shape', async () => {
@@ -338,6 +362,32 @@ describe('requirePermission', () => {
 
     expect(res.statusCode).toBe(403);
     expect((res as any).jsonBody.error.message).toContain('Insufficient permissions');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when permissions is not an array (non-array hardening)', () => {
+    const req = {
+      user: { permissions: 'streams:read' as unknown as string[] },
+    } as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requirePermission(Permission.STREAMS_READ)(req, res, next);
+
+    expect(res.statusCode).toBe(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when permissions is null (null hardening)', () => {
+    const req = {
+      user: { permissions: null as unknown as string[] },
+    } as Request;
+    const res = mockRes() as Response;
+    const next = mockNext();
+
+    requirePermission(Permission.STREAMS_READ)(req, res, next);
+
+    expect(res.statusCode).toBe(403);
     expect(next).not.toHaveBeenCalled();
   });
 

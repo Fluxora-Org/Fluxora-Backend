@@ -274,7 +274,22 @@ export function csrfMiddleware(req: Request, res: Response, next: NextFunction):
     return;
   }
 
-  // 6. Compare tokens in constant time
+  // 6. Validate token well-formedness — reject oversized, empty, or control-character
+  //    tokens before they reach the HMAC comparison path (DoS defense + input hardening).
+  if (!isValidCsrfToken(cookieTokenTrimmed) || !isValidCsrfToken(headerTokenTrimmed)) {
+    warn('CSRF token malformed', { requestId, method: req.method, path: req.path, ip: req.ip });
+    res.status(403).json(
+      errorResponse(
+        ApiErrorCode.FORBIDDEN,
+        'CSRF token malformed: token exceeds maximum length or contains invalid characters',
+        undefined,
+        requestId,
+      ),
+    );
+    return;
+  }
+
+  // 7. Compare tokens in constant time
   if (!safeCompareCsrfTokens(cookieTokenTrimmed, headerTokenTrimmed)) {
     warn('CSRF token mismatch', { requestId, method: req.method, path: req.path, ip: req.ip });
     res.status(403).json(
