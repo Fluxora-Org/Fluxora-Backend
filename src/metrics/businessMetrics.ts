@@ -307,6 +307,34 @@ function sanitizeMetricGaugeValue(val: unknown): number {
 }
 
 /**
+ * Describes the contract for a store that can provide webhook queue metrics.
+ * Used by {@link syncWebhookMetrics} to decouple from a concrete store implementation.
+ */
+export interface WebhookMetricsProvider {
+  /**
+   * Returns a snapshot of webhook queue depths.
+   *
+   * This method must be resilient:
+   * - It should not throw exceptions.
+   * - It should return `null` or an empty object on failure.
+   * - All numeric fields are optional and will be sanitized to `0` if missing or invalid.
+   */
+  getMetrics(): {
+    dlqItems?: number;
+    outboxItems?: number;
+  } | null;
+}
+
+export const webhookMetricsSyncTotal =
+  (registry.getSingleMetric('fluxora_webhook_metrics_sync_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_metrics_sync_total',
+    help: 'Total number of /metrics scrapes that synced webhook queue gauges, labeled by outcome.',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
+/**
  * Sync webhook metrics (DLQ depth and outbox backlog) from the store into Prometheus gauges.
  *
  * Called on every authenticated `/metrics` scrape so Prometheus sees current queue depth
@@ -327,38 +355,32 @@ function sanitizeMetricGaugeValue(val: unknown): number {
  * @see webhookDlqItemsGauge
  * @see webhookOutboxPendingItemsGauge
  */
-export function syncWebhookMetrics(
-  store?: {
-    getMetrics?: () => {
-      totalDeliveries?: number;
-      successfulDeliveries?: number;
-      failedDeliveries?: number;
-      dlqItems?: number;
-      outboxItems?: number;
-    } | null;
-  } | null
-): void {
+export function syncWebhookMetrics(store?: WebhookMetricsProvider | null): void {
   // Explicit validation: store must be a non-null object with a callable getMetrics
   if (!store || typeof store.getMetrics !== 'function') {
     webhookDlqItemsGauge.set(0);
     webhookOutboxPendingItemsGauge.set(0);
+    webhookMetricsSyncTotal.inc({ outcome: 'provider_unavailable' });
     return;
   }
 
   try {
     const metrics = store.getMetrics();
     // Explicit null/undefined check on returned metrics object
-    if (!metrics || typeof metrics !== 'object') {
+    if (metrics === null || typeof metrics !== 'object') {
       webhookDlqItemsGauge.set(0);
       webhookOutboxPendingItemsGauge.set(0);
+      webhookMetricsSyncTotal.inc({ outcome: 'success_empty' });
       return;
     }
     webhookDlqItemsGauge.set(sanitizeMetricGaugeValue(metrics.dlqItems));
     webhookOutboxPendingItemsGauge.set(sanitizeMetricGaugeValue(metrics.outboxItems));
+    webhookMetricsSyncTotal.inc({ outcome: 'success' });
   } catch {
     // Observability must not fail closed: never let store errors 500 the scrape path.
     webhookDlqItemsGauge.set(0);
     webhookOutboxPendingItemsGauge.set(0);
+    webhookMetricsSyncTotal.inc({ outcome: 'provider_error' });
   }
 }
 
@@ -465,6 +487,7 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
   registry.removeSingleMetric('fluxora_webhook_deliveries_suppressed_total');
   registry.removeSingleMetric('fluxora_webhook_dlq_items');
+  registry.removeSingleMetric('fluxora_webhook_metrics_sync_total');
   registry.removeSingleMetric('fluxora_webhook_outbox_pending_items');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');

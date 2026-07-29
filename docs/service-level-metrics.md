@@ -1,4 +1,4 @@
-# Service-Level Metrics Documentation
+﻿# Service-Level Metrics Documentation
 
 ## Overview
 
@@ -11,7 +11,7 @@ This document describes the service-level metrics instrumentation in the Stellar
 The `businessMetrics.ts` module serves as the central hub for business-level metrics, exporting:
 
 - **16+ metric instruments** (Counters, Histograms, Gauges)
-- **Helper functions** for validation and safe observation
+- **Helper functions** for validation and safe observation (`safeObserveDuration`, `sanitizeMetricGaugeValue`)
 - **Registry integration** with Prometheus
 - **Edge-case protection** for robust operation
 
@@ -48,24 +48,31 @@ The `businessMetrics.ts` module serves as the central hub for business-level met
 
 ## Key Functions and Contracts
 
-### 1. `syncWebhookMetrics(store?)`
+### 1. `WebhookMetricsProvider` Interface
+
+**Purpose**: Defines a formal contract for stores providing webhook queue metrics to `syncWebhookMetrics`.
+
+**Signature**:
+```typescript
+export interface WebhookMetricsProvider {
+  getMetrics(): {
+    dlqItems?: number;
+    outboxItems?: number;
+  } | null;
+}
+```
+
+**Behavior**:
+- `getMetrics()` must not throw exceptions.
+- It should return `null` or an empty object on failure.
+
+### 2. `syncWebhookMetrics(store?: WebhookMetricsProvider | null)`
 
 **Purpose**: Sync webhook metrics (DLQ depth and outbox backlog) from the store into Prometheus gauges.
 
 **Signature**:
-
 ```typescript
-export function syncWebhookMetrics(
-  store?: {
-    getMetrics?: () => {
-      totalDeliveries?: number;
-      successfulDeliveries?: number;
-      failedDeliveries?: number;
-      dlqItems?: number;
-      outboxItems?: number;
-    } | null;
-  } | null
-): void;
+export function syncWebhookMetrics(store?: WebhookMetricsProvider | null): void;
 ```
 
 **Behavior**:
@@ -73,6 +80,7 @@ export function syncWebhookMetrics(
 - **Called on every authenticated `/metrics` scrape** to ensure Prometheus sees current queue depth
 - **Never throws** - all errors are caught and handled gracefully
 - **Fallback to 0** on any store error to prevent 500 responses
+
 
 **Edge-Case Handling**:
 
@@ -84,7 +92,7 @@ export function syncWebhookMetrics(
 - Negative values → clamped to `0`
 - Large values → clamped to `Number.MAX_SAFE_INTEGER`
 
-### 2. `sanitizeMetricGaugeValue(val: unknown): number`
+### 3. `sanitizeMetricGaugeValue(val: unknown): number`
 
 **Purpose**: Sanitize store-reported gauge values into non-negative finite integers.
 
@@ -96,7 +104,7 @@ export function syncWebhookMetrics(
 - Fractional values → `Math.floor` (counts are whole deliveries)
 - Values above `Number.MAX_SAFE_INTEGER` → clamped to `Number.MAX_SAFE_INTEGER`
 
-### 3. Validation Functions
+### 4. Validation Functions
 
 #### `isValidStreamStatus(value: string): value is StreamStatus`
 
@@ -116,7 +124,7 @@ export function syncWebhookMetrics(
 - **Accepted values**: `'per_ip_limit'`, `'global_limit'`
 - **Security**: Prevents cardinality blowup from arbitrary rejection reasons
 
-### 4. `safeObserveDuration(histogram: Histogram, durationSeconds: number): void`
+### 5. `safeObserveDuration(histogram: Histogram, durationSeconds: number): void`
 
 **Purpose**: Observe duration into histogram with NaN/negative value protection.
 
@@ -126,6 +134,16 @@ export function syncWebhookMetrics(
 - **Negative values** → observed as `0`
 - **Infinity values** → observed as `0`
 - **Valid positive values** → passed through unchanged
+
+### 6. `webhookMetricsSyncTotal` Counter
+
+**Purpose**: Provides observability into the `syncWebhookMetrics` function itself.
+
+**Labels**:
+- `outcome: 'success'`: The provider returned valid metrics.
+- `outcome: 'success_empty'`: The provider returned `null` or an empty object.
+- `outcome: 'provider_unavailable'`: The provider was `null`, `undefined`, or missing `getMetrics`.
+- `outcome: 'provider_error'`: The provider's `getMetrics()` method threw an exception.
 
 ## Security Considerations
 
