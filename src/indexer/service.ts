@@ -17,6 +17,21 @@ import {
   indexerEventsIngestedTotal,
   indexerLagSeconds,
 } from '../metrics/businessMetrics.js';
+import {
+  recordIndexerBatchFailure,
+  recordIndexerBatchSuccess,
+} from '../metrics/indexerRed.js';
+
+/**
+ * Seconds elapsed since a `process.hrtime.bigint()` reading.
+ *
+ * Uses the monotonic clock rather than `Date.now()` so a wall-clock adjustment
+ * (NTP step, DST) mid-batch can never produce a negative or wildly inflated
+ * duration observation.
+ */
+function elapsedSecondsSince(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1e9;
+}
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -488,12 +503,39 @@ export class IndexerService {
         }
 
         // Acquire a fresh connection for this batch.
-        const batchResult = await this.processBatch(
-          cursor.id,
-          request,
-          offset,
-          batchIndex,
-        );
+        //
+        // RED instrumentation wraps *only* this call so the histogram measures
+        // the batch processing step itself (fetch → insert → cursor advance →
+        // COMMIT) and nothing else. The loop guards above are control flow, not
+        // work, and deliberately stay outside the measurement.
+        const batchStartedAt = process.hrtime.bigint();
+        let batchResult: { rowsFetched: number };
+        try {
+          batchResult = await this.processBatch(
+            cursor.id,
+            request,
+            offset,
+            batchIndex,
+          );
+        } catch (batchError) {
+          const classification = recordIndexerBatchFailure(
+            request.contract_id,
+            elapsedSecondsSince(batchStartedAt),
+            batchError,
+          );
+          logger.warn('replay_batch_failed', undefined, {
+            event: 'replay_batch_failed',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            batch_index: batchIndex,
+            offset,
+            error_source: classification.source,
+            error_type: classification.type,
+          });
+          throw batchError;
+        }
+        recordIndexerBatchSuccess(request.contract_id, elapsedSecondsSince(batchStartedAt));
 
         if (batchResult.rowsFetched === 0) {
           // Source exhausted ahead of totalRows count — safe to stop.
