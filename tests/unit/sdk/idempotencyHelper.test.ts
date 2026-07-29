@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { IdempotencyHelper, IdempotencyError, ICacheStore, Logger } from '../../../sdk/typescript/src/idempotency.js';
 
@@ -109,5 +110,19 @@ describe('IdempotencyHelper', () => {
 
     expect(mockStore.set).not.toHaveBeenCalled();
     expect(mockStore.releaseLock).toHaveBeenCalledWith('idempotency:user-1:key-123:lock');
+  });
+
+  it('documents validation, retry, caller-scoped cache keys, and observability hooks', () => {
+    const helperSource = readFileSync(new URL('../../../sdk/typescript/src/idempotency.ts', import.meta.url), 'utf8');
+    const readme = readFileSync(new URL('../../../sdk/typescript/README.md', import.meta.url), 'utf8');
+
+    const helperText = helperSource.toLowerCase();
+    const readmeText = readme.toLowerCase();
+
+    expect(helperText).toContain('retry semantics');
+    expect(helperText).toContain('caller-scoped cache keys');
+    expect(helperText).toContain('observability hooks');
+    expect(readmeText).toContain('caller-scoped cache keys');
+    expect(readmeText).toContain('observability hooks');
   });
 });

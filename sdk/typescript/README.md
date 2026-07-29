@@ -101,6 +101,8 @@ POST /api/streams requires an `Idempotency-Key` header. The SDK handles this aut
 - If you omit `idempotencyKey`, the SDK auto-generates a UUID v4.
 - The SDK does **not** retry requests internally. If your application retries, supply and reuse the **same key** for every attempt of the same logical create operation.
 - Reusing a key with a **different body** throws `IdempotencyConflictError`.
+- The helper uses caller-scoped cache keys to avoid cross-tenant collisions and keeps the retry semantics explicit: replayed requests return the cached result, while concurrent requests for the same logical operation fail fast with `CONCURRENT_REQUEST`.
+- Observability hooks emit info, warn, and error events for validation, cache hits, lock contention, fresh execution, and operation failures.
 
 ```typescript
 const key = generateIdempotencyKey(); // UUID v4

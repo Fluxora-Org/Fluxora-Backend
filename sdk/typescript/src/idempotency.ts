@@ -199,6 +199,17 @@ export interface IdempotencyOptions {
   ttlSeconds?: number;
 }
 
+/**
+ * Helper contract notes:
+ * - Validation: both the idempotency key and caller ID must be non-empty strings.
+ * - Retry semantics: a replay with the same key and caller context returns the cached response;
+ *   a concurrent attempt for the same logical request is rejected with CONCURRENT_REQUEST.
+ * - caller-scoped cache keys: entries are stored under `idempotency:${callerId}:${idempotencyKey}`
+ *   to avoid cross-tenant collisions.
+ * - observability hooks: the logger receives info/warn/error events for validation, cache hits,
+ *   lock contention, fresh execution, and failures.
+ */
+
 export interface Logger {
   info(message: string, meta?: any): void;
   warn(message: string, meta?: any): void;
@@ -220,7 +231,15 @@ export class IdempotencyHelper {
 
   /**
    * Executes an operation idempotently.
-   * 
+   *
+   * The helper enforces the current contract for SDK-facing idempotency handling:
+   * - validation fails fast for empty key/caller values;
+   * - retry semantics use a caller-scoped cache key plus a short-lived lock to
+   *   guarantee that a replay returns the original outcome while concurrent requests
+   *   are rejected rather than executing twice;
+   * - observability hooks emit warnings and errors for invalid input, cache hits,
+   *   lock contention, fresh execution, and operation failures.
+   *
    * @param options Idempotency settings including the key and caller context.
    * @param operation The business logic to execute if this is a fresh request.
    * @returns The result of the operation or the cached result.
