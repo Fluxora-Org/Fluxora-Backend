@@ -31,6 +31,7 @@ export const httpRequestDurationSeconds = new Histogram({
   registers: [registry],
 });
 
+
 /**
  * Total requests rejected by the rate limiter with a 429 response.
  * Labels: identifier_type ('ip' | 'apiKey'), route (path or 'global').
@@ -42,6 +43,7 @@ export const rateLimitRejectedTotal = new Counter({
   registers: [registry],
 });
 
+
 /**
  * Total Redis errors that triggered rate-limit fallback to in-memory store.
  * Labels: operation ('increment' | 'getCount').
@@ -52,6 +54,7 @@ export const rateLimitRedisErrorsTotal = new Counter({
   labelNames: ['operation'] as const,
   registers: [registry],
 });
+
 
 /**
  * Total Redis errors in dedup operations (has/add).
