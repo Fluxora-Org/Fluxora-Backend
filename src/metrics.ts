@@ -70,6 +70,7 @@ export const dedupRedisErrorsTotal =
     registers: [registry],
   });
 
+
 /**
  * Total times HybridDedupCache fell back to in-memory because Redis was degraded.
  * Labels: operation ('has' | 'add').
@@ -128,6 +129,7 @@ export const configReloadDurationSeconds: Histogram =
     registers: [registry],
   });
 
+
 /**
  * Monotonic generation of the last successfully applied HotConfig.
  * Useful for verifying deploys/retries converge on the same generation.
@@ -150,6 +152,7 @@ export function recordConfigReloadSuccess(opts: {
   configReloadDurationSeconds.observe(opts.durationMs / 1000);
   configReloadGeneration.set(opts.generation);
 }
+
 
 /** Record a failed config reload for observability. */
 export function recordConfigReloadFailure(durationMs: number): void {
