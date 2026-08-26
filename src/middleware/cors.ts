@@ -18,15 +18,24 @@ const DEFAULT_ALLOWED_HEADERS = 'Content-Type,Authorization,X-Correlation-ID';
 const PREFLIGHT_MAX_AGE = '86400'; // 24 hours in seconds
 
 export function isOriginAllowed(origin: string, allowedOrigins: Set<string>): boolean {
-  if (allowedOrigins.has(origin)) {
+  if (allowedOrigins.has(origin) || allowedOrigins.has('*')) {
     return true;
+  }
+
+  if (origin === 'null') {
+    return false;
   }
 
   for (const allowed of allowedOrigins) {
     if (allowed.startsWith('*.')) {
       const baseDomain = allowed.slice(2);
-      if (origin.endsWith('.' + baseDomain)) {
-        return true;
+      try {
+        const url = new URL(origin);
+        if (url.hostname === baseDomain || url.hostname.endsWith('.' + baseDomain)) {
+          return true;
+        }
+      } catch {
+        // Ignore invalid URLs
       }
     }
   }
@@ -51,8 +60,16 @@ function isProduction(): boolean {
   return process.env.NODE_ENV === 'production';
 }
 
-function allowOrigin(req: CorsRequest, res: CorsResponse, origin: string): void {
-  res.setHeader('Access-Control-Allow-Origin', origin);
+function allowOrigin(req: CorsRequest, res: CorsResponse, origin: string, allowedOrigins?: Set<string>): void {
+  const isGlobalWildcard = allowedOrigins?.has('*') || origin === '*';
+
+  if (isGlobalWildcard) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', DEFAULT_ALLOWED_METHODS);
 
@@ -96,7 +113,7 @@ export function corsAllowlistMiddleware(req: CorsRequest, res: CorsResponse, nex
   const isAllowed = isOriginAllowed(origin, allowedOrigins);
 
   if (isAllowed) {
-    allowOrigin(req, res, origin);
+    allowOrigin(req, res, origin, allowedOrigins);
     if (isPreflight(req)) {
       res.setHeader('Access-Control-Max-Age', PREFLIGHT_MAX_AGE);
       res.sendStatus(204);
