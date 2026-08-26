@@ -1,39 +1,61 @@
 /**
  * Enhanced webhook delivery and management routes
  * Includes outbox, dead-letter queue, and circuit breaker endpoints
+ *
+ * Authentication model:
+ *   POST /receive  — public, HMAC-verified by external webhook senders
+ *   all other routes — require a valid admin Bearer token (requireAdminAuth)
  */
 
 import express from 'express';
 import type { Request, Response } from 'express';
 import { webhookService } from '../webhooks/service.js';
-import { webhookDeliveryStore } from '../webhooks/store.js';
+import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
+import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
+import { OffsetPaginationSchema } from '../validation/paginationSchema.js';
+import { InMemoryDedupCache } from '../redis/dedup.js';
+import type { DedupCache } from '../redis/dedup.js';
+
+let inboundWebhookDedupCache: DedupCache = new InMemoryDedupCache();
+
+export function setInboundWebhookDedupCache(cache: DedupCache): void {
+  inboundWebhookDedupCache = cache;
+}
+
+export function getInboundWebhookDedupCache(): DedupCache {
+  return inboundWebhookDedupCache;
+}
 
 export const webhooksRouter = express.Router();
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PUBLIC endpoint — no admin token required; verified by HMAC signature only.
+// Must be registered BEFORE the requireAdminAuth guard below.
+// ──────────────────────────────────────────────────────────────────────────────
 
 /**
  * POST /internal/webhooks/receive
  *
  * Verifies an incoming Fluxora webhook delivery against the shared secret.
+ * Deduplicates using `inboundWebhookDedupCache` (24h TTL, max 10,000 entries per instance).
  * Returns a flat envelope (not the standard successResponse / errorResponse
  * shape) so callers can rely on stable HTTP status codes and the
  * `error` string match the documented `WebhookVerificationCode` values.
  */
-const seenDeliveries = new Set<string>();
 webhooksRouter.post(
   '/receive',
   express.raw({ type: '*/*', limit: '1mb' }),
-  (req, res): void => {
+  async (req, res): Promise<void> => {
     const rawBody = req.body as Buffer;
     const headers = req.headers as Record<string, string | undefined>;
     // `verifyWebhookSignature` uses exact-optional types — only forward
     // properties when they are actually set.
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
-      isDuplicateDelivery: (id: string) => seenDeliveries.has(id),
     };
     if (process.env.FLUXORA_WEBHOOK_SECRET !== undefined) {
       verifyInput.secret = process.env.FLUXORA_WEBHOOK_SECRET;
@@ -55,7 +77,12 @@ webhooksRouter.post(
     }
 
     const deliveryId = headers['x-fluxora-delivery-id']!;
-    seenDeliveries.add(deliveryId);
+    
+    const isNew = await inboundWebhookDedupCache.add('webhook', deliveryId);
+    if (!isNew) {
+      res.status(409).json({ error: 'duplicate_delivery', message: 'Duplicate delivery id' });
+      return;
+    }
 
     let parsed: unknown;
     try {
@@ -73,6 +100,17 @@ webhooksRouter.post(
   },
 );
 
+// ──────────────────────────────────────────────────────────────────────────────
+// ADMIN guard — every route registered after this line requires a valid
+// Bearer token matching ADMIN_API_KEY.  This mirrors the pattern used by
+// /api/admin (adminRouter.use(requireAdminAuth)).
+// ──────────────────────────────────────────────────────────────────────────────
+webhooksRouter.use(requireAdminAuth);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Protected endpoints below
+// ──────────────────────────────────────────────────────────────────────────────
+
 /**
  * POST /api/webhooks/queue
  * Queue a webhook delivery for reliable processing
@@ -88,6 +126,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
           message: 'Missing required fields: event, endpointUrl, secret',
         },
       });
+      return;
     }
 
     // Add to outbox for reliable processing
@@ -138,7 +177,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
  */
 webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): void => {
   const deliveryId = req.params['deliveryId'];
-  const requestId = req.id;
+  const requestId = req.correlationId;
 
   if (!deliveryId) {
     res.status(400).json(
@@ -179,7 +218,21 @@ webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): voi
  * List all webhook deliveries (for monitoring/debugging)
  */
 webhooksRouter.get('/deliveries', (req, res) => {
-  const { status, limit = 100, offset = 0 } = req.query;
+  const parsed = OffsetPaginationSchema.safeParse(req.query);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: {
+        code: 'INVALID_PAGINATION',
+        message: first?.message ?? 'Invalid pagination parameters',
+      },
+    });
+    return;
+  }
+
+  const limit  = parsed.data.limit  ?? 100;
+  const offset = parsed.data.offset ?? 0;
+  const { status } = req.query;
   
   let deliveries = webhookDeliveryStore.getAll();
   
@@ -188,7 +241,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
   }
   
   const total = deliveries.length;
-  const paginated = deliveries.slice(Number(offset), Number(offset) + Number(limit));
+  const paginated = deliveries.slice(offset, offset + limit);
 
   res.json({
     total,
@@ -249,9 +302,21 @@ webhooksRouter.get('/outbox', (req, res) => {
  * List dead-letter queue items
  */
 webhooksRouter.get('/dlq', (req, res) => {
-  const { limit = 50 } = req.query;
+  const parsed = OffsetPaginationSchema.safeParse(req.query);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: {
+        code: 'INVALID_PAGINATION',
+        message: first?.message ?? 'Invalid pagination parameters',
+      },
+    });
+    return;
+  }
+
+  const limit = parsed.data.limit ?? 50;
   
-  const items = webhookDeliveryStore.getDeadLetterQueueItems(Number(limit));
+  const items = webhookDeliveryStore.getDeadLetterQueueItems(limit);
 
   res.json({
     total: items.length,
@@ -271,20 +336,28 @@ webhooksRouter.get('/dlq', (req, res) => {
 
 /**
  * POST /api/webhooks/dlq/:dlqId/retry
- * Retry a dead-letter queue item
+ * Retry a dead-letter queue item.
+ *
+ * Authorization: requireAdminAuth (Bearer token) — applied by the router-level
+ * guard above. No secondary secret check is performed here.
+ *
+ * Body (optional):
+ *   secret {string} — the per-delivery HMAC signing key to use when the item
+ *     is re-queued. This is NOT an authorization credential; it is the
+ *     webhook signing secret that will be used to sign the outbound HTTP
+ *     delivery to the consumer endpoint. If omitted, the original delivery's
+ *     secret (stored on the DLQ item) is reused.
+ *
+ * Previously this handler checked `if (!secret) { return 400 }`.  That check
+ * was a presence-only guard — any non-empty string passed — giving the false
+ * impression of secret-based authorization while providing none.  It has been
+ * removed.  Admin authentication via requireAdminAuth is the sole gate.
  */
 webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
   const { dlqId } = req.params;
-  const { secret } = req.body;
-
-  if (!secret) {
-    res.status(400).json({
-      error: {
-        code: 'MISSING_SECRET',
-        message: 'Webhook secret is required',
-      },
-    });
-  }
+  // `secret` is the per-delivery HMAC signing key for the re-queued outbox
+  // item, NOT an authorization credential.  Omitting it reuses the original.
+  const { secret } = req.body ?? {};
 
   try {
     // Get DLQ item
@@ -311,16 +384,23 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
           message: 'Failed to process DLQ item',
         },
       });
+      return;
     }
 
-    // Re-queue the webhook for retry
+    // Re-queue the webhook for retry, using the provided signing secret or
+    // falling back to the one stored on the original DLQ item.
+    const signingSecret: string =
+      typeof secret === 'string' && secret.length > 0
+        ? secret
+        : (dlqItem.originalDelivery.payload ?? '');
+
     const outboxId = webhookDeliveryStore.addToOutbox({
       deliveryId: `retry_${dlqItem.deliveryId}_${Date.now()}`,
       eventId: dlqItem.eventId,
       eventType: dlqItem.eventType,
       endpointUrl: dlqItem.endpointUrl,
       payload: dlqItem.payload,
-      secret,
+      secret: signingSecret,
       priority: 'high', // Prioritize retries
       createdAt: Date.now(),
       scheduledFor: Date.now(),
@@ -431,7 +511,7 @@ webhooksRouter.get('/metrics', (req, res) => {
  * Verify a webhook signature (for consumer testing)
  */
 webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, res) => {
-  const requestId = req.id;
+  const requestId = req.correlationId;
   const secret = req.query.secret as string;
   const deliveryId = req.header('x-fluxora-delivery-id');
   const timestamp = req.header('x-fluxora-timestamp');
@@ -450,6 +530,7 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
     res.status(result.status).json(
       errorResponse(result.code, result.message, undefined, requestId)
     );
+    return;
   }
 
   res.json(successResponse({
@@ -462,21 +543,11 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
 /**
  * POST /internal/webhooks/process-outbox
  * Process outbox items (internal endpoint for background job)
+ *
+ * Previously gated by an ad-hoc `?secret=` query-param check.
+ * That check has been removed — requireAdminAuth above provides real auth.
  */
 webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
-  const secret = req.query.secret as string;
-
-  if (!secret) {
-    logger.warn('Webhook outbox processing endpoint called without secret', undefined);
-    res.status(400).json({
-      error: {
-        code: 'MISSING_SECRET',
-        message: 'Webhook secret is required as query parameter',
-      },
-    });
-    return;
-  }
-
   try {
     const readyItems = webhookDeliveryStore.getReadyOutboxItems();
     let processed = 0;
@@ -526,19 +597,18 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
 /**
  * POST /internal/webhooks/retry
  * Process pending webhook retries (internal endpoint for background job)
+ *
+ * Previously gated by an ad-hoc `?secret=` query-param check.
+ * That check has been removed — requireAdminAuth above provides real auth.
  */
 webhooksRouter.post('/retry', express.json(), async (req, res) => {
   const requestId = req.id;
-  const secret = req.query.secret as string;
-
-  if (!secret) {
-    logger.warn('Webhook retry endpoint called without secret', undefined);
-    res.status(400).json(
-      errorResponse('MISSING_SECRET', 'Webhook secret is required as query parameter', undefined, requestId)
-    );
-  }
 
   try {
+    // Extract the webhook secret from the request body for use with processPendingRetries.
+    // The admin-level auth has already been validated by requireAdminAuth above; this
+    // secret is the per-delivery webhook signing secret, not an admin credential.
+    const { secret = '' } = req.body ?? {};
     await webhookService.processPendingRetries(secret);
     res.json(successResponse({
       ok: true,

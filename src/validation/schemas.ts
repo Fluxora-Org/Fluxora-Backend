@@ -154,6 +154,29 @@ export const StreamBatchCreateSchema = z.object({
 export type StreamBatchCreateInput = z.infer<typeof StreamBatchCreateSchema>;
 
 /**
+ * Schema for PUT /api/privacy/consent body.
+ *
+ * @remarks
+ * The address is validated at the API boundary, but route handlers must not
+ * persist or log the plaintext value. Consent rows are keyed by the same
+ * keyed HMAC address hash used for encrypted PII lookup.
+ */
+export const PrivacyConsentSchema = z.strictObject({
+  /** Stellar recipient public key used only to derive the stored address hash. */
+  address: stellarPublicKeyField('address'),
+  /** CCPA-style opt-out for analytics processing. */
+  analytics_optout: z.boolean({ error: 'analytics_optout must be a boolean' }),
+  /** CCPA-style opt-out for marketing communications or profiling. */
+  marketing_optout: z.boolean({ error: 'marketing_optout must be a boolean' }),
+  /** BIPA-style affirmative consent for biometric processing. */
+  biometric_processing_consent: z.boolean({
+    error: 'biometric_processing_consent must be a boolean',
+  }),
+});
+
+export type PrivacyConsentInput = z.infer<typeof PrivacyConsentSchema>;
+
+/**
  * Schema for GET /api/streams query parameters.
  */
 export const ListStreamsQuerySchema = z.object({

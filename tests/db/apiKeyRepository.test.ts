@@ -26,6 +26,7 @@ function makeRow(overrides: Partial<Record<string, unknown>> = {}): Record<strin
     created_at: new Date('2024-01-01T00:00:00Z'),
     rotated_at: null,
     active: true,
+    scopes: ['streams:read', 'streams:write'],
     ...overrides,
   };
 }
@@ -40,6 +41,7 @@ function makeRecord(overrides: Partial<ApiKeyRecord> = {}): ApiKeyRecord {
     createdAt: '2024-01-01T00:00:00.000Z',
     rotatedAt: null,
     active: true,
+    scopes: ['streams:read', 'streams:write'],
     ...overrides,
   };
 }
@@ -58,7 +60,7 @@ describe('apiKeyRepository', () => {
       expect(sql).toContain('INSERT INTO api_keys');
       expect(params).toEqual([
         'key-1', 'service-a', 'a'.repeat(64), 'b'.repeat(32), 'flx_abcd',
-        '2024-01-01T00:00:00.000Z', null, true,
+        '2024-01-01T00:00:00.000Z', null, true, ['streams:read', 'streams:write'],
       ]);
     });
   });
@@ -122,12 +124,13 @@ describe('apiKeyRepository', () => {
         salt: 'e'.repeat(32),
         prefix: 'flx_newp',
         rotatedAt: '2024-03-03T00:00:00.000Z',
+        scopes: ['streams:read', 'streams:write'],
       });
 
       const [, sql, params] = mockQuery.mock.calls[0]!;
       expect(sql).toContain('UPDATE api_keys');
       expect(sql).toContain('RETURNING');
-      expect(params).toEqual(['key-1', 'd'.repeat(64), 'e'.repeat(32), 'flx_newp', '2024-03-03T00:00:00.000Z']);
+      expect(params).toEqual(['key-1', 'd'.repeat(64), 'e'.repeat(32), 'flx_newp', '2024-03-03T00:00:00.000Z', ['streams:read', 'streams:write']]);
       expect(updated!.prefix).toBe('flx_newp');
     });
 
@@ -135,8 +138,38 @@ describe('apiKeyRepository', () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       const updated = await apiKeyRepository.rotate('missing', {
         keyHash: 'x', salt: 'y', prefix: 'flx_zzzz', rotatedAt: 'now',
+        scopes: ['streams:read', 'streams:write'],
       });
       expect(updated).toBeUndefined();
+    });
+
+    it('persists custom scopes and round-trips through findActiveByPrefix', async () => {
+      const customScopes = ['admin:read'];
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: customScopes })],
+      });
+      const records = await apiKeyRepository.findActiveByPrefix('flx_abcd');
+      expect(records).toHaveLength(1);
+      expect(records[0]!.scopes).toEqual(customScopes);
+    });
+
+    it('updates scopes on rotate and returns the new value', async () => {
+      const newScopes = ['admin:read', 'admin:write'];
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: newScopes })],
+      });
+      const updated = await apiKeyRepository.rotate('key-1', {
+        keyHash: 'd'.repeat(64),
+        salt: 'e'.repeat(32),
+        prefix: 'flx_newp',
+        rotatedAt: '2024-03-03T00:00:00.000Z',
+        scopes: newScopes,
+      });
+      expect(updated).toBeDefined();
+      expect(updated!.scopes).toEqual(newScopes);
+
+      const [, , params] = mockQuery.mock.calls[0]!;
+      expect(params[5]).toEqual(newScopes);
     });
   });
 
@@ -170,6 +203,67 @@ describe('apiKeyRepository', () => {
     it('propagates unexpected DB errors', async () => {
       mockQuery.mockRejectedValueOnce(new Error('connection refused'));
       await expect(apiKeyRepository.getById('x')).rejects.toThrow('connection refused');
+    });
+  });
+
+  // ── rowToRecord edge cases ──────────────────────────────────────────────────
+  // These lock down the exact scopes that come back from the DB so a silent
+  // field-assignment bug (using the raw column instead of the resolved variable)
+  // is immediately caught.
+
+  describe('rowToRecord — scope resolution', () => {
+    it('uses the resolved scopes variable, not the raw column (default fallback)', async () => {
+      // null scopes in the DB → default ['streams:read', 'streams:write']
+      mockQuery.mockResolvedValueOnce({ rows: [makeRow({ scopes: null })] });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['streams:read', 'streams:write']);
+    });
+
+    it('parses JSON-string scopes returned by some pg drivers', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: '["admin:read","admin:write"]' })],
+      });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['admin:read', 'admin:write']);
+    });
+
+    it('passes through a native array of scopes unchanged', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: ['streams:read'] })],
+      });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['streams:read']);
+    });
+
+    it('applies the default when scopes is undefined', async () => {
+      const rowWithoutScopes = makeRow();
+      delete (rowWithoutScopes as any)['scopes'];
+      mockQuery.mockResolvedValueOnce({ rows: [rowWithoutScopes] });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['streams:read', 'streams:write']);
+    });
+  });
+
+  // ── findActiveByPrefix — empty-prefix guard ─────────────────────────────────
+
+  describe('findActiveByPrefix — empty / blank prefix guard', () => {
+    it('returns [] immediately for an empty string prefix without querying the DB', async () => {
+      const result = await apiKeyRepository.findActiveByPrefix('');
+      expect(result).toEqual([]);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('returns [] immediately for a whitespace-only prefix without querying the DB', async () => {
+      const result = await apiKeyRepository.findActiveByPrefix('   ');
+      expect(result).toEqual([]);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('still queries the DB for a non-empty prefix', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+      const result = await apiKeyRepository.findActiveByPrefix('flx_abcd');
+      expect(result).toEqual([]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
     });
   });
 });

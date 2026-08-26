@@ -20,7 +20,7 @@
  *   increase(fluxora_request_body_too_large_total[5m]) > 50
  */
 
-import { Counter } from 'prom-client';
+import { Counter, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
 /**
@@ -42,10 +42,46 @@ export const requestBodyTooLargeTotal =
   });
 
 /**
+ * Token-bucket fill level for the webhook outbound rate limiter.
+ *
+ * A Gauge per consumer endpoint that shows how many tokens remain in the
+ * bucket. When the gauge approaches 0 the consumer is being throttled;
+ * when it stays near the configured burst maximum the consumer is idle.
+ *
+ * Label:
+ *   `consumer_hash` — SHA-256 prefix of the consumer endpoint URL (16 hex chars).
+ *     Hashed to bound label-cardinality and avoid leaking endpoint URLs.
+ *
+ * @security
+ * - The `consumer_hash` label is a one-way hash of the URL, not the raw URL,
+ *   preventing endpoint URLs (which could contain private IPs or internal
+ *   service names) from appearing in metric label values.
+ */
+export const webhookRateLimiterBucketFill =
+  (registry.getSingleMetric('fluxora_webhook_rate_limiter_bucket_fill') as Gauge<'consumer_hash'>) ||
+  new Gauge({
+    name: 'fluxora_webhook_rate_limiter_bucket_fill',
+    help: 'Current token-bucket fill level for outbound webhook rate limiter, labeled by consumer hash',
+    labelNames: ['consumer_hash'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Update the bucket-fill gauge for a given consumer.
+ *
+ * @param consumerHash - SHA-256 prefix of the consumer endpoint URL.
+ * @param fillLevel    - Current number of tokens in the bucket (may be fractional).
+ */
+export function updateWebhookBucketFill(consumerHash: string, fillLevel: number): void {
+  webhookRateLimiterBucketFill.set({ consumer_hash: consumerHash }, fillLevel);
+}
+
+/**
  * De-register the counter. Intended only for test teardown — do not call in
  * production code as it cannot be safely re-registered without restarting the
  * process.
  */
 export function deRegisterRequestProtectionMetrics(): void {
   registry.removeSingleMetric('fluxora_request_body_too_large_total');
+  registry.removeSingleMetric('fluxora_webhook_rate_limiter_bucket_fill');
 }

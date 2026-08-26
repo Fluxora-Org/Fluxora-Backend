@@ -14,14 +14,17 @@
  * @module redis/banStore
  */
 
+import { createHash } from 'crypto';
 import type { RedisClient } from './client.js';
 import { logger } from '../lib/logger.js';
 
 export const BAN_KEY_PREFIX = 'fluxora:ws:ban:';
 
 /** Sanitise IP for use in Redis key (replace unsafe chars). */
+// Hash IP with SHA-256 to prevent collision from truncation (#833)
 export function sanitiseIp(ip: string): string {
-  return ip.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 256) || 'unknown';
+  if (!ip) return 'unknown';
+  return createHash('sha256').update(ip).digest('hex');
 }
 
 function buildKey(ip: string): string {

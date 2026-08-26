@@ -47,6 +47,7 @@ export interface DlqEntry {
   firstFailedAt: string;
   lastFailedAt: string;
   correlationId?: string;
+  status?: 'dead' | 'replayed';
 }
 
 /** Enqueue a dead-letter entry. Called by internal workers. */
@@ -80,7 +81,7 @@ dlqRouter.get(
     const limitParam  = req.query.limit;
     const offsetParam = req.query.offset;
     const topicFilter = req.query.topic;
-    const requestId   = req.id;
+    const requestId   = req.correlationId;
 
     let limit = 50;
     if (limitParam !== undefined) {
@@ -125,15 +126,10 @@ dlqRouter.get(
   '/:id',
   requirePermission(Permission.DLQ_READ),
   asyncHandler(async (req: Request, res: Response) => {
-    const [entry, suspension] = await Promise.all([
-      dlqRepository.findById(req.params.id),
-      // We don't know the topic yet; fetch after entry resolves — two round-trips
-      // is acceptable here; the read path is not hot.
-      Promise.resolve(null) as Promise<null>,
-    ]);
+    const entry = await dlqRepository.findById(req.params.id);
 
     if (!entry) {
-      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.correlationId));
       return;
     }
 
@@ -142,7 +138,7 @@ dlqRouter.get(
       entry,
       consumerSuspended: consumerSuspension?.suspended ?? false,
       consecutiveFailures: consumerSuspension?.consecutiveFailures ?? 0,
-    }, req.id));
+    }, req.correlationId));
   }),
 );
 
@@ -162,7 +158,7 @@ dlqRouter.post(
   asyncHandler(async (req: Request, res: Response) => {
     const entry = await dlqRepository.findById(req.params.id);
     if (!entry) {
-      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.correlationId));
       return;
     }
 
@@ -174,21 +170,30 @@ dlqRouter.post(
         `Consumer for topic '${entry.topic}' is suspended after ${suspension.consecutiveFailures} consecutive failures. ` +
         `Use POST /admin/dlq/consumers/${encodeURIComponent(entry.topic)}/resume to re-enable.`,
         undefined,
+        req.correlationId,
+      ));
+      return;
+    }
+
+    // ── Reset attempt counter and record outcome, with optimistic concurrency ──
+    const replayFailed = req.body?.failed === true;
+
+    const replayed = await dlqRepository.replayEntry(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
+    if (!replayed) {
+      res.status(409).json(errorResponse(
+        'ENTRY_ALREADY_REPLAYED',
+        `DLQ entry '${entry.id}' has already been replayed or resolved.`,
+        undefined,
         req.id,
       ));
       return;
     }
 
-    // ── Reset attempt counter and record outcome ──────────────────────────────
-    const replayFailed = req.body?.failed === true;
-
-    await dlqRepository.update(entry.id, { attempts: 0, lastFailedAt: new Date().toISOString() });
-
     if (replayFailed) {
       const updated = await dlqRepository.recordReplayFailure(entry.topic);
       if (updated.suspended) {
-        info('DLQ consumer suspended after consecutive failures', { topic: entry.topic, failures: updated.consecutiveFailures, requestId: req.id });
-        recordAuditEvent('DLQ_CONSUMER_SUSPENDED', 'dlq_consumer', entry.topic, req.id, {
+        info('DLQ consumer suspended after consecutive failures', { topic: entry.topic, failures: updated.consecutiveFailures, requestId: req.correlationId });
+        recordAuditEvent('DLQ_CONSUMER_SUSPENDED', 'dlq_consumer', entry.topic, req.correlationId, {
           consecutiveFailures: updated.consecutiveFailures,
         });
       }
@@ -196,14 +201,14 @@ dlqRouter.post(
       await dlqRepository.recordReplaySuccess(entry.topic);
     }
 
-    info('DLQ entry replayed', { id: entry.id, topic: entry.topic, failed: replayFailed, requestId: req.id });
-    recordAuditEvent('DLQ_REPLAYED', 'dlq', entry.id, req.id, {
+    info('DLQ entry replayed', { id: entry.id, topic: entry.topic, failed: replayFailed, requestId: req.correlationId });
+    recordAuditEvent('DLQ_REPLAYED', 'dlq', entry.id, req.correlationId, {
       topic: entry.topic,
       originalAttempts: entry.attempts,
       replayFailed,
     });
 
-    res.json(successResponse({ message: 'DLQ entry replayed', id: entry.id, topic: entry.topic }, req.id));
+    res.json(successResponse({ message: 'DLQ entry replayed', id: entry.id, topic: entry.topic }, req.correlationId));
   }),
 );
 
@@ -223,14 +228,14 @@ dlqRouter.post(
 
     if (!updated) {
       // No suspension record — consumer is healthy; treat as idempotent success.
-      res.json(successResponse({ message: 'Consumer has no suspension record — already active', topic }, req.id));
+      res.json(successResponse({ message: 'Consumer has no suspension record — already active', topic }, req.correlationId));
       return;
     }
 
-    info('DLQ consumer resumed by operator', { topic, requestId: req.id });
-    recordAuditEvent('DLQ_CONSUMER_RESUMED', 'dlq_consumer', topic, req.id);
+    info('DLQ consumer resumed by operator', { topic, requestId: req.correlationId });
+    recordAuditEvent('DLQ_CONSUMER_RESUMED', 'dlq_consumer', topic, req.correlationId);
 
-    res.json(successResponse({ message: 'Consumer resumed', topic, resumedAt: updated.resumedAt }, req.id));
+    res.json(successResponse({ message: 'Consumer resumed', topic, resumedAt: updated.resumedAt }, req.correlationId));
   }),
 );
 
@@ -244,11 +249,11 @@ dlqRouter.delete(
   asyncHandler(async (req: Request, res: Response) => {
     const deleted = await dlqRepository.deleteById(req.params.id);
     if (!deleted) {
-      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.id));
+      res.status(404).json(errorResponse('NOT_FOUND', `DLQ entry '${req.params.id}' not found`, undefined, req.correlationId));
       return;
     }
-    info('DLQ entry acknowledged', { id: req.params.id, requestId: req.id });
-    res.json(successResponse({ message: 'DLQ entry removed', id: req.params.id }, req.id));
+    info('DLQ entry acknowledged', { id: req.params.id, requestId: req.correlationId });
+    res.json(successResponse({ message: 'DLQ entry removed', id: req.params.id }, req.correlationId));
   }),
 );
 
@@ -261,7 +266,7 @@ dlqRouter.delete(
   requirePermission(Permission.DLQ_DELETE),
   asyncHandler(async (req: Request, res: Response) => {
     const topicFilter = req.query.topic;
-    const requestId = req.id;
+    const requestId = req.correlationId;
 
     const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
     const purged = await dlqRepository.deleteAll(topic);

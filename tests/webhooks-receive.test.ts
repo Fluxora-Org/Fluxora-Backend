@@ -8,7 +8,7 @@
 import express from 'express';
 import request from 'supertest';
 import { webhooksRouter } from '../src/routes/webhooks.js';
-import { webhookDeliveryStore } from '../src/webhooks/store.js';
+import { webhookDeliveryStore } from '../src/webhooks/storeFactory.js';
 import { computeWebhookSignature } from '../src/webhooks/signature.js';
 
 const SECRET = 'test-webhook-secret-abc123';

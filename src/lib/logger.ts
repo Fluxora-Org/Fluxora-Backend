@@ -7,10 +7,17 @@
  *
  * Output goes to stdout for info/warn/debug and stderr for error so that
  * log-shipping agents and shell pipelines can separate severity streams.
+ *
+ * ## OpenTelemetry Logs Bridge
+ * When `TRACING_OTEL_ENABLED=true` and {@link initLogsBridge} has been called,
+ * each log entry is also forwarded to the OTel Logs API via
+ * `src/tracing/logsBridge.ts`. The OTel emission is **additive** — existing
+ * console/file behaviour is never altered.
  */
 
 import { sanitize, redactKeysInString } from '../pii/sanitizer.js';
 import { getCorrelationId } from '../tracing/middleware.js';
+import { forwardToOtel } from '../tracing/logsBridge.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -44,6 +51,12 @@ function write(level: LogLevel, message: string, correlationId?: string, meta?: 
   } else {
     process.stdout.write(line);
   }
+
+  // Additive OTel emission: forward the log record to the OTel Logs API when
+  // TRACING_OTEL_ENABLED=true. This is a no-op when the bridge is disabled.
+  // Errors thrown by the bridge are swallowed inside forwardToOtel() so they
+  // can never interfere with the primary logging path.
+  forwardToOtel(level, sanitizedMessage, currentCorrelationId, sanitizedMeta);
 }
 
 /**
@@ -140,3 +153,6 @@ export const logger = {
     process.stdout.write(JSON.stringify(record) + '\n');
   },
 };
+
+export type Logger = typeof logger;
+

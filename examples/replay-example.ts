@@ -1,4 +1,4 @@
-/**
+ /**
  * Example usage of the IndexerService replay API
  *
  * This script demonstrates how to:

@@ -30,7 +30,7 @@
 import { logger } from './logger.js';
 import { getPool, query } from '../db/pool.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'STREAM_BROADCAST' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE' | 'ADMIN_BULK_ACTION' | 'INDEXER_MTLS_FAILURE' | 'PURGE_INITIATED' | 'PURGE_SKIPPED_LEGAL_HOLD' | 'PII_ERASURE_REQUESTED' | 'GDPR_ERASURE' | 'BACKUP_RESTORE_QUEUED' | 'BACKUP_RESTORE_STARTED' | 'BACKUP_RESTORE_COMPLETED' | 'BACKUP_RESTORE_FAILED' | 'REPLAY_INTEGRITY_ISSUE' | 'MTLS_VALIDATION_FAILED' | 'DLQ_RETENTION_PURGED' | 'AUDIT_EXPORTED';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.
@@ -200,6 +200,31 @@ export async function recordAuditEventToDb(
   appendAuditEntry(entry);
   return entry;
 }
+
+/**
+ * Audit helper: Record a GDPR Right-to-Erasure entry in the database audit log.
+ *
+ * @param action - The audit action type ('GDPR_ERASURE' or 'PII_ERASURE_REQUESTED')
+ * @param resourceType - Affected database table (e.g. 'streams')
+ * @param recipientAddress - Plaintext address which is safely truncated to avoid logging PII
+ * @param correlationId - Trace correlation identifier from HTTP request
+ * @param meta - Audit metadata containing requester identity, role, outcome, and affected row count
+ * @returns Promise resolving to the created AuditEntry
+ *
+ * @security Never stores full recipient PII inside the audit log. Address is truncated
+ * to an 8-character prefix followed by an ellipsis.
+ */
+export async function recordErasureAuditLog(
+  action: AuditAction,
+  resourceType: string,
+  recipientAddress: string,
+  correlationId?: string,
+  meta?: Record<string, unknown>
+): Promise<AuditEntry> {
+  const truncatedId = recipientAddress.length > 8 ? recipientAddress.substring(0, 8) + '…' : recipientAddress;
+  return recordAuditEventToDb(action, resourceType, truncatedId, correlationId, meta);
+}
+
 
 // ── Queries ───────────────────────────────────────────────────────────────────
 

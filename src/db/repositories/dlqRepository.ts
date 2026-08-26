@@ -91,6 +91,7 @@ function rowToEntry(row: Record<string, unknown>): DlqEntry {
     correlationId: row['correlation_id'] as string | undefined,
     firstFailedAt: (row['first_failed_at'] as Date).toISOString(),
     lastFailedAt:  (row['last_failed_at']  as Date).toISOString(),
+    status:        row['status']         as 'dead' | 'replayed',
   };
 }
 
@@ -116,8 +117,8 @@ export const dlqRepository = {
     await query(
       pool,
       `INSERT INTO dead_letter_queue
-         (id, topic, payload, error, attempts, correlation_id, first_failed_at, last_failed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         (id, topic, payload, error, attempts, correlation_id, first_failed_at, last_failed_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         entry.id,
         entry.topic,
@@ -127,6 +128,7 @@ export const dlqRepository = {
         entry.correlationId ?? null,
         entry.firstFailedAt,
         entry.lastFailedAt,
+        entry.status ?? 'dead',
       ],
     );
   },
@@ -201,6 +203,70 @@ export const dlqRepository = {
     }
     const result = await query(pool, 'DELETE FROM dead_letter_queue');
     return result.rowCount ?? 0;
+  },
+
+  /**
+   * Purge terminal-state DLQ entries older than the given cutoff date.
+   *
+   * Terminal states:
+   *   - `status = 'replayed'` — explicitly resolved by an operator replay.
+   *   - `status = 'dead'` with `last_failed_at < cutoff` — entries that have
+   *     been sitting dead beyond the retention window.  Because the
+   *     dead_letter_queue table has no `max_attempts` column, the age-based
+   *     heuristic serves as the "permanently failed" signal: if an entry has
+   *     been dead for longer than the retention window, no operator or worker
+   *     is actively retrying it.
+   *
+   * This method is called by the scheduled `dlq-purge` job in bounded
+   * batches to avoid long-held locks on `dead_letter_queue`.
+   *
+   * **Security**: Only targets rows in terminal states; pending entries
+   * (`status = 'dead'` with recent `last_failed_at`) are never touched.
+   *
+   * @param batchSize  — Maximum rows to delete in a single call.
+   * @param cutoffDate — ISO-8601 timestamp; entries older than this are eligible.
+   * @returns The number of rows deleted.
+   */
+  async purgeTerminalEntries(batchSize: number, cutoffDate: string): Promise<number> {
+    const pool = getPool();
+    const result = await query(
+      pool,
+      `DELETE FROM dead_letter_queue
+       WHERE id IN (
+         SELECT id FROM dead_letter_queue
+          WHERE (
+            -- Resolved: explicitly replayed by an operator
+            status = 'replayed'
+            OR
+            -- Exhausted: dead entries beyond retention window;
+            -- recent last_failed_at implies still pending/in-flight.
+            (status = 'dead' AND last_failed_at < $2)
+          )
+          ORDER BY last_failed_at ASC
+          LIMIT $1
+       )`,
+      [batchSize, cutoffDate],
+    );
+    return result.rowCount ?? 0;
+  },
+
+  async replayEntry(id: string, patch: Partial<Pick<DlqEntry, 'attempts' | 'lastFailedAt'>>): Promise<boolean> {
+    const pool = getPool();
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    let idx = 1;
+
+    if (patch.attempts !== undefined) { sets.push(`attempts = $${idx++}`); params.push(patch.attempts); }
+    if (patch.lastFailedAt !== undefined) { sets.push(`last_failed_at = $${idx++}`); params.push(patch.lastFailedAt); }
+    sets.push(`status = $${idx++}`); params.push('replayed');
+
+    params.push(id);
+    const result = await query(
+      pool,
+      `UPDATE dead_letter_queue SET ${sets.join(', ')} WHERE id = $${idx} AND status = 'dead'`,
+      params
+    );
+    return (result.rowCount ?? 0) > 0;
   },
 
   // ── Consumer suspension ─────────────────────────────────────────────────────

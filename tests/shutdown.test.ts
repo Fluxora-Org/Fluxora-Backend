@@ -198,6 +198,79 @@ describe('gracefulShutdown()', () => {
 
     expect(forceCloseSpy).toHaveBeenCalled();
   });
+
+  // ─── Hook isolation — #863 ───────────────────────────────────────────────
+
+  it('runs all hooks when one throws synchronously, one rejects, and one succeeds (hook isolation)', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const executionOrder: string[] = [];
+
+    addShutdownHook(() => {
+      executionOrder.push('throws');
+      throw new Error('sync failure');
+    });
+
+    addShutdownHook(async () => {
+      executionOrder.push('rejects');
+      throw new Error('async failure');
+    });
+
+    addShutdownHook(async () => {
+      executionOrder.push('succeeds');
+    });
+
+    await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
+
+    expect(executionOrder).toEqual(['throws', 'rejects', 'succeeds']);
+  });
+
+  it('logs enough context to identify which hook failed (hook index and count)', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const { logger } = await import('../src/lib/logger.js');
+    const errorSpy = vi.spyOn(logger, 'error');
+
+    addShutdownHook(() => {
+      throw new Error('hook-0-error');
+    });
+
+    addShutdownHook(() => {
+      throw new Error('hook-1-error');
+    });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    const errorCalls = errorSpy.mock.calls.filter(
+      ([msg]) => msg === 'Shutdown hook threw an error',
+    );
+    expect(errorCalls).toHaveLength(2);
+    expect(errorCalls[0]?.[2]).toMatchObject({ hookIndex: 0, hookCount: 2 });
+    expect(errorCalls[1]?.[2]).toMatchObject({ hookIndex: 1, hookCount: 2 });
+
+    errorSpy.mockRestore();
+  });
+
+  it('catches a regression to Promise.all-style execution (all-or-nothing)', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const reached: boolean[] = [];
+
+    addShutdownHook(() => {
+      reached.push(true);
+      throw new Error('boom');
+    });
+
+    addShutdownHook(async () => {
+      reached.push(true);
+    });
+
+    await expect(gracefulShutdown(server, 'SIGTERM', 5_000)).resolves.toBeUndefined();
+    expect(reached).toEqual([true, true]);
+  });
 });
 
 // --- WebSocket Hub Shutdown Tests ---

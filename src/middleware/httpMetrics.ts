@@ -6,7 +6,7 @@ import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
  * Falls back to the raw path only when no Express route was matched,
  * which keeps the label set predictable for Prometheus.
  */
-function resolveRoute(req: Request): string {
+export function resolveRoute(req: Request): string {
   const raw = req.route?.path
     ? `${req.baseUrl}${req.route.path}`
     : (req.originalUrl.split('?')[0] ?? req.originalUrl);

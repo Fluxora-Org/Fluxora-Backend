@@ -10,8 +10,8 @@
 
 import * as fs from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { RedisClient } from '../redis/client.js';
-import { RedisDistributedLock, NoOpLock, Lock } from './adminStateLock.js';
+import { NoOpRedisClient, type RedisClient } from '../redis/client.js';
+import { RedisDistributedLock, NoOpLock, Lock, AdminStateLockError, REINDEX_LOCK_NAMESPACE } from './adminStateLock.js';
 import { logger } from '../lib/logger.js';
 import { adminReindexJobDurationSeconds } from '../metrics/businessMetrics.js';
 
@@ -59,6 +59,7 @@ const state: AdminState = {
 };
 
 let pauseFlagsLock: Lock | null = null;
+let reindexLock: Lock | null = null;
 
 hydratePauseFlagsFromPersistence();
 
@@ -157,23 +158,29 @@ function hydratePauseFlagsFromPersistence(): void {
 }
 
 /**
- * Initialize distributed locking for pause flags with a Redis client.
+ * Initialize distributed locking for admin state with a Redis client.
  * Call this during app startup after Redis is available.
- * If not called, file-based locking will be used as fallback.
+ * Creates locks for both pause flags and reindex operations.
+ * If not called, file-based locking will be used as fallback for pause flags
+ * and no distributed lock will protect reindex across processes.
  */
 export function initializeAdminStateLock(redis: RedisClient): void {
   pauseFlagsLock = new RedisDistributedLock(redis, 'pauseFlags');
+  reindexLock = new RedisDistributedLock(redis, REINDEX_LOCK_NAMESPACE);
 }
 
 async function acquirePauseFlagsLock(): Promise<Lock> {
   if (!pauseFlagsLock) {
     pauseFlagsLock = new RedisDistributedLock(
-      // Create a minimal Redis-compatible interface that falls back to file locking
-      { setNx: async () => false, del: async () => {} } as RedisClient,
+      new NoOpRedisClient(),
       'pauseFlags',
     );
   }
-  return pauseFlagsLock.acquire();
+  const lock = pauseFlagsLock;
+  if (!lock) {
+    throw new AdminStateLockError('pauseFlagsLock is not initialized');
+  }
+  return lock.acquire();
 }
 
 export function getPauseFlags(): PauseFlags {
@@ -215,12 +222,62 @@ export function getReindexState(): ReindexState {
 /**
  * Kick off a simulated reindex. In production this would trigger a
  * Horizon replay or database rebuild from chain events.
+ *
+ * Acquires a distributed lock (Redis-backed) for the entire duration of the
+ * reindex job to prevent overlapping reindex jobs across independent process
+ * instances sharing the same Redis.  If the lock cannot be acquired, the
+ * caller receives the current state so the route layer can return 409.
+ *
+ * @security The lock key includes a PID + timestamp for auditability.
+ *           Lock expiry (TTL) prevents deadlocks if the process crashes
+ *           while holding the lock.
  */
 export async function triggerReindex(): Promise<ReindexState> {
+  // Fast path: if already running (same process), short-circuit.
   if (state.reindex.status === 'running') {
     return { ...state.reindex };
   }
 
+  // If a distributed lock is available, serialize across processes.
+  if (reindexLock) {
+    let lock: Lock | null = null;
+    try {
+      lock = await reindexLock.acquire();
+    } catch {
+      // Lock acquisition failed — another instance holds it or Redis is down.
+      // Return current state so the route layer can return 409.
+      return { ...state.reindex };
+    }
+
+    // Re-check after acquiring lock (double-checked locking pattern).
+    // Cast to widen: `state.reindex` may have been reassigned by a concurrent
+    // caller during the `await` above, but TS's narrowing from the early
+    // return doesn't account for mutation across an await boundary.
+    if ((state.reindex.status as ReindexStatus) === 'running') {
+      await lock.release();
+      return { ...state.reindex };
+    }
+
+    state.reindex = {
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+      error: null,
+      processedItems: 0,
+    };
+
+    const result = { ...state.reindex };
+
+    // Fire-and-forget: the job runs in the background.  The lock is held
+    // for the entire job duration so no other process can start a reindex.
+    runReindexJob()
+      .catch(() => { /* errors are captured in state */ })
+      .finally(() => { lock!.release().catch(() => {}); });
+
+    return result;
+  }
+
+  // Fallback: no distributed lock configured (file-lock or single-process).
   state.reindex = {
     status: 'running',
     startedAt: new Date().toISOString(),
@@ -229,13 +286,18 @@ export async function triggerReindex(): Promise<ReindexState> {
     processedItems: 0,
   };
 
-  // Fire-and-forget: the actual work runs in the background.
-  // In production, replace this with a real reindex job.
-  runReindexJob().catch(() => {
-    /* errors are captured in state */
-  });
+  runReindexJob().catch(() => { /* errors are captured in state */ });
 
   return { ...state.reindex };
+}
+
+/**
+ * Kick off a simulated reindex for a specific stream.
+ * In production this would trigger a stream-specific Horizon replay.
+ */
+export async function triggerStreamReindex(streamId: string): Promise<ReindexState> {
+  logger.info('Triggering stream-specific reindex', undefined, { streamId });
+  return triggerReindex();
 }
 
 async function runReindexJob(): Promise<void> {
@@ -263,7 +325,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Reset state — only exposed for tests. */
-export function _resetForTest(options: { clearPersistence?: boolean } = {}): void {
+export function _resetForTest(options: { clearPersistence?: boolean; clearLock?: boolean } = {}): void {
   state.pauseFlags.streamCreation = false;
   state.pauseFlags.ingestion = false;
   state.reindex = {
@@ -274,6 +336,11 @@ export function _resetForTest(options: { clearPersistence?: boolean } = {}): voi
     processedItems: 0,
   };
 
+  if (options.clearLock !== false) {
+    pauseFlagsLock = null;
+    reindexLock = null;
+  }
+
   if (options.clearPersistence !== false) {
     try {
       fs.rmSync(resolveAdminStatePath(), { force: true });
@@ -281,6 +348,16 @@ export function _resetForTest(options: { clearPersistence?: boolean } = {}): voi
       // no-op
     }
   }
+}
+
+/**
+ * Set the distributed lock instance used by `triggerReindex()`.
+ * Exported for integration testing — allows tests to inject a lock backed
+ * by a shared FakeRedisClient to simulate cross-process serialization.
+ * @security Only for testing; never called in production code paths.
+ */
+export function _setReindexLockForTest(lock: Lock | null): void {
+  reindexLock = lock as RedisDistributedLock | null;
 }
 
 export function _reloadPauseFlagsFromPersistenceForTest(): void {

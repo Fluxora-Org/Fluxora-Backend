@@ -73,6 +73,28 @@ interface VacuumRow {
   last_autovacuum: Date | null;
 }
 
+/**
+ * Map a raw `pg_stat_user_tables` aggregate row into a typed {@link VacuumRow}.
+ *
+ * Never pass `VacuumRow` (or any bare domain interface) as the generic argument
+ * to `pool.query<T>()` — pg requires `QueryResultRow`. Query with
+ * `Record<string, unknown>` and map through this helper instead.
+ * See `src/db/repositories/README.md`.
+ */
+export function rowToVacuumRow(row: Record<string, unknown>): VacuumRow {
+  return {
+    table_name: String(row['table_name'] ?? ''),
+    n_dead_tup: String(row['n_dead_tup'] ?? '0'),
+    n_live_tup: String(row['n_live_tup'] ?? '0'),
+    last_autovacuum:
+      row['last_autovacuum'] === null || row['last_autovacuum'] === undefined
+        ? null
+        : row['last_autovacuum'] instanceof Date
+          ? row['last_autovacuum']
+          : new Date(String(row['last_autovacuum'])),
+  };
+}
+
 // ── Collector ─────────────────────────────────────────────────────────────────
 
 /**
@@ -84,8 +106,8 @@ export async function collectVacuumMetrics(pool: pg.Pool): Promise<void> {
   let rows: VacuumRow[];
 
   try {
-    const result = await pool.query<VacuumRow>(VACUUM_STATS_SQL, [MONITORED_TABLES]);
-    rows = result.rows;
+    const result = await pool.query<Record<string, unknown>>(VACUUM_STATS_SQL, [MONITORED_TABLES]);
+    rows = result.rows.map(rowToVacuumRow);
   } catch (err) {
     logger.warn('Vacuum metrics collection failed — skipping this interval', undefined, {
       error: err instanceof Error ? err.message : String(err),

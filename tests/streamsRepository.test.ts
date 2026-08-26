@@ -56,7 +56,7 @@ vi.mock('../src/utils/logger.js', () => ({
   error: vi.fn(),
 }));
 
-import { streamRepository, MAX_PAGE_SIZE } from '../src/db/repositories/streamRepository.js';
+import { streamRepository, MAX_PAGE_SIZE, StatusConflictError } from '../src/db/repositories/streamRepository.js';
 import type { CreateStreamInput, UpdateStreamInput } from '../src/db/types.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -585,6 +585,60 @@ describe('streamRepository', () => {
       expect(result.streams).toHaveLength(0);
       expect(result.hasMore).toBe(false);
       expect(result.total).toBe(0);
+    });
+  });
+
+  // ── concurrency / compare-and-swap ──────────────────────────────────────────
+
+  describe('concurrency (compare-and-swap)', () => {
+    it('throws StatusConflictError when status changed between read and update', async () => {
+      // Simulate: getById reads status=active, but another tx changed it before UPDATE
+      queryReturnsRows([makeRow({ status: 'active' })]);  // getById (forcePrimary)
+      queryReturnsRows([]);                               // UPDATE returns empty — status guard failed
+      queryReturnsRows([{ exists: true }]);               // Stream still exists (stale read → conflict)
+
+      await expect(
+        streamRepository.updateStream('stream-x', { status: 'cancelled' }),
+      ).rejects.toThrow(StatusConflictError);
+    });
+
+    it('detects stream deletion between read and update', async () => {
+      queryReturnsRows([makeRow({ status: 'active' })]);  // getById
+      queryReturnsRows([]);                               // UPDATE returns empty
+      queryReturnsRows([{ exists: false }]);              // Stream no longer exists
+
+      await expect(
+        streamRepository.updateStream('stream-x', { status: 'cancelled' }),
+      ).rejects.toThrow('Stream not found after update');
+    });
+
+    it('two concurrent updateStream calls: exactly one succeeds, the other gets StatusConflictError', async () => {
+      // Both calls see the same initial state (status=active)
+      queryReturnsRows([makeRow({ status: 'active' })]);  // Call 1 getById
+      queryReturnsRows([makeRow({ status: 'active' })]);  // Call 2 getById
+      queryReturnsRows([makeRow({ status: 'paused' })]);  // Call 1 UPDATE succeeds
+      queryReturnsRows([]);                               // Call 2 UPDATE fails (status guard)
+      queryReturnsRows([{ exists: true }]);               // Call 2 exists check
+
+      const [r1, r2] = await Promise.allSettled([
+        streamRepository.updateStream('stream-x', { status: 'paused' }),
+        streamRepository.updateStream('stream-x', { status: 'cancelled' }),
+      ]);
+
+      const succeeded = [r1, r2].find(r => r.status === 'fulfilled');
+      const conflicted = [r1, r2].find(
+        r => r.status === 'rejected' && r.reason instanceof StatusConflictError,
+      );
+
+      expect(succeeded).toBeDefined();
+      expect(conflicted).toBeDefined();
+
+      if (succeeded?.status === 'fulfilled') {
+        expect(succeeded.value.status).toBe('paused');
+      }
+      if (conflicted?.status === 'rejected') {
+        expect(conflicted.reason).toBeInstanceOf(StatusConflictError);
+      }
     });
   });
 

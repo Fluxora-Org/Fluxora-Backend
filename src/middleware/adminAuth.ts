@@ -1,5 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
+import { verifyToken } from '../lib/auth.js';
+import crypto from 'crypto';
 
 /**
  * Maximum allowed length for the `Authorization` header value, in bytes.
@@ -79,14 +81,30 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   }
 
   // Constant-time-ish comparison to reduce timing side-channels.
-  if (token.length !== adminKey.length || !timingSafeEqual(token, adminKey)) {
-    recordOutcome('failure');
-    res.status(403).json({ error: 'Invalid admin credentials.' });
+  if (token.length === adminKey.length && timingSafeEqual(token, adminKey)) {
+    (req as any).user = { role: 'admin' };
+    recordOutcome('success');
+    next();
     return;
   }
 
-  recordOutcome('success');
-  next();
+  // Check if token is a JWT token containing an authorized role (admin or data-protection-officer)
+  try {
+    const payload = verifyToken(token);
+    const role = payload?.role;
+    if (role === 'admin' || role === 'data-protection-officer') {
+      (req as any).user = payload;
+      recordOutcome('success');
+      next();
+      return;
+    }
+  } catch {
+    // JWT verification failed; fall through to 403
+  }
+
+  recordOutcome('failure');
+  res.status(403).json({ error: 'Invalid admin credentials.' });
+  return;
 }
 
 /**
@@ -98,8 +116,7 @@ function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
 
   try {
-    const { timingSafeEqual: nativeEqual } = require('crypto');
-    return nativeEqual(Buffer.from(a), Buffer.from(b));
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
   } catch {
     let mismatch = 0;
     for (let i = 0; i < a.length; i++) {

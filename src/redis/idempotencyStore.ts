@@ -171,9 +171,8 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
 
       const result = parseAndValidateEnvelope<T>(raw);
       if (result.invalidReason !== undefined) {
-        this.logger.warn('Idempotency store: envelope validation failed — treating as absent', {
+        this.logger.warn('Idempotency store: envelope validation failed — treating as absent', correlationStore.getStore(), {
           operation: 'get',
-          correlationId: correlationStore.getStore(),
           keyLength: key.length,
           reason: result.invalidReason,
         });
@@ -182,9 +181,8 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       return result.entry;
     } catch (err) {
       this.onStateChange?.(false);
-      this.logger.warn('Idempotency store: Redis get failed — degrading to pass-through', {
+      this.logger.warn('Idempotency store: Redis get failed — degrading to pass-through', correlationStore.getStore(), {
         operation: 'get',
-        correlationId: correlationStore.getStore(),
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -199,9 +197,8 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       this.onStateChange?.(true);
     } catch (err) {
       this.onStateChange?.(false);
-      this.logger.warn('Idempotency store: Redis set failed — idempotency not persisted', {
+      this.logger.warn('Idempotency store: Redis set failed — idempotency not persisted', correlationStore.getStore(), {
         operation: 'set',
-        correlationId: correlationStore.getStore(),
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });

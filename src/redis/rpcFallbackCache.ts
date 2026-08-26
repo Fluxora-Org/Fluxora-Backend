@@ -346,7 +346,7 @@ export class InMemoryRpcFallbackCache implements RpcFallbackCache {
       return null;
     }
 
-    return parseCacheEntry<T>(entry.value);
+    return parseCacheEntry<T>(entry.value, key);
   }
 
   async set<T>(

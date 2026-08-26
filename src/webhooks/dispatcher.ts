@@ -1,5 +1,5 @@
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
-import { getCorrelationId } from '../tracing/middleware.js';
+import { getCorrelationId, getActiveTraceContext, buildTraceparent } from '../tracing/middleware.js';
 
 import { logger } from '../lib/logger.js';
 
@@ -72,7 +72,6 @@ export class WebhookDispatcher {
     const enhancedPolicy = this.policy as EnhancedRetryPolicy;
 
     // Validate webhook target for SSRF protection before any network call
-    let validatedUrl = url;
     try {
       let allowlist: string[] | undefined;
       try {
@@ -81,7 +80,7 @@ export class WebhookDispatcher {
       } catch {
         // Config not initialized, proceed without allowlist
       }
-      validatedUrl = await validateWebhookTarget(url, {
+      await validateWebhookTarget(url, {
         allowlist,
       });
     } catch (error) {
@@ -100,7 +99,7 @@ export class WebhookDispatcher {
       throw error;
     }
 
-    const gate = await circuitBreakerStore.checkAndClaimAttempt(validatedUrl, enhancedPolicy);
+    const gate = await circuitBreakerStore.checkAndClaimAttempt(url, enhancedPolicy);
     if (!gate.allowed) {
       const nextRetryAt = resolveCircuitBreakerDeferral(gate, enhancedPolicy).getTime();
       logger.warn('Webhook delivery deferred by circuit breaker', undefined, {
@@ -126,7 +125,7 @@ export class WebhookDispatcher {
     const signature = computeWebhookSignature(secret, timestamp, payload);
 
     try {
-      const response = await this.sendRequest(validatedUrl, payload, deliveryId, eventType, timestamp, signature, effectiveCorrelationId);
+      const response = await this.sendRequest(url, payload, deliveryId, eventType, timestamp, signature, effectiveCorrelationId);
       
       const attempt: WebhookDeliveryAttempt = {
         attemptNumber,
@@ -135,7 +134,7 @@ export class WebhookDispatcher {
       };
 
       if (response.ok) {
-        await circuitBreakerStore.recordSuccess(validatedUrl, enhancedPolicy as CircuitBreakerPolicy);
+        await circuitBreakerStore.recordSuccess(url, enhancedPolicy as CircuitBreakerPolicy);
         logger.info('Webhook delivered successfully', undefined, {
           deliveryId,
           eventType,
@@ -155,8 +154,8 @@ export class WebhookDispatcher {
       attempt.error = errorMessage;
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
-        ? (await circuitBreakerStore.recordFailure(validatedUrl, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
-        : (await circuitBreakerStore.getState(validatedUrl))?.consecutiveFailures ?? 0;
+        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
       const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
@@ -193,6 +192,28 @@ export class WebhookDispatcher {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Check if it's WebhookTargetValidationError, which are non-retryable
+      let isNonRetryable = false;
+      if (error instanceof WebhookTargetValidationError) {
+        isNonRetryable = true;
+      }
+      
+      if (isNonRetryable) {
+        logger.error('Webhook delivery failed permanently with error', undefined, {
+          deliveryId,
+          eventType,
+          attemptNumber,
+          error: errorMessage,
+        });
+        
+        return {
+          success: false,
+          error: errorMessage,
+          shouldRetry: false,
+        };
+      }
+
       const attempt: WebhookDeliveryAttempt = {
         attemptNumber,
         timestamp: Date.now(),
@@ -200,8 +221,8 @@ export class WebhookDispatcher {
       };
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
-        ? (await circuitBreakerStore.recordFailure(validatedUrl, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
-        : (await circuitBreakerStore.getState(validatedUrl))?.consecutiveFailures ?? 0;
+        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
       const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
@@ -232,6 +253,76 @@ export class WebhookDispatcher {
         error: errorMessage,
         shouldRetry: false,
       };
+    }
+  }
+
+  /**
+   * Follow redirects with SSRF validation on each hop.
+   */
+  private async followRedirects(
+    initialUrl: string,
+    requestOptions: Omit<RequestInit, 'redirect'>,
+    deliveryId: string,
+    eventType: string,
+    maxRedirects: number = 1,
+  ): Promise<Response> {
+    let currentUrl = initialUrl;
+    let redirectCount = 0;
+    let allowlist: string[] | undefined;
+
+    try {
+      const config = getConfig();
+      allowlist = config.webhookAllowedHosts;
+    } catch {
+      // Config not initialized, proceed without allowlist
+    }
+
+    while (true) {
+      const response = await fetch(currentUrl, {
+        ...requestOptions,
+        redirect: 'manual',
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const locationHeader = response.headers.get('Location');
+        if (!locationHeader) {
+          return response;
+        }
+
+        if (redirectCount >= maxRedirects) {
+          logger.error('Too many webhook redirects', undefined, {
+            deliveryId,
+            eventType,
+            redirectCount,
+            maxRedirects,
+          });
+          throw new Error('Too many redirects');
+        }
+
+        // Resolve relative URL to absolute
+        const redirectUrl = new URL(locationHeader, currentUrl).toString();
+        
+        // Validate the redirect URL with SSRF guard
+        try {
+          await validateWebhookTarget(redirectUrl, { allowlist });
+          currentUrl = redirectUrl;
+        } catch (error) {
+          if (error instanceof WebhookTargetValidationError) {
+            logger.error('Redirect target rejected by SSRF guard', undefined, {
+              deliveryId,
+              eventType,
+              reason: error.message,
+            });
+            throw error;
+          }
+          throw error;
+        }
+
+        redirectCount++;
+        continue;
+      }
+
+      return response;
     }
   }
 
@@ -267,16 +358,89 @@ export class WebhookDispatcher {
         headers[CORRELATION_ID_HEADER] = correlationId;
       }
 
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: payload,
-        signal: controller.signal,
-      });
+      // Attach outbound W3C traceparent so webhook consumers can continue the
+      // distributed trace across the service boundary.  Only added when an
+      // active trace context exists in the current async scope; we never
+      // fabricate a traceparent when no upstream trace is present.
+      const activeTrace = getActiveTraceContext();
+      if (activeTrace) {
+        headers['traceparent'] = buildTraceparent(
+          activeTrace.traceId,
+          activeTrace.parentId,
+          activeTrace.sampled,
+        );
+      }
+
+      const response = await this.followRedirects(
+        url,
+        {
+          method: 'POST',
+          headers,
+          body: payload,
+          signal: controller.signal,
+        },
+        deliveryId,
+        eventType,
+      );
 
       return response;
     } finally {
       clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Follow redirects for validation requests.
+   */
+  private async followValidationRedirects(
+    initialUrl: string,
+    maxRedirects: number = 1,
+  ): Promise<Response> {
+    let currentUrl = initialUrl;
+    let redirectCount = 0;
+    let allowlist: string[] | undefined;
+
+    try {
+      const config = getConfig();
+      allowlist = config.webhookAllowedHosts;
+    } catch {
+      // Config not initialized, proceed without allowlist
+    }
+
+    while (true) {
+      const response = await fetch(currentUrl, {
+        method: 'HEAD',
+        redirect: 'manual',
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const locationHeader = response.headers.get('Location');
+        if (!locationHeader) {
+          return response;
+        }
+
+        if (redirectCount >= maxRedirects) {
+          logger.error('Too many redirects during endpoint validation');
+          throw new Error('Too many redirects');
+        }
+
+        const redirectUrl = new URL(locationHeader, currentUrl).toString();
+        try {
+          await validateWebhookTarget(redirectUrl, { allowlist });
+          currentUrl = redirectUrl;
+        } catch (error) {
+          if (error instanceof WebhookTargetValidationError) {
+            logger.error('Redirect target rejected by SSRF guard during validation');
+            throw error;
+          }
+          throw error;
+        }
+
+        redirectCount++;
+        continue;
+      }
+
+      return response;
     }
   }
 
@@ -291,10 +455,7 @@ export class WebhookDispatcher {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout for validation
 
-      const response = await fetch(url, {
-        method: 'HEAD',
-        signal: controller.signal,
-      });
+      const response = await this.followValidationRedirects(url);
 
       clearTimeout(timeoutId);
       return response.status < 500; // Accept any non-server-error status
@@ -331,9 +492,66 @@ export interface SimpleWebhookDispatch {
   ledger?: number;
 }
 
+/**
+ * Follow redirects for the dispatchWebhook convenience function.
+ */
+async function followDispatchWebhookRedirects(
+  initialUrl: string,
+  requestOptions: Omit<RequestInit, 'redirect'>,
+  maxRedirects: number = 1,
+): Promise<Response> {
+  let currentUrl = initialUrl;
+  let redirectCount = 0;
+  let allowlist: string[] | undefined;
+
+  try {
+    const config = getConfig();
+    allowlist = config.webhookAllowedHosts;
+  } catch {
+    // Config not initialized, proceed without allowlist
+  }
+
+  while (true) {
+    const response = await fetch(currentUrl, {
+      ...requestOptions,
+      redirect: 'manual',
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const locationHeader = response.headers.get('Location');
+      if (!locationHeader) {
+        return response;
+      }
+
+      if (redirectCount >= maxRedirects) {
+        logger.error('Too many redirects during webhook dispatch');
+        throw new Error('Too many redirects');
+      }
+
+      const redirectUrl = new URL(locationHeader, currentUrl).toString();
+      try {
+        await validateWebhookTarget(redirectUrl, { allowlist });
+        currentUrl = redirectUrl;
+      } catch (error) {
+        if (error instanceof WebhookTargetValidationError) {
+          logger.error('Redirect target rejected by SSRF guard during webhook dispatch', undefined, {
+            reason: error.message,
+          });
+          throw error;
+        }
+        throw error;
+      }
+
+      redirectCount++;
+      continue;
+    }
+
+    return response;
+  }
+}
+
 export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void> {
   // Validate webhook target for SSRF protection before any network call
-  let validatedUrl = opts.url;
   try {
     let allowlist: string[] | undefined;
     try {
@@ -342,7 +560,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
     } catch {
       // Config not initialized, proceed without allowlist
     }
-    validatedUrl = await validateWebhookTarget(opts.url, {
+    await validateWebhookTarget(opts.url, {
       allowlist,
     });
   } catch (error) {
@@ -355,52 +573,39 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
     throw error;
   }
 
-    // Optional reorg suppression: callers that pass a ledger number opt in to
-    // skipping delivery for ledgers the indexer has rolled back.
-    // The imports are dynamic to avoid hard dependencies on the indexer module.
-    if (typeof opts.ledger === 'number') {
-      const [{ webhookDeliveriesSuppressedTotal }, { isLedgerRolledBack }] = await Promise.all([
-        import('../metrics/businessMetrics.js'),
-        import('../indexer/service.js'),
-      ]);
-      if (isLedgerRolledBack(opts.ledger)) {
-        // Increment suppressed counter with outcome label
-        webhookDeliveriesSuppressedTotal.inc({ outcome: 'suppressed' });
-        return;
-      }
+  // Optional reorg suppression: callers that pass a ledger number opt in to
+  // skipping delivery for ledgers the indexer has rolled back. The imports are
+  // dynamic to avoid hard dependencies on the indexer module graph.
+  if (typeof opts.ledger === 'number') {
+    const [{ webhookDeliveriesSuppressedTotal }, { isLedgerRolledBack }] = await Promise.all([
+      import('../metrics/businessMetrics.js'),
+      import('../indexer/service.js'),
+    ]);
+    if (isLedgerRolledBack(opts.ledger)) {
+      // Increment suppressed counter with outcome label
+      webhookDeliveriesSuppressedTotal.inc({ outcome: 'suppressed' });
+      return;
     }
+  }
 
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const payloadStr = JSON.stringify(opts.payload);
   const signature = computeWebhookSignature(opts.secret, timestamp, payloadStr);
 
-  // Propagate correlation ID when available to preserve end-to-end tracing.
-  // Header name uses the shared correlation constant to avoid mismatches.
-  const effectiveCorrelationId = getCorrelationId();
-
   // Add AbortController timeout to prevent slow-loris attacks
-
   const controller = new AbortController();
   const timeoutMs = DEFAULT_RETRY_POLICY.timeoutMs;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'X-Fluxora-Event': opts.event,
-      'X-Fluxora-Signature': signature,
-      'X-Fluxora-Timestamp': timestamp,
-    };
-
-    // Only propagate the correlation ID; it is validated as a UUID-shaped value
-    // by the correlationId middleware.
-    if (effectiveCorrelationId && effectiveCorrelationId !== 'unknown') {
-      headers[CORRELATION_ID_HEADER] = effectiveCorrelationId;
-    }
-
-    await fetch(validatedUrl, {
+    await fetch(opts.url, {
       method: 'POST',
-      headers,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Fluxora-Event': opts.event,
+        'X-Fluxora-Signature': signature,
+        'X-Fluxora-Timestamp': timestamp,
+      },
       body: payloadStr,
       signal: controller.signal,
     });

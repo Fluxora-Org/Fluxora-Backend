@@ -6,6 +6,9 @@ import { InMemoryStore, SlidingWindowStore, HybridStore } from '../redis/rateLim
 import { createRedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 import { rateLimitRejectedTotal, rateLimitRedisErrorsTotal } from '../metrics.js';
+import { getClientIp } from '../ws/connectionLimiter.js';
+import { getOverride } from '../services/tenantRateLimitOverride.service.js';
+import type { RateLimitOverride } from '../services/tenantRateLimitOverride.service.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -101,10 +104,7 @@ export function extractClientIdentifier(req: Request): {
   if (typeof apiKey === 'string' && apiKey.length > 0) {
     return { identifier: apiKey, identifierType: 'apiKey' };
   }
-  const ip =
-    (req as Request & { ip?: string }).ip ??
-    req.socket.remoteAddress ??
-    'unknown';
+  const ip = getClientIp(req);
   return { identifier: ip, identifierType: 'ip' };
 }
 
@@ -120,6 +120,7 @@ export interface RateLimiter {
     identifierType: 'ip' | 'apiKey',
     path?: string,
     method?: string,
+    keyId?: string,
   ): Promise<RateLimitStatus>;
   extractClientIdentifier(req: Request): { identifier: string; identifierType: 'ip' | 'apiKey' };
   /** The backing store — used by GET /api/rate-limits to read live counts. */
@@ -137,14 +138,28 @@ export function createRateLimiter(
   /** Optional store injection — used in tests to bypass Redis. */
   injectedStore?: RateLimitStore,
 ): RateLimiter {
-  const { ip: ipConfig, apiKey: apiKeyConfig, admin: adminConfig, allowlistIps } =
-    getRateLimitConfig(env);
+  // Resolve config on each request via getRateLimitConfig() so SIGHUP-driven
+  // setRuntimeRateLimitConfig() patches are observed without recreating the
+  // middleware. Admin keys and allowlist still come from the factory-time env
+  // snapshot (restart-required).
+  const initial = getRateLimitConfig(env);
+  const allowlistIps = initial.allowlistIps;
 
   // Build admin key set
   const adminKeys = new Set<string>();
   const adminKeyEnv = env.ADMIN_API_KEY ?? '';
   for (const k of adminKeyEnv.split(',').map((s) => s.trim())) {
     if (k) adminKeys.add(k);
+  }
+
+  /** Live tier configs — re-read each request for hot-reload determinism. */
+  function liveConfigs(): {
+    ip: RateLimitConfig;
+    apiKey: RateLimitConfig;
+    admin: RateLimitConfig;
+  } {
+    const cfg = getRateLimitConfig(env);
+    return { ip: cfg.ip, apiKey: cfg.apiKey, admin: cfg.admin };
   }
 
   // ── Store selection ──────────────────────────────────────────────────────
@@ -228,6 +243,9 @@ export function createRateLimiter(
     res: Response,
     next: NextFunction,
   ): Promise<void> {
+    // Hot-reload aware: pick up the latest runtime overrides on every request.
+    const { ip: ipConfig, apiKey: apiKeyConfig, admin: adminConfig } = liveConfigs();
+
     if (!ipConfig.enabled && !apiKeyConfig.enabled) {
       return next();
     }
@@ -246,10 +264,26 @@ export function createRateLimiter(
     }
 
     const isAdmin = identifierType === 'apiKey' && adminKeys.has(identifier);
-    const config = isAdmin ? adminConfig : identifierType === 'apiKey' ? apiKeyConfig : ipConfig;
+    let config = isAdmin ? adminConfig : identifierType === 'apiKey' ? apiKeyConfig : ipConfig;
 
     if (!config.enabled) {
       return next();
+    }
+
+    // Override resolution: authenticated identity → per-tenant override → global default
+    // Security: identity is read from the verified auth context, never from client-supplied headers
+    const authenticatedKeyId = req.keyId;
+    if (authenticatedKeyId && identifierType === 'apiKey' && !isAdmin) {
+      try {
+        const tenantOverride: RateLimitOverride | null = await getOverride(authenticatedKeyId);
+        if (tenantOverride) {
+          config = { ...config, max: tenantOverride.maxRequests, windowMs: tenantOverride.windowMs };
+        }
+      } catch (err) {
+        logger.warn('Rate-limit override lookup failed; using global default', undefined, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     const routeConfig = getRouteRateLimitConfig(path);
@@ -328,9 +362,25 @@ export function createRateLimiter(
     identifierType: 'ip' | 'apiKey',
     path?: string,
     method?: string,
+    keyId?: string,
   ): Promise<RateLimitStatus> {
+    const { ip: ipConfig, apiKey: apiKeyConfig, admin: adminConfig } = liveConfigs();
     const isAdmin = identifierType === 'apiKey' && adminKeys.has(identifier);
-    const config = isAdmin ? adminConfig : identifierType === 'apiKey' ? apiKeyConfig : ipConfig;
+    let config = isAdmin ? adminConfig : identifierType === 'apiKey' ? apiKeyConfig : ipConfig;
+
+    // Override resolution for getStatus: keyId is the authenticated identity
+    if (keyId && identifierType === 'apiKey' && !isAdmin) {
+      try {
+        const tenantOverride: RateLimitOverride | null = await getOverride(keyId);
+        if (tenantOverride) {
+          config = { ...config, max: tenantOverride.maxRequests, windowMs: tenantOverride.windowMs };
+        }
+      } catch (err) {
+        logger.warn('Rate-limit override lookup failed in getStatus; using global default', undefined, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     const routeConfig = path ? getRouteRateLimitConfig(path) : null;
     const { effectiveLimit } = resolveEffectiveLimit(config, routeConfig, method ?? 'GET');

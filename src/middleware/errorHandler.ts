@@ -5,6 +5,7 @@ import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
 import { ApiError } from '../errors.js';
+import { getActiveTraceSpanIds } from '../tracing/hooks.js';
 
 export { ApiError } from '../errors.js';
 
@@ -40,7 +41,12 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  const requestId = req.correlationId ?? req.id ?? (res.locals['requestId'] as string | undefined);
+  const requestId = req.correlationId ?? (res.locals['requestId'] as string | undefined);
+
+  // Read traceId / spanId from the active OTel span context (if any).
+  // Degrades gracefully to an empty object when no tracing context exists
+  // (e.g. background jobs, tracing disabled).
+  const traceSpanIds = getActiveTraceSpanIds();
 
   // Ensure X-Request-ID is present even if correlationId middleware ran before
   // the route that set it, or if something cleared it.
@@ -69,7 +75,7 @@ export function errorHandler(
   }
 
   if (err instanceof ApiError) {
-    logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId });
+    logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId, ...traceSpanIds });
 
     if (err.expose) {
       res.status(err.statusCode).json(
@@ -114,6 +120,7 @@ export function errorHandler(
     errorMessage: err.message,
     stack: err.stack,
     requestId,
+    ...traceSpanIds,
   });
 
   res.status(500).json({

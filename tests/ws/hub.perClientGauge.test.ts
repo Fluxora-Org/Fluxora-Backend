@@ -23,7 +23,8 @@
  */
 
 import http from 'node:http';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import jwt from 'jsonwebtoken';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   StreamHub,
   type StreamHubBackpressureEvent,
@@ -44,6 +45,34 @@ import {
   wait,
   type SlowClient,
 } from './fixtures/slowClient.js';
+
+// ── Stub JWT credentials used by the coexistence test ─────────────────────
+// vi.mock factories are hoisted before variable declarations, so the literal
+// value 'gauge-test-sender-subject' must match GAUGE_TEST_SUBJECT below.
+const GAUGE_TEST_JWT_SECRET = 'gauge-test-jwt-secret-32-chars!!';
+const GAUGE_TEST_SUBJECT = 'gauge-test-sender-subject';
+
+function makeGaugeToken(): string {
+  return jwt.sign({ sub: GAUGE_TEST_SUBJECT }, GAUGE_TEST_JWT_SECRET);
+}
+
+// ── Mock streamRepository for the coexistence test ────────────────────────
+// The coexistence test subscribes with a streamId, which triggers
+// authorizeSubscriptionFilter → streamRepository.getById.  The real
+// repository requires DB config which is not initialised in this test
+// environment, so we mock it to return a stub stream whose sender matches
+// the JWT subject.
+vi.mock('../../src/db/repositories/streamRepository.js', () => ({
+  streamRepository: {
+    getById: vi.fn().mockResolvedValue({
+      id: 'stream-mock',
+      sender: 'gauge-test-sender-subject',
+      recipient: 'other-recipient',
+    }),
+    upsertStream: vi.fn(),
+    updateStream: vi.fn(),
+  },
+}));
 
 interface GaugeSample {
   labels: Record<string, string>;
@@ -317,6 +346,7 @@ describe('StreamHub backpressure emitter coexistence with the per-client gauge',
     server = http.createServer();
     hub = new StreamHub(server, {
       backpressureCollector: { intervalMs: 0 },
+      jwtSecret: GAUGE_TEST_JWT_SECRET,
     });
     hub.setBackpressureThresholds({ dropBytes: 8, terminateBytes: 64 });
     hub._resetMetrics();
@@ -347,13 +377,49 @@ describe('StreamHub backpressure emitter coexistence with the per-client gauge',
       events.push(event as StreamHubBackpressureEvent);
     });
 
-    const slow = await createSlowClient(port, hub);
-    slowClients.push(slow);
-    openClients.push(slow.client);
-    sendJson(slow.client, { type: 'subscribe', streamId: 'stream-coexist' });
+    // Connect with an authenticated slow client so streamId subscription
+    // passes authorizeSubscriptionFilter without hitting the real DB.
+    const token = makeGaugeToken();
+    const { WebSocket: WS } = await import('ws');
+    const clientWs = await new Promise<import('ws').WebSocket>((resolve, reject) => {
+      const ws = new WS(`ws://127.0.0.1:${port}/ws/streams`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    });
+    openClients.push(clientWs);
+
+    // Wrap in a slow-client stub: find the server-side socket and intercept
+    // bufferedAmount + write.
+    const localPort = (clientWs as unknown as { _socket?: { localPort?: number } })._socket?.localPort;
+    if (typeof localPort !== 'number') throw new Error('Unable to read client socket localPort');
+    const hubClients = (hub as unknown as { clients: Map<import('ws').WebSocket, unknown> }).clients;
+    const serverSock = Array.from(hubClients.keys()).find(
+      (ws) => (ws as unknown as { _socket?: { remotePort?: number } })._socket?.remotePort === localPort,
+    );
+    if (!serverSock) throw new Error('Server socket not found');
+
+    let bufferedAmount = 0;
+    Object.defineProperty(serverSock, 'bufferedAmount', {
+      configurable: true,
+      get: () => bufferedAmount,
+    });
+
+    const rawSock = (serverSock as unknown as { _socket?: { write?: (...a: unknown[]) => boolean } })._socket;
+    const origWrite = rawSock?.write?.bind(rawSock);
+    if (rawSock?.write) {
+      rawSock.write = ((...args: unknown[]): boolean => {
+        const cb = args.find((a): a is () => void => typeof a === 'function');
+        if (cb) cb();
+        return false;
+      }) as typeof rawSock.write;
+    }
+
+    sendJson(clientWs, { type: 'subscribe', streamId: 'stream-coexist' });
     await wait(20);
 
-    slow.setBufferedAmount(16);
+    bufferedAmount = 16;
     await hub.broadcast({
       streamId: 'stream-coexist',
       eventId: 'evt-coexist-1',
@@ -374,5 +440,8 @@ describe('StreamHub backpressure emitter coexistence with the per-client gauge',
 
     const connId = events[0].connectionId;
     expect(await readClientGauge(connId)).toBe(16);
+
+    // Restore original write
+    if (rawSock && origWrite) rawSock.write = origWrite as typeof rawSock.write;
   });
 });

@@ -55,6 +55,15 @@ export const ROUTE_BUDGETS: RouteBudget[] = [
     path: '/api/streams/:id',
     config: { baseLimit: 30, writeLimit: 5, exempt: false }
   },
+  // Privacy endpoints - strict limits for sensitive operations
+  {
+    path: '/api/privacy/consent',
+    config: { baseLimit: 10, writeLimit: 10, exempt: false }
+  },
+  {
+    path: '/api/privacy/erasure/:recipientAddress',
+    config: { baseLimit: 5, writeLimit: 5, exempt: false }
+  },
   // Admin endpoints - different limits
   {
     path: '/api/admin',
@@ -84,32 +93,45 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
 } {
   const enabled = env.RATE_LIMIT_ENABLED !== 'false';
 
-  const ip: RateLimitConfig = {
-    windowMs: parseInt(env.RATE_LIMIT_IP_WINDOW_MS ?? '', 10) || DEFAULT_IP_CONFIG.windowMs,
-    max: parseInt(env.RATE_LIMIT_IP_MAX ?? '', 10) || DEFAULT_IP_CONFIG.max,
-    enabled,
-  };
+  // Prefer the hot-reloaded runtime snapshot when present so SIGHUP / admin
+  // PUT /api/rate-limits/config take effect on the live request path without
+  // recreating the middleware. Falls back to env-seeded defaults otherwise.
+  const runtime = runtimeConfig;
 
-  const apiKey: RateLimitConfig = {
-    windowMs: parseInt(env.RATE_LIMIT_APIKEY_WINDOW_MS ?? '', 10) || DEFAULT_APIKEY_CONFIG.windowMs,
-    max: parseInt(env.RATE_LIMIT_APIKEY_MAX ?? '', 10) || DEFAULT_APIKEY_CONFIG.max,
-    enabled,
-  };
+  const ip: RateLimitConfig = runtime?.ip
+    ? { ...runtime.ip, enabled: runtime.ip.enabled && enabled }
+    : {
+        windowMs: parseInt(env.RATE_LIMIT_IP_WINDOW_MS ?? '', 10) || DEFAULT_IP_CONFIG.windowMs,
+        max: parseInt(env.RATE_LIMIT_IP_MAX ?? '', 10) || DEFAULT_IP_CONFIG.max,
+        enabled,
+      };
 
-  const admin: RateLimitConfig = {
-    windowMs: parseInt(env.RATE_LIMIT_ADMIN_WINDOW_MS ?? '', 10) || DEFAULT_ADMIN_CONFIG.windowMs,
-    max: parseInt(env.RATE_LIMIT_ADMIN_MAX ?? '', 10) || DEFAULT_ADMIN_CONFIG.max,
-    enabled,
-  };
+  const apiKey: RateLimitConfig = runtime?.apiKey
+    ? { ...runtime.apiKey, enabled: runtime.apiKey.enabled && enabled }
+    : {
+        windowMs:
+          parseInt(env.RATE_LIMIT_APIKEY_WINDOW_MS ?? '', 10) || DEFAULT_APIKEY_CONFIG.windowMs,
+        max: parseInt(env.RATE_LIMIT_APIKEY_MAX ?? '', 10) || DEFAULT_APIKEY_CONFIG.max,
+        enabled,
+      };
+
+  const admin: RateLimitConfig = runtime?.admin
+    ? { ...runtime.admin, enabled: runtime.admin.enabled && enabled }
+    : {
+        windowMs:
+          parseInt(env.RATE_LIMIT_ADMIN_WINDOW_MS ?? '', 10) || DEFAULT_ADMIN_CONFIG.windowMs,
+        max: parseInt(env.RATE_LIMIT_ADMIN_MAX ?? '', 10) || DEFAULT_ADMIN_CONFIG.max,
+        enabled,
+      };
 
   const trustProxy = env.RATE_LIMIT_TRUST_PROXY !== 'false';
-  
+
   // Parse allowlist IPs for health probes
   const allowlistIps = new Set<string>();
   const allowlistEnv = env.RATE_LIMIT_ALLOWLIST_IPS ?? '';
   if (allowlistEnv) {
-    for (const ip of allowlistEnv.split(',').map(s => s.trim()).filter(Boolean)) {
-      allowlistIps.add(ip);
+    for (const entry of allowlistEnv.split(',').map((s) => s.trim()).filter(Boolean)) {
+      allowlistIps.add(entry);
     }
   }
 
@@ -185,4 +207,44 @@ export function setRuntimeRateLimitConfig(
 /** Resets runtime overrides (used in tests and on startup). */
 export function resetRuntimeRateLimitConfig(): void {
   runtimeConfig = null;
+}
+
+// ─── Webhook dispatch rate-limit config ─────────────────────────────────────
+
+export interface WebhookRateLimitConfig {
+  /** Maximum delivery attempts allowed within the sliding window. */
+  limit: number;
+  /** Sliding-window duration in milliseconds. */
+  windowMs: number;
+  /**
+   * Token-bucket burst allowance.
+   * When > 0, up to `burst` consecutive outbound webhook attempts are
+   * allowed in zero time before the steady-state rate is enforced.
+   * When 0 (default) the limiter behaves as a flat sliding-window limit.
+   */
+  burst: number;
+}
+
+/**
+ * Default webhook dispatch rate-limit: 10 attempts per second, no burst.
+ */
+export const DEFAULT_WEBHOOK_RATE_LIMIT: WebhookRateLimitConfig = {
+  limit: 10,
+  windowMs: 1000,
+  burst: 0,
+};
+
+/**
+ * Parse webhook dispatch rate-limit config from environment variables.
+ */
+export function getWebhookRateLimitConfig(
+  env: Record<string, string | undefined>,
+): WebhookRateLimitConfig {
+  const limit =
+    parseInt(env.WEBHOOK_RETRY_RPS ?? '', 10) || DEFAULT_WEBHOOK_RATE_LIMIT.limit;
+  const windowMs = DEFAULT_WEBHOOK_RATE_LIMIT.windowMs;
+  const burst =
+    parseInt(env.WEBHOOK_RETRY_BURST ?? '', 10) || DEFAULT_WEBHOOK_RATE_LIMIT.burst;
+
+  return { limit, windowMs, burst };
 }

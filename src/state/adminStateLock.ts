@@ -11,6 +11,7 @@ import type { RedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 
 export interface Lock {
+  acquire(): Promise<Lock>;
   release(): Promise<void>;
 }
 
@@ -19,6 +20,13 @@ const LOCK_TIMEOUT_MS = 5000;
 const LOCK_POLL_MS = 50;
 const LOCK_MAX_RETRIES = Math.ceil(LOCK_TIMEOUT_MS / LOCK_POLL_MS);
 
+/**
+ * Lock namespace for reindex operations.  Acquired by `triggerReindex()`
+ * to prevent overlapping reindex jobs across independent process instances
+ * sharing the same Redis backend.
+ */
+export const REINDEX_LOCK_NAMESPACE = 'reindex';
+
 export class AdminStateLockError extends Error {
   constructor(message: string, public readonly cause?: unknown) {
     super(message);
@@ -26,11 +34,25 @@ export class AdminStateLockError extends Error {
   }
 }
 
-export class RedisDistributedLock {
+export interface RedisDistributedLockOptions {
+  /**
+   * Maximum time (ms) to retry lock acquisition before throwing.
+   * Defaults to `LOCK_TIMEOUT_MS` (5000 ms).  Tests may use a shorter
+   * value to avoid slow timeouts when contention is expected.
+   */
+  timeoutMs?: number;
+}
+
+export class RedisDistributedLock implements Lock {
+  private readonly timeoutMs: number;
+
   constructor(
     private readonly redis: RedisClient,
     private readonly lockNamespace: string,
-  ) {}
+    options?: RedisDistributedLockOptions,
+  ) {
+    this.timeoutMs = options?.timeoutMs ?? LOCK_TIMEOUT_MS;
+  }
 
   /**
    * Acquire a distributed lock via Redis.
@@ -39,12 +61,14 @@ export class RedisDistributedLock {
   async acquire(): Promise<Lock> {
     const lockKey = `${LOCK_KEY_PREFIX}${this.lockNamespace}`;
     const lockValue = `${process.pid}:${Date.now()}`;
+    const maxRetries = Math.ceil(this.timeoutMs / LOCK_POLL_MS);
 
-    for (let attempt = 0; attempt < LOCK_MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        const acquired = await this.redis.setNx(lockKey, lockValue, LOCK_TIMEOUT_MS);
+        const acquired = await this.redis.setNx(lockKey, lockValue, this.timeoutMs);
         if (acquired) {
           return {
+            acquire: async () => this.acquire(),
             release: async () => {
               try {
                 await this.redis.del(lockKey);
@@ -70,8 +94,23 @@ export class RedisDistributedLock {
     }
 
     throw new AdminStateLockError(
-      `Failed to acquire admin state lock after ${LOCK_TIMEOUT_MS}ms`,
+      `Failed to acquire admin state lock after ${this.timeoutMs}ms`,
     );
+  }
+
+  /**
+   * Release the distributed lock for this instance's namespace directly.
+   */
+  async release(): Promise<void> {
+    const lockKey = `${LOCK_KEY_PREFIX}${this.lockNamespace}`;
+    try {
+      await this.redis.del(lockKey);
+    } catch (err) {
+      logger.warn('Failed to release admin state lock', undefined, {
+        lockKey,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private async _acquireFileLock(): Promise<Lock> {
@@ -84,6 +123,7 @@ export class RedisDistributedLock {
         fs.closeSync(fd);
 
         return {
+          acquire: async () => this.acquire(),
           release: async () => {
             try {
               fs.rmSync(lockFile, { force: true });
@@ -115,6 +155,10 @@ export class RedisDistributedLock {
  * No-op lock for when locking is disabled or unavailable.
  */
 export class NoOpLock implements Lock {
+  async acquire(): Promise<Lock> {
+    return this;
+  }
+
   async release(): Promise<void> {
     return;
   }

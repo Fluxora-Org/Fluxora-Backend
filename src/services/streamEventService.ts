@@ -14,6 +14,9 @@ import { info, warn, error as logError, debug } from "../utils/logger.js";
 import { getStreamHub } from "../ws/hub.js";
 import { enrichActiveSpanWithStream, traceSpan } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";
+import type { DedupCache } from "../redis/dedup.js";
+import { InMemoryDedupCache } from "../redis/dedup.js";
+import { recordAuditEvent } from "../lib/auditLog.js";
 
 /**
  * Structured event code emitted in all catch-block log entries.
@@ -90,35 +93,52 @@ export interface EventIngestionResult {
  * - Out-of-order events are handled via upsert logic
  */
 
-const DEDUP_CACHE_SIZE = 10000;
-const processedEvents = new Set<string>();
-const processedEventsQueue: string[] = [];
+let activeDedupCache: DedupCache = new InMemoryDedupCache();
 
 /**
- * Checks if an event has been recently processed to prevent duplicate fan-out.
- * Uses a short-lived in-memory LRU-like cache.
+ * Configure the DedupCache instance used by streamEventService for duplicate suppression.
+ *
+ * Supports InMemoryDedupCache, RedisDedupCache, or HybridDedupCache.
+ *
+ * @param cache DedupCache implementation instance
  */
-function isDuplicateEvent(eventId: string): boolean {
-  if (processedEvents.has(eventId)) {
-    return true;
-  }
-  processedEvents.add(eventId);
-  processedEventsQueue.push(eventId);
-  if (processedEventsQueue.length > DEDUP_CACHE_SIZE) {
-    const oldest = processedEventsQueue.shift();
-    if (oldest) {
-      processedEvents.delete(oldest);
-    }
-  }
-  return false;
+export function setDedupCache(cache: DedupCache): void {
+  activeDedupCache = cache;
 }
 
 /**
+ * Get the current DedupCache instance used by streamEventService.
+ *
+ * @returns Active DedupCache instance
+ */
+export function getDedupCache(): DedupCache {
+  return activeDedupCache;
+}
+
+/**
+ * Checks if an event has been processed to prevent duplicate DB writes and broadcast fan-out.
+ * Uses the active DedupCache instance (e.g. HybridDedupCache with in-memory fallback during Redis outage).
+ *
+ * Security: eventId and streamId are technical identifiers derived from chain transactions and indices;
+ * no PII or Stellar secret keys are involved.
+ *
+ * @param streamId Stream identifier
+ * @param eventId Transaction hash and event index identifier (txHash-index)
+ * @returns Promise resolving to true if duplicate, false if first encounter
+ */
+async function isDuplicateEvent(streamId: string, eventId: string): Promise<boolean> {
+  const added = await activeDedupCache.add(streamId, eventId);
+  return !added;
+}
+
+/**
+ * Reset or clear the current active dedup cache.
  * Exported for testing purposes only.
  */
-export const _resetDedupCache = (): void => {
-  processedEvents.clear();
-  processedEventsQueue.length = 0;
+export const _resetDedupCache = async (): Promise<void> => {
+  if (activeDedupCache) {
+    await activeDedupCache.clear();
+  }
 };
 
 export const streamEventService = {
@@ -147,7 +167,7 @@ export const streamEventService = {
         event.eventIndex,
       );
 
-      if (isDuplicateEvent(eventId)) {
+      if (await isDuplicateEvent(streamId, eventId)) {
         debug("Event already processed (in-memory dedup)", {
           eventId,
           streamId,
@@ -181,6 +201,13 @@ export const streamEventService = {
         info("Stream created from event", { streamId, eventId, correlationId });
         const hub = getStreamHub();
         if (hub) {
+          recordAuditEvent(
+            "STREAM_BROADCAST",
+            "stream",
+            streamId,
+            correlationId,
+            { event: "stream.created", eventId, contractId: event.contractId }
+          );
           hub.broadcast({
             streamId,
             eventId,
@@ -249,7 +276,7 @@ export const streamEventService = {
       correlationId,
     });
 
-    if (isDuplicateEvent(eventId)) {
+    if (await isDuplicateEvent(event.streamId, eventId)) {
       debug("Event already processed (in-memory dedup)", {
         eventId,
         streamId: event.streamId,
@@ -300,6 +327,13 @@ export const streamEventService = {
         });
         const hub = getStreamHub();
         if (hub) {
+          recordAuditEvent(
+            "STREAM_BROADCAST",
+            "stream",
+            event.streamId,
+            correlationId,
+            { event: "stream.updated", eventId }
+          );
           hub.broadcast({
             streamId: event.streamId,
             eventId,
@@ -374,7 +408,7 @@ export const streamEventService = {
       correlationId,
     });
 
-    if (isDuplicateEvent(eventId)) {
+    if (await isDuplicateEvent(event.streamId, eventId)) {
       debug("Event already processed (in-memory dedup)", {
         eventId,
         streamId: event.streamId,
@@ -411,6 +445,13 @@ export const streamEventService = {
       });
       const hub = getStreamHub();
       if (hub) {
+        recordAuditEvent(
+          "STREAM_BROADCAST",
+          "stream",
+          event.streamId,
+          correlationId,
+          { event: "stream.cancelled", eventId }
+        );
         hub.broadcast({
           streamId: event.streamId,
           eventId,

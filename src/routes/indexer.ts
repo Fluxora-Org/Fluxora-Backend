@@ -36,8 +36,12 @@ import { authenticate, requireAuth, requirePermission, Permission } from '../mid
 import { successResponse, errorResponse } from '../utils/response.js';
 import { ReplayRequestSchema, parseBody, formatZodIssues } from '../validation/schemas.js';
 import { logger } from '../lib/logger.js';
+import { mtlsValidationMiddleware } from '../indexer/mtls.js';
 
 export const indexerRouter = Router();
+
+// Apply mTLS validation for all indexer endpoints
+indexerRouter.use(mtlsValidationMiddleware);
 
 // ── Internal worker-token auth ────────────────────────────────────────────────
 
@@ -87,7 +91,7 @@ indexerRouter.post('/contract-events', async (req: any, res: any, next: any) => 
 
     const result = await indexerIngestionService.ingest(req.body, {
       actor: resolveActor(req),
-      requestId: req.id ?? req.correlationId,
+      requestId: req.correlationId,
     });
 
     res.status(200).json(successResponse({
@@ -96,7 +100,7 @@ indexerRouter.post('/contract-events', async (req: any, res: any, next: any) => 
       duplicateCount: result.duplicateCount,
       insertedEventIds: result.insertedEventIds,
       duplicateEventIds: result.duplicateEventIds,
-    }, req.id ?? req.correlationId));
+    }, req.correlationId));
   } catch (caught) {
     next(caught);
   }
@@ -125,11 +129,11 @@ indexerRouter.get('/events/replay', async (req: any, res: any, next: any) => {
 
     try {
       const result = await indexerIngestionService.getEvents(filter);
-      res.status(200).json(successResponse(result, req.id ?? req.correlationId));
+      res.status(200).json(successResponse(result, req.correlationId));
     } catch (err) {
       if (err instanceof StaleCursorError) {
         // Unknown cursor = treat as past end of store, return empty
-        res.status(200).json(successResponse({ events: [], total: 0, limit: filter.limit ?? 100, offset: 0 }, req.id ?? req.correlationId));
+        res.status(200).json(successResponse({ events: [], total: 0, limit: filter.limit ?? 100, offset: 0 }, req.correlationId));
         return;
       }
       throw err;
@@ -155,7 +159,7 @@ indexerRouter.get('/events', async (req: any, res: any, next: any) => {
     };
 
     const result = await indexerIngestionService.getEvents(filter);
-    res.status(200).json(successResponse(result, req.id ?? req.correlationId));
+    res.status(200).json(successResponse(result, req.correlationId));
   } catch (caught) {
     next(caught);
   }
@@ -174,7 +178,7 @@ indexerRouter.post(
   requireAuth,
   requirePermission(Permission.INDEXER_REPLAY),
   async (req: any, res: any) => {
-    const requestId = req.id ?? req.correlationId;
+    const requestId = req.correlationId;
     const correlationId = req.correlationId;
 
     const parsed = parseBody(ReplayRequestSchema, req.body);
@@ -216,7 +220,7 @@ indexerRouter.get(
   requireAuth,
   requirePermission(Permission.INDEXER_REPLAY),
   async (req: any, res: any) => {
-    const requestId = req.id ?? req.correlationId;
+    const requestId = req.correlationId;
     const correlationId = req.correlationId;
     try {
       // Use the DB-backed extended snapshot so persisted replay checkpoints
@@ -265,5 +269,6 @@ export function getIndexerHealth() {
       requests: INDEXER_RATE_LIMIT_REQUESTS,
       windowMs: INDEXER_RATE_LIMIT_WINDOW_MS,
     },
+    catchupTelemetry: indexerIngestionService.getCatchupTelemetry(),
   };
 }

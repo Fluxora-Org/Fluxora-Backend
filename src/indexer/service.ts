@@ -9,6 +9,29 @@ import {
   indexerReplayRowsPerSecond,
   indexerReplayDurationSeconds,
 } from '../metrics/indexerMetrics.js';
+import {
+  getIndexerLeaderElection,
+  type IndexerLeaderElection,
+} from './leaderElection.js';
+import { checkReplayIntegrity } from './replayIntegrity.js';
+import {
+  recordIndexerBatchFailure,
+  recordIndexerBatchSuccess,
+} from '../metrics/indexerRed.js';
+import {
+  indexerLedgerLag,
+  indexerCatchupEtaSeconds,
+} from '../metrics/indexerLag.js';
+import {
+  indexerEventsIngestedTotal,
+  indexerLagSeconds,
+} from '../metrics/businessMetrics.js';
+import { getStellarRpcService } from '../services/stellar-rpc.js';
+
+/** Seconds elapsed since a `process.hrtime.bigint()` start mark. */
+function elapsedSecondsSince(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
+}
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -24,6 +47,23 @@ export class ReplayBudgetExceededError extends Error {
         'Re-run to resume from the last committed cursor offset.',
     );
     this.name = 'ReplayBudgetExceededError';
+  }
+}
+
+/**
+ * Thrown when this instance could not acquire (or lost) the distributed
+ * indexer leader-election lease. Another instance is currently the leader
+ * and is expected to own replay; no data was lost, already-committed
+ * batches remain durable, and a re-run resumes from the last committed
+ * cursor offset once this instance becomes leader.
+ */
+export class IndexerNotLeaderError extends Error {
+  constructor() {
+    super(
+      'This instance is not the indexer replay leader; another instance is ' +
+        'currently running (or eligible to run) replay.',
+    );
+    this.name = 'IndexerNotLeaderError';
   }
 }
 
@@ -142,6 +182,65 @@ class ReplayState {
 
 export const replayState = new ReplayState();
 
+// ── Row mappers (pg QueryResultRow → domain types) ────────────────────────────
+//
+// Never pass a bare domain interface to `client.query<T>()`.  pg requires
+// `QueryResultRow` (an index signature); domain interfaces do not satisfy it.
+// Query with `Record<string, unknown>` and map through these helpers instead.
+// See `src/db/repositories/README.md`.
+
+function asNumber(value: unknown): number {
+  return Number(value);
+}
+
+function asNumberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  return Number(value);
+}
+
+function asDate(value: unknown): Date {
+  return value instanceof Date ? value : new Date(String(value));
+}
+
+function asDateOrNull(value: unknown): Date | null {
+  if (value === null || value === undefined) return null;
+  return asDate(value);
+}
+
+/** Map a raw `replay_cursors` row into a typed {@link ReplayCursor}. */
+export function rowToReplayCursor(row: Record<string, unknown>): ReplayCursor {
+  return {
+    id:                    row['id'] as string,
+    contract_id:           row['contract_id'] as string,
+    ledger:                asNumber(row['ledger']),
+    from_block:            asNumberOrNull(row['from_block']),
+    to_block:              asNumberOrNull(row['to_block']),
+    total_rows:            asNumber(row['total_rows']),
+    last_committed_offset: asNumber(row['last_committed_offset']),
+    started_at:            asDate(row['started_at']),
+    completed_at:          asDateOrNull(row['completed_at']),
+  };
+}
+
+/** Map a raw `historical_events` / contract-event row into a typed {@link ContractEvent}. */
+export function rowToContractEvent(row: Record<string, unknown>): ContractEvent {
+  return {
+    event_id:         row['event_id'] as string,
+    contract_id:      row['contract_id'] as string,
+    ledger:           asNumber(row['ledger']),
+    event_type:       row['event_type'] as string,
+    event_data:       row['event_data'],
+    block_height:     asNumber(row['block_height']),
+    transaction_hash: row['transaction_hash'] as string,
+    ...(row['ingested_at'] !== undefined
+      ? { ingested_at: asDateOrNull(row['ingested_at']) }
+      : {}),
+    ...(row['created_at'] !== undefined
+      ? { created_at: asDate(row['created_at']) }
+      : {}),
+  };
+}
+
 // ── Cursor repository (DB operations) ─────────────────────────────────────────
 
 /**
@@ -161,7 +260,7 @@ export class ReplayCursorRepository {
     contractId: string,
     ledger: number,
   ): Promise<ReplayCursor | null> {
-    const result = await client.query<ReplayCursor>(
+    const result = await client.query<Record<string, unknown>>(
       `SELECT id, contract_id, ledger, from_block, to_block,
               total_rows, last_committed_offset, started_at, completed_at
          FROM replay_cursors
@@ -172,7 +271,7 @@ export class ReplayCursorRepository {
         LIMIT 1`,
       [contractId, ledger],
     );
-    return result.rows[0] ?? null;
+    return result.rows[0] ? rowToReplayCursor(result.rows[0]) : null;
   }
 
   /**
@@ -186,7 +285,7 @@ export class ReplayCursorRepository {
     toBlock: number | undefined,
     totalRows: number,
   ): Promise<ReplayCursor> {
-    const result = await client.query<ReplayCursor>(
+    const result = await client.query<Record<string, unknown>>(
       `INSERT INTO replay_cursors
          (contract_id, ledger, from_block, to_block, total_rows, last_committed_offset)
        VALUES ($1, $2, $3, $4, $5, 0)
@@ -194,7 +293,7 @@ export class ReplayCursorRepository {
                  total_rows, last_committed_offset, started_at, completed_at`,
       [contractId, ledger, fromBlock ?? null, toBlock ?? null, totalRows],
     );
-    return result.rows[0]!;
+    return rowToReplayCursor(result.rows[0]!);
   }
 
   /**
@@ -274,6 +373,7 @@ export class IndexerService {
   private replayBudgetMs: number;
   private cursorRepo: ReplayCursorRepository;
   private pool: pg.Pool;
+  private readonly leaderElectionOverride: IndexerLeaderElection | undefined;
 
   constructor(
     pool?: pg.Pool,
@@ -281,6 +381,7 @@ export class IndexerService {
     maxRangeBlocks?: number,
     replayBudgetMs?: number,
     cursorRepo?: ReplayCursorRepository,
+    leaderElection?: IndexerLeaderElection,
   ) {
     // Use the injected pool or fall back to the shared db pool.
     // Accessing db.pool directly is avoided to keep the service testable.
@@ -289,6 +390,17 @@ export class IndexerService {
     this.maxRangeBlocks = maxRangeBlocks ?? config.indexer.maxRangeBlocks;
     this.replayBudgetMs = replayBudgetMs ?? config.indexer.replayBudgetMs;
     this.cursorRepo = cursorRepo ?? new ReplayCursorRepository();
+    // Only stored when explicitly injected (tests). Otherwise every call
+    // resolves the *current* default via getLeaderElection() below —
+    // this singleton is constructed at module load, before app.ts finishes
+    // wiring Redis, so caching a resolved instance here would freeze it to
+    // the NoOp default forever.
+    this.leaderElectionOverride = leaderElection;
+  }
+
+  /** Resolves the current leader-election instance — never cached, see constructor note. */
+  private getLeaderElection(): IndexerLeaderElection {
+    return this.leaderElectionOverride ?? getIndexerLeaderElection();
   }
 
   /**
@@ -303,18 +415,28 @@ export class IndexerService {
    * committed rows.
    *
    * @param request  Validated replay parameters.
-   * @throws {Error}                    If a replay is already in progress.
+   * @throws {Error}                    If a replay is already in progress on this process.
+   * @throws {IndexerNotLeaderError}     If another instance holds the distributed replay lease.
    * @throws {ReplayBudgetExceededError} If the wall-clock budget is exceeded.
    */
   async replayEvents(request: ReplayRequest): Promise<void> {
     // 1. Validate input (no DB access yet)
     this.validateReplayRequest(request);
 
-    // 2. Concurrent-replay guard
+    // 2. Concurrent-replay guard (same-process)
     if (replayLock.isHeld()) {
       throw new Error('Replay operation already in progress');
     }
     replayLock.acquire();
+
+    // 2b. Distributed leader-election guard (cross-process/multi-replica).
+    //     Acquired after the in-process lock so two concurrent calls into
+    //     the same process still fail fast without touching Redis at all.
+    const leaderElection = this.getLeaderElection();
+    if (!(await leaderElection.tryAcquire())) {
+      replayLock.release();
+      throw new IndexerNotLeaderError();
+    }
 
     const replayStart = Date.now();
     let cursor: ReplayCursor | null = null;
@@ -361,6 +483,22 @@ export class IndexerService {
           break;
         }
 
+        // Leadership guard: our lease may have expired (e.g. Redis outage)
+        // and another instance may already be leading. Abort at this safe
+        // batch boundary — already-committed batches are durable and a
+        // future run (by whichever instance is leader) resumes from
+        // last_committed_offset.
+        if (!leaderElection.isLeader()) {
+          logger.warn('replay_stopped_lost_leadership', undefined, {
+            event: 'replay_stopped_lost_leadership',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            offset,
+          });
+          break;
+        }
+
         // Budget guard: abort if the wall-clock limit has been exceeded.
         if (this.replayBudgetMs > 0) {
           const elapsed = Date.now() - replayStart;
@@ -370,12 +508,39 @@ export class IndexerService {
         }
 
         // Acquire a fresh connection for this batch.
-        const batchResult = await this.processBatch(
-          cursor.id,
-          request,
-          offset,
-          batchIndex,
-        );
+        //
+        // RED instrumentation wraps *only* this call so the histogram measures
+        // the batch processing step itself (fetch → insert → cursor advance →
+        // COMMIT) and nothing else. The loop guards above are control flow, not
+        // work, and deliberately stay outside the measurement.
+        const batchStartedAt = process.hrtime.bigint();
+        let batchResult: { rowsFetched: number };
+        try {
+          batchResult = await this.processBatch(
+            cursor.id,
+            request,
+            offset,
+            batchIndex,
+          );
+        } catch (batchError) {
+          const classification = recordIndexerBatchFailure(
+            request.contract_id,
+            elapsedSecondsSince(batchStartedAt),
+            batchError,
+          );
+          logger.warn('replay_batch_failed', undefined, {
+            event: 'replay_batch_failed',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            batch_index: batchIndex,
+            offset,
+            error_source: classification.source,
+            error_type: classification.type,
+          });
+          throw batchError;
+        }
+        recordIndexerBatchSuccess(request.contract_id, elapsedSecondsSince(batchStartedAt));
 
         if (batchResult.rowsFetched === 0) {
           // Source exhausted ahead of totalRows count — safe to stop.
@@ -439,12 +604,23 @@ export class IndexerService {
         total_rows: totalRows,
         duration_sec: Math.round(durationSec * 100) / 100,
       });
+
+      // ── Post-replay integrity check (fire-and-forget) ────────────────────
+      // Scoped to the affected ledger range — never a full-table scan.
+      // Runs asynchronously so the response path is never blocked.
+      this.runPostReplayIntegrityCheck(request).catch((err) => {
+        logger.warn('post_replay_integrity_check_failed', undefined, {
+          event: 'post_replay_integrity_check_failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     } catch (error) {
       replayState.endReplay();
       indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);
       throw error;
     } finally {
       replayLock.release();
+      await leaderElection.release();
     }
   }
 
@@ -598,6 +774,26 @@ export class IndexerService {
   }
 
   /**
+   * Run the post-replay ledger-sequence integrity check in a fire-and-forget
+   * manner.  This method is called inside the main `try` block of
+   * `replayEvents` after the cursor has been marked complete, so it runs
+   * outside any in-flight batch transaction.
+   *
+   * The check is scoped to a window around the replayed ledger (not using
+   * `from_block`/`to_block`, which are block-height filters on the source
+   * table).  A window of ±1000 ledgers ensures the check is efficient without
+   * being a full-table scan.  It NEVER throws — all errors are caught and
+   * logged internally.
+   */
+  private async runPostReplayIntegrityCheck(request: ReplayRequest): Promise<void> {
+    const INTEGRITY_WINDOW_SIZE = 1000;
+    const fromLedger = Math.max(0, request.ledger - INTEGRITY_WINDOW_SIZE);
+    const toLedger = request.ledger + INTEGRITY_WINDOW_SIZE;
+
+    await checkReplayIntegrity(this.pool, request.contract_id, fromLedger, toLedger);
+  }
+
+  /**
    * Validate replay request parameters.
    *
    * All validation runs before any database access — bad parameters are
@@ -672,8 +868,9 @@ export class IndexerService {
       params.push(request.to_block);
     }
 
-    const result = await client.query<{ count: string }>(query, params);
-    return parseInt(result.rows[0]?.count ?? '0', 10);
+    const result = await client.query<Record<string, unknown>>(query, params);
+    const first = result.rows[0];
+    return parseInt(String(first?.['count'] ?? '0'), 10);
   }
 
   /**
@@ -713,8 +910,8 @@ export class IndexerService {
     query += ` ORDER BY block_height ASC, event_id ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
 
-    const result = await client.query<ContractEvent>(query, params);
-    return result.rows;
+    const result = await client.query<Record<string, unknown>>(query, params);
+    return result.rows.map(rowToContractEvent);
   }
 
   /**
@@ -772,9 +969,20 @@ export class IndexerService {
    * This facilitates automatic crash recovery when the server restarts.
    */
   async resumeIncompleteReplay(): Promise<void> {
+    // Only the leader replica auto-resumes on startup — otherwise every
+    // replica in a multi-instance deployment would race to resume the same
+    // incomplete replay. replayEvents() re-confirms leadership itself
+    // (idempotently, see leaderElection.ts) once an incomplete run is found.
+    if (!(await this.getLeaderElection().tryAcquire())) {
+      logger.info('Skipping incomplete-replay resume: not the indexer leader', undefined, {
+        event: 'replay_resume_skipped_not_leader',
+      });
+      return;
+    }
+
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.last_committed_cursor, c.contract_id, c.ledger, c.from_block, c.to_block
           FROM indexer_replay_progress p
           JOIN replay_cursors c ON p.last_committed_cursor = c.id
@@ -790,28 +998,31 @@ export class IndexerService {
 
       const row = result.rows[0];
       const request: ReplayRequest = {
-        contract_id: row.contract_id,
-        ledger: row.ledger,
-        from_block: row.from_block ?? undefined,
-        to_block: row.to_block ?? undefined,
+        contract_id: row['contract_id'] as string,
+        ledger: Number(row['ledger']),
+        from_block: row['from_block'] != null ? Number(row['from_block']) : undefined,
+        to_block: row['to_block'] != null ? Number(row['to_block']) : undefined,
       };
 
       logger.info('Resuming incomplete replay from checkpoint', undefined, {
         event: 'replay_resume_startup',
         contract_id: request.contract_id,
         ledger: request.ledger,
-        cursor_id: row.last_committed_cursor,
+        cursor_id: row['last_committed_cursor'] as string,
       });
 
       // Start the replay asynchronously so we do not block startup.
       this.replayEvents(request).catch((err) => {
-        logger.error('Resumed replay failed', err, {
+        logger.error('Resumed replay failed', undefined, {
           contract_id: request.contract_id,
           ledger: request.ledger,
+          error: err instanceof Error ? err.message : String(err),
         });
       });
     } catch (err) {
-      logger.error('Failed to check for incomplete replays on startup', err as Error);
+      logger.error('Failed to check for incomplete replays on startup', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }
@@ -831,7 +1042,7 @@ export class IndexerService {
 
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.status, p.total, p.started_at, p.updated_at,
                c.contract_id, c.ledger, c.id as cursor_id, c.last_committed_offset
           FROM indexer_replay_progress p
@@ -841,22 +1052,26 @@ export class IndexerService {
       `);
       if (result.rows.length > 0) {
         const row = result.rows[0];
+        const lastCommittedOffset = Number(row['last_committed_offset']);
+        const total = Number(row['total']);
         return {
-          isReplaying: row.status === 'in-progress',
-          rowsReplayed: row.last_committed_offset,
-          rowsRemaining: Math.max(0, row.total - row.last_committed_offset),
-          totalRows: row.total,
+          isReplaying: row['status'] === 'in-progress',
+          rowsReplayed: lastCommittedOffset,
+          rowsRemaining: Math.max(0, total - lastCommittedOffset),
+          totalRows: total,
           estimatedCompletion: null,
-          startedAt: row.started_at,
-          contractId: row.contract_id,
-          ledger: row.ledger,
-          replayCursorId: row.cursor_id,
-          currentOffset: row.last_committed_offset,
-          status: row.status,
+          startedAt: row['started_at'] != null ? asDate(row['started_at']) : null,
+          contractId: row['contract_id'] as string,
+          ledger: Number(row['ledger']),
+          replayCursorId: row['cursor_id'] as string,
+          currentOffset: lastCommittedOffset,
+          status: row['status'] as string,
         };
       }
     } catch (err) {
-      logger.error('Failed to fetch replay progress from database', err as Error);
+      logger.error('Failed to fetch replay progress from database', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }
@@ -914,6 +1129,12 @@ type IndexerState = {
   lastSafeLedger: number;
   reorgDetected: boolean;
   reorgHeight?: number;
+  // Catch-up telemetry state
+  lastIndexedLedger: number;
+  ledgerLag: number;
+  catchupEtaSeconds: number | null;
+  ledgerThroughputSamples: number[]; // Rolling window of ledgers/second samples
+  lastLedgerLagUpdateAt: number | null;
 };
 
 const rolledBackLedgers = new Set<number>();
@@ -1023,6 +1244,12 @@ export class IndexerIngestionService {
       duplicateEventCount: 0,
       lastSafeLedger: 0,
       reorgDetected: false,
+      // Catch-up telemetry initialization
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     };
   }
 
@@ -1051,6 +1278,12 @@ export class IndexerIngestionService {
       lastSafeLedger: 0,
       reorgDetected: false,
       reorgHeight: undefined,
+      // Reset catch-up telemetry state
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     });
     rolledBackLedgers.clear();
   }
@@ -1068,6 +1301,105 @@ export class IndexerIngestionService {
       lastSafeLedger: this.state.lastSafeLedger,
       reorgDetected: this.state.reorgDetected,
     };
+  }
+
+  /**
+   * Get catch-up telemetry including ledger lag and ETA.
+   * This provides visibility into how far behind the indexer is and
+   * estimated time to catch up when lagging.
+   */
+  getCatchupTelemetry(): {
+    ledgerLag: number;
+    catchupEtaSeconds: number | null;
+    lastIndexedLedger: number;
+    lastLedgerLagUpdateAt: string | null;
+  } {
+    return {
+      ledgerLag: this.state.ledgerLag,
+      catchupEtaSeconds: this.state.catchupEtaSeconds,
+      lastIndexedLedger: this.state.lastIndexedLedger,
+      lastLedgerLagUpdateAt: this.state.lastLedgerLagUpdateAt
+        ? new Date(this.state.lastLedgerLagUpdateAt).toISOString()
+        : null,
+    };
+  }
+
+  /**
+   * Compute ledger lag and ETA using the Stellar RPC tip.
+   * This should be called periodically (e.g., on each successful ingest)
+   * to update catch-up telemetry without making redundant RPC calls.
+   *
+   * Uses a rolling average of ledger throughput samples to estimate ETA,
+   * avoiding naive linear extrapolation from a single sample.
+   */
+  private async updateCatchupTelemetry(maxLedger: number): Promise<void> {
+    try {
+      const rpcService = getStellarRpcService();
+      const tip = await rpcService.getLatestLedger();
+      const tipLedger = tip.sequence;
+
+      // Store previous values before updating
+      const previousLedger = this.state.lastIndexedLedger;
+      const previousUpdateTime = this.state.lastLedgerLagUpdateAt;
+
+      // Compute ledger lag (tip - last indexed)
+      const lag = Math.max(0, tipLedger - maxLedger);
+      this.state.ledgerLag = lag;
+      this.state.lastIndexedLedger = maxLedger;
+      const now = Date.now();
+      this.state.lastLedgerLagUpdateAt = now;
+
+      // Update Prometheus gauge
+      indexerLedgerLag.set(lag);
+
+      // Compute ETA if lagging and we have throughput data
+      if (lag > 0) {
+        // Calculate throughput if we have previous data
+        if (previousUpdateTime && previousLedger > 0) {
+          const timeSinceLastUpdate = (now - previousUpdateTime) / 1000; // seconds
+          
+          if (timeSinceLastUpdate > 0) {
+            const ledgersProcessed = maxLedger - previousLedger;
+            const throughput = ledgersProcessed / timeSinceLastUpdate; // ledgers/second
+
+            // Maintain rolling window of last 10 samples
+            this.state.ledgerThroughputSamples.push(throughput);
+            if (this.state.ledgerThroughputSamples.length > 10) {
+              this.state.ledgerThroughputSamples.shift();
+            }
+
+            // Compute average throughput from samples
+            const avgThroughput =
+              this.state.ledgerThroughputSamples.reduce((sum, sample) => sum + sample, 0) /
+              this.state.ledgerThroughputSamples.length;
+
+            // Estimate ETA using average throughput
+            if (avgThroughput > 0) {
+              const etaSeconds = lag / avgThroughput;
+              this.state.catchupEtaSeconds = etaSeconds;
+              indexerCatchupEtaSeconds.set(etaSeconds);
+            } else {
+              this.state.catchupEtaSeconds = null;
+              indexerCatchupEtaSeconds.set(0);
+            }
+          }
+        } else {
+          // Not enough data for ETA estimation yet
+          this.state.catchupEtaSeconds = null;
+          indexerCatchupEtaSeconds.set(0);
+        }
+      } else {
+        // Caught up - reset ETA
+        this.state.catchupEtaSeconds = null;
+        indexerCatchupEtaSeconds.set(0);
+      }
+    } catch (err) {
+      // If RPC fails, we can't compute lag - log but don't fail the ingest
+      warn('Failed to update catch-up telemetry (RPC error)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Don't update telemetry on RPC failure - keep last known values
+    }
   }
 
   private enforceRateLimit(actor: string): void {
@@ -1137,6 +1469,22 @@ export class IndexerIngestionService {
       debug('Indexer contract event ids processed', {
         requestId: context.requestId, insertedEventIds: result.insertedEventIds, duplicateEventIds: result.duplicateEventIds,
       });
+
+      if (result.insertedEventIds.length > 0) {
+        indexerEventsIngestedTotal.inc(result.insertedEventIds.length);
+
+        const latestHappenedAtMs = events.reduce((max, event) => {
+          const happenedAtMs = Date.parse(event.happenedAt);
+          return Number.isFinite(happenedAtMs) && happenedAtMs > max ? happenedAtMs : max;
+        }, 0);
+        if (latestHappenedAtMs > 0) {
+          indexerLagSeconds.set(Math.max(0, (Date.now() - latestHappenedAtMs) / 1000));
+        }
+
+        // Update catch-up telemetry (ledger lag and ETA)
+        // This uses the same Stellar RPC tip-fetching path to avoid redundant calls
+        await this.updateCatchupTelemetry(maxLedger);
+      }
 
       return {
         insertedCount: result.insertedEventIds.length,

@@ -41,7 +41,7 @@ export function requireJsonContentType(
     return;
   }
 
-  const requestId = req.id ?? (res.locals['requestId'] as string | undefined);
+  const requestId = req.correlationId ?? (res.locals['requestId'] as string | undefined);
   res.status(415).json(
     errorResponse(
       'UNSUPPORTED_MEDIA_TYPE',

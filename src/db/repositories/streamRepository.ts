@@ -22,6 +22,10 @@
  *   logged or included in error messages.  Key rotation is supported via an
  *   optional PGCRYPTO_KEY_PREVIOUS.
  *
+ * Typed row mapping:
+ *   Never pass a bare domain interface to `query<T>()`. Query with
+ *   `Record<string, unknown>` and map through `rowToRecord()` (see README.md).
+ *
  * @module db/repositories/streamRepository
  */
 
@@ -107,6 +111,19 @@ function resolvePgcryptoKeys(): { current: string; previous?: string } {
     throw new Error('PGCRYPTO_KEY is required to encrypt and decrypt stream PII');
   }
   return { current: config.pgcryptoKey, previous: config.pgcryptoKeyPrevious };
+}
+
+/**
+ * Error thrown when a concurrent UPDATE changed the stream's status between
+ * the validation read and the conditional UPDATE, indicating a lost race.
+ *
+ * Route handlers should catch this and surface it as HTTP 409 CONFLICT.
+ */
+export class StatusConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StatusConflictError';
+  }
 }
 
 function isValidStatusTransition(from: StreamStatus, to: StreamStatus): boolean {
@@ -205,7 +222,7 @@ export const streamRepository = {
     enrichActiveSpanWithStream(id);
     return timed('updateStream', async () => {
       const pool = getPool();
-      const current = await this.getById(id);
+      const current = await this.getById(id, { forcePrimary: true });
       if (!current) throw new Error(`Stream not found: ${id}`);
       enrichActiveSpanWithStream(current.id, current.sender_address, current.recipient_address);
       if (input.status && !isValidStatusTransition(current.status, input.status)) {
@@ -221,6 +238,12 @@ export const streamRepository = {
       if (input.end_time !== undefined) { setClauses.push(`end_time = $${idx++}`); values.push(input.end_time); }
       values.push(id);
 
+      // Compare-and-swap guard: bind the validated current.status so the
+      // UPDATE only succeeds if the status hasn't changed since we read it.
+      // This prevents the check-then-act race documented in issue #842.
+      const statusParamIdx = values.length + 1;
+      values.push(current.status);
+
       const keySet = resolvePgcryptoKeys();
       const keyIndex = values.length + 1;
       const previousKeyIndex = keySet.previous ? keyIndex + 1 : undefined;
@@ -229,9 +252,22 @@ export const streamRepository = {
         values.push(keySet.previous);
       }
 
-      const sql = `UPDATE streams SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING ${streamSelectColumns(keyIndex, previousKeyIndex)}`;
+      const sql = `UPDATE streams SET ${setClauses.join(', ')} WHERE id = $${idx} AND status = $${statusParamIdx} RETURNING ${streamSelectColumns(keyIndex, previousKeyIndex)}`;
       const result = await query<Record<string, unknown>>(pool, sql, values);
-      if (result.rows.length === 0) throw new Error(`Stream not found after update: ${id}`);
+      if (result.rows.length === 0) {
+        // Distinguish "stream deleted" from "status changed concurrently"
+        const exists = await query<{ exists: boolean }>(
+          pool,
+          'SELECT EXISTS(SELECT 1 FROM streams WHERE id = $1)',
+          [id],
+        );
+        if (!exists.rows[0]?.exists) {
+          throw new Error(`Stream not found after update: ${id}`);
+        }
+        throw new StatusConflictError(
+          `Status conflict: stream ${id} status changed concurrently from '${current.status}'. Precondition no longer holds.`,
+        );
+      }
       info('Stream updated', { id, input, correlationId });
       return rowToRecord(result.rows[0]!);
     });
@@ -254,10 +290,10 @@ export const streamRepository = {
    * **Security**: keys are sourced exclusively from {@link resolvePgcryptoKeys}
    * and are never logged or included in error messages.
    */
-  async getById(id: string): Promise<StreamRecord | undefined> {
+  async getById(id: string, options?: { forcePrimary?: boolean }): Promise<StreamRecord | undefined> {
     enrichActiveSpanWithStream(id);
     return timed('getById', async () => {
-      const pool = await getReadPool();
+      const pool = await getReadPool({ forcePrimary: options?.forcePrimary });
       const keySet = resolvePgcryptoKeys();
       const params: unknown[] = [id, keySet.current];
       const previousKeyIndex = keySet.previous ? params.length + 1 : undefined;
@@ -333,19 +369,22 @@ export const streamRepository = {
    * @param afterId       - Exclusive lower bound for keyset pagination.
    * @param includeTotal  - When `true`, a separate COUNT(*) query is executed
    *   and returned as `total`.
+   * @param options       - Optional routing overrides.  Pass `{ forcePrimary: true }`
+   *   to route this read to the primary pool (read-your-writes consistency).
    */
   async findWithCursor(
     filter: StreamFilter,
     limit: number,
     afterId?: string,
     includeTotal?: boolean,
+    options?: { forcePrimary?: boolean },
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
       const effectiveLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
       if (effectiveLimit !== limit) {
         debug('findWithCursor: limit clamped', { requested: limit, effective: effectiveLimit });
       }
-      const pool = await getReadPool();
+      const pool = await getReadPool({ forcePrimary: options?.forcePrimary });
       const keySet = resolvePgcryptoKeys();
       const conditions: string[] = [];
       const params: unknown[] = [];

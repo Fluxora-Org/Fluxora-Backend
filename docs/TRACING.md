@@ -397,38 +397,165 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 ### Non-Goals (Out of Scope for This Issue)
 
 1. **Real-time streaming to external backends** — OpenTelemetry integration is provided, but external backend setup is operator responsibility
-2. **Automatic span propagation across services** — Correlation ID is used locally; W3C traceparent headers not implemented in this version
-3. **Request sampling at middleware level** — Sampling is implemented at tracer invocation level; per-route sampling is deferred
-4. **Distributed context baggage** — Span context is request-scoped; cross-request baggage (e.g., tenant ID) is not carried
-5. **Span filtering/mutation** — All events matching a name are recorded; filtering to reduce overhead is operator responsibility
-6. **PII classification** — Operators must avoid logging sensitive fields in attributes; no automatic PII detection
+2. **Request sampling at middleware level** — Sampling is implemented at tracer invocation level; per-route sampling is deferred
+3. **Distributed context baggage** — Span context is request-scoped; cross-request baggage (e.g., tenant ID) is not carried
+4. **Span filtering/mutation** — All events matching a name are recorded; filtering to reduce overhead is operator responsibility
+5. **PII classification** — Operators must avoid logging sensitive fields in attributes; no automatic PII detection
 
 ### Follow-Up Work (Documented for Future Sprints)
 
-1. **Automatic instrumentation** — Instrument database driver, HTTP client, message queues without explicit calls
-   - Ticket: [Create issue for auto-instrumentation]
-   - Rationale: Reduces boilerplate, improves consistency
+1. ~~**Automatic instrumentation**~~ — **IMPLEMENTED** (issue #941). See the Automatic Instrumentation section below.
 
-2. **W3C Traceparent support** — Implement W3C Trace Context for cross-service propagation
-   - Ticket: [Create issue for W3C traceparent]
-   - Rationale: Enables end-to-end tracing across Fluxora services and external APIs
-   - Depends on: OpenTelemetry integration validation
+2. ~~**W3C Traceparent support**~~ — **IMPLEMENTED** (issue #756). See the W3C Trace Context section below.
 
 3. **Sampling strategies** — Implement head-based sampling (consistent trace decision), tail-based sampling, and per-route overrides
-   - Ticket: [Create issue for advanced sampling]
    - Rationale: Reduce volume of traces in production while capturing interesting requests
 
-4. **Span export batch optimization** — Batch spans for more efficient export to backends
-   - Ticket: [Create issue for batch export]
-   - Rationale: Reduce network calls and improve throughput to external collectors
+4. ~~**Span export batch optimization**~~ — **IMPLEMENTED** (issue #758). See the Span Export Batching section below.
 
 5. **Metrics dashboard** — Create Grafana/CloudWatch dashboard for span metrics
-   - Ticket: [Create issue for metrics dashboard]
    - Rationale: Operational visibility without log parsing
 
 6. **Trace query API** — Add `/admin/traces` endpoint for operators to query spans
-   - Ticket: [Create issue for trace query API]
    - Rationale: Avoid log parsing for debugging; real-time query capability
+
+---
+
+## Automatic Instrumentation (issue #941)
+
+Fluxora registers `PgInstrumentation` and `HttpInstrumentation` (along with
+`ExpressInstrumentation` and `IORedisInstrumentation`) with the `NodeSDK`
+at startup so that every `pg.Pool.query` / `pg.Client.query` call and every
+outbound HTTP request automatically produces a child span — no manual
+`traceSpan()` wrapper required.
+
+### What is auto-instrumented
+
+| Library | Instrumentation class | Spans produced |
+|---------|-----------------------|----------------|
+| `pg` (Pool/Client) | `PgInstrumentation` | `pg.query` with `db.statement`, `db.parameters` attributes |
+| `http` / `https` | `HttpInstrumentation` | `HTTP <method>` for outbound requests; inbound server spans (suppressed for `/health` and `/metrics`) |
+| Express | `ExpressInstrumentation` | Route-handler and middleware spans |
+| ioredis | `IORedisInstrumentation` | `redis.<command>` spans |
+
+### Relationship with manual `traceSpan()`
+
+The manual `traceSpan()` helper (used in `src/db/pool.ts`, etc.) and the
+auto-instrumentation do **not** conflict. Auto-instrumented spans are
+produced by the OTel SDK patching the `pg` and `http` prototypes at module
+load time; `traceSpan()` creates application-level business spans via the
+hook-based tracer. Both appear in the trace tree — the auto-instrumented
+span is a child of the request span, and the manual span is a sibling.
+
+### Disabling auto-instrumentation
+
+Set `OTEL_SDK_DISABLED=true` to skip the entire OTel SDK (including all
+auto-instrumentation). There is currently no granular toggle to disable
+individual instrumentations.
+
+### Code references
+
+- SDK bootstrap: [`src/tracing/index.ts`](../src/tracing/index.ts) (`instrumentations` array)
+- Tests: [`tests/tracing/autoInstrumentation.test.ts`](../tests/tracing/autoInstrumentation.test.ts)
+
+---
+
+## W3C Trace Context Propagation (issue #756)
+
+Fluxora now implements [W3C Trace Context Level 1](https://www.w3.org/TR/trace-context/)
+for distributed tracing across service boundaries. This enables continuous traces
+from upstream callers through Fluxora to Stellar RPC and webhook consumers.
+
+### Overview
+
+```
+upstream caller
+    │  traceparent: 00-<traceId>-<parentId>-01
+    ▼
+tracingMiddleware (src/tracing/middleware.ts)
+    │  parses traceparent, adopts upstream traceId
+    │  stores TraceparentFields in AsyncLocalStorage
+    ▼
+route handler / business logic
+    │
+    ├─► StellarRpcService.accountExists (Horizon fetch)
+    │       outbound traceparent: 00-<traceId>-<parentId>-01
+    │
+    └─► WebhookDispatcher.sendRequest / dispatchWebhook
+            outbound traceparent: 00-<traceId>-<parentId>-01
+```
+
+### Inbound Parsing (src/tracing/middleware.ts)
+
+The `tracingMiddleware` reads the `traceparent` HTTP header on every inbound
+request and validates it with `parseTraceparent()`:
+
+- **Valid header** → upstream `traceId` is used as the span's `traceId`, upstream
+  `parentId` is stored as `parentSpanId`, and the `TraceparentFields` object is
+  placed in `traceContextStore` (an `AsyncLocalStorage`) for outbound propagation.
+- **Invalid / missing header** → existing behaviour is preserved: the local
+  correlation ID (`x-correlation-id`) is used as the `traceId` and
+  `traceContextStore` stores `null`.
+
+**Security hardening on `parseTraceparent()`:**
+
+| Check | What it prevents |
+|-------|-----------------|
+| Length cap (200 chars) before regex | ReDoS on pathological inputs |
+| Anchored regex (`^…$`) | Partial / prefix matching |
+| Reserved version `ff` rejected | Forward-compat guard per spec |
+| All-zero `traceId` rejected | Invalid per spec §2.2.4 |
+| All-zero `parentId` rejected | Invalid per spec §2.2.5 |
+| Lower-cased before comparison | Case-insensitive, canonical output |
+
+### Outbound Propagation
+
+#### Stellar RPC (src/services/stellar-rpc.ts)
+
+`StellarRpcService.accountExists()` calls `getActiveTraceContext()` before
+each Horizon HTTP fetch. When a non-null context is available, `buildTraceparent()`
+constructs the header and it is added to the request:
+
+```
+traceparent: 00-<upstream-traceId>-<upstream-parentId>-<flags>
+```
+
+No header is added when `getActiveTraceContext()` returns `null` (no upstream trace).
+
+#### Webhook Dispatcher (src/webhooks/dispatcher.ts)
+
+Both `WebhookDispatcher.sendRequest()` (class-based) and `dispatchWebhook()`
+(convenience function) call `getActiveTraceContext()` and attach a `traceparent`
+header when a trace context is present. Correlation ID propagation via
+`x-correlation-id` is unchanged.
+
+### API
+
+```typescript
+// Parse an inbound traceparent header (returns null on any invalid input)
+import { parseTraceparent } from './src/tracing/middleware.js';
+const fields = parseTraceparent(req.headers['traceparent']);
+// → { version, traceId, parentId, flags, sampled } | null
+
+// Build an outbound traceparent header
+import { buildTraceparent } from './src/tracing/middleware.js';
+const header = buildTraceparent(traceId, parentId, sampled);
+// → "00-<traceId>-<parentId>-01"
+
+// Read the active trace context (works anywhere in the async call chain)
+import { getActiveTraceContext } from './src/tracing/middleware.js';
+const ctx = getActiveTraceContext();
+// → TraceparentFields | null
+```
+
+### Backward Compatibility
+
+- Clients that do not send `traceparent` continue to work exactly as before.
+- The correlation-ID header (`x-correlation-id`) continues to function.
+- When both are present, `traceparent` takes precedence for trace continuity;
+  the correlation ID is still propagated independently.
+- No new required environment variables; the feature works automatically once
+  `tracingMiddleware` is in the middleware stack.
 
 ## Configuration Reference
 
@@ -438,7 +565,7 @@ TRACING_ENABLED=true pnpm test -- --benchmark
 |----------|------|---------|-------------|
 | `TRACING_ENABLED` | boolean | `false` | Enable distributed tracing |
 | `TRACING_SAMPLE_RATE` | float (0.0-1.0) | `1.0` | Fraction of requests to trace (100% if enabled) |
-| `TRACING_OTEL_ENABLED` | boolean | `false` | Enable OpenTelemetry export |
+| `TRACING_OTEL_ENABLED` | boolean | `false` | Enable OpenTelemetry export **and** the logs bridge |
 | `TRACING_LOG_EVENTS` | boolean | `false` | Log span events to stdout/stderr |
 
 ### Code Configuration
@@ -478,6 +605,7 @@ app.use(tracingMiddleware({
 - Tracer core: [src/tracing/hooks.ts](../src/tracing/hooks.ts)
 - Middleware integration: [src/tracing/middleware.ts](../src/tracing/middleware.ts)
 - Built-in hooks: [src/tracing/builtin.ts](../src/tracing/builtin.ts)
+- **Logs bridge**: [src/tracing/logsBridge.ts](../src/tracing/logsBridge.ts)
 - Tests: [tests/tracing/](../tests/tracing/)
 
 ---
@@ -594,3 +722,316 @@ const result = await traceSpan(
 
 The helper starts a span, runs the async function, ends the span `ok` on
 success or `error` on throw, and always re-throws the original error.
+
+
+---
+
+## Sampling Strategies
+
+Fluxora supports four trace sampling strategies to control observability cost
+and signal-to-noise ratio in production:
+
+1. **Head-based sampling** (recommended for production)
+2. **Tail-based sampling** (error-focused)
+3. **Always** (useful for development / debugging)
+4. **Never** (useful for benchmarking overhead)
+
+### Head-based sampling (default)
+
+The sampling decision is made **at trace creation time** using a deterministic
+FNV-1a hash of the trace ID. Because the decision is derived from the trace ID
+itself, all services/replicas that see the same trace ID make the same
+keep-or-drop decision, guaranteeing that you never get partial traces.
+
+**Algorithm:**
+```
+bucket = FNV-1a32(traceId) % 1000
+keep   = bucket < round(sampleRate * 1000)
+```
+
+**Properties:**
+- Pure function: same trace ID → same decision, always, on every replica.
+- No shared state required.
+- Uniform distribution: 50% sample rate yields ~50% of traces kept.
+
+**Configuration:**
+
+| Env Var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `TRACING_SAMPLING_STRATEGY` | `'head'` | `'head'` | Enable head-based sampling |
+| `TRACING_HEAD_SAMPLE_RATE` | float 0–1 | value of `TRACING_SAMPLE_RATE` | Fraction of traces to keep |
+| `TRACING_PER_ROUTE_OVERRIDES` | JSON string | unset | Route-specific sample rates (see below) |
+
+**Example:**
+```bash
+export TRACING_SAMPLING_STRATEGY=head
+export TRACING_HEAD_SAMPLE_RATE=0.1       # keep 10% of traces globally
+export TRACING_PER_ROUTE_OVERRIDES='{ "/health": 0, "/api/streams": 1 }'
+# Health checks: never sampled (0%)
+# Stream API: always sampled (100%)
+# Everything else: 10%
+```
+
+### Per-route overrides
+
+When using head-based sampling, individual API routes can have their own
+sample rates configured via `TRACING_PER_ROUTE_OVERRIDES`:
+
+```json
+{
+  "/health": 0,
+  "/metrics": 0,
+  "/api/streams": 1,
+  "/api": 0.25
+}
+```
+
+**Lookup rules:**
+1. Exact match checked first (`/api/streams` matches `/api/streams` exactly).
+2. Longest prefix match (`/api/streams/abc` matches `/api/streams` with rate 1.0, not `/api` with 0.25).
+3. If no match, use global `TRACING_HEAD_SAMPLE_RATE`.
+
+### Tail-based sampling
+
+The decision is made **at span-end time** based on the span's outcome. Error
+spans (status `'error'` or events named `'error'`) are always kept when
+`TRACING_TAIL_KEEP_ERRORS=true`, without requiring full in-memory buffering.
+
+**Configuration:**
+
+| Env Var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `TRACING_SAMPLING_STRATEGY` | `'tail'` | `'head'` | Enable tail-based sampling |
+| `TRACING_HEAD_SAMPLE_RATE` | float 0–1 | 1.0 | Sample rate for non-error spans |
+| `TRACING_TAIL_KEEP_ERRORS` | boolean | `true` | Always keep spans with errors |
+
+**Example:**
+```bash
+export TRACING_SAMPLING_STRATEGY=tail
+export TRACING_HEAD_SAMPLE_RATE=0.01      # 1% of healthy traffic
+export TRACING_TAIL_KEEP_ERRORS=true      # but 100% of errors
+```
+
+**Use case:** Debugging production incidents. You capture every error trace
+while sampling only a small fraction of healthy traffic to keep costs low.
+
+**Limitation:** Unlike head-based sampling, tail sampling does NOT guarantee
+full cross-service trace consistency — if service A drops a trace and service B
+keeps it (due to an error), you may see partial traces. For this reason,
+head-based sampling is recommended for production.
+
+### Always / Never
+
+**Always** (`TRACING_SAMPLING_STRATEGY=always`):
+- Keeps every span.
+- Useful for local development and debugging specific issues.
+- **Not recommended for production** — high cost, high cardinality.
+
+**Never** (`TRACING_SAMPLING_STRATEGY=never`):
+- Drops every span.
+- Useful for benchmarking the overhead of the tracing instrumentation itself.
+
+---
+
+## Implementation Notes
+
+### Determinism
+
+Head-based sampling uses a pure FNV-1a 32-bit hash function:
+- Offset basis: `2166136261`
+- Prime: `16777619`
+- No external dependencies; implemented in `src/tracing/hooks.ts`.
+
+The same trace ID produces the same bucket on every call, on every replica,
+with no clock drift, no shared state, and no race conditions.
+
+### Migration from flat `TRACING_SAMPLE_RATE`
+
+The legacy `TRACING_SAMPLE_RATE` env var (flat probability applied per span)
+is still respected for backward compatibility:
+- When `TRACING_SAMPLING_STRATEGY` is unset or `'head'`, and
+  `TRACING_HEAD_SAMPLE_RATE` is also unset, the global rate defaults to
+  `TRACING_SAMPLE_RATE`.
+- This preserves existing behavior: old configs continue to work without changes.
+
+### Testing
+
+See `tests/tracing/sampling.test.ts` for comprehensive coverage:
+- `shouldSampleHead` determinism and distribution (50% rate → 35%–65% kept)
+- `shouldSampleTail` error retention and random sampling
+- `resolvePerRouteOverride` exact match, prefix match, fallback
+- `getSamplingConfig` env var parsing for all strategies
+
+---
+
+## OpenTelemetry Logs Bridge (issue #942)
+
+Fluxora now includes a **logs bridge** (`src/tracing/logsBridge.ts`) that
+forwards every entry written by the structured logger (`src/lib/logger.ts`)
+to the [OpenTelemetry Logs API](https://opentelemetry.io/docs/specs/otel/logs/)
+as a `LogRecord`, enabling full log-trace correlation in backends such as
+Datadog and Elastic.
+
+### Design: Additive, not a replacement
+
+The bridge is strictly **additive**.
+
+- The existing `process.stdout` / `process.stderr` JSON output is completely
+  unchanged. Every log line still lands in the console, the shipping agent, or
+  whatever file sink is configured.
+- The OTel emission is an extra side-effect, active only when
+  `TRACING_OTEL_ENABLED=true` and `initLogsBridge({ enabled: true })` has been
+  called (typically right after `startTracing()`).
+- When the bridge is disabled, `forwardToOtel()` returns immediately without
+  allocating any objects — zero overhead on the hot path.
+
+### How log entries become OTel LogRecords
+
+Each call to the internal `write()` function in `src/lib/logger.ts` now ends
+with a call to `forwardToOtel()` after the primary write. `forwardToOtel`:
+
+1. **Guards** — returns early if bridge is disabled.
+2. **Double-sanitizes** — runs `redactKeysInString` on the message body and
+   `sanitize()` on the metadata again (defence-in-depth; the logger already
+   sanitized them once before passing them in).
+3. **Flattens meta** — each primitive meta field becomes a LogRecord attribute.
+   Nested objects and arrays are JSON-stringified.
+4. **Redacts Stellar keys in string attributes** — `redactKeysInString` is
+   applied to every string attribute value, catching keys embedded in
+   free-form text that field-name based redaction would miss.
+5. **Correlates with the active OTel span** — if a W3C OTel span is active in
+   the current async context, its `traceId` and `spanId` are attached as
+   `trace.id` / `span.id` attributes so log-trace join queries work out of the box.
+6. **Emits** — calls `logs.getLogger('fluxora-backend/logs-bridge').emit(record)`.
+7. **Swallows errors** — any exception from the OTel SDK is silently caught; a
+   broken exporter or misconfigured collector can never affect application behavior.
+
+### Severity mapping
+
+| Fluxora level | OTel SeverityNumber | OTel SeverityText |
+|---------------|--------------------|--------------------|
+| `debug`       | 5 (`DEBUG`)        | `DEBUG`            |
+| `info`        | 9 (`INFO`)         | `INFO`             |
+| `warn`        | 13 (`WARN`)        | `WARN`             |
+| `error`       | 17 (`ERROR`)       | `ERROR`            |
+
+### LogRecord attributes
+
+| Attribute key   | Source                                 |
+|-----------------|----------------------------------------|
+| `correlation.id`| `correlationId` from the log call      |
+| `trace.id`      | `spanContext().traceId` (active span)  |
+| `span.id`       | `spanContext().spanId` (active span)   |
+| `<meta key>`    | Every primitive field in `meta`        |
+
+### Enabling the bridge
+
+```bash
+# Both flags must be enabled:
+export TRACING_OTEL_ENABLED=true   # gates the forwardToOtel() call
+export OTEL_SERVICE_NAME=fluxora-backend
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318  # or your collector URL
+```
+
+In application startup code (after `startTracing()`):
+
+```typescript
+import { startTracing } from './tracing/index.js';
+import { initLogsBridge } from './tracing/logsBridge.js';
+import { getConfig } from './config/env.js';
+
+const config = getConfig();
+startTracing();
+initLogsBridge({ enabled: config.tracingOtelEnabled });
+```
+
+### PII guarantees
+
+The bridge applies the same two-layer PII pipeline as the structured logger:
+
+1. **Field-name redaction** (`sanitize()`) — any key from `src/pii/policy.ts`
+   (e.g. `password`, `token`, `authToken`, `secret`, Stellar address fields)
+   is replaced with `[REDACTED]` before the value ever reaches the OTel SDK.
+2. **Stellar key masking** (`redactKeysInString()`) — any string value (message
+   body or attribute value) that contains a `G…` 56-char Stellar public key
+   has those keys partially masked (`GAAZ..WN7`). This catches keys embedded
+   in free-form log messages that field-level redaction cannot detect.
+
+No PII should ever reach a downstream OTel collector via the bridge.
+
+### Integration with Datadog and Elastic
+
+When the OTel Collector is configured to forward logs to Datadog or
+Elasticsearch, the `trace.id` and `span.id` attributes on each LogRecord are
+automatically mapped to the backend's trace correlation fields:
+
+- **Datadog**: `trace.id` → `dd.trace_id`, `span.id` → `dd.span_id`
+  (via the Datadog OTel exporter mapping). See [`docs/integrations/datadog.md`](integrations/datadog.md).
+- **Elastic APM**: `trace.id` → `trace.id`, `span.id` → `transaction.id`
+  (via the Elastic OTel exporter). See [`docs/integrations/elastic.md`](integrations/elastic.md).
+
+### Security assumptions
+
+| Assumption | Mechanism |
+|---|---|
+| No PII in OTel attributes | Double-sanitize + Stellar key masking |
+| Bridge errors are non-fatal | All SDK calls wrapped in `try/catch` |
+| Bridge inactive by default | `bridgeEnabled = false` until `initLogsBridge({ enabled: true })` |
+| Logs backend credentials never logged | OTLP headers from env only, never written to stdout |
+
+### Code references
+
+- Bridge implementation: [`src/tracing/logsBridge.ts`](../src/tracing/logsBridge.ts)
+- Logger integration: [`src/lib/logger.ts`](../src/lib/logger.ts) (`forwardToOtel` call in `write()`)
+- Tests: [`tests/tracing/logsBridge.test.ts`](../tests/tracing/logsBridge.test.ts)
+
+---
+
+## Span Export Batching (issue #758)
+
+Fluxora implements a bounded, in-memory batch exporter (`BatchSpanExporter` in `src/tracing/hooks.ts`) for finished spans. Instead of making an individual network call to the OTLP collector on every span end, spans are accumulated into a buffer and exported in batches.
+
+### Key Guarantees & Features
+
+- **Non-blocking Execution**: `onSpanEnd` adds completed spans to the in-memory queue synchronously in O(1) time without awaiting HTTP/network I/O.
+- **Size-Threshold & Scheduled Flushing**: Spans are automatically flushed when either:
+  1. The buffered count reaches `maxBatchSize` (default: 512 spans).
+  2. The `scheduledDelayMs` timer (default: 5000 ms) expires.
+- **Bounded Memory & Overflow Fallback**: Queue size is capped at `maxQueueSize` (default: 2048 spans). If the queue becomes full, excess spans fall back to non-blocking direct export without blocking the request execution loop or consuming unbounded process memory.
+- **Graceful Shutdown**: Automatically registered with `addShutdownHook()` in `src/shutdown.ts`. During process shutdown, `stopTracing()` and `flush()` drain all queued spans before process termination, guaranteeing zero span loss on exit.
+- **Failure Resilience**: Errors or network timeouts during export handler execution are caught and recorded in operational metrics (`exportFailures`), never propagating exceptions to application code.
+
+### Configuration Reference
+
+Environment variables controlling batch export behavior:
+
+| Environment Variable | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | integer | `512` | Maximum number of spans in a single export batch |
+| `OTEL_BSP_SCHEDULED_DELAY_MILLIS` | integer | `5000` | Maximum time (ms) to wait before flushing buffered spans |
+| `OTEL_BSP_MAX_QUEUE_SIZE` | integer | `2048` | Maximum capacity of the in-memory span queue |
+
+`TRACING_BATCH_MAX_SIZE`, `TRACING_BATCH_TIMEOUT_MS`, and `TRACING_BATCH_QUEUE_SIZE` are supported as configuration aliases.
+
+### Code API
+
+```typescript
+import { BatchSpanExporter, createBatchSpanExporter } from './src/tracing/hooks.js';
+
+// Create custom batch exporter
+const batchExporter = createBatchSpanExporter({
+  maxBatchSize: 100,
+  scheduledDelayMs: 1000,
+  maxQueueSize: 1000,
+  exportHandler: async (spans) => {
+    await sendToOtlpCollector(spans);
+  },
+});
+
+// Flush all buffered spans manually
+await batchExporter.flush();
+
+// Shut down batch exporter (drains remaining queue)
+await batchExporter.shutdown();
+```
+

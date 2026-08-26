@@ -46,6 +46,16 @@ jobs:
         run: pnpm run lint || echo "Linter not configured"
         continue-on-error: true
 
+      # Drift check: fail CI if sdk/python/ diverges from a fresh generation.
+      # Re-run `pnpm generate:sdk:python` locally and commit the result to fix.
+      - name: SDK drift check (Python)
+        run: node scripts/generate-sdk-python.mjs --check
+
+      # Drift check: fail CI if sdk/typescript/ diverges from openapi.yaml.
+      # Re-run `pnpm generate:sdk:ts` locally and commit the result to fix.
+      - name: SDK drift check (TypeScript)
+        run: node scripts/generate-sdk-ts.mjs --check
+
       # continue-on-error keeps this visible without blocking the pipeline while
       # a large pre-existing backlog (~467 failing tests / 59 files, unrelated
       # to CI restoration) gets triaged in a dedicated follow-up.

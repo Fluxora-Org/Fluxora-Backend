@@ -1,8 +1,8 @@
-# S3 Backup Retention Policy
+# S3 Backup Retention & Restore
 
 ## Overview
 
-This document describes the S3 backup retention lifecycle policy for the Fluxora backend. A three-tier retention strategy is enforced to manage backup storage costs while maintaining sufficient recovery points:
+This document describes the S3 backup retention lifecycle policy and the admin HTTP restore API for the Fluxora backend. A three-tier retention strategy is enforced to manage backup storage costs while maintaining sufficient recovery points:
 
 - **Daily**: 7 days (all daily backups)
 - **Weekly**: 28 days (one backup per week)
@@ -623,3 +623,234 @@ npx ts-node src/scripts/backup-retention.ts
 - [Terraform aws_s3_bucket_lifecycle_configuration](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_lifecycle_configuration)
 - [AWS SDK for JavaScript (v3) S3 Client](https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/)
 - [AWS IAM Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html)
+
+---
+
+## Admin Restore API
+
+Backup restoration is available as an authenticated HTTP API in addition to the CLI script. The API is async — the caller receives a job handle immediately and polls for completion.
+
+### Authentication
+
+All restore endpoints require an `Authorization: Bearer <ADMIN_API_KEY>` header. Requests without valid credentials are rejected:
+
+- Missing header → `401 Unauthorized`
+- Wrong token → `403 Forbidden`
+- `ADMIN_API_KEY` env var unset → `503 Service Unavailable`
+
+The token comparison is timing-safe (uses `crypto.timingSafeEqual`) to prevent side-channel leaks.
+
+### Endpoints
+
+#### `POST /api/admin/restore`
+
+Queues an async restore job. Returns `202 Accepted` immediately; the actual S3 copy runs in the background.
+
+**Request body**
+
+```json
+{
+  "backupId": "backups/db-2026-07-01.sql.gz",
+  "targetEnvironment": "staging",
+  "confirmProduction": false
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `backupId` | string | ✅ | S3 object key to restore. Must be non-empty, ≤ 1 024 chars, must not start with `/`, must not contain `..`. |
+| `targetEnvironment` | `"staging"` \| `"production"` | ❌ | Where to restore the backup. Defaults to `"staging"`. |
+| `confirmProduction` | boolean | ⚠️ | Must be exactly `true` (boolean) when `targetEnvironment` is `"production"`. Deliberate friction to prevent accidental prod restores. |
+
+**Successful response (202)**
+
+```json
+{
+  "success": true,
+  "data": {
+    "message": "Restore job queued.",
+    "job": {
+      "jobId": "clv8r2abc000000example",
+      "backupId": "backups/db-2026-07-01.sql.gz",
+      "status": "queued",
+      "targetEnvironment": "staging",
+      "queuedAt": "2026-07-24T20:00:00.000Z"
+    }
+  },
+  "meta": { "timestamp": "2026-07-24T20:00:00.005Z" }
+}
+```
+
+**Error responses**
+
+| Status | `error.code` | Trigger |
+|--------|--------------|---------|
+| `400` | `VALIDATION_ERROR` | `backupId` missing, empty, starts with `/`, contains `..`, or exceeds 1 024 chars |
+| `400` | `VALIDATION_ERROR` | `targetEnvironment` is not `"staging"` or `"production"` |
+| `400` | `VALIDATION_ERROR` | `targetEnvironment` is `"production"` and `confirmProduction` is not exactly `true` |
+| `401` | — | Missing `Authorization` header |
+| `403` | — | Wrong admin token |
+| `503` | `CONFIGURATION_ERROR` | `S3_BACKUP_BUCKET` env var is unset |
+
+---
+
+#### `GET /api/admin/restore/:jobId`
+
+Polls the current status of a restore job.
+
+**Successful response (200)**
+
+```json
+{
+  "success": true,
+  "data": {
+    "job": {
+      "jobId": "clv8r2abc000000example",
+      "backupId": "backups/db-2026-07-01.sql.gz",
+      "status": "completed",
+      "targetEnvironment": "staging",
+      "queuedAt": "2026-07-24T20:00:00.000Z",
+      "startedAt": "2026-07-24T20:00:00.010Z",
+      "completedAt": "2026-07-24T20:00:01.200Z",
+      "restoredTo": "s3://my-bucket/restored/staging/2026-07-24T20-00-00-000Z-db-2026-07-01.sql.gz"
+    }
+  },
+  "meta": { "timestamp": "2026-07-24T20:00:01.500Z" }
+}
+```
+
+**Job status values**
+
+| Status | Description |
+|--------|-------------|
+| `queued` | Job accepted, not yet started |
+| `running` | S3 copy in progress |
+| `completed` | Object copied successfully; `restoredTo` is populated |
+| `failed` | Copy failed; `errorMessage` explains the cause |
+
+**Error responses**
+
+| Status | `error.code` | Trigger |
+|--------|--------------|---------|
+| `400` | `VALIDATION_ERROR` | `jobId` exceeds 255 characters |
+| `404` | `NOT_FOUND` | No job with the given ID in the current process |
+
+---
+
+#### `GET /api/admin/restore`
+
+Lists all restore jobs known to the current process, newest first.
+
+```json
+{
+  "success": true,
+  "data": {
+    "jobs": [ { "jobId": "...", "status": "completed", ... } ]
+  },
+  "meta": { "timestamp": "..." }
+}
+```
+
+⚠️ **Multi-replica note**: the job store is in-memory and process-local. In deployments with ≥ 2 replicas, each replica returns only its own jobs. Pin polling to the same replica using a sticky session or sticky load-balancer rule, or migrate job state to a shared store (Redis or Postgres).
+
+---
+
+### Job lifecycle and audit trail
+
+Every status transition emits an audit entry in `audit_logs` (via `recordAuditEvent`):
+
+| Transition | Audit action |
+|------------|--------------|
+| Accepted by route | `BACKUP_RESTORE_QUEUED` |
+| Execution started | `BACKUP_RESTORE_STARTED` |
+| S3 copy succeeded | `BACKUP_RESTORE_COMPLETED` |
+| S3 copy failed | `BACKUP_RESTORE_FAILED` |
+
+Each audit entry includes `backupId`, `targetEnvironment`, `jobId` (as `resourceId`), and, where applicable, `restoredTo` or `errorMessage` in `meta`.
+
+#### Transition diagram
+
+```
+POST /api/admin/restore
+         │
+         ▼
+      [queued]   ← BACKUP_RESTORE_QUEUED audit event
+         │
+    setImmediate
+         │
+         ▼
+      [running]  ← BACKUP_RESTORE_STARTED audit event
+         │
+    executeRestore()
+         │
+    ┌────┴────┐
+    ▼         ▼
+[completed] [failed]
+    ↑           ↑
+BACKUP_RESTORE_COMPLETED  BACKUP_RESTORE_FAILED
+```
+
+---
+
+### Security notes
+
+1. **Path traversal prevention** — `backupId` is validated before any S3 call: empty strings, absolute paths (`/`), and keys containing `..` are rejected with `400`.
+2. **Production-restore confirmation gate** — restoring into production requires `confirmProduction: true` (strict boolean). Strings, numbers, or objects are rejected, preventing accidental or automated production restores from misconfigured clients.
+3. **Timing-safe auth** — the admin token comparison uses `crypto.timingSafeEqual` to prevent timing side-channels.
+4. **Fail-closed configuration** — if `ADMIN_API_KEY` or `S3_BACKUP_BUCKET` are unset, the endpoint returns an error rather than proceeding with degraded behaviour.
+5. **No sensitive data in logs** — `errorMessage` from failed S3 operations is included in audit `meta` but is scoped to the job record, not broadcast in HTTP responses to unauthenticated callers.
+
+### Required IAM permissions
+
+The IAM role attached to the service needs the following S3 permissions for restore operations:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:CopyObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::YOUR_BUCKET"
+    }
+  ]
+}
+```
+
+### Example usage
+
+```bash
+# Queue a staging restore
+curl -X POST https://api.example.com/api/admin/restore \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"backupId": "backups/db-2026-07-01.sql.gz"}'
+
+# Poll until completed
+JOB_ID="clv8r2abc000000example"
+curl https://api.example.com/api/admin/restore/$JOB_ID \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
+
+# Production restore (requires explicit confirmation)
+curl -X POST https://api.example.com/api/admin/restore \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "backupId": "backups/db-2026-07-01.sql.gz",
+    "targetEnvironment": "production",
+    "confirmProduction": true
+  }'
+
+# List all recent jobs
+curl https://api.example.com/api/admin/restore \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
+```

@@ -1,6 +1,53 @@
 import { Counter, Histogram, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
+export type StreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+export type WebhookDeliveryOutcome = 'success' | 'failed';
+export type SseConnectionRejectionReason = 'per_ip_limit' | 'global_limit';
+
+const VALID_STREAM_STATUSES: readonly StreamStatus[] = [
+  'active',
+  'paused',
+  'completed',
+  'cancelled',
+];
+const VALID_OUTCOMES: readonly WebhookDeliveryOutcome[] = ['success', 'failed'];
+const VALID_REJECTION_REASONS: readonly SseConnectionRejectionReason[] = [
+  'per_ip_limit',
+  'global_limit',
+];
+
+/**
+ * Returns true if the value is a known StreamStatus label value.
+ */
+export function isValidStreamStatus(value: string): value is StreamStatus {
+  return (VALID_STREAM_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known webhook delivery outcome label value.
+ */
+export function isValidDeliveryOutcome(value: string): value is WebhookDeliveryOutcome {
+  return (VALID_OUTCOMES as readonly string[]).includes(value);
+}
+
+/**
+ * Returns true if the value is a known SSE connection rejection reason.
+ */
+export function isValidRejectionReason(value: string): value is SseConnectionRejectionReason {
+  return (VALID_REJECTION_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * Observes a duration into the histogram, clamping NaN and negative values to 0.
+ *
+ * Prevents metric corruption from clock skew, negative deltas, or uninitialized
+ * timers while keeping the happy-path label set unchanged.
+ */
+export function safeObserveDuration(histogram: Histogram, durationSeconds: number): void {
+  histogram.observe(Number.isFinite(durationSeconds) && durationSeconds >= 0 ? durationSeconds : 0);
+}
+
 /**
  * Histogram tracking JWT verification latency in seconds.
  *
@@ -16,9 +63,7 @@ import { registry } from '../metrics.js';
  *   (no `jti`, `address`, `subject`, `kid`, etc.).
  */
 export const authJwtVerifyDurationSeconds =
-  (registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds') as Histogram<
-    'outcome'
-  >) ||
+  (registry.getSingleMetric('fluxora_auth_jwt_verify_duration_seconds') as Histogram<'outcome'>) ||
   new Histogram({
     name: 'fluxora_auth_jwt_verify_duration_seconds',
     help: 'Duration of JWT signature verification in seconds, labeled by outcome',
@@ -42,9 +87,9 @@ export const authJwtVerifyDurationSeconds =
  *   (no key id, key prefix, hash, or raw key material).
  */
 export const authApiKeyLookupDurationSeconds =
-  (registry.getSingleMetric('fluxora_auth_apikey_lookup_duration_seconds') as Histogram<
-    'outcome'
-  >) ||
+  (registry.getSingleMetric(
+    'fluxora_auth_apikey_lookup_duration_seconds'
+  ) as Histogram<'outcome'>) ||
   new Histogram({
     name: 'fluxora_auth_apikey_lookup_duration_seconds',
     help: 'Duration of API key lookup in seconds, labeled by outcome',
@@ -79,11 +124,37 @@ export const sseConnectionsRejectedTotal =
     registers: [registry],
   });
 
+export const longPollActiveConnectionsGauge =
+  (registry.getSingleMetric('fluxora_longpoll_active_connections') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_longpoll_active_connections',
+    help: 'Current number of active long-polling fallback stream connections',
+    registers: [registry],
+  });
+
+export const longPollConnectionsRejectedTotal =
+  (registry.getSingleMetric('fluxora_longpoll_connections_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_longpoll_connections_rejected_total',
+    help: 'Total number of rejected long-polling connection attempts',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
 export const webhookDeliveriesSuppressedTotal =
   (registry.getSingleMetric('fluxora_webhook_deliveries_suppressed_total') as Counter<'outcome'>) ||
   new Counter({
     name: 'fluxora_webhook_deliveries_suppressed_total',
     help: 'Number of webhook deliveries suppressed due to reorg',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
+export const webhookDeliveriesTotal =
+  (registry.getSingleMetric('fluxora_webhook_deliveries_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_deliveries_total',
+    help: 'Total number of webhook delivery attempts, labeled by outcome',
     labelNames: ['outcome'] as const,
     registers: [registry],
   });
@@ -172,6 +243,22 @@ export const sseSubscriberErrorsTotal =
     registers: [registry],
   });
 
+/**
+ * Counter for SSE connections dropped due to backpressure (buffer overflow).
+ *
+ * Fires when a slow consumer's per-connection buffer exceeds
+ * `SSE_MAX_BUFFERED_EVENTS` and the connection is severed to prevent
+ * unbounded memory growth (DoS vector).
+ *
+ * @security No payloads, IPs, or PII. Bounded cardinality (single series).
+ */
+export const sseBackpressureDropsTotal =
+  (registry.getSingleMetric('fluxora_sse_backpressure_drops_total') as Counter) ||
+  new Counter({
+    name: 'fluxora_sse_backpressure_drops_total',
+    help: 'Total number of SSE connections dropped due to per-connection buffer overflow (slow consumer backpressure)',
+    registers: [registry],
+  });
 
 /**
  * Webhook outbox backlog gauge.
@@ -197,35 +284,104 @@ export const webhookOutboxPendingItemsGauge =
   });
 
 /**
+ * Sanitize a store-reported gauge value into a non-negative finite integer.
+ *
+ * Edge-case contract (regression-locked by tests):
+ * - Non-numbers (`null`, `undefined`, strings, objects) → `0`
+ * - Non-finite numbers (`NaN`, `±Infinity`) → `0`
+ * - Negatives → `0`
+ * - Fractional values → `Math.floor` (counts are whole deliveries)
+ * - Values above `Number.MAX_SAFE_INTEGER` → clamped to `Number.MAX_SAFE_INTEGER`
+ *
+ * Prevents NaN/Infinity/negative pollution of Prometheus gauges scraped via `/metrics`.
+ */
+function sanitizeMetricGaugeValue(val: unknown): number {
+  if (typeof val !== 'number' || !Number.isFinite(val)) {
+    return 0;
+  }
+  const floored = Math.floor(val);
+  if (floored <= 0) {
+    return 0;
+  }
+  return floored > Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : floored;
+}
+
+/**
+ * Describes the contract for a store that can provide webhook queue metrics.
+ * Used by {@link syncWebhookMetrics} to decouple from a concrete store implementation.
+ */
+export interface WebhookMetricsProvider {
+  /**
+   * Returns a snapshot of webhook queue depths.
+   *
+   * This method must be resilient:
+   * - It should not throw exceptions.
+   * - It should return `null` or an empty object on failure.
+   * - All numeric fields are optional and will be sanitized to `0` if missing or invalid.
+   */
+  getMetrics(): {
+    dlqItems?: number;
+    outboxItems?: number;
+  } | null;
+}
+
+export const webhookMetricsSyncTotal =
+  (registry.getSingleMetric('fluxora_webhook_metrics_sync_total') as Counter<'outcome'>) ||
+  new Counter({
+    name: 'fluxora_webhook_metrics_sync_total',
+    help: 'Total number of /metrics scrapes that synced webhook queue gauges, labeled by outcome.',
+    labelNames: ['outcome'] as const,
+    registers: [registry],
+  });
+
+/**
  * Sync webhook metrics (DLQ depth and outbox backlog) from the store into Prometheus gauges.
  *
- * This function should be called periodically (via scheduled task) or on each `/metrics` scrape.
- * It reads the current state from the webhook delivery store and updates the gauges.
+ * Called on every authenticated `/metrics` scrape so Prometheus sees current queue depth
+ * without a separate polling loop. Failures never throw — gauges fall back to `0` so a
+ * store outage cannot break metrics exposure or auth-gated scrapes.
  *
- * @param store - WebhookDeliveryStore instance to read metrics from
+ * Edge-case contract (regression-locked by tests):
+ * - `undefined` / `null` store → gauges set to `0`
+ * - Missing or non-function `getMetrics` → gauges set to `0`
+ * - `getMetrics()` throws → gauges set to `0` (error swallowed)
+ * - `getMetrics()` returns `null` / `undefined` / partial objects → missing fields sanitize to `0`
+ * - Invalid numeric fields → sanitized via {@link sanitizeMetricGaugeValue}
+ * - Negative values → clamped to `0`
+ * - Large values → clamped to `Number.MAX_SAFE_INTEGER`
  *
- * @example
- * // Call on each metrics scrape
- * app.get('/metrics', (req, res) => {
- *   syncWebhookMetrics(webhookDeliveryStore);
- *   // ... return metrics
- * });
+ * @param store - WebhookDeliveryStore-like object to read metrics from
  *
  * @see webhookDlqItemsGauge
  * @see webhookOutboxPendingItemsGauge
  */
-export function syncWebhookMetrics(store: {
-  getMetrics(): {
-    totalDeliveries: number;
-    successfulDeliveries: number;
-    failedDeliveries: number;
-    dlqItems: number;
-    outboxItems: number;
-  };
-}): void {
-  const metrics = store.getMetrics();
-  webhookDlqItemsGauge.set(Math.max(0, metrics.dlqItems));
-  webhookOutboxPendingItemsGauge.set(Math.max(0, metrics.outboxItems));
+export function syncWebhookMetrics(store?: WebhookMetricsProvider | null): void {
+  // Explicit validation: store must be a non-null object with a callable getMetrics
+  if (!store || typeof store.getMetrics !== 'function') {
+    webhookDlqItemsGauge.set(0);
+    webhookOutboxPendingItemsGauge.set(0);
+    webhookMetricsSyncTotal.inc({ outcome: 'provider_unavailable' });
+    return;
+  }
+
+  try {
+    const metrics = store.getMetrics();
+    // Explicit null/undefined check on returned metrics object
+    if (metrics === null || typeof metrics !== 'object') {
+      webhookDlqItemsGauge.set(0);
+      webhookOutboxPendingItemsGauge.set(0);
+      webhookMetricsSyncTotal.inc({ outcome: 'success_empty' });
+      return;
+    }
+    webhookDlqItemsGauge.set(sanitizeMetricGaugeValue(metrics.dlqItems));
+    webhookOutboxPendingItemsGauge.set(sanitizeMetricGaugeValue(metrics.outboxItems));
+    webhookMetricsSyncTotal.inc({ outcome: 'success' });
+  } catch {
+    // Observability must not fail closed: never let store errors 500 the scrape path.
+    webhookDlqItemsGauge.set(0);
+    webhookOutboxPendingItemsGauge.set(0);
+    webhookMetricsSyncTotal.inc({ outcome: 'provider_error' });
+  }
 }
 
 /**
@@ -245,12 +401,78 @@ export const wsAuthFailureTotal =
   });
 
 export const adminReindexJobDurationSeconds =
-  (registry.getSingleMetric('fluxora_admin_reindex_job_duration_seconds') as Histogram<'outcome'>) ||
+  (registry.getSingleMetric(
+    'fluxora_admin_reindex_job_duration_seconds'
+  ) as Histogram<'outcome'>) ||
   new Histogram({
     name: 'fluxora_admin_reindex_job_duration_seconds',
     help: 'Duration of adminState.triggerReindex job in seconds, labeled by outcome',
     labelNames: ['outcome'] as const,
     buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60],
+    registers: [registry],
+  });
+
+/**
+ * Counter for jobs that have been permanently routed to the dead-letter queue.
+ *
+ * Each increment represents one terminal job failure that was persisted to
+ * `job_dead_letter`.  Labelled by `job_name` so operators can see which
+ * specific job types are failing most frequently without requiring a DB query.
+ *
+ * @security
+ * - Label cardinality is bounded: job_name values come from developer-controlled
+ *   `register()` call sites, not from user input.
+ */
+export const jobDlqEntriesTotal =
+  (registry.getSingleMetric('fluxora_job_dlq_entries_total') as Counter<'job_name'>) ||
+  new Counter({
+    name: 'fluxora_job_dlq_entries_total',
+    help: 'Total number of jobs permanently moved to the dead-letter queue, labelled by job name',
+    labelNames: ['job_name'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for monthly partitions created by the partition-maintenance job.
+ *
+ * Each increment represents one `CREATE TABLE ... PARTITION OF` that
+ * actually created a new partition (idempotent no-ops are not counted).
+ * Labelled by `table` so operators can distinguish `contract_events` from
+ * `audit_logs` activity without a DB query.
+ *
+ * @security
+ * - `table` values come from the developer-controlled `CANDIDATE_TABLES`
+ *   constant in `src/jobs/partitionMaintenance.ts`, not from user input.
+ */
+export const partitionsCreatedTotal =
+  (registry.getSingleMetric('fluxora_partitions_created_total') as Counter<'table'>) ||
+  new Counter({
+    name: 'fluxora_partitions_created_total',
+    help: 'Total number of monthly partitions created by the partition-maintenance job, labelled by table',
+    labelNames: ['table'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for partition-maintenance runs that discovered the current
+ * month's partition missing (i.e. an earlier scheduled run failed or was
+ * skipped).
+ *
+ * Any increment means rows for the current month may have already landed
+ * in the unindexed `DEFAULT` partition before this run self-healed the
+ * situation. Alert on `increase(...) > 0` — a healthy deployment should
+ * never increment this counter.
+ *
+ * @see docs/database.md#partition-pre-creation
+ */
+export const partitionMaintenanceBehindScheduleTotal =
+  (registry.getSingleMetric(
+    'fluxora_partition_maintenance_behind_schedule_total'
+  ) as Counter<'table'>) ||
+  new Counter({
+    name: 'fluxora_partition_maintenance_behind_schedule_total',
+    help: 'Total number of partition-maintenance runs where the current-month partition was found missing, labelled by table',
+    labelNames: ['table'] as const,
     registers: [registry],
   });
 
@@ -265,13 +487,19 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_webhook_delivery_duration_seconds');
   registry.removeSingleMetric('fluxora_webhook_deliveries_suppressed_total');
   registry.removeSingleMetric('fluxora_webhook_dlq_items');
+  registry.removeSingleMetric('fluxora_webhook_metrics_sync_total');
   registry.removeSingleMetric('fluxora_webhook_outbox_pending_items');
   registry.removeSingleMetric('fluxora_indexer_events_ingested_total');
   registry.removeSingleMetric('fluxora_indexer_lag_seconds');
   registry.removeSingleMetric('fluxora_sse_live_subscribers');
   registry.removeSingleMetric('fluxora_sse_event_listeners');
   registry.removeSingleMetric('fluxora_sse_subscriber_errors_total');
+  registry.removeSingleMetric('fluxora_sse_backpressure_drops_total');
   registry.removeSingleMetric('fluxora_ws_auth_failure_total');
   registry.removeSingleMetric('fluxora_admin_reindex_job_duration_seconds');
+  registry.removeSingleMetric('fluxora_longpoll_active_connections');
+  registry.removeSingleMetric('fluxora_longpoll_connections_rejected_total');
+  registry.removeSingleMetric('fluxora_job_dlq_entries_total');
+  registry.removeSingleMetric('fluxora_partitions_created_total');
+  registry.removeSingleMetric('fluxora_partition_maintenance_behind_schedule_total');
 }
-
