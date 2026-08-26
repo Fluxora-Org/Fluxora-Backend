@@ -62,6 +62,8 @@ import { ApiError } from './errors.js';
 import { docsRouter } from './routes/docs.js';
 import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { getStreamHub } from './ws/hub.js';
+import { getPool } from './db/pool.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 
@@ -431,6 +433,22 @@ export function createApp(options: AppOptions = {}): Express {
     startBackgroundJobs(options.pool);
     addShutdownHook(() => stopBackgroundJobs());
   }
+
+  addShutdownHook(async () => {
+    const hub = getStreamHub();
+    if (hub) {
+      await new Promise<void>((resolve) => {
+        hub.close(() => resolve());
+      });
+    }
+  });
+
+  addShutdownHook(async () => {
+    const pool = getPool();
+    if (pool) {
+      await pool.end();
+    }
+  });
 
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
   const appConfig = options.config ?? loadConfig();
