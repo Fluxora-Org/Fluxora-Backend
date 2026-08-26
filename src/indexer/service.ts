@@ -119,9 +119,12 @@ class ReplayState {
   }
 
   updateProgress(rowsProcessed: number, newOffset: number): void {
-    this.state.rowsReplayed += rowsProcessed;
+    const prevOffset = this.state.currentOffset ?? 0;
+    const monotonicOffset = Math.max(prevOffset, newOffset);
+    const actualAdded = Math.max(0, monotonicOffset - prevOffset);
+    this.state.rowsReplayed += actualAdded;
     this.state.rowsRemaining = Math.max(0, this.state.totalRows - this.state.rowsReplayed);
-    this.state.currentOffset = newOffset;
+    this.state.currentOffset = monotonicOffset;
 
     if (this.state.startedAt && this.state.rowsReplayed > 0) {
       const elapsed = Date.now() - this.state.startedAt.getTime();
@@ -198,6 +201,8 @@ export class ReplayCursorRepository {
    * Advance the cursor offset.  Called inside the SAME transaction as the
    * batch INSERT so the offset advance and the data commit are atomic — a crash
    * between the two can never happen.
+   *
+   * Uses GREATEST to ensure progress offset is strictly monotonic and never regresses.
    */
   async advanceOffset(
     client: PoolClient,
@@ -206,7 +211,7 @@ export class ReplayCursorRepository {
   ): Promise<void> {
     await client.query(
       `UPDATE replay_cursors
-          SET last_committed_offset = $1
+          SET last_committed_offset = GREATEST(last_committed_offset, $1)
         WHERE id = $2`,
       [newOffset, cursorId],
     );
@@ -1071,7 +1076,7 @@ export class IndexerIngestionService {
     bucket.timestamps = bucket.timestamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
     if (bucket.timestamps.length >= MAX_RATE_LIMIT_REQUESTS) {
       warn('Indexer ingest rate limit exceeded', { actor, limit: MAX_RATE_LIMIT_REQUESTS, windowMs: RATE_LIMIT_WINDOW_MS });
-      throw new ApiError(ApiErrorCode.TOO_MANY_REQUESTS, 'indexer ingest rate limit exceeded', 429, {
+      throw new ApiError(429, ApiErrorCode.TOO_MANY_REQUESTS, 'indexer ingest rate limit exceeded', {
         retryAfterSeconds: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000),
       });
     }
