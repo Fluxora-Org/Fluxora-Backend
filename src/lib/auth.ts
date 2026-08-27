@@ -8,6 +8,11 @@ export interface UserPayload {
   permissions?: string[];
 }
 
+const JWT_ALGORITHM = 'HS256';
+const JWT_ISSUER = 'fluxora';
+const JWT_AUDIENCE = 'fluxora';
+const CLOCK_TOLERANCE_SECONDS = 10;
+
 /**
  * Generates a signed JWT for testing or initial administrative access.
  *
@@ -18,7 +23,11 @@ export interface UserPayload {
  */
 export function generateToken(payload: UserPayload): string {
   const { jwtSecret, jwtExpiresIn } = getConfig();
-  const options: SignOptions = {};
+  const options: SignOptions = {
+    algorithm: JWT_ALGORITHM,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  };
   if (jwtExpiresIn !== undefined && jwtExpiresIn !== '') {
     // `jsonwebtoken` brands the string form as `StringValue`; users pass plain
     // duration strings like "24h" / "7d" which are runtime-equivalent.
@@ -53,11 +62,25 @@ export function generateToken(payload: UserPayload): string {
  * Verifies a JWT and returns the decoded payload.
  */
 export function verifyToken(token: string): UserPayload {
-  const { jwtSecret } = getConfig();
+  const { jwtSecret, jwtSecretPrevious } = getConfig();
+  
+  const verifyOptions = {
+    algorithms: [JWT_ALGORITHM],
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+    clockTolerance: CLOCK_TOLERANCE_SECONDS,
+  } as const;
+
   try {
-    const payload = jwt.verify(token, jwtSecret) as UserPayload;
-    return payload;
+    return jwt.verify(token, jwtSecret, verifyOptions) as UserPayload;
   } catch (error) {
+    if (jwtSecretPrevious) {
+      try {
+        return jwt.verify(token, jwtSecretPrevious, verifyOptions) as UserPayload;
+      } catch (prevError) {
+        // Fall through to throw the original error
+      }
+    }
     warn('JWT verification failed', { error: error instanceof Error ? error.message : String(error) });
     throw error;
   }

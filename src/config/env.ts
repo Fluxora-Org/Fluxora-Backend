@@ -21,6 +21,7 @@ type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const SECRET_ENV_NAMES = new Set([
   'JWT_SECRET',
+  'JWT_SECRET_PREVIOUS',
   'INDEXER_WORKER_TOKEN',
   'WEBHOOK_SECRET',
   'WEBHOOK_SECRET_PREVIOUS',
@@ -211,6 +212,10 @@ export const EnvSchema = z
     STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
 
     JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+    JWT_SECRET_PREVIOUS: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'JWT_SECRET_PREVIOUS must be at least 32 characters').optional()
+    ),
     PGCRYPTO_KEY: z.preprocess(
       (value) => (value === '' ? undefined : value),
       z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional()
@@ -545,6 +550,7 @@ export interface Config {
   contractAddresses: ContractAddresses;
 
   jwtSecret: string;
+  jwtSecretPrevious?: string | undefined;
   pgcryptoKey?: string | undefined;
   pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
@@ -763,6 +769,7 @@ function toConfig(env: ParsedEnv): Config {
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
 
     jwtSecret: env.JWT_SECRET,
+    jwtSecretPrevious: env.JWT_SECRET_PREVIOUS,
     pgcryptoKey: env.PGCRYPTO_KEY,
     pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
     jwtExpiresIn: env.JWT_EXPIRES_IN,
