@@ -109,16 +109,41 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
       dependencies[dep.name] = dep.status;
     }
 
+    let isReady = true;
     if (report.status === 'unhealthy') {
+      isReady = false;
+    } else if (report.status === 'degraded') {
+      const gracePeriodMs = 30_000;
+      const uptimeMs = report.uptime * 1000;
+      
+      if (uptimeMs < gracePeriodMs) {
+        // Startup phase: no grace period, fail readiness until healthy
+        isReady = false;
+      } else {
+        // Steady state: fail if any dependency has been degraded longer than grace period
+        const now = Date.now();
+        for (const dep of report.dependencies) {
+          if (dep.status === 'degraded' && dep.degradedSince) {
+            const degradedTime = now - new Date(dep.degradedSince).getTime();
+            if (degradedTime >= gracePeriodMs) {
+              isReady = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!isReady) {
       logger?.warn('Readiness check failed', req.correlationId, {
         dependencies: report.dependencies.map((d: DependencyHealth) => ({
           name: d.name,
           status: d.status,
           error: d.error,
+          degradedSince: d.degradedSince,
         })),
       });
-      // 503 for unhealthy; return the same flat shape as the healthy / degraded
-      // responses so dashboards and probes can parse a single schema.
+      // 503 for unhealthy or unacceptably degraded
       res.status(503).json({
         status: report.status,
         version: report.version,
@@ -127,8 +152,6 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    // "degraded" is still ready — return 200 so load balancers keep routing
-    // traffic, but signal the degraded state for observability.
     res.status(200).json({
       status: report.status, // "healthy" | "degraded"
       version: report.version,
