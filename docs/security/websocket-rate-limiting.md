@@ -45,3 +45,16 @@ WS_TRUSTED_PROXIES=127.0.0.1,10.0.0.1
 ```
 
 If `WS_TRUSTED_PROXIES` is not set or the remote address is not in the list, the server uses the raw socket remote address and ignores any `X-Forwarded-For` headers.
+
+## Ban store outage policy
+
+The WebSocket ban store (`src/redis/banStore.ts`, `HybridBanStore`) **fails closed** during a Redis outage using a local in-memory read-through cache and fallback, so banning is never disabled when Redis is unavailable:
+
+- `ban()` records the ban in the local cache **before** contacting Redis, so even if the Redis write fails the IP is rejected on that instance.
+- `isBanned()` checks the local cache first, so a ban recorded on the instance (or the read-through cache from Redis) keeps denying during the outage.
+- Rationale: accepting a banned abusive IP is a security failure (rule 1/4 of the governing outage-policy rule).
+
+Trade-off: a ban created during an outage is only enforced locally until Redis returns, so it may not be visible across other instances/cluster replicas for the duration of the outage.
+
+> Governing rule for all Redis outages:
+> [`docs/security/redis-outage-policy.md`](./redis-outage-policy.md).
