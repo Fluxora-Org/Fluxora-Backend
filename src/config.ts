@@ -54,6 +54,12 @@ export const config = {
      * 0 = wait indefinitely (no forced timeout). Default: 10_000.
      */
     replayStopForcedTimeoutMs: envInt('INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS', 10_000),
+
+    /** Maximum concurrent batches in a backfill worker pool. */
+    backfillConcurrency: envInt('INDEXER_BACKFILL_CONCURRENCY', 5),
+
+    /** Maximum attempts for a failed backfill batch. */
+    backfillMaxRetries: envInt('INDEXER_BACKFILL_MAX_RETRIES', 3),
   },
   dlq: {
     /** Retention in days for terminal dead_letter_queue entries. Default 30. */
@@ -65,4 +71,3 @@ export const config = {
     url: process.env.DATABASE_URL || 'postgresql://localhost/fluxora',
   },
 };
-

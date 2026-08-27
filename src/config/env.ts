@@ -351,6 +351,18 @@ export const EnvSchema = z
     INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(
       5 * 60 * 1000
     ),
+    /** Maximum number of backfill batches processed concurrently. */
+    INDEXER_BACKFILL_CONCURRENCY: integerEnv('INDEXER_BACKFILL_CONCURRENCY', 1, 64).default(1),
+    /** Number of ledger ranges in a single backfill batch. */
+    INDEXER_BACKFILL_BATCH_SIZE: integerEnv('INDEXER_BACKFILL_BATCH_SIZE', 1, 100000).default(100),
+    /** Require backfill checkpoints to advance in ledger order. */
+    INDEXER_BACKFILL_STRICT_ORDER: booleanEnv().default(true),
+    /** Number of ordered batches completed before the checkpoint advances. */
+    INDEXER_BACKFILL_COMMIT_INTERVAL: integerEnv('INDEXER_BACKFILL_COMMIT_INTERVAL', 1, 10000).default(1),
+    /** Maximum retries for a failed backfill batch. */
+    INDEXER_BACKFILL_MAX_RETRIES: integerEnv('INDEXER_BACKFILL_MAX_RETRIES', 0, 100).default(3),
+    /** Delay between backfill batch retries. */
+    INDEXER_BACKFILL_RETRY_DELAY_MS: integerEnv('INDEXER_BACKFILL_RETRY_DELAY_MS', 0).default(1000),
     INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
     DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
     ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
@@ -604,6 +616,18 @@ export interface Config {
   grpcGatewayPort: number;
   /** When true, reject non-TLS indexer worker connections (fail-closed). */
   indexerMtlsRequired: boolean;
+  /** Maximum number of backfill batches processed concurrently. */
+  indexerBackfillConcurrency: number;
+  /** Number of ledger ranges in a single backfill batch. */
+  indexerBackfillBatchSize: number;
+  /** Require backfill checkpoints to advance in ledger order. */
+  indexerBackfillStrictOrder: boolean;
+  /** Number of ordered batches completed before the checkpoint advances. */
+  indexerBackfillCommitInterval: number;
+  /** Maximum retries for a failed backfill batch. */
+  indexerBackfillMaxRetries: number;
+  /** Delay between backfill batch retries. */
+  indexerBackfillRetryDelayMs: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -802,6 +826,12 @@ function toConfig(env: ParsedEnv): Config {
     grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
     grpcGatewayPort: env.GRPC_GATEWAY_PORT,
     indexerMtlsRequired: env.INDEXER_MTLS_REQUIRED ?? isProduction,
+    indexerBackfillConcurrency: env.INDEXER_BACKFILL_CONCURRENCY,
+    indexerBackfillBatchSize: env.INDEXER_BACKFILL_BATCH_SIZE,
+    indexerBackfillStrictOrder: env.INDEXER_BACKFILL_STRICT_ORDER,
+    indexerBackfillCommitInterval: env.INDEXER_BACKFILL_COMMIT_INTERVAL,
+    indexerBackfillMaxRetries: env.INDEXER_BACKFILL_MAX_RETRIES,
+    indexerBackfillRetryDelayMs: env.INDEXER_BACKFILL_RETRY_DELAY_MS,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
