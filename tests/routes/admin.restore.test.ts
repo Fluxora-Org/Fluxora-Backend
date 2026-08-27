@@ -9,7 +9,7 @@
  * Coverage strategy
  * ─────────────────
  * - Auth gate (missing header, wrong scheme, bad token, unconfigured key)
- * - Input validation (missing backupId, empty string, path traversal, too long,
+ * - Input validation (missing backupId, empty string, path traversal, prefix escape, too long,
  *   bad targetEnvironment, production without confirmProduction)
  * - Happy path (staging restore, production restore with confirmation)
  * - Async lifecycle (queued → running → completed / failed)
@@ -22,7 +22,7 @@
  *
  * Security notes
  * ──────────────
- * - backupId path-traversal payloads are explicitly rejected at the route layer
+ * - backupId path-traversal and prefix-escape payloads are explicitly rejected at the route layer
  *   (via queueRestoreJob's validateBackupId) before any S3 call is made.
  * - Production restores require an explicit `confirmProduction: true` flag;
  *   omitting it or setting it to a falsy value returns 400.
@@ -34,13 +34,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import { app } from '../../src/app.js';
-import { _resetRestoreJobs } from '../../src/scripts/backup-retention.js';
+import {
+  _resetRestoreJobs,
+  normalizeBackupPrefix,
+  resolveBackupObjectKey,
+} from '../../src/scripts/backup-retention.js';
 import { _resetAuditLog, getAuditEntries } from '../../src/lib/auditLog.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const ADMIN_KEY = 'test-admin-key-for-restore-routes';
 const VALID_BACKUP_ID = 'backups/db-2026-07-01.sql.gz';
+const CUSTOM_PREFIX = 'private/fluxora-backups/';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -151,9 +156,7 @@ describe('GET /api/admin/restore — auth gate', () => {
   });
 
   it('returns 403 when token is wrong', async () => {
-    const res = await request(app)
-      .get('/api/admin/restore')
-      .set('Authorization', 'Bearer bad-key');
+    const res = await request(app).get('/api/admin/restore').set('Authorization', 'Bearer bad-key');
     expect(res.status).toBe(403);
   });
 });
@@ -214,6 +217,47 @@ describe('POST /api/admin/restore — input validation', () => {
     const res = await postRestore({ backupId: 'backups/../secrets/key' });
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('returns 400 when backupId is outside the configured backup prefix', async () => {
+    process.env.S3_BACKUP_PREFIX = CUSTOM_PREFIX;
+    const outsideKeys = [
+      'backups/db-2026-07-01.sql.gz',
+      'private/fluxora-backups-archive/db.sql.gz',
+      '/private/fluxora-backups/db.sql.gz',
+    ];
+
+    for (const backupId of outsideKeys) {
+      const res = await postRestore({ backupId });
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+      expect(res.body.error.message).toMatch(/configured backup prefix/i);
+    }
+  });
+
+  it('accepts nested keys under a custom configured prefix', async () => {
+    process.env.S3_BACKUP_PREFIX = CUSTOM_PREFIX;
+    const nestedKey = `${CUSTOM_PREFIX}2026/07/daily/db-snapshot.sql.gz`;
+    const res = await postRestore({ backupId: nestedKey });
+
+    expect(res.status).toBe(202);
+    expect(res.body.data.job.backupId).toBe(nestedKey);
+  });
+
+  it('rejects encoded separators and traversal components', () => {
+    process.env.S3_BACKUP_PREFIX = CUSTOM_PREFIX;
+    for (const backupId of [
+      `${CUSTOM_PREFIX}2026%2F07%2Fdb.sql.gz`,
+      `${CUSTOM_PREFIX}2026/%2e%2e/secrets.sql.gz`,
+      `${CUSTOM_PREFIX}2026\\\\07\\\\db.sql.gz`,
+      `${CUSTOM_PREFIX}2026/./db.sql.gz`,
+    ]) {
+      expect(() => resolveBackupObjectKey(backupId, CUSTOM_PREFIX)).toThrow();
+    }
+  });
+
+  it('normalizes configured prefixes to one slash-delimited boundary', () => {
+    expect(normalizeBackupPrefix(' /private/fluxora-backups/ ')).toBe('private/fluxora-backups/');
   });
 
   it('returns 400 when backupId exceeds 1024 characters', async () => {
@@ -647,11 +691,7 @@ describe('POST /api/admin/restore — security edge cases', () => {
   });
 
   it('rejects backupId with ".." anywhere in the string', async () => {
-    const payloads = [
-      'backups/db-..-.sql.gz',
-      '..backups/db.sql.gz',
-      'backups/..db.sql.gz',
-    ];
+    const payloads = ['backups/db-..-.sql.gz', '..backups/db.sql.gz', 'backups/..db.sql.gz'];
 
     for (const backupId of payloads) {
       const res = await postRestore({ backupId });

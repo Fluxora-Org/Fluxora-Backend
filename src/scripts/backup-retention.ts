@@ -165,7 +165,7 @@ export function getRestoreJob(jobId: string): RestoreJob | undefined {
  */
 export function listRestoreJobs(): RestoreJob[] {
   return [...getJobStore().values()].sort(
-    (a, b) => new Date(b.queuedAt).getTime() - new Date(a.queuedAt).getTime(),
+    (a, b) => new Date(b.queuedAt).getTime() - new Date(a.queuedAt).getTime()
   );
 }
 
@@ -185,25 +185,76 @@ export function _resetRestoreJobs(): void {
  * Rejects:
  * - Empty strings
  * - Path traversal sequences ("../", "..")
+ * - Keys outside the configured S3_BACKUP_PREFIX
  * - Keys starting with "/" (absolute paths)
  * - Excessively long keys (>1 024 characters — S3 limit)
  *
  * @param backupId - Raw input from the HTTP request body.
  * @throws {ValidationError} when the key is unsafe.
  */
-function validateBackupId(backupId: unknown): asserts backupId is string {
+const DEFAULT_BACKUP_PREFIX = 'backups/';
+
+/**
+ * Normalize a configured S3 prefix to a non-ambiguous directory boundary.
+ * Empty prefixes are intentionally rejected: restore jobs must always be
+ * scoped to an explicit backup namespace.
+ */
+export function normalizeBackupPrefix(prefix: unknown): string {
+  if (typeof prefix !== 'string' || prefix.trim() === '') {
+    throw new ConfigurationError(
+      'S3_BACKUP_PREFIX must be a non-empty prefix for restore operations.'
+    );
+  }
+
+  const normalized = prefix.trim().replace(/^\/+|\/+$/g, '');
+  if (normalized === '' || normalized === '.' || normalized === '..' || normalized.includes('..')) {
+    throw new ConfigurationError('S3_BACKUP_PREFIX contains an unsafe path component.');
+  }
+  return `${normalized}/`;
+}
+
+/**
+ * Resolve and validate a backup object key against the configured prefix.
+ * S3 keys are not filesystem paths, so containment is checked on normalized
+ * slash-separated segments rather than with a naive string prefix check.
+ */
+export function resolveBackupObjectKey(backupId: unknown, configuredPrefix: unknown): string {
   if (typeof backupId !== 'string' || backupId.trim() === '') {
     throw new ValidationError('backupId must be a non-empty string.');
   }
-  if (backupId.startsWith('/')) {
-    throw new ValidationError('backupId must not start with "/".');
+
+  const prefix = normalizeBackupPrefix(configuredPrefix);
+  const candidate = backupId.trim();
+  if (candidate.startsWith('/') || candidate.length > 1024) {
+    throw new ValidationError(
+      candidate.startsWith('/')
+        ? 'backupId must not start with "/".'
+        : 'backupId exceeds the maximum S3 key length of 1 024 characters.'
+    );
   }
-  if (backupId.includes('..')) {
+
+  // Reject encoded separators and traversal before decoding any input. A key
+  // containing them must never be interpreted as a different object path.
+  if (/%2f|%5c|%2e/i.test(candidate) || candidate.includes('\\\\')) {
+    throw new ValidationError('backupId must not contain encoded or alternate path separators.');
+  }
+
+  const segments = candidate.split('/');
+  if (segments.some((segment) => segment === '.' || segment === '..' || segment.includes('..'))) {
     throw new ValidationError('backupId must not contain path traversal sequences.');
   }
-  if (backupId.length > 1024) {
-    throw new ValidationError('backupId exceeds the maximum S3 key length of 1 024 characters.');
+  if (!candidate.startsWith(prefix)) {
+    throw new ValidationError(
+      `backupId must remain under the configured backup prefix "${prefix}".`
+    );
   }
+  if (candidate.slice(prefix.length).trim() === '') {
+    throw new ValidationError(
+      'backupId must identify an object below the configured backup prefix.'
+    );
+  }
+
+  return candidate;
 }
 
 /**
@@ -211,7 +262,8 @@ function validateBackupId(backupId: unknown): asserts backupId is string {
  * restore-prefixed destination key.
  *
  * The copy is intra-bucket: the source key is the original backup key; the
- * destination is `restored/<environment>/<timestamp>-<filename>`.
+ * destination stays under `S3_BACKUP_PREFIX` as
+ * `<prefix>restored/<environment>/<timestamp>-<relative-key>`.
  *
  * @param job    - The job record (mutated in place on status transitions).
  * @param bucket - S3 bucket name.
@@ -223,8 +275,12 @@ async function executeRestore(job: RestoreJob, bucket: string, region: string): 
 
   try {
     // Derive destination key:  restored/<env>/<ts>-<filename>
-    const filename = job.backupId.split('/').at(-1) ?? job.backupId;
-    const destKey = `restored/${job.targetEnvironment}/${job.queuedAt.replace(/[:.]/g, '-')}-${filename}`;
+    const prefix = normalizeBackupPrefix(process.env.S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX);
+    const filename = job.backupId.slice(prefix.length);
+    const destKey = `${prefix}restored/${job.targetEnvironment}/${job.queuedAt.replace(/[:.]/g, '-')}-${filename}`;
+    if (!destKey.startsWith(prefix) || destKey.includes('..')) {
+      throw new ValidationError('Restore destination escaped the configured backup prefix.');
+    }
 
     // Copy within the same bucket
     await client.send(
@@ -232,7 +288,7 @@ async function executeRestore(job: RestoreJob, bucket: string, region: string): 
         Bucket: bucket,
         CopySource: `${bucket}/${job.backupId}`,
         Key: destKey,
-      }),
+      })
     );
 
     return `s3://${bucket}/${destKey}`;
@@ -277,12 +333,13 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
   } = request;
 
   // ── Input validation ──────────────────────────────────────────────────────
-  validateBackupId(backupId);
+  const configuredPrefix = process.env.S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX;
+  const resolvedBackupId = resolveBackupObjectKey(backupId, configuredPrefix);
 
   if (targetEnvironment === 'production' && !confirmProduction) {
     throw new Error(
       'Restoring into the production environment requires confirmProduction: true. ' +
-        'Set this flag explicitly to acknowledge the risk.',
+        'Set this flag explicitly to acknowledge the risk.'
     );
   }
 
@@ -296,7 +353,7 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
   // ── Create job record ─────────────────────────────────────────────────────
   const job: RestoreJob = {
     jobId: createId(),
-    backupId,
+    backupId: resolvedBackupId,
     status: 'queued',
     targetEnvironment,
     queuedAt: new Date().toISOString(),
@@ -388,7 +445,10 @@ export function calculateAgeInDays(lastModified: Date): number {
  * For weekly/monthly classification in the age ranges, we identify candidate
  * objects by checking if they're approximately one week or one month apart.
  */
-export function classifyBackup(object: BackupObject, policy: RetentionPolicy): 'daily' | 'weekly' | 'monthly' | 'expired' {
+export function classifyBackup(
+  object: BackupObject,
+  policy: RetentionPolicy
+): 'daily' | 'weekly' | 'monthly' | 'expired' {
   const { ageInDays } = object;
 
   if (ageInDays <= policy.dailyDays) {
@@ -416,7 +476,7 @@ export function classifyBackup(object: BackupObject, policy: RetentionPolicy): '
  */
 export function filterRetainedObjects(
   objects: BackupObject[],
-  policy: RetentionPolicy,
+  policy: RetentionPolicy
 ): BackupObject[] {
   const daily = objects.filter((o) => o.classification === 'daily');
   const weekly = objects.filter((o) => o.classification === 'weekly');
@@ -472,7 +532,7 @@ export function filterRetainedObjects(
 async function fetchBackupObjects(
   client: S3Client,
   bucket: string,
-  prefix: string,
+  prefix: string
 ): Promise<BackupObject[]> {
   const objects: BackupObject[] = [];
   let continuationToken: string | undefined;
@@ -483,7 +543,7 @@ async function fetchBackupObjects(
         Bucket: bucket,
         Prefix: prefix,
         ContinuationToken: continuationToken,
-      }),
+      })
     );
 
     if (response.Contents) {
@@ -516,7 +576,7 @@ async function fetchBackupObjects(
 async function deleteObjects(
   client: S3Client,
   bucket: string,
-  keys: string[],
+  keys: string[]
 ): Promise<{ deleted: number; errors: string[] }> {
   if (keys.length === 0) {
     return { deleted: 0, errors: [] };
@@ -536,7 +596,7 @@ async function deleteObjects(
           Delete: {
             Objects: batch.map((key) => ({ Key: key })),
           },
-        }),
+        })
       );
 
       deleted += response.Deleted?.length ?? 0;
@@ -562,7 +622,7 @@ async function validateBucket(client: S3Client, bucket: string): Promise<void> {
     await client.send(new HeadBucketCommand({ Bucket: bucket }));
   } catch (error) {
     throw new Error(
-      `Cannot access S3 bucket "${bucket}": ${error instanceof Error ? error.message : String(error)}`,
+      `Cannot access S3 bucket "${bucket}": ${error instanceof Error ? error.message : String(error)}`
     );
   }
 }
@@ -615,9 +675,11 @@ async function enforceBackupRetention(options: {
 
     console.log('[INFO] Backup classification:');
     console.log(`  Daily (0-${DEFAULT_POLICY.dailyDays} days):      ${dailyCount} objects`);
-    console.log(`  Weekly (${DEFAULT_POLICY.dailyDays + 1}-${DEFAULT_POLICY.weeklyDays} days):    ${weeklyCount} objects`);
     console.log(
-      `  Monthly (${DEFAULT_POLICY.weeklyDays + 1}-${DEFAULT_POLICY.monthlyDays} days):  ${monthlyCount} objects`,
+      `  Weekly (${DEFAULT_POLICY.dailyDays + 1}-${DEFAULT_POLICY.weeklyDays} days):    ${weeklyCount} objects`
+    );
+    console.log(
+      `  Monthly (${DEFAULT_POLICY.weeklyDays + 1}-${DEFAULT_POLICY.monthlyDays} days):  ${monthlyCount} objects`
     );
     console.log(`  Expired (>${DEFAULT_POLICY.monthlyDays} days):   ${expiredCount} objects`);
 
@@ -638,7 +700,9 @@ async function enforceBackupRetention(options: {
     // Log objects to be deleted
     console.log(`[INFO] Objects to be deleted:`);
     for (const obj of toDelete.slice(0, 10)) {
-      console.log(`  - ${obj.key} (${(obj.size / 1024 / 1024).toFixed(2)} MiB, ${obj.ageInDays} days old)`);
+      console.log(
+        `  - ${obj.key} (${(obj.size / 1024 / 1024).toFixed(2)} MiB, ${obj.ageInDays} days old)`
+      );
     }
     if (toDelete.length > 10) {
       console.log(`  ... and ${toDelete.length - 10} more`);
@@ -654,7 +718,7 @@ async function enforceBackupRetention(options: {
     const deleteResult = await deleteObjects(
       client,
       bucket,
-      toDelete.map((obj) => obj.key),
+      toDelete.map((obj) => obj.key)
     );
 
     console.log(`[SUCCESS] Deleted ${deleteResult.deleted} objects`);
