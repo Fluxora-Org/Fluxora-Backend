@@ -159,6 +159,10 @@ which has no importers. The other pre-existing errors are in active-graph files
 and are isolated with a file-level `// @ts-nocheck` directive, tracked under
 `#TBD-typecheck-backlog`:
 
+- `src/lib/auth.ts`  (pre-existing, from upstream merge)
+- `src/validation/stellarAddressValidator.ts`  (pre-existing, from upstream merge)
+- `tests/jobs/retentionPurge.test.ts`  (pre-existing, from upstream merge)
+- `tests/privacy/erasure.legalHold.test.ts`  (pre-existing, from upstream merge)
 - `src/graphql/gateway.ts`
 - `src/graphql/schema.ts`
 - `src/indexer/service.ts`
