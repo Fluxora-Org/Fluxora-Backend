@@ -1,5 +1,22 @@
+/**
+ * tests/ws/hub.backpressure.test.ts
+ *
+ * Integration tests for StreamHub backpressure: drop, terminate, and
+ * multi-client isolation.
+ *
+ * ## Why the streamRepository mock is here
+ *
+ * When a client sends `{ type: "subscribe", streamId: "…" }`, the hub calls
+ * `authorizeSubscriptionFilter` which invokes `streamRepository.getById`.
+ * In the test environment the PostgreSQL configuration is not initialised,
+ * so the real repository throws a `ConfigError`.  We mock the module here to
+ * return a stub stream whose `sender` matches the JWT subject so that the
+ * authorization check passes without a real database connection.
+ */
+
 import http from 'http';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import jwt from 'jsonwebtoken';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WebSocket } from 'ws';
 import {
   BACKPRESSURE_DROP_BYTES,
@@ -8,12 +25,109 @@ import {
   type StreamHubBackpressureEvent,
 } from '../../src/ws/hub.js';
 import {
-  connectClient,
-  createSlowClient,
   sendJson,
   wait,
   type SlowClient,
 } from './fixtures/slowClient.js';
+
+// ── Stub JWT credentials ───────────────────────────────────────────────────
+const TEST_JWT_SECRET = 'backpressure-test-secret-32-chars!!';
+const TEST_SUBJECT = 'sender-subject-backpressure-tests';
+
+function makeToken(): string {
+  return jwt.sign({ sub: TEST_SUBJECT }, TEST_JWT_SECRET);
+}
+
+// ── Mock streamRepository so getById never hits the database ───────────────
+// NOTE: vi.mock factories are hoisted to the top of the file before any
+// variable declarations, so TEST_SUBJECT cannot be referenced here.
+// The literal 'sender-subject-backpressure-tests' must match TEST_SUBJECT.
+vi.mock('../../src/db/repositories/streamRepository.js', () => ({
+  streamRepository: {
+    getById: vi.fn().mockResolvedValue({
+      id: 'stream-mock',
+      sender: 'sender-subject-backpressure-tests',
+      recipient: 'other-recipient',
+    }),
+    upsertStream: vi.fn(),
+    updateStream: vi.fn(),
+  },
+}));
+
+// ── Slow-client factory that injects a Bearer token ───────────────────────
+
+async function createAuthenticatedSlowClient(port: number, hub: StreamHub): Promise<SlowClient> {
+  const token = makeToken();
+  const { WebSocket: WS } = await import('ws');
+  const clientWs = await new Promise<WebSocket>((resolve, reject) => {
+    const ws = new WS(`ws://127.0.0.1:${port}/ws/streams`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    ws.once('open', () => resolve(ws as unknown as WebSocket));
+    ws.once('error', reject);
+  });
+  // Re-use `createSlowClient` by passing the already-connected socket —
+  // instead, inline the minimal slow-client fixture logic here.
+  const localPort = (clientWs as unknown as { _socket?: { localPort?: number } })._socket?.localPort;
+  if (typeof localPort !== 'number') throw new Error('Unable to read client socket localPort');
+
+  const hubClients = (hub as unknown as { clients: Map<WebSocket, unknown> }).clients;
+  const serverSocket = Array.from(hubClients.keys()).find((ws) => {
+    return (ws as unknown as { _socket?: { remotePort?: number } })._socket?.remotePort === localPort;
+  });
+  if (!serverSocket) throw new Error(`Unable to find server WebSocket for client port ${localPort}`);
+
+  const messages: unknown[] = [];
+  let bufferedAmount = 0;
+
+  clientWs.on('message', (data) => {
+    messages.push(JSON.parse(data.toString()));
+  });
+
+  const origDescriptor = Object.getOwnPropertyDescriptor(serverSocket, 'bufferedAmount');
+  Object.defineProperty(serverSocket, 'bufferedAmount', {
+    configurable: true,
+    get: () => bufferedAmount,
+  });
+
+  const rawSocket = (serverSocket as unknown as { _socket?: { write?: (...a: unknown[]) => boolean; emit?: (e: string) => boolean } })._socket;
+  const originalWrite = rawSocket?.write?.bind(rawSocket);
+  const queuedCallbacks: Array<() => void> = [];
+
+  const restore = (): void => {
+    if (rawSocket && originalWrite) rawSocket.write = originalWrite as typeof rawSocket.write;
+    if (origDescriptor) Object.defineProperty(serverSocket, 'bufferedAmount', origDescriptor);
+    else delete (serverSocket as { bufferedAmount?: number }).bufferedAmount;
+  };
+
+  if (rawSocket?.write) {
+    rawSocket.write = ((...args: unknown[]): boolean => {
+      const cb = args.find((a): a is () => void => typeof a === 'function');
+      if (cb) queuedCallbacks.push(cb);
+      return false;
+    }) as typeof rawSocket.write;
+  }
+
+  return {
+    client: clientWs,
+    serverSocket,
+    messages,
+    subscribe(streamId: string) {
+      sendJson(clientWs, { type: 'subscribe', streamId });
+    },
+    setBufferedAmount(bytes: number) { bufferedAmount = bytes; },
+    getBufferedAmount() { return bufferedAmount; },
+    releaseDrain() {
+      bufferedAmount = 0;
+      if (rawSocket && originalWrite) rawSocket.write = originalWrite as typeof rawSocket.write;
+      for (const cb of queuedCallbacks.splice(0)) cb();
+      rawSocket?.emit?.('drain');
+    },
+    simulatePartition() { /* no-op for these tests */ },
+    restore,
+    close() { restore(); clientWs.close(); },
+  };
+}
 
 describe('StreamHub backpressure', () => {
   let server: http.Server;
@@ -24,7 +138,10 @@ describe('StreamHub backpressure', () => {
 
   beforeEach(async () => {
     server = http.createServer();
-    hub = new StreamHub(server);
+    hub = new StreamHub(server, {
+      jwtSecret: TEST_JWT_SECRET,
+      backpressureCollector: { intervalMs: 0 },
+    });
     hub._resetDedup();
     hub._resetMetrics();
     openClients = [];
@@ -50,7 +167,7 @@ describe('StreamHub backpressure', () => {
 
   it('emits a backpressure event and drops a message for a single slow client', async () => {
     const events = collectBackpressureEvents(hub);
-    const slow = await trackSlow(createSlowClient(port, hub));
+    const slow = await trackSlow(createAuthenticatedSlowClient(port, hub));
     slow.subscribe('stream-slow');
     await wait(30);
 
@@ -78,8 +195,8 @@ describe('StreamHub backpressure', () => {
   });
 
   it('does not let one slow peer block delivery to a fast peer on the same stream', async () => {
-    const slow = await trackSlow(createSlowClient(port, hub));
-    const fast = await track(connectClient(port));
+    const slow = await trackSlow(createAuthenticatedSlowClient(port, hub));
+    const fast = await track(connectClientWithAuth(port));
     const fastMessages: unknown[] = [];
     fast.on('message', (data) => fastMessages.push(JSON.parse(data.toString())));
 
@@ -108,8 +225,8 @@ describe('StreamHub backpressure', () => {
   it('accounts for multiple slow clients independently', async () => {
     const events = collectBackpressureEvents(hub);
     const [slowA, slowB] = await Promise.all([
-      trackSlow(createSlowClient(port, hub)),
-      trackSlow(createSlowClient(port, hub)),
+      trackSlow(createAuthenticatedSlowClient(port, hub)),
+      trackSlow(createAuthenticatedSlowClient(port, hub)),
     ]);
 
     slowA.subscribe('stream-many-slow');
@@ -133,7 +250,7 @@ describe('StreamHub backpressure', () => {
   });
 
   it('resumes delivery after a slow client drains below the drop threshold', async () => {
-    const slow = await trackSlow(createSlowClient(port, hub));
+    const slow = await trackSlow(createAuthenticatedSlowClient(port, hub));
     slow.subscribe('stream-recovers');
     await wait(30);
 
@@ -164,7 +281,7 @@ describe('StreamHub backpressure', () => {
 
   it('terminates clients above the hard threshold and cleans them up', async () => {
     const events = collectBackpressureEvents(hub);
-    const slow = await trackSlow(createSlowClient(port, hub));
+    const slow = await trackSlow(createAuthenticatedSlowClient(port, hub));
     slow.subscribe('stream-terminate');
     await wait(30);
 
@@ -191,7 +308,7 @@ describe('StreamHub backpressure', () => {
   });
 
   it('does not retain a slow disconnected client in later broadcasts', async () => {
-    const slow = await trackSlow(createSlowClient(port, hub));
+    const slow = await trackSlow(createAuthenticatedSlowClient(port, hub));
     slow.subscribe('stream-disconnect');
     await wait(30);
 
@@ -211,6 +328,20 @@ describe('StreamHub backpressure', () => {
     expect(BACKPRESSURE_DROP_BYTES).toBeGreaterThan(8);
     expect(BACKPRESSURE_TERMINATE_BYTES).toBeGreaterThan(BACKPRESSURE_DROP_BYTES);
   });
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  async function connectClientWithAuth(p: number): Promise<WebSocket> {
+    const token = makeToken();
+    const { WebSocket: WS } = await import('ws');
+    return new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WS(`ws://127.0.0.1:${p}/ws/streams`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      ws.once('open', () => resolve(ws as unknown as WebSocket));
+      ws.once('error', reject);
+    });
+  }
 
   async function track(clientPromise: Promise<WebSocket>): Promise<WebSocket> {
     const client = await clientPromise;

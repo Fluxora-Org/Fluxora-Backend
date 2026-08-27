@@ -18,24 +18,9 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './storeFactory.js';
 import { computeWebhookSignature } from './signature.js';
-import {
-  calculateNextRetryTime,
-  scheduleWebhookOutboxRetry,
-  shouldRetry,
-  isRetryableStatusCode,
-  checkWebhookDeliveryGate,
-  attemptWebhookDeliveryWithRateLimit,
-  countsTowardCircuitBreaker,
-  type EnhancedRetryPolicy,
-} from './retry.js';
-import {
-  webhookDeliveriesTotal,
-  webhookDeliveryDurationSeconds,
-} from '../metrics/businessMetrics.js';
-import type {
-  WebhookCircuitBreakerStore,
-  CircuitBreakerPolicy,
-} from '../redis/webhookCircuitBreakerStore.js';
+import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy, isRetryableStatusCode } from './retry.js';
+import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds, safeObserveDuration } from '../metrics/businessMetrics.js';
+import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import type { IWebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
 import { TokenBucketRateLimiter } from './rate-limiter.js';
@@ -261,8 +246,13 @@ function classifyPoisonFailure(
   payload: unknown,
   endpointUrl: string,
   statusCode: number | undefined,
-  policy: EnhancedRetryPolicy
+  policy: EnhancedRetryPolicy,
+  error?: string
 ): DLQReasonCode | null {
+  if (error && error.includes('Webhook delivery timeout')) {
+    return 'timeout';
+  }
+
   // Check for structurally invalid payload
   try {
     validateWebhookPayload(payload);
@@ -461,8 +451,7 @@ export class WebhookService {
       webhookDeliveryStore.store(delivery);
       webhookDeliveriesTotal.inc({ outcome: 'failed' });
     } finally {
-      const durationSeconds = (Date.now() - startTime) / 1000;
-      webhookDeliveryDurationSeconds.observe(durationSeconds);
+      safeObserveDuration(webhookDeliveryDurationSeconds, (Date.now() - startTime) / 1000);
     }
 
     return attempt;
@@ -570,7 +559,7 @@ export class WebhookService {
     correlationId?: string
   ): Promise<Response> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(new DOMException('Webhook delivery timeout', 'TimeoutError')), this.policy.timeoutMs);
 
     try {
       const headers: Record<string, string> = {
@@ -608,7 +597,7 @@ export class WebhookService {
           if (done) break;
           bytesRead += value.length;
           if (bytesRead > maxBytes) {
-            controller.abort();
+            controller.abort(new Error('Webhook response exceeds maximum allowed size'));
             throw new Error('Webhook response exceeds maximum allowed size');
           }
         }
@@ -974,10 +963,11 @@ export class WebhookDispatcher {
       payload,
       endpoint.endpointUrl,
       attempt.statusCode,
-      this.policy
+      this.policy,
+      attempt.error
     );
 
-    if (failureReasonCode === 'poison') {
+    if (failureReasonCode === 'poison' || failureReasonCode === 'timeout') {
       delivery.status = 'permanent_failure';
       delivery.attempts.push(attempt);
 

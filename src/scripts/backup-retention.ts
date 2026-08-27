@@ -37,6 +37,24 @@ import {
 } from '@aws-sdk/client-s3';
 import { createId } from '@paralleldrive/cuid2';
 
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+/** Raised when caller-supplied input fails validation (maps to HTTP 400). */
+export class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+
+/** Raised when required backup configuration is missing (maps to HTTP 503). */
+export class ConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfigurationError';
+  }
+}
+
 // ─── Restore Job Types ────────────────────────────────────────────────────────
 
 /**

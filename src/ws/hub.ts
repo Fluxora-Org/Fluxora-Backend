@@ -53,7 +53,6 @@ import { CORRELATION_ID_HEADER, isValidCorrelationId } from '../middleware/corre
 import {
   isValidStellarPublicKey,
   parseHandshakeSubscriptionFilter,
-  parseWsClientMessage,
   type SubscriptionFilter,
   type WsClientMessage,
   validateWebSocketMessage,
@@ -74,6 +73,7 @@ import {
   wsBatchEventsCoalescedTotal,
   wsBatchSizeExceededTotal,
 } from '../metrics/wsBackpressure.js';
+import { updateWsHealthMetrics } from '../metrics/wsHealth.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -251,6 +251,7 @@ interface ClientState {
   metrics: ConnectionMetrics;
   subscriptionFilters: Map<string, SubscriptionFilter>;
   messageTimestamps: number[];
+  missedPongs: number;
 }
 
 // ── Backpressure collector options ────────────────────────────────────────────
@@ -324,6 +325,10 @@ export interface StreamHubOptions {
    * @default 5000
    */
   closeFrameTimeoutMs?: number;
+  /** Configurable heartbeat interval in ms. Default 30000. */
+  healthProbeIntervalMs?: number;
+  /** Number of consecutive missed pongs before termination. Default 2. */
+  healthProbeMaxMissed?: number;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -358,6 +363,10 @@ export class StreamHub extends EventEmitter {
    * shutdown never blocks indefinitely on a single stalled socket.
    */
   private readonly closeFrameTimeoutMs: number;
+
+  private readonly healthProbeIntervalMs: number;
+  private readonly healthProbeMaxMissed: number;
+  private readonly healthProbeTimer: NodeJS.Timeout | undefined;
 
   public getEventStore(): ContractEventStore | undefined {
     return this.eventStore;
@@ -425,6 +434,9 @@ export class StreamHub extends EventEmitter {
         ? Math.max(50, options.closeFrameTimeoutMs)
         : 5_000;
 
+    this.healthProbeIntervalMs = options?.healthProbeIntervalMs ?? 30_000;
+    this.healthProbeMaxMissed = options?.healthProbeMaxMissed ?? 2;
+
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
 
@@ -439,6 +451,13 @@ export class StreamHub extends EventEmitter {
         : undefined;
     if (intervalMs > 0) {
       collectWsBackpressureMetrics(this, this.backpressureSlowThresholdBytes);
+    }
+
+    if (this.healthProbeIntervalMs > 0) {
+      this.healthProbeTimer = setInterval(() => this.runHealthProbes(), this.healthProbeIntervalMs);
+      if (this.healthProbeTimer.unref) {
+        this.healthProbeTimer.unref();
+      }
     }
 
     // ── WebSocket upgrade handler with atomic per-IP connection limiting ─────
@@ -568,6 +587,7 @@ export class StreamHub extends EventEmitter {
       metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
       subscriptionFilters: new Map(),
       messageTimestamps: [],
+      missedPongs: 0,
     };
     if (correlationId !== undefined) {
       state.correlationId = correlationId;
@@ -585,6 +605,13 @@ export class StreamHub extends EventEmitter {
     });
 
     this.applyHandshakeSubscription(ws, req);
+
+    ws.on('pong', () => {
+      const client = this.clients.get(ws);
+      if (client) {
+        client.missedPongs = 0;
+      }
+    });
 
     ws.on('message', (data, isBinary) => {
       const state = this.clients.get(ws);
@@ -699,7 +726,7 @@ export class StreamHub extends EventEmitter {
 
   // ── Message handling ───────────────────────────────────────────────────────
 
-  private async handleMessage(ws: WebSocket, raw: string): Promise<void> {
+  async handleMessage(ws: WebSocket, raw: string): Promise<void> {
     const result = validateWebSocketMessage(raw);
     if (!result.ok) {
       this.sendError(ws, result.code, result.message);
@@ -763,7 +790,7 @@ export class StreamHub extends EventEmitter {
       }
 
       const subject = state.authenticatedSubject;
-      if (!subject || (stream.sender !== subject && stream.recipient !== subject)) {
+      if (!subject || (stream.sender_address !== subject && stream.recipient_address !== subject)) {
         return { ok: false, code: 'FORBIDDEN', message: 'Not authorized for this stream' };
       }
 
@@ -1274,13 +1301,18 @@ export class StreamHub extends EventEmitter {
 
     if (result.filter === null) return;
 
-    const authorized = this.authorizeSubscriptionFilter(ws, result.filter);
-    if (!authorized.ok) {
-      this.sendError(ws, authorized.code, authorized.message);
-      return;
-    }
-
-    this.subscribe(ws, authorized.filter);
+    this.authorizeSubscriptionFilter(ws, result.filter)
+      .then((authorized) => {
+        if (!authorized.ok) {
+          this.sendError(ws, authorized.code, authorized.message);
+          return;
+        }
+        this.subscribe(ws, authorized.filter);
+      })
+      .catch((err) => {
+        // Just send a generic error if the authorization check throws
+        this.sendError(ws, 'INTERNAL_ERROR', 'Failed to authorize subscription filter');
+      });
   }
 
   private extractCorrelationId(headers: IncomingHttpHeaders): string | undefined {
@@ -1450,9 +1482,32 @@ export class StreamHub extends EventEmitter {
     }
   }
 
+  private runHealthProbes(): void {
+    let healthyCount = 0;
+    let unhealthyCount = 0;
+
+    for (const [ws, state] of this.clients.entries()) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+
+      if (state.missedPongs >= this.healthProbeMaxMissed) {
+        unhealthyCount++;
+        ws.terminate();
+      } else {
+        healthyCount++;
+        state.missedPongs++;
+        ws.ping();
+      }
+    }
+
+    updateWsHealthMetrics(healthyCount, unhealthyCount);
+  }
+
   async close(cb?: () => void): Promise<void> {
     if (this.backpressureCollectorInterval) {
       clearInterval(this.backpressureCollectorInterval);
+    }
+    if (this.healthProbeTimer) {
+      clearInterval(this.healthProbeTimer);
     }
     // Cancel all pending batch flush timers before closing.
     for (const acc of this.batchAccumulators.values()) {

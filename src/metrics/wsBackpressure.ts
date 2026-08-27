@@ -31,16 +31,6 @@
  *   - `fluxora_ws_batch_size_exceeded_total` — flushes where the batch hit
  *     `WS_BATCH_MAX_SIZE` before the flush window expired (early ejection).
  *
- * ### Micro-batching counters (three series)
- *
- *   - `fluxora_ws_batch_flush_total`         — total flush operations (each
- *     flush produces one outbound `stream_update_batch` frame per client).
- *   - `fluxora_ws_batch_events_coalesced_total` — total individual events
- *     that were coalesced across all flushes.  Comparing this to
- *     `fluxora_ws_batch_flush_total` gives the average batch size.
- *   - `fluxora_ws_batch_size_exceeded_total` — flushes where the batch hit
- *     `WS_BATCH_MAX_SIZE` before the flush window expired (early ejection).
- *
  * The per-client gauge is updated by a poll loop so the value reflects the
  * actual kernel/OS send-buffer state, not just the snapshot taken during a
  * `deliverBatch` call.  Series for disconnected clients are explicitly removed
@@ -56,8 +46,9 @@ import type { StreamHub } from '../ws/hub.js';
 /**
  * Default warning threshold for "slow client" classification.
  * Mirrors `BACKPRESSURE_DROP_BYTES` in `src/ws/hub.ts` (1 MiB) by default,
- * but can be overridden via `startWsBackpressureCollector` to e.g. trigger
- * before the hub actively drops frames.
+ * but can be overridden via the `slowThresholdBytes` parameter of
+ * `collectWsBackpressureMetrics` to e.g. trigger before the hub actively
+ * drops frames.
  */
 export const DEFAULT_WS_SLOW_CLIENT_BYTES = 1 * 1024 * 1024;
 
@@ -145,7 +136,7 @@ export const wsBroadcastBatchFlushLatencySeconds = metric(
  * Helper to record batch flush latency in seconds.
  */
 export function recordWsBroadcastBatchFlushLatency(durationSeconds: number): void {
-  if (durationSeconds >= 0) {
+  if (typeof durationSeconds === 'number' && isFinite(durationSeconds) && durationSeconds >= 0) {
     wsBroadcastBatchFlushLatencySeconds.observe(durationSeconds);
   }
 }
@@ -203,6 +194,22 @@ export const wsBatchSizeExceededTotal = metric(
 
 // ── Collection ────────────────────────────────────────────────────────────
 
+/**
+ * Collect all WebSocket backpressure and subscription-cardinality metrics
+ * from the hub and publish them to Prometheus gauges.
+ *
+ * Should be called on a periodic interval (typically every 5 s).  The
+ * function is designed to be resilient — missing hub methods, undefined
+ * socket properties, and invalid parameter values are all handled without
+ * throwing.
+ *
+ * @param hub                   StreamHub instance (or stub) providing
+ *                              `_getClients` and `_getStreamSubscriptions`.
+ * @param slowThresholdBytes    Buffered-amount threshold above which a client
+ *                              is classified as "slow".  Clamped to 0.
+ * @param topN                  Maximum number of stream-subscription-cardinality
+ *                              series to emit.  Clamped to 1.
+ */
 export function collectWsBackpressureMetrics(
   hub: {
     _getClients?: () => IterableIterator<[unknown, { id: string }]>;
@@ -211,20 +218,27 @@ export function collectWsBackpressureMetrics(
   slowThresholdBytes: number = DEFAULT_WS_SLOW_CLIENT_BYTES,
   topN: number = DEFAULT_WS_STREAM_CARDINALITY_TOP_N,
 ): void {
+  const effectiveSlowThreshold = slowThresholdBytes >= 0 ? slowThresholdBytes : 0;
+  const effectiveTopN = topN >= 1 ? topN : 1;
+
   const clientIterator = hub._getClients?.();
   if (clientIterator) {
     let max = 0;
     let slowCount = 0;
 
     for (const [ws, state] of clientIterator) {
+      if (!state || !state.id) continue;
+
       const socket = ws as { readyState?: number; bufferedAmount?: number };
       if (socket.readyState !== 1) continue;
 
-      const ba = typeof socket.bufferedAmount === 'number' ? socket.bufferedAmount : 0;
+      const ba = typeof socket.bufferedAmount === 'number' && socket.bufferedAmount >= 0
+        ? socket.bufferedAmount
+        : 0;
       wsClientBufferedBytes.set({ connection_id: state.id }, ba);
 
       if (ba > max) max = ba;
-      if (ba > slowThresholdBytes) slowCount++;
+      if (ba > effectiveSlowThreshold) slowCount++;
     }
 
     wsMaxBufferedBytes.set(max);
@@ -234,9 +248,9 @@ export function collectWsBackpressureMetrics(
   const streamSubs = hub._getStreamSubscriptions?.();
   if (streamSubs) {
     const sorted = Array.from(streamSubs.entries())
-      .map(([id, set]) => [id, set.size] as const)
+      .map(([id, set]) => [id, set?.size ?? 0] as const)
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      .slice(0, topN);
+      .slice(0, effectiveTopN);
 
     wsStreamSubscriberCount.reset();
     for (const [id, count] of sorted) {
@@ -254,4 +268,8 @@ export function resetWsBackpressureMetrics(): void {
   wsMaxBufferedBytes.reset();
   wsSlowClients.reset();
   wsStreamSubscriberCount.reset();
+  wsBatchFlushTotal.reset();
+  wsBatchEventsCoalescedTotal.reset();
+  wsBatchSizeExceededTotal.reset();
+  wsBroadcastBatchFlushLatencySeconds.reset();
 }

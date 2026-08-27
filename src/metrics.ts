@@ -97,3 +97,59 @@ export const banStoreActiveBans: Gauge =
 export function setActiveBansCount(count: number): void {
   banStoreActiveBans.set(count);
 }
+
+/**
+ * Total SIGHUP / hot-config refresh attempts.
+ * Labels:
+ *   result — 'success' | 'failure' | 'noop' (success with no field changes)
+ * Bounded cardinality; never labels secret values or env contents.
+ */
+export const configReloadTotal: Counter<'result'> =
+  (registry.getSingleMetric('fluxora_config_reload_total') as Counter<'result'>) ||
+  new Counter({
+    name: 'fluxora_config_reload_total',
+    help: 'Total hot-config reload attempts via SIGHUP / refreshHotConfig',
+    labelNames: ['result'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Duration of hot-config refresh cycles in seconds.
+ */
+export const configReloadDurationSeconds: Histogram =
+  (registry.getSingleMetric('fluxora_config_reload_duration_seconds') as Histogram) ||
+  new Histogram({
+    name: 'fluxora_config_reload_duration_seconds',
+    help: 'Duration of hot-config reload cycles in seconds',
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [registry],
+  });
+
+/**
+ * Monotonic generation of the last successfully applied HotConfig.
+ * Useful for verifying deploys/retries converge on the same generation.
+ */
+export const configReloadGeneration: Gauge =
+  (registry.getSingleMetric('fluxora_config_reload_generation') as Gauge) ||
+  new Gauge({
+    name: 'fluxora_config_reload_generation',
+    help: 'Generation counter of the last successfully applied hot config',
+    registers: [registry],
+  });
+
+/** Record a successful (or noop) config reload for observability. */
+export function recordConfigReloadSuccess(opts: {
+  changed: boolean;
+  durationMs: number;
+  generation: number;
+}): void {
+  configReloadTotal.inc({ result: opts.changed ? 'success' : 'noop' });
+  configReloadDurationSeconds.observe(opts.durationMs / 1000);
+  configReloadGeneration.set(opts.generation);
+}
+
+/** Record a failed config reload for observability. */
+export function recordConfigReloadFailure(durationMs: number): void {
+  configReloadTotal.inc({ result: 'failure' });
+  configReloadDurationSeconds.observe(durationMs / 1000);
+}

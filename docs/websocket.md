@@ -137,6 +137,16 @@ Emitted when validation of a client control frame fails or execution encounters 
 }
 ```
 
+## Connection Liveness & Health Probes
+
+To prevent stale or half-open connections (e.g., dropped by NAT timeouts or flaky mobile networks) from lingering indefinitely in the `StreamHub` registry and wasting fan-out cycles, the server implements a periodic WebSocket ping/pong health probe.
+
+- **Ping Interval**: The server sends a standard WebSocket `ping` frame to each connected client every 30 seconds (configurable via `healthProbeIntervalMs`).
+- **Pong Response**: Clients are expected to respond with a `pong` frame. Most standard WebSocket client libraries (such as the native browser API) do this automatically.
+- **Termination Threshold**: If a client misses consecutive `pong` responses (default is 2 missed pongs, configurable via `healthProbeMaxMissed`), the server proactively terminates the connection (`ws.terminate()`) and fully cleans up its subscription state.
+
+The aggregate health of all WebSocket connections is exposed via the Prometheus gauge `fluxora_ws_connection_health_total`, labeled by `status="healthy"` or `status="unhealthy"`.
+
 ## Backpressure Policy
 
 `StreamHub` checks each server-side `ws.bufferedAmount` before sending a
@@ -498,6 +508,11 @@ that occur **during** the fan-out iteration:
   for the disconnected client.
 - Pending batch-accumulator timers for the disconnected client are cancelled
   by `onDisconnect`, preventing stale frame delivery.
+
+_(Regression coverage: `tests/ws/ws.concurrency.test.ts` exercises both abrupt
+`ws.terminate()` and clean `ws.close()` occurring mid-broadcast on a 5-client
+fan-out, asserting `BackpressureMetrics` integrity and absence of escaped
+exceptions.)_
 
 ## Broadcast Authorization & Audit
 

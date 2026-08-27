@@ -17,7 +17,11 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: fluxora
-          POSTGRES_PASSWORD: ${{ secrets.E2E_DB_PASSWORD }}
+          # Ephemeral service container, destroyed with the runner. A literal
+          # default keeps the job runnable; postgres refuses to start on an
+          # empty password, which is why every nightly run failed at
+          # "Initialize containers" before reaching a single test.
+          POSTGRES_PASSWORD: ${{ secrets.E2E_DB_PASSWORD || 'fluxora_e2e_local' }}
           POSTGRES_DB: fluxora_e2e
         ports:
           - 5432:5432
@@ -28,10 +32,12 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: postgres://fluxora:${{ secrets.E2E_DB_PASSWORD }}@localhost:5432/fluxora_e2e
-      HORIZON_URL: ${{ secrets.E2E_HORIZON_URL }}
-      NETWORK_PASSPHRASE: ${{ secrets.E2E_NETWORK_PASSPHRASE }}
-      JWT_SECRET: ${{ secrets.E2E_JWT_SECRET }}
+      DATABASE_URL: postgres://fluxora:${{ secrets.E2E_DB_PASSWORD || 'fluxora_e2e_local' }}@localhost:5432/fluxora_e2e
+      # Horizon URL and network passphrase are public Stellar testnet constants,
+      # not secrets. Holding them in unset secrets meant the job could never run.
+      HORIZON_URL: ${{ secrets.E2E_HORIZON_URL || 'https://horizon-testnet.stellar.org' }}
+      NETWORK_PASSPHRASE: ${{ secrets.E2E_NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015' }}
+      JWT_SECRET: ${{ secrets.E2E_JWT_SECRET || 'e2e-test-only-not-a-real-secret' }}
       NODE_ENV: test
 
     steps:

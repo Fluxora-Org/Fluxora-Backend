@@ -46,6 +46,7 @@ import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
+import { startRedisSaturationMetrics, stopRedisSaturationMetrics } from './redis/client.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
 import { requestStopReplay } from './indexer/service.js';
 import { initializeIndexerLeaderElection, getIndexerLeaderElection } from './indexer/leaderElection.js';
@@ -56,8 +57,10 @@ import { createDeprecationMiddleware } from './middleware/deprecation.js';
 import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
-import { successResponse, errorResponse } from './utils/response.js';
+import { successResponse } from './utils/response.js';
+import { ApiError, notFound } from './errors.js';
 import { docsRouter } from './routes/docs.js';
+import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
@@ -395,6 +398,11 @@ export function createApp(options: AppOptions = {}): Express {
     stopRuntimeMetrics();
   });
 
+  startRedisSaturationMetrics();
+  addShutdownHook(() => {
+    stopRedisSaturationMetrics();
+  });
+
   // Shutdown hook ordering (runs after server.close() drains HTTP):
   //   1. Drain SSE — close open event-stream responses with retry:0.
   //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
@@ -515,6 +523,9 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/admin/dlq', dlqRouter);
   app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
 
+  // Experimental GraphQL federation gateway — feature-flagged off by default.
+  app.use('/api/graphql', graphqlGatewayRouter);
+
   app.get('/', (_req: Request, res: Response) => {
     res.json(
       successResponse({
@@ -525,11 +536,8 @@ export function createApp(options: AppOptions = {}): Express {
     );
   });
 
-  app.use((req: Request, res: Response) => {
-    const requestId = req.correlationId;
-    res.status(404).json(
-      errorResponse('NOT_FOUND', 'The requested resource was not found', undefined, requestId),
-    );
+  app.use((_req: Request, _res: Response, next: NextFunction) => {
+    next(notFound('The requested resource was'));
   });
 
   app.use(errorHandler);

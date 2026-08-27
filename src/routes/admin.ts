@@ -17,6 +17,7 @@ import { recordAuditEvent, recordAuditEventToDb } from '../lib/auditLog.js';
 import { getStreamHub } from '../ws/hub.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { clearIndexerStall, ActiveStallError } from '../indexer/stall.js';
+import { getDiagnosticsService } from '../services/diagnostics.js';
 import { routeDeprecations } from '../config/deprecations.js';
 import {
   queueRestoreJob,
@@ -709,4 +710,33 @@ adminRouter.get('/restore', (req, res) => {
   const requestId = req.correlationId;
   const jobs = listRestoreJobs();
   res.json(successResponse({ jobs }, requestId));
+});
+
+/**
+ * GET /api/admin/diagnostics
+ *
+ * Returns an aggregated system diagnostics snapshot aggregating DB pool stats,
+ * Redis connectivity, Stellar RPC circuit-breaker state, and indexer lag.
+ *
+ * Each sub-check is individually timeout-bounded (default 5s) so a single
+ * hung dependency cannot stall the whole endpoint.
+ *
+ * @security Requires valid Bearer admin token (`ADMIN_API_KEY`).
+ * @returns 200 with a {@link DiagnosticsReport}.
+ */
+adminRouter.get('/diagnostics', async (req, res) => {
+  const requestId = req.correlationId;
+  try {
+    const diagnostics = await getDiagnosticsService().runDiagnostics();
+    res.json(successResponse(diagnostics, requestId));
+  } catch (err) {
+    res.status(503).json(
+      errorResponse(
+        'DIAGNOSTICS_ERROR',
+        err instanceof Error ? err.message : 'Diagnostics check failed',
+        undefined,
+        requestId,
+      ),
+    );
+  }
 });

@@ -420,3 +420,51 @@ describe('IWebhookDeliveryStore interface compliance', () => {
     });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 4 — Idempotency and Crash Recovery (Send/Ack Window)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Idempotency and Crash Recovery (Send/Ack Window)', () => {
+  it('an outbox row becomes retryable when its lock expires (simulated crash before ack)', () => {
+    const store = new WebhookDeliveryStore();
+    const now = Date.now();
+    const id = store.addToOutbox({
+      deliveryId: 'crash_test_001',
+      eventId: 'evt',
+      eventType: 'stream.created',
+      endpointUrl: 'https://example.com',
+      payload: '{}',
+      secret: 'sec',
+      priority: 'high',
+      createdAt: now - 10000,
+      scheduledFor: now - 10000,
+      attempts: 0,
+      maxAttempts: 3,
+    });
+
+    // Worker 1 claims it (simulating start of network request)
+    const claimed = store.claimReadyOutboxItems({ workerId: 'worker-1', now });
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]?.status).toBe('in_flight');
+
+    // Worker 1 "crashes" before calling markOutboxItemDelivered
+    // ...
+
+    // Worker 2 attempts to claim immediately (lock has not expired)
+    const claimedTooSoon = store.claimReadyOutboxItems({ workerId: 'worker-2', now: now + 5000 });
+    expect(claimedTooSoon).toHaveLength(0);
+
+    // Worker 2 attempts to claim after lockTimeoutMs expires
+    const lockTimeoutMs = 30_000;
+    const claimedLater = store.claimReadyOutboxItems({ workerId: 'worker-2', now: now + lockTimeoutMs + 1000 });
+    
+    // The item becomes retryable and is claimed by Worker 2
+    expect(claimedLater).toHaveLength(1);
+    expect(claimedLater[0]?.id).toBe(id);
+    expect(claimedLater[0]?.lockedBy).toBe('worker-2');
+    
+    // Attempt count is unchanged because Worker 1 crashed before updating it
+    expect(claimedLater[0]?.attempts).toBe(0);
+  });
+});

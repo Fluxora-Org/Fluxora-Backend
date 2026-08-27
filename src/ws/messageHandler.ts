@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { STELLAR_PUBLIC_KEY_REGEX } from '../validation/schemas.js';
+import { logger } from '../lib/logger.js';
 
 const MAX_FILTER_VALUE_LENGTH = 256;
 const MAX_INBOUND_MESSAGE_BYTES = 4_096;
@@ -84,6 +85,14 @@ const recipientAddressSchema = z
   .regex(STELLAR_PUBLIC_KEY_REGEX, 'recipient_address must be a valid Stellar public key')
   .refine(isValidStellarPublicKey, 'recipient_address must be a valid Stellar StrKey public key');
 
+/**
+ * WebSocket Envelope Schemas
+ *
+ * We do not use `.passthrough()` on these schemas. By default, Zod strips any unknown fields.
+ * This ensures the message shape is explicitly locked down inside the backend, preserving backward
+ * compatibility for clients sending extra unrecognized fields (which will simply be stripped
+ * rather than failing the validation), while preventing accidental bleeding of unvalidated data.
+ */
 const subscriptionFilterSchema = z.object({
   stream_id: streamIdSchema.optional(),
   streamId: streamIdSchema.optional(),
@@ -91,7 +100,7 @@ const subscriptionFilterSchema = z.object({
   recipientAddress: recipientAddressSchema.optional(),
   /** Opt-in micro-batching: coalesce rapid events for this stream into a single frame. */
   batching: z.boolean().optional(),
-}).passthrough();
+});
 
 const subscriptionMessageSchema = z.object({
   type: z.enum(['subscribe', 'unsubscribe']),
@@ -102,7 +111,16 @@ const subscriptionMessageSchema = z.object({
   /** Opt-in micro-batching: coalesce rapid events for this stream into a single frame. */
   batching: z.boolean().optional(),
   filter: subscriptionFilterSchema.optional(),
-}).passthrough();
+});
+
+const replayFilterSchema = z.object({
+  afterEventId: z.string().trim().min(1).optional(),
+  fromLedger: z.number().int().nonnegative().optional(),
+  toledger: z.number().int().nonnegative().optional(),
+  contractId: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
+  topic: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
+  limit: z.number().int().positive().max(1000).optional(),
+});
 
 const replayMessageSchema = z.object({
   type: z.literal('replay'),
@@ -112,7 +130,8 @@ const replayMessageSchema = z.object({
   contractId: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
   topic: z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH).optional(),
   limit: z.number().int().positive().max(1000).optional(),
-}).passthrough();
+  filter: replayFilterSchema.optional(),
+});
 
 export interface SubscriptionFilter {
   streamId?: string;
@@ -198,12 +217,12 @@ function normalizeSubscriptionFilter(
 
 function normalizeReplayFilter(value: z.infer<typeof replayMessageSchema>): StreamEventReplayFilter {
   return {
-    ...(value.afterEventId !== undefined ? { afterEventId: value.afterEventId } : {}),
-    ...(value.fromLedger !== undefined ? { fromLedger: value.fromLedger } : {}),
-    ...(value.toledger !== undefined ? { toledger: value.toledger } : {}),
-    ...(value.contractId !== undefined ? { contractId: value.contractId } : {}),
-    ...(value.topic !== undefined ? { topic: value.topic } : {}),
-    ...(value.limit !== undefined ? { limit: value.limit } : {}),
+    ...((value.afterEventId ?? value.filter?.afterEventId) !== undefined ? { afterEventId: (value.afterEventId ?? value.filter?.afterEventId) } : {}),
+    ...((value.fromLedger ?? value.filter?.fromLedger) !== undefined ? { fromLedger: (value.fromLedger ?? value.filter?.fromLedger) } : {}),
+    ...((value.toledger ?? value.filter?.toledger) !== undefined ? { toledger: (value.toledger ?? value.filter?.toledger) } : {}),
+    ...((value.contractId ?? value.filter?.contractId) !== undefined ? { contractId: (value.contractId ?? value.filter?.contractId) } : {}),
+    ...((value.topic ?? value.filter?.topic) !== undefined ? { topic: (value.topic ?? value.filter?.topic) } : {}),
+    ...((value.limit ?? value.filter?.limit) !== undefined ? { limit: (value.limit ?? value.filter?.limit) } : {}),
   };
 }
 
@@ -221,13 +240,15 @@ function validationMessage(issues: z.ZodIssue[]): string {
  * @param raw Parsed JSON value from the client frame.
  * @returns The normalized WebSocket client message or a validation error.
  */
-export function validateWebSocketMessage(data: unknown): WsMessageParseResult {
+export function validateWebSocketMessage(data: unknown, correlationId?: string): WsMessageParseResult {
   if (typeof data !== 'string') {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'not_string' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a string' };
   }
 
   const byteLength = Buffer.byteLength(data, 'utf8');
   if (byteLength > MAX_INBOUND_MESSAGE_BYTES) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'payload_too_large', byteLength });
     return {
       ok: false,
       code: 'INVALID_MESSAGE',
@@ -239,16 +260,18 @@ export function validateWebSocketMessage(data: unknown): WsMessageParseResult {
   try {
     parsed = JSON.parse(data);
   } catch {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'malformed_json' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Invalid JSON' };
   }
 
-  return parseWsClientMessage(parsed);
+  return parseWsClientMessage(parsed, correlationId);
 }
 
-export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
+export function parseWsClientMessage(raw: unknown, correlationId?: string): WsMessageParseResult {
   // Reject oversized payloads before any parsing (issue #674)
   const rawString = typeof raw === 'string' ? raw : JSON.stringify(raw);
   if (rawString && rawString.length > MAX_MESSAGE_BYTES) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'oversized_payload', size: rawString.length });
     return { 
       ok: false, 
       code: 'INVALID_MESSAGE', 
@@ -257,16 +280,19 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
   }
 
   if (!isObject(raw)) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'not_object' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a JSON object' };
   }
 
   if (typeof raw.type !== 'string') {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'missing_or_invalid_type' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'type must be a string' };
   }
 
   if (raw.type === 'subscribe' || raw.type === 'unsubscribe') {
     const result = subscriptionMessageSchema.safeParse(raw);
     if (!result.success) {
+      logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'schema_validation', type: raw.type, issues: result.error.issues.map(i => i.message) });
       return { ok: false, code: 'INVALID_MESSAGE', message: validationMessage(result.error.issues) };
     }
 
@@ -279,6 +305,7 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
         },
       };
     } catch (error) {
+      logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'normalize_error', type: raw.type });
       return {
         ok: false,
         code: 'INVALID_MESSAGE',
@@ -290,6 +317,7 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
   if (raw.type === 'replay') {
     const result = replayMessageSchema.safeParse(raw);
     if (!result.success) {
+      logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'schema_validation', type: 'replay', issues: result.error.issues.map(i => i.message) });
       return { ok: false, code: 'INVALID_MESSAGE', message: validationMessage(result.error.issues) };
     }
 
@@ -302,10 +330,11 @@ export function parseWsClientMessage(raw: unknown): WsMessageParseResult {
     };
   }
 
+  logger.warn('ws_envelope_reject', correlationId, { code: 'UNKNOWN_TYPE', type: raw.type });
   return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${raw.type}` };
 }
 
-export function parseHandshakeSubscriptionFilter(url: string): HandshakeSubscriptionParseResult {
+export function parseHandshakeSubscriptionFilter(url: string, correlationId?: string): HandshakeSubscriptionParseResult {
   const params = new URL(url, 'ws://localhost').searchParams;
   const streamId = params.get('stream_id') ?? params.get('streamId');
   const recipientAddress = params.get('recipient_address') ?? params.get('recipientAddress');
@@ -320,8 +349,9 @@ export function parseHandshakeSubscriptionFilter(url: string): HandshakeSubscrip
   if (streamId !== null) input['stream_id'] = streamId;
   if (recipientAddress !== null) input['recipient_address'] = recipientAddress;
 
-  const result = parseWsClientMessage(input);
+  const result = parseWsClientMessage(input, correlationId);
   if (!result.ok) {
+    logger.warn('ws_handshake_reject', correlationId, { reason: result.message });
     return { ok: false, message: result.message };
   }
 

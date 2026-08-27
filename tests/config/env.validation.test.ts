@@ -80,6 +80,14 @@ describe('EnvSchema startup validation', () => {
     expect(config.redisEnabled).toBe(true);
     expect(config.maxRequestSizeBytes).toBe(1024 * 1024);
     expect(config.webhookPollIntervalMs).toBe(10000);
+    // Tracing knobs must resolve to stable defaults so deploys that omit them
+    // get deterministic config (not undefined).
+    expect(config.tracingEnabled).toBe(false);
+    expect(config.tracingSampleRate).toBe(1);
+    expect(config.tracingSamplingStrategy).toBe('head');
+    expect(config.tracingTailKeepErrors).toBe(true);
+    expect(config.tracingOtelEnabled).toBe(false);
+    expect(config.tracingLogEvents).toBe(false);
   });
 
   it('does not include secret values in validation messages', async () => {

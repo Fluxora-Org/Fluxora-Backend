@@ -116,7 +116,7 @@ export function parseFlagsJson(json: string): FlagMap {
   try {
     parsed = JSON.parse(json);
   } catch {
-    process.stderr.write('[featureFlags] Invalid feature flags JSON; using empty flag set\n');
+    process.stderr.write('[featureFlags] Invalid feature flags JSON — falling back to empty map\n');
     return flags;
   }
 
@@ -154,11 +154,7 @@ function loadFlagsFromEnv(): FlagMap {
   try {
     return parseFlagsJson(fs.readFileSync(filePath, 'utf8'));
   } catch (err) {
-    process.stderr.write(
-      `[featureFlags] Could not read FEATURE_FLAGS_FILE: ${
-        err instanceof Error ? err.message : String(err)
-      }\n`,
-    );
+    process.stderr.write(`[featureFlags] Could not read FEATURE_FLAGS_FILE: ${err instanceof Error ? err.message : String(err)} — falling back to empty map\n`);
     return new Map();
   }
 }
@@ -171,10 +167,16 @@ function loadFlagsFromEnv(): FlagMap {
  *
  * @returns Newly active feature flag map.
  */
-export function reloadFlags(): ReadonlyMap<string, FeatureFlagDefinition> {
+export function prepareReloadFlags(): () => ReadonlyMap<string, FeatureFlagDefinition> {
   const nextFlags = loadFlagsFromEnv();
-  currentFlags = nextFlags;
-  return currentFlags;
+  return () => {
+    currentFlags = nextFlags;
+    return currentFlags;
+  };
+}
+
+export function reloadFlags(): ReadonlyMap<string, FeatureFlagDefinition> {
+  return prepareReloadFlags()();
 }
 
 /**

@@ -396,9 +396,9 @@ async function handleGetEvents(
     const result = await indexerIngestionService.getEvents(filter);
 
     const events: GrpcStreamEventRecord[] = (result.events ?? []).map((e: import('../db/types.js').StreamEventRecord) => ({
-      eventId: e.event_id ?? '',
+      eventId: e.eventId ?? '',
       ledger: (e as unknown as Record<string, unknown>).ledger as number ?? 0,
-      contractId: e.contract_id ?? '',
+      contractId: e.contractId ?? '',
       topic: (e as unknown as Record<string, unknown>).topic as string ?? '',
       txHash: (e as unknown as Record<string, unknown>).tx_hash as string ?? '',
       payloadJson: JSON.stringify((e as unknown as Record<string, unknown>).payload ?? {}),
@@ -516,8 +516,8 @@ async function handleGetReplayStatus(
             ? progress.startedAt.toISOString()
             : String(progress.startedAt))
         : '',
-      contractId: (progress as Record<string, unknown>).contractId as string ?? '',
-      ledger: (progress as Record<string, unknown>).ledger as number ?? 0,
+      contractId: (progress as unknown as Record<string, unknown>).contractId as string ?? '',
+      ledger: (progress as unknown as Record<string, unknown>).ledger as number ?? 0,
     });
   } catch (err) {
     logger.error('grpc_gateway_status_error', undefined, {

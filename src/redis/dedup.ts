@@ -21,7 +21,7 @@ export interface DedupCache {
 }
 
 const DEDUP_TTL_SECONDS = 86400;
-const DEDUP_CACHE_MAX = 10_000;
+export const DEDUP_CACHE_MAX = 10_000;
 const FALLBACK_LOG_THROTTLE_MS = 5_000;
 
 let lastFallbackLog = 0;

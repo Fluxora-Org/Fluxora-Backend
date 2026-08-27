@@ -1,3 +1,4 @@
+import type { Attributes } from '@opentelemetry/api';
 /**
  * Distributed Tracing Hooks for Fluxora Backend.
  *
@@ -672,7 +673,9 @@ export function recordCircuitBreakerTransition(
 
   // 1. OTel active span (no-throw guard)
   try {
-    trace.getActiveSpan()?.addEvent('circuit_breaker.state_change', attributes);
+    trace
+      .getActiveSpan()
+      ?.addEvent('circuit_breaker.state_change', attributes as unknown as Attributes);
   } catch {
     // tracing failures must never affect application logic
   }
@@ -719,6 +722,37 @@ function getCorrelationIdFromContext(): string {
     // ignore
   }
   return 'unknown';
+}
+
+/**
+ * Retrieve the active traceId and spanId from the current OpenTelemetry
+ * span context, if a distributed trace is in progress.
+ *
+ * Reads from the same OTel AsyncLocalStorage context used by the rest of
+ * src/tracing/hooks.ts (via `trace.getActiveSpan().spanContext()`) rather
+ * than deriving trace context independently.  This guarantees a single
+ * source of truth for trace-identity fields in log records.
+ *
+ * When no active span exists (e.g. background jobs outside a request,
+ * tracing disabled, or called before middleware sets up the span), the
+ * returned object is empty and callers should spread it into log metadata
+ * without adding undefined keys.
+ *
+ * Errors thrown by the OTel SDK are silently swallowed — a broken
+ * exporter or collector must never affect application error-logging.
+ *
+ * @returns Object with `traceId` and `spanId` when available, otherwise `{}`.
+ */
+export function getActiveTraceSpanIds(): { traceId?: string; spanId?: string } {
+  try {
+    const spanContext = trace.getActiveSpan()?.spanContext();
+    if (spanContext?.traceId && spanContext?.spanId) {
+      return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+    }
+  } catch {
+    // OTel unavailable or broken — degrade gracefully.
+  }
+  return {};
 }
 
 /**

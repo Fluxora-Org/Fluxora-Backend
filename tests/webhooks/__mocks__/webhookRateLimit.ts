@@ -1,6 +1,6 @@
 import { vi, type Mocked } from 'vitest';
-import { RedisClient } from '../redis/client.js';
-import { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
+import { RedisClient } from '../../../src/redis/client.js';
+import { WebhookRateLimiter, RateLimitConfig } from '../../../src/redis/webhookRateLimit.js';
 
 /**
  * @param {RedisClient} mockRedisClient - Mock Redis client for testing.
@@ -13,11 +13,11 @@ export function setupRateLimiter(
     rateLimit: number, 
     windowMs: number
 ): WebhookRateLimiter {
-    const mockRateLimiter = {
-        checkLimit: vi.fn(),
+    const checkLimit = vi.fn();
+    checkLimit.mockResolvedValue({ canAttempt: true, retryAfterMs: null });
+
+    return {
+        checkLimit,
         recordFailure: vi.fn(),
     } as unknown as WebhookRateLimiter;
-
-    mockRateLimiter.checkLimit.mockResolvedValue({ canAttempt: true, retryAfterMs: null });
-    return mockRateLimiter;
 }

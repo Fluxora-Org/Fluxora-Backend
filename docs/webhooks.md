@@ -82,6 +82,52 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 4. A deferred attempt returns `{ shouldRetry: true, rateLimited: true, retryAt: now + windowMs }`. The dispatcher re-inserts the outbox row with `created_at = retryAt`, so the deferral is durable in PostgreSQL.
 5. `WEBHOOK_RETRY_RPS` (default `10`) controls `limit`; `windowMs` is `1000 ms` (one second).
 
+### Burst configuration (token-bucket extension)
+
+To allow momentary spikes in retry traffic above the steady-state
+`WEBHOOK_RETRY_RPS` limit (e.g. a batch of stream creations), opt in to
+the token-bucket layer with `WEBHOOK_RETRY_BURST`. When the burst is
+exhausted the limiter reverts to the steady-state rate configured above.
+
+| Env var                | Default | Description                                                                                          |
+|------------------------|--------:|------------------------------------------------------------------------------------------------------|
+| `WEBHOOK_RETRY_BURST`  |     `0` | Token-bucket capacity per consumer. `0` keeps the legacy sliding-window behaviour (backward compat). |
+
+When `WEBHOOK_RETRY_BURST > 0`:
+
+- The bucket starts full with `burst` tokens. Each successful delivery
+  decrements the bucket by `1.0`.
+- Tokens refill at the steady-state rate `WEBHOOK_RETRY_RPS` tokens per
+  `windowMs` (default `10 / 1000 ms` = `0.01` tokens/ms), clamped to
+  `burst`.
+- When the bucket has fewer than `1.0` tokens, the attempt returns
+  `{ canAttempt: false, retryAfterMs: ceil((1.0 - tokens) / refillRateMs) }`
+  and the dispatcher defers it identically to the sliding-window path
+  (outbox row re-enqueued with `created_at = retryAt`).
+
+When `WEBHOOK_RETRY_BURST = 0` (default), the limiter is exactly the
+`WEBHOOK_RETRY_RPS` sliding-window described above — behaviour is
+unchanged for existing deployments.
+
+**Observability** — the bucket fill level per consumer is exported as
+the Prometheus gauge `fluxora_webhook_rate_limiter_bucket_fill{consumer_hash="…"}`
+(the `consumer_hash` label is the same SHA-256 prefix used as the
+Redis sliding-window key, so dashboards that already join by consumer
+continue to work). The gauge is updated on every
+`TokenBucketRateLimiter.checkLimit` call. See
+`src/metrics/requestProtectionMetrics.ts` for the label cardinality
+guarantees (one time-series per currently-tracked consumer, not per
+historical attempt).
+
+**Security** — the bucket only refills at the steady-state
+`WEBHOOK_RETRY_RPS`, so a configured `burst` cannot be abused to sustain
+an effective outbound rate above the configured limit. Bursts absorb
+instantaneous spikes; over a `windowMs` window the average rate is at
+most `WEBHOOK_RETRY_RPS`. Bucket entries from inactive consumers are
+cleaned up after `30 s` of idleness, so a long-burst-then-disconnect
+consumer does not pin a stale gauge series. See
+`src/webhooks/rate-limiter.ts` and `tests/webhooks/rate-limiter.test.ts`.
+
 ### Failure modes
 
 | Condition | Behaviour |
@@ -102,6 +148,77 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 Webhook requests are signed with the configured secret and include delivery metadata headers. Production endpoints must use HTTPS unless they target loopback for local deployments. URLs with embedded credentials are rejected.
 
 Consumers must treat webhook delivery as at-least-once: verify the signature, deduplicate by `x-fluxora-delivery-id`, and make handlers idempotent.
+
+## Signature verification
+
+Webhook consumers verify incoming requests by recomputing the HMAC-SHA256 signature using the shared signing secret. The verification path lives in `src/webhooks/signature.ts`.
+
+### Request headers
+
+| Header | Description |
+|--------|-------------|
+| `x-fluxora-delivery-id` | Unique identifier for the delivery (used for deduplication). |
+| `x-fluxora-timestamp` | Unix timestamp (seconds) at which the request was signed. |
+| `x-fluxora-signature` | HMAC-SHA256 hex digest of `{timestamp}.{rawBody}`. |
+| `x-fluxora-event` | Event type (e.g. `stream.updated`). |
+
+### Verification steps
+
+1. Reject if the payload exceeds `DEFAULT_MAX_WEBHOOK_BODY_BYTES` (256 KiB).
+2. Reject if the timestamp is not a positive integer.
+3. Reject if the timestamp is outside `DEFAULT_WEBHOOK_TOLERANCE_SECONDS` (300s) of the current time.
+4. Compute the expected signature and compare using a constant-time comparison (`timingSafeEqual` over HMAC-hashed inputs) to prevent timing attacks.
+5. If `isDuplicateDelivery(deliveryId)` returns true, reject with `409 duplicate_delivery`.
+
+### Secret rotation grace window
+
+When a webhook consumer rotates its signing secret via the admin API, there is a transition period during which some producers may still be signing with the old secret. To avoid spurious verification failures, the verification path supports a **bounded dual-secret grace window**:
+
+- During the grace window, **both** the previous and current secret are accepted.
+- After the grace window expires, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
+- The rotation timestamp and grace-window expiry are **persisted** in the `webhook_secrets` table (not held in memory), so a process restart cannot silently extend or shrink the window.
+- The default grace window is `DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS` (86 400 seconds / 24 hours).
+
+#### Grace window parameters
+
+`verifyWebhookSignature` accepts the following optional fields for rotation support:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `secretPrevious` | `string` | The previous signing secret, valid only during the grace window. |
+| `previousSecretRotatedAt` | `number` | Unix timestamp (seconds) when the previous secret was rotated out. When omitted, the previous secret is accepted unconditionally (backward compatibility). |
+| `graceWindowSeconds` | `number` | Bounded grace window in seconds. Defaults to 86 400. Only consulted when `previousSecretRotatedAt` is also provided. |
+
+#### Rotation flow
+
+1. **Set initial secret**: `webhookSecretRepository.setSecret(id, secret)` inserts a row with no previous secret.
+2. **Rotate**: `webhookSecretRepository.rotateSecret(id, { newSecret, graceWindowSeconds })` atomically moves the current secret to `previous_secret`, sets `previous_secret_rotated_at` and `previous_secret_expires_at`, and activates the new secret as `current_secret`.
+3. **Verify**: The verification path checks both secrets. The previous secret is only accepted if `now < previous_secret_expires_at`.
+4. **Cleanup**: `webhookSecretRepository.clearExpiredPreviousSecret(id, now)` nulls out the previous secret once the grace window has expired, providing defense-in-depth so the stale secret cannot be used even if the verification path is misconfigured.
+
+#### Security properties
+
+- **Bounded acceptance**: The previous secret is rejected after `graceWindowSeconds` — no indefinite acceptance of a stale secret.
+- **Constant-time comparison**: Both secrets are verified using the same `constantTimeCompare` path, preventing timing-based secret enumeration.
+- **Persistence**: Rotation state survives process restarts because it is stored in PostgreSQL, not in-memory.
+- **Defense-in-depth cleanup**: The `clearExpiredPreviousSecret` method provides a second layer of protection by physically removing the previous secret after expiry.
+- **Backward compatibility**: When `previousSecretRotatedAt` is not provided, the previous secret is accepted unconditionally, preserving existing behavior for callers that have not yet adopted the grace window.
+
+#### Verification result codes
+
+| Code | Status | Description |
+|------|--------|-------------|
+| `ok` | 200 | Signature verified successfully. |
+| `previous_secret_expired` | 401 | The previous secret was provided but has exceeded its grace window. |
+| `signature_mismatch` | 401 | No provided secret matched the signature. |
+| `missing_secret` | 401 | No signing secret configured. |
+| `missing_delivery_id` | 401 | `x-fluxora-delivery-id` header missing. |
+| `missing_timestamp` | 401 | `x-fluxora-timestamp` header missing. |
+| `missing_signature` | 401 | `x-fluxora-signature` header missing. |
+| `invalid_timestamp` | 400 | Timestamp is not a positive integer. |
+| `timestamp_outside_tolerance` | 401 | Timestamp is outside the allowed tolerance window. |
+| `payload_too_large` | 413 | Request body exceeds the maximum allowed size. |
+| `duplicate_delivery` | 409 | Delivery ID has already been processed. |
 
 ## SSRF Protection
 
@@ -150,20 +267,15 @@ Add to your environment configuration:
 ```bash
 # Optional: Restrict webhook delivery to specific hosts
 WEBHOOK_ALLOWED_HOSTS=api.example.com,*.trusted.com
-
-# Optional: Webhook DNS resolution timeout (in milliseconds)
-WEBHOOK_DNS_TIMEOUT_MS=2000
 ```
 
 ### Error handling
 
 SSRF validation failures are logged without exposing the full URL for security. The validation fails closed: any ambiguous or unresolvable target is rejected with a `WebhookTargetValidationError`.
 
-If DNS resolution times out or is aborted, it is rejected with a `WebhookTargetValidationError` containing a `DNS_TIMEOUT` code, which fails closed.
-
 ### Implementation details
 
 - Validation function: `validateWebhookTarget(url, options)` in `src/webhooks/ssrfGuard.ts`
 - Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
 - Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
-- DNS resolution: Uses Node.js `dns.promises.lookup()` wrapped with a custom timeout helper and `AbortController` bounded by `WEBHOOK_DNS_TIMEOUT_MS` (default `2000` ms).
+- DNS resolution: Uses Node.js `dns.promises.lookup()`

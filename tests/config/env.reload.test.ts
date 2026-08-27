@@ -32,9 +32,13 @@ import {
   reloadHotConfig,
   captureStartupEnvSnapshot,
   resetStartupEnvSnapshot,
+  refreshHotConfig,
+  getLastHotConfig,
+  getHotConfigGeneration,
 } from '../../src/config/env.js';
 import {
   getRuntimeRateLimitConfig,
+  getRateLimitConfig,
   resetRuntimeRateLimitConfig,
   setRuntimeRateLimitConfig,
 } from '../../src/config/rateLimits.js';
@@ -210,6 +214,30 @@ describe('reloadHotConfig', () => {
     process.env.TRACING_ENABLED = '0';
     expect(reloadHotConfig().tracingEnabled).toBe(false);
   });
+
+  it('rejects negative rate limit values', () => {
+    process.env.RATE_LIMIT_IP_MAX = '-100';
+    expect(reloadHotConfig().rateLimitIpMax).toBeUndefined();
+
+    process.env.RATE_LIMIT_IP_WINDOW_MS = '-50000';
+    expect(reloadHotConfig().rateLimitIpWindowMs).toBeUndefined();
+  });
+
+  it('rejects zero rate limit values', () => {
+    process.env.RATE_LIMIT_IP_MAX = '0';
+    expect(reloadHotConfig().rateLimitIpMax).toBeUndefined();
+
+    process.env.RATE_LIMIT_APIKEY_MAX = '0';
+    expect(reloadHotConfig().rateLimitApikeyMax).toBeUndefined();
+  });
+
+  it('rejects non-numeric rate limit values', () => {
+    process.env.RATE_LIMIT_IP_MAX = 'not-a-number';
+    expect(reloadHotConfig().rateLimitIpMax).toBeUndefined();
+
+    process.env.RATE_LIMIT_IP_WINDOW_MS = 'abc';
+    expect(reloadHotConfig().rateLimitIpWindowMs).toBeUndefined();
+  });
 });
 
 // ─── captureStartupEnvSnapshot ───────────────────────────────────────────────
@@ -346,6 +374,120 @@ describe('SIGHUP → reloadFlags wiring', () => {
     reloadFlags();
     expect(getFlags().size).toBe(0);
   });
+
+  it('handles malformed FEATURE_FLAGS_JSON gracefully', () => {
+    process.env.FEATURE_FLAGS_JSON = 'invalid-json{{{';
+    const warnSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    
+    reloadFlags();
+    
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    expect(output).toContain('Invalid feature flags JSON');
+    expect(getFlags().size).toBe(0);
+  });
+
+  it('handles FEATURE_FLAGS_JSON with invalid entries gracefully', () => {
+    process.env.FEATURE_FLAGS_JSON = '[{"name":"valid","percentage":50},{"name":"","percentage":10}]';
+    reloadFlags();
+    
+    // Valid entry should be loaded, invalid entry skipped
+    expect(getFlags().get('valid')?.percentage).toBe(50);
+    expect(getFlags().size).toBe(1);
+  });
+
+  it('handles FEATURE_FLAGS_FILE read errors gracefully', () => {
+    process.env.FEATURE_FLAGS_FILE = '/nonexistent/path/to/flags.json';
+    delete process.env.FEATURE_FLAGS_JSON;
+    const warnSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    
+    reloadFlags();
+    
+    const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
+    expect(output).toContain('Could not read FEATURE_FLAGS_FILE');
+    expect(getFlags().size).toBe(0);
+  });
+});
+
+// ─── Concurrent reload safety ───────────────────────────────────────────────────
+
+describe('concurrent reloadHotConfig calls', () => {
+  it('handles concurrent reloadHotConfig calls safely', () => {
+    process.env.RATE_LIMIT_IP_MAX = '100';
+    process.env.TRACING_SAMPLE_RATE = '0.5';
+    
+    // Simulate concurrent calls
+    const results = Array.from({ length: 10 }, () => reloadHotConfig());
+    
+    // All results should be consistent and frozen
+    for (const result of results) {
+      expect(result.rateLimitIpMax).toBe(100);
+      expect(result.tracingSampleRate).toBe(0.5);
+      expect(Object.isFrozen(result)).toBe(true);
+    }
+  });
+
+  it('maintains atomicity when env changes during concurrent calls', () => {
+    process.env.RATE_LIMIT_IP_MAX = '50';
+    
+    // First batch of calls
+    const firstBatch = Array.from({ length: 5 }, () => reloadHotConfig());
+    
+    // Change env mid-stream
+    process.env.RATE_LIMIT_IP_MAX = '200';
+    
+    // Second batch of calls
+    const secondBatch = Array.from({ length: 5 }, () => reloadHotConfig());
+    
+    // First batch should have old value, second batch new value
+    for (const result of firstBatch) {
+      expect(result.rateLimitIpMax).toBe(50);
+    }
+    for (const result of secondBatch) {
+      expect(result.rateLimitIpMax).toBe(200);
+    }
+  });
+});
+
+// ─── Empty/undefined hot config values ───────────────────────────────────────────
+
+describe('empty/undefined hot config values', () => {
+  it('handles empty string rate limit values as undefined', () => {
+    process.env.RATE_LIMIT_IP_MAX = '';
+    process.env.RATE_LIMIT_IP_WINDOW_MS = '';
+    
+    const hot = reloadHotConfig();
+    expect(hot.rateLimitIpMax).toBeUndefined();
+    expect(hot.rateLimitIpWindowMs).toBeUndefined();
+  });
+
+  it('handles empty string tracing values with defaults', () => {
+    process.env.TRACING_SAMPLE_RATE = '';
+    process.env.TRACING_ENABLED = '';
+    process.env.LOG_LEVEL = '';
+    
+    const hot = reloadHotConfig();
+    expect(hot.tracingSampleRate).toBe(1); // default
+    expect(hot.tracingEnabled).toBe(false); // default
+    expect(hot.logLevel).toBe('info'); // default
+  });
+
+  it('handles empty string feature flags as undefined', () => {
+    process.env.FEATURE_FLAGS_JSON = '';
+    process.env.FEATURE_FLAGS_FILE = '';
+    
+    const hot = reloadHotConfig();
+    expect(hot.featureFlagsJson).toBeUndefined();
+    expect(hot.featureFlagsFile).toBeUndefined();
+  });
+
+  it('handles whitespace-only values appropriately', () => {
+    process.env.RATE_LIMIT_IP_MAX = '   ';
+    process.env.LOG_LEVEL = '   ';
+    
+    const hot = reloadHotConfig();
+    expect(hot.rateLimitIpMax).toBeUndefined();
+    expect(hot.logLevel).toBe('info'); // fallback to default
+  });
 });
 
 // ─── Security: no secret values in warn output ────────────────────────────────
@@ -363,5 +505,50 @@ describe('security: restart-only warn does not leak secrets', () => {
     const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
     expect(output).toContain('JWT_SECRET');
     expect(output).not.toContain(secretValue);
+  });
+});
+
+// ─── Deterministic refresh path (stabilization) ───────────────────────────────
+
+describe('refreshHotConfig + last snapshot', () => {
+  it('stores last HotConfig for getLastHotConfig consumers', () => {
+    process.env.RATE_LIMIT_IP_MAX = '111';
+    const hot = reloadHotConfig();
+    expect(getLastHotConfig()).toBe(hot);
+    expect(getHotConfigGeneration()).toBeGreaterThan(0);
+  });
+
+  it('refreshHotConfig applies rate limits via callback deterministically', async () => {
+    process.env.RATE_LIMIT_IP_MAX = '222';
+    process.env.RATE_LIMIT_IP_WINDOW_MS = '15000';
+
+    await refreshHotConfig({
+      applyRateLimits: (hot) => {
+        setRuntimeRateLimitConfig({
+          ip: {
+            windowMs: hot.rateLimitIpWindowMs ?? 60_000,
+            max: hot.rateLimitIpMax ?? 100,
+            enabled: true,
+          },
+        });
+      },
+    });
+
+    const runtime = getRuntimeRateLimitConfig();
+    expect(runtime?.ip.max).toBe(222);
+    expect(runtime?.ip.windowMs).toBe(15_000);
+
+    // Live getRateLimitConfig must observe the runtime override
+    const live = getRateLimitConfig(process.env as Record<string, string | undefined>);
+    expect(live.ip.max).toBe(222);
+  });
+
+  it('identical env across sequential refreshes yields changed=false after first', async () => {
+    process.env.RATE_LIMIT_IP_MAX = '50';
+    const first = await refreshHotConfig();
+    const second = await refreshHotConfig();
+    expect(first.changed).toBe(true);
+    expect(second.changed).toBe(false);
+    expect(second.hot.rateLimitIpMax).toBe(first.hot.rateLimitIpMax);
   });
 });

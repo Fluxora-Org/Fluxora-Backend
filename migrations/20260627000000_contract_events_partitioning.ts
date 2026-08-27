@@ -3,9 +3,9 @@ import { MigrationBuilder } from 'node-pg-migrate';
 export async function up(pgm: MigrationBuilder): Promise<void> {
   // 1. Rename existing table and indexes to avoid conflicts
   pgm.renameTable('contract_events', 'contract_events_old');
-  pgm.renameIndex('contract_events_old', 'contract_id', 'idx_contract_events_old_contract_id');
-  pgm.renameIndex('contract_events_old', 'tx_hash', 'idx_contract_events_old_tx_hash');
-  pgm.renameIndex('contract_events_old', 'happened_at', 'idx_contract_events_old_happened_at');
+  pgm.sql('ALTER INDEX IF EXISTS contract_events_old_contract_id_idx RENAME TO idx_contract_events_old_contract_id');
+  pgm.sql('ALTER INDEX IF EXISTS contract_events_old_tx_hash_idx RENAME TO idx_contract_events_old_tx_hash');
+  pgm.sql('ALTER INDEX IF EXISTS contract_events_old_happened_at_idx RENAME TO idx_contract_events_old_happened_at');
 
   // 2. Create the new range-partitioned table
   pgm.sql(`

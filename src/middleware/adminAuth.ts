@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 import { verifyToken } from '../lib/auth.js';
+import crypto from 'crypto';
 
 /**
  * Maximum allowed length for the `Authorization` header value, in bytes.
@@ -115,8 +116,7 @@ function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
 
   try {
-    const { timingSafeEqual: nativeEqual } = require('crypto');
-    return nativeEqual(Buffer.from(a), Buffer.from(b));
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
   } catch {
     let mismatch = 0;
     for (let i = 0; i < a.length; i++) {

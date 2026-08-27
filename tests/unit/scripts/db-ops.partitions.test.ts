@@ -335,7 +335,60 @@ describe('dropOldPartitions – fixture-driven expiry classification', () => {
   });
 });
 
-// ── 3. Integration-style: realistic multi-month partition scenario ────────────
+// ── 3. Input validation ──────────────────────────────────────────────────────
+
+describe('dropOldPartitions – input validation', () => {
+  it('rejects empty parentTable with explanatory message', async () => {
+    const pool = makeFakePool([]);
+    const result = await dropOldPartitions(pool, '', 30, true);
+    expect(result.droppedPartitions).toHaveLength(0);
+    expect(result.message).toContain('parentTable is required');
+  });
+
+  it('rejects negative olderThanDays', async () => {
+    const pool = makeFakePool([]);
+    const result = await dropOldPartitions(pool, 't', -1, true);
+    expect(result.message).toContain('non-negative');
+  });
+
+  it('rejects NaN olderThanDays', async () => {
+    const pool = makeFakePool([]);
+    const result = await dropOldPartitions(pool, 't', NaN, true);
+    expect(result.message).toContain('non-negative');
+  });
+
+  it('rejects Infinity olderThanDays', async () => {
+    const pool = makeFakePool([]);
+    const result = await dropOldPartitions(pool, 't', Infinity, true);
+    expect(result.message).toContain('non-negative');
+  });
+
+  it('accepts olderThanDays = 0', async () => {
+    const pool = makeFakePool([
+      { partition_name: 'ce_old', partition_bound: PG_BOUND_YEAR_2020 },
+    ]);
+    const result = await dropOldPartitions(pool, 't', 0, true);
+    expect(result.droppedPartitions).toContain('ce_old');
+  });
+
+  it('returns graceful message on pool.query rejection', async () => {
+    const pool = {
+      query: vi.fn().mockRejectedValue(new Error('ECONNREFUSED')),
+    } as unknown as Pool;
+    const result = await dropOldPartitions(pool, 'contract_events', 30, true);
+    expect(result.droppedPartitions).toHaveLength(0);
+    expect(result.message).toContain('Failed to query partitions');
+    expect(result.message).toContain('ECONNREFUSED');
+  });
+
+  it('does not call pool.query when validation fails', async () => {
+    const pool = { query: vi.fn() } as unknown as Pool;
+    await dropOldPartitions(pool, '', 30, true);
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+});
+
+// ── 4. Integration-style: realistic multi-month partition scenario ────────────
 
 describe('dropOldPartitions – realistic multi-month partition scenario', () => {
   beforeEach(() => {

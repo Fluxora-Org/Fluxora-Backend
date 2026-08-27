@@ -47,6 +47,26 @@
  * | `WebhookDispatcher`    | `webhook_outbox` table  | ✅        | Stream-event fanout via Postgres  |
  *
  * *Set `WEBHOOK_DELIVERY_STORE=postgres` to switch to the durable path.
+ *
+ * ### Idempotency and Crash Recovery (The Send/Ack Window)
+ *
+ * Both outbox implementations (management routes and stream dispatcher) are 
+ * subject to a "send/ack crash window". If the process crashes after sending the 
+ * HTTP network request but before committing the acknowledgement to the database:
+ * 
+ * 1. **Delivery Identity**: The `x-fluxora-delivery-id` header (and the `deliveryId` field) 
+ *    serves as the primary idempotency key.
+ * 2. **Receiver Deduplication**: Receivers *must* deduplicate based on this identity. 
+ *    Duplicate sends are an expected byproduct of at-least-once delivery guarantees.
+ * 3. **Retryability**: 
+ *    - In `WebhookDeliveryStore` / `PgWebhookDeliveryStore`: an in-flight row becomes 
+ *      retryable when its lock expires (`lockedAt + lockTimeoutMs < now`).
+ *    - In `WebhookDispatcher`: an outbox row becomes retryable immediately upon 
+ *      transaction rollback (the `FOR UPDATE SKIP LOCKED` is released).
+ * 4. **Signature Reuse Policy**: A crashed attempt is not recorded. The subsequent 
+ *    retry will be treated as the same attempt number as the crashed one, but will 
+ *    feature a *fresh* timestamp and a newly computed signature. Signatures are 
+ *    never cached or reused across attempts.
  */
 
 import type { WebhookDelivery, WebhookDeliveryStatus, DLQReasonCode } from './types.js';
@@ -69,7 +89,7 @@ export interface DeadLetterQueueItem {
 export type OutboxItemStatus = 'pending' | 'in_flight' | 'delivered' | 'failed';
 
 export interface ClaimOptions {
-  workerId: string;
+  workerId?: string;
   lockTimeoutMs?: number;
   now?: number;
 }

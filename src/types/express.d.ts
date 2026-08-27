@@ -10,6 +10,11 @@ declare global {
     interface Request {
       /** Attached by auth middleware when a valid JWT is present. */
       user?: UserPayload;
+      /**
+       * Request identifier. Used alongside `correlationId` for log correlation;
+       * call sites read it as `req.id ?? req.correlationId`.
+       */
+      id?: string;
       /** Attached by correlationId middleware. */
       correlationId?: string;
       /** Attached by apiVersion middleware based on the Accept-Version header. */

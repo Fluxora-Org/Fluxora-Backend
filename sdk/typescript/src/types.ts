@@ -254,4 +254,6 @@ export interface ListStreamsParams {
   recipient?: string;
   /** When `true`, include `total` count in the response. */
   include_total?: boolean;
+  /** Maximum pages to auto-paginate (default 10 000). */
+  maxPages?: number;
 }

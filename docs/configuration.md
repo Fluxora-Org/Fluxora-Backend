@@ -198,6 +198,24 @@ atomic in Node.js's single-threaded event loop.
 - The SIGHUP handler catches and logs all errors; a malformed environment after
   a SIGHUP never kills the process.
 
+### Deterministic refresh API
+
+In addition to `reloadHotConfig()`, the process entry point uses
+`refreshHotConfig()` which:
+
+1. Serializes concurrent SIGHUP / refresh callers onto a single in-flight apply.
+2. Builds a frozen `HotConfig`, then applies rate limits → feature flags → log level
+   in a fixed order.
+3. Records Prometheus metrics (`fluxora_config_reload_*`) for success/failure/noop.
+4. Exposes `getLastHotConfig()` / `getHotConfigGeneration()` for request paths and tests.
+
+Auth and restart-only secrets (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`,
+`INDEXER_WORKER_TOKEN`) are never applied by this path.
+
+The rate-limit middleware resolves `getRateLimitConfig()` on every request so
+`setRuntimeRateLimitConfig()` patches from SIGHUP take effect without recreating
+middleware instances.
+
 ### Test isolation helper
 
 `resetStartupEnvSnapshot()` (exported from `src/config/env.ts`) resets the

@@ -190,8 +190,8 @@ export class PostgresContractEventStore implements ContractEventStore {
    *
    * Enforces server-authoritative ingest timestamps:
    * - If `ingestedAt` is omitted, null, or undefined on an event record, the insert uses the
-   *   database-level DEFAULT `now()` value, making the PostgreSQL server the authoritative
-   *   source for ingestion timestamps.
+   *   database-level `now()` value, making the PostgreSQL server the authoritative source for
+   *   ingestion timestamps.
    * - If an explicit `ingestedAt` timestamp is provided, it will override the database default.
    * - This ensures existing database entries and legacy writes can define explicit timestamps
    *   if needed, but default writes rely on the database server time.
@@ -218,7 +218,8 @@ export class PostgresContractEventStore implements ContractEventStore {
         event.eventIndex,
         JSON.stringify(event.payload),
         event.happenedAt,
-        event.ledgerHash
+        event.ledgerHash,
+        event.ingestedAt ?? null,
       );
 
       const basePlaceholders = [
@@ -233,32 +234,41 @@ export class PostgresContractEventStore implements ContractEventStore {
         `$${placeholderOffset + 8}::jsonb`,
         `$${placeholderOffset + 9}::timestamptz`,
         `$${placeholderOffset + 10}`,
+        `$${placeholderOffset + 11}::timestamptz`,
       ];
 
-      placeholderOffset += 11;
-
-      if (event.ingestedAt !== undefined && event.ingestedAt !== null) {
-        values.push(event.ingestedAt);
-        basePlaceholders.push(`$${placeholderOffset}::timestamptz`);
-        placeholderOffset += 1;
-      } else {
-        basePlaceholders.push('DEFAULT');
-      }
+      placeholderOffset += 12;
 
       return `(${basePlaceholders.join(', ')})`;
     });
 
-    // The contract_events table is range-partitioned by happened_at.
-    // The PRIMARY KEY is (happened_at, event_id), so the ON CONFLICT target
-    // must include both columns. Using just (event_id) would fail with
-    // "there is no unique or exclusion constraint matching the ON CONFLICT
-    // specification" on a partitioned table.
+    // contract_events is range-partitioned by happened_at, so its primary key
+    // cannot provide a globally unique event_id constraint. Claim the event ID
+    // in the non-partitioned table first. The claim and canonical row insert
+    // are one statement, so concurrent workers have exactly one winner and a
+    // rolled-back transaction releases the claim automatically.
     const sql = `
+      WITH input (
+        event_id, ledger, contract_id, topic, tx_hash,
+        tx_index, operation_index, event_index, payload,
+        happened_at, ledger_hash, ingested_at
+      ) AS (
+        VALUES ${placeholders.join(', ')}
+      ), claimed AS (
+        INSERT INTO contract_event_dedup (event_id, happened_at)
+        SELECT event_id, happened_at FROM input
+        ON CONFLICT (event_id) DO NOTHING
+        RETURNING event_id
+      )
       INSERT INTO ${this.tableName} (
         event_id, ledger, contract_id, topic, tx_hash,
         tx_index, operation_index, event_index, payload, happened_at, ledger_hash, ingested_at
       )
-      VALUES ${placeholders.join(', ')}
+      SELECT i.event_id, i.ledger, i.contract_id, i.topic, i.tx_hash,
+             i.tx_index, i.operation_index, i.event_index, i.payload,
+             i.happened_at, i.ledger_hash, COALESCE(i.ingested_at, now())
+        FROM input i
+        INNER JOIN claimed c ON c.event_id = i.event_id
       ON CONFLICT (happened_at, event_id) DO NOTHING
       RETURNING event_id
     `;
@@ -274,7 +284,16 @@ export class PostgresContractEventStore implements ContractEventStore {
   }
 
   async rollbackBeforeLedger(ledger: number): Promise<void> {
-    await this.client.query(`DELETE FROM ${this.tableName} WHERE ledger >= $1`, [ledger]);
+    await this.client.query(`
+      WITH removed AS (
+        DELETE FROM ${this.tableName}
+         WHERE ledger >= $1
+         RETURNING event_id
+      )
+      DELETE FROM contract_event_dedup d
+       USING removed r
+       WHERE d.event_id = r.event_id
+    `, [ledger]);
   }
 
   async getLedgerHash(ledger: number): Promise<string | null> {

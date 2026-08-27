@@ -1,7 +1,7 @@
 import { PeerCertificate } from 'tls';
 import { recordAuditEvent } from '../lib/auditLog.js';
 // We don't have a direct prometheus counter imported yet, but we will mock or implement one here if necessary.
-import { metrics } from '../lib/metrics.js';
+import * as metrics from '../metrics/index.js';
 
 export type MtlsFailureReason = 'EXPIRED_CERT' | 'UNKNOWN_CA' | 'INVALID_SUBJECT' | 'NO_CERTIFICATE' | 'OTHER';
 
@@ -31,9 +31,16 @@ export function logMtlsValidationFailure(
 ): void {
   const reason = parseAuthorizationError(authError);
   
-  // Increment prometheus metric (assuming metrics.increment exists, if not we will define a stub or update it)
-  if (metrics && typeof metrics.increment === 'function') {
-    metrics.increment('indexer_mtls_validation_failures_total', 1, { reason });
+  // The metrics module exposes no generic `increment`; the call was written
+  // speculatively and guarded. Keep the guard, but look the symbol up in a way
+  // that type-checks against the module's actual surface.
+  const increment = (
+    metrics as unknown as {
+      increment?: (name: string, value: number, labels?: Record<string, string>) => void;
+    }
+  ).increment;
+  if (typeof increment === 'function') {
+    increment('indexer_mtls_validation_failures_total', 1, { reason });
   }
 
   // Extract safe certificate fields

@@ -262,6 +262,7 @@ Zero external runtime dependencies; uses the standard Web \`fetch\` API.
 | **Typed error hierarchy** | \`FluxoraApiError\`, \`IdempotencyConflictError\`, \`ValidationError\` |
 | **Client-side validation** | Input guards throw \`ValidationError\` before any network round-trip |
 | **Auth support** | Bearer JWT + static API key |
+| **Deterministic dispatch** | No hidden retries; query params and JSON bodies are sent in caller insertion order |
 
 ---
 
@@ -341,7 +342,7 @@ try {
 POST /api/streams requires an \`Idempotency-Key\` header. The SDK handles this automatically:
 
 - If you omit \`idempotencyKey\`, the SDK auto-generates a UUID v4.
-- If you supply a key, reuse the **same key when retrying** to prevent duplicate creation.
+- The SDK does **not** retry requests internally. If your application retries, supply and reuse the **same key** for every attempt of the same logical create operation.
 - Reusing a key with a **different body** throws \`IdempotencyConflictError\`.
 
 \`\`\`typescript
@@ -356,10 +357,26 @@ const same = await client.createStream(payload, key); // replays cached response
 ## Security notes
 
 - Bearer tokens and API keys are stored in memory only and never logged.
-- The \`Authorization\` header is only added when a credential is present.
+- The \`Authorization\` and \`X-API-Key\` headers are only added when non-empty credentials are present; runtime setters trim surrounding whitespace.
 - Client-side input validation rejects obviously invalid values before network dispatch.
+- Per-request SDK headers override constructor headers. Runtime credentials override any user-supplied \`Authorization\` or \`X-API-Key\` constructor headers.
 - TLS certificate validation is performed by the platform's \`fetch\` implementation.
 - Idempotency key values are never echoed in error bodies or logs (server-side guarantee).
+
+---
+
+## SDK Generation Contract
+
+The TypeScript SDK is generated from \`openapi.yaml\` and its compatibility
+surface is intentionally small:
+
+- Public exports remain \`types\`, \`errors\`, \`idempotency\`, \`pagination\`, and \`client\`.
+- \`FluxoraClient\` methods preserve the current backend envelopes and unwrap only the documented stream convenience shapes.
+- Requests use native \`fetch\` once per SDK method call. Network failures from \`fetch\` are allowed to bubble unchanged.
+- Query parameters omit only \`undefined\` and \`null\` values; \`false\`, \`0\`, and empty strings are serialized.
+- JSON responses are parsed when possible. Empty successful responses resolve to \`{}\`; text error bodies become \`FluxoraApiError\` messages.
+- Request IDs are read from \`X-Request-ID\` first, then response envelope metadata, then nested error objects.
+- Generated output must pass \`pnpm check:sdk:ts\`; drift is treated as a regression.
 
 ---
 
@@ -715,6 +732,8 @@ export interface ListStreamsParams {
   recipient?: string;
   /** When \`true\`, include \`total\` count in the response. */
   include_total?: boolean;
+  /** Maximum pages to auto-paginate (default 10 000). */
+  maxPages?: number;
 }
 `;
 }
@@ -899,12 +918,48 @@ function generateIdempotency() {
  * - \`hashBody()\` — computes a SHA-256 hex digest matching the server-side
  *   \`fingerprintInput()\` in \`src/routes/streams.ts\`.
  *
+ * ## Idempotency Contract
+ *
+ * ### Key Format and Validation
+ * - Keys must be 1–128 characters matching \`[A-Za-z0-9:_-]\`.
+ * - UUID v4 format is recommended but not required.
+ * - The server validates key format via \`requireIdempotencyKey\` middleware.
+ * - Invalid or missing keys return \`400 VALIDATION_ERROR\`.
+ *
+ * ### Conflict Detection
+ * - Same key + same body hash → cached response replayed (201 with \`Idempotency-Replayed: true\`).
+ * - Same key + different body hash → \`409 CONFLICT\` with \`stored_hash\` and \`incoming_hash\`.
+ * - Different keys → always treated as separate operations (no collision).
+ *
+ * ### Retry Behavior
+ * - Generate a **new key per logical operation**.
+ * - Reuse the **same key** when retrying a failed request to make it idempotent.
+ * - Do not reuse keys across different logical operations.
+ * - The SDK does not retry requests internally; retry logic is application-level.
+ *
+ * ### Cache TTL
+ * - Idempotency entries expire after \`IDEMPOTENCY_TTL_SECONDS\` (default 24 hours).
+ * - After expiry, the same key can be reused safely for a new operation.
+ * - TTL is server-side configured; clients cannot control it.
+ *
  * ## Security
  * - Keys are generated with \`crypto.randomUUID()\` (WebCrypto) where available,
  *   with a \`Math.random\`-based UUID v4 fallback for older environments.
  * - \`hashBody()\` uses \`crypto.subtle.digest\` (WebCrypto) with a Node.js
  *   \`node:crypto\` \`createHash\` fallback.
  * - Key values are never logged or echoed in error responses.
+ * - Only key length is logged server-side for debugging.
+ *
+ * ## Error Handling
+ * - \`hashBody()\` throws \`Error\` when no crypto API is available.
+ * - Conflict errors include both hashes for debugging mismatched payloads.
+ * - Network errors from \`fetch\` bubble up unchanged; retry with the same key.
+ *
+ * ## Observability
+ * - Successful responses include \`Idempotency-Key\` header echoing the submitted key.
+ * - Replayed responses include \`Idempotency-Replayed: true\` header.
+ * - Fresh responses include \`Idempotency-Replayed: false\` header.
+ * - Request IDs (from \`X-Request-ID\`) correlate client and server logs.
  *
  * @module @fluxora/sdk/idempotency
  */
@@ -1023,6 +1078,109 @@ export async function hashBody(body: unknown): Promise<string> {
     throw new Error('Crypto API unavailable: cannot compute SHA-256 hash');
   }
 }
+
+// ── Idempotency Helper ────────────────────────────────────────────────────────
+
+export interface CacheEntry<T> {
+  response: T;
+  statusCode: number;
+}
+
+export interface ICacheStore {
+  get<T>(key: string): Promise<CacheEntry<T> | null>;
+  set<T>(key: string, entry: CacheEntry<T>, ttlSeconds?: number): Promise<void>;
+  /** Returns false if the lock is already held */
+  acquireLock(key: string, ttlSeconds: number): Promise<boolean>;
+  releaseLock(key: string): Promise<void>;
+}
+
+export interface IdempotencyOptions {
+  /** The unique idempotency key provided by the client */
+  idempotencyKey: string;
+  /** The identifier of the authenticated caller (e.g. user ID or API key ID) */
+  callerId: string;
+  /** TTL for the idempotency cache in seconds (default: 86400 / 24h) */
+  ttlSeconds?: number;
+}
+
+export interface Logger {
+  info(message: string, meta?: any): void;
+  warn(message: string, meta?: any): void;
+  error(message: string, meta?: any): void;
+}
+
+export class IdempotencyError extends Error {
+  constructor(public code: string, message: string) {
+    super(message);
+    this.name = 'IdempotencyError';
+  }
+}
+
+export class IdempotencyHelper {
+  constructor(
+    private store: ICacheStore,
+    private logger: Logger = console
+  ) {}
+
+  /**
+   * Executes an operation idempotently.
+   * 
+   * @param options Idempotency settings including the key and caller context.
+   * @param operation The business logic to execute if this is a fresh request.
+   * @returns The result of the operation or the cached result.
+   */
+  async execute<T>(
+    options: IdempotencyOptions,
+    operation: () => Promise<{ response: T; statusCode: number }>
+  ): Promise<{ response: T; statusCode: number; cached: boolean }> {
+    const { idempotencyKey, callerId, ttlSeconds = 86400 } = options;
+
+    if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') {
+      this.logger.warn('Idempotency validation failed: Invalid idempotency key', { idempotencyKey, callerId });
+      throw new IdempotencyError('INVALID_KEY', 'Idempotency key is required and must be a valid string.');
+    }
+
+    if (!callerId || typeof callerId !== 'string' || callerId.trim() === '') {
+      this.logger.warn('Idempotency validation failed: Invalid caller ID', { idempotencyKey, callerId });
+      throw new IdempotencyError('INVALID_CALLER', 'Caller ID is required and must be a valid string.');
+    }
+
+    // Isolate keys per caller to prevent cross-tenant collisions
+    const scopedKey = \`idempotency:\${callerId}:\${idempotencyKey}\`;
+
+    // 1. Check if we already have a completed response
+    const cached = await this.store.get<T>(scopedKey);
+    if (cached) {
+      this.logger.info('Idempotency cache hit', { idempotencyKey, callerId });
+      return { ...cached, cached: true };
+    }
+
+    // 2. Acquire a lock to prevent concurrent processing of the same key
+    const lockKey = \`\${scopedKey}:lock\`;
+    const lockAcquired = await this.store.acquireLock(lockKey, 30); // 30 second lock
+    if (!lockAcquired) {
+      this.logger.warn('Concurrent request collision', { idempotencyKey, callerId });
+      throw new IdempotencyError('CONCURRENT_REQUEST', 'A request with this idempotency key is already in progress.');
+    }
+
+    try {
+      // 3. Execute the operation
+      this.logger.info('Executing fresh operation', { idempotencyKey, callerId });
+      const result = await operation();
+
+      // 4. Cache the result for future replays
+      await this.store.set(scopedKey, result, ttlSeconds);
+      
+      return { ...result, cached: false };
+    } catch (error) {
+      this.logger.error('Operation failed during idempotent execution', { idempotencyKey, callerId, error });
+      throw error;
+    } finally {
+      // 5. Release the lock
+      await this.store.releaseLock(lockKey);
+    }
+  }
+}
 `;
 }
 
@@ -1049,10 +1207,34 @@ function generatePagination() {
  * treat them as black boxes — do not construct or decode manually.
  * See \`docs/openapi/README.md\` for the full cursor protocol.
  *
+ * ## Retry idempotency
+ * When a page fetch fails, the internal cursor is **not** advanced — the next
+ * call to \`nextPage()\` retries the same logical page. This makes pagination
+ * fully idempotent under transient network failures.
+ *
+ * ## Concurrency guard
+ * \`nextPage()\` rejects with \`ValidationError\` if a fetch is already in-flight
+ * for this paginator, preventing interleaved cursor mutations.
+ *
+ * ## Page-limit safety
+ * \`autoPaginate()\` stops after \`maxPages\` pages (default 10 000) to prevent
+ * infinite iteration against a misbehaving server that never sets \`has_more\`
+ * to \`false\`.
+ *
  * @module @fluxora/sdk/pagination
  */
 
 import type { Stream, ListStreamsParams, StreamListResponse } from './types.js';
+import { ValidationError } from './errors.js';
+
+/** Default page size returned when \`limit\` is omitted. */
+export const DEFAULT_PAGE_LIMIT = 20;
+/** Minimum allowed page size. */
+export const MIN_PAGE_LIMIT = 1;
+/** Maximum allowed page size (server-enforced). */
+export const MAX_PAGE_LIMIT = 100;
+/** Default safety cap on pages fetched by \`autoPaginate()\`. */
+export const DEFAULT_MAX_PAGES = 10_000;
 
 /**
  * Cursor-based paginator for the GET /api/streams endpoint.
@@ -1078,11 +1260,16 @@ export class StreamPaginator {
   private readonly sender?: string;
   private readonly recipient?: string;
   private readonly includeTotal: boolean;
+  private readonly maxPages: number;
 
   /** Opaque cursor from the last response; \`null\` = start of sequence. */
   private nextCursor: string | null = null;
   /** \`false\` once the server signals no more pages. */
   private hasMore = true;
+  /** Tracks total pages fetched across all calls. */
+  private pagesFetchedCount = 0;
+  /** Guards against concurrent \`nextPage()\` calls. */
+  private inFlight = false;
 
   /**
    * @param fetchPage - Calls the API and returns a \`StreamListResponse\`.
@@ -1093,16 +1280,32 @@ export class StreamPaginator {
     fetchPage: (params: ListStreamsParams) => Promise<StreamListResponse>,
     params: ListStreamsParams = {},
   ) {
-    const limit = params.limit ?? 20;
-    if (limit < 1 || limit > 100) {
+    const limit = params.limit ?? DEFAULT_PAGE_LIMIT;
+    if (limit < MIN_PAGE_LIMIT || limit > MAX_PAGE_LIMIT) {
       throw new Error('limit must be an integer between 1 and 100 per paginationSchema');
     }
     this.fetchPage = fetchPage;
     this.limit = limit;
+    this.maxPages = params.maxPages ?? DEFAULT_MAX_PAGES;
     this.status = params.status;
     this.sender = params.sender;
     this.recipient = params.recipient;
     this.includeTotal = params.include_total ?? false;
+  }
+
+  /** The most recent opaque cursor, or \`null\` before the first fetch. */
+  get currentCursor(): string | null {
+    return this.nextCursor;
+  }
+
+  /** Whether the server may have more pages. */
+  get hasMorePages(): boolean {
+    return this.hasMore;
+  }
+
+  /** Total number of pages fetched so far. */
+  get pagesFetched(): number {
+    return this.pagesFetchedCount;
   }
 
   /**
@@ -1110,34 +1313,44 @@ export class StreamPaginator {
    *
    * @returns Array of \`Stream\` objects for this page, or \`null\` when all
    *          pages have been consumed (\`has_more\` was \`false\`).
+   * @throws {ValidationError} When a fetch is already in-flight.
    */
   async nextPage(): Promise<Stream[] | null> {
+    if (this.inFlight) {
+      throw new ValidationError('A pagination request is already in flight');
+    }
     if (!this.hasMore) return null;
 
-    const response = await this.fetchPage({
-      limit: this.limit,
-      cursor: this.nextCursor ?? undefined,
-      status: this.status,
-      sender: this.sender,
-      recipient: this.recipient,
-      include_total: this.includeTotal,
-    });
+    this.inFlight = true;
+    try {
+      const response = await this.fetchPage({
+        limit: this.limit,
+        cursor: this.nextCursor ?? undefined,
+        status: this.status,
+        sender: this.sender,
+        recipient: this.recipient,
+        include_total: this.includeTotal,
+      });
 
-    const pageData = response.data;
-    const streams: Stream[] = pageData?.streams ?? [];
-    const hasMore: boolean = pageData?.has_more ?? false;
-    const nextCursor: string | null =
-      pageData?.next_cursor ??
-      (response.meta?.next_cursor as string | null | undefined) ??
-      null;
+      const pageData = response.data;
+      const streams: Stream[] = pageData?.streams ?? [];
+      const hasMore: boolean = pageData?.has_more ?? false;
+      const nextCursor: string | null =
+        pageData?.next_cursor ??
+        (response.meta?.next_cursor as string | null | undefined) ??
+        null;
 
-    if (nextCursor && hasMore) {
-      this.nextCursor = nextCursor;
-    } else {
-      this.hasMore = false;
+      if (nextCursor && hasMore) {
+        this.nextCursor = nextCursor;
+      } else {
+        this.hasMore = false;
+      }
+
+      this.pagesFetchedCount++;
+      return streams;
+    } finally {
+      this.inFlight = false;
     }
-
-    return streams;
   }
 
   /**
@@ -1146,12 +1359,15 @@ export class StreamPaginator {
    * Pagination terminates automatically when the server has no more results.
    * A \`break\` inside \`for await\` stops iteration without fetching further pages.
    *
+   * A safety cap of \`maxPages\` (default 10 000) prevents infinite iteration
+   * against a misbehaving server.
+   *
    * @yields \`Stream\` objects one at a time.
    */
   async *autoPaginate(): AsyncGenerator<Stream, void, unknown> {
-    while (this.hasMore) {
+    while (this.hasMore && this.pagesFetchedCount < this.maxPages) {
       const page = await this.nextPage();
-      if (!page || page.length === 0) break;
+      if (!page) break;
       for (const item of page) {
         yield item;
       }
@@ -1160,6 +1376,7 @@ export class StreamPaginator {
 }
 `;
 }
+
 
 // ── src/client.ts ─────────────────────────────────────────────────────────────
 
@@ -1175,10 +1392,12 @@ function generateClient() {
  * - All monetary amounts flow as **decimal strings** (never JS numbers).
  * - Idempotency keys are auto-generated for POST /api/streams when omitted.
  * - Cursor-based pagination is encapsulated in \`StreamPaginator\`.
+ * - The SDK performs no hidden retries; callers own retry policy and should
+ *   reuse explicit idempotency keys for retried stream creation attempts.
  *
  * ## Security notes
  * - Bearer tokens and API keys are stored in memory only; never logged.
- * - The \`Authorization\` header is only set when a credential is present.
+ * - Auth headers are only set when non-empty credentials are present.
  * - Client-side validation (empty/missing required params) fires before any
  *   network round-trip, reducing the attack surface for injection.
  * - TLS validation is delegated to the platform's \`fetch\` implementation.
@@ -1257,8 +1476,8 @@ export class FluxoraClient {
 
   constructor(config: FluxoraClientConfig = {}) {
     this.baseUrl = (config.baseUrl ?? 'http://localhost:3000').replace(/\\/+$/, '');
-    this.apiKey = config.apiKey;
-    this.bearerToken = config.bearerToken;
+    this.apiKey = config.apiKey?.trim() || undefined;
+    this.bearerToken = config.bearerToken?.trim() || undefined;
     this.headers = {
       'User-Agent': 'FluxoraTypeScriptSDK/0.1.0',
       Accept: 'application/json',
@@ -1272,7 +1491,7 @@ export class FluxoraClient {
    * @security Token is stored in memory only; never logged.
    */
   public setBearerToken(token: string): void {
-    this.bearerToken = token;
+    this.bearerToken = token.trim() || undefined;
   }
 
   /**
@@ -1280,7 +1499,7 @@ export class FluxoraClient {
    * @security Key is stored in memory only; never logged.
    */
   public setApiKey(apiKey: string): void {
-    this.apiKey = apiKey;
+    this.apiKey = apiKey.trim() || undefined;
   }
 
   // ── Core HTTP dispatcher ───────────────────────────────────────────────────
@@ -1291,6 +1510,10 @@ export class FluxoraClient {
    * On non-2xx responses the method throws:
    * - \`IdempotencyConflictError\` for 409 \`IDEMPOTENCY_CONFLICT\`
    * - \`FluxoraApiError\` for all other non-2xx responses
+   *
+   * The dispatcher intentionally performs exactly one \`fetch\` call. Retry,
+   * timeout, and abort policies belong to the caller or runtime \`fetch\`
+   * implementation so SDK behavior remains deterministic across deploys.
    *
    * @param method  - HTTP verb (GET, POST, DELETE, PATCH, PUT).
    * @param path    - Request path (e.g. \`'/api/streams'\`).

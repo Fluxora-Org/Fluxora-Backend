@@ -336,7 +336,11 @@ export async function attemptWebhookDeliveryWithRateLimit(
 ): Promise<WebhookOutboxRetryPlan & { attempt?: WebhookDeliveryAttempt }> {
   const policy = input.policy ?? DEFAULT_RETRY_POLICY;
   const now = input.now ?? Date.now();
-  const gate = await checkWebhookDeliveryGate(input.consumerUrl, policy, deps, now);
+  // consumerUrl is optional on the input but is the rate-limit and
+  // circuit-breaker key; fall back to the stream id so callers that omit it
+  // still get per-stream isolation rather than a shared global bucket.
+  const consumerKey = input.consumerUrl ?? input.streamId;
+  const gate = await checkWebhookDeliveryGate(consumerKey, policy, deps, now);
 
   if (!gate.canDeliver) {
     return {
@@ -359,13 +363,13 @@ export async function attemptWebhookDeliveryWithRateLimit(
   let consecutiveFailures = gate.consecutiveFailures;
   if (success) {
     const breakerRecord = await circuitBreakerStore.recordSuccess(
-      input.consumerUrl,
+      consumerKey,
       policy as CircuitBreakerPolicy
     );
     consecutiveFailures = breakerRecord.consecutiveFailures;
   } else if (countsTowardCircuitBreaker(attempt, policy)) {
     const breakerRecord = await circuitBreakerStore.recordFailure(
-      input.consumerUrl,
+      consumerKey,
       policy as CircuitBreakerPolicy,
       now
     );

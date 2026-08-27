@@ -13,6 +13,26 @@ import {
   getIndexerLeaderElection,
   type IndexerLeaderElection,
 } from './leaderElection.js';
+import { checkReplayIntegrity } from './replayIntegrity.js';
+import {
+  recordIndexerBatchFailure,
+  recordIndexerBatchSuccess,
+} from '../metrics/indexerRed.js';
+import {
+  indexerLedgerLag,
+  indexerCatchupEtaSeconds,
+} from '../metrics/indexerLag.js';
+import {
+  indexerEventsIngestedTotal,
+  indexerLagSeconds,
+} from '../metrics/businessMetrics.js';
+import { getStellarRpcService } from '../services/stellar-rpc.js';
+import { rowReader, INT32_MAX, BIGINT_SAFE_MAX } from '../db/rowMapping.js';
+
+/** Seconds elapsed since a `process.hrtime.bigint()` start mark. */
+function elapsedSecondsSince(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
+}
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 
@@ -45,6 +65,25 @@ export class IndexerNotLeaderError extends Error {
         'currently running (or eligible to run) replay.',
     );
     this.name = 'IndexerNotLeaderError';
+  }
+}
+
+/**
+ * Thrown when a replay cancellation was requested but a single batch's
+ * database wait (e.g. `fetch` or `COMMIT`) did not settle within
+ * `INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS` of the request. The replay unwinds
+ * cooperatively so the in-memory indexer lock and the leader lease are
+ * released rather than being held indefinitely on a stuck connection.
+ * Already-committed batches remain durable; a re-run resumes from the last
+ * committed cursor offset.
+ */
+export class ReplayForcedStopError extends Error {
+  constructor(timeoutMs: number) {
+    super(
+      `Replay stop requested but the in-flight batch did not settle within ` +
+        `${timeoutMs} ms; forcing cancellation to release the indexer lock.`,
+    );
+    this.name = 'ReplayForcedStopError';
   }
 }
 
@@ -82,6 +121,22 @@ export const replayLock = new ReplayLock();
 // ── Graceful stop signal ───────────────────────────────────────────────────────
 
 let _stopRequested = false;
+let _stopRequestedAt: number | null = null;
+
+/**
+ * Resolved the moment a stop is requested so that in-flight database waits
+ * (inside `processBatch`) can be force-bounded by a timer instead of blocking
+ * forever on a stuck connection while holding the indexer lock.
+ */
+function createStopTriggered(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+let _stopTriggered = createStopTriggered();
 
 /**
  * Request that an in-progress replay stops at the next safe batch boundary.
@@ -89,12 +144,18 @@ let _stopRequested = false;
  * committed cursor offset.
  */
 export function requestStopReplay(): void {
-  _stopRequested = true;
+  if (!_stopRequested) {
+    _stopRequested = true;
+    _stopRequestedAt = Date.now();
+    _stopTriggered.resolve();
+  }
 }
 
 /** Reset stop flag — for testing only. */
 export function _resetStopReplay(): void {
   _stopRequested = false;
+  _stopRequestedAt = null;
+  _stopTriggered = createStopTriggered();
 }
 
 // ── In-memory progress state (for low-latency /status polling) ────────────────
@@ -167,54 +228,110 @@ export const replayState = new ReplayState();
 // Query with `Record<string, unknown>` and map through these helpers instead.
 // See `src/db/repositories/README.md`.
 
-function asNumber(value: unknown): number {
-  return Number(value);
-}
-
-function asNumberOrNull(value: unknown): number | null {
-  if (value === null || value === undefined) return null;
-  return Number(value);
-}
-
+/**
+ * Lenient timestamp coercion, retained only for `getReplayProgress`, whose
+ * mapper is out of scope for issue #1316 and is guarded by its own try/catch.
+ * New mappers must use the readers in `src/db/rowMapping.ts`.
+ */
 function asDate(value: unknown): Date {
   return value instanceof Date ? value : new Date(String(value));
 }
 
-function asDateOrNull(value: unknown): Date | null {
-  if (value === null || value === undefined) return null;
-  return asDate(value);
-}
-
-/** Map a raw `replay_cursors` row into a typed {@link ReplayCursor}. */
+/**
+ * Map a raw `replay_cursors` row into a typed {@link ReplayCursor}.
+ *
+ * The nullability contract comes from
+ * `migrations/1000000000002_create_replay_cursors.ts`:
+ *
+ * | Column                  | Type          | Nullable |
+ * | ----------------------- | ------------- | -------- |
+ * | `id`                    | `uuid` PK     | no       |
+ * | `contract_id`           | `text`        | no       |
+ * | `ledger`                | `integer`     | no       |
+ * | `from_block`            | `integer`     | **yes**  |
+ * | `to_block`              | `integer`     | **yes**  |
+ * | `total_rows`            | `integer`     | no       |
+ * | `last_committed_offset` | `integer`     | no       |
+ * | `started_at`            | `timestamptz` | no       |
+ * | `completed_at`          | `timestamptz` | **yes**  |
+ *
+ * Block heights, ledger sequences, row counts and offsets are non-negative by
+ * construction, so the readers are bounded to `[0, INT32_MAX]`. A negative or
+ * out-of-range value means the row is corrupt, and a corrupt cursor silently
+ * read as `0` would restart a replay from the beginning and re-emit every
+ * event — the exact failure this mapper now refuses to produce.
+ *
+ * @throws {RowMappingError} if any column violates the contract above.
+ */
 export function rowToReplayCursor(row: Record<string, unknown>): ReplayCursor {
+  const r = rowReader('replay_cursors', row);
+  const bounds = { min: 0, max: INT32_MAX };
+
   return {
-    id:                    row['id'] as string,
-    contract_id:           row['contract_id'] as string,
-    ledger:                asNumber(row['ledger']),
-    from_block:            asNumberOrNull(row['from_block']),
-    to_block:              asNumberOrNull(row['to_block']),
-    total_rows:            asNumber(row['total_rows']),
-    last_committed_offset: asNumber(row['last_committed_offset']),
-    started_at:            asDate(row['started_at']),
-    completed_at:          asDateOrNull(row['completed_at']),
+    id:                    r.requireString('id'),
+    contract_id:           r.requireString('contract_id'),
+    ledger:                r.requireInt('ledger', bounds),
+    from_block:            r.optionalInt('from_block', bounds),
+    to_block:              r.optionalInt('to_block', bounds),
+    total_rows:            r.requireInt('total_rows', bounds),
+    last_committed_offset: r.requireInt('last_committed_offset', bounds),
+    started_at:            r.requireDate('started_at'),
+    completed_at:          r.optionalDate('completed_at'),
   };
 }
 
-/** Map a raw `historical_events` / contract-event row into a typed {@link ContractEvent}. */
+/**
+ * Map a raw `historical_events` row into a typed {@link ContractEvent}.
+ *
+ * The nullability contract comes from
+ * `migrations/1000000000000_initial_schema.ts`:
+ *
+ * | Column             | Type        | Nullable |
+ * | ------------------ | ----------- | -------- |
+ * | `event_id`         | `text` PK   | no       |
+ * | `contract_id`      | `text`      | no       |
+ * | `ledger`           | `integer`   | no       |
+ * | `event_type`       | `text`      | no       |
+ * | `event_data`       | `jsonb`     | no       |
+ * | `block_height`     | `bigint`    | no       |
+ * | `transaction_hash` | `text`      | no       |
+ * | `created_at`       | `timestamp` | **yes**  |
+ *
+ * `ingested_at` and `created_at` are read only when the column is present on
+ * the row. That distinction is deliberate: `fetchEventBatch` does not select
+ * them, and an absent column must stay absent from the domain object rather
+ * than materialise as a fabricated timestamp. A column that *is* selected and
+ * holds NULL maps to `null`, because the schema permits it.
+ *
+ * `block_height` is a `bigint`, so it is bounded by the safe-integer range
+ * instead of int4 — `Number('9007199254740993')` rounds down silently, and a
+ * replay ordered by a rounded block height would skip or repeat events.
+ *
+ * Failure policy: fail fast. The single caller is `fetchEventBatch`, whose
+ * rows are inserted straight into `contract_events`. Today a corrupt row is
+ * coerced and then either rejected by Postgres with an opaque `invalid input
+ * syntax for type bigint: "NaN"` or — worse — inserted with a silently
+ * defaulted `ledger` of 0. Throwing here surfaces the same batch failure with
+ * the table, column and reason named, and prevents the second case entirely.
+ *
+ * @throws {RowMappingError} if any column violates the contract above.
+ */
 export function rowToContractEvent(row: Record<string, unknown>): ContractEvent {
+  const r = rowReader('historical_events', row);
+
   return {
-    event_id:         row['event_id'] as string,
-    contract_id:      row['contract_id'] as string,
-    ledger:           asNumber(row['ledger']),
-    event_type:       row['event_type'] as string,
-    event_data:       row['event_data'],
-    block_height:     asNumber(row['block_height']),
-    transaction_hash: row['transaction_hash'] as string,
+    event_id:         r.requireString('event_id'),
+    contract_id:      r.requireString('contract_id'),
+    ledger:           r.requireInt('ledger', { min: 0, max: INT32_MAX }),
+    event_type:       r.requireString('event_type'),
+    event_data:       r.requireJsonObject('event_data'),
+    block_height:     r.requireInt('block_height', { min: 0, max: BIGINT_SAFE_MAX }),
+    transaction_hash: r.requireString('transaction_hash'),
     ...(row['ingested_at'] !== undefined
-      ? { ingested_at: asDateOrNull(row['ingested_at']) }
+      ? { ingested_at: r.optionalDate('ingested_at') }
       : {}),
     ...(row['created_at'] !== undefined
-      ? { created_at: asDate(row['created_at']) }
+      ? { created_at: r.optionalDate('created_at') }
       : {}),
   };
 }
@@ -347,6 +464,7 @@ export class IndexerService {
   private batchSize: number;
   private maxRangeBlocks: number;
   private replayBudgetMs: number;
+  private replayStopForcedTimeoutMs: number;
   private cursorRepo: ReplayCursorRepository;
   private pool: pg.Pool;
   private readonly leaderElectionOverride: IndexerLeaderElection | undefined;
@@ -358,6 +476,7 @@ export class IndexerService {
     replayBudgetMs?: number,
     cursorRepo?: ReplayCursorRepository,
     leaderElection?: IndexerLeaderElection,
+    replayStopForcedTimeoutMs?: number,
   ) {
     // Use the injected pool or fall back to the shared db pool.
     // Accessing db.pool directly is avoided to keep the service testable.
@@ -365,6 +484,8 @@ export class IndexerService {
     this.batchSize = batchSize ?? config.indexer.replayBatchSize;
     this.maxRangeBlocks = maxRangeBlocks ?? config.indexer.maxRangeBlocks;
     this.replayBudgetMs = replayBudgetMs ?? config.indexer.replayBudgetMs;
+    this.replayStopForcedTimeoutMs =
+      replayStopForcedTimeoutMs ?? config.indexer.replayStopForcedTimeoutMs;
     this.cursorRepo = cursorRepo ?? new ReplayCursorRepository();
     // Only stored when explicitly injected (tests). Otherwise every call
     // resolves the *current* default via getLeaderElection() below —
@@ -377,6 +498,88 @@ export class IndexerService {
   /** Resolves the current leader-election instance — never cached, see constructor note. */
   private getLeaderElection(): IndexerLeaderElection {
     return this.leaderElectionOverride ?? getIndexerLeaderElection();
+  }
+
+  /** True when a stop has been requested (cooperative cancellation signal). */
+  private isStopRequested(): boolean {
+    return _stopRequested;
+  }
+
+  /**
+   * Cooperatively bound a database wait once a stop has been requested.
+   *
+   * - If no stop is requested, the operation runs unmodified.
+   * - If a stop is requested (either before or while the operation is in
+   *   flight), the wait is raced against a forced-timeout countdown. If the
+   *   database call does not settle within `replayStopForcedTimeoutMs` of the
+   *   stop being requested, a {@link ReplayForcedStopError} is thrown so the
+   *   replay unwinds and releases the in-memory indexer lock and leader lease
+   *   instead of hanging on a stuck connection.
+   *
+   * The forced timeout is a safety net; normal cancellation is handled by the
+   * explicit checkpoints in `processBatch` (before fetch / before COMMIT) which
+   * roll back the in-flight batch cleanly without waiting on a timer.
+   */
+  private async withStopGuard<T>(op: () => Promise<T>): Promise<T> {
+    const run = (): Promise<T> => op();
+
+    if (this.isStopRequested()) {
+      return this.raceForcedTimeout(run());
+    }
+
+    // No stop yet: start the operation, but arm a forced timeout that only
+    // fires if a stop is requested while the operation is in flight.
+    const opPromise = run();
+    let timer: NodeJS.Timeout | undefined;
+    const forced = _stopTriggered.promise.then(
+      () =>
+        new Promise<never>((_, reject) => {
+          const remaining = Math.max(
+            0,
+            (this.stopRequestedAt ?? Date.now()) + this.replayStopForcedTimeoutMs - Date.now(),
+          );
+          timer = setTimeout(
+            () => reject(new ReplayForcedStopError(this.replayStopForcedTimeoutMs)),
+            remaining,
+          );
+          if (typeof timer.unref === 'function') timer.unref();
+        }),
+    );
+    // Avoid an unhandled rejection if the operation settles before the timer.
+    forced.catch(() => undefined);
+
+    try {
+      return await Promise.race([opPromise, forced]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Race `opPromise` against the forced-stop timeout using the current deadline. */
+  private raceForcedTimeout<T>(opPromise: Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const remaining = Math.max(
+      0,
+      (this.stopRequestedAt ?? Date.now()) + this.replayStopForcedTimeoutMs - Date.now(),
+    );
+    const forced = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new ReplayForcedStopError(this.replayStopForcedTimeoutMs)),
+        remaining,
+      );
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    // Avoid an unhandled rejection if the operation settles first.
+    forced.catch(() => undefined);
+
+    return Promise.race([opPromise, forced]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
+  /** Timestamp (ms) at which the current stop was requested, or null if none. */
+  private get stopRequestedAt(): number | null {
+    return _stopRequestedAt;
   }
 
   /**
@@ -394,8 +597,23 @@ export class IndexerService {
    * @throws {Error}                    If a replay is already in progress on this process.
    * @throws {IndexerNotLeaderError}     If another instance holds the distributed replay lease.
    * @throws {ReplayBudgetExceededError} If the wall-clock budget is exceeded.
+   * @throws {ReplayForcedStopError}     If a stop was requested and a batch's DB wait did not settle within the forced timeout.
    */
   async replayEvents(request: ReplayRequest): Promise<void> {
+    // 0. Cancel-before-start: if a stop was already requested (e.g. shutdown
+    //    signalled before this replay began), do not acquire the in-memory
+    //    lock or the leader lease. The flag is cleared so a later, genuine
+    //    replay request is not permanently blocked by a stale cancellation.
+    if (_stopRequested) {
+      logger.info('replay_cancelled_before_start', undefined, {
+        event: 'replay_cancelled_before_start',
+        contract_id: request.contract_id,
+        ledger: request.ledger,
+      });
+      _resetStopReplay();
+      return;
+    }
+
     // 1. Validate input (no DB access yet)
     this.validateReplayRequest(request);
 
@@ -416,6 +634,7 @@ export class IndexerService {
 
     const replayStart = Date.now();
     let cursor: ReplayCursor | null = null;
+    let stoppedByRequest = false;
 
     try {
       // 3. Resolve or create the DB-backed cursor.
@@ -449,6 +668,7 @@ export class IndexerService {
       while (offset < totalRows) {
         // Stop-requested guard: honour a shutdown signal at a safe batch boundary.
         if (_stopRequested) {
+          stoppedByRequest = true;
           logger.warn('replay_stopped_by_shutdown', undefined, {
             event: 'replay_stopped_by_shutdown',
             contract_id: request.contract_id,
@@ -484,12 +704,46 @@ export class IndexerService {
         }
 
         // Acquire a fresh connection for this batch.
-        const batchResult = await this.processBatch(
-          cursor.id,
-          request,
-          offset,
-          batchIndex,
-        );
+        //
+        // RED instrumentation wraps *only* this call so the histogram measures
+        // the batch processing step itself (fetch → insert → cursor advance →
+        // COMMIT) and nothing else. The loop guards above are control flow, not
+        // work, and deliberately stay outside the measurement.
+        const batchStartedAt = process.hrtime.bigint();
+        let batchResult: { rowsFetched: number; aborted: boolean };
+        try {
+          batchResult = await this.processBatch(
+            cursor.id,
+            request,
+            offset,
+            batchIndex,
+          );
+        } catch (batchError) {
+          const classification = recordIndexerBatchFailure(
+            request.contract_id,
+            elapsedSecondsSince(batchStartedAt),
+            batchError,
+          );
+          logger.warn('replay_batch_failed', undefined, {
+            event: 'replay_batch_failed',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            batch_index: batchIndex,
+            offset,
+            error_source: classification.source,
+            error_type: classification.type,
+          });
+          throw batchError;
+        }
+        recordIndexerBatchSuccess(request.contract_id, elapsedSecondsSince(batchStartedAt));
+
+        if (batchResult.aborted) {
+          // A stop was requested mid-batch; the in-flight batch was rolled
+          // back and not committed. Stop at this boundary.
+          stoppedByRequest = true;
+          break;
+        }
 
         if (batchResult.rowsFetched === 0) {
           // Source exhausted ahead of totalRows count — safe to stop.
@@ -534,25 +788,51 @@ export class IndexerService {
         });
       }
 
-      // 6. Mark cursor as complete and record duration.
-      await this.completeCursor(cursor.id);
-      replayState.endReplay();
+      // 6. Finalize. If we stopped by request, leave the DB cursor as
+      //    'in-progress' so a future replay resumes from the last committed
+      //    offset; only mark it completed when the run finished naturally.
+      if (!stoppedByRequest) {
+        await this.completeCursor(cursor.id);
+        replayState.endReplay();
 
-      const durationSec = (Date.now() - replayStart) / 1_000;
-      indexerReplayDurationSeconds.observe(
-        { contract_id: request.contract_id.slice(0, 64) },
-        durationSec,
-      );
-      indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);
+        const durationSec = (Date.now() - replayStart) / 1_000;
+        indexerReplayDurationSeconds.observe(
+          { contract_id: request.contract_id.slice(0, 64) },
+          durationSec,
+        );
+        indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);
 
-      logger.info('replay_completed', undefined, {
-        event: 'replay_completed',
-        contract_id: request.contract_id,
-        ledger: request.ledger,
-        cursor_id: cursor.id,
-        total_rows: totalRows,
-        duration_sec: Math.round(durationSec * 100) / 100,
-      });
+        logger.info('replay_completed', undefined, {
+          event: 'replay_completed',
+          contract_id: request.contract_id,
+          ledger: request.ledger,
+          cursor_id: cursor.id,
+          total_rows: totalRows,
+          duration_sec: Math.round(durationSec * 100) / 100,
+        });
+
+        // ── Post-replay integrity check (fire-and-forget) ──────────────────
+        // Scoped to the affected ledger range — never a full-table scan.
+        // Runs asynchronously so the response path is never blocked.
+        this.runPostReplayIntegrityCheck(request).catch((err) => {
+          logger.warn('post_replay_integrity_check_failed', undefined, {
+            event: 'post_replay_integrity_check_failed',
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      } else {
+        // Cancellation: clear in-memory progress without marking the durable
+        // cursor complete. The stop flag is reset in `finally` so subsequent
+        // replays are not blocked by a stale cancellation request.
+        replayState.endReplay();
+        logger.info('replay_cancelled', undefined, {
+          event: 'replay_cancelled',
+          contract_id: request.contract_id,
+          ledger: request.ledger,
+          cursor_id: cursor.id,
+          offset,
+        });
+      }
     } catch (error) {
       replayState.endReplay();
       indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);
@@ -560,6 +840,10 @@ export class IndexerService {
     } finally {
       replayLock.release();
       await leaderElection.release();
+      // Clear a stale cancellation request so a future replay is not blocked.
+      if (_stopRequested) {
+        _resetStopReplay();
+      }
     }
   }
 
@@ -636,23 +920,51 @@ export class IndexerService {
    * The connection is acquired at the start and released in the `finally`
    * block so it is never held across multiple batches.
    *
-   * @returns `{ rowsFetched }` — 0 means the source is exhausted.
+   * Cooperative cancellation checkpoints: if a stop is requested before the
+   * batch's `fetch` or before its `COMMIT`, the in-flight (empty or
+   * not-yet-committed) transaction is rolled back and `{ aborted: true }` is
+   * returned so the caller can stop without persisting partial progress. The
+   * long-running `fetch` and `COMMIT` waits are additionally wrapped by
+   * {@link withStopGuard} so a stop requested while they are in flight is
+   * force-bounded by the configured timeout instead of holding the indexer
+   * lock on a stuck connection.
+   *
+   * @returns `{ rowsFetched, aborted }` — `rowsFetched === 0` means the source
+   *   is exhausted; `aborted === true` means a stop was honoured and the batch
+   *   was rolled back.
    */
   private async processBatch(
     cursorId: string,
     request: ReplayRequest,
     offset: number,
     batchIndex: number,
-  ): Promise<{ rowsFetched: number }> {
+  ): Promise<{ rowsFetched: number; aborted: boolean }> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
 
-      const events = await this.fetchEventBatch(client, request, offset, this.batchSize);
+      // Cooperative checkpoint (before any work in this batch): roll back the
+      // empty transaction and abort cleanly.
+      if (this.isStopRequested()) {
+        await client.query('ROLLBACK');
+        return { rowsFetched: 0, aborted: true };
+      }
+
+      const events = await this.withStopGuard(() =>
+        this.fetchEventBatch(client, request, offset, this.batchSize),
+      );
 
       if (events.length === 0) {
         await client.query('ROLLBACK');
-        return { rowsFetched: 0 };
+        return { rowsFetched: 0, aborted: false };
+      }
+
+      // Cooperative checkpoint (after fetch, before commit): a stop requested
+      // during the fetch wait means we discard this batch (it will be
+      // re-replayed on resume) rather than persisting partial progress.
+      if (this.isStopRequested()) {
+        await client.query('ROLLBACK');
+        return { rowsFetched: 0, aborted: true };
       }
 
       await this.batchInsertEvents(client, events);
@@ -670,8 +982,14 @@ export class IndexerService {
         [cursorId],
       );
 
-      await client.query('COMMIT');
-      return { rowsFetched: events.length };
+      // Cooperative checkpoint (immediately before COMMIT).
+      if (this.isStopRequested()) {
+        await client.query('ROLLBACK');
+        return { rowsFetched: 0, aborted: true };
+      }
+
+      await this.withStopGuard(() => client.query('COMMIT'));
+      return { rowsFetched: events.length, aborted: false };
     } catch (error) {
       // Roll back the partial batch — already-committed batches are untouched.
       try {
@@ -710,6 +1028,26 @@ export class IndexerService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Run the post-replay ledger-sequence integrity check in a fire-and-forget
+   * manner.  This method is called inside the main `try` block of
+   * `replayEvents` after the cursor has been marked complete, so it runs
+   * outside any in-flight batch transaction.
+   *
+   * The check is scoped to a window around the replayed ledger (not using
+   * `from_block`/`to_block`, which are block-height filters on the source
+   * table).  A window of ±1000 ledgers ensures the check is efficient without
+   * being a full-table scan.  It NEVER throws — all errors are caught and
+   * logged internally.
+   */
+  private async runPostReplayIntegrityCheck(request: ReplayRequest): Promise<void> {
+    const INTEGRITY_WINDOW_SIZE = 1000;
+    const fromLedger = Math.max(0, request.ledger - INTEGRITY_WINDOW_SIZE);
+    const toLedger = request.ledger + INTEGRITY_WINDOW_SIZE;
+
+    await checkReplayIntegrity(this.pool, request.contract_id, fromLedger, toLedger);
   }
 
   /**
@@ -787,8 +1125,9 @@ export class IndexerService {
       params.push(request.to_block);
     }
 
-    const result = await client.query<{ count: string }>(query, params);
-    return parseInt(result.rows[0]?.count ?? '0', 10);
+    const result = await client.query<Record<string, unknown>>(query, params);
+    const first = result.rows[0];
+    return parseInt(String(first?.['count'] ?? '0'), 10);
   }
 
   /**
@@ -900,7 +1239,7 @@ export class IndexerService {
 
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.last_committed_cursor, c.contract_id, c.ledger, c.from_block, c.to_block
           FROM indexer_replay_progress p
           JOIN replay_cursors c ON p.last_committed_cursor = c.id
@@ -916,28 +1255,31 @@ export class IndexerService {
 
       const row = result.rows[0];
       const request: ReplayRequest = {
-        contract_id: row.contract_id,
-        ledger: row.ledger,
-        from_block: row.from_block ?? undefined,
-        to_block: row.to_block ?? undefined,
+        contract_id: row['contract_id'] as string,
+        ledger: Number(row['ledger']),
+        from_block: row['from_block'] != null ? Number(row['from_block']) : undefined,
+        to_block: row['to_block'] != null ? Number(row['to_block']) : undefined,
       };
 
       logger.info('Resuming incomplete replay from checkpoint', undefined, {
         event: 'replay_resume_startup',
         contract_id: request.contract_id,
         ledger: request.ledger,
-        cursor_id: row.last_committed_cursor,
+        cursor_id: row['last_committed_cursor'] as string,
       });
 
       // Start the replay asynchronously so we do not block startup.
       this.replayEvents(request).catch((err) => {
-        logger.error('Resumed replay failed', err, {
+        logger.error('Resumed replay failed', undefined, {
           contract_id: request.contract_id,
           ledger: request.ledger,
+          error: err instanceof Error ? err.message : String(err),
         });
       });
     } catch (err) {
-      logger.error('Failed to check for incomplete replays on startup', err as Error);
+      logger.error('Failed to check for incomplete replays on startup', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }
@@ -957,7 +1299,7 @@ export class IndexerService {
 
     const client = await this.pool.connect();
     try {
-      const result = await client.query(`
+      const result = await client.query<Record<string, unknown>>(`
         SELECT p.status, p.total, p.started_at, p.updated_at,
                c.contract_id, c.ledger, c.id as cursor_id, c.last_committed_offset
           FROM indexer_replay_progress p
@@ -967,22 +1309,26 @@ export class IndexerService {
       `);
       if (result.rows.length > 0) {
         const row = result.rows[0];
+        const lastCommittedOffset = Number(row['last_committed_offset']);
+        const total = Number(row['total']);
         return {
-          isReplaying: row.status === 'in-progress',
-          rowsReplayed: row.last_committed_offset,
-          rowsRemaining: Math.max(0, row.total - row.last_committed_offset),
-          totalRows: row.total,
+          isReplaying: row['status'] === 'in-progress',
+          rowsReplayed: lastCommittedOffset,
+          rowsRemaining: Math.max(0, total - lastCommittedOffset),
+          totalRows: total,
           estimatedCompletion: null,
-          startedAt: row.started_at,
-          contractId: row.contract_id,
-          ledger: row.ledger,
-          replayCursorId: row.cursor_id,
-          currentOffset: row.last_committed_offset,
-          status: row.status,
+          startedAt: row['started_at'] != null ? asDate(row['started_at']) : null,
+          contractId: row['contract_id'] as string,
+          ledger: Number(row['ledger']),
+          replayCursorId: row['cursor_id'] as string,
+          currentOffset: lastCommittedOffset,
+          status: row['status'] as string,
         };
       }
     } catch (err) {
-      logger.error('Failed to fetch replay progress from database', err as Error);
+      logger.error('Failed to fetch replay progress from database', undefined, {
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       client.release();
     }
@@ -1040,6 +1386,12 @@ type IndexerState = {
   lastSafeLedger: number;
   reorgDetected: boolean;
   reorgHeight?: number;
+  // Catch-up telemetry state
+  lastIndexedLedger: number;
+  ledgerLag: number;
+  catchupEtaSeconds: number | null;
+  ledgerThroughputSamples: number[]; // Rolling window of ledgers/second samples
+  lastLedgerLagUpdateAt: number | null;
 };
 
 const rolledBackLedgers = new Set<number>();
@@ -1149,6 +1501,12 @@ export class IndexerIngestionService {
       duplicateEventCount: 0,
       lastSafeLedger: 0,
       reorgDetected: false,
+      // Catch-up telemetry initialization
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     };
   }
 
@@ -1177,6 +1535,12 @@ export class IndexerIngestionService {
       lastSafeLedger: 0,
       reorgDetected: false,
       reorgHeight: undefined,
+      // Reset catch-up telemetry state
+      lastIndexedLedger: 0,
+      ledgerLag: 0,
+      catchupEtaSeconds: null,
+      ledgerThroughputSamples: [],
+      lastLedgerLagUpdateAt: null,
     });
     rolledBackLedgers.clear();
   }
@@ -1194,6 +1558,105 @@ export class IndexerIngestionService {
       lastSafeLedger: this.state.lastSafeLedger,
       reorgDetected: this.state.reorgDetected,
     };
+  }
+
+  /**
+   * Get catch-up telemetry including ledger lag and ETA.
+   * This provides visibility into how far behind the indexer is and
+   * estimated time to catch up when lagging.
+   */
+  getCatchupTelemetry(): {
+    ledgerLag: number;
+    catchupEtaSeconds: number | null;
+    lastIndexedLedger: number;
+    lastLedgerLagUpdateAt: string | null;
+  } {
+    return {
+      ledgerLag: this.state.ledgerLag,
+      catchupEtaSeconds: this.state.catchupEtaSeconds,
+      lastIndexedLedger: this.state.lastIndexedLedger,
+      lastLedgerLagUpdateAt: this.state.lastLedgerLagUpdateAt
+        ? new Date(this.state.lastLedgerLagUpdateAt).toISOString()
+        : null,
+    };
+  }
+
+  /**
+   * Compute ledger lag and ETA using the Stellar RPC tip.
+   * This should be called periodically (e.g., on each successful ingest)
+   * to update catch-up telemetry without making redundant RPC calls.
+   *
+   * Uses a rolling average of ledger throughput samples to estimate ETA,
+   * avoiding naive linear extrapolation from a single sample.
+   */
+  private async updateCatchupTelemetry(maxLedger: number): Promise<void> {
+    try {
+      const rpcService = getStellarRpcService();
+      const tip = await rpcService.getLatestLedger();
+      const tipLedger = tip.sequence;
+
+      // Store previous values before updating
+      const previousLedger = this.state.lastIndexedLedger;
+      const previousUpdateTime = this.state.lastLedgerLagUpdateAt;
+
+      // Compute ledger lag (tip - last indexed)
+      const lag = Math.max(0, tipLedger - maxLedger);
+      this.state.ledgerLag = lag;
+      this.state.lastIndexedLedger = maxLedger;
+      const now = Date.now();
+      this.state.lastLedgerLagUpdateAt = now;
+
+      // Update Prometheus gauge
+      indexerLedgerLag.set(lag);
+
+      // Compute ETA if lagging and we have throughput data
+      if (lag > 0) {
+        // Calculate throughput if we have previous data
+        if (previousUpdateTime && previousLedger > 0) {
+          const timeSinceLastUpdate = (now - previousUpdateTime) / 1000; // seconds
+          
+          if (timeSinceLastUpdate > 0) {
+            const ledgersProcessed = maxLedger - previousLedger;
+            const throughput = ledgersProcessed / timeSinceLastUpdate; // ledgers/second
+
+            // Maintain rolling window of last 10 samples
+            this.state.ledgerThroughputSamples.push(throughput);
+            if (this.state.ledgerThroughputSamples.length > 10) {
+              this.state.ledgerThroughputSamples.shift();
+            }
+
+            // Compute average throughput from samples
+            const avgThroughput =
+              this.state.ledgerThroughputSamples.reduce((sum, sample) => sum + sample, 0) /
+              this.state.ledgerThroughputSamples.length;
+
+            // Estimate ETA using average throughput
+            if (avgThroughput > 0) {
+              const etaSeconds = lag / avgThroughput;
+              this.state.catchupEtaSeconds = etaSeconds;
+              indexerCatchupEtaSeconds.set(etaSeconds);
+            } else {
+              this.state.catchupEtaSeconds = null;
+              indexerCatchupEtaSeconds.set(0);
+            }
+          }
+        } else {
+          // Not enough data for ETA estimation yet
+          this.state.catchupEtaSeconds = null;
+          indexerCatchupEtaSeconds.set(0);
+        }
+      } else {
+        // Caught up - reset ETA
+        this.state.catchupEtaSeconds = null;
+        indexerCatchupEtaSeconds.set(0);
+      }
+    } catch (err) {
+      // If RPC fails, we can't compute lag - log but don't fail the ingest
+      warn('Failed to update catch-up telemetry (RPC error)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Don't update telemetry on RPC failure - keep last known values
+    }
   }
 
   private enforceRateLimit(actor: string): void {
@@ -1263,6 +1726,22 @@ export class IndexerIngestionService {
       debug('Indexer contract event ids processed', {
         requestId: context.requestId, insertedEventIds: result.insertedEventIds, duplicateEventIds: result.duplicateEventIds,
       });
+
+      if (result.insertedEventIds.length > 0) {
+        indexerEventsIngestedTotal.inc(result.insertedEventIds.length);
+
+        const latestHappenedAtMs = events.reduce((max, event) => {
+          const happenedAtMs = Date.parse(event.happenedAt);
+          return Number.isFinite(happenedAtMs) && happenedAtMs > max ? happenedAtMs : max;
+        }, 0);
+        if (latestHappenedAtMs > 0) {
+          indexerLagSeconds.set(Math.max(0, (Date.now() - latestHappenedAtMs) / 1000));
+        }
+
+        // Update catch-up telemetry (ledger lag and ETA)
+        // This uses the same Stellar RPC tip-fetching path to avoid redundant calls
+        await this.updateCatchupTelemetry(maxLedger);
+      }
 
       return {
         insertedCount: result.insertedEventIds.length,

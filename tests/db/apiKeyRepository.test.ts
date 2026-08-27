@@ -205,4 +205,65 @@ describe('apiKeyRepository', () => {
       await expect(apiKeyRepository.getById('x')).rejects.toThrow('connection refused');
     });
   });
+
+  // ── rowToRecord edge cases ──────────────────────────────────────────────────
+  // These lock down the exact scopes that come back from the DB so a silent
+  // field-assignment bug (using the raw column instead of the resolved variable)
+  // is immediately caught.
+
+  describe('rowToRecord — scope resolution', () => {
+    it('uses the resolved scopes variable, not the raw column (default fallback)', async () => {
+      // null scopes in the DB → default ['streams:read', 'streams:write']
+      mockQuery.mockResolvedValueOnce({ rows: [makeRow({ scopes: null })] });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['streams:read', 'streams:write']);
+    });
+
+    it('parses JSON-string scopes returned by some pg drivers', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: '["admin:read","admin:write"]' })],
+      });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['admin:read', 'admin:write']);
+    });
+
+    it('passes through a native array of scopes unchanged', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ scopes: ['streams:read'] })],
+      });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['streams:read']);
+    });
+
+    it('applies the default when scopes is undefined', async () => {
+      const rowWithoutScopes = makeRow();
+      delete (rowWithoutScopes as any)['scopes'];
+      mockQuery.mockResolvedValueOnce({ rows: [rowWithoutScopes] });
+      const record = await apiKeyRepository.getById('key-1');
+      expect(record!.scopes).toEqual(['streams:read', 'streams:write']);
+    });
+  });
+
+  // ── findActiveByPrefix — empty-prefix guard ─────────────────────────────────
+
+  describe('findActiveByPrefix — empty / blank prefix guard', () => {
+    it('returns [] immediately for an empty string prefix without querying the DB', async () => {
+      const result = await apiKeyRepository.findActiveByPrefix('');
+      expect(result).toEqual([]);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('returns [] immediately for a whitespace-only prefix without querying the DB', async () => {
+      const result = await apiKeyRepository.findActiveByPrefix('   ');
+      expect(result).toEqual([]);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('still queries the DB for a non-empty prefix', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+      const result = await apiKeyRepository.findActiveByPrefix('flx_abcd');
+      expect(result).toEqual([]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+  });
 });

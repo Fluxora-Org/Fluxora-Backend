@@ -31,6 +31,7 @@ import {
   pgDeadTuples,
   pgBloatRatio,
   pgLastAutovacuumAgeSeconds,
+  pgVacuumRowsRejectedTotal,
 } from '../../src/metrics/vacuumCollector.js';
 import { registry } from '../../src/metrics.js';
 
@@ -544,5 +545,100 @@ describe.skipIf(!isLiveDb)('collectVacuumMetrics — partition rollup (live DB)'
       // restoreAuditLogs() again as a safety net.
       await restoreAuditLogs();
     }
+  });
+});
+
+// ── Issue #1316: quarantine policy for unmappable vacuum stat rows ────────────
+
+describe('collectVacuumMetrics — row quarantine (#1316)', () => {
+  /** Minimal pg.Pool stand-in that replays a fixed result set. */
+  const fakePool = (rows: Record<string, unknown>[]): pg.Pool =>
+    ({ query: async () => ({ rows }) }) as unknown as pg.Pool;
+
+  const gaugeValue = async (
+    gauge: typeof pgDeadTuples,
+    table: string,
+  ): Promise<number | undefined> => {
+    const metric = await gauge.get();
+    return metric.values.find((v) => v.labels.table === table)?.value;
+  };
+
+  const counterValue = async (column: string): Promise<number | undefined> => {
+    const metric = await pgVacuumRowsRejectedTotal.get();
+    return metric.values.find((v) => v.labels.column === column)?.value;
+  };
+
+  // deRegisterVacuumMetrics() only detaches the metrics from the registry; the
+  // instances keep their samples. Reset the instances so each case starts clean.
+  const resetMetrics = () => {
+    pgDeadTuples.reset();
+    pgBloatRatio.reset();
+    pgLastAutovacuumAgeSeconds.reset();
+    pgVacuumRowsRejectedTotal.reset();
+  };
+
+  beforeEach(resetMetrics);
+  afterEach(resetMetrics);
+
+  it('skips a row whose NOT NULL count is NULL and keeps collecting the rest', async () => {
+    // Before #1316 the NULL became '0' and was published as a real reading of
+    // zero dead tuples — a table with runaway bloat would have looked healthy.
+    await expect(
+      collectVacuumMetrics(
+        fakePool([
+          { table_name: 'streams', n_dead_tup: null, n_live_tup: '100', last_autovacuum: null },
+          { table_name: 'audit_logs', n_dead_tup: '5', n_live_tup: '95', last_autovacuum: null },
+        ]),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(await gaugeValue(pgDeadTuples, 'streams')).toBeUndefined();
+    expect(await gaugeValue(pgDeadTuples, 'audit_logs')).toBe(5);
+    expect(await gaugeValue(pgBloatRatio, 'audit_logs')).toBeCloseTo(0.05);
+  });
+
+  it('counts each quarantined row under the offending column', async () => {
+    await collectVacuumMetrics(
+      fakePool([
+        { table_name: 'streams', n_dead_tup: '', n_live_tup: '1', last_autovacuum: null },
+        { table_name: null, n_dead_tup: '1', n_live_tup: '1', last_autovacuum: null },
+      ]),
+    );
+
+    expect(await counterValue('n_dead_tup')).toBe(1);
+    expect(await counterValue('table_name')).toBe(1);
+  });
+
+  it('never publishes NaN to a gauge', async () => {
+    // parseInt('') and parseInt('NaN') both yield NaN, which prom-client used
+    // to accept and export verbatim.
+    await collectVacuumMetrics(
+      fakePool([
+        { table_name: 'streams', n_dead_tup: 'NaN', n_live_tup: 'NaN', last_autovacuum: null },
+      ]),
+    );
+
+    const dead = await pgDeadTuples.get();
+    const bloat = await pgBloatRatio.get();
+    expect(dead.values.some((v) => Number.isNaN(v.value))).toBe(false);
+    expect(bloat.values.some((v) => Number.isNaN(v.value))).toBe(false);
+  });
+
+  it('still reports the -1 sentinel for a table that was never autovacuumed', async () => {
+    // last_autovacuum is genuinely nullable — quarantine must not swallow it.
+    await collectVacuumMetrics(
+      fakePool([
+        { table_name: 'streams', n_dead_tup: '0', n_live_tup: '0', last_autovacuum: null },
+      ]),
+    );
+
+    expect(await gaugeValue(pgLastAutovacuumAgeSeconds, 'streams')).toBe(-1);
+    expect(await counterValue('last_autovacuum')).toBeUndefined();
+  });
+
+  it('does not throw when every row is unmappable', async () => {
+    await expect(
+      collectVacuumMetrics(fakePool([{ table_name: 'streams', n_dead_tup: {} }])),
+    ).resolves.toBeUndefined();
   });
 });

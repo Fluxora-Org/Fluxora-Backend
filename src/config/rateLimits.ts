@@ -93,32 +93,45 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
 } {
   const enabled = env.RATE_LIMIT_ENABLED !== 'false';
 
-  const ip: RateLimitConfig = {
-    windowMs: parseInt(env.RATE_LIMIT_IP_WINDOW_MS ?? '', 10) || DEFAULT_IP_CONFIG.windowMs,
-    max: parseInt(env.RATE_LIMIT_IP_MAX ?? '', 10) || DEFAULT_IP_CONFIG.max,
-    enabled,
-  };
+  // Prefer the hot-reloaded runtime snapshot when present so SIGHUP / admin
+  // PUT /api/rate-limits/config take effect on the live request path without
+  // recreating the middleware. Falls back to env-seeded defaults otherwise.
+  const runtime = runtimeConfig;
 
-  const apiKey: RateLimitConfig = {
-    windowMs: parseInt(env.RATE_LIMIT_APIKEY_WINDOW_MS ?? '', 10) || DEFAULT_APIKEY_CONFIG.windowMs,
-    max: parseInt(env.RATE_LIMIT_APIKEY_MAX ?? '', 10) || DEFAULT_APIKEY_CONFIG.max,
-    enabled,
-  };
+  const ip: RateLimitConfig = runtime?.ip
+    ? { ...runtime.ip, enabled: runtime.ip.enabled && enabled }
+    : {
+        windowMs: parseInt(env.RATE_LIMIT_IP_WINDOW_MS ?? '', 10) || DEFAULT_IP_CONFIG.windowMs,
+        max: parseInt(env.RATE_LIMIT_IP_MAX ?? '', 10) || DEFAULT_IP_CONFIG.max,
+        enabled,
+      };
 
-  const admin: RateLimitConfig = {
-    windowMs: parseInt(env.RATE_LIMIT_ADMIN_WINDOW_MS ?? '', 10) || DEFAULT_ADMIN_CONFIG.windowMs,
-    max: parseInt(env.RATE_LIMIT_ADMIN_MAX ?? '', 10) || DEFAULT_ADMIN_CONFIG.max,
-    enabled,
-  };
+  const apiKey: RateLimitConfig = runtime?.apiKey
+    ? { ...runtime.apiKey, enabled: runtime.apiKey.enabled && enabled }
+    : {
+        windowMs:
+          parseInt(env.RATE_LIMIT_APIKEY_WINDOW_MS ?? '', 10) || DEFAULT_APIKEY_CONFIG.windowMs,
+        max: parseInt(env.RATE_LIMIT_APIKEY_MAX ?? '', 10) || DEFAULT_APIKEY_CONFIG.max,
+        enabled,
+      };
+
+  const admin: RateLimitConfig = runtime?.admin
+    ? { ...runtime.admin, enabled: runtime.admin.enabled && enabled }
+    : {
+        windowMs:
+          parseInt(env.RATE_LIMIT_ADMIN_WINDOW_MS ?? '', 10) || DEFAULT_ADMIN_CONFIG.windowMs,
+        max: parseInt(env.RATE_LIMIT_ADMIN_MAX ?? '', 10) || DEFAULT_ADMIN_CONFIG.max,
+        enabled,
+      };
 
   const trustProxy = env.RATE_LIMIT_TRUST_PROXY !== 'false';
-  
+
   // Parse allowlist IPs for health probes
   const allowlistIps = new Set<string>();
   const allowlistEnv = env.RATE_LIMIT_ALLOWLIST_IPS ?? '';
   if (allowlistEnv) {
-    for (const ip of allowlistEnv.split(',').map(s => s.trim()).filter(Boolean)) {
-      allowlistIps.add(ip);
+    for (const entry of allowlistEnv.split(',').map((s) => s.trim()).filter(Boolean)) {
+      allowlistIps.add(entry);
     }
   }
 

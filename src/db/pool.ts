@@ -203,7 +203,6 @@ export function createPool(config?: PoolConfig): pg.Pool {
     // incompatible (PgBouncer returns error on PREPARE/EXECUTE).  Setting
     // allowExitOnIdle: false disables the cache so the driver does not try to
     // use PREPARE.  In session mode we explicitly enable it (default in pg).
-    allowExitOnIdle: !isTransactionMode,
   });
 
   // Store queueLimit and poolMode on the pool instance for use in query()
@@ -219,7 +218,11 @@ export function createPool(config?: PoolConfig): pg.Pool {
   // lost and queries would run without any timeout.  Operators must configure
   // statement_timeout at the pooler layer (pgbouncer.ini `server_reset_query`
   // or Postgres `ALTER ROLE … SET statement_timeout`).
-  pool.on('connect', (client: pg.PoolClient) => {
+  // @types/pg declares the 'connect' listener as `() => void`, but pg passes
+  // the PoolClient at runtime. Narrow the emitter for this one call.
+  (pool as unknown as {
+    on(event: 'connect', cb: (c: pg.PoolClient) => void): void;
+  }).on('connect', (client: pg.PoolClient) => {
     syncGauges(pool, poolName);
     if (!isTransactionMode && cfg.statementTimeoutMs > 0) {
       // Fire-and-forget; errors are surfaced via pool.on('error')

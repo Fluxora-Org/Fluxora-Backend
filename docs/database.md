@@ -166,11 +166,78 @@ The `contract_events` table is partitioned by `happened_at` to ensure bounded gr
 
 ### Partition Pre-creation
 
-To avoid rows landing in the unindexed `DEFAULT` partition, partitions for the next 3 months are pre-created by the background job `src/jobs/partitionMaintenance.ts`.
+To avoid rows landing in the unindexed `DEFAULT` partition, the background job `src/jobs/partitionMaintenance.ts` pre-creates monthly partitions ahead of schedule for every range-partitioned table it manages.
 
-1. The job runs every 24 hours.
-2. It uses `pg_try_advisory_lock` to prevent concurrent execution.
-3. If partition creation falls behind, the job logs an error and should be monitored for alerting.
+#### Managed tables
+
+| Table | Managed today? | Notes |
+|---|---|---|
+| `contract_events` | Yes | Range-partitioned since `20260627000000_contract_events_partitioning.ts` |
+| `audit_logs` | Not yet | Currently a plain table (see `1774715200000_audit-and-webhook-outbox.ts`). The job detects partitioning automatically at runtime — once `audit_logs` is migrated to `PARTITION BY RANGE`, this job starts managing it with no code change required. |
+
+The job checks each table via `pg_class.relkind = 'p'` + `pg_partitioned_table.partstrat = 'r'` before touching it; a table that is not range-partitioned is skipped silently (logged at `debug`, not an error).
+
+#### Partition naming
+
+Monthly partitions are named `<table>_y<YYYY>m<MM>` (e.g. `contract_events_y2026m07`), matching the convention already used by `tests/db/contractEvents.partitionPruning.test.ts` and `tests/db/vacuumCollector.collect.test.ts`. Month boundaries are computed in **UTC** (`Date.UTC(...)`) to avoid off-by-one errors near midnight on a server running in a non-UTC timezone.
+
+#### Schedule and idempotency
+
+1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus the next `monthsAhead` months (default `3`, see `DEFAULT_MONTHS_AHEAD` in `src/jobs/partitionMaintenance.ts`).
+2. It acquires a single **non-blocking** advisory lock (`pg_try_advisory_lock(123456789)`, exported as `PARTITION_MAINTENANCE_LOCK_ID`) before doing any work. If another instance already holds the lock, the run is a no-op — it does not wait or retry, so overlapping cron + manual invocations across multiple app instances never race to create the same partition.
+3. Every `CREATE TABLE` uses `IF NOT EXISTS`, so re-running the job when all partitions already exist performs zero DDL and is always a safe no-op — the defining idempotency property required of this job.
+4. The lock is released in a `finally` block, so a failure partway through (e.g. one table's DDL fails) never leaves the lock held for subsequent runs.
+
+#### Behind-schedule alerting
+
+Every run checks whether the **current month's** partition already existed *before* this run created it. Since the job pre-creates months in advance, the current month's partition should already exist by the time it becomes current — if it's still missing, an earlier scheduled run was missed or failed, and rows for today may have already been landing in the unindexed `DEFAULT` partition.
+
+When this happens, the job:
+
+- Emits a structured `error`-level log:
+  ```json
+  {
+    "event": "partition_maintenance_behind_schedule",
+    "table": "contract_events",
+    "partition": "contract_events_y2026m07",
+    "level": "error",
+    "message": "Partition maintenance fell behind schedule: current-month partition was missing"
+  }
+  ```
+- Increments the `fluxora_partition_maintenance_behind_schedule_total{table="..."}` counter.
+- Still creates the missing partition immediately afterward (self-healing) — the alert reports a `DEFAULT`-partition risk window that already occurred, it does not prevent the fix.
+
+##### Recommended alert
+
+```yaml
+- alert: PartitionMaintenanceBehindSchedule
+  expr: increase(fluxora_partition_maintenance_behind_schedule_total[1d]) > 0
+  severity: critical
+  annotations:
+    summary: "A scheduled partition pre-creation run was missed — rows may have landed in the DEFAULT partition"
+```
+
+#### Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted) |
+| `fluxora_partition_maintenance_behind_schedule_total` | Counter | `table` | Incremented when the current-month partition was found missing (see above) |
+
+#### Security
+
+- Table names come exclusively from the developer-controlled `CANDIDATE_TABLES` constant, never from user input.
+- Partition names are derived deterministically from the table name and a UTC year/month, and are additionally passed through `quoteIdentifier()` before being interpolated into DDL (defence-in-depth against a future change widening the input surface).
+- Partition bound literals are ISO-8601 UTC timestamps produced by `Date#toISOString()`, validated against a strict regex before interpolation — the `pg` driver cannot parameterize DDL bound expressions, so this validation substitutes for parameterization.
+- The job's DB principal needs `CREATE` on the parent table only; no superuser privileges are required.
+
+#### Tests
+
+`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), behind-schedule detection and metrics, and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+
+```bash
+pnpm test tests/jobs/partitionMaintenance.test.ts
+```
 
 ### Recommended alert thresholds
 
@@ -606,3 +673,118 @@ pnpm run migrate
 ### Tests
 
 Unit tests for the queue are in `tests/jobs/queue.test.ts`. They mock pg-boss using `vi.mock()` to test the `JobQueue` class independently of a real database.
+
+---
+
+## Scripted Database Operations & Operator Ergonomics
+
+### Overview & Architecture
+
+Script-based database operations reside in [`src/scripts/db-ops.ts`](../src/scripts/db-ops.ts). This module provides production-grade wrappers around PostgreSQL utilities (`pg_dump` and `pg_restore`) as well as SQL partition cleanup utilities (`dropOldPartitions`).
+
+The design prioritizes zero-disk footprint (streaming dumps directly to/from S3), strict shell injection safety, credential isolation, and fail-safe operator defaults.
+
+```
+                  ┌──────────────────────────────────────────────┐
+                  │              src/scripts/db-ops.ts           │
+                  └──────┬───────────────────────────────┬───────┘
+                         │                               │
+             ┌───────────▼───────────┐       ┌───────────▼───────────┐
+             │    backupDatabase     │       │    restoreDatabase    │
+             └─────┬───────────┬─────┘       └─────┬───────────┬─────┘
+                   │           │                   │           │
+           (Local) │           │ (S3 Stream)  (Local)│           │ (S3 Stream)
+                   ▼           ▼                   ▼           ▼
+             execFile       spawn               execFile     spawn
+            "pg_dump"     "pg_dump"            "pg_restore" "pg_restore"
+             └─► Disk      └─► S3 Upload         ▲           ▲
+                                                 │           │
+                                                Disk       S3 Stream
+```
+
+### Core Operations Reference
+
+#### 1. `backupDatabase(databaseUrl, outputPath, s3Target?)`
+
+Generates a custom-format PostgreSQL database backup (`--format=custom`).
+
+- **Local Mode** (`s3Target` omitted): Executes `pg_dump` via `execFile`, writing output directly to `outputPath`.
+- **S3 Streaming Mode** (`s3Target` provided): Spawns `pg_dump` stdout stream piped into a `PassThrough` stream to AWS S3 using `@aws-sdk/lib-storage` `Upload`. The dump streams directly to S3 without creating temporary files on the local filesystem.
+- **Return Type**: `Promise<DbOperationResult>` where:
+  ```typescript
+  export interface DbOperationResult {
+    success: boolean;
+    message: string;
+    /** Raw stderr / error detail — never contains connection passwords or AWS keys */
+    error?: string;
+  }
+  ```
+
+#### 2. `restoreDatabase(databaseUrl, inputPath, s3Source?)`
+
+Restores a custom-format PostgreSQL database dump using `pg_restore`.
+
+- **Local Mode** (`s3Source` omitted): Executes `pg_restore` via `execFile` from `inputPath`.
+- **S3 Streaming Mode** (`s3Source` provided): Downloads object body via S3 `GetObjectCommand` and streams `response.Body` directly into `pg_restore` standard input (`stdin`).
+- **Flags Used**:
+  - `--clean`: Drops database objects before restoring them.
+  - `--no-owner`: Skips restoration of original object ownership, enabling portable restores across environments with different database roles.
+  - `--no-password`: Prevents prompt hanging when credentials are missing or invalid.
+
+> [!WARNING]
+> `--clean` drops existing database tables/objects before recreating them. Ensure active database connections are closed or quieted before invoking `restoreDatabase` in production.
+
+#### 3. `dropOldPartitions(pool, parentTable, olderThanDays, dryRun = true)`
+
+Performs retention-based partition pruning for range-partitioned tables such as `contract_events`.
+
+- **Bound Extraction**: Queries `pg_inherits` and `pg_class`, extracting upper bound date strings using `/TO \('([^']+)'\)/` from `pg_get_expr(c.relpartbound, c.oid)`.
+- **Default Partition Handling**: Automatically skips the `DEFAULT` partition (`partition_bound === 'DEFAULT'`).
+- **Dry-Run Safety**: Defaults `dryRun = true`. Operators must explicitly pass `dryRun = false` to execute `DROP TABLE IF EXISTS`.
+
+### Security & Credential Protection
+
+1. **Input Validation**:
+   - Connection strings: Validated against `^postgre(?:s|sql):\/\/` before spawning subprocesses. Rejects empty strings, whitespace, and non-postgres schemes (`mysql://`, `redis://`, etc.).
+   - File paths: Validated to reject empty strings and shell control characters (`[\0`$|;&<>]`).
+2. **Subprocess Isolation**:
+   - Uses Node.js `execFile` (array form) and `spawn` with explicit argument vectors.
+   - Arguments are never concatenated into a shell string, eliminating shell injection vectors.
+3. **Password & Credential Masking**:
+   - `DATABASE_URL` credentials and AWS secrets are consumed strictly from environment variables or argument inputs.
+   - Raw database passwords are never printed to console or leaked inside `DbOperationResult.error` strings during error conditions.
+4. **AWS Credential Isolation**:
+   - Uses AWS SDK v3 environment provider chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+   - S3 credentials are never logged or stored in job results.
+
+### Decimal-String Serialization Guarantee
+
+Financial and numerical fields in Fluxora (e.g. event stream amounts, token balances) are stored as decimal strings in database `TEXT` or `NUMERIC` columns.
+
+The `db-ops` module processes backup and restore operations purely as binary/text byte streams. No JSON coercion or numeric parsing is applied to table records, guaranteeing zero loss of precision for monetary values.
+
+### Operator Ergonomics & Safety Controls
+
+| Ergonomic Control | Behavior | Benefit |
+|---|---|---|
+| **Default Dry Run** | `dropOldPartitions` defaults `dryRun = true` | Prevents accidental data deletion if invoked without arguments |
+| **Lazy AWS SDK Loading** | Dynamic `import('@aws-sdk/client-s3')` and `import('@aws-sdk/lib-storage')` | `db-ops.ts` runs in local-only mode even when `@aws-sdk` packages are not installed |
+| **AWS Region Resolution** | `s3Target.region` ➔ `AWS_REGION` ➔ `AWS_DEFAULT_REGION` ➔ `'us-east-1'` | Flexible environment configuration across AWS ECS, Lambda, and local environments |
+| **Whitespace Normalization** | Trims leading/trailing whitespace from `databaseUrl`, `outputPath`, and `inputPath` | Prevents spurious validation failures from whitespace in config files or CLI input |
+| **Clean Output Interface** | `DbOperationResult` standardizes `{ success, message, error }` | Simplifies caller code, logging, and error handling |
+
+### Regression Surface & Edge-Case Matrix
+
+| Component / Function | Input / Condition | Expected Behavior | Failure Mode / Mitigation |
+|---|---|---|---|
+| `backupDatabase` | Empty or whitespace `databaseUrl` | Returns `{ success: false, message: 'DATABASE_URL is required...' }` | Fast failure before subprocess creation |
+| `backupDatabase` | Non-postgres scheme (`mysql://`) | Returns `{ success: false, message: 'DATABASE_URL must be a valid PostgreSQL...' }` | Fast failure before subprocess creation |
+| `backupDatabase` | File path with `;` or `` ` `` | Returns `{ success: false, message: 'Output path contains invalid characters.' }` | Rejection of unsafe path inputs |
+| `backupDatabase` | Local mode, `pg_dump` fails | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | Error captured without password leakage |
+| `backupDatabase` | S3 mode, AWS SDK missing | Throws Error: `'AWS SDK v3 is not installed...'` | Clear diagnostic message asking user to install SDK |
+| `backupDatabase` | S3 mode, `pg_dump` non-zero exit | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | S3 upload discarded, error reported |
+| `restoreDatabase` | S3 mode, S3 object body null/empty | Returns `{ success: false, message: 'Restore failed', error: 'S3 object ... returned an empty body' }` | Prevents hanging `pg_restore` on empty input |
+| `dropOldPartitions` | Table has `DEFAULT` partition | `DEFAULT` partition is skipped; never dropped | Prevents dropping catch-all partition |
+| `dropOldPartitions` | Unparseable partition bound | Partition is skipped without throwing | Log/continue without breaking retention task |
+| `dropOldPartitions` | `dryRun = true` | Returns list of partition names in `droppedPartitions`; no `DROP TABLE` query issued | Safe audit before execution |
+

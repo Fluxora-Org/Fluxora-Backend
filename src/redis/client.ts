@@ -4,11 +4,28 @@
  * Mode is selected via REDIS_MODE env var (default: standalone).
  * Structured log events are emitted on connect, reconnecting, and error
  * so ops tooling can alert on failover.
+ *
+ * ## Connection saturation metrics
+ *
+ * When {@link startRedisSaturationMetrics} is called (typically from app.ts),
+ * a background interval reads the command-queue length and connection status
+ * from every tracked ioredis instance and pushes the values into the
+ * Prometheus gauges defined in {@link src/metrics/redisPool.ts}.
+ *
+ * A rate-limited structured warning is emitted via the logger when the queue
+ * length exceeds `REDIS_QUEUE_WARNING_THRESHOLD` (default 500).
  */
 
 import type { Redis, Cluster } from 'ioredis';
 import { logger } from '../logging/logger.js';
 import { calculateNextRetryDelay } from '../lib/retry.js';
+import {
+  redisCommandQueueLength,
+  redisConnectionStatus,
+  redisQueueLengthWarningsTotal,
+  statusToValue,
+  syncRedisGauges,
+} from '../metrics/redisPool.js';
 
 function defaultRetryStrategy(times: number): number | null {
   const delay = calculateNextRetryDelay(times - 1, {
@@ -78,14 +95,14 @@ function parseHostPorts(raw: string): Array<{ host: string; port: number }> {
 
 /** Attach structured log listeners to any ioredis client (Redis | Cluster). */
 function attachLogListeners(client: Redis | Cluster, mode: string): void {
-  client.on('connect', () => logger.info('redis:connect', { mode }));
-  client.on('ready', () => logger.info('redis:ready', { mode }));
-  client.on('reconnecting', () => logger.warn('redis:reconnecting', { mode }));
+  client.on('connect', () => logger.info('redis:connect', undefined, { mode }));
+  client.on('ready', () => logger.info('redis:ready', undefined, { mode }));
+  client.on('reconnecting', () => logger.warn('redis:reconnecting', undefined, { mode }));
   client.on('error', (err: Error) =>
-    logger.error('redis:error', { mode, error: err.message }),
+    logger.error('redis:error', undefined, { mode, error: err.message }),
   );
-  client.on('close', () => logger.warn('redis:close', { mode }));
-  client.on('end', () => logger.warn('redis:end', { mode }));
+  client.on('close', () => logger.warn('redis:close', undefined, { mode }));
+  client.on('end', () => logger.warn('redis:end', undefined, { mode }));
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +192,13 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
     }
 
     attachLogListeners(raw, mode);
+
+    // Generate a stable instance label — use the mode as a simple differentiator.
+    // In app.ts where the same config is reused for multiple modules, each call
+    // creates a separate connection, but they all share the "default" label.
+    const instanceName = 'default';
+    _trackClient(instanceName, raw);
+
     return new IORedisClient(raw);
   }
 
@@ -267,6 +291,157 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
 }
 
 // ---------------------------------------------------------------------------
+// Tracked ioredis instances for saturation metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * A minimal stats snapshot that {@link src/metrics/redisPool.ts} understands.
+ * Separated into its own interface so the metrics module does not depend on ioredis types.
+ */
+export interface RedisSaturationStats {
+  commandQueueLength: number;
+  status: string;
+  instanceName: string;
+}
+
+/**
+ * Internal store of raw ioredis clients, keyed by instance name.
+ * Used exclusively by the saturation-metrics polling loop.
+ */
+const _trackedClients = new Map<string, Redis | Cluster>();
+
+/** Register a raw ioredis client for saturation-metrics tracking. */
+function _trackClient(instanceName: string, client: Redis | Cluster): void {
+  _trackedClients.set(instanceName, client);
+}
+
+/**
+ * Collect saturation stats from all tracked ioredis instances.
+ * Returns an empty array when no instances are tracked.
+ */
+export function collectRedisSaturationStats(): RedisSaturationStats[] {
+  const stats: RedisSaturationStats[] = [];
+  for (const [name, client] of _trackedClients) {
+    stats.push({
+      commandQueueLength:
+        (client as { commandQueue?: { length: number } }).commandQueue?.length ?? 0,
+      status: client.status ?? 'unknown',
+      instanceName: name,
+    });
+  }
+  return stats;
+}
+
+// ---------------------------------------------------------------------------
+// Saturation-metrics polling
+// ---------------------------------------------------------------------------
+
+/** Default polling interval (ms). Override via REDIS_SATURATION_POLL_INTERVAL_MS. */
+const DEFAULT_POLL_INTERVAL_MS = 10_000;
+
+/**
+ * Environment-variable name for the queue-length warning threshold.
+ * Defaults to 500 when not set.
+ */
+const REDIS_QUEUE_WARNING_THRESHOLD = Number(
+  process.env['REDIS_QUEUE_WARNING_THRESHOLD'] ?? 500,
+);
+
+/**
+ * Minimum interval (ms) between successive {@link logger.warn} calls for
+ * queue-length exceedance, preventing log floods. Default: 30 000 (30 s).
+ */
+const REDIS_QUEUE_WARNING_RATE_LIMIT_MS = Number(
+  process.env['REDIS_QUEUE_WARNING_RATE_LIMIT_MS'] ?? 30_000,
+);
+
+/** Timestamp (epoch ms) of the last queue-length warning, per instance. */
+const _lastWarnTimestamps = new Map<string, number>();
+
+let _metricsIntervalTimer: NodeJS.Timeout | null = null;
+
+/** Reset the tracked-clients registry — for testing only. */
+export function _resetTrackedClients(): void {
+  _trackedClients.clear();
+  _lastWarnTimestamps.clear();
+  if (_metricsIntervalTimer) {
+    clearInterval(_metricsIntervalTimer);
+    _metricsIntervalTimer = null;
+  }
+}
+
+/**
+ * Central polling callback: iterates over all tracked clients and syncs
+ * gauges, emitting rate-limited warnings on threshold exceedance.
+ */
+function _pollRedisSaturation(): void {
+  const stats = collectRedisSaturationStats();
+  const now = Date.now();
+
+  for (const s of stats) {
+    // Always update gauges (they stay current even without warnings)
+    syncRedisGauges(s);
+
+    // Rate-limited warning
+    if (s.commandQueueLength > REDIS_QUEUE_WARNING_THRESHOLD) {
+      const lastWarn = _lastWarnTimestamps.get(s.instanceName) ?? 0;
+      if (now - lastWarn >= REDIS_QUEUE_WARNING_RATE_LIMIT_MS) {
+        _lastWarnTimestamps.set(s.instanceName, now);
+        redisQueueLengthWarningsTotal.inc({ instance: s.instanceName });
+        logger.warn('redis:queue_length_exceeded', undefined, {
+          instance: s.instanceName,
+          commandQueueLength: s.commandQueueLength,
+          threshold: REDIS_QUEUE_WARNING_THRESHOLD,
+          status: s.status,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Start the Redis saturation metrics polling loop.
+ *
+ * The loop reads command-queue length and connection status from each tracked
+ * ioredis instance at the configured interval and pushes them into Prometheus
+ * gauges. A rate-limited warning is emitted when queue length exceeds the
+ * configured threshold.
+ *
+ * Safe to call multiple times — subsequent calls are no-ops.
+ *
+ * @param intervalMs  Polling interval (default: 10 000 ms / 10 s).
+ */
+export function startRedisSaturationMetrics(
+  intervalMs = Number(process.env['REDIS_SATURATION_POLL_INTERVAL_MS']) || DEFAULT_POLL_INTERVAL_MS,
+): void {
+  if (_metricsIntervalTimer) return;
+
+  logger.info('redis:metrics_started', undefined, {
+    intervalMs,
+    queueWarningThreshold: REDIS_QUEUE_WARNING_THRESHOLD,
+    warnRateLimitMs: REDIS_QUEUE_WARNING_RATE_LIMIT_MS,
+  });
+
+  // Run once immediately so there is data on the first scrape
+  _pollRedisSaturation();
+
+  _metricsIntervalTimer = setInterval(_pollRedisSaturation, intervalMs);
+  _metricsIntervalTimer.unref();
+}
+
+/**
+ * Stop the Redis saturation metrics polling loop.
+ * Idempotent — safe to call when not running.
+ */
+export function stopRedisSaturationMetrics(): void {
+  if (_metricsIntervalTimer) {
+    clearInterval(_metricsIntervalTimer);
+    _metricsIntervalTimer = null;
+    logger.info('redis:metrics_stopped');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Module-level factory (replaceable for testing)
 // ---------------------------------------------------------------------------
 
@@ -299,7 +474,7 @@ export async function quitAllRedisClients(): Promise<void> {
   await Promise.all(
     clients.map((c) =>
       c.close().catch((err: unknown) => {
-        logger.warn('redis:quit_error', { error: (err as Error).message });
+        logger.warn('redis:quit_error', undefined, { error: (err as Error).message });
       }),
     ),
   );

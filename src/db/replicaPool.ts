@@ -126,8 +126,14 @@ export function createReplicaPool(config?: PoolConfig): pg.Pool {
 
   // Store queueLimit on the pool instance (same pattern as primary pool).
   (pool as pg.Pool & { _queueLimit?: number })._queueLimit = cfg.queueLimit;
+  // @types/pg declares the 'connect' listener as `() => void`, but pg passes
+  // the PoolClient at runtime. Narrow the emitter for this one call.
 
-  pool.on('connect', (client: pg.PoolClient) => {
+  (pool as unknown as {
+
+    on(event: 'connect', cb: (c: pg.PoolClient) => void): void;
+
+  }).on('connect', (client: pg.PoolClient) => {
     // Issue both SETs in one round-trip so the connection is either fully
     // configured or rejected — no partial state can enter the pool.
     const sql = timeoutMs > 0

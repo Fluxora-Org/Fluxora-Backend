@@ -31,15 +31,19 @@ import { indexerService } from './indexer/service.js';
 import { checkAdminStatePersistence } from './state/adminState.js';
 import {
   captureStartupEnvSnapshot,
-  reloadHotConfig,
+  refreshHotConfig,
   loadConfig,
 } from './config/env.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
-import { reloadFlags } from './config/featureFlags.js';
+import { reloadFlags, prepareReloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
 import { probeStartupDependencies } from './config/health.js';
 import { startTracing } from './tracing/index.js';
 import { initLogsBridge } from './tracing/logsBridge.js';
+import {
+  recordConfigReloadFailure,
+  recordConfigReloadSuccess,
+} from './metrics.js';
 
 const app = express();
 
@@ -229,16 +233,19 @@ if (process.env.NODE_ENV !== 'test') {
    * What is reloaded:
    *   - Rate-limit windows and max values (applied via setRuntimeRateLimitConfig)
    *   - Feature flag definitions (applied via reloadFlags)
-   *   - TRACING_SAMPLE_RATE, TRACING_ENABLED, LOG_LEVEL (logged; callers
-   *     should re-read from reloadHotConfig() result when needed)
+   *   - TRACING_SAMPLE_RATE, TRACING_ENABLED, LOG_LEVEL (applied to process.env
+   *     LOG_LEVEL so debug() filtering and getLastHotConfig() stay in sync)
    *
    * What is NOT reloaded (restart required):
    *   - DATABASE_URL, REDIS_URL, JWT_SECRET, INDEXER_WORKER_TOKEN
    *   - Any variable requiring a new DB/Redis connection
+   *   - Auth secrets / tokens (never applied from a SIGHUP path)
    *
-   * Safety:
-   *   - reloadHotConfig() builds the config atomically before returning.
+   * Determinism & safety:
+   *   - refreshHotConfig() serializes concurrent SIGHUPs onto one in-flight apply.
+   *   - HotConfig is frozen before side effects run.
    *   - setRuntimeRateLimitConfig() performs a single object-assignment swap.
+   *   - Metrics (fluxora_config_reload_*) record success/failure/noop + duration.
    *   - Any thrown error is caught and logged; the process is never killed.
    */
   process.on('SIGHUP', () => {
@@ -246,49 +253,70 @@ if (process.env.NODE_ENV !== 'test') {
       component: 'sighup-reload',
     });
 
-    try {
-      const hot = reloadHotConfig();
-
-      // 1. Hot-swap rate-limit config
-      setRuntimeRateLimitConfig({
-        ip: {
-          windowMs: hot.rateLimitIpWindowMs ?? 60_000,
-          max: hot.rateLimitIpMax ?? 100,
-          enabled: true,
-        },
-        apiKey: {
-          windowMs: hot.rateLimitApikeyWindowMs ?? 60_000,
-          max: hot.rateLimitApikeyMax ?? 500,
-          enabled: true,
-        },
-        admin: {
-          windowMs: hot.rateLimitAdminWindowMs ?? 60_000,
-          max: hot.rateLimitAdminMax ?? 2000,
-          enabled: true,
-        },
-      });
-
-      // 2. Hot-swap feature flags
-      const reloadedFlags = reloadFlags();
-
-      logger.info('SIGHUP config reload complete', undefined, {
-        component: 'sighup-reload',
-        rateLimitIpWindowMs: hot.rateLimitIpWindowMs,
-        rateLimitIpMax: hot.rateLimitIpMax,
-        rateLimitApikeyWindowMs: hot.rateLimitApikeyWindowMs,
-        rateLimitApikeyMax: hot.rateLimitApikeyMax,
-        tracingSampleRate: hot.tracingSampleRate,
-        tracingEnabled: hot.tracingEnabled,
-        logLevel: hot.logLevel,
-        featureFlagCount: reloadedFlags.size,
-      });
-    } catch (err) {
-      // Never crash the process on a failed reload.
-      logger.warn('SIGHUP config reload failed', undefined, {
-        component: 'sighup-reload',
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    void refreshHotConfig({
+      prepareRateLimits: (hot) => {
+        const nextConfig = {
+          ip: {
+            windowMs: hot.rateLimitIpWindowMs ?? 60_000,
+            max: hot.rateLimitIpMax ?? 100,
+            enabled: true,
+          },
+          apiKey: {
+            windowMs: hot.rateLimitApikeyWindowMs ?? 60_000,
+            max: hot.rateLimitApikeyMax ?? 500,
+            enabled: true,
+          },
+          admin: {
+            windowMs: hot.rateLimitAdminWindowMs ?? 60_000,
+            max: hot.rateLimitAdminMax ?? 2000,
+            enabled: true,
+          },
+        };
+        return () => setRuntimeRateLimitConfig(nextConfig);
+      },
+      prepareFeatureFlags: () => {
+        return prepareReloadFlags();
+      },
+      prepareLogLevel: (level) => {
+        return () => {
+          // Keep process.env.LOG_LEVEL aligned so debug() gating and any
+          // env-driven log consumers observe the hot-reloaded level.
+          process.env.LOG_LEVEL = level;
+        };
+      },
+      onSuccess: (result) => {
+        recordConfigReloadSuccess({
+          changed: result.changed,
+          durationMs: result.durationMs,
+          generation: result.generation,
+        });
+        logger.info('SIGHUP config reload complete', undefined, {
+          component: 'sighup-reload',
+          generation: result.generation,
+          changed: result.changed,
+          durationMs: result.durationMs,
+          restartOnlyChanges: result.restartOnlyChanges,
+          rateLimitIpWindowMs: result.hot.rateLimitIpWindowMs,
+          rateLimitIpMax: result.hot.rateLimitIpMax,
+          rateLimitApikeyWindowMs: result.hot.rateLimitApikeyWindowMs,
+          rateLimitApikeyMax: result.hot.rateLimitApikeyMax,
+          tracingSampleRate: result.hot.tracingSampleRate,
+          tracingEnabled: result.hot.tracingEnabled,
+          logLevel: result.hot.logLevel,
+        });
+      },
+      onFailure: (err, durationMs) => {
+        recordConfigReloadFailure(durationMs);
+        // Never crash the process on a failed reload.
+        logger.warn('SIGHUP config reload failed', undefined, {
+          component: 'sighup-reload',
+          error: err instanceof Error ? err.message : String(err),
+          durationMs,
+        });
+      },
+    }).catch(() => {
+      // onFailure already recorded metrics + logged; swallow to keep process alive.
+    });
   });
 }
 

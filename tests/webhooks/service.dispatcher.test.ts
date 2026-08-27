@@ -95,7 +95,7 @@ describe('WebhookDispatcher outbox polling', () => {
       },
     ]);
     global.fetch = vi.fn(
-      async () => new Response(null, { status: 204 })
+      async () => new Response(null, { status: 204, headers: { 'Content-Type': 'application/json' } })
     ) as unknown as typeof fetch;
 
     await createDispatcher(client, breaker).pollOnce();
@@ -128,7 +128,7 @@ describe('WebhookDispatcher outbox polling', () => {
       },
     ]);
     global.fetch = vi.fn(
-      async () => new Response(null, { status: 500, statusText: 'Server Error' })
+      async () => new Response(null, { status: 500, statusText: 'Server Error', headers: { 'Content-Type': 'application/json' } })
     ) as unknown as typeof fetch;
 
     await createDispatcher(client, breaker).pollOnce();
@@ -165,7 +165,7 @@ describe('WebhookDispatcher outbox polling', () => {
       },
     ]);
     global.fetch = vi.fn(
-      async () => new Response(null, { status: 500, statusText: 'Server Error' })
+      async () => new Response(null, { status: 500, statusText: 'Server Error', headers: { 'Content-Type': 'application/json' } })
     ) as unknown as typeof fetch;
 
     await createDispatcher(client, breaker).pollOnce();
@@ -230,6 +230,77 @@ describe('WebhookDispatcher outbox polling', () => {
     const insert = client.queries.find((q) => q.sql.includes('INSERT INTO webhook_outbox'));
     expect(insert).toBeDefined();
     expect(insert?.params?.[3]).toEqual(new Date(now + 1_000));
+  });
+
+  it('maintains idempotency and retry state on crash before DB acknowledgement (Send/Ack Window)', async () => {
+    const now = new Date('2026-05-26T12:00:00.000Z').getTime();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    
+    // Simulate initial poll with one outbox row
+    const originalRow = {
+      id: 'crash-42',
+      stream_id: 'stream-crash',
+      event_type: 'stream.created',
+      payload: { id: 'evt-crash', amount: '10' },
+      created_at: new Date(now),
+    };
+    
+    const client = createClient([originalRow]);
+    
+    // Make the UPDATE statement (the DB acknowledgement) throw an error,
+    // simulating a process crash/DB failure *after* the network send.
+    const originalQuery = client.query;
+    client.query = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('UPDATE webhook_outbox SET processed = true')) {
+        throw new Error('Simulated crash during DB acknowledgement');
+      }
+      return originalQuery(sql, params);
+    });
+
+    let fetchHeaders: HeadersInit | undefined;
+    global.fetch = vi.fn(async (url, init) => {
+      fetchHeaders = init?.headers;
+      return new Response(null, { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as unknown as typeof fetch;
+
+    const dispatcher = createDispatcher(client, breaker);
+    await dispatcher.pollOnce();
+
+    // 1. Network send occurred
+    expect(global.fetch).toHaveBeenCalledOnce();
+    
+    // 2. Transaction rolled back due to the crash
+    expect(client.queries.some((q) => q.sql === 'ROLLBACK')).toBe(true);
+    
+    // 3. No retry row was inserted (since the original row is un-acked, it will just be polled again)
+    expect(client.queries.some((q) => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+
+    // Now simulate the NEXT poll cycle, simulating process restart/recovery
+    const now2 = now + 10_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now2);
+    
+    const client2 = createClient([originalRow]);
+    let fetchHeaders2: HeadersInit | undefined;
+    global.fetch = vi.fn(async (url, init) => {
+      fetchHeaders2 = init?.headers;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+    
+    const dispatcher2 = createDispatcher(client2, breaker);
+    await dispatcher2.pollOnce();
+    
+    // 4. Network send occurred AGAIN (duplicate send)
+    expect(global.fetch).toHaveBeenCalledOnce();
+    
+    // 5. Attempt count is logically 1 because the previous attempt crashed before persistence
+    // The delivery ID must be the same (idempotency key for receiver deduplication)
+    const headers1 = fetchHeaders as Record<string, string>;
+    const headers2 = fetchHeaders2 as Record<string, string>;
+    expect(headers1['x-fluxora-delivery-id']).toBe(headers2['x-fluxora-delivery-id']);
+    
+    // 6. Signature Reuse Policy: Timestamp and signature MUST be fresh/different
+    expect(headers1['x-fluxora-timestamp']).not.toBe(headers2['x-fluxora-timestamp']);
+    expect(headers1['x-fluxora-signature']).not.toBe(headers2['x-fluxora-signature']);
   });
 
   it('drains an in-flight delivery when stopped during shutdown', async () => {
@@ -376,7 +447,7 @@ describe('WebhookDispatcher outbox polling', () => {
 
       // Mock fetch to return 404 (not found - poison)
       global.fetch = vi.fn(
-        async () => new Response(null, { status: 404 })
+        async () => new Response(null, { status: 404, headers: { 'Content-Type': 'application/json' } })
       ) as unknown as typeof fetch;
 
       const dispatcher = createDispatcher(client, breaker);
@@ -411,7 +482,7 @@ describe('WebhookDispatcher outbox polling', () => {
       ]);
 
       global.fetch = vi.fn(
-        async () => new Response(null, { status: 401 })
+        async () => new Response(null, { status: 401, headers: { 'Content-Type': 'application/json' } })
       ) as unknown as typeof fetch;
 
       const dispatcher = createDispatcher(client, breaker);
@@ -433,7 +504,7 @@ describe('WebhookDispatcher outbox polling', () => {
       ]);
 
       global.fetch = vi.fn(
-        async () => new Response(null, { status: 403 })
+        async () => new Response(null, { status: 403, headers: { 'Content-Type': 'application/json' } })
       ) as unknown as typeof fetch;
 
       const dispatcher = createDispatcher(client, breaker);
@@ -459,7 +530,7 @@ describe('WebhookDispatcher outbox polling', () => {
 
       // Return 500 (retryable)
       global.fetch = vi.fn(
-        async () => new Response(null, { status: 500 })
+        async () => new Response(null, { status: 500, headers: { 'Content-Type': 'application/json' } })
       ) as unknown as typeof fetch;
 
       const dispatcher = createDispatcher(client, breaker);
@@ -488,7 +559,7 @@ describe('WebhookDispatcher outbox polling', () => {
       ]);
 
       global.fetch = vi.fn(
-        async () => new Response(null, { status: 429 })
+        async () => new Response(null, { status: 429, headers: { 'Content-Type': 'application/json' } })
       ) as unknown as typeof fetch;
 
       const poisonPolicy: EnhancedRetryPolicy = {
@@ -529,7 +600,7 @@ describe('WebhookDispatcher outbox polling', () => {
       ]);
 
       global.fetch = vi.fn(
-        async () => new Response(null, { status: 200 })
+        async () => new Response(null, { status: 200, headers: { 'Content-Type': 'application/json' } })
       ) as unknown as typeof fetch;
 
       const dispatcher = createDispatcher(client, breaker);
@@ -539,6 +610,64 @@ describe('WebhookDispatcher outbox polling', () => {
 
       // Should NOT enqueue retry
       expect(client.queries.some((q) => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+    });
+  });
+
+  describe('delivery deadlines', () => {
+    it('cancels in-flight webhook requests when delivery deadlines expire', async () => {
+      vi.useFakeTimers();
+      try {
+        const client = createClient([
+          {
+            id: 'timeout-1',
+            stream_id: 'stream-timeout',
+            event_type: 'stream.created',
+            payload: { id: 'evt-timeout' },
+            created_at: new Date(),
+          },
+        ]);
+        
+        let abortSignal: AbortSignal | undefined;
+        global.fetch = vi.fn(async (_url, options) => {
+          abortSignal = options?.signal as AbortSignal;
+          return new Promise<Response>((resolve, reject) => {
+            if (abortSignal) {
+              abortSignal.addEventListener('abort', () => {
+                reject(abortSignal?.reason || new DOMException('Aborted', 'AbortError'));
+              });
+            }
+          });
+        }) as unknown as typeof fetch;
+
+        const dispatcher = createDispatcher(client, breaker);
+        
+        const pollPromise = dispatcher.pollOnce();
+        
+        // Wait for fetch to be called and set up listener
+        await Promise.resolve();
+        await Promise.resolve();
+        
+        await vi.advanceTimersByTimeAsync(1500); // Wait for timeout (policy.timeoutMs = 1000)
+        
+        await pollPromise;
+        
+        expect(global.fetch).toHaveBeenCalledOnce();
+        
+        // Should NOT enqueue retry because timeout is treated as permanent failure ('poison' / 'timeout')
+        expect(client.queries.some((q) => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+        
+        // Should mark the row as processed
+        expect(client.queries).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
+              params: ['timeout-1'],
+            }),
+          ])
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

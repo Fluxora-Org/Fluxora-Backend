@@ -15,7 +15,7 @@ import { getApiKeyFromRequest, findRecordByRawKey } from '../lib/apiKey.js';
  * If an invalid API key is present, returns 401.
  */
 export async function authenticateApiKey(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const requestId = req.correlationId;
+  const requestId = req.id ?? req.correlationId;
   const rawKey = getApiKeyFromRequest(req.headers);
 
   if (!rawKey) {
@@ -23,7 +23,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
   }
 
   try {
-    const record = await getApiKeyRecord(rawKey);
+    const record = await findRecordByRawKey(rawKey);
     
     if (!record) {
       warn('API key authentication failed — key not found', { requestId });
@@ -123,9 +123,15 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     return next();
   }
 
-  const [type, token] = authHeader.split(' ');
-  if (type !== 'Bearer' || !token) {
-    warn('Invalid Authorization header format', { requestId });
+  const [type, ...rest] = authHeader.split(' ');
+  if (type !== 'Bearer') {
+    warn('Invalid Authorization header format — non-Bearer scheme', { scheme: type, requestId });
+    return next();
+  }
+
+  const token = rest.join(' ').trim();
+  if (!token) {
+    warn('Invalid Authorization header format — empty Bearer token', { requestId });
     return next();
   }
 
@@ -176,7 +182,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 }
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const requestId = req.correlationId;
+  const requestId = req.id ?? req.correlationId;
   if (!req.user) {
     warn('Anonymous access denied to protected route', { path: req.path, requestId });
     res.status(401).json({
@@ -193,7 +199,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 
 export function requirePermission(permission: Permission) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.correlationId;
+    const requestId = req.id ?? req.correlationId;
     if (!req.user) {
       warn('Permission check failed: no authenticated user', { path: req.path, requestId });
       res.status(401).json({
@@ -205,8 +211,19 @@ export function requirePermission(permission: Permission) {
       });
       return;
     }
-    const permissions: string[] = (req.user as any).permissions ?? [];
-    if (!Array.isArray(permissions) || !permissions.includes(permission)) {
+    const permissions: unknown = (req.user as any).permissions ?? [];
+    if (!Array.isArray(permissions)) {
+      warn('Permission check failed: non-array permissions on principal', { path: req.path, requestId });
+      res.status(403).json({
+        error: {
+          code: ApiErrorCode.FORBIDDEN,
+          message: 'Insufficient permissions to access this resource',
+          requestId,
+        },
+      });
+      return;
+    }
+    if (!permissions.includes(permission)) {
       warn('Insufficient permissions', { required: permission, have: permissions, path: req.path, requestId });
       res.status(403).json({
         error: {
@@ -223,7 +240,7 @@ export function requirePermission(permission: Permission) {
 
 export function requireScope(...requiredScopes: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const requestId = req.correlationId;
+    const requestId = req.id ?? req.correlationId;
     const isApiKeyAuth = (req as any).keyId !== undefined;
     const isJwtAuth = req.user !== undefined;
     if (!isApiKeyAuth && !isJwtAuth) {

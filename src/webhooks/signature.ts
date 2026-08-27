@@ -18,6 +18,13 @@ export const FLUXORA_WEBHOOK_HEADERS = {
 export const DEFAULT_WEBHOOK_TOLERANCE_SECONDS = 300;
 export const DEFAULT_MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
 
+/**
+ * Default grace window (in seconds) during which a rotated-out secret remains
+ * valid for incoming webhook verification. 24 hours gives producers a full
+ * day to finish signing with the new secret before the old one is rejected.
+ */
+export const DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS = 86_400;
+
 export type WebhookVerificationCode =
   | 'ok'
   | 'missing_secret'
@@ -28,7 +35,8 @@ export type WebhookVerificationCode =
   | 'invalid_timestamp'
   | 'timestamp_outside_tolerance'
   | 'signature_mismatch'
-  | 'duplicate_delivery';
+  | 'duplicate_delivery'
+  | 'previous_secret_expired';
 
 export type WebhookVerificationResult = {
   ok: boolean;
@@ -43,6 +51,20 @@ export type VerifyWebhookSignatureInput = {
   secret?: string;
   /** Previous secret kept valid during rotation window. */
   secretPrevious?: string;
+  /**
+   * Unix timestamp (seconds) when the previous secret was rotated out.
+   * When provided together with `graceWindowSeconds`, the previous secret is
+   * only accepted for `graceWindowSeconds` after this timestamp; afterwards it
+   * is rejected with `previous_secret_expired`. When omitted, the previous
+   * secret is accepted unconditionally (backward compatibility).
+   */
+  previousSecretRotatedAt?: number;
+  /**
+   * Bounded grace window (seconds) during which the previous secret remains
+   * valid. Defaults to {@link DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS}.
+   * Only consulted when `previousSecretRotatedAt` is also provided.
+   */
+  graceWindowSeconds?: number;
   deliveryId?: string;
   timestamp?: string;
   signature?: string;
@@ -85,6 +107,8 @@ export function verifyWebhookSignature(
   const {
     secret,
     secretPrevious,
+    previousSecretRotatedAt,
+    graceWindowSeconds = DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS,
     deliveryId,
     timestamp,
     signature,
@@ -163,10 +187,25 @@ export function verifyWebhookSignature(
 
   const actualSignature = signature.trim().toLowerCase();
 
-  // Try current secret first, then fall back to previous secret (rotation window).
+  // Determine whether the previous secret is within its bounded grace window.
+  // When previousSecretRotatedAt is provided, the previous secret is only
+  // accepted for `graceWindowSeconds` after the rotation timestamp. After the
+  // window expires the previous secret is rejected to prevent indefinite
+  // acceptance of a stale secret. When previousSecretRotatedAt is omitted the
+  // previous secret is accepted unconditionally (backward compatibility).
+  const previousSecretExpired =
+    secretPrevious !== undefined && previousSecretRotatedAt !== undefined
+      ? toUnixSeconds(now) - previousSecretRotatedAt > graceWindowSeconds
+      : false;
+
+  // Build the list of secrets to try. The previous secret is only included
+  // when it is within the grace window (or when no rotation timestamp was
+  // provided, preserving backward compatibility).
   const secrets: Array<{ value: string; isPrevious: boolean }> = [
     { value: secret, isPrevious: false },
-    ...(secretPrevious ? [{ value: secretPrevious, isPrevious: true }] : []),
+    ...(secretPrevious && !previousSecretExpired
+      ? [{ value: secretPrevious, isPrevious: true }]
+      : []),
   ];
 
   let matched = false;
@@ -182,6 +221,16 @@ export function verifyWebhookSignature(
   }
 
   if (!matched) {
+    // If the previous secret was provided but has expired, surface a dedicated
+    // code so operators can distinguish "stale secret" from "wrong secret".
+    if (previousSecretExpired) {
+      return {
+        ok: false,
+        status: 401,
+        code: 'previous_secret_expired',
+        message: 'Previous webhook secret has expired; rotate to the current secret',
+      };
+    }
     return {
       ok: false,
       status: 401,

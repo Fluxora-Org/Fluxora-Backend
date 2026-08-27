@@ -138,14 +138,28 @@ export function createRateLimiter(
   /** Optional store injection — used in tests to bypass Redis. */
   injectedStore?: RateLimitStore,
 ): RateLimiter {
-  const { ip: ipConfig, apiKey: apiKeyConfig, admin: adminConfig, allowlistIps } =
-    getRateLimitConfig(env);
+  // Resolve config on each request via getRateLimitConfig() so SIGHUP-driven
+  // setRuntimeRateLimitConfig() patches are observed without recreating the
+  // middleware. Admin keys and allowlist still come from the factory-time env
+  // snapshot (restart-required).
+  const initial = getRateLimitConfig(env);
+  const allowlistIps = initial.allowlistIps;
 
   // Build admin key set
   const adminKeys = new Set<string>();
   const adminKeyEnv = env.ADMIN_API_KEY ?? '';
   for (const k of adminKeyEnv.split(',').map((s) => s.trim())) {
     if (k) adminKeys.add(k);
+  }
+
+  /** Live tier configs — re-read each request for hot-reload determinism. */
+  function liveConfigs(): {
+    ip: RateLimitConfig;
+    apiKey: RateLimitConfig;
+    admin: RateLimitConfig;
+  } {
+    const cfg = getRateLimitConfig(env);
+    return { ip: cfg.ip, apiKey: cfg.apiKey, admin: cfg.admin };
   }
 
   // ── Store selection ──────────────────────────────────────────────────────
@@ -229,6 +243,9 @@ export function createRateLimiter(
     res: Response,
     next: NextFunction,
   ): Promise<void> {
+    // Hot-reload aware: pick up the latest runtime overrides on every request.
+    const { ip: ipConfig, apiKey: apiKeyConfig, admin: adminConfig } = liveConfigs();
+
     if (!ipConfig.enabled && !apiKeyConfig.enabled) {
       return next();
     }
@@ -347,6 +364,7 @@ export function createRateLimiter(
     method?: string,
     keyId?: string,
   ): Promise<RateLimitStatus> {
+    const { ip: ipConfig, apiKey: apiKeyConfig, admin: adminConfig } = liveConfigs();
     const isAdmin = identifierType === 'apiKey' && adminKeys.has(identifier);
     let config = isAdmin ? adminConfig : identifierType === 'apiKey' ? apiKeyConfig : ipConfig;
 
