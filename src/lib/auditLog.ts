@@ -29,6 +29,7 @@
 
 import { logger } from './logger.js';
 import { getPool, query } from '../db/pool.js';
+import { redactKeysInString, sanitize } from '../pii/sanitizer.js';
 
 export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'STREAM_BROADCAST' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE' | 'ADMIN_BULK_ACTION' | 'INDEXER_MTLS_FAILURE' | 'PURGE_INITIATED' | 'PURGE_SKIPPED_LEGAL_HOLD' | 'PII_ERASURE_REQUESTED' | 'GDPR_ERASURE' | 'BACKUP_RESTORE_QUEUED' | 'BACKUP_RESTORE_STARTED' | 'BACKUP_RESTORE_COMPLETED' | 'BACKUP_RESTORE_FAILED' | 'REPLAY_INTEGRITY_ISSUE' | 'MTLS_VALIDATION_FAILED' | 'DLQ_RETENTION_PURGED' | 'AUDIT_EXPORTED';
 
@@ -95,10 +96,10 @@ export function recordAuditEvent(
       seq: ++seq,
       timestamp: new Date().toISOString(),
       action,
-      resourceType,
-      resourceId,
+      resourceType: redactKeysInString(resourceType),
+      resourceId: redactKeysInString(resourceId),
       ...(correlationId !== undefined ? { correlationId } : {}),
-      ...(meta !== undefined ? { meta } : {}),
+      ...(meta !== undefined ? { meta: sanitize(meta) } : {}),
     };
     appendAuditEntry(entry);
   } catch (err) {
@@ -129,10 +130,10 @@ export function buildAuditEntry(
     seq: ++seq,
     timestamp: new Date().toISOString(),
     action,
-    resourceType,
-    resourceId,
+    resourceType: redactKeysInString(resourceType),
+    resourceId: redactKeysInString(resourceId),
     ...(correlationId !== undefined ? { correlationId } : {}),
-    ...(meta !== undefined ? { meta } : {}),
+    ...(meta !== undefined ? { meta: sanitize(meta) } : {}),
   };
 }
 

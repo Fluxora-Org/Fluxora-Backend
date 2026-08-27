@@ -1,4 +1,5 @@
 import type { Attributes } from '@opentelemetry/api';
+import { redactKeysInString, sanitize, sanitizeError } from '../pii/sanitizer.js';
 /**
  * Distributed Tracing Hooks for Fluxora Backend.
  *
@@ -251,7 +252,7 @@ export class Tracer {
     span.durationMs = span.endTimeMs - span.startTimeMs;
     span.status = status;
     if (statusMessage !== undefined) {
-      span.statusMessage = statusMessage;
+      span.statusMessage = redactKeysInString(statusMessage);
     }
 
     this.activeSpans.delete(span.context.spanId);
@@ -281,7 +282,7 @@ export class Tracer {
     const event: SpanEvent = {
       name,
       timestamp: Date.now(),
-      ...(attributes !== undefined ? { attributes } : {}),
+      ...(attributes !== undefined ? { attributes: sanitize(attributes) } : {}),
     };
 
     span.events.push(event);
@@ -301,7 +302,15 @@ export class Tracer {
       return;
     }
 
-    this.safeCall(() => this.config.hooks?.onError?.(correlationId, error, context));
+    const sanitized = sanitizeError(error);
+    const safeError = new Error(sanitized.message as string);
+    safeError.name = error.name;
+    if (sanitized.stack) safeError.stack = sanitized.stack as string;
+    this.safeCall(() => this.config.hooks?.onError?.(
+      correlationId,
+      safeError,
+      context ? sanitize(context) : undefined,
+    ));
   }
 
   /**
@@ -752,16 +761,16 @@ export function enrichSpanWithStream(
 
   // 1. Enrich custom span tags
   if (streamId) span.context.tags['fluxora.stream_id'] = streamId;
-  if (sender) span.context.tags['fluxora.sender'] = sender;
-  if (recipient) span.context.tags['fluxora.recipient'] = recipient;
+  if (sender) span.context.tags['fluxora.sender'] = redactKeysInString(sender);
+  if (recipient) span.context.tags['fluxora.recipient'] = redactKeysInString(recipient);
 
   // 2. Enrich the internal OTel span if it exists in tags
   const otelSpan = span.context.tags['_otelSpan'] as any;
   if (otelSpan && typeof otelSpan.setAttribute === 'function') {
     try {
       if (streamId) otelSpan.setAttribute('fluxora.stream_id', streamId);
-      if (sender) otelSpan.setAttribute('fluxora.sender', sender);
-      if (recipient) otelSpan.setAttribute('fluxora.recipient', recipient);
+      if (sender) otelSpan.setAttribute('fluxora.sender', redactKeysInString(sender));
+      if (recipient) otelSpan.setAttribute('fluxora.recipient', redactKeysInString(recipient));
     } catch {
       // ignore OTel setAttribute errors
     }
@@ -772,8 +781,8 @@ export function enrichSpanWithStream(
     const activeSpan = trace.getActiveSpan();
     if (activeSpan) {
       if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
-      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
-      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+      if (sender) activeSpan.setAttribute('fluxora.sender', redactKeysInString(sender));
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', redactKeysInString(recipient));
     }
   } catch {
     // ignore active span errors
@@ -792,8 +801,8 @@ export function enrichActiveSpanWithStream(
     const activeSpan = trace.getActiveSpan();
     if (activeSpan) {
       if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
-      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
-      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+      if (sender) activeSpan.setAttribute('fluxora.sender', redactKeysInString(sender));
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', redactKeysInString(recipient));
     }
   } catch {
     // ignore active span errors
