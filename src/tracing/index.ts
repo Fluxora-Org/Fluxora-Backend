@@ -176,7 +176,7 @@ export function getSamplingConfig(): SamplingConfig {
   const parseRate = (raw: string | undefined, fallback: number): number => {
     if (!raw || raw.trim() === '') return fallback;
     const n = Number.parseFloat(raw);
-    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+    return Number.isFinite(n) && !Number.isNaN(n) && n >= 0 && n <= 1 ? n : fallback;
   };
 
   const parseBool = (raw: string | undefined, fallback: boolean): boolean => {
@@ -203,35 +203,37 @@ export function getSamplingConfig(): SamplingConfig {
   // Default: head-based sampling
   const headRate = parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate);
 
-  let perRouteOverrides: Record<string, number> | undefined;
-  const rawOverrides = process.env.TRACING_PER_ROUTE_OVERRIDES;
-  if (rawOverrides && rawOverrides.trim().length > 0) {
+  const parseOverrides = (raw: string | undefined, name: string): Record<string, number> | undefined => {
+    if (!raw || raw.trim().length === 0) return undefined;
     try {
-      const parsed = JSON.parse(rawOverrides) as unknown;
+      const parsed = JSON.parse(raw) as unknown;
       if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        // Validate: only keep entries with numeric values in [0, 1]
         const validated: Record<string, number> = {};
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-          if (typeof v === 'number' && v >= 0 && v <= 1) {
+          if (typeof v === 'number' && Number.isFinite(v) && !Number.isNaN(v) && v >= 0 && v <= 1) {
             validated[k] = v;
           }
         }
         if (Object.keys(validated).length > 0) {
-          perRouteOverrides = validated;
+          return validated;
         }
       }
     } catch {
-      // Malformed JSON — ignore overrides, log to stderr for visibility
       process.stderr.write(
-        `[tracing] TRACING_PER_ROUTE_OVERRIDES is not valid JSON — per-route overrides disabled\n`,
+        `[tracing] ${name} is not valid JSON — overrides disabled\n`,
       );
     }
-  }
+    return undefined;
+  };
+
+  const perRouteOverrides = parseOverrides(process.env.TRACING_PER_ROUTE_OVERRIDES, 'TRACING_PER_ROUTE_OVERRIDES');
+  const perTenantOverrides = parseOverrides(process.env.TRACING_PER_TENANT_OVERRIDES, 'TRACING_PER_TENANT_OVERRIDES');
 
   const config: SamplingConfig = {
     strategy: 'head',
     sampleRate: headRate,
     ...(perRouteOverrides !== undefined ? { perRouteOverrides } : {}),
+    ...(perTenantOverrides !== undefined ? { perTenantOverrides } : {}),
   };
   return config;
 }
