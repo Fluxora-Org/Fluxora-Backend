@@ -652,3 +652,165 @@ describe('extractTableHint', () => {
     expect(extractTableHint('SELECT * FROM "my_table"')).toBe('my_table');
   });
 });
+
+// ── Pool exhaustion ─────────────────────────────────────────────────────────────
+
+describe('query — pool exhaustion', () => {
+  beforeEach(() => deRegisterDbMetrics());
+
+  function makePool(waitingCount: number, queueLimit: number): pg.Pool {
+    return {
+      totalCount: 10,
+      idleCount: 0,
+      waitingCount,
+      options: { max: 10 },
+      query: vi.fn(),
+      on: vi.fn(),
+    } as unknown as pg.Pool & { _queueLimit: number };
+  }
+
+  it('throws PoolExhaustedError when waitingCount >= queueLimit', async () => {
+    const pool = makePool(50, 50);
+    (pool as any)._queueLimit = 50;
+    await expect(query(pool, 'SELECT 1')).rejects.toBeInstanceOf(PoolExhaustedError);
+  });
+
+  it('throws PoolExhaustedError when waitingCount exceeds queueLimit', async () => {
+    const pool = makePool(51, 50);
+    (pool as any)._queueLimit = 50;
+    await expect(query(pool, 'SELECT 1')).rejects.toBeInstanceOf(PoolExhaustedError);
+  });
+
+  it('does not throw when waitingCount is below queueLimit', async () => {
+    const pool = makePool(49, 50);
+    (pool as any)._queueLimit = 50;
+    pool.query = vi.fn().mockResolvedValue({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] });
+    await expect(query(pool, 'SELECT 1')).resolves.toBeDefined();
+  });
+
+  it('does not throw when waitingCount is 0', async () => {
+    const pool = makePool(0, 50);
+    (pool as any)._queueLimit = 50;
+    pool.query = vi.fn().mockResolvedValue({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] });
+    await expect(query(pool, 'SELECT 1')).resolves.toBeDefined();
+  });
+});
+
+// ── withClient — transaction-leak prevention ─────────────────────────────────────
+
+describe('withClient — transaction-leak prevention', () => {
+  beforeEach(() => deRegisterDbMetrics());
+
+  it('releases client even when fn throws an error', async () => {
+    const mockClient = {
+      query: vi.fn(),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn().mockResolvedValue(mockClient),
+      totalCount: 1,
+      idleCount: 1,
+      waitingCount: 0,
+      options: { max: 10 },
+      on: vi.fn(),
+    } as unknown as pg.Pool;
+
+    await expect(withClient(pool, async () => {
+      throw new Error('Transaction failed');
+    })).rejects.toThrow('Transaction failed');
+
+    expect(mockClient.release).toHaveBeenCalledOnce();
+    expect(pool.connect).toHaveBeenCalledOnce();
+  });
+
+  it('releases client when pool.query fails inside withClient', async () => {
+    const mockClient = {
+      query: vi.fn().mockRejectedValue(new Error('Query timeout')),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn().mockResolvedValue(mockClient),
+      totalCount: 1,
+      idleCount: 1,
+      waitingCount: 0,
+      options: { max: 10 },
+      on: vi.fn(),
+    } as unknown as pg.Pool;
+
+    await expect(withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      await client.query('INSERT INTO test VALUES ($1)', [1]);
+      await client.query('COMMIT');
+      return { ok: true };
+    })).rejects.toThrow('Query timeout');
+
+    expect(mockClient.release).toHaveBeenCalledOnce();
+  });
+
+  it('releases client when client.release is called after error', async () => {
+    const mockClient = {
+      query: vi.fn().mockRejectedValue(new Error('Connection lost')),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn().mockResolvedValue(mockClient),
+      totalCount: 1,
+      idleCount: 1,
+      waitingCount: 0,
+      options: { max: 10 },
+      on: vi.fn(),
+    } as unknown as pg.Pool;
+
+    await expect(withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      await client.query('INSERT INTO test VALUES ($1)', [1]);
+      await client.query('COMMIT');
+      return { ok: true };
+    })).rejects.toThrow('Connection lost');
+
+    expect(mockClient.release).toHaveBeenCalledOnce();
+  });
+
+  it('does not leak connections on multiple sequential withClient calls', async () => {
+    const mockClient = {
+      query: vi.fn().mockResolvedValue({ rows: [] }),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn().mockResolvedValue(mockClient),
+      totalCount: 1,
+      idleCount: 1,
+      waitingCount: 0,
+      options: { max: 10 },
+      on: vi.fn(),
+    } as unknown as pg.Pool;
+
+    await withClient(pool, async () => ({ ok: 1 }));
+    await withClient(pool, async () => ({ ok: 2 }));
+    await withClient(pool, async () => ({ ok: 3 }));
+
+    expect(pool.connect).toHaveBeenCalledTimes(3);
+    expect(mockClient.release).toHaveBeenCalledTimes(3);
+  });
+
+  it('releases client even when fn throws PoolExhaustedError', async () => {
+    const mockClient = {
+      query: vi.fn(),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn().mockResolvedValue(mockClient),
+      totalCount: 1,
+      idleCount: 1,
+      waitingCount: 0,
+      options: { max: 10 },
+      on: vi.fn(),
+    } as unknown as pg.Pool;
+
+    await expect(withClient(pool, async () => {
+      throw new PoolExhaustedError();
+    })).rejects.toBeInstanceOf(PoolExhaustedError);
+
+    expect(mockClient.release).toHaveBeenCalledOnce();
+  });
+});
