@@ -167,6 +167,45 @@ export function writeAuditEntryToDb(db: AuditDbConnection, entry: AuditEntry): v
 }
 
 /**
+ * Write an audit entry inside an already-open Postgres transaction.
+ *
+ * Unlike `writeAuditEntryToDb` (which uses a SQLite-style `.prepare().run()` API),
+ * this variant accepts a `PoolClient` from the `pg` driver and is safe to call
+ * inside `BEGIN` / `COMMIT` blocks.  The audit row is committed or rolled back
+ * atomically with whatever else the caller is doing in the same transaction.
+ *
+ * Throws on DB error so the caller's transaction rolls back atomically.
+ * Also mirrors the entry into the in-memory log.
+ */
+export async function writeAuditEntryToClient(
+  client: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  action: AuditAction,
+  resourceType: string,
+  resourceId: string,
+  correlationId?: string,
+  meta?: Record<string, unknown>,
+): Promise<AuditEntry> {
+  const entry = buildAuditEntry(action, resourceType, resourceId, correlationId, meta);
+
+  await client.query(
+    `INSERT INTO audit_logs
+       (timestamp, action, resource_type, resource_id, correlation_id, meta)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      entry.timestamp,
+      entry.action,
+      entry.resourceType,
+      entry.resourceId,
+      entry.correlationId ?? null,
+      entry.meta !== undefined ? JSON.stringify(entry.meta) : null,
+    ],
+  );
+
+  appendAuditEntry(entry);
+  return entry;
+}
+
+/**
  * Build and persist an audit entry using the shared Postgres pool.
  * Intended for non-transactional admin actions that still need durable audit
  * logging in the `audit_logs` table.
