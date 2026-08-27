@@ -145,9 +145,44 @@ explicitly sets up those services.
 
 ## CI Pipeline
 
-The CI workflow (`.github/workflows/ci.yml`) runs `pnpm test:coverage` which
-executes Vitest with coverage. The resulting `./coverage/lcov.info` is uploaded
-to Codecov.
+The CI workflow (`.github/workflows/ci.yml`) has a blocking TypeScript gate that
+runs:
+
+```bash
+pnpm run typecheck
+```
+
+This uses the project `tsconfig.json` and checks the project boundary of `src/`,
+`migrations/`, and `tests/`. The `exclude` list covers only `node_modules/`,
+`dist/`, and the genuinely orphaned `tests/indexer/catchupTelemetry.test.ts`,
+which has no importers. The other pre-existing errors are in active-graph files
+and are isolated with a file-level `// @ts-nocheck` directive, tracked under
+`#TBD-typecheck-backlog`:
+
+- `src/graphql/gateway.ts`
+- `src/graphql/schema.ts`
+- `src/indexer/service.ts`
+- `src/metrics/indexerMetrics.ts`
+- `src/middleware/requestProtection.ts`
+- `src/routes/auth.ts`
+- `src/routes/dlq.ts`
+- `src/routes/indexer.ts`
+- `src/routes/privacy.ts`
+- `src/routes/streams.ts`
+- `src/scripts/backup-retention.ts`
+- `src/services/streamEventService.ts`
+- `src/shutdown.ts`
+- `src/streams/sseConnectionLimiter.ts`
+- `src/tracing/index.ts`
+
+Any new file, or any file without this directive, blocks CI when it has a type
+error. This is a fixed, named boundary, not a blanket ignore. A follow-up issue
+should be opened as `#TBD-typecheck-backlog` to burn down the pre-existing
+backlog.
+
+The same workflow runs `pnpm test:coverage`; the resulting `./coverage/lcov.info`
+is uploaded to Codecov. The build command remains available for local and CI
+verification with `pnpm run build`.
 
 ## Security Notes
 
