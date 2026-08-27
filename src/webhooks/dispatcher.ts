@@ -193,9 +193,11 @@ export class WebhookDispatcher {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       
-      // Check if it's WebhookTargetValidationError, which are non-retryable
+      // Check if it's WebhookTargetValidationError or TimeoutError, which are non-retryable
       let isNonRetryable = false;
       if (error instanceof WebhookTargetValidationError) {
+        isNonRetryable = true;
+      } else if (error instanceof DOMException && error.name === 'TimeoutError') {
         isNonRetryable = true;
       }
       
@@ -342,7 +344,7 @@ export class WebhookDispatcher {
     correlationId?: string,
   ): Promise<Response> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(new DOMException('Webhook delivery timeout', 'TimeoutError')), this.policy.timeoutMs);
 
     try {
       const headers: Record<string, string> = {
@@ -595,7 +597,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   // Add AbortController timeout to prevent slow-loris attacks
   const controller = new AbortController();
   const timeoutMs = DEFAULT_RETRY_POLICY.timeoutMs;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(new DOMException('Webhook delivery timeout', 'TimeoutError')), timeoutMs);
 
   try {
     await fetch(opts.url, {

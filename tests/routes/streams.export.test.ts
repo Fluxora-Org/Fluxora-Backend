@@ -67,4 +67,46 @@ describe('GET /api/streams/export', () => {
     const cursor2 = JSON.parse(lines[3]);
     expect(cursor2).toHaveProperty('resumption_cursor');
   });
+  it('should bound export to MAX_PAGES', async () => {
+    const stream1 = { id: 'stream-1', sender_address: 'S1', recipient_address: 'R1', amount: '100', streamed_amount: '0', remaining_amount: '100', rate_per_second: '1', start_time: 1000, end_time: 2000, status: 'active', contract_id: 'c1', transaction_hash: 'tx1', event_index: 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    
+    ;(streamRepository.findWithCursor as any).mockResolvedValue({ streams: [stream1], hasMore: true });
+
+    const response = await request(app)
+      .get('/api/streams/export')
+      .set('x-api-key', 'valid-api-key')
+      .expect(200);
+
+    const lines = response.text.trim().split('\n');
+    // MAX_PAGES is 1000. Each page returns 1 stream and 1 cursor, so 2000 lines.
+    expect(lines.length).toBe(2000);
+  });
+
+  it('should abort export if client disconnects', async () => {
+    let callCount = 0;
+    ;(streamRepository.findWithCursor as any).mockImplementation(async () => {
+      callCount++;
+      return { streams: [], hasMore: true }; // infinite loop if no cancel
+    });
+
+    const { streamsRouter } = await import('../../src/routes/streams.js');
+    const { default: express } = await import('express');
+    const testApp = express();
+    testApp.use((req: any, res: any, next: any) => {
+      // simulate disconnect after first fetch
+      setTimeout(() => {
+        req.closed = true;
+      }, 5);
+      next();
+    });
+    testApp.use('/api/streams', streamsRouter);
+    
+    await request(testApp)
+      .get('/api/streams/export')
+      .set('x-api-key', 'valid-api-key')
+      .expect(200);
+      
+    // callCount should be much less than 1000 because it aborts
+    expect(callCount).toBeLessThan(1000);
+  });
 });

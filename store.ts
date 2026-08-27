@@ -1,5 +1,12 @@
 import { ContractEventRecord, IndexerStoreKind } from './types.js';
 import { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } from '../db/types.js';
+import {
+  rowReader,
+  describeValue,
+  RowMappingError,
+  INT32_MAX,
+  BIGINT_SAFE_MAX,
+} from '../db/rowMapping.js';
 
 export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
 
@@ -12,6 +19,68 @@ export class StaleCursorError extends Error {
     super(`Replay cursor '${afterEventId}' no longer exists; resync from fromLedger`);
     this.name = 'StaleCursorError';
   }
+}
+
+/**
+ * Map a raw `contract_events` row into a typed {@link StreamEventRecord}.
+ *
+ * Contract, from `migrations/1774715131962_streams-table.ts` plus
+ * `migrations/20260624000000_add_ledger_hash_to_contract_events.ts` and
+ * `migrations/20260627110000_contract_events_ingested_at_default.ts`:
+ *
+ * | Column            | Type                       | Nullable |
+ * | ----------------- | -------------------------- | -------- |
+ * | `event_id`        | `text` PK                  | no       |
+ * | `ledger`          | `integer`                  | no       |
+ * | `contract_id`     | `text`                     | no       |
+ * | `topic`           | `text`                     | no       |
+ * | `tx_hash`         | `text`                     | no       |
+ * | `tx_index`        | `integer`                  | no       |
+ * | `operation_index` | `integer`                  | no       |
+ * | `event_index`     | `integer`                  | no       |
+ * | `payload`         | `jsonb`                    | no       |
+ * | `happened_at`     | `timestamp with time zone` | no       |
+ * | `ledger_hash`     | `text`                     | **yes**  |
+ * | `ingested_at`     | `timestamp with time zone` | no       |
+ *
+ * Two corrections over the previous inline mapper:
+ *
+ *  - `ledger_hash` is nullable by design, so a legacy row reads as `null`
+ *    rather than as a `string` that happens to hold `null` at runtime.
+ *  - `happened_at` and `ingested_at` are `timestamptz`, which `pg` parses into
+ *    `Date`. They were assigned straight to fields declared `string` and
+ *    documented as ISO-8601. They are now converted explicitly, so the runtime
+ *    value matches the declared type. HTTP responses are byte-identical:
+ *    `JSON.stringify` already rendered those `Date`s as ISO-8601.
+ *
+ * Failure policy: fail fast. This is a read path behind the replay API and the
+ * WebSocket hub. Returning a page of events whose `contractId` is silently
+ * `null` corrupts every consumer downstream; a rejected request does not.
+ *
+ * @param table — source table name, used only in error messages.
+ * @throws {RowMappingError} if any column violates the contract above.
+ */
+export function rowToStreamEventRecord(
+  row: Record<string, unknown>,
+  table = 'contract_events',
+): StreamEventRecord {
+  const r = rowReader(table, row);
+  const index = { min: 0, max: INT32_MAX };
+
+  return {
+    eventId: r.requireString('event_id'),
+    ledger: r.requireInt('ledger', index),
+    ledgerHash: r.optionalString('ledger_hash'),
+    contractId: r.requireString('contract_id'),
+    topic: r.requireString('topic'),
+    txHash: r.requireString('tx_hash'),
+    txIndex: r.requireInt('tx_index', index),
+    operationIndex: r.requireInt('operation_index', index),
+    eventIndex: r.requireInt('event_index', index),
+    payload: r.requireJsonObject('payload'),
+    happenedAt: r.requireDate('happened_at').toISOString(),
+    ingestedAt: r.requireDate('ingested_at').toISOString(),
+  };
 }
 
 /** Record of a chain reorg that evicted previously stored events. */
@@ -134,10 +203,23 @@ export class InMemoryContractEventStore implements ContractEventStore {
       ? results.slice(0, limit)
       : results.slice(offset, offset + limit);
 
-    const events = slice.map((r) => ({
-      ...r,
-      ingestedAt: r.ingestedAt ?? new Date().toISOString(),
-    }));
+    // `insertMany` stamps `ingestedAt` on every record it accepts, mirroring the
+    // `DEFAULT now()` that the Postgres store relies on. Reading is therefore a
+    // pure projection: a missing timestamp means the record bypassed the insert
+    // path, and inventing one here would both hide that and hand the caller a
+    // different value on every read of the same event.
+    const events: StreamEventRecord[] = slice.map((record) => {
+      const { ingestedAt } = record;
+      if (typeof ingestedAt !== 'string' || ingestedAt.length === 0) {
+        throw new RowMappingError(
+          'memory:contract_events',
+          'ingestedAt',
+          'stored record has no ingest timestamp',
+          describeValue(ingestedAt),
+        );
+      }
+      return { ...record, ingestedAt };
+    });
 
     const lastEvent = events[events.length - 1];
     const nextCursor = events.length === limit && total > limit && lastEvent
@@ -190,8 +272,8 @@ export class PostgresContractEventStore implements ContractEventStore {
    *
    * Enforces server-authoritative ingest timestamps:
    * - If `ingestedAt` is omitted, null, or undefined on an event record, the insert uses the
-   *   database-level `now()` value, making the PostgreSQL server the authoritative source for
-   *   ingestion timestamps.
+   *   database-level DEFAULT `now()` value, making the PostgreSQL server the authoritative
+   *   source for ingestion timestamps.
    * - If an explicit `ingestedAt` timestamp is provided, it will override the database default.
    * - This ensures existing database entries and legacy writes can define explicit timestamps
    *   if needed, but default writes rely on the database server time.
@@ -218,8 +300,7 @@ export class PostgresContractEventStore implements ContractEventStore {
         event.eventIndex,
         JSON.stringify(event.payload),
         event.happenedAt,
-        event.ledgerHash,
-        event.ingestedAt ?? null,
+        event.ledgerHash
       );
 
       const basePlaceholders = [
@@ -234,41 +315,32 @@ export class PostgresContractEventStore implements ContractEventStore {
         `$${placeholderOffset + 8}::jsonb`,
         `$${placeholderOffset + 9}::timestamptz`,
         `$${placeholderOffset + 10}`,
-        `$${placeholderOffset + 11}::timestamptz`,
       ];
 
-      placeholderOffset += 12;
+      placeholderOffset += 11;
+
+      if (event.ingestedAt !== undefined && event.ingestedAt !== null) {
+        values.push(event.ingestedAt);
+        basePlaceholders.push(`$${placeholderOffset}::timestamptz`);
+        placeholderOffset += 1;
+      } else {
+        basePlaceholders.push('DEFAULT');
+      }
 
       return `(${basePlaceholders.join(', ')})`;
     });
 
-    // contract_events is range-partitioned by happened_at, so its primary key
-    // cannot provide a globally unique event_id constraint. Claim the event ID
-    // in the non-partitioned table first. The claim and canonical row insert
-    // are one statement, so concurrent workers have exactly one winner and a
-    // rolled-back transaction releases the claim automatically.
+    // The contract_events table is range-partitioned by happened_at.
+    // The PRIMARY KEY is (happened_at, event_id), so the ON CONFLICT target
+    // must include both columns. Using just (event_id) would fail with
+    // "there is no unique or exclusion constraint matching the ON CONFLICT
+    // specification" on a partitioned table.
     const sql = `
-      WITH input (
-        event_id, ledger, contract_id, topic, tx_hash,
-        tx_index, operation_index, event_index, payload,
-        happened_at, ledger_hash, ingested_at
-      ) AS (
-        VALUES ${placeholders.join(', ')}
-      ), claimed AS (
-        INSERT INTO contract_event_dedup (event_id, happened_at)
-        SELECT event_id, happened_at FROM input
-        ON CONFLICT (event_id) DO NOTHING
-        RETURNING event_id
-      )
       INSERT INTO ${this.tableName} (
         event_id, ledger, contract_id, topic, tx_hash,
         tx_index, operation_index, event_index, payload, happened_at, ledger_hash, ingested_at
       )
-      SELECT i.event_id, i.ledger, i.contract_id, i.topic, i.tx_hash,
-             i.tx_index, i.operation_index, i.event_index, i.payload,
-             i.happened_at, i.ledger_hash, COALESCE(i.ingested_at, now())
-        FROM input i
-        INNER JOIN claimed c ON c.event_id = i.event_id
+      VALUES ${placeholders.join(', ')}
       ON CONFLICT (happened_at, event_id) DO NOTHING
       RETURNING event_id
     `;
@@ -284,16 +356,7 @@ export class PostgresContractEventStore implements ContractEventStore {
   }
 
   async rollbackBeforeLedger(ledger: number): Promise<void> {
-    await this.client.query(`
-      WITH removed AS (
-        DELETE FROM ${this.tableName}
-         WHERE ledger >= $1
-         RETURNING event_id
-      )
-      DELETE FROM contract_event_dedup d
-       USING removed r
-       WHERE d.event_id = r.event_id
-    `, [ledger]);
+    await this.client.query(`DELETE FROM ${this.tableName} WHERE ledger >= $1`, [ledger]);
   }
 
   async getLedgerHash(ledger: number): Promise<string | null> {
@@ -357,19 +420,23 @@ export class PostgresContractEventStore implements ContractEventStore {
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const countResult = await this.client.query<{ count: string }>(
+    const countResult = await this.client.query<Record<string, unknown>>(
       `SELECT COUNT(*) AS count FROM ${this.tableName} ${where}`,
       values
     );
-    const total = parseInt(countResult.rows[0]?.count ?? '0', 10);
+    // COUNT(*) always returns exactly one row. Defaulting a missing row to 0
+    // would have reported "no events" for a query that never actually ran.
+    const total = rowReader(this.tableName, countResult.rows[0] ?? {}).requireInt('count', {
+      min: 0,
+      max: BIGINT_SAFE_MAX,
+    });
 
     const pageValues = [...values, limit, filter.afterEventId !== undefined ? 0 : offset];
-    const dataResult = await this.client.query<{
-      event_id: string; ledger: number; ledger_hash: string; contract_id: string;
-      topic: string; tx_hash: string; tx_index: number; operation_index: number;
-      event_index: number; payload: Record<string, unknown>; happened_at: string;
-      ingested_at: string;
-    }>(
+    // Query with `Record<string, unknown>` and map through the validating
+    // reader — the previous inline generic asserted a shape the database does
+    // not guarantee (`ledger_hash` is nullable, and the timestamptz columns
+    // arrive as `Date`, not `string`).
+    const dataResult = await this.client.query<Record<string, unknown>>(
       `SELECT event_id, ledger, ledger_hash, contract_id, topic, tx_hash,
               tx_index, operation_index, event_index, payload, happened_at, ingested_at
        FROM ${this.tableName} ${where}
@@ -378,20 +445,9 @@ export class PostgresContractEventStore implements ContractEventStore {
       pageValues
     );
 
-    const events: StreamEventRecord[] = dataResult.rows.map((row) => ({
-      eventId: row.event_id,
-      ledger: row.ledger,
-      ledgerHash: row.ledger_hash,
-      contractId: row.contract_id,
-      topic: row.topic,
-      txHash: row.tx_hash,
-      txIndex: row.tx_index,
-      operationIndex: row.operation_index,
-      eventIndex: row.event_index,
-      payload: row.payload,
-      happenedAt: row.happened_at,
-      ingestedAt: row.ingested_at,
-    }));
+    const events: StreamEventRecord[] = dataResult.rows.map((row) =>
+      rowToStreamEventRecord(row, this.tableName),
+    );
 
     const lastEvent = events[events.length - 1];
     const nextCursor = events.length === limit && total > limit && lastEvent
