@@ -58,7 +58,7 @@ import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse } from './utils/response.js';
-import { ApiError } from './errors.js';
+import { ApiError, notFound } from './errors.js';
 import { docsRouter } from './routes/docs.js';
 import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
@@ -537,7 +537,7 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   app.use((_req: Request, _res: Response, next: NextFunction) => {
-    next(new ApiError(404, 'NOT_FOUND', 'The requested resource was not found'));
+    next(notFound('The requested resource was'));
   });
 
   app.use(errorHandler);

@@ -408,4 +408,69 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(getActiveLongPollConnectionCount()).toBe(0);
     expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
   });
+  it('handles gap of unrelated events by paginating until a matching event is found', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const unrelatedEvents = Array(100).fill(null).map((_, i) => ({
+      eventId: `evt-unrelated-${i}`,
+      txHash: 'b'.repeat(64),
+      eventIndex: i,
+      payload: { id: 'stream-other' },
+    }));
+
+    const matchingEvent = {
+      eventId: 'evt-matching-101',
+      txHash: 'a'.repeat(64),
+      eventIndex: 101,
+      payload: { id: 'stream-123', depositAmount: '500' },
+    };
+
+    mockGetEvents
+      .mockResolvedValueOnce({
+        events: unrelatedEvents,
+        total: 101,
+        nextCursor: 'evt-unrelated-99',
+      })
+      .mockResolvedValueOnce({
+        events: [matchingEvent],
+        total: 101,
+      });
+
+    const res = await requestPoll('/api/streams/stream-123/poll?since=evt-0');
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.eventId).toBe('evt-matching-101');
+    expect(mockGetEvents).toHaveBeenCalledTimes(2);
+    expect(mockGetEvents).toHaveBeenNthCalledWith(1, { afterEventId: 'evt-0', limit: 100 });
+    expect(mockGetEvents).toHaveBeenNthCalledWith(2, { afterEventId: 'evt-unrelated-99', limit: 100 });
+    expect(getActiveLongPollConnectionCount()).toBe(0);
+  });
+
+  it('handles duplicate requests gracefully (at-least-once semantics)', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const historicalEvent = {
+      eventId: 'evt-100',
+      txHash: 'a'.repeat(64),
+      eventIndex: 0,
+      payload: { id: 'stream-123', depositAmount: '500' },
+    };
+
+    mockGetEvents.mockResolvedValue({
+      events: [historicalEvent],
+      total: 1,
+    });
+
+    const [res1, res2] = await Promise.all([
+      requestPoll('/api/streams/stream-123/poll?since=evt-99'),
+      requestPoll('/api/streams/stream-123/poll?since=evt-99'),
+    ]);
+
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    expect(res1.body.data.eventId).toBe('evt-100');
+    expect(res2.body.data.eventId).toBe('evt-100');
+    expect(mockGetEvents).toHaveBeenCalledTimes(2);
+  });
 });

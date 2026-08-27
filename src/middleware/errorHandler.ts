@@ -4,32 +4,14 @@ import { SerializationLogger, error as logError } from '../utils/logger.js';
 import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
-import { ApiError } from '../errors.js';
+import { ApiError, ApiErrorCode } from '../errors.js';
 import { getActiveTraceSpanIds } from '../tracing/hooks.js';
 
-export { ApiError } from '../errors.js';
+export { ApiError, ApiErrorCode } from '../errors.js';
 
 export interface ApiErrorResponse {
   success: false;
   error: { code: string; message: string; details?: unknown; requestId?: string };
-}
-
-export enum ApiErrorCode {
-  VALIDATION_ERROR = 'VALIDATION_ERROR',
-  DECIMAL_ERROR = 'DECIMAL_ERROR',
-  NOT_FOUND = 'NOT_FOUND',
-  CONFLICT = 'CONFLICT',
-  UNAUTHORIZED = 'UNAUTHORIZED',
-  FORBIDDEN = 'FORBIDDEN',
-  PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
-  TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
-  METHOD_NOT_ALLOWED = 'METHOD_NOT_ALLOWED',
-  REQUEST_TIMEOUT = 'REQUEST_TIMEOUT',
-  INTERNAL_ERROR = 'INTERNAL_ERROR',
-  SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
-  UNPROCESSABLE_ENTITY = 'UNPROCESSABLE_ENTITY',
-  UNSUPPORTED_MEDIA_TYPE = 'UNSUPPORTED_MEDIA_TYPE',
-  GATEWAY_TIMEOUT = 'GATEWAY_TIMEOUT',
 }
 
 /**
@@ -136,44 +118,4 @@ export function asyncHandler(
   return (req: Request, res: Response, next: NextFunction): void => {
     Promise.resolve(fn(req, res, next)).catch((error: unknown) => next(error));
   };
-}
-
-export function notFound(resource: string, id?: string): ApiError {
-  return new ApiError(404, ApiErrorCode.NOT_FOUND, id !== undefined ? `${resource} '${id}' not found` : `${resource} not found`);
-}
-
-export function validationError(message: string, details?: unknown): ApiError {
-  return new ApiError(400, ApiErrorCode.VALIDATION_ERROR, message, details);
-}
-
-export function conflictError(message: string, details?: unknown): ApiError {
-  return new ApiError(409, ApiErrorCode.CONFLICT, message, details);
-}
-
-export function serviceUnavailable(message: string): ApiError {
-  return new ApiError(503, ApiErrorCode.SERVICE_UNAVAILABLE, message);
-}
-
-export function unauthorized(message: string, details?: unknown): ApiError {
-  return new ApiError(401, ApiErrorCode.UNAUTHORIZED, message, details);
-}
-
-export function forbidden(message: string, details?: unknown): ApiError {
-  return new ApiError(403, ApiErrorCode.FORBIDDEN, message, details);
-}
-
-export function payloadTooLarge(message: string, details?: unknown): ApiError {
-  return new ApiError(413, ApiErrorCode.PAYLOAD_TOO_LARGE, message, details);
-}
-
-export function tooManyRequests(message: string, details?: unknown): ApiError {
-  return new ApiError(429, ApiErrorCode.TOO_MANY_REQUESTS, message, details);
-}
-
-export function requestTimeout(message: string): ApiError {
-  return new ApiError(408, ApiErrorCode.REQUEST_TIMEOUT, message);
-}
-
-export function gatewayTimeout(message: string): ApiError {
-  return new ApiError(504, ApiErrorCode.GATEWAY_TIMEOUT, message);
 }

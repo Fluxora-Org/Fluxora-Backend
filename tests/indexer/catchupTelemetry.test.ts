@@ -208,7 +208,6 @@ describe('Replay Progress Checkpoints — Monotonicity & Crash Safety', () => {
       const cpAfterRetry = await store.getCheckpoint(cursorId);
       expect(cpAfterRetry!.lastCommittedOffset).toBe(2);
     });
-  });
 
   describe('PostgresContractEventStore & ReplayCursorRepository Monotonic SQL', () => {
     it('advanceOffset uses GREATEST in SQL to prevent regression', async () => {
@@ -251,4 +250,4 @@ describe('Replay Progress Checkpoints — Monotonicity & Crash Safety', () => {
       expect(queries[0].values).toEqual(['c-uuid-999', 100, 'in-progress']);
     });
   });
-});
+}

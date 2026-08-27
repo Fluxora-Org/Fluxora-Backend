@@ -3,11 +3,13 @@ FROM node:18-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json pnpm-lock.yaml* ./
+# Copy package files and the preinstall guard
+COPY package.json pnpm-lock.yaml ./
+COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
 
-# Install pnpm and dependencies
-RUN npm install -g pnpm && \
+# Activate the pinned pnpm version and install dependencies
+RUN corepack enable && \
+    corepack prepare pnpm@9.15.9 --activate && \
     pnpm install --frozen-lockfile
 
 # Copy source code
@@ -21,14 +23,18 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-# Install pnpm
-RUN npm install -g pnpm
+# Keep Corepack's prepared pnpm distribution outside root's home so the
+# non-root runtime user can execute pnpm without downloading it again.
+ENV COREPACK_HOME=/opt/corepack
 
-# Copy package files
-COPY package.json pnpm-lock.yaml* ./
+# Copy package files and the preinstall guard
+COPY package.json pnpm-lock.yaml ./
+COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
 
-# Install production dependencies only
-RUN pnpm install --prod --frozen-lockfile
+# Activate the pinned pnpm version and install production dependencies only
+RUN corepack enable && \
+    corepack prepare pnpm@9.15.9 --activate && \
+    pnpm install --prod --frozen-lockfile
 
 # Copy built application from builder
 COPY --from=builder /app/dist ./dist
@@ -38,7 +44,7 @@ RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
 
 # Change ownership
-RUN chown -R nodejs:nodejs /app
+RUN chown -R nodejs:nodejs /app /opt/corepack
 
 # Switch to non-root user
 USER nodejs
