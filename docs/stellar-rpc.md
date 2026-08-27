@@ -14,7 +14,26 @@ The breaker is configured with `RPC_CB_FAILURE_THRESHOLD`, `RPC_CB_WINDOW_MS`, `
 
 ## RPC Retries
 
-Individual RPC calls (such as fetching the latest ledger or checking account existence) are automatically wrapped in a retry loop using a shared decorrelated jitter helper. If a transient error occurs (such as a timeout or a provider error) and the circuit is not open, the request will be retried up to `STELLAR_RPC_MAX_RETRIES` times (default 3) before failing, with a base delay of `STELLAR_RPC_RETRY_DELAY` (default 1000ms). Jitter ensures that concurrent callers do not thunder-herd the RPC provider.
+Individual RPC calls (such as fetching the latest ledger or checking account existence) are automatically wrapped in a retry loop using a shared decorrelated jitter helper. If a *retryable* error occurs and the circuit is not open, the request is retried up to `STELLAR_RPC_MAX_RETRIES` times (default 3) before failing, with a base delay of `STELLAR_RPC_RETRY_DELAY` (default 1000ms). Jitter ensures that concurrent callers do not thunder-herd the RPC provider.
+
+### Read vs. submit fallback policy
+
+Every operation this service currently exposes — `getLatestLedger` and `accountExists` — is a **read**: side-effect-free and safe to repeat any number of times. Retrying reads carries no risk of duplicate submissions, so retry decisions only need to ask "can this plausibly succeed on a second attempt?", not "is it safe to attempt again?". There is presently no submit/write RPC path (e.g. transaction submission) in this service; if one is added, it must carry its own idempotency key (e.g. the transaction hash) so a client-side retry after an ambiguous network failure cannot result in a duplicate on-chain submission — retrying a submit call blindly under this same policy would be unsafe.
+
+### Retryable status classes
+
+`isRetryableRpcError` (in `src/services/stellar-rpc.ts`) classifies every `RpcProviderError` raised by a call site before a retry is attempted:
+
+| Condition | Retried? | Rationale |
+| --- | --- | --- |
+| `TIMEOUT` / `NETWORK` kind | Yes | Connection-level hiccups are plausibly transient. |
+| `PROVIDER` kind, HTTP 429 | Yes | Rate limiting is expected to clear; backoff gives the provider room. |
+| `PROVIDER` kind, HTTP 5xx | Yes | Upstream server errors are plausibly transient. |
+| `PROVIDER` kind, HTTP 4xx (other than 429) | No | A permanent client/request error — retrying cannot change the outcome. |
+| `PROVIDER` kind, no HTTP status (config error, malformed response) | No | Permanent by construction (e.g. a missing `horizonUrl`) — retrying would only add latency and could mask the real error behind a generic timeout. |
+| `CANCELLED` kind | No | The caller explicitly aborted the request. |
+
+Only errors that have already been classified into an `RpcProviderError` by the service's own call sites are evaluated this way; a raw transport error thrown directly by a `RawRpcClient` implementation is left to the outer per-call timeout instead of being retried, so a single call's overall timeout budget can never be silently multiplied by per-attempt backoff sleeps.
 
 ## Fallback Cache
 

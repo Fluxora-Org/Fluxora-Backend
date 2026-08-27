@@ -149,6 +149,44 @@ function classifyError(err: unknown): RpcFailureKind {
   return 'PROVIDER';
 }
 
+/**
+ * Retryable-status classification for errors already raised as
+ * {@link RpcProviderError} by our own call sites (e.g. the config-validation
+ * and HTTP-status checks inside `accountExists`).
+ *
+ * Retries must not paper over permanent errors, and permanent errors must
+ * not pay the full jittered-backoff delay before surfacing. Only failures
+ * that are plausibly transient are retried:
+ *
+ *   - TIMEOUT / NETWORK          — connection-level hiccups, safe to retry.
+ *   - PROVIDER with status 429   — rate limited; retry with backoff.
+ *   - PROVIDER with status >=500 — upstream server error; retry.
+ *   - everything else            — permanent: a 4xx client/request error, a
+ *     malformed response, or a config error (e.g. a missing horizonUrl) —
+ *     and is surfaced immediately without consuming retry budget.
+ *
+ * `getLatestLedger` and `accountExists` are both read-only, idempotent
+ * operations, so retrying them carries no duplicate-submission risk — this
+ * only needs to decide whether a retry can plausibly *succeed*, not whether
+ * it is safe to attempt.
+ *
+ * Errors that have not yet been classified into an `RpcProviderError` (i.e.
+ * raw transport errors thrown directly by a `RawRpcClient` implementation)
+ * are intentionally left to the outer per-call timeout/classification in
+ * {@link StellarRpcService.callWithTimeout} rather than retried here, so a
+ * single call's overall timeout budget cannot be silently multiplied by
+ * per-attempt backoff sleeps.
+ */
+export function isRetryableRpcError(err: unknown): boolean {
+  if (!(err instanceof RpcProviderError)) return false;
+  if (err.kind === 'TIMEOUT' || err.kind === 'NETWORK') return true;
+  if (err.kind !== 'PROVIDER') return false;
+
+  if (err.statusCode === 429) return true;
+  if (err.statusCode !== undefined && err.statusCode >= 500) return true;
+  return false;
+}
+
 // ── Circuit breaker ───────────────────────────────────────────────────────────
 
 export class CircuitBreaker {
@@ -400,7 +438,7 @@ export class StellarRpcService {
           maxDelayMs: this.retryDelayMs * 5,
           maxAttempts: this.maxRetries + 1,
         },
-        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+        isRetryableRpcError
       ),
       opts,
     );
@@ -458,7 +496,7 @@ export class StellarRpcService {
           maxDelayMs: this.retryDelayMs * 5,
           maxAttempts: this.maxRetries + 1,
         },
-        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+        isRetryableRpcError
       ),
       opts,
     );
