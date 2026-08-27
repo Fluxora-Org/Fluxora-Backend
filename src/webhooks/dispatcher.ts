@@ -2,6 +2,7 @@ import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId, getActiveTraceContext, buildTraceparent } from '../tracing/middleware.js';
 
 import { logger } from '../lib/logger.js';
+import { redactKeysInString } from '../pii/sanitizer.js';
 
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
@@ -85,7 +86,7 @@ export class WebhookDispatcher {
       });
     } catch (error) {
       if (error instanceof WebhookTargetValidationError) {
-        logger.error('Webhook target rejected by SSRF guard', undefined, {
+        logger.error('Webhook target rejected by SSRF guard', effectiveCorrelationId, {
           deliveryId,
           eventType,
           reason: error.message,
@@ -102,7 +103,7 @@ export class WebhookDispatcher {
     const gate = await circuitBreakerStore.checkAndClaimAttempt(url, enhancedPolicy);
     if (!gate.allowed) {
       const nextRetryAt = resolveCircuitBreakerDeferral(gate, enhancedPolicy).getTime();
-      logger.warn('Webhook delivery deferred by circuit breaker', undefined, {
+      logger.warn('Webhook delivery deferred by circuit breaker', effectiveCorrelationId, {
         deliveryId,
         attemptNumber,
         state: gate.state,
@@ -135,7 +136,7 @@ export class WebhookDispatcher {
 
       if (response.ok) {
         await circuitBreakerStore.recordSuccess(url, enhancedPolicy as CircuitBreakerPolicy);
-        logger.info('Webhook delivered successfully', undefined, {
+        logger.info('Webhook delivered successfully', effectiveCorrelationId, {
           deliveryId,
           eventType,
           statusCode: response.status,
@@ -150,7 +151,7 @@ export class WebhookDispatcher {
       }
 
       // Handle non-2xx responses
-      const errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+      const errorMessage = redactKeysInString(`HTTP ${response.status}: ${response.statusText}`);
       attempt.error = errorMessage;
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
@@ -161,7 +162,7 @@ export class WebhookDispatcher {
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
         
-        logger.warn('Webhook delivery failed, will retry', undefined, {
+        logger.warn('Webhook delivery failed, will retry', effectiveCorrelationId, {
           deliveryId,
           eventType,
           statusCode: response.status,
@@ -177,7 +178,7 @@ export class WebhookDispatcher {
         };
       }
 
-      logger.error('Webhook delivery failed permanently', undefined, {
+      logger.error('Webhook delivery failed permanently', effectiveCorrelationId, {
         deliveryId,
         eventType,
         statusCode: response.status,
@@ -191,7 +192,7 @@ export class WebhookDispatcher {
         shouldRetry: false,
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorMessage = redactKeysInString(error instanceof Error ? error.message : String(error));
       
       // Check if it's WebhookTargetValidationError or TimeoutError, which are non-retryable
       let isNonRetryable = false;
@@ -202,7 +203,7 @@ export class WebhookDispatcher {
       }
       
       if (isNonRetryable) {
-        logger.error('Webhook delivery failed permanently with error', undefined, {
+        logger.error('Webhook delivery failed permanently with error', effectiveCorrelationId, {
           deliveryId,
           eventType,
           attemptNumber,
@@ -230,7 +231,7 @@ export class WebhookDispatcher {
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
         
-        logger.warn('Webhook delivery failed with error, will retry', undefined, {
+        logger.warn('Webhook delivery failed with error, will retry', effectiveCorrelationId, {
           deliveryId,
           eventType,
           attemptNumber,
@@ -244,7 +245,7 @@ export class WebhookDispatcher {
         };
       }
 
-      logger.error('Webhook delivery failed permanently with error', undefined, {
+      logger.error('Webhook delivery failed permanently with error', effectiveCorrelationId, {
         deliveryId,
         eventType,
         attemptNumber,
