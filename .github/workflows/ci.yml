@@ -46,6 +46,9 @@ jobs:
         run: pnpm run lint || echo "Linter not configured"
         continue-on-error: true
 
+      - name: Check migration naming policy
+        run: pnpm run check:migrations
+
       # Drift check: fail CI if sdk/python/ diverges from a fresh generation.
       # Re-run `pnpm generate:sdk:python` locally and commit the result to fix.
       - name: SDK drift check (Python)
