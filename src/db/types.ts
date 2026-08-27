@@ -211,6 +211,36 @@ export interface ApiKeyCreated {
   createdAt: string;
 }
 
+/**
+ * Safe display projection of an API key record.
+ *
+ * This is the ONLY shape that should ever be serialised into an HTTP response.
+ * It deliberately omits `keyHash` and `salt`, which are internal credential
+ * material that must never leave the server boundary.
+ *
+ * Fields included:
+ * - `id`        — stable opaque identifier (cuid2), safe to expose
+ * - `name`      — human-readable label set at creation time
+ * - `prefix`    — first 8 chars of the raw key; sufficient for log correlation
+ * - `createdAt` — ISO-8601 creation timestamp
+ * - `rotatedAt` — ISO-8601 last-rotated timestamp, or null
+ * - `active`    — whether the key can still authenticate requests
+ * - `scopes`    — granted permission scopes
+ *
+ * Fields deliberately absent:
+ * - `keyHash`   — HMAC digest; leaking it narrows the offline brute-force surface
+ * - `salt`      — per-key random salt used to derive `keyHash`
+ */
+export interface ApiKeyView {
+  id: string;
+  name: string;
+  prefix: string;
+  createdAt: string;
+  rotatedAt: string | null;
+  active: boolean;
+  scopes: string[];
+}
+
 // ─── Stream Event Store ───────────────────────────────────────────────────────
 
 /**
