@@ -12,7 +12,7 @@ import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.j
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders } from './middleware/pii.js';
 import type { Config } from './config/env.js';
-import { loadConfig } from './config/env.js';
+import { loadConfig, initializeConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
 import { createGrpcHealthServer, startGrpcHealthServer, stopGrpcHealthServer } from './health/grpcHealth.js';
 import { createRedisClient } from './redis/client.js';
@@ -544,6 +544,10 @@ export function createApp(options: AppOptions = {}): Express {
 
   return app;
 }
+
+// Initialize the config singleton so getConfig() works in all route handlers
+// and services that run after module load. No-op if already initialized.
+initializeConfig();
 
 export const app = createApp();
 export default app;
