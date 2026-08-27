@@ -62,7 +62,7 @@ function createConfiguredStore() {
 
         const execute = async () => {
           try {
-            if (failLedger !== undefined && isEventBatch && (eve~ts as Array<{ ledger: number }>).some(e => e.ledger === failLedger)) {
+            if (failLedger !== undefined && isEventBatch && (first as Array<{ ledger: number }>).some(e => e.ledger === failLedger)) {
               throw new Error(`simulated failure for ledger ${failLedger}`);
             }
             if (delayMs > 0) {
@@ -143,7 +143,7 @@ describe('Indexer Catch-up Telemetry', () => {
 
     it('should return updated telemetry after ingest', async () => {
       // Mock RPC tip at ledger 1000
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const events: ContractEventRecord[] = [
         {
@@ -167,14 +167,14 @@ describe('Indexer Catch-up Telemetry', () => {
 
       expect(telemetry.ledgerLag).toBe(50); // 1000 - 950
       expect(telemetry.lastIndexedLedger).toBe(950);
-      expect(telemetry.lastLedgerLagUpdateAt).notToBeNull();
+      expect(telemetry.lastLedgerLagUpdateAt).not.toBeNull();
       expect(telemetry.catchupEtaSeconds).toBeNull(); // No ETA yet (first sample)
     });
   });
 
   describe('ledger lag computation', () => {
     it('should compute lag as tip - last indexed ledger', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const events: ContractEventRecord[] = [
         {
@@ -199,7 +199,7 @@ describe('Indexer Catch-up Telemetry', () => {
     });
 
     it('should return zero lag when caught up', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const events: ContractEventRecord[] = [
         {
@@ -224,7 +224,7 @@ describe('Indexer Catch-up Telemetry', () => {
     });
 
     it('should handle lag when indexer is behind', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 5000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 5000 });
 
       const events: ContractEventRecord[] = [
         {
@@ -249,7 +249,7 @@ describe('Indexer Catch-up Telemetry', () => {
     });
 
     it('should never return negative lag', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 500 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 500 });
 
       const events: ContractEventRecord[] = [
         {
@@ -276,7 +276,7 @@ describe('Indexer Catch-up Telemetry', () => {
 
   describe('ETA estimation with rolling average', () => {
     it('should estimate ETA using rolling average throughput', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       // First ingest - establishes baseline
       const events1: ContractEventRecord[] = [
@@ -301,7 +301,7 @@ describe('Indexer Catch-up Telemetry', () => {
       await new Promise(resolve => setTimeout(resolve, 100));
 
       // Second ingest - provides throughput sample
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1005 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1005 });
       const events2: ContractEventRecord[] = [
         {
           eventId: 'event-2',
@@ -322,12 +322,12 @@ describe('Indexer Catch-up Telemetry', () => {
 
       const telemetry = ingestionService.getCatchupTelemetry();
       expect(telemetry.ledgerLag).toBe(55); // 1005 - 950
-      expect(telemetry.catchupEtaSeconds).notToBeNull();
+      expect(telemetry.catchupEtaSeconds).not.toBeNull();
       expect(telemetry.catchupEtaSeconds).toBeGreaterThan(0);
     });
 
     it('should maintain rolling window of 10 samples', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       // Ingest 15 times to test window size
       for (let i = 0; i < 15; i++) {
@@ -347,7 +347,7 @@ describe('Indexer Catch-up Telemetry', () => {
           },
         ];
 
-        vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 + i * 10 });
+        vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 + i * 10 });
         await ingestionService.ingest({ events }, { actor: 'test-actor', requestId: `test-${i}` });
         
         // Small delay to simulate time passing
@@ -356,11 +356,11 @@ describe('Indexer Catch-up Telemetry', () => {
 
       const telemetry = ingestionService.getCatchupTelemetry();
       // Should have computed ETA from rolling average
-      expect(telemetry.catchupEtaSeconds).notToBeNull();
+      expect(telemetry.catchupEtaSeconds).not.toBeNull();
     });
 
     it('should return null ETA when not lagging', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const events: ContractEventRecord[] = [
         {
@@ -386,7 +386,7 @@ describe('Indexer Catch-up Telemetry', () => {
     });
 
     it('should return null ETA on first ingest (no throughput data)', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const events: ContractEventRecord[] = [
         {
@@ -414,7 +414,7 @@ describe('Indexer Catch-up Telemetry', () => {
 
   describe('Prometheus metrics', () => {
     it('should update indexerLedgerLag guage', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const events: ContractEventRecord[] = [
         {
@@ -439,14 +439,14 @@ describe('Indexer Catch-up Telemetry', () => {
     });
 
     it('should update indexerCatchupEtaSeconds guage', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       // Need two ingests to get a throughput sample
       const events1 = [makeEvent(900, 'e1')];
       await ingestionService.ingest({ events: events1 }, { actor: 'test', requestId: 'r1' });
 
       await new Promise(resolve => setTimeout(resolve, 10));
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1005 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1005 });
       const events2 = [makeEvent(950, 'e2')];
       await ingestionService.ingest({ events: events2 }, { actor: 'test', requestId: 'r2' });
 
@@ -455,7 +455,7 @@ describe('Indexer Catch-up Telemetry', () => {
     });
 
     it('should handle rpc failure gracefully', async () => {
-      vi.mocked(mockRpcClient.getLatestLedger).mockReject(new Error('RPC failed'));
+      vi.mocked(mockRpcClient.getLatestLedger).mockRejectedValue(new Error('RPC failed'));
 
       const events = [makeEvent(500, 'e1')];
       await expect((ingestionService.ingest({ events }, { actor: 'test', requestId: 't' }))).resolves.not.toThrow();
@@ -469,7 +469,7 @@ describe('Indexer Catch-up Telemetry', () => {
       const { store, setDelayMs, getMaxActiveWrites } = createConfiguredStore();
       setDelayMs(20);
       ingestionService = new IndexerIngestionService(store);
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const promises = Array.from({ length: 10 }, (_, i) => {
         const events = [makeEvent(100 + i, `event-${i}`)];
@@ -484,7 +484,7 @@ describe('Indexer Catch-up Telemetry', () => {
       const { store, setFailLedger } = createConfiguredStore();
       setFailLedger(2);
       ingestionService = new IndexerIngestionService(store);
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       const results = await Promise.allSettled([
         ingestionService.ingest({ events: [makeEvent(1, 'e1')] }, { actor: 'test', requestId: 'r1' }),
@@ -494,14 +494,16 @@ describe('Indexer Catch-up Telemetry', () => {
 
       expect(results.some(r => r.status === 'rejected')).toBe(true);
       const telemetry = ingestionService.getCatchupTelemetry();
-      expect(telemetry.lastIndexedLedger).toBe(1);
+      // Ledger 2 failed, so the highest successfully processed ledger is 3
+      // (ledger 3 succeeded despite ledger 2 failing)
+      expect(telemetry.lastIndexedLedger).toBe(3);
     });
 
     it('should resume from last checkpoint after retry', async () => {
       const { store, setFailLedger } = createConfiguredStore();
       setFailLedger(2);
       ingestionService = new IndexerIngestionService(store);
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       // First attempt: ledger 2 fails
       await Promise.allSettled([
@@ -521,7 +523,7 @@ describe('Indexer Catch-up Telemetry', () => {
     it('should handle duplicate batches without advancing checkpoint incorrectly', async () => {
       const { store } = createConfiguredStore();
       ingestionService = new IndexerIngestionService(store);
-      vi.mocked(mockRpcClient.getLatestLedger).mockResolved({ sequence: 1000 });
+      vi.mocked(mockRpcClient.getLatestLedger).mockResolvedValue({ sequence: 1000 });
 
       await Promise.all([
         ingestionService.ingest({ events: [makeEvent(1, 'e1a')] }, { actor: 'test', requestId: 'r1a' }),
@@ -532,4 +534,4 @@ describe('Indexer Catch-up Telemetry', () => {
       expect(telemetry.lastIndexedLedger).toBe(1);
     });
   });
-}
+});

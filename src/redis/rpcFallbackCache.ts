@@ -75,17 +75,15 @@ function encodeCacheKeyPart(part: string): string {
 }
 
 /**
- * Builds a collision-resistant cache key.
+ * Builds a collision-resistant, versioned v2 cache key for Stellar RPC fallback caching.
  *
- * We keep the SAFE_OPERATION allow-list check, but we additionally hash each
- * cache-part (and also the operation name) before concatenation.
- *
- * Why: delimiter-joined raw strings can be made to collide via different
- * (operation, parts[]) tuples.
- *
- * Key format stays stable for SAFE operations by including explicit versions.
+ * @security Security Assumptions & Collision Resistance:
+ * - Validates operation name against `SAFE_OPERATION` regex to prevent injection of unsafe characters.
+ * - Hashes operation name and each cachePart with SHA-256 prior to concatenation.
+ * - Prevents tuple collision attacks (e.g. ("op1", ["a", "b"]) vs ("op1", ["ab"]) or delimiter injection).
+ * - Incorporates key version `v2` to support key format upgrades and invalidate legacy keys safely.
  */
-function buildCacheKey(operation: string, cacheParts: readonly string[] = []): string {
+export function buildRpcFallbackCacheKey(operation: string, cacheParts: readonly string[] = []): string {
   if (!SAFE_OPERATION.test(operation)) {
     throw new Error('RPC fallback cache operation contains unsafe characters');
   }
@@ -93,11 +91,10 @@ function buildCacheKey(operation: string, cacheParts: readonly string[] = []): s
   const encodedOperation = encodeCacheKeyPart(operation);
   const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
-  // Key format versioning:
-  // - Prevent collisions between different tuple shapes by hashing each part.
-  // - Include key-version to allow future format upgrades.
   return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
 }
+
+export const buildCacheKey = buildRpcFallbackCacheKey;
 
 
 

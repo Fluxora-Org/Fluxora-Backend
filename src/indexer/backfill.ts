@@ -67,9 +67,9 @@ export class OrderedBackfillScheduler {
     options: BackfillOptions = {},
   ) {
     this.options = {
-      concurrency: Math.max(1, Math.floor(options.concurrency ?/ defaultOptions.concurrency)),
-      batchSize: Math.max(1, Math.floor(options.batchSize ?/ defaultOptions.batchSize)),
-      maxRetries: Math.max(0, Math.floor(options.maxRetries ?/ defaultOptions.maxRetries)),
+      concurrency: Math.max(1, Math.floor(options.concurrency ?? defaultOptions.concurrency)),
+      batchSize: Math.max(1, Math.floor(options.batchSize ?? defaultOptions.batchSize)),
+      maxRetries: Math.max(0, Math.floor(options.maxRetries ?? defaultOptions.maxRetries)),
       retryDelayMs: Math.max(0, options.retryDelayMs ?? defaultOptions.retryDelayMs),
       onCheckpoint: options.onCheckpoint ?? (() => {}),
     };

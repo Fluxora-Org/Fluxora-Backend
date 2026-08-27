@@ -407,3 +407,28 @@ export class PostgresContractEventStore implements ContractEventStore {
     };
   }
 }
+
+import { rowReader, INT32_MAX } from '../db/rowMapping.js';
+
+export function rowToStreamEventRecord(row: Record<string, unknown>, table = 'contract_events'): StreamEventRecord {
+  const r = rowReader(table, row);
+  const rawHappened = row['happened_at'];
+  const rawIngested = row['ingested_at'];
+  const happenedAt = typeof rawHappened === 'string' ? r.requireString('happened_at') : r.requireDate('happened_at').toISOString();
+  const ingestedAt = typeof rawIngested === 'string' ? r.requireString('ingested_at') : r.requireDate('ingested_at').toISOString();
+
+  return {
+    eventId: r.requireString('event_id'),
+    ledger: r.requireInt('ledger', { min: 0, max: INT32_MAX }),
+    ledgerHash: r.optionalString('ledger_hash') ?? '',
+    contractId: r.requireString('contract_id'),
+    topic: r.requireString('topic'),
+    txHash: r.requireString('tx_hash'),
+    txIndex: r.requireInt('tx_index', { min: 0, max: INT32_MAX }),
+    operationIndex: r.requireInt('operation_index', { min: 0, max: INT32_MAX }),
+    eventIndex: r.requireInt('event_index', { min: 0, max: INT32_MAX }),
+    payload: r.requireJsonObject('payload'),
+    happenedAt,
+    ingestedAt,
+  };
+}

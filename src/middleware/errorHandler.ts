@@ -7,7 +7,20 @@ import { REQUEST_ID_HEADER } from './correlationId.js';
 import { ApiError, ApiErrorCode } from '../errors.js';
 import { getActiveTraceSpanIds } from '../tracing/hooks.js';
 
-export { ApiError, ApiErrorCode } from '../errors.js';
+export {
+  ApiError,
+  ApiErrorCode,
+  notFound,
+  validationError,
+  conflictError,
+  serviceUnavailable,
+  unauthorized,
+  forbidden,
+  payloadTooLarge,
+  tooManyRequests,
+  requestTimeout,
+  gatewayTimeout,
+} from '../errors.js';
 
 export interface ApiErrorResponse {
   success: false;

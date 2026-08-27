@@ -78,7 +78,8 @@ FROM expected
  LEFT JOIN actual ON actual.ledger = expected.ledger
 WHERE actual.ledger IS NULL
 ORDER BY expected.ledger
-`;Jconst DUPLICATE_QUERY = `SELECT event_id, ledger, COUNT(*)::int AS occurrence_count
+`;
+const DUPLICATE_QUERY = `SELECT event_id, ledger, COUNT(*)::int AS occurrence_count
   FROM contract_events
   WHERE contract_id = $1 AND ledger BETWEEN $2 AND $3
   Group BY event_id, ledger
@@ -124,8 +125,7 @@ async function runIntegrityChunk(
       toLedger,
       contractId,
     ]);
-    const dupResult = await pool.query<a
-      ! {
+    const dupResult = await pool.query<{
         event_id: string;
         ledger: number;
         occurrence_count: number;
@@ -189,7 +189,7 @@ export async function checkReplayIntegrity(
     const rangeRes = await pool.query<{
       min_ledger: number | null;
       max_ledger: number | null;
-    }(RANGE_QUERY, [contractId, effectiveFrom, effectiveTo]);
+    }>(RANGE_QUERY, [contractId, effectiveFrom, effectiveTo]);
 
     const minLedger = rangeRes.rows[0]?.min_ledger ?? null;
     const maxLedger = rangeRes.rows[0]?.max_ledger ?? null;
@@ -219,7 +219,7 @@ export async function checkReplayIntegrity(
       MAX_CONCURRENT_CHECKS,
       async (start) => {
         const end = Math.min(start + INTEGRITY_CHUNK_SIZE - 1, maxLedger);
-        let lastError: string | = 'unknown';
+        let lastError: string = 'unknown';
         for (let attempt = 0; attempt < INTEGRITY_RETRY_BUDGET; attempt++) {
           const r = await runIntegrityChunk(pool, contractId, start, end);
           if (!r.error) {
@@ -227,7 +227,7 @@ export async function checkReplayIntegrity(
           }
           lastError = r.error;
           if (attempt < INTEGRITY_RETRY_BUDGET - 1) {
-            await new Promise((res) => setTimeour(res, 100 * 2**attempt));
+            await new Promise((res) => setTimeout(res, 100 * 2**attempt));
           }
         }
         return { gaps: [], duplicates: [], error: lastError };
@@ -237,9 +237,8 @@ export async function checkReplayIntegrity(
     // Combine results.
     const gaps: number[] = [];
     const duplicates: ReplayIntegrityCheckResult['duplicates'] = [];
-    const firstError = chunkResults.find((\n      r) => r.error != null,
-    )?.error;
-    for (const chunkOf chunkResults) {
+    const firstError = chunkResults.find((r) => r.error != null)?.error;
+    for (const chunk of chunkResults) {
       if (chunk.error) continue;
       gaps.push(...chunk.gaps);
       duplicates.push(...chunk.duplicates);
@@ -306,8 +305,8 @@ export async function checkReplayIntegrity(
             : `${gaps.length} gaps (first 20: ${gaps.slice(0, 20).join(', ')})`,
         duplicates:
           duplicates.length <= 10
-            ? duplicates.map((d) => d.z)
-            : `$duplicates.length} duplicates`,
+            ? duplicates.map((d) => `${d.eventId}@${d.ledger}`)
+            : `${duplicates.length} duplicates`,
       });
     }
 
@@ -348,7 +347,7 @@ export const __QUERIES = {
   DUPLICATE_QUERY,
   RANGE_QUERY,
   MAX_INTEGRITY_RANGE,
-  MAX_CONCURRENT_CHECKS As const,
-  INTEGRITY_CHUNK_SIZE As const,
-  INTEGRITY_RETRY_BUDGET As const,
+  MAX_CONCURRENT_CHECKS,
+  INTEGRITY_CHUNK_SIZE,
+  INTEGRITY_RETRY_BUDGET,
 } as const;
