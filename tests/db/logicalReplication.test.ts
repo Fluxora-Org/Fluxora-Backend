@@ -218,6 +218,7 @@ describe('Postgres Logical Replication (Offline Contract Tests)', () => {
 
 // ── Live DB Integration Tests ─────────────────────────────────────────────────
 
+// Keep-gated and intentionally excluded from issue #1248; tracked as live-DB coverage.
 describe.skipIf(!isLiveDb)('Postgres Logical Replication (Live DB Integration Tests)', () => {
   let client: pg.Client;
 
