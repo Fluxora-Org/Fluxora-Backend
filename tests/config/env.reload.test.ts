@@ -42,7 +42,7 @@ import {
   resetRuntimeRateLimitConfig,
   setRuntimeRateLimitConfig,
 } from '../../src/config/rateLimits.js';
-import { reloadFlags, getFlags } from '../../src/config/featureFlags.js';
+import { reloadFlags, getFlags, prepareReloadFlags } from '../../src/config/featureFlags.js';
 
 // ─── env save/restore helpers ─────────────────────────────────────────────────
 
@@ -550,5 +550,88 @@ describe('refreshHotConfig + last snapshot', () => {
     expect(first.changed).toBe(true);
     expect(second.changed).toBe(false);
     expect(second.hot.rateLimitIpMax).toBe(first.hot.rateLimitIpMax);
+  });
+});
+
+// ─── SIGHUP reload with schema compatibility ─────────────────────────────────
+
+describe('SIGHUP reload with schema compatibility', () => {
+  it('prepareReloadFlags with latestMigration strips incompatible flags', () => {
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
+      { name: 'flag_ok', percentage: 100, minMigration: '20260601000000' },
+      { name: 'flag_bad', percentage: 100, minMigration: '20260827000000' },
+    ]);
+
+    const commit = prepareReloadFlags('20260728000000');
+    const result = commit();
+
+    expect(result.has('flag_ok')).toBe(true);
+    expect(result.has('flag_bad')).toBe(false);
+  });
+
+  it('prepareReloadFlags without latestMigration retains all flags', () => {
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
+      { name: 'flag_a', percentage: 100, minMigration: '20260827000000' },
+    ]);
+
+    const commit = prepareReloadFlags();
+    const result = commit();
+
+    expect(result.has('flag_a')).toBe(true);
+  });
+
+  it('prepareReloadFlags with null latestMigration strips all minMigration flags', () => {
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
+      { name: 'flag_req', percentage: 100, minMigration: '20260601000000' },
+      { name: 'flag_no_req', percentage: 100 },
+    ]);
+
+    const commit = prepareReloadFlags(null);
+    const result = commit();
+
+    expect(result.has('flag_req')).toBe(false);
+    expect(result.has('flag_no_req')).toBe(true);
+  });
+
+  it('refreshHotConfig prepareFeatureFlags callback strips incompatible flags', async () => {
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
+      { name: 'flag_ok', percentage: 100, minMigration: '20260601000000' },
+      { name: 'flag_bad', percentage: 100, minMigration: '20260827000000' },
+    ]);
+
+    await refreshHotConfig({
+      prepareFeatureFlags: () => {
+        return prepareReloadFlags('20260728000000');
+      },
+    });
+
+    const { isEnabled } = await import('../../src/config/featureFlags.js');
+    expect(isEnabled('flag_ok', 'user')).toBe(true);
+    expect(isEnabled('flag_bad', 'user')).toBe(false);
+  });
+
+  it('DB query failure in SIGHUP handler falls back to loading all flags', async () => {
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
+      { name: 'flag_a', percentage: 100, minMigration: '20260827000000' },
+    ]);
+
+    const failQuery = async (): Promise<string | null> => {
+      throw new Error('DB connection refused');
+    };
+
+    // Simulate the SIGHUP handler pattern: try DB, catch, fall back
+    let latestMigration: string | null = null;
+    try {
+      latestMigration = await failQuery();
+    } catch {
+      // Fall back — latestMigration stays null, but we call prepareReloadFlags()
+      // without args to skip schema check
+    }
+
+    const commit = prepareReloadFlags(latestMigration ?? undefined);
+    const result = commit();
+
+    // Flag retained because we skipped schema check on DB failure
+    expect(result.has('flag_a')).toBe(true);
   });
 });

@@ -36,6 +36,7 @@ import {
 } from './config/env.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { reloadFlags, prepareReloadFlags } from './config/featureFlags.js';
+import { getLatestAppliedMigration } from './db/migrate.js';
 import { logger } from './lib/logger.js';
 import { probeStartupDependencies } from './config/health.js';
 import { startTracing } from './tracing/index.js';
@@ -275,7 +276,20 @@ if (process.env.NODE_ENV !== 'test') {
         return () => setRuntimeRateLimitConfig(nextConfig);
       },
       prepareFeatureFlags: () => {
-        return prepareReloadFlags();
+        const databaseUrl = process.env.DATABASE_URL;
+        if (!databaseUrl) {
+          return prepareReloadFlags();
+        }
+
+        return getLatestAppliedMigration(databaseUrl)
+          .then((latestMigration) => prepareReloadFlags(latestMigration))
+          .catch((err) => {
+            logger.warn('SIGHUP: failed to query latest migration — loading flags without schema check', undefined, {
+              component: 'sighup-reload',
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return prepareReloadFlags();
+          });
       },
       prepareLogLevel: (level) => {
         return () => {
