@@ -281,6 +281,8 @@ export interface StreamHubOptions {
    * Defaults to the JWT_SECRET environment variable.
    */
   jwtSecret?: string;
+  /** Exact origins allowed to perform browser WebSocket upgrades. */
+  allowedOrigins?: string[];
   /**
    * Event store used by replayFromCursor to fetch historical events.
    * When absent, replayFromCursor sends an empty result.
@@ -342,6 +344,7 @@ export class StreamHub extends EventEmitter {
   private readonly ownsDedup: boolean;
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
+  private readonly allowedOrigins: ReadonlySet<string> | undefined;
   private eventStore: ContractEventStore | undefined;
   private readonly backpressureCollectorInterval: NodeJS.Timeout | undefined;
   private readonly backpressureSlowThresholdBytes: number;
@@ -406,6 +409,11 @@ export class StreamHub extends EventEmitter {
     this.wsAuthRequired = options?.wsAuthRequired ?? process.env.WS_AUTH_REQUIRED === 'true';
 
     this.jwtSecret = options?.jwtSecret ?? process.env.JWT_SECRET;
+
+    const configuredOrigins = options?.allowedOrigins ?? process.env.WS_ALLOWED_ORIGINS?.split(',').map((origin) => origin.trim());
+    this.allowedOrigins = configuredOrigins && configuredOrigins.length > 0
+      ? new Set(configuredOrigins.filter((origin) => origin.length > 0))
+      : undefined;
 
     this.eventStore = options?.eventStore;
 
@@ -513,6 +521,18 @@ export class StreamHub extends EventEmitter {
     server.on('upgrade', async (req, socket, head) => {
       const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
       if (pathname !== '/ws/streams') return;
+
+      const origin = req.headers.origin;
+      if (this.allowedOrigins && (typeof origin !== 'string' || !this.allowedOrigins.has(origin))) {
+        socket.write(
+          'HTTP/1.1 403 Forbidden\r\n' +
+            'Content-Type: text/plain\r\n' +
+            'Connection: close\r\n\r\n' +
+            'Forbidden origin\r\n'
+        );
+        socket.destroy();
+        return;
+      }
 
       // 1. Connection Limiter Check — atomically reserve IP slot
       const ip = getClientIp(req);
