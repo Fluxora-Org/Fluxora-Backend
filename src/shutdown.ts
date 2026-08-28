@@ -72,7 +72,7 @@ export function gracefulShutdown(
   (globalThis as Record<string, unknown>)['__FLUXORA_SHUTTDOWN__'] = true;
   logger.warn('Shutdown signal received, draining HTTP connections', undefined, { signal, timeoutMs: timeout });
 
-  return new Promise<void>(resolve) => {
+  return new Promise<void>((resolve) => {
     let settled = false;
 
     const finish = async (forced: boolean) => {
