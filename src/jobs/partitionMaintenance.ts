@@ -30,10 +30,18 @@
  *
  * The entire run is guarded by a single Postgres advisory lock
  * ({@link PARTITION_MAINTENANCE_LOCK_ID}), acquired with `pg_try_advisory_lock`
- * (non-blocking). If another instance already holds the lock, this run is a
- * no-op — it does **not** wait, retry, or error. This keeps multiple app
+ * (non-blocking) **on a dedicated client session** checked out from the pool
+ * via `pool.connect()`. All subsequent queries (partition checks, DDL) execute
+ * on that same client, so the lock — which is session-scoped — remains held
+ * for the full duration. If another instance already holds the lock, this run
+ * is a no-op — it does **not** wait, retry, or error. This keeps multiple app
  * instances (or an overlapping cron + manual invocation) from racing to
  * `CREATE TABLE` the same partition concurrently.
+ *
+ * A configurable `lockTimeoutMs` (default 30 000 ms) is set via
+ * `SET LOCAL statement_timeout` immediately after acquiring the lock, so a
+ * hung maintenance run cannot hold the advisory lock indefinitely and starve
+ * subsequent schedulers.
  *
  * Partition creation itself is additionally idempotent at the SQL level via
  * `CREATE TABLE IF NOT EXISTS`, so even a partition that appears between our
@@ -71,9 +79,8 @@
  *   require super-user access.
  */
 
-import type { Pool } from 'pg';
+import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { logger } from '../lib/logger.js';
-import { query } from '../db/pool.js';
 import {
   partitionsCreatedTotal,
   partitionMaintenanceBehindScheduleTotal,
@@ -103,6 +110,15 @@ export type CandidateTable = (typeof CANDIDATE_TABLES)[number];
 /** Default number of future months pre-created beyond the current month. */
 export const DEFAULT_MONTHS_AHEAD = 3;
 
+/**
+ * Default maximum duration (ms) for the entire lock-guarded maintenance
+ * section. If the job exceeds this limit, `statement_timeout` will cancel
+ * the active query, the `finally` block releases the lock, and the next
+ * scheduled run can retry. Prevents a hung DDL from starving all future
+ * maintenance runs.
+ */
+export const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /**
@@ -115,6 +131,12 @@ export interface PartitionMaintenanceOptions {
   now?: Date;
   /** Correlation id threaded into every log line emitted by this run. */
   correlationId?: string;
+  /**
+   * Maximum duration (ms) for the lock-guarded maintenance section.
+   * A `statement_timeout` is applied to the dedicated client immediately
+   * after acquiring the advisory lock. Defaults to {@link DEFAULT_LOCK_TIMEOUT_MS}.
+   */
+  lockTimeoutMs?: number;
 }
 
 /** Per-table outcome of a single {@link runPartitionMaintenance} run. */
@@ -143,16 +165,34 @@ export interface PartitionMaintenanceResult {
   tables: TablePartitionResult[];
 }
 
+// ── Internal query helper ─────────────────────────────────────────────────────
+
+/**
+ * Thin wrapper around `client.query()` so that all SQL in this module flows
+ * through a single call-site. This keeps the mock surface in tests identical
+ * to what the production path exercises and makes call-recording trivial.
+ */
+async function clientQuery<T extends QueryResultRow = QueryResultRow>(
+  client: PoolClient,
+  sql: string,
+  params?: unknown[],
+): Promise<QueryResult<T>> {
+  return client.query<T>(sql, params);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
  * Execute the partition maintenance job.
  *
- * Acquires a non-blocking Postgres advisory lock, then ensures the current
- * month plus `monthsAhead` future monthly partitions exist for every
- * range-partitioned table in {@link CANDIDATE_TABLES}.
+ * Checks out a **dedicated client** from the pool, acquires a non-blocking
+ * Postgres advisory lock on that session, then ensures the current month
+ * plus `monthsAhead` future monthly partitions exist for every
+ * range-partitioned table in {@link CANDIDATE_TABLES}. All queries run on
+ * the same client session, so the session-scoped advisory lock is held
+ * throughout.
  *
- * @param pool - PostgreSQL pool (or a mock exposing a compatible `query`) to run against.
+ * @param pool - PostgreSQL pool (or a mock exposing a compatible `connect`) to run against.
  * @param options - Tuning / injection parameters, or (for backward compatibility)
  *                  a bare `monthsAhead` number.
  * @returns A summary of what was (or would have needed to be) created.
@@ -177,49 +217,75 @@ export async function runPartitionMaintenance(
   const monthsAhead = options.monthsAhead ?? DEFAULT_MONTHS_AHEAD;
   const correlationId = options.correlationId;
   const now = options.now ?? new Date();
+  const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
   const startedAt = new Date().toISOString();
 
   if (!Number.isInteger(monthsAhead) || monthsAhead < 0) {
     throw new Error(`runPartitionMaintenance: monthsAhead must be a non-negative integer, got ${monthsAhead}`);
   }
 
-  const lockRes = await query<{ pg_try_advisory_lock: boolean }>(
-    pool,
-    'SELECT pg_try_advisory_lock($1)',
-    [PARTITION_MAINTENANCE_LOCK_ID],
-  );
+  // ── Check out a dedicated client so the advisory lock stays held ─────────
+  //
+  // `pg_try_advisory_lock` is session-scoped: it is bound to the underlying
+  // connection, not to a transaction. Using `pool.query()` (which borrows
+  // then immediately returns a connection) would lose the lock before any
+  // DDL ran. By reserving a single client for the entire guarded section,
+  // the lock is released only when we explicitly call `pg_advisory_unlock`
+  // (or when the session terminates abnormally).
+  const client = await pool.connect();
 
-  if (lockRes.rows[0]?.pg_try_advisory_lock !== true) {
-    logger.info('Partition maintenance: another instance holds the lock, skipping this run', correlationId, {
-      event: 'partition_maintenance_skipped_lock_held',
-    });
-    return { lockAcquired: false, startedAt, finishedAt: new Date().toISOString(), tables: [] };
-  }
-
-  const tables: TablePartitionResult[] = [];
   try {
-    for (const table of CANDIDATE_TABLES) {
-      tables.push(await maintainTablePartitions(pool, table, monthsAhead, now, correlationId));
+    const lockRes = await clientQuery<{ pg_try_advisory_lock: boolean }>(
+      client,
+      'SELECT pg_try_advisory_lock($1)',
+      [PARTITION_MAINTENANCE_LOCK_ID],
+    );
+
+    if (lockRes.rows[0]?.pg_try_advisory_lock !== true) {
+      logger.info('Partition maintenance: another instance holds the lock, skipping this run', correlationId, {
+        event: 'partition_maintenance_skipped_lock_held',
+      });
+      // Release the client immediately — we never held the lock.
+      client.release();
+      return { lockAcquired: false, startedAt, finishedAt: new Date().toISOString(), tables: [] };
     }
+
+    // Apply a statement_timeout for the maintenance section so a hung DDL
+    // cannot hold the advisory lock indefinitely. SET LOCAL scopes to the
+    // current transaction; since we are not inside an explicit transaction,
+    // use plain SET so it sticks for the remainder of this session checkout.
+    await clientQuery(client, `SET statement_timeout = ${Number(lockTimeoutMs)}`);
+
+    const tables: TablePartitionResult[] = [];
+    try {
+      for (const table of CANDIDATE_TABLES) {
+        tables.push(await maintainTablePartitions(client, table, monthsAhead, now, correlationId));
+      }
+    } finally {
+      // Always release the lock, even if a table's maintenance throws, so a
+      // single failure never wedges the job for every future run.
+      await clientQuery(client, 'SELECT pg_advisory_unlock($1)', [PARTITION_MAINTENANCE_LOCK_ID]);
+    }
+
+    const finishedAt = new Date().toISOString();
+    logger.info('Partition maintenance run complete', correlationId, {
+      event: 'partition_maintenance_complete',
+      monthsAhead,
+      tables: tables.map((t) => ({
+        table: t.table,
+        managed: t.managed,
+        created: t.partitionsCreated,
+        behindSchedule: t.behindSchedule,
+      })),
+    });
+
+    return { lockAcquired: true, startedAt, finishedAt, tables };
   } finally {
-    // Always release the lock, even if a table's maintenance throws, so a
-    // single failure never wedges the job for every future run.
-    await query(pool, 'SELECT pg_advisory_unlock($1)', [PARTITION_MAINTENANCE_LOCK_ID]);
+    // Unconditionally return the client to the pool. This is separate from
+    // lock release: even if the unlock call above threw, the connection must
+    // go back to the pool (or be destroyed) so we do not leak it.
+    client.release();
   }
-
-  const finishedAt = new Date().toISOString();
-  logger.info('Partition maintenance run complete', correlationId, {
-    event: 'partition_maintenance_complete',
-    monthsAhead,
-    tables: tables.map((t) => ({
-      table: t.table,
-      managed: t.managed,
-      created: t.partitionsCreated,
-      behindSchedule: t.behindSchedule,
-    })),
-  });
-
-  return { lockAcquired: true, startedAt, finishedAt, tables };
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -233,13 +299,13 @@ export async function runPartitionMaintenance(
  * until it is migrated to partitioning.
  */
 async function maintainTablePartitions(
-  pool: Pool,
+  client: PoolClient,
   table: CandidateTable,
   monthsAhead: number,
   now: Date,
   correlationId: string | undefined,
 ): Promise<TablePartitionResult> {
-  const managed = await isRangePartitioned(pool, table);
+  const managed = await isRangePartitioned(client, table);
   if (!managed) {
     logger.debug(`Partition maintenance: '${table}' is not range-partitioned, skipping`, correlationId, {
       event: 'partition_maintenance_table_not_managed',
@@ -256,7 +322,7 @@ async function maintainTablePartitions(
     const rangeEnd = monthStartUtc(now, i + 1);
     const partitionName = partitionNameFor(table, rangeStart);
 
-    const exists = await partitionExists(pool, partitionName);
+    const exists = await partitionExists(client, partitionName);
     if (exists) continue;
 
     if (i === 0) {
@@ -274,7 +340,7 @@ async function maintainTablePartitions(
       });
     }
 
-    await createPartition(pool, table, partitionName, rangeStart, rangeEnd);
+    await createPartition(client, table, partitionName, rangeStart, rangeEnd);
     created.push(partitionName);
     partitionsCreatedTotal.inc({ table });
     logger.info('Partition maintenance: created partition', correlationId, {
@@ -295,9 +361,9 @@ async function maintainTablePartitions(
  * when the table does not exist, is a plain table, or uses LIST/HASH
  * partitioning.
  */
-async function isRangePartitioned(pool: Pool, table: string): Promise<boolean> {
-  const res = await query<{ relkind: string; partstrat: string | null }>(
-    pool,
+async function isRangePartitioned(client: PoolClient, table: string): Promise<boolean> {
+  const res = await clientQuery<{ relkind: string; partstrat: string | null }>(
+    client,
     `SELECT c.relkind::text AS relkind, p.partstrat::text AS partstrat
        FROM pg_class c
        LEFT JOIN pg_partitioned_table p ON p.partrelid = c.oid
@@ -309,9 +375,9 @@ async function isRangePartitioned(pool: Pool, table: string): Promise<boolean> {
 }
 
 /** Returns `true` when a relation named `partitionName` already exists. */
-async function partitionExists(pool: Pool, partitionName: string): Promise<boolean> {
-  const res = await query<{ exists: boolean }>(
-    pool,
+async function partitionExists(client: PoolClient, partitionName: string): Promise<boolean> {
+  const res = await clientQuery<{ exists: boolean }>(
+    client,
     'SELECT to_regclass($1) IS NOT NULL AS exists',
     [partitionName],
   );
@@ -324,7 +390,7 @@ async function partitionExists(pool: Pool, partitionName: string): Promise<boole
  * and this call) is a silent no-op rather than an error.
  */
 async function createPartition(
-  pool: Pool,
+  client: PoolClient,
   table: CandidateTable,
   partitionName: string,
   rangeStart: Date,
@@ -335,8 +401,8 @@ async function createPartition(
   const startLiteral = isoRangeBound(rangeStart);
   const endLiteral = isoRangeBound(rangeEnd);
 
-  await query(
-    pool,
+  await clientQuery(
+    client,
     `CREATE TABLE IF NOT EXISTS ${partitionId} PARTITION OF ${tableId}
        FOR VALUES FROM ('${startLiteral}') TO ('${endLiteral}')`,
   );
