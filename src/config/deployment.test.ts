@@ -214,7 +214,7 @@ describe('buildDeploymentChecklistReport()', () => {
   // ─── 3. Verification that Every Item Participates in Status Aggregation ──────
 
   describe('Every Item Contributes to Status Aggregation', () => {
-    const KNOWN_CHECKLIST_KEYS = [
+    const FAILABLE_CHECKLIST_KEYS = [
       'partner_auth',
       'admin_auth',
       'redis',
@@ -224,15 +224,20 @@ describe('buildDeploymentChecklistReport()', () => {
       'metrics',
     ];
 
+    const ALL_CHECKLIST_KEYS = [
+      ...FAILABLE_CHECKLIST_KEYS,
+      'schema_compatibility',
+    ];
+
     it('includes all expected checklist item keys in the report', () => {
       const report = buildDeploymentChecklistReport(makeInput());
       const keys = report.checklist.map((item) => item.key);
 
-      expect(keys).toEqual(expect.arrayContaining(KNOWN_CHECKLIST_KEYS));
-      expect(keys.length).toBe(KNOWN_CHECKLIST_KEYS.length);
+      expect(keys).toEqual(expect.arrayContaining(ALL_CHECKLIST_KEYS));
+      expect(keys.length).toBe(ALL_CHECKLIST_KEYS.length);
     });
 
-    it.each(KNOWN_CHECKLIST_KEYS)(
+    it.each(FAILABLE_CHECKLIST_KEYS)(
       'causes overall status to become "fail" when item "%s" is configured to fail',
       (failingKey) => {
         let input: ReturnType<typeof makeInput>;
@@ -296,6 +301,61 @@ describe('buildDeploymentChecklistReport()', () => {
         expect(report.status).toBe('warn');
       },
     );
+  });
+
+  // ─── 3b. Schema Compatibility Checklist Item ────────────────────────────────
+
+  describe('schema_compatibility checklist item', () => {
+    it('reports pass when no flags are blocked', () => {
+      const report = buildDeploymentChecklistReport(makeInput({ nodeEnv: 'staging' }));
+      const item = report.checklist.find((i) => i.key === 'schema_compatibility');
+      expect(item).toBeDefined();
+      expect(item?.status).toBe('pass');
+      expect(item?.summary).toContain('compatible');
+    });
+
+    it('reports pass when blockedFeatureFlags is 0', () => {
+      const report = buildDeploymentChecklistReport({
+        ...makeInput({ nodeEnv: 'staging' }),
+        blockedFeatureFlags: 0,
+      });
+      const item = report.checklist.find((i) => i.key === 'schema_compatibility');
+      expect(item?.status).toBe('pass');
+    });
+
+    it('reports warn when blockedFeatureFlags > 0', () => {
+      const report = buildDeploymentChecklistReport({
+        ...makeInput({ nodeEnv: 'staging' }),
+        blockedFeatureFlags: 3,
+      });
+      const item = report.checklist.find((i) => i.key === 'schema_compatibility');
+      expect(item).toBeDefined();
+      expect(item?.status).toBe('warn');
+      expect(item?.summary).toContain('3');
+      expect(item?.summary).toContain('blocked');
+    });
+
+    it('contributes warn to overall status when other items pass', () => {
+      const report = buildDeploymentChecklistReport({
+        ...makeInput({ nodeEnv: 'staging' }),
+        blockedFeatureFlags: 1,
+      });
+      expect(report.status).toBe('warn');
+    });
+
+    it('does not override fail from other items', () => {
+      const report = buildDeploymentChecklistReport({
+        ...makeInput({ nodeEnv: 'staging', redisEnabled: false }),
+        blockedFeatureFlags: 2,
+      });
+      expect(report.status).toBe('fail');
+    });
+
+    it('defaults to pass when blockedFeatureFlags is omitted', () => {
+      const report = buildDeploymentChecklistReport(makeInput({ nodeEnv: 'production' }));
+      const item = report.checklist.find((i) => i.key === 'schema_compatibility');
+      expect(item?.status).toBe('pass');
+    });
   });
 
   // ─── 4. Report Structure & Metadata Assertions ─────────────────────────────
