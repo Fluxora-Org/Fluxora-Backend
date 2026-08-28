@@ -34,7 +34,7 @@ import { errorHandler } from './middleware/errorHandler.js';
 import {
   bodySizeLimitMiddleware,
   requestTimeoutMiddleware,
-  BODY_LIMIT_BYTES,
+  dynamicJsonParser,
 } from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { requireJsonContentType } from './middleware/contentType.js';
@@ -480,7 +480,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
-  app.use(express.json({ limit: BODY_LIMIT_BYTES }));
+  app.use(dynamicJsonParser);
   app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);

@@ -321,4 +321,52 @@ describe('Strict origin validation', () => {
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('CORS_ORIGIN_DENIED');
   });
+
+  it('rejects null origin', () => {
+    const allowed = new Set(['https://app.fluxora.io']);
+    expect(isOriginAllowed('null', allowed)).toBe(false);
+  });
+
+  it('allows null origin if explicitly in allowlist', () => {
+    const allowed = new Set(['null']);
+    expect(isOriginAllowed('null', allowed)).toBe(true);
+  });
+
+  it('rejects credentialed combination when wildcard origin is allowed', async () => {
+    const app = express();
+    app.use(corsAllowlistMiddleware);
+    app.get('/health', (_req, res) => {
+      res.status(200).json({ status: 'ok' });
+    });
+
+    process.env.NODE_ENV = 'production';
+    process.env.CORS_ALLOWED_ORIGINS = '*';
+
+    const res = await request(app)
+      .get('/health')
+      .set('Origin', 'https://some-origin.com');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+    expect(res.headers['access-control-allow-credentials']).toBeUndefined();
+  });
+
+  it('allows credentialed combination when exact origin is matched', async () => {
+    const app = express();
+    app.use(corsAllowlistMiddleware);
+    app.get('/health', (_req, res) => {
+      res.status(200).json({ status: 'ok' });
+    });
+
+    process.env.NODE_ENV = 'production';
+    process.env.CORS_ALLOWED_ORIGINS = 'https://some-origin.com';
+
+    const res = await request(app)
+      .get('/health')
+      .set('Origin', 'https://some-origin.com');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('https://some-origin.com');
+    expect(res.headers['access-control-allow-credentials']).toBe('true');
+  });
 });

@@ -13,29 +13,29 @@ import { describe, it, expect, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import {
-  BODY_LIMIT_BYTES,
+  DEFAULT_RAW_LIMIT_BYTES,
+  DEFAULT_DECOMPRESSED_LIMIT_BYTES,
+  ROUTE_LIMITS,
   bodySizeLimitMiddleware,
+  dynamicJsonParser,
   jsonDepthMiddleware,
   requestTimeoutMiddleware,
 } from '../src/middleware/requestProtection.js';
 import { ApiError } from '../src/errors.js';
 import { ApiErrorCode, errorHandler } from '../src/middleware/errorHandler.js';
+import zlib from 'zlib';
 
 function buildApp() {
   const app = express();
   app.use(bodySizeLimitMiddleware);
-  app.use(express.json({ limit: BODY_LIMIT_BYTES }));
+  app.use(dynamicJsonParser);
   app.use(jsonDepthMiddleware());
   app.post('/echo', (req, res) => res.status(200).json(req.body));
+  app.post('/internal/webhooks/echo', (req, res) => res.status(200).json(req.body));
+  app.post('/api/uploads/echo', (req, res) => res.status(200).json(req.body));
   app.use(errorHandler);
   return app;
 }
-
-describe('BODY_LIMIT_BYTES', () => {
-  it('equals 256 KiB', () => {
-    expect(BODY_LIMIT_BYTES).toBe(256 * 1024);
-  });
-});
 
 describe('bodySizeLimitMiddleware — Content-Length fast path', () => {
   const app = buildApp();
@@ -44,7 +44,7 @@ describe('bodySizeLimitMiddleware — Content-Length fast path', () => {
     const res = await request(app)
       .post('/echo')
       .set('Content-Type', 'application/json')
-      .set('Content-Length', String(BODY_LIMIT_BYTES + 1))
+      .set('Content-Length', String(DEFAULT_RAW_LIMIT_BYTES + 1))
       .send('{}');
 
     expect(res.status).toBe(413);
@@ -52,12 +52,12 @@ describe('bodySizeLimitMiddleware — Content-Length fast path', () => {
   });
 
   it('passes when Content-Length is exactly at the limit', async () => {
-    // Build a JSON body whose byte length equals BODY_LIMIT_BYTES.
+    // Build a JSON body whose byte length equals DEFAULT_RAW_LIMIT_BYTES.
     // {"d":"<padding>"} — pad to hit the limit exactly.
     const overhead = '{"d":""}';
-    const padding = 'x'.repeat(BODY_LIMIT_BYTES - overhead.length);
+    const padding = 'x'.repeat(DEFAULT_RAW_LIMIT_BYTES - overhead.length);
     const body = `{"d":"${padding}"}`;
-    expect(Buffer.byteLength(body)).toBe(BODY_LIMIT_BYTES);
+    expect(Buffer.byteLength(body)).toBe(DEFAULT_RAW_LIMIT_BYTES);
 
     const res = await request(app)
       .post('/echo')
@@ -65,6 +65,43 @@ describe('bodySizeLimitMiddleware — Content-Length fast path', () => {
       .send(body);
 
     expect(res.status).toBe(200);
+  });
+});
+
+describe('bodySizeLimitMiddleware - route limits', () => {
+  const app = buildApp();
+  
+  it('allows larger raw payloads on webhooks route', async () => {
+    const webhookLimit = ROUTE_LIMITS.find(r => r.pathPrefix === '/internal/webhooks')!.rawLimit;
+    const body = '{"a":1}';
+    const res = await request(app)
+      .post('/internal/webhooks/echo')
+      .set('Content-Type', 'application/json')
+      .set('Content-Length', String(webhookLimit))
+      .send(body);
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('dynamicJsonParser - compressed payloads', () => {
+  const app = buildApp();
+
+  it('rejects oversized decompressed bodies (zip bomb)', async () => {
+    // We send a small compressed payload that expands to more than the decompressed limit.
+    const largeBody = 'x'.repeat(DEFAULT_DECOMPRESSED_LIMIT_BYTES + 1024);
+    const compressed = zlib.gzipSync(largeBody);
+    
+    // The compressed size is well within the RAW limit
+    expect(compressed.length).toBeLessThan(DEFAULT_RAW_LIMIT_BYTES);
+
+    const res = await request(app)
+      .post('/echo')
+      .set('Content-Type', 'application/json')
+      .set('Content-Encoding', 'gzip')
+      .send(compressed);
+
+    // Express.json returns 413 when decompressed size exceeds limit
+    expect(res.status).toBe(413);
   });
 });
 

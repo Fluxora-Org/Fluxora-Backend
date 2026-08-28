@@ -12,7 +12,8 @@ import express from 'express';
 import request from 'supertest';
 import {
   bodySizeLimitMiddleware,
-  BODY_LIMIT_BYTES,
+  DEFAULT_RAW_LIMIT_BYTES,
+  ROUTE_LIMITS,
 } from '../../src/middleware/requestProtection.js';
 import { errorHandler } from '../../src/middleware/errorHandler.js';
 import {
@@ -44,13 +45,13 @@ describe('fluxora_request_body_too_large_total counter', () => {
     app.use(bodySizeLimitMiddleware);
     app.use(express.json());
     app.post('/api/streams', (_req, res) => res.status(201).json({ ok: true }));
-    app.post('/api/webhooks', (_req, res) => res.status(200).json({ ok: true }));
+    app.post('/internal/webhooks', (_req, res) => res.status(200).json({ ok: true }));
     app.use(errorHandler);
   });
 
   describe('counter increments on rejection', () => {
     it('increments once when Content-Length exceeds the limit', async () => {
-      const oversizedBody = 'x'.repeat(BODY_LIMIT_BYTES + 1);
+      const oversizedBody = 'x'.repeat(DEFAULT_RAW_LIMIT_BYTES + 1);
 
       await request(app)
         .post('/api/streams')
@@ -64,7 +65,7 @@ describe('fluxora_request_body_too_large_total counter', () => {
     });
 
     it('increments only once even for repeated rejections on the same path', async () => {
-      const oversizedBody = 'y'.repeat(BODY_LIMIT_BYTES + 100);
+      const oversizedBody = 'y'.repeat(DEFAULT_RAW_LIMIT_BYTES + 100);
 
       await request(app)
         .post('/api/streams')
@@ -85,7 +86,7 @@ describe('fluxora_request_body_too_large_total counter', () => {
     });
 
     it('tracks different paths independently', async () => {
-      const oversizedBody = 'z'.repeat(BODY_LIMIT_BYTES + 1);
+      const oversizedBody = 'z'.repeat(DEFAULT_RAW_LIMIT_BYTES + 1);
 
       await request(app)
         .post('/api/streams')
@@ -94,15 +95,18 @@ describe('fluxora_request_body_too_large_total counter', () => {
         .send(oversizedBody)
         .expect(413);
 
+      const webhookLimit = ROUTE_LIMITS.find(r => r.pathPrefix === '/internal/webhooks')!.rawLimit;
+      const oversizedWebhookBody = 'w'.repeat(webhookLimit + 1);
+
       await request(app)
-        .post('/api/webhooks')
+        .post('/internal/webhooks')
         .set('Content-Type', 'application/json')
-        .set('Content-Length', String(oversizedBody.length))
-        .send(oversizedBody)
+        .set('Content-Length', String(oversizedWebhookBody.length))
+        .send(oversizedWebhookBody)
         .expect(413);
 
       const streamsCount = await getCounterValue('/api/streams');
-      const webhooksCount = await getCounterValue('/api/webhooks');
+      const webhooksCount = await getCounterValue('/internal/webhooks');
 
       expect(streamsCount).toBe(1);
       expect(webhooksCount).toBe(1);
@@ -126,13 +130,13 @@ describe('fluxora_request_body_too_large_total counter', () => {
     });
 
     it('does not increment when Content-Length exactly equals the limit', async () => {
-      // Content-Length == BODY_LIMIT_BYTES should pass (limit is strict >)
-      const exactBody = Buffer.alloc(BODY_LIMIT_BYTES).fill(32).toString();
+      // Content-Length == DEFAULT_RAW_LIMIT_BYTES should pass (limit is strict >)
+      const exactBody = Buffer.alloc(DEFAULT_RAW_LIMIT_BYTES).fill(32).toString();
 
       await request(app)
         .post('/api/streams')
         .set('Content-Type', 'application/json')
-        .set('Content-Length', String(BODY_LIMIT_BYTES))
+        .set('Content-Length', String(DEFAULT_RAW_LIMIT_BYTES))
         .send(exactBody);
 
       // We don't assert status here because express.json may reject invalid JSON;
@@ -144,7 +148,7 @@ describe('fluxora_request_body_too_large_total counter', () => {
 
   describe('path label normalization', () => {
     it('uses req.path as the label (not raw originalUrl with query string)', async () => {
-      const oversizedBody = 'q'.repeat(BODY_LIMIT_BYTES + 1);
+      const oversizedBody = 'q'.repeat(DEFAULT_RAW_LIMIT_BYTES + 1);
 
       await request(app)
         .post('/api/streams')
