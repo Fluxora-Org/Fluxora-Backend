@@ -317,6 +317,72 @@ describe('runRetentionPurge — dryRun mode', () => {
     );
     expect(initiatedCalls).toHaveLength(0);
   });
+
+  it('does not write PURGE_SKIPPED_LEGAL_HOLD audit rows for held rows in dryRun mode', async () => {
+    // A dry run must be a true no-op against the database: legal-hold rows
+    // are still counted as "would be skipped", but the audit write (which
+    // goes through the shared pool outside the batch transaction) must not
+    // fire, otherwise dryRun would leave a real mutation behind.
+    const { recordAuditEventToDb } = await import('../../src/lib/auditLog.js');
+    vi.clearAllMocks();
+
+    // Rule 1 (audit_logs): slot 0 → []
+    // Rule 2 (streams):    slot 1 → heldBatch (2 held rows), slot 2 → []
+    // Rule 3 (webhook):    slot 3 → []
+    const heldBatch: MockRow[] = [expiredRow('dh-1', true), expiredRow('dh-2', true)];
+    const client = buildMockClient([[], heldBatch, [], []]);
+    const pool = buildMockPool(() => client);
+
+    const result = await runRetentionPurge({ ...baseOptions(pool), dryRun: true });
+
+    const skippedCalls = (recordAuditEventToDb as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([action]: [string]) => action === 'PURGE_SKIPPED_LEGAL_HOLD',
+    );
+    expect(skippedCalls).toHaveLength(0);
+
+    // Counts are still reported so operators can see what dryRun *would* skip.
+    const streamsRule = result.results.find((r) => r.table === 'streams');
+    expect(streamsRule!.rowsSkipped).toBe(2);
+    expect(streamsRule!.dryRun).toBe(true);
+  });
+
+  it('writes PURGE_SKIPPED_LEGAL_HOLD audit rows for held rows outside dryRun mode (regression guard)', async () => {
+    const { recordAuditEventToDb } = await import('../../src/lib/auditLog.js');
+    vi.clearAllMocks();
+
+    const heldBatch: MockRow[] = [expiredRow('rh-1', true)];
+    const client = buildMockClient([[], heldBatch, [], []]);
+    const pool = buildMockPool(() => client);
+
+    await runRetentionPurge({ ...baseOptions(pool), dryRun: false });
+
+    const skippedCalls = (recordAuditEventToDb as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([action]: [string]) => action === 'PURGE_SKIPPED_LEGAL_HOLD',
+    );
+    expect(skippedCalls).toHaveLength(1);
+  });
+});
+
+describe('runRetentionPurge — deletion ordering', () => {
+  it('fetches candidates oldest-first via ORDER BY <ageColumn> ASC before LIMIT', async () => {
+    const client = buildMockClient([[], [], [], []]);
+    const pool = buildMockPool(() => client);
+
+    await runRetentionPurge(baseOptions(pool));
+
+    const selectSqls = client.query.mock.calls
+      .map(([sql]: [string]) => sql as string)
+      .filter((s: string) => s.includes('FOR UPDATE SKIP LOCKED'));
+
+    expect(selectSqls.length).toBeGreaterThan(0);
+    for (const sql of selectSqls) {
+      const orderIdx = sql.indexOf('ORDER BY');
+      const limitIdx = sql.indexOf('LIMIT');
+      expect(orderIdx).toBeGreaterThan(-1);
+      expect(limitIdx).toBeGreaterThan(orderIdx);
+      expect(sql).toMatch(/ORDER BY "[a-z_]+" ASC/);
+    }
+  });
 });
 
 describe('runRetentionPurge — PURGE_INITIATED audit', () => {

@@ -216,7 +216,9 @@ rows that have exceeded their configured retention window.
 
 Every row in a target table with `legal_hold = TRUE` is unconditionally skipped
 by the purge job.  A `PURGE_SKIPPED_LEGAL_HOLD` audit event is written for
-each skipped row for compliance evidence.
+each skipped row for compliance evidence — except in `dryRun` mode, where no
+audit rows are written, so a dry run never mutates the database (see
+Configuration below).
 
 The legal-hold check happens **inside the same transaction** as the delete,
 preventing a TOCTOU race where a hold is set between the check and the delete.
@@ -229,13 +231,15 @@ defaults to `FALSE`.
 ### Execution model
 
 1. **Batched processing**: Each batch acquires a connection, runs
-   `SELECT … FOR UPDATE SKIP LOCKED`, processes rows, then commits.
-   Default batch size is 500 rows (configurable via `batchSize` option).
+   `SELECT … ORDER BY <ageColumn> ASC … FOR UPDATE SKIP LOCKED`, processes
+   rows oldest-first, then commits. Default batch size is 500 rows
+   (configurable via `batchSize` option).
 
-2. **Idempotent / crash-safe**: Each batch is committed atomically.  A crash
-   mid-run simply restarts from wherever the last successful commit left off.
-   Re-running the job after a crash is safe — already-purged rows are not
-   selected again.
+2. **Idempotent / crash-safe, no checkpoint table**: Each batch is committed
+   atomically.  A crash mid-run simply restarts from wherever the last
+   successful commit left off — eligibility is recomputed from live data on
+   every run, so already-purged rows are not selected again and a fully
+   converged run is a safe no-op.
 
 3. **Concurrent-safe**: `FOR UPDATE SKIP LOCKED` prevents multiple purge
    workers from processing the same rows simultaneously.
@@ -258,7 +262,7 @@ interface PurgeJobOptions {
   now?: Date;           // override for deterministic testing
   pool?: Pool;          // injectable pool for testing
   correlationId?: string; // propagated into audit entries
-  dryRun?: boolean;     // count-only mode, no deletes
+  dryRun?: boolean;     // count-only mode: no deletes/redacts AND no audit-log writes
 }
 ```
 
