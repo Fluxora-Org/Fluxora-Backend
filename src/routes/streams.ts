@@ -361,7 +361,6 @@ function encodeCursor(lastId: string): string {
 
 /** Maximum permitted length for the `lastId` field inside a decoded cursor payload. */
 const CURSOR_LAST_ID_MAX_LENGTH = 200;
-
 function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
   let parsed: unknown;
   try {
@@ -699,7 +698,6 @@ streamsRouter.get(
           info('Stream export cancelled by client', { requestId });
           break;
         }
-
         const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
         pagesFetched++;
 
