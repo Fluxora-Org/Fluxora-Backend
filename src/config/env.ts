@@ -262,6 +262,10 @@ export const EnvSchema = z
       .default(1024 * 1024),
     MAX_JSON_DEPTH: integerEnv('MAX_JSON_DEPTH', 1, 1000).default(20),
     REQUEST_TIMEOUT_MS: integerEnv('REQUEST_TIMEOUT_MS', 1000, 300000).default(30000),
+    GRAPHQL_PERSISTED_QUERY_ALLOWLIST: optionalString('GRAPHQL_PERSISTED_QUERY_ALLOWLIST'),
+    GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION: booleanEnv().default(true),
+    GRAPHQL_UNPERSISTED_QUERY_POLICY: z.enum(['allow', 'reject']).default('allow'),
+    GRAPHQL_INTROSPECTION_ENABLED: booleanEnv().default(true),
 
     LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
     METRICS_ENABLED: booleanEnv().default(true),
@@ -576,6 +580,10 @@ export interface Config {
   maxRequestSizeBytes: number;
   maxJsonDepth: number;
   requestTimeoutMs: number;
+  graphqlPersistedQueryAllowlist: string[];
+  graphqlPersistedQueryHashVerification: boolean;
+  graphqlUnpersistedQueryPolicy: 'allow' | 'reject';
+  graphqlIntrospectionEnabled: boolean;
 
   logLevel: LogLevel;
   metricsEnabled: boolean;
@@ -795,6 +803,14 @@ function toConfig(env: ParsedEnv): Config {
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
     maxJsonDepth: env.MAX_JSON_DEPTH,
     requestTimeoutMs: env.REQUEST_TIMEOUT_MS,
+    graphqlPersistedQueryAllowlist: env.GRAPHQL_PERSISTED_QUERY_ALLOWLIST
+      ? env.GRAPHQL_PERSISTED_QUERY_ALLOWLIST.split(',')
+          .map((hash) => hash.trim())
+          .filter((hash) => hash.length > 0)
+      : [],
+    graphqlPersistedQueryHashVerification: env.GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION,
+    graphqlUnpersistedQueryPolicy: env.GRAPHQL_UNPERSISTED_QUERY_POLICY,
+    graphqlIntrospectionEnabled: env.GRAPHQL_INTROSPECTION_ENABLED,
 
     logLevel: env.LOG_LEVEL,
     metricsEnabled: env.METRICS_ENABLED,
