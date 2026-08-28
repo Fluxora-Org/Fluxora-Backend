@@ -1,7 +1,7 @@
 import pg, { PoolClient } from 'pg';
-import { db } from '../db/client';
-import { config } from '../config';
-import { ContractEvent, ReplayProgress, ReplayCursor, ReplayRequest } from '../types';
+import { db } from '../db/client.js';
+import { config } from '../config.js';
+import { ContractEvent, ReplayProgress, ReplayCursor, ReplayRequest } from '../types.js';
 import { logger } from '../lib/logger.js';
 import {
   indexerReplayBatchesCommittedTotal,
@@ -28,6 +28,31 @@ import {
 } from '../metrics/businessMetrics.js';
 import { getStellarRpcService } from '../services/stellar-rpc.js';
 import { rowReader, INT32_MAX, BIGINT_SAFE_MAX } from '../db/rowMapping.js';
+
+function createConcurrencyLimiter(limit: number): { acquire: () => Promise<void>; release: () => void } {
+  const waiters: Array<() => void> = [];
+  let active = 0;
+
+  return {
+    acquire: () =>
+      new Promise<void>((resolve) => {
+        if (active < limit) {
+          active++;
+          resolve();
+        } else {
+          waiters.push(() => {
+            active++;
+            resolve();
+          });
+        }
+      }),
+    release: () => {
+      active--;
+      const next = waiters.shift();
+      if (next) next();
+    },
+  };
+}
 
 /** Seconds elapsed since a `process.hrtime.bigint()` start mark. */
 function elapsedSecondsSince(startedAt: bigint): number {
@@ -201,9 +226,12 @@ class ReplayState {
   }
 
   updateProgress(rowsProcessed: number, newOffset: number): void {
-    this.state.rowsReplayed += rowsProcessed;
+    const prevOffset = this.state.currentOffset ?? 0;
+    const monotonicOffset = Math.max(prevOffset, newOffset);
+    const actualAdded = Math.max(0, monotonicOffset - prevOffset);
+    this.state.rowsReplayed += actualAdded;
     this.state.rowsRemaining = Math.max(0, this.state.totalRows - this.state.rowsReplayed);
-    this.state.currentOffset = newOffset;
+    this.state.currentOffset = monotonicOffset;
 
     if (this.state.startedAt && this.state.rowsReplayed > 0) {
       const elapsed = Date.now() - this.state.startedAt.getTime();
@@ -328,10 +356,10 @@ export function rowToContractEvent(row: Record<string, unknown>): ContractEvent 
     block_height:     r.requireInt('block_height', { min: 0, max: BIGINT_SAFE_MAX }),
     transaction_hash: r.requireString('transaction_hash'),
     ...(row['ingested_at'] !== undefined
-      ? { ingested_at: r.optionalDate('ingested_at') }
+      ? { ingested_at: r.optionalDate('ingested_at') ?? undefined }
       : {}),
     ...(row['created_at'] !== undefined
-      ? { created_at: r.optionalDate('created_at') }
+      ? { created_at: r.optionalDate('created_at') ?? undefined }
       : {}),
   };
 }
@@ -395,6 +423,8 @@ export class ReplayCursorRepository {
    * Advance the cursor offset.  Called inside the SAME transaction as the
    * batch INSERT so the offset advance and the data commit are atomic — a crash
    * between the two can never happen.
+   *
+   * Uses GREATEST to ensure progress offset is strictly monotonic and never regresses.
    */
   async advanceOffset(
     client: PoolClient,
@@ -403,7 +433,7 @@ export class ReplayCursorRepository {
   ): Promise<void> {
     await client.query(
       `UPDATE replay_cursors
-          SET last_committed_offset = $1
+          SET last_committed_offset = GREATEST(last_committed_offset, $1)
         WHERE id = $2`,
       [newOffset, cursorId],
     );
@@ -1489,6 +1519,7 @@ function validateBatch(body: unknown): IngestContractEventsRequest {
 export class IndexerIngestionService {
   private readonly rateLimits = new Map<string, RateLimitBucket>();
   private readonly state: IndexerState;
+  private readonly writeSemaphore: { acquire: () => Promise<void>; release: () => void };
 
   constructor(private store: ContractEventStore) {
     this.state = {
@@ -1508,6 +1539,7 @@ export class IndexerIngestionService {
       ledgerThroughputSamples: [],
       lastLedgerLagUpdateAt: null,
     };
+    this.writeSemaphore = createConcurrencyLimiter(4);
   }
 
   setStore(store: ContractEventStore): void { this.store = store; }
@@ -1702,7 +1734,13 @@ export class IndexerIngestionService {
     }
 
     try {
-      const result = await this.store.insertMany(request.events);
+      await this.writeSemaphore.acquire();
+      let result;
+      try {
+        result = await this.store.insertMany(request.events);
+      } finally {
+        this.writeSemaphore.release();
+      }
       const now = new Date().toISOString();
       const maxLedger = Math.max(...events.map((e) => e.ledger));
       const safeLedger = Math.max(this.state.lastSafeLedger, maxLedger - 1);

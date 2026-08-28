@@ -27,13 +27,45 @@
  * Each batch is committed in its own short transaction, so a crash
  * mid-run simply restarts from wherever the last successful commit left
  * off.  Re-running the job after a crash is safe — already-purged rows
- * are gone and will not be selected again.
+ * are gone and will not be selected again.  There is **no separate
+ * checkpoint table**: eligibility (`ageColumn < cutoff`, `legal_hold`)
+ * is recomputed from live data on every run, so the already-committed
+ * batches from a prior (possibly crashed) run are simply absent from the
+ * next run's candidate set.  Re-running a fully-converged job (nothing
+ * left to purge) is always a safe no-op that reports zero rows.
+ *
+ * ## Deletion ordering
+ *
+ * Candidates within a rule are fetched oldest-first
+ * (`ORDER BY <ageColumn> ASC`).  This makes purge progress monotonic and
+ * deterministic: if a run is interrupted partway through a rule, the
+ * oldest — and therefore longest-overdue — rows are always the ones
+ * already committed, and a resumed run continues forward in time rather
+ * than potentially reprocessing an arbitrary scan order.
+ *
+ * ## Clock source
+ *
+ * All cut-off calculations for a single run share one `now` value
+ * (`options.now`, defaulting to `new Date()` at call time). It is read
+ * once in `runRetentionPurge` and threaded through every rule, so a run
+ * that spans a month/ledger boundary in wall-clock time still evaluates
+ * every rule against a single, consistent instant.
  *
  * ## Legal-hold exemption
  *
- * Any row with `legal_hold = TRUE` is unconditionally skipped and an
- * audit trail is written.  The hold must be lifted by an operator
- * before the next job run for the row to become purgeable.
+ * Any row with `legal_hold = TRUE` is unconditionally skipped.  In a
+ * real (non-dry-run) run this also writes a `PURGE_SKIPPED_LEGAL_HOLD`
+ * audit trail entry.  The hold must be lifted by an operator before the
+ * next job run for the row to become purgeable.
+ *
+ * ## Dry-run behavior
+ *
+ * `dryRun: true` makes the run fully read-only: candidate rows are still
+ * counted (so `rowsPurged`/`rowsSkipped` reflect what *would* happen),
+ * but no `DELETE`/`UPDATE` is issued against the target table and no
+ * audit-log rows are written — including `PURGE_SKIPPED_LEGAL_HOLD` for
+ * held rows, which is otherwise written outside the batch transaction.
+ * A dry run therefore leaves the database byte-for-byte unchanged.
  *
  * ## Audit trail
  *
@@ -253,7 +285,6 @@ async function purgeRule(
   let rowsPurged = 0;
   let rowsSkipped = 0;
   let batchIndex = 0;
-  let hasMore = true;
 
   logger.info(`Retention purge: processing rule '${rule.category}'`, correlationId, {
     table: rule.table,
@@ -263,7 +294,13 @@ async function purgeRule(
     hasLegalHold,
   });
 
-  while (hasMore) {
+  // Keep processing until a batch returns fewer rows than requested, meaning
+  // we have exhausted all candidates.  Using `purged + skipped < batchSize`
+  // is intentional: if an entire batch is held rows (purged=0, skipped=N),
+  // we still stop when skipped < batchSize — there are no more candidates.
+  // FOR UPDATE SKIP LOCKED ensures we do not re-visit the same held rows on
+  // the next iteration.
+  while (true) {
     const { purged, skipped } = await processBatch(rule, {
       cutoff,
       batchSize,
@@ -278,8 +315,14 @@ async function purgeRule(
     rowsSkipped += skipped;
     batchIndex += 1;
 
-    // If the batch was smaller than batchSize, we've exhausted candidates.
-    hasMore = purged + skipped >= batchSize;
+    // A batch that returns fewer rows than requested means we've exhausted
+    // all eligible candidates.  Note: a batch of exactly batchSize held rows
+    // (purged=0, skipped=batchSize) does NOT mean there are more; SKIP LOCKED
+    // means those rows will not appear again.  We stop when the batch was not
+    // full — regardless of the purged/skipped split.
+    if (purged + skipped < batchSize) {
+      break;
+    }
   }
 
   logger.info(`Retention purge: rule '${rule.category}' complete`, correlationId, {
@@ -345,12 +388,19 @@ async function processBatch(
       const primaryKey = getPrimaryKey(row);
 
       if (row.legal_hold === true) {
-        // Row is under legal hold — skip it and write an audit event.
+        // Row is under legal hold — skip it. Only write the audit event for
+        // a real run: dry-run must not mutate the database, and the skip
+        // audit write goes through the shared pool outside this transaction
+        // (see writeSkippedAuditEvent), so it is not covered by the
+        // transaction ROLLBACK/no-DELETE guarantees below.
         skipped += 1;
-        await writeSkippedAuditEvent(client, rule, primaryKey, correlationId);
+        if (!dryRun) {
+          await writeSkippedAuditEvent(client, rule, primaryKey, correlationId);
+        }
         logger.info('Retention purge: row skipped (legal hold)', correlationId, {
           table: rule.table,
           id: primaryKey,
+          dryRun,
         });
         continue;
       }
@@ -418,7 +468,10 @@ async function tableHasColumn(
  * Fetch candidate rows from the target table.
  *
  * Uses `SELECT … FOR UPDATE SKIP LOCKED` so concurrent purge workers or
- * operators modifying legal_hold do not block each other.
+ * operators modifying legal_hold do not block each other. Rows are ordered
+ * oldest-first (`ORDER BY <ageColumn> ASC`) so purge progress is
+ * deterministic and monotonic across batches and across runs (see
+ * "Deletion ordering" in the module docs).
  *
  * The SQL is **statically branched** based on `hasLegalHold` (determined
  * once per rule by {@link tableHasColumn}).  Tables that lack the column
@@ -447,6 +500,7 @@ async function fetchCandidateRows(
     `SELECT *, ${legalHoldExpr}
        FROM ${tableId}
       WHERE ${ageColId} < $1
+      ORDER BY ${ageColId} ASC
       LIMIT $2
       FOR UPDATE SKIP LOCKED`,
     [cutoff.toISOString(), batchSize]
@@ -457,6 +511,12 @@ async function fetchCandidateRows(
 
 /**
  * Delete or redact a single row identified by `id` (or `rowid` fallback).
+ *
+ * The `streams` redact path updates only the columns we know exist.
+ * The generic `redact` path is intentionally left as a safety error so
+ * any future table that needs redaction explicitly defines its own purge
+ * action rather than silently failing with a missing-column error at
+ * runtime. Add a dedicated branch here when a new table gains `purgeAction: 'redact'`.
  */
 async function purgeRow(
   client: PoolClient,
@@ -469,25 +529,26 @@ async function purgeRow(
     await client.query(`DELETE FROM ${tableId} WHERE id = $1`, [primaryKey]);
   } else if (rule.table === 'streams') {
     // Redact stream PII columns while preserving the stream row for audit
-    // and chain-derived consistency.
+    // and chain-derived consistency.  Also marks encryption_state so the
+    // row is distinguishable from plaintext or still-encrypted rows.
     await client.query(
       `UPDATE ${tableId}
-          SET sender_address        = $1,
-              recipient_address     = $1,
-              sender_address_hash   = NULL,
+          SET sender_address         = $1,
+              recipient_address      = $1,
+              sender_address_hash    = NULL,
               recipient_address_hash = NULL,
-              updated_at            = NOW()
+              encryption_state       = 'redacted',
+              updated_at             = NOW()
         WHERE id = $2`,
       [STREAM_REDACTION_TOMBSTONE, primaryKey]
     );
   } else {
-    // Generic redact path for tables that retain the row shell for auditability.
-    await client.query(
-      `UPDATE ${tableId}
-          SET meta = jsonb_build_object('purged', true),
-              correlation_id = NULL
-        WHERE id = $1`,
-      [primaryKey]
+    // Guard: a purgeable rule with purgeAction='redact' must have an explicit
+    // branch above. Throwing here surfaces the gap at development time rather
+    // than silently issuing a SQL UPDATE that references non-existent columns.
+    throw new Error(
+      `No redact implementation for table '${rule.table}'. ` +
+      `Add a dedicated branch in purgeRow or change purgeAction to 'delete'.`
     );
   }
 }
@@ -530,12 +591,13 @@ async function writePurgeAuditEvent(
 
 /**
  * Writes a `PURGE_SKIPPED_LEGAL_HOLD` audit entry.
- * Intentionally NOT inside the main transaction — the skip audit event
- * should persist even if the batch transaction rolls back, so we use the
- * non-transactional `recordAuditEventToDb` path after the fact.
  *
- * We still accept the PoolClient to satisfy the function signature but
- * we log via the shared pool to ensure the entry is durable.
+ * Intentionally written outside the main transaction via the shared pool.
+ * This ensures the skip is recorded even if the enclosing batch transaction
+ * rolls back — compliance evidence must persist regardless of batch outcome.
+ *
+ * The `client` parameter is accepted for interface uniformity but is not
+ * used; the write goes through the shared pool.
  */
 async function writeSkippedAuditEvent(
   _client: PoolClient,

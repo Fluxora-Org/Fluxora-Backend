@@ -52,6 +52,8 @@ import {
   startGrpcGatewayServer,
   stopGrpcGatewayServer,
   isGrpcGatewayEnabled,
+  GRPC_GATEWAY_MAX_MESSAGE_BYTES,
+  GRPC_GATEWAY_DEADLINE_MS,
 } from '../../src/indexer/grpcGateway.js';
 import { indexerIngestionService, indexerService } from '../../src/indexer/service.js';
 import { getConfig } from '../../src/config/env.js';
@@ -172,6 +174,11 @@ describe('createGrpcGatewayServer', () => {
     const server = createGrpcGatewayServer();
     expect(server).toBeInstanceOf(grpc.Server);
     server.forceShutdown();
+  });
+
+  it('publishes bounded message and handler deadline policy', () => {
+    expect(GRPC_GATEWAY_MAX_MESSAGE_BYTES).toBe(4 * 1024 * 1024);
+    expect(GRPC_GATEWAY_DEADLINE_MS).toBe(30_000);
   });
 });
 
@@ -350,6 +357,20 @@ describe('IngestContractEvents RPC', () => {
       client, 'IngestContractEvents', { events: [] }, makeMetadata(VALID_TOKEN),
     );
     expect(res.insertedCount).toBe(0);
+  });
+
+  it('rejects a request beyond the configured receive-message limit', async () => {
+    const err = await callRpc(client, 'IngestContractEvents', {
+      events: [{
+        eventId: 'oversized', ledger: 1, contractId: 'c', topic: 't', txHash: 'h',
+        txIndex: 0, operationIndex: 0, eventIndex: 0,
+        payloadJson: 'x'.repeat(GRPC_GATEWAY_MAX_MESSAGE_BYTES),
+        happenedAt: '2024-01-01T00:00:00Z', ledgerHash: 'lh',
+      }],
+    }, makeMetadata(VALID_TOKEN)).catch((e) => e as grpc.ServiceError);
+
+    expect((err as grpc.ServiceError).code).toBe(grpc.status.RESOURCE_EXHAUSTED);
+    expect(mockIngest).not.toHaveBeenCalled();
   });
 });
 

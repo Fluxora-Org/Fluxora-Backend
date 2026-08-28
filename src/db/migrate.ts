@@ -87,6 +87,41 @@ async function getAppliedMigrationNames(databaseUrl: string): Promise<string[]> 
 }
 
 /**
+ * Return the latest applied migration name, or null if no migrations have been
+ * applied (fresh database or missing migrations table).
+ *
+ * Migration names are timestamp-prefixed strings that sort lexicographically,
+ * so the last entry in `ORDER BY name` is the most recent.
+ *
+ * @param databaseUrl - PostgreSQL connection string.
+ * @returns The latest migration name, or null.
+ */
+export async function getLatestAppliedMigration(
+  databaseUrl: string,
+): Promise<string | null> {
+  const client = new pg.Client({ connectionString: databaseUrl });
+  await client.connect();
+  try {
+    const tableCheck = await client.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.tables
+         WHERE table_name = $1
+       ) AS exists`,
+      [MIGRATIONS_TABLE],
+    );
+    if (!tableCheck.rows[0]?.exists) {
+      return null;
+    }
+    const result = await client.query<{ name: string }>(
+      `SELECT name FROM ${MIGRATIONS_TABLE} ORDER BY name DESC LIMIT 1`,
+    );
+    return result.rows[0]?.name ?? null;
+  } finally {
+    await client.end();
+  }
+}
+
+/**
  * Startup migration guard — fail fast if any migrations are pending.
  *
  * Compares migration files on disk against the pgmigrations table.

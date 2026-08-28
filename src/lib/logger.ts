@@ -15,7 +15,7 @@
  * console/file behaviour is never altered.
  */
 
-import { sanitize, redactKeysInString } from '../pii/sanitizer.js';
+import { sanitize, sanitizeError, redactKeysInString } from '../pii/sanitizer.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { forwardToOtel } from '../tracing/logsBridge.js';
 
@@ -92,7 +92,7 @@ export function warn(message: string, context: LogContext = {}): void {
 
 export function error(message: string, context: LogContext = {}, err?: Error): void {
   const { correlationId, meta } = splitContext(context);
-  write('error', message, correlationId, { ...meta, ...(err ? { error: err.message, stack: err.stack } : {}) });
+  write('error', message, correlationId, { ...meta, ...(err ? { error: sanitizeError(err) } : {}) });
 }
 
 export function debug(message: string, context: LogContext = {}): void {

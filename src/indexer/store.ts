@@ -28,6 +28,14 @@ export interface ReorgRecord {
   rolledBackAt: string;
 }
 
+export interface ReplayProgressCheckpoint {
+  cursorId: string;
+  total: number;
+  lastCommittedOffset: number;
+  status: 'in-progress' | 'completed';
+  updatedAt?: string;
+}
+
 export interface ContractEventStore {
   readonly kind: IndexerStoreKind;
   insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult>;
@@ -35,6 +43,8 @@ export interface ContractEventStore {
   getLedgerHash(ledger: number): Promise<string | null>;
   /** Replay stored events with optional filtering. Append-only — never mutates. */
   getEvents(filter?: StreamEventReplayFilter): Promise<StreamEventReplayResult>;
+  saveCheckpoint?(checkpoint: ReplayProgressCheckpoint): Promise<void>;
+  getCheckpoint?(cursorId: string): Promise<ReplayProgressCheckpoint | null>;
 }
 
 export interface PgClientLike {
@@ -45,6 +55,7 @@ export class InMemoryContractEventStore implements ContractEventStore {
   public readonly kind: IndexerStoreKind = 'memory';
   private readonly records = new Map<string, ContractEventRecord>();
   private readonly reorgLog: ReorgRecord[] = [];
+  private readonly checkpoints = new Map<string, ReplayProgressCheckpoint>();
 
   async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
     const insertedEventIds: string[] = [];
@@ -153,9 +164,32 @@ export class InMemoryContractEventStore implements ContractEventStore {
     };
   }
 
+  async saveCheckpoint(checkpoint: ReplayProgressCheckpoint): Promise<void> {
+    const existing = this.checkpoints.get(checkpoint.cursorId);
+    if (existing && checkpoint.lastCommittedOffset < existing.lastCommittedOffset) {
+      throw new Error(
+        `Monotonicity violation: Cannot regress checkpoint offset from ${existing.lastCommittedOffset} to ${checkpoint.lastCommittedOffset}`,
+      );
+    }
+    const maxOffset = existing
+      ? Math.max(existing.lastCommittedOffset, checkpoint.lastCommittedOffset)
+      : checkpoint.lastCommittedOffset;
+    this.checkpoints.set(checkpoint.cursorId, {
+      ...checkpoint,
+      lastCommittedOffset: maxOffset,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  async getCheckpoint(cursorId: string): Promise<ReplayProgressCheckpoint | null> {
+    const cp = this.checkpoints.get(cursorId);
+    return cp ? { ...cp } : null;
+  }
+
   reset(): void {
     this.records.clear();
     this.reorgLog.length = 0;
+    this.checkpoints.clear();
   }
 
   all(): ContractEventRecord[] {
@@ -406,4 +440,66 @@ export class PostgresContractEventStore implements ContractEventStore {
       ...(nextCursor !== undefined ? { nextCursor } : {}),
     };
   }
+
+  async saveCheckpoint(checkpoint: ReplayProgressCheckpoint): Promise<void> {
+    await this.client.query(
+      `INSERT INTO indexer_replay_progress (last_committed_cursor, total, status, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (last_committed_cursor) DO UPDATE
+          SET total = EXCLUDED.total,
+              status = EXCLUDED.status,
+              updated_at = NOW()`,
+      [checkpoint.cursorId, checkpoint.total, checkpoint.status],
+    );
+  }
+
+  async getCheckpoint(cursorId: string): Promise<ReplayProgressCheckpoint | null> {
+    const result = await this.client.query<{
+      last_committed_cursor: string;
+      total: number;
+      status: string;
+      updated_at: string;
+      last_committed_offset: number;
+    }>(
+      `SELECT p.last_committed_cursor, p.total, p.status, p.updated_at, c.last_committed_offset
+         FROM indexer_replay_progress p
+         JOIN replay_cursors c ON p.last_committed_cursor = c.id
+        WHERE p.last_committed_cursor = $1 LIMIT 1`,
+      [cursorId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      cursorId: row.last_committed_cursor,
+      total: row.total,
+      lastCommittedOffset: row.last_committed_offset ?? 0,
+      status: row.status as 'in-progress' | 'completed',
+      updatedAt: row.updated_at,
+    };
+  }
+}
+
+import { rowReader, INT32_MAX } from '../db/rowMapping.js';
+
+export function rowToStreamEventRecord(row: Record<string, unknown>, table = 'contract_events'): StreamEventRecord {
+  const r = rowReader(table, row);
+  const rawHappened = row['happened_at'];
+  const rawIngested = row['ingested_at'];
+  const happenedAt = typeof rawHappened === 'string' ? r.requireString('happened_at') : r.requireDate('happened_at').toISOString();
+  const ingestedAt = typeof rawIngested === 'string' ? r.requireString('ingested_at') : r.requireDate('ingested_at').toISOString();
+
+  return {
+    eventId: r.requireString('event_id'),
+    ledger: r.requireInt('ledger', { min: 0, max: INT32_MAX }),
+    ledgerHash: r.optionalString('ledger_hash') ?? '',
+    contractId: r.requireString('contract_id'),
+    topic: r.requireString('topic'),
+    txHash: r.requireString('tx_hash'),
+    txIndex: r.requireInt('tx_index', { min: 0, max: INT32_MAX }),
+    operationIndex: r.requireInt('operation_index', { min: 0, max: INT32_MAX }),
+    eventIndex: r.requireInt('event_index', { min: 0, max: INT32_MAX }),
+    payload: r.requireJsonObject('payload'),
+    happenedAt,
+    ingestedAt,
+  };
 }

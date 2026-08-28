@@ -194,7 +194,7 @@ export interface Stream {
   status: string;
 }
 
-type StreamsCursor = { v: 1; lastId: string };
+type StreamsCursor = { v: 1; lastId: string; scope?: string };
 type DependencyState = 'healthy' | 'unavailable';
 
 type NormalizedCreateInput = {
@@ -354,14 +354,13 @@ function matchesIfNoneMatch(ifNoneMatch: string, etag: string): boolean {
 
 // ── Cursor helpers ────────────────────────────────────────────────────────────
 
-function encodeCursor(lastId: string): string {
-  const payload: StreamsCursor = { v: 1, lastId };
+function encodeCursor(lastId: string, scope = 'streams:v1'): string {
+  const payload: StreamsCursor = { v: 1, lastId, scope };
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
 /** Maximum permitted length for the `lastId` field inside a decoded cursor payload. */
 const CURSOR_LAST_ID_MAX_LENGTH = 200;
-
 function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
   let parsed: unknown;
   try {
@@ -385,7 +384,20 @@ function decodeCursor(cursor: string, requestId?: string): StreamsCursor {
     warn('Cursor lastId exceeds maximum length', { length: candidate.lastId.length, requestId });
     throw validationError('cursor must be a valid opaque pagination token');
   }
+  if (candidate.scope !== undefined && (typeof candidate.scope !== 'string' || candidate.scope.length > 500)) {
+    throw validationError('cursor must be a valid opaque pagination token');
+  }
   return candidate;
+}
+
+/** Canonical query binding stored in every newly issued stream cursor. */
+function streamCursorScope(
+  status: string | undefined,
+  sender: string | undefined,
+  recipient: string | undefined,
+  callerAddress: string | undefined,
+): string {
+  return JSON.stringify({ v: 1, status: status ?? null, sender: sender ?? null, recipient: recipient ?? null, caller: callerAddress ?? null, order: 'id:asc' });
 }
 
 // ── Query-param parsers ───────────────────────────────────────────────────────
@@ -546,6 +558,11 @@ streamsRouter.get(
 
     const cursor = rawCursor !== undefined ? parseCursor(rawCursor, requestId) : undefined;
     const includeTotal = include_total === 'true';
+    const cursorScope = streamCursorScope(statusFilter, senderFilter, recipientFilter, req.callerAddress);
+    if (cursor?.scope !== undefined && cursor.scope !== cursorScope) {
+      warn('Stream cursor scope mismatch', { requestId });
+      throw validationError('cursor does not match the requested tenant, filters, or sort order');
+    }
 
     if (streamListingDependency.state !== 'healthy') {
       warn('Stream listing dependency unavailable', { dependency: 'stream-list-view', requestId });
@@ -602,7 +619,7 @@ streamsRouter.get(
     const pageStreams = result!.streams;
     const hasMore = result!.hasMore;
     const nextCursor = hasMore && pageStreams.length > 0
-      ? encodeCursor(pageStreams[pageStreams.length - 1]!.id)
+      ? encodeCursor(pageStreams[pageStreams.length - 1]!.id, cursorScope)
       : null;
 
     info('Listing streams', { limit, returned: pageStreams.length, hasMore, requestId });
@@ -699,7 +716,6 @@ streamsRouter.get(
           info('Stream export cancelled by client', { requestId });
           break;
         }
-
         const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
         pagesFetched++;
 

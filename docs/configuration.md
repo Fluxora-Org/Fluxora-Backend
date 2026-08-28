@@ -60,6 +60,9 @@ Secret values are never included in validation messages.
 | `REQUIRE_ADMIN_AUTH`              | boolean                                        | `false`                                                                                                  |
 | `ADMIN_API_TOKEN`                 | string                                         | unset                                                                                                    |
 | `WS_AUTH_REQUIRED`                | boolean                                        | `false`                                                                                                  |
+| `WS_ALLOWED_ORIGINS`              | comma-separated origins                        | unset                                                                                                    |
+| `WS_RECONNECT_LIMIT`              | integer                                        | `20`                                                                                                     |
+| `WS_RECONNECT_WINDOW_MS`          | integer milliseconds                           | `60000`                                                                                                  |
 | `INDEXER_ENABLED`                 | boolean                                        | `false`                                                                                                  |
 | `WORKER_ENABLED`                  | boolean                                        | `false`                                                                                                  |
 | `INDEXER_STALL_THRESHOLD_MS`      | integer ms, minimum 1000                       | `300000`                                                                                                 |

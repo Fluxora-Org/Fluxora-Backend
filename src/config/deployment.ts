@@ -74,9 +74,12 @@ export function buildDeploymentChecklistReport(input: {
   config: Config;
   dependencyHealth: HealthReport;
   indexerHealth: IndexerHealth;
+  /** Number of feature flags blocked by pending migrations (0 = all compatible). */
+  blockedFeatureFlags?: number;
 }): DeploymentChecklistReport {
   const { config, dependencyHealth, indexerHealth } = input;
   const parityRequired = config.nodeEnv !== 'development';
+  const blockedFlags = input.blockedFeatureFlags ?? 0;
 
   const checklist: DeploymentChecklistItem[] = [
     makeCheck(
@@ -165,6 +168,16 @@ export function buildDeploymentChecklistReport(input: {
       config.metricsEnabled
         ? 'Metrics are enabled.'
         : 'Metrics are disabled, reducing production parity for incident response.',
+    ),
+    makeCheck(
+      'schema_compatibility',
+      'Feature flag schema compatibility',
+      blockedFlags > 0
+        ? 'warn'
+        : 'pass',
+      blockedFlags > 0
+        ? `${blockedFlags} feature flag(s) blocked by pending database migrations.`
+        : 'All feature flags are compatible with the current schema.',
     ),
   ];
 

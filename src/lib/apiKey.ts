@@ -23,7 +23,7 @@ import { z } from 'zod';
 import { getConfig } from '../config/env.js';
 import { apiKeyRepository } from '../db/repositories/apiKeyRepository.js';
 import { recordAuditEventToDb } from './auditLog.js';
-import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import type { ApiKeyRecord, ApiKeyCreated, ApiKeyView } from '../db/types.js';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 
 /**
@@ -119,6 +119,27 @@ function hashesMatch(a: string, b: string): boolean {
 // ---------------------------------------------------------------------------
 
 /**
+ * Project an internal {@link ApiKeyRecord} to its safe display shape.
+ *
+ * Strips `keyHash` and `salt` so the credential material never leaves the
+ * service boundary. Call this before serialising any record into an HTTP
+ * response, a log line, or any other outbound channel.
+ *
+ * @param record - Full internal record fetched from the repository.
+ * @returns A view safe for serialisation into HTTP responses.
+ */
+export function toApiKeyView(record: ApiKeyRecord): ApiKeyView {
+  return {
+    id: record.id,
+    name: record.name,
+    prefix: record.prefix,
+    createdAt: record.createdAt,
+    rotatedAt: record.rotatedAt,
+    active: record.active,
+    scopes: record.scopes,
+  };
+}
+
 /**
  * Creates a new API key with optional scopes. Returns the record plus the raw key (shown once).
  *
@@ -212,10 +233,15 @@ export async function revokeApiKey(id: string, correlationId?: string): Promise<
 }
 
 /**
- * Returns all stored key records (hashes only — raw keys are never stored).
+ * Returns all stored key records projected to safe display fields.
+ *
+ * `keyHash` and `salt` are stripped before returning — only the non-secret
+ * display fields (`id`, `name`, `prefix`, `createdAt`, `rotatedAt`, `active`,
+ * `scopes`) are included in each entry.
  */
-export async function listApiKeys(): Promise<ApiKeyRecord[]> {
-  return apiKeyRepository.listAll();
+export async function listApiKeys(): Promise<ApiKeyView[]> {
+  const records = await apiKeyRepository.listAll();
+  return records.map(toApiKeyView);
 }
 
 /**

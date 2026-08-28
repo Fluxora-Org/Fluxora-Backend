@@ -11,6 +11,7 @@ export { getClientIp };
 // In-memory state (non-ban state)
 const connectionCounts = new Map<string, number>();
 const rejectionHistory = new Map<string, number[]>(); // IP -> timestamps of rejections
+const reconnectHistory = new Map<string, number[]>(); // IP -> timestamps of upgrade attempts
 
 // Graceful shutdown state
 let shuttingDown = false;
@@ -115,6 +116,17 @@ export async function checkAndReserve(ip: string): Promise<{ allowed: boolean; c
 
   const now = Date.now();
   const maxConnections = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
+  const reconnectLimit = parseInt(process.env.WS_RECONNECT_LIMIT || '20', 10);
+  const reconnectWindowMs = parseInt(process.env.WS_RECONNECT_WINDOW_MS || '60000', 10);
+
+  const attempts = (reconnectHistory.get(ip) || []).filter((timestamp) => now - timestamp < reconnectWindowMs);
+  if (attempts.length >= reconnectLimit) {
+    reconnectHistory.set(ip, attempts);
+    recordRejection(ip, now);
+    return { allowed: false, code: 4029, reason: 'Reconnect rate exceeded' };
+  }
+  attempts.push(now);
+  reconnectHistory.set(ip, attempts);
 
   // 1. Check connection limit FIRST (synchronously) to avoid TOCTOU
   const currentCount = connectionCounts.get(ip) || 0;
@@ -285,6 +297,7 @@ export async function gracefulDrain(
 export function _resetLimiter(): void {
   connectionCounts.clear();
   rejectionHistory.clear();
+  reconnectHistory.clear();
   shuttingDown = false;
   activeConnections = 0;
   updateActiveConnectionsMetric();

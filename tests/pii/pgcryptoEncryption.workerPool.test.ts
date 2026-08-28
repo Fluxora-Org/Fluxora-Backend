@@ -297,6 +297,54 @@ describe('batchComputeAddressHashes', () => {
   });
 });
 
+// ── Worker HashErrorMessage → rejection ────────────────────────────────────
+//
+// Before the fix, a worker that posted { type: 'error', taskId, error: '...' }
+// would cause the pool to RESOLVE the task promise with the error-shaped
+// object instead of rejecting it.  Callers expecting a HashResultMessage
+// would get a HashErrorMessage silently, making the bug impossible to
+// detect without explicit type checking downstream.
+
+describe('WorkerPool — HashErrorMessage causes rejection', () => {
+  it('rejects the task promise when the worker message has type "error"', async () => {
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
+    const pool = new WorkerPool(workerUrl, { maxWorkers: 1 });
+
+    // Register a fallback that simulates a worker posting an error-shaped message
+    pool.setFallback((_msg: unknown) => {
+      return { type: 'error', taskId: 0, error: 'hmac computation failed' };
+    });
+
+    // Force fallback by marking all workers failed
+    (pool as any).allWorkersFailed = true;
+
+    await expect(
+      pool.exec({ type: 'hash', taskId: 0, address, keys })
+    ).rejects.toThrow('hmac computation failed');
+
+    await pool.shutdown();
+  });
+
+  it('resolves normally when the worker message has type "result"', async () => {
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
+    const p = new WorkerPool(workerUrl, { maxWorkers: 1 });
+
+    p.setFallback((_msg: unknown) => {
+      return { type: 'result', taskId: 0, current: 'aabbcc', previous: undefined };
+    });
+
+    (p as any).allWorkersFailed = true;
+
+    const result = await p.exec<{ type: string; current: string }>({
+      type: 'hash', taskId: 0, address, keys,
+    });
+
+    expect(result.type).toBe('result');
+    expect(result.current).toBe('aabbcc');
+    await p.shutdown();
+  });
+});
+
 // ── Key security ───────────────────────────────────────────────────────────
 
 describe('Key security', () => {

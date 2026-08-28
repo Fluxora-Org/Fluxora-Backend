@@ -211,6 +211,41 @@ export const REQUEST_FIELD_POLICIES: Record<string, FieldPolicy> = {
     redactInLogs: true,
     rationale: 'Set-Cookie header containing session data.',
   },
+  address: {
+    classification: DataClassification.SENSITIVE,
+    redactInLogs: true,
+    rationale: 'Blockchain or physical address that may identify a person.',
+  },
+  payload: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Webhook or request payload may contain arbitrary user data.',
+  },
+  body: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Request or response body may contain arbitrary user data.',
+  },
+  query: {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Raw database queries can contain identifiers or user data.',
+  },
+  'query-params': {
+    classification: DataClassification.RESTRICTED,
+    redactInLogs: true,
+    rationale: 'Database query parameters may contain identifiers or user data.',
+  },
+  'database-id': {
+    classification: DataClassification.SENSITIVE,
+    redactInLogs: true,
+    rationale: 'Internal database identifiers must not leave the process.',
+  },
+  'row-id': {
+    classification: DataClassification.SENSITIVE,
+    redactInLogs: true,
+    rationale: 'Internal row identifiers can expose database structure.',
+  },
 };
 
 /** Retention schedule exposed via the privacy endpoint. */

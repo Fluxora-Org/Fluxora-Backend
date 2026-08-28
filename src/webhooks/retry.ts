@@ -23,6 +23,8 @@ export interface EnhancedRetryPolicy extends WebhookRetryPolicy {
   deadLetterAfterMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerResetMs?: number;
+  /** Previous delay in ms, used for decorrelated jitter calculation. */
+  previousDelayMs?: number;
 }
 
 export interface RetrySchedule {
@@ -95,12 +97,17 @@ export function calculateNextRetryTime(
   attemptNumber: number,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
   now: number = Date.now(),
+  previousDelayMs?: number
 ): number {
   if (attemptNumber >= policy.maxAttempts) return 0;
   const delayMs = calculateNextRetryDelay(attemptNumber, {
     baseDelayMs: policy.initialBackoffMs,
     maxDelayMs: policy.maxBackoffMs,
     maxAttempts: policy.maxAttempts,
+    jitterAlgorithm: policy.jitterAlgorithm ?? 'full',
+    jitterPercent: policy.jitterPercent,
+    random: policy.random,
+    previousDelayMs: previousDelayMs ?? policy.previousDelayMs,
   });
   return now + delayMs;
 }
@@ -112,14 +119,26 @@ export function generateRetrySchedule(
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
   now: number = Date.now(),
 ): RetrySchedule[] {
-  return Array.from({ length: policy.maxAttempts }, (_, i) => {
+  const schedule: RetrySchedule[] = [];
+  let previousDelayMs: number | undefined;
+  const algorithm = policy.jitterAlgorithm ?? 'full';
+  for (let i = 0; i < policy.maxAttempts; i++) {
     const delayMs = calculateNextRetryDelay(i, {
       baseDelayMs: policy.initialBackoffMs,
       maxDelayMs: policy.maxBackoffMs,
       maxAttempts: policy.maxAttempts,
+      jitterAlgorithm: algorithm,
+      jitterPercent: policy.jitterPercent,
+      random: policy.random,
+      previousDelayMs,
     });
-    return { attemptNumber: i + 1, delayMs, retryAt: now + delayMs };
-  });
+    schedule.push({ attemptNumber: i + 1, delayMs, retryAt: now + delayMs });
+    // For decorrelated jitter, track the actual delay for the next iteration
+    if (algorithm === 'decorrelated') {
+      previousDelayMs = delayMs;
+    }
+  }
+  return schedule;
 }
 
 /** Attach retry metadata to an outbox payload and return the next retry time. */
@@ -234,10 +253,18 @@ export function countsTowardCircuitBreaker(
 
 /** Return a human-readable summary of the retry policy (for logging). */
 export function formatRetryPolicy(policy: EnhancedRetryPolicy): string {
+  const jitterAlgo = policy.jitterAlgorithm;
+  let jitterStr: string;
+  if (jitterAlgo === undefined) {
+    // Backward-compatible format for default policy
+    jitterStr = `${policy.jitterPercent}%`;
+  } else {
+    jitterStr = `${jitterAlgo}${policy.jitterPercent !== undefined ? ` ${policy.jitterPercent}%` : ''}`;
+  }
   const base =
     `max_attempts=${policy.maxAttempts}, initial_backoff=${policy.initialBackoffMs}ms, ` +
     `multiplier=${policy.backoffMultiplier}x, max_backoff=${policy.maxBackoffMs}ms, ` +
-    `jitter=decorrelated, timeout=${policy.timeoutMs}ms`;
+    `jitter=${jitterStr}, timeout=${policy.timeoutMs}ms`;
 
   const extras: string[] = [];
   if (policy.deadLetterAfterMs) extras.push(`dlq_after=${policy.deadLetterAfterMs}ms`);

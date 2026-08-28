@@ -1,4 +1,5 @@
 import type { Attributes } from '@opentelemetry/api';
+import { redactKeysInString, sanitize, sanitizeError } from '../pii/sanitizer.js';
 /**
  * Distributed Tracing Hooks for Fluxora Backend.
  *
@@ -204,11 +205,33 @@ export class Tracer {
       }
       if (sampling.strategy === 'head') {
         let rate = sampling.sampleRate;
-        const route = context.tags?.['route'] as string | undefined;
-        if (route && sampling.perRouteOverrides) {
-          const override = resolvePerRouteOverride(route, sampling.perRouteOverrides);
-          if (override !== undefined) rate = override;
+        
+        if (context.tags) {
+          const tenant = context.tags['tenant'] as string | undefined;
+          if (tenant !== undefined) {
+            if (sampling.perTenantOverrides && Object.prototype.hasOwnProperty.call(sampling.perTenantOverrides, tenant)) {
+              rate = sampling.perTenantOverrides[tenant];
+            } else {
+              context.tags['tenant'] = 'OTHER';
+            }
+          }
+
+          const route = context.tags['route'] as string | undefined;
+          if (route !== undefined) {
+            if (sampling.perRouteOverrides) {
+              const override = resolvePerRouteOverride(route, sampling.perRouteOverrides);
+              if (override !== undefined) {
+                rate = override.rate;
+                context.tags['route'] = override.key;
+              } else {
+                context.tags['route'] = 'OTHER';
+              }
+            } else {
+              context.tags['route'] = 'OTHER';
+            }
+          }
         }
+
         if (!shouldSampleHead(context.traceId, rate)) {
           return this.createNoOpSpan(context);
         }
@@ -251,7 +274,7 @@ export class Tracer {
     span.durationMs = span.endTimeMs - span.startTimeMs;
     span.status = status;
     if (statusMessage !== undefined) {
-      span.statusMessage = statusMessage;
+      span.statusMessage = redactKeysInString(statusMessage);
     }
 
     this.activeSpans.delete(span.context.spanId);
@@ -281,7 +304,7 @@ export class Tracer {
     const event: SpanEvent = {
       name,
       timestamp: Date.now(),
-      ...(attributes !== undefined ? { attributes } : {}),
+      ...(attributes !== undefined ? { attributes: sanitize(attributes) } : {}),
     };
 
     span.events.push(event);
@@ -301,7 +324,15 @@ export class Tracer {
       return;
     }
 
-    this.safeCall(() => this.config.hooks?.onError?.(correlationId, error, context));
+    const sanitized = sanitizeError(error);
+    const safeError = new Error(sanitized.message as string);
+    safeError.name = error.name;
+    if (sanitized.stack) safeError.stack = sanitized.stack as string;
+    this.safeCall(() => this.config.hooks?.onError?.(
+      correlationId,
+      safeError,
+      context ? sanitize(context) : undefined,
+    ));
   }
 
   /**
@@ -752,16 +783,16 @@ export function enrichSpanWithStream(
 
   // 1. Enrich custom span tags
   if (streamId) span.context.tags['fluxora.stream_id'] = streamId;
-  if (sender) span.context.tags['fluxora.sender'] = sender;
-  if (recipient) span.context.tags['fluxora.recipient'] = recipient;
+  if (sender) span.context.tags['fluxora.sender'] = redactKeysInString(sender);
+  if (recipient) span.context.tags['fluxora.recipient'] = redactKeysInString(recipient);
 
   // 2. Enrich the internal OTel span if it exists in tags
   const otelSpan = span.context.tags['_otelSpan'] as any;
   if (otelSpan && typeof otelSpan.setAttribute === 'function') {
     try {
       if (streamId) otelSpan.setAttribute('fluxora.stream_id', streamId);
-      if (sender) otelSpan.setAttribute('fluxora.sender', sender);
-      if (recipient) otelSpan.setAttribute('fluxora.recipient', recipient);
+      if (sender) otelSpan.setAttribute('fluxora.sender', redactKeysInString(sender));
+      if (recipient) otelSpan.setAttribute('fluxora.recipient', redactKeysInString(recipient));
     } catch {
       // ignore OTel setAttribute errors
     }
@@ -772,8 +803,8 @@ export function enrichSpanWithStream(
     const activeSpan = trace.getActiveSpan();
     if (activeSpan) {
       if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
-      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
-      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+      if (sender) activeSpan.setAttribute('fluxora.sender', redactKeysInString(sender));
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', redactKeysInString(recipient));
     }
   } catch {
     // ignore active span errors
@@ -792,8 +823,8 @@ export function enrichActiveSpanWithStream(
     const activeSpan = trace.getActiveSpan();
     if (activeSpan) {
       if (streamId) activeSpan.setAttribute('fluxora.stream_id', streamId);
-      if (sender) activeSpan.setAttribute('fluxora.sender', sender);
-      if (recipient) activeSpan.setAttribute('fluxora.recipient', recipient);
+      if (sender) activeSpan.setAttribute('fluxora.sender', redactKeysInString(sender));
+      if (recipient) activeSpan.setAttribute('fluxora.recipient', redactKeysInString(recipient));
     }
   } catch {
     // ignore active span errors
@@ -846,6 +877,13 @@ export interface HeadSamplingConfig {
    * Exact matches are checked first; then longest prefix match.
    */
   perRouteOverrides?: Record<string, number>;
+  /**
+   * Per-tenant sample rate overrides.
+   * Keys are tenant IDs.
+   * Values are sample rates in [0, 1].
+   * Exact matches only.
+   */
+  perTenantOverrides?: Record<string, number>;
 }
 
 /**
@@ -920,10 +958,12 @@ export function samplingFnv1a32(input: string): number {
  * @returns `true` if the trace should be kept.
  */
 export function shouldSampleHead(traceId: string, sampleRate: number): boolean {
-  if (sampleRate <= 0) return false;
-  if (sampleRate >= 1) return true;
+  if (Number.isNaN(sampleRate) || !Number.isFinite(sampleRate)) return false;
+  const clampedRate = Math.max(0, Math.min(1, sampleRate));
+  if (clampedRate <= 0) return false;
+  if (clampedRate >= 1) return true;
   const bucket = samplingFnv1a32(traceId) % 1000;
-  return bucket < Math.round(sampleRate * 1000);
+  return bucket < Math.round(clampedRate * 1000);
 }
 
 /**
@@ -970,10 +1010,10 @@ export function shouldSampleTail(span: Span, config: TailSamplingConfig): boolea
 export function resolvePerRouteOverride(
   route: string,
   overrides: Record<string, number>
-): number | undefined {
+): { rate: number; key: string } | undefined {
   // 1. Exact match
   if (Object.prototype.hasOwnProperty.call(overrides, route)) {
-    return overrides[route];
+    return { rate: overrides[route], key: route };
   }
 
   // 2. Longest prefix match (segment-aware)
@@ -987,7 +1027,7 @@ export function resolvePerRouteOverride(
     }
   }
 
-  return best?.rate;
+  return best;
 }
 
 // ── Span Export Batching (Issue #758) ──────────────────────────────────────────
