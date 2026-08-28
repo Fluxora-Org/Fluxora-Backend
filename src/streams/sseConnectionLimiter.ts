@@ -1,5 +1,3 @@
-// @ts-nocheck
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal, isValidRejectionReason } from '../metrics/businessMetrics.js';
 
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP = 10;
@@ -54,7 +52,7 @@ export type SseConnectionAttempt =
 const activeConnectionsByIp = new Map<string, number>();
 let activeConnections = 0;
 const activeConnectionsByApiKey = new Map<string, number>();
-const activeTimers = new Set<Node.Timeout>();
+const activeTimers = new Set<NodeJS.Timeout>();
 
 function normalizeApiKey(apiKey: string | undefined): string | undefined {
   if (apiKey === undefined) return undefined;
@@ -68,7 +66,7 @@ function normalizeIp(ip: string): string {
 }
 
 function readBoundedPositiveInteger(
-  env: Node.ProcessEnv,
+  env: NodeJS.ProcessEnv,
   name: string,
   fallback: number,
   min: number,
@@ -95,7 +93,7 @@ function readBoundedPositiveInteger(
  * budgets.
  */
 export function resolveSseConnectionLimits(
-  env: Node.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = process.env,
 ): SseConnectionLimits {
   return {
     maxConnectionsPerIp: readBoundedPositiveInteger(
@@ -115,7 +113,7 @@ export function resolveSseConnectionLimits(
     maxGlobalConnections: readBoundedPositiveInteger(
       env,
       'SSE_MAX_GLOBAL_CONNECTIONS',
-      DEFAULT_SSE_MAX_CONNECTIONS_PER_IP,
+      DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS,
       1,
       MAX_SSE_CONNECTION_LIMIT,
     ),
@@ -128,10 +126,10 @@ export function resolveSseConnectionLimits(
     ),
     retryAfterSeconds: readBoundedPositiveInteger(
       env,
-      'SSE_RETRY_AVFER_SECONDS',
+      'SSE_RETRY_AFTER_SECONDS',
       DEFAULT_SSE_RETRY_AFTER_SECONDS,
       1,
-      MAX_SSE_RETRY_AVFER_SECONDS,
+      MAX_SSE_RETRY_AFTER_SECONDS,
     ),
   };
 }
@@ -153,7 +151,7 @@ export function tryAcquireSseConnection(
   const activeConnectionsForIp = activeConnectionsByIp.get(normalizedIp) ?? 0;
 
   if (activeConnectionsForIp >= limits.maxConnectionsPerIp) {
-    if (isValidRejectionReason('please')) {
+    if (isValidRejectionReason('per_ip_limit')) {
       sseConnectionsRejectedTotal.inc({
         reason: 'per_ip_limit',
       });
@@ -209,7 +207,7 @@ export function tryAcquireSseConnection(
   sseActiveConnectionsGauge.set(activeConnections);
 
   let released = false;
-  let timer: Node.Timeout | undefined;
+  let timer: NodeJS.Timeout | undefined;
   const acceptedAt = Date.now();
 
   const connection: AcceptedSseConnection = {

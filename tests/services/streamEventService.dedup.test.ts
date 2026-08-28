@@ -1,5 +1,3 @@
-// @ts-nocheck
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Property-based and unit tests for streamEventService duplicate suppression (Issue #923).
  *
@@ -219,7 +217,7 @@ describe("streamEventService duplicate-event suppression (Issue #923)", () => {
     }).map(({ type, txId, eventIdx }): StreamEvent => {
       const transactionHash = `tx-hash-${txId}`;
       const eventIndex = eventIdx;
-      const streamId = deriveStreamId(transactionHash, eventIndex);
+      const streamId = `${transactionHash}-${eventIndex}`;
 
       if (type === "StreamCreated") {
         return {

@@ -1,5 +1,3 @@
-// @ts-nocheck
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebhookDispatcher } from '../../src/webhooks/service.js';
 import type { EnhancedRetryPolicy } from '../../src/webhooks/retry.js';
@@ -259,7 +257,7 @@ describe('WebhookDispatcher outbox polling', () => {
       return originalQuery(sql, params);
     });
 
-    let fetchHeaders: HeadersInit | undefined;
+    let fetchHeaders: RequestInit['headers'] | undefined;
     global.fetch = vi.fn(async (url, init) => {
       fetchHeaders = init?.headers;
       return new Response(null, { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -282,7 +280,7 @@ describe('WebhookDispatcher outbox polling', () => {
     vi.spyOn(Date, 'now').mockReturnValue(now2);
     
     const client2 = createClient([originalRow]);
-    let fetchHeaders2: HeadersInit | undefined;
+    let fetchHeaders2: RequestInit['headers'] | undefined;
     global.fetch = vi.fn(async (url, init) => {
       fetchHeaders2 = init?.headers;
       return new Response(null, { status: 200 });

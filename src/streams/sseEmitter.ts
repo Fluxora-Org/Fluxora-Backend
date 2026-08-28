@@ -30,6 +30,10 @@ export const sseEventBus = new EventEmitter();
 
 sseEventBus.setMaxListeners(1000);
 
+export function deriveStreamId(transactionHash: string, eventIndex: number): string {
+  return `${transactionHash}-${eventIndex}`;
+}
+
 export interface LiveSseStreamUpdateEvent {
   streamId: string;
   eventId: string;
