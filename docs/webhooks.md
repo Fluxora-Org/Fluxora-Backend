@@ -72,7 +72,7 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 | Circuit open | Delivery deferred to `resetAt`; no consumer traffic. |
 | Half-open probe succeeds | Circuit resets to closed. |
 | Half-open probe fails | Circuit re-opens for another `circuitBreakerResetMs`. |
-| Redis unavailable | **Fail-open** for gate checks; deliveries proceed. Failure recording is best-effort. |
+| Redis unavailable | **Fail-open** for gate checks; deliveries proceed. Failure recording is best-effort. (Rule 2 of [`docs/security/redis-outage-policy.md`](security/redis-outage-policy.md) — availability-only, no deny/abuse gate.) |
 
 ### How rate limiting works
 
@@ -134,8 +134,22 @@ consumer does not pin a stale gauge series. See
 |-----------|-----------|
 | Within rate limit | Attempt proceeds; attempt recorded in Redis. |
 | Limit exceeded | Attempt deferred; outbox row re-enqueued with `retryAt = now + windowMs`. No delivery is dropped. |
-| Redis unavailable | **Fail-open**: attempt proceeds normally. A Redis outage does not halt deliveries. |
+| Redis unavailable | **Fail-open**: attempt proceeds normally. A Redis outage does not halt deliveries. (Rule 2 of [`docs/security/redis-outage-policy.md`](security/redis-outage-policy.md) — the only harm of a false default is lost availability, and there is no authorisation/abuse gate.) |
 | `maxAttempts` reached | `shouldRetry = false`; row moves to dead-letter queue regardless of rate limit. |
+
+### Outage policy
+
+Both the retry **rate limiter** (`src/redis/webhookRateLimit.ts`) and the **circuit
+breaker** (`src/redis/webhookCircuitBreakerStore.ts`) **fail open** when Redis is
+unavailable — the attempt is allowed and recorded best-effort. This is a
+deliberate, rule-2 classification of the governing outage policy, not an
+accidental `catch`: the cost of a false "allow" is only availability (extra
+deliveries), while a false "deny" would stall all webhook deliveries. The fail-open
+is observable via `fluxora_webhook_rate_limiter_fail_open_total` and error logs.
+
+This is deliberate opposite of the fail-closed stores (JWT revocation, WS ban),
+which must never admit a denied subject. See
+[`docs/security/redis-outage-policy.md`](security/redis-outage-policy.md).
 
 ### Security notes
 
