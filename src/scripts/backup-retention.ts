@@ -179,31 +179,69 @@ export function _resetRestoreJobs(): void {
 
 // ─── Restore Execution ────────────────────────────────────────────────────────
 
+const DEFAULT_BACKUP_PREFIX = 'backups/';
+
 /**
- * Validates that `backupId` is safe to use as an S3 key.
- *
- * Rejects:
- * - Empty strings
- * - Path traversal sequences ("../", "..")
- * - Keys starting with "/" (absolute paths)
- * - Excessively long keys (>1 024 characters — S3 limit)
- *
- * @param backupId - Raw input from the HTTP request body.
- * @throws {ValidationError} when the key is unsafe.
+ * Normalize a configured S3 prefix to a non-ambiguous directory boundary.
+ * Empty prefixes are intentionally rejected: restore jobs must always be
+ * scoped to an explicit backup namespace.
  */
-function validateBackupId(backupId: unknown): asserts backupId is string {
+export function normalizeBackupPrefix(prefix: unknown): string {
+  if (typeof prefix !== 'string' || prefix.trim() === '') {
+    throw new ConfigurationError(
+      'S3_BACKUP_PREFIX must be a non-empty prefix for restore operations.',
+    );
+  }
+
+  const normalized = prefix.trim().replace(/^\/+|\/+$/g, '');
+  if (normalized === '' || normalized === '.' || normalized === '..' || normalized.includes('..')) {
+    throw new ConfigurationError('S3_BACKUP_PREFIX contains an unsafe path component.');
+  }
+  return `${normalized}/`;
+}
+
+/**
+ * Resolve and validate a backup object key against the configured prefix.
+ * S3 keys are not filesystem paths, so containment is checked on normalized
+ * slash-separated segments rather than with a naive string prefix check.
+ */
+export function resolveBackupObjectKey(backupId: unknown, configuredPrefix: unknown): string {
   if (typeof backupId !== 'string' || backupId.trim() === '') {
     throw new ValidationError('backupId must be a non-empty string.');
   }
-  if (backupId.startsWith('/')) {
-    throw new ValidationError('backupId must not start with "/".');
+
+  const prefix = normalizeBackupPrefix(configuredPrefix);
+  const candidate = backupId.trim();
+  if (candidate.startsWith('/') || candidate.length > 1024) {
+    throw new ValidationError(
+      candidate.startsWith('/')
+        ? 'backupId must not start with "/".'
+        : 'backupId exceeds the maximum S3 key length of 1 024 characters.',
+    );
   }
-  if (backupId.includes('..')) {
+
+  // Reject encoded separators and traversal before decoding any input. A key
+  // containing them must never be interpreted as a different object path.
+  if (/%2f|%5c|%2e/i.test(candidate) || candidate.includes('\\\\')) {
+    throw new ValidationError('backupId must not contain encoded or alternate path separators.');
+  }
+
+  const segments = candidate.split('/');
+  if (segments.some((segment) => segment === '.' || segment === '..' || segment.includes('..'))) {
     throw new ValidationError('backupId must not contain path traversal sequences.');
   }
-  if (backupId.length > 1024) {
-    throw new ValidationError('backupId exceeds the maximum S3 key length of 1 024 characters.');
+  if (!candidate.startsWith(prefix)) {
+    throw new ValidationError(
+      `backupId must remain under the configured backup prefix "${prefix}".`,
+    );
   }
+  if (candidate.slice(prefix.length).trim() === '') {
+    throw new ValidationError(
+      'backupId must identify an object below the configured backup prefix.',
+    );
+  }
+
+  return candidate;
 }
 
 /**
@@ -223,8 +261,12 @@ async function executeRestore(job: RestoreJob, bucket: string, region: string): 
 
   try {
     // Derive destination key:  restored/<env>/<ts>-<filename>
-    const filename = job.backupId.split('/').at(-1) ?? job.backupId;
-    const destKey = `restored/${job.targetEnvironment}/${job.queuedAt.replace(/[:.]/g, '-')}-${filename}`;
+    const prefix = normalizeBackupPrefix(process.env.S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX);
+    const filename = job.backupId.slice(prefix.length);
+    const destKey = `${prefix}restored/${job.targetEnvironment}/${job.queuedAt.replace(/[:.]/g, '-')}-${filename}`;
+    if (!destKey.startsWith(prefix) || destKey.includes('..')) {
+      throw new ValidationError('Restore destination escaped the configured backup prefix.');
+    }
 
     // Copy within the same bucket
     await client.send(
@@ -277,10 +319,11 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
   } = request;
 
   // ── Input validation ──────────────────────────────────────────────────────
-  validateBackupId(backupId);
+  const configuredPrefix = process.env.S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX;
+  const resolvedBackupId = resolveBackupObjectKey(backupId, configuredPrefix);
 
   if (targetEnvironment === 'production' && !confirmProduction) {
-    throw new Error(
+    throw new ValidationError(
       'Restoring into the production environment requires confirmProduction: true. ' +
         'Set this flag explicitly to acknowledge the risk.',
     );
@@ -288,7 +331,7 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
 
   const bucket = process.env.S3_BACKUP_BUCKET;
   if (!bucket) {
-    throw new Error('S3_BACKUP_BUCKET environment variable is required for restore operations.');
+    throw new ConfigurationError('S3_BACKUP_BUCKET environment variable is required for restore operations.');
   }
 
   const region = process.env.AWS_REGION ?? 'us-east-1';
@@ -296,7 +339,7 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
   // ── Create job record ─────────────────────────────────────────────────────
   const job: RestoreJob = {
     jobId: createId(),
-    backupId,
+    backupId: resolvedBackupId,
     status: 'queued',
     targetEnvironment,
     queuedAt: new Date().toISOString(),
