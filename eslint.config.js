@@ -86,12 +86,5 @@ export default [
       '@typescript-eslint/no-explicit-any': 'warn',
     },
   },
-  {
-  files: ['src/**/*.ts'],
-  plugins: { 'unused-exports': unusedExports },
-  rules: {
-    'unused-exports/no-unused-exports': 'error',
-  },
-},
   prettierConfig,
 ];
