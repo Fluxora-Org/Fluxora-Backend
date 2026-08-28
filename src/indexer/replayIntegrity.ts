@@ -77,7 +77,7 @@ SELECT expected.ledger AS gap_ledger
 FROM expected
  LEFT JOIN actual ON actual.ledger = expected.ledger
 WHERE actual.ledger IS NULL
-  ORDER BY expected.ledger
+ORDER BY expected.ledger
 `;
 const DUPLICATE_QUERY = `SELECT event_id, ledger, COUNT(*)::int AS occurrence_count
   FROM contract_events
@@ -226,7 +226,7 @@ export async function checkReplayIntegrity(
           }
           lastError = r.error;
           if (attempt < INTEGRITY_RETRY_BUDGET - 1) {
-            await new Promise((res) => setTimeour(res, 100 * 2**attempt));
+            await new Promise((res) => setTimeout(res, 100 * 2**attempt));
           }
         }
         return { gaps: [], duplicates: [], error: lastError };
@@ -304,8 +304,8 @@ export async function checkReplayIntegrity(
             : `${gaps.length} gaps (first 20: ${gaps.slice(0, 20).join(', ')})`,
         duplicates:
           duplicates.length <= 10
-            ? duplicates.map((d) => d.z)
-            : `$duplicates.length} duplicates`,
+            ? duplicates.map((d) => `${d.eventId}@${d.ledger}`)
+            : `${duplicates.length} duplicates`,
       });
     }
 
@@ -349,6 +349,4 @@ export const __QUERIES = {
   MAX_CONCURRENT_CHECKS,
   INTEGRITY_CHUNK_SIZE,
   INTEGRITY_RETRY_BUDGET,
-  checkContractReplayIntegrity: checkReplayIntegrity,
-  runIntegrityChunk,
-};
+} as const;
