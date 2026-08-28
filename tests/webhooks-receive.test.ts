@@ -218,6 +218,12 @@ describe('POST /internal/webhooks/receive', () => {
         'x-fluxora-event': 'stream.created',
         'Content-Type': 'application/json',
       })
+      // supertest/superagent JSON-serializes non-string `.send()` payloads
+      // once a `Content-Type: application/json` header is set (even Buffers),
+      // which would silently mangle these raw invalid-UTF-8 bytes into
+      // `{"type":"Buffer","data":[...]}` before it reaches the server. A
+      // no-op serializer keeps the exact byte sequence we signed on the wire.
+      .serialize((data) => data)
       .send(invalidBody);
 
     expect(res.status).toBe(400);
