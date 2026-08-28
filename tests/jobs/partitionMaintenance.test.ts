@@ -34,15 +34,19 @@ function buildMockPool(opts: {
   partitioned?: Partial<Record<string, boolean>>;
   existingPartitions?: Set<string>;
   onCreate?: (partitionName: string) => void;
+  /** 1-indexed: throw instead of creating on the Nth CREATE TABLE call (simulates a mid-run crash/DB error). */
+  failOnCreateNumber?: number;
 } = {}) {
   const {
     lockAcquired = true,
     partitioned = { contract_events: true },
     existingPartitions = new Set<string>(),
     onCreate,
+    failOnCreateNumber,
   } = opts;
 
   const calls: QueryCall[] = [];
+  let createCount = 0;
 
   const queryImpl = vi.fn(async (sql: string, params?: unknown[]) => {
     calls.push({ sql, params });
@@ -66,6 +70,10 @@ function buildMockPool(opts: {
       return { rows: [{ exists: existingPartitions.has(partitionName) }], rowCount: 1 };
     }
     if (sql.includes('CREATE TABLE IF NOT EXISTS')) {
+      createCount += 1;
+      if (failOnCreateNumber === createCount) {
+        throw new Error(`Injected failure on CREATE TABLE call #${createCount}`);
+      }
       const match = /CREATE TABLE IF NOT EXISTS "([^"]+)"/.exec(sql);
       const partitionName = match?.[1];
       if (partitionName) {
@@ -276,6 +284,71 @@ describe('runPartitionMaintenance', () => {
 
       const createCall = calls.find((c) => c.sql.includes('CREATE TABLE'));
       expect(createCall!.sql).toMatch(/CREATE TABLE IF NOT EXISTS/);
+    });
+
+    it('crossing a month boundary between two runs creates only the newly-current month, without recreating prior partitions or double-counting metrics', async () => {
+      const incSpy = vi.spyOn(partitionsCreatedTotal, 'inc');
+      const { pool, calls, existingPartitions } = buildMockPool();
+
+      // First run in July: creates July + August (monthsAhead: 1).
+      const julyRun = await runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 1 });
+      expect(julyRun.tables[0].partitionsCreated).toEqual([
+        'contract_events_y2026m07',
+        'contract_events_y2026m08',
+      ]);
+      const createsAfterJuly = calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS')).length;
+      expect(createsAfterJuly).toBe(2);
+      expect(incSpy).toHaveBeenCalledTimes(2);
+
+      // Second run after crossing into August: August already exists (from
+      // the July run), so only September is newly created. August must not
+      // be recreated or double-counted, and behindSchedule must be false
+      // since the now-current month (August) was already pre-created.
+      const augustNow = new Date('2026-08-15T12:00:00.000Z');
+      const augustRun = await runPartitionMaintenance(pool, { now: augustNow, monthsAhead: 1 });
+
+      expect(augustRun.tables[0].behindSchedule).toBe(false);
+      expect(augustRun.tables[0].partitionsCreated).toEqual(['contract_events_y2026m09']);
+
+      const createsAfterAugust = calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS')).length;
+      expect(createsAfterAugust).toBe(3); // 2 from July run + 1 new (September)
+      expect(incSpy).toHaveBeenCalledTimes(3);
+      expect(existingPartitions).toEqual(
+        new Set(['contract_events_y2026m07', 'contract_events_y2026m08', 'contract_events_y2026m09']),
+      );
+    });
+
+    it('a mid-run DDL failure leaves earlier partitions committed; retrying converges without recreating them or double-counting the metric', async () => {
+      const incSpy = vi.spyOn(partitionsCreatedTotal, 'inc');
+      // monthsAhead: 2 => 3 CREATE calls (current + 2 future). Fail on the 2nd.
+      const { pool, calls, existingPartitions } = buildMockPool({ failOnCreateNumber: 2 });
+
+      await expect(
+        runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 2 }),
+      ).rejects.toThrow(/Injected failure on CREATE TABLE call #2/);
+
+      // The first partition's CREATE TABLE succeeded before the failure.
+      expect(existingPartitions).toEqual(new Set(['contract_events_y2026m07']));
+      expect(incSpy).toHaveBeenCalledTimes(1);
+
+      // The advisory lock must still have been released despite the throw,
+      // otherwise a retry would be starved forever.
+      const unlockCall = calls.find((c) => c.sql.includes('pg_advisory_unlock'));
+      expect(unlockCall).toBeDefined();
+
+      // Retry (same underlying partition state, no more injected failures):
+      // the already-created July partition is not recreated, and the run
+      // converges by creating the remaining two months.
+      const { pool: retryPool, calls: retryCalls } = buildMockPool({ existingPartitions });
+      const retryResult = await runPartitionMaintenance(retryPool, { now: FIXED_NOW, monthsAhead: 2 });
+
+      expect(retryResult.tables[0].partitionsCreated).toEqual([
+        'contract_events_y2026m08',
+        'contract_events_y2026m09',
+      ]);
+      expect(incSpy).toHaveBeenCalledTimes(3); // 1 from the crashed run + 2 from the retry
+      const retryCreateCalls = retryCalls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'));
+      expect(retryCreateCalls).toHaveLength(2); // does not re-issue CREATE for July
     });
   });
 
