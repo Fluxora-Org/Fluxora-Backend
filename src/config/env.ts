@@ -210,6 +210,12 @@ export const EnvSchema = z
     STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(10000),
     STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(3),
     STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
+    /**
+     * Per-operation timeout overrides for Stellar RPC calls.
+     * Format: JSON object mapping operation names to timeouts in ms.
+     * Example: '{"getLatestLedger":2000,"accountExists":8000}'
+     */
+    STELLAR_RPC_OPERATION_DEADLINES: z.string().optional(),
 
     JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
     JWT_SECRET_PREVIOUS: z.preprocess(

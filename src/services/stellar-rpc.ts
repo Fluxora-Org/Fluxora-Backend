@@ -81,6 +81,21 @@ export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCall
   healthCheckFailureThreshold?: number;
   /** Stable provider label for metrics (default "primary"). */
   providerLabel?: string;
+  /**
+   * Per-operation timeout overrides, in milliseconds. Keys are operation names
+   * (e.g. `"getLatestLedger"`, `"accountExists"`). When an operation is listed
+   * here its deadline takes precedence over the global `timeoutMs`. Callers can
+   * still override on a per-call basis via `RpcCallOptions.timeoutMs`.
+   *
+   * Example:
+   * ```ts
+   * operationDeadlines: {
+   *   getLatestLedger: 2_000,  // fast — used by health checks
+   *   accountExists:   8_000,  // generous — Horizon lookup
+   * }
+   * ```
+   */
+  operationDeadlines?: Record<string, number>;
 }
 
 interface RpcRequestMetadata {
@@ -293,6 +308,7 @@ export class StellarRpcService {
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
+  private readonly operationDeadlines: Record<string, number>;
   private readonly fallbackCache: RpcFallbackCache;
   private readonly fallbackCacheTtlSeconds: number;
   private readonly fallbackCacheEarlyExpiryBeta: number;
@@ -315,6 +331,7 @@ export class StellarRpcService {
     this.timeoutMs = opts.timeoutMs ?? 5_000;
     this.maxRetries = opts.maxRetries ?? 3;
     this.retryDelayMs = opts.retryDelayMs ?? 1_000;
+    this.operationDeadlines = opts.operationDeadlines ?? {};
     this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
     this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
     this.fallbackCacheEarlyExpiryBeta = Math.max(0, opts.fallbackCacheEarlyExpiryBeta ?? 0);
@@ -601,13 +618,23 @@ export class StellarRpcService {
     await this.fallbackCache.set(operation, value, this.fallbackCacheTtlSeconds, cacheParts);
   }
 
+  /**
+   * Resolve the effective deadline for an operation, in priority order:
+   *   1. Per-call override (`RpcCallOptions.timeoutMs`)
+   *   2. Per-operation default (`operationDeadlines[operation]`)
+   *   3. Global default (`this.timeoutMs`)
+   */
+  resolveDeadline(operation: string, opts: RpcCallOptions = {}): number {
+    return opts.timeoutMs ?? this.operationDeadlines[operation] ?? this.timeoutMs;
+  }
+
   private async callWithTimeout<T>(
     fn: () => Promise<T>,
     operation: string,
     opts: RpcCallOptions = {},
   ): Promise<T> {
     const start = Date.now();
-    const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
+    const timeoutMs = this.resolveDeadline(operation, opts);
     const signal = opts.signal;
 
     // Reject immediately if already aborted
@@ -687,6 +714,30 @@ function logFailure(operation: string, err: RpcProviderError, durationMs: number
   });
 }
 
+/**
+ * Parse a JSON string of per-operation deadlines into a typed map.
+ * Returns an empty object when the input is undefined, empty, or invalid.
+ * Each value is clamped to a minimum of 1 ms.
+ */
+export function parseOperationDeadlines(
+  raw: string | undefined,
+): Record<string, number> {
+  if (!raw || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+    const result: Record<string, number> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'number' && value >= 1) {
+        result[key] = Math.floor(value);
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
 // ── Singleton ─────────────────────────────────────────────────────────────────
 
 function buildRefreshKey(operation: string, cacheParts: readonly string[]): string {
@@ -721,6 +772,9 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       throw new RpcProviderError('No Stellar RPC client configured', 'PROVIDER');
     });
     const redisFallbackCache = createConfiguredRpcFallbackCache();
+    const operationDeadlines = parseOperationDeadlines(
+      process.env.STELLAR_RPC_OPERATION_DEADLINES,
+    );
     _service = new StellarRpcService(client, {
       failureThreshold: parseInt(process.env.RPC_CB_FAILURE_THRESHOLD ?? '5', 10),
       windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
@@ -728,6 +782,7 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
       maxRetries: parseInt(process.env.STELLAR_RPC_MAX_RETRIES ?? '3', 10),
       retryDelayMs: parseInt(process.env.STELLAR_RPC_RETRY_DELAY ?? '1000', 10),
+      operationDeadlines,
       fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
       fallbackCacheEarlyExpiryBeta: parseFloat(process.env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA ?? '0'),
       fallbackCache: redisFallbackCache,
