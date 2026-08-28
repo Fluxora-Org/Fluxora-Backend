@@ -1,7 +1,7 @@
 import pg, { PoolClient } from 'pg';
-import { db } from '../db/client';
-import { config } from '../config';
-import { ContractEvent, ReplayProgress, ReplayCursor, ReplayRequest } from '../types';
+import { db } from '../db/client.js';
+import { config } from '../config.js';
+import { ContractEvent, ReplayProgress, ReplayCursor, ReplayRequest } from '../types.js';
 import { logger } from '../lib/logger.js';
 import {
   indexerReplayBatchesCommittedTotal,
