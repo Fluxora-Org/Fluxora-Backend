@@ -35,7 +35,7 @@ import {
   loadConfig,
 } from './config/env.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
-import { reloadFlags } from './config/featureFlags.js';
+import { reloadFlags, prepareReloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
 import { probeStartupDependencies } from './config/health.js';
 import { startTracing } from './tracing/index.js';
@@ -254,8 +254,8 @@ if (process.env.NODE_ENV !== 'test') {
     });
 
     void refreshHotConfig({
-      applyRateLimits: (hot) => {
-        setRuntimeRateLimitConfig({
+      prepareRateLimits: (hot) => {
+        const nextConfig = {
           ip: {
             windowMs: hot.rateLimitIpWindowMs ?? 60_000,
             max: hot.rateLimitIpMax ?? 100,
@@ -271,15 +271,18 @@ if (process.env.NODE_ENV !== 'test') {
             max: hot.rateLimitAdminMax ?? 2000,
             enabled: true,
           },
-        });
+        };
+        return () => setRuntimeRateLimitConfig(nextConfig);
       },
-      applyFeatureFlags: () => {
-        reloadFlags();
+      prepareFeatureFlags: () => {
+        return prepareReloadFlags();
       },
-      applyLogLevel: (level) => {
-        // Keep process.env.LOG_LEVEL aligned so debug() gating and any
-        // env-driven log consumers observe the hot-reloaded level.
-        process.env.LOG_LEVEL = level;
+      prepareLogLevel: (level) => {
+        return () => {
+          // Keep process.env.LOG_LEVEL aligned so debug() gating and any
+          // env-driven log consumers observe the hot-reloaded level.
+          process.env.LOG_LEVEL = level;
+        };
       },
       onSuccess: (result) => {
         recordConfigReloadSuccess({

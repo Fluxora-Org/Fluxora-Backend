@@ -159,7 +159,7 @@ async function uploadStreamToS3(readable: Readable, target: S3Target): Promise<v
     Upload = uploadMod.Upload
   } catch {
     throw new Error(
-      'AWS SDK v3 is not installed. Run: npm install @aws-sdk/client-s3 @aws-sdk/lib-storage',
+      'AWS SDK v3 is not installed. Run: pnpm add @aws-sdk/client-s3 @aws-sdk/lib-storage',
     )
   }
 
@@ -405,7 +405,7 @@ export async function restoreDatabase(
         return {
           success: false,
           message: 'Restore failed',
-          error: 'AWS SDK v3 is not installed. Run: npm install @aws-sdk/client-s3',
+          error: 'AWS SDK v3 is not installed. Run: pnpm add @aws-sdk/client-s3',
         }
       }
 

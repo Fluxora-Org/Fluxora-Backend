@@ -250,7 +250,17 @@ export class WorkerPool {
       this.activeTasks--;
       slot.worker.removeListener('message', handler);
       slot.worker.removeListener('error', errorHandler);
-      task.resolve(msg);
+
+      // Workers emit { type: 'error', taskId, error } on task-level failures.
+      // Resolve the task as a rejection so callers receive an Error, not a
+      // success value shaped like an error message.
+      if (msg !== null && typeof msg === 'object' && (msg as Record<string, unknown>).type === 'error') {
+        const workerErr = (msg as Record<string, unknown>).error;
+        task.reject(new Error(typeof workerErr === 'string' ? workerErr : 'Worker task failed'));
+      } else {
+        task.resolve(msg);
+      }
+
       this.drainQueue(slotIndex);
     };
 

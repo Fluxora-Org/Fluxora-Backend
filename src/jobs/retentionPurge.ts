@@ -253,7 +253,6 @@ async function purgeRule(
   let rowsPurged = 0;
   let rowsSkipped = 0;
   let batchIndex = 0;
-  let hasMore = true;
 
   logger.info(`Retention purge: processing rule '${rule.category}'`, correlationId, {
     table: rule.table,
@@ -263,7 +262,13 @@ async function purgeRule(
     hasLegalHold,
   });
 
-  while (hasMore) {
+  // Keep processing until a batch returns fewer rows than requested, meaning
+  // we have exhausted all candidates.  Using `purged + skipped < batchSize`
+  // is intentional: if an entire batch is held rows (purged=0, skipped=N),
+  // we still stop when skipped < batchSize — there are no more candidates.
+  // FOR UPDATE SKIP LOCKED ensures we do not re-visit the same held rows on
+  // the next iteration.
+  while (true) {
     const { purged, skipped } = await processBatch(rule, {
       cutoff,
       batchSize,
@@ -278,8 +283,14 @@ async function purgeRule(
     rowsSkipped += skipped;
     batchIndex += 1;
 
-    // If the batch was smaller than batchSize, we've exhausted candidates.
-    hasMore = purged + skipped >= batchSize;
+    // A batch that returns fewer rows than requested means we've exhausted
+    // all eligible candidates.  Note: a batch of exactly batchSize held rows
+    // (purged=0, skipped=batchSize) does NOT mean there are more; SKIP LOCKED
+    // means those rows will not appear again.  We stop when the batch was not
+    // full — regardless of the purged/skipped split.
+    if (purged + skipped < batchSize) {
+      break;
+    }
   }
 
   logger.info(`Retention purge: rule '${rule.category}' complete`, correlationId, {
@@ -457,6 +468,12 @@ async function fetchCandidateRows(
 
 /**
  * Delete or redact a single row identified by `id` (or `rowid` fallback).
+ *
+ * The `streams` redact path updates only the columns we know exist.
+ * The generic `redact` path is intentionally left as a safety error so
+ * any future table that needs redaction explicitly defines its own purge
+ * action rather than silently failing with a missing-column error at
+ * runtime. Add a dedicated branch here when a new table gains `purgeAction: 'redact'`.
  */
 async function purgeRow(
   client: PoolClient,
@@ -469,25 +486,26 @@ async function purgeRow(
     await client.query(`DELETE FROM ${tableId} WHERE id = $1`, [primaryKey]);
   } else if (rule.table === 'streams') {
     // Redact stream PII columns while preserving the stream row for audit
-    // and chain-derived consistency.
+    // and chain-derived consistency.  Also marks encryption_state so the
+    // row is distinguishable from plaintext or still-encrypted rows.
     await client.query(
       `UPDATE ${tableId}
-          SET sender_address        = $1,
-              recipient_address     = $1,
-              sender_address_hash   = NULL,
+          SET sender_address         = $1,
+              recipient_address      = $1,
+              sender_address_hash    = NULL,
               recipient_address_hash = NULL,
-              updated_at            = NOW()
+              encryption_state       = 'redacted',
+              updated_at             = NOW()
         WHERE id = $2`,
       [STREAM_REDACTION_TOMBSTONE, primaryKey]
     );
   } else {
-    // Generic redact path for tables that retain the row shell for auditability.
-    await client.query(
-      `UPDATE ${tableId}
-          SET meta = jsonb_build_object('purged', true),
-              correlation_id = NULL
-        WHERE id = $1`,
-      [primaryKey]
+    // Guard: a purgeable rule with purgeAction='redact' must have an explicit
+    // branch above. Throwing here surfaces the gap at development time rather
+    // than silently issuing a SQL UPDATE that references non-existent columns.
+    throw new Error(
+      `No redact implementation for table '${rule.table}'. ` +
+      `Add a dedicated branch in purgeRow or change purgeAction to 'delete'.`
     );
   }
 }
@@ -530,12 +548,13 @@ async function writePurgeAuditEvent(
 
 /**
  * Writes a `PURGE_SKIPPED_LEGAL_HOLD` audit entry.
- * Intentionally NOT inside the main transaction — the skip audit event
- * should persist even if the batch transaction rolls back, so we use the
- * non-transactional `recordAuditEventToDb` path after the fact.
  *
- * We still accept the PoolClient to satisfy the function signature but
- * we log via the shared pool to ensure the entry is durable.
+ * Intentionally written outside the main transaction via the shared pool.
+ * This ensures the skip is recorded even if the enclosing batch transaction
+ * rolls back — compliance evidence must persist regardless of batch outcome.
+ *
+ * The `client` parameter is accepted for interface uniformity but is not
+ * used; the write goes through the shared pool.
  */
 async function writeSkippedAuditEvent(
   _client: PoolClient,

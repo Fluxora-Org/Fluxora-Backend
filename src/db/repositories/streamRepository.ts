@@ -47,6 +47,11 @@ import { enrichActiveSpanWithStream } from '../../tracing/hooks.js';
 import { getConfig } from '../../config/env.js';
 import { computeAddressHashes } from '../../pii/pgcryptoEncryption.js';
 import {
+  allowlistedSqlIdentifier,
+  STREAM_CURSOR_SORT_FIELDS,
+  STREAM_OFFSET_SORT_FIELDS,
+} from './sqlIdentifiers.js';
+import {
   encryptAddressValue,
   streamSelectColumns,
   senderAddressFilterCondition,
@@ -424,7 +429,8 @@ export const streamRepository = {
       const previousKeyIndex = keySet.previous ? cursorParams.length + 1 : undefined;
       if (keySet.previous) cursorParams.push(keySet.previous);
 
-      const dataSql = `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${whereCursor} ORDER BY id ASC LIMIT $${limitParamIndex}`;
+      const cursorSort = allowlistedSqlIdentifier('id', STREAM_CURSOR_SORT_FIELDS, 'stream cursor sort field');
+      const dataSql = `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${whereCursor} ORDER BY ${cursorSort} ASC LIMIT $${limitParamIndex}`;
       const [dataResult, countResult] = await Promise.all([
         query<Record<string, unknown>>(pool, dataSql, cursorParams),
         includeTotal
@@ -525,11 +531,12 @@ export const streamRepository = {
       params.push(keySet.current);
       if (keySet.previous) params.push(keySet.previous);
 
+      const offsetSort = allowlistedSqlIdentifier('created_at', STREAM_OFFSET_SORT_FIELDS, 'stream offset sort field');
       const [countResult, dataResult] = await Promise.all([
         query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY ${offsetSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
           [...params, effectiveLimit, pagination.offset],
         ),
       ]);

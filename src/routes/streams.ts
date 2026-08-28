@@ -691,8 +691,17 @@ streamsRouter.get(
         throw forbidden('Scoped users are not authorized to use the full export endpoint');
       }
 
-      while (true) {
+      const MAX_PAGES = 1000;
+      let pagesFetched = 0;
+
+      while (pagesFetched < MAX_PAGES) {
+        if (req.closed || req.destroyed) {
+          info('Stream export cancelled by client', { requestId });
+          break;
+        }
+
         const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        pagesFetched++;
 
         for (const record of dbResult.streams) {
           res.write(JSON.stringify(toApiStream(record)) + '\n');
@@ -704,11 +713,12 @@ streamsRouter.get(
         }
 
         if (!dbResult.hasMore) {
-          res.end();
           break;
         }
       }
-      info('Stream export completed', { requestId });
+      
+      res.end();
+      info('Stream export completed or bounded', { requestId, pagesFetched });
     } catch (err) {
       warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
       wrapDbError(err);
@@ -1715,26 +1725,41 @@ streamsRouter.get(
       const eventStore = hub?.getEventStore();
       if (eventStore) {
         try {
-          const result = await eventStore.getEvents({
-            afterEventId: sinceEventId,
-            limit: 100,
-          });
+          let cursor: string | undefined = sinceEventId;
+          const LONG_POLL_REPLAY_MAX_PAGES = 10;
+          let pagesRead = 0;
+          let foundEvent = false;
 
-          for (const event of result.events) {
+          do {
             if (cleanedUp) break;
-            if (eventMatchesStreamId(event, id)) {
-              const envelope = {
-                type: 'stream_update',
-                streamId: id,
-                eventId: event.eventId,
-                payload: event.payload,
-                correlationId: req.correlationId,
-              };
-              cleanup('replay_event_found');
-              res.json(successResponse(envelope, requestId));
-              return;
+            const result = await eventStore.getEvents({
+              afterEventId: cursor,
+              limit: 100,
+            });
+
+            for (const event of result.events) {
+              if (cleanedUp) break;
+              if (eventMatchesStreamId(event, id)) {
+                const envelope = {
+                  type: 'stream_update',
+                  streamId: id,
+                  eventId: event.eventId,
+                  payload: event.payload,
+                  correlationId: req.correlationId,
+                };
+                cleanup('replay_event_found');
+                res.json(successResponse(envelope, requestId));
+                foundEvent = true;
+                break;
+              }
             }
-          }
+
+            if (foundEvent) break;
+            cursor = result.nextCursor;
+            pagesRead++;
+          } while (cursor !== undefined && !cleanedUp && pagesRead < LONG_POLL_REPLAY_MAX_PAGES);
+
+          if (foundEvent) return;
         } catch (err) {
           if (err instanceof StaleCursorError || (err as any)?.name === 'StaleCursorError') {
             cleanup('stale_cursor');

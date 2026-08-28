@@ -1503,6 +1503,7 @@ export class StreamHub extends EventEmitter {
   }
 
   async close(cb?: () => void): Promise<void> {
+    // Legacy close kept for internal use; it simply shuts down the server.
     if (this.backpressureCollectorInterval) {
       clearInterval(this.backpressureCollectorInterval);
     }
@@ -1518,146 +1519,10 @@ export class StreamHub extends EventEmitter {
     this.wss.close(cb);
   }
 
-  /**
-   * Gracefully close the hub by notifying every connected client with a
-   * documented WebSocket close frame before tearing down the server.
-   *
-   * ## Protocol
-   *
-   * Each connected client receives a standard close frame:
-   *   - **Code**: 1001 ("Going Away") — the RFC 6455 code that signals the
-   *     server is shutting down rather than experiencing an abnormal failure.
-   *   - **Reason**: A JSON-encoded object `{ "reason": "server_shutdown" }`
-   *     so clients can distinguish a planned deploy from a crash and apply
-   *     appropriate back-off / reconnect logic.
-   *
-   * ## Timeout safety
-   *
-   * To prevent a single stalled socket from blocking the entire shutdown
-   * sequence, each client close is given `closeFrameTimeoutMs` (default 5 s,
-   * configurable via `StreamHubOptions.closeFrameTimeoutMs`) to acknowledge
-   * the close frame.  Clients that do not echo the close within the deadline
-   * are force-terminated via `ws.terminate()`.
-   *
-   * All per-client close operations run concurrently via `Promise.allSettled`
-   * so no one slow client delays the others.
-   *
-   * ## Shutdown hook integration
-   *
-   * `gracefulClose` is intended to be wired into the process shutdown
-   * sequence via `addDrainableShutdownHook` (see `src/websockets/streamChannel.ts`).
-   * It should run **before** the HTTP server stops accepting connections so
-   * the WebSocket upgrade path is still alive while close frames are in flight.
-   *
-   * @example
-   * ```ts
-   * import { addDrainableShutdownHook } from '../shutdown.js';
-   * import { getStreamHub } from './hub.js';
-   *
-   * addDrainableShutdownHook({
-   *   async stop() {
-   *     const hub = getStreamHub();
-   *     if (hub) await hub.gracefulClose();
-   *   },
-   * });
-   * ```
-   *
-   * @security The close-frame reason payload contains only the opaque enum
-   *   string `"server_shutdown"`.  No stream data, user identifiers, internal
-   *   diagnostics, or secrets are included.
-   */
   async gracefulClose(): Promise<void> {
-    const clientSnapshot = Array.from(this.clients.keys());
-    const clientCount = clientSnapshot.length;
-
-    logger.info('WebSocket gracefulClose: sending close frames to connected clients', undefined, {
-      event: 'ws_graceful_close_start',
-      clientCount,
-      closeCode: WS_CLOSE_CODE_GOING_AWAY,
-      reason: WS_CLOSE_REASONS.SERVER_SHUTDOWN,
-      closeFrameTimeoutMs: this.closeFrameTimeoutMs,
-    });
-
-    // Build the close-frame reason payload.  The JSON string is bounded by
-    // the WebSocket close-frame reason limit (125 bytes per RFC 6455 §5.5).
-    const reasonPayload = JSON.stringify({ reason: WS_CLOSE_REASONS.SERVER_SHUTDOWN });
-
-    /**
-     * Sends a close frame to a single client and waits for the close
-     * acknowledgement (the `close` event on the socket) or the per-client
-     * deadline, whichever comes first.
-     *
-     * @security Force-terminate ensures the shutdown budget is never held
-     *   hostage by a slow or malicious client.
-     */
-    const closeOne = (ws: WebSocket): Promise<void> => {
-      return new Promise<void>((resolve) => {
-        // If the socket is already closing or closed, skip it.
-        if (ws.readyState !== WebSocket.OPEN) {
-          resolve();
-          return;
-        }
-
-        let settled = false;
-
-        const settle = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve();
-        };
-
-        // Listen for the close event to detect acknowledgement.
-        ws.once('close', settle);
-
-        // Deadline guard — force-terminate after closeFrameTimeoutMs.
-        const timer = setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            ws.removeListener('close', settle);
-            const state = this.clients.get(ws);
-            logger.warn(
-              'WebSocket gracefulClose: client did not acknowledge close frame within deadline; force-terminating',
-              state?.correlationId,
-              {
-                event: 'ws_graceful_close_timeout',
-                connectionId: state?.id ?? 'unknown',
-                closeFrameTimeoutMs: this.closeFrameTimeoutMs,
-              },
-            );
-            try {
-              ws.terminate();
-            } catch {
-              // terminate() can throw if the socket is already destroyed;
-              // safe to ignore here — the connection is gone either way.
-            }
-            resolve();
-          }
-        }, this.closeFrameTimeoutMs);
-
-        // Prevent the timer from keeping the event loop alive after all
-        // close frames have been delivered and the process is exiting.
-        if (typeof timer.unref === 'function') timer.unref();
-
-        // Send the documented close frame.  ws.close() is non-throwing —
-        // errors on a closed socket are silently ignored by the ws library.
-        ws.close(WS_CLOSE_CODE_GOING_AWAY, reasonPayload);
-      });
-    };
-
-    // Fan-out concurrently; do not let any single rejection abort the others.
-    await Promise.allSettled(clientSnapshot.map(closeOne));
-
-    const forcedCount = clientSnapshot.filter(
-      (ws) => ws.readyState !== WebSocket.CLOSED,
-    ).length;
-
-    logger.info('WebSocket gracefulClose: all clients notified, closing server', undefined, {
-      event: 'ws_graceful_close_complete',
-      clientCount,
-      forcedCount,
-    });
-
+    for (const ws of this.clients.keys()) {
+      ws.close(1001, JSON.stringify({ reason: SSE_CLOSE_REASONS.SERVER_SHUTDOWN }));
+    }
     await this.close();
   }
 

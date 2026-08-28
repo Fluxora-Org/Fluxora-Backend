@@ -21,6 +21,7 @@ type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const SECRET_ENV_NAMES = new Set([
   'JWT_SECRET',
+  'JWT_SECRET_PREVIOUS',
   'INDEXER_WORKER_TOKEN',
   'WEBHOOK_SECRET',
   'WEBHOOK_SECRET_PREVIOUS',
@@ -211,6 +212,10 @@ export const EnvSchema = z
     STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
 
     JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+    JWT_SECRET_PREVIOUS: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'JWT_SECRET_PREVIOUS must be at least 32 characters').optional()
+    ),
     PGCRYPTO_KEY: z.preprocess(
       (value) => (value === '' ? undefined : value),
       z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional()
@@ -351,6 +356,18 @@ export const EnvSchema = z
     INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(
       5 * 60 * 1000
     ),
+    /** Maximum number of backfill batches processed concurrently. */
+    INDEXER_BACKFILL_CONCURRENCY: integerEnv('INDEXER_BACKFILL_CONCURRENCY', 1, 64).default(1),
+    /** Number of ledger ranges in a single backfill batch. */
+    INDEXER_BACKFILL_BATCH_SIZE: integerEnv('INDEXER_BACKFILL_BATCH_SIZE', 1, 100000).default(100),
+    /** Require backfill checkpoints to advance in ledger order. */
+    INDEXER_BACKFILL_STRICT_ORDER: booleanEnv().default(true),
+    /** Number of ordered batches completed before the checkpoint advances. */
+    INDEXER_BACKFILL_COMMIT_INTERVAL: integerEnv('INDEXER_BACKFILL_COMMIT_INTERVAL', 1, 10000).default(1),
+    /** Maximum retries for a failed backfill batch. */
+    INDEXER_BACKFILL_MAX_RETRIES: integerEnv('INDEXER_BACKFILL_MAX_RETRIES', 0, 100).default(3),
+    /** Delay between backfill batch retries. */
+    INDEXER_BACKFILL_RETRY_DELAY_MS: integerEnv('INDEXER_BACKFILL_RETRY_DELAY_MS', 0).default(1000),
     INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
     DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
     ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
@@ -533,6 +550,7 @@ export interface Config {
   contractAddresses: ContractAddresses;
 
   jwtSecret: string;
+  jwtSecretPrevious?: string | undefined;
   pgcryptoKey?: string | undefined;
   pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
@@ -604,6 +622,18 @@ export interface Config {
   grpcGatewayPort: number;
   /** When true, reject non-TLS indexer worker connections (fail-closed). */
   indexerMtlsRequired: boolean;
+  /** Maximum number of backfill batches processed concurrently. */
+  indexerBackfillConcurrency: number;
+  /** Number of ledger ranges in a single backfill batch. */
+  indexerBackfillBatchSize: number;
+  /** Require backfill checkpoints to advance in ledger order. */
+  indexerBackfillStrictOrder: boolean;
+  /** Number of ordered batches completed before the checkpoint advances. */
+  indexerBackfillCommitInterval: number;
+  /** Maximum retries for a failed backfill batch. */
+  indexerBackfillMaxRetries: number;
+  /** Delay between backfill batch retries. */
+  indexerBackfillRetryDelayMs: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -739,6 +769,7 @@ function toConfig(env: ParsedEnv): Config {
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
 
     jwtSecret: env.JWT_SECRET,
+    jwtSecretPrevious: env.JWT_SECRET_PREVIOUS,
     pgcryptoKey: env.PGCRYPTO_KEY,
     pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
     jwtExpiresIn: env.JWT_EXPIRES_IN,
@@ -802,6 +833,12 @@ function toConfig(env: ParsedEnv): Config {
     grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
     grpcGatewayPort: env.GRPC_GATEWAY_PORT,
     indexerMtlsRequired: env.INDEXER_MTLS_REQUIRED ?? isProduction,
+    indexerBackfillConcurrency: env.INDEXER_BACKFILL_CONCURRENCY,
+    indexerBackfillBatchSize: env.INDEXER_BACKFILL_BATCH_SIZE,
+    indexerBackfillStrictOrder: env.INDEXER_BACKFILL_STRICT_ORDER,
+    indexerBackfillCommitInterval: env.INDEXER_BACKFILL_COMMIT_INTERVAL,
+    indexerBackfillMaxRetries: env.INDEXER_BACKFILL_MAX_RETRIES,
+    indexerBackfillRetryDelayMs: env.INDEXER_BACKFILL_RETRY_DELAY_MS,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
@@ -1098,6 +1135,11 @@ export function reloadHotConfig(): HotConfig {
  *                without killing the process.
  */
 export async function refreshHotConfig(apply?: {
+  /** Two-phase commit style (preferred): return a commit fn from preparation. */
+  prepareRateLimits?: (hot: HotConfig) => () => void;
+  prepareFeatureFlags?: (hot: HotConfig) => () => void;
+  prepareLogLevel?: (level: LogLevel) => () => void;
+  /** Legacy direct-apply style (still supported). */
   applyRateLimits?: (hot: HotConfig) => void;
   applyFeatureFlags?: () => void;
   applyLogLevel?: (level: LogLevel) => void;
@@ -1135,10 +1177,30 @@ export async function refreshHotConfig(apply?: {
       const changed =
         previous === null || hotConfigFingerprint(previous) !== hotConfigFingerprint(hot);
 
-      // Apply side effects in a fixed order for deterministic deploys/retries.
-      apply?.applyRateLimits?.(hot);
-      apply?.applyFeatureFlags?.();
-      apply?.applyLogLevel?.(hot.logLevel);
+      // Resolve prepare callbacks — prefer the prepare* form (two-phase commit);
+      // fall back to the legacy apply* form for backward compatibility.
+      const commitRateLimits = apply?.prepareRateLimits
+        ? apply.prepareRateLimits(hot)
+        : apply?.applyRateLimits
+          ? () => apply.applyRateLimits!(hot)
+          : undefined;
+
+      const commitFeatureFlags = apply?.prepareFeatureFlags
+        ? apply.prepareFeatureFlags(hot)
+        : apply?.applyFeatureFlags
+          ? () => apply.applyFeatureFlags!()
+          : undefined;
+
+      const commitLogLevel = apply?.prepareLogLevel
+        ? apply.prepareLogLevel(hot.logLevel)
+        : apply?.applyLogLevel
+          ? () => apply.applyLogLevel!(hot.logLevel)
+          : undefined;
+
+      // Commit side effects in a fixed order for deterministic deploys/retries.
+      commitRateLimits?.();
+      commitFeatureFlags?.();
+      commitLogLevel?.();
 
       lastHotConfig = hot;
       reloadGeneration += 1;
