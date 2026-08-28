@@ -42,7 +42,14 @@
  *
  * Re-running this job when every partition already exists is a safe no-op:
  * no DDL is executed, no rows are touched, and the result simply reports
- * zero created partitions.
+ * zero created partitions. There is no checkpoint table: like
+ * `src/jobs/retentionPurge.ts` (the other destructive/structural
+ * retention-adjacent job — see its module docs for the shared idempotency
+ * contract), current state is always re-derived from `to_regclass()` /
+ * `pg_partitioned_table`, so a crash mid-run and a run that happens to
+ * straddle a calendar-month boundary both converge on the next run without
+ * double-creating a partition or double-incrementing
+ * `partitionsCreatedTotal`.
  *
  * ## Security assumptions
  *

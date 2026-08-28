@@ -9,6 +9,8 @@ import { resolvePoolConfig } from '../db/pool.js';
 import { runPartitionMaintenance } from './partitionMaintenance.js';
 import { runDlqPurge } from './dlqPurge.js';
 import { jobDlqEntriesTotal } from '../metrics/businessMetrics.js';
+import { getCorrelationId, correlationStore } from '../tracing/middleware.js';
+import { traceSpan } from '../tracing/hooks.js';
 
 // ── Retry / expiry defaults ───────────────────────────────────────────────────
 //
@@ -56,7 +58,10 @@ interface DlqJobPayload {
   /** Original job ID (UUID). */
   id?: unknown;
   /** Application‑level data the job was created with. */
-  data?: unknown;
+  data?: {
+    correlationId?: string;
+    payload: unknown;
+  };
   /**
    * Error output captured when the job exceeded its retry limit.
    * May be a plain string, an `{ message: string }` object, or arbitrary JSON.
@@ -232,11 +237,25 @@ export class JobQueue {
       if (reg.options.pollingIntervalSeconds !== undefined) workOpts.pollingIntervalSeconds = reg.options.pollingIntervalSeconds;
       await this.boss.work(name, workOpts, async (jobs: Job[]) => {
         for (const job of jobs) {
+          let correlationId = job.id;
+          let jobData = job.data;
+          
+          if (jobData && typeof jobData === 'object' && '__payload' in jobData) {
+            if ('__correlationId' in jobData && typeof (jobData as any).__correlationId === 'string') {
+              correlationId = (jobData as any).__correlationId;
+            }
+            jobData = (jobData as any).__payload;
+          }
+
           try {
-            const ctx: JobHandlerContext = { id: job.id, name, data: job.data };
-            await reg.handler(ctx);
+            const ctx: JobHandlerContext = { id: job.id, name, data: jobData };
+            await correlationStore.run(correlationId, async () => {
+              await traceSpan('job.process', correlationId, { 'job.name': name, 'job.id': job.id }, async () => {
+                await reg.handler(ctx);
+              });
+            });
           } catch (err) {
-            logger.error('Job handler failed', undefined, {
+            logger.error('Job handler failed', correlationId !== 'unknown' ? correlationId : undefined, {
               jobName: name,
               jobId: job.id,
               error: err instanceof Error ? err.message : String(err),
@@ -285,7 +304,12 @@ export class JobQueue {
       throw new TypeError('send: name must be a non-empty string');
     }
     const sendOpts = this.toSendOptions(options);
-    return this.boss.send(name, data as object | null, sendOpts);
+    
+    let correlationId = getCorrelationId();
+    if (correlationId === 'unknown') correlationId = '';
+    const wrappedData = correlationId ? { __payload: data, __correlationId: correlationId } : data;
+
+    return this.boss.send(name, wrappedData as object | null, sendOpts);
   }
 
   /**
@@ -311,7 +335,12 @@ export class JobQueue {
       ...(options?.tz ? { tz: options.tz } : {}),
       ...(options?.key ? { key: options.key } : {}),
     };
-    return this.boss.schedule(name, cron, (data ?? null) as object | null, schedOpts);
+
+    let correlationId = getCorrelationId();
+    if (correlationId === 'unknown') correlationId = '';
+    const wrappedData = correlationId ? { __payload: data ?? null, __correlationId: correlationId } : (data ?? null);
+
+    return this.boss.schedule(name, cron, wrappedData as object | null, schedOpts);
   }
 
   /**
@@ -533,7 +562,10 @@ export function startBackgroundJobs(pool: Pool): void {
         typeof payload.name === 'string' && payload.name !== '' ? payload.name : 'unknown';
       const originalJobId =
         typeof payload.id === 'string' && payload.id !== '' ? payload.id : 'unknown';
-      const originalPayload = payload.data ?? null;
+      let originalPayload = payload.data ?? null;
+      if (originalPayload && typeof originalPayload === 'object' && '__payload' in originalPayload) {
+        originalPayload = (originalPayload as any).__payload;
+      }
 
       let errorMessage = 'Unknown error';
       if (payload.output !== undefined && payload.output !== null) {

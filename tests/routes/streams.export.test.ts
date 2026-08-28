@@ -109,4 +109,31 @@ describe('GET /api/streams/export', () => {
     // callCount should be much less than 1000 because it aborts
     expect(callCount).toBeLessThan(1000);
   });
+
+  it('rejects arrays for resume_from', async () => {
+    const res = await request(app)
+      .get('/api/streams/export?resume_from=a&resume_from=b')
+      .set('x-api-key', 'valid-api-key');
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects scoped users from using full export', async () => {
+    // For this test we need the scoped token logic which may depend on the auth middleware
+    // Since we mocked auth above to allow everything, we temporarily override it for this test
+    const { enforceStreamScope } = await import('../../src/routes/streams.js');
+    const { default: express } = await import('express');
+    const testApp = express();
+    testApp.use((req: any, res: any, next: any) => {
+      req.callerAddress = 'SOME_SCOPED_ADDRESS';
+      next();
+    });
+    testApp.use(enforceStreamScope);
+    const { streamsRouter } = await import('../../src/routes/streams.js');
+    testApp.use('/api/streams', streamsRouter);
+    
+    const res = await request(testApp)
+      .get('/api/streams/export')
+      .set('x-api-key', 'valid-api-key');
+    expect(res.status).toBe(403);
+  });
 });

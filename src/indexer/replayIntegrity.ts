@@ -78,7 +78,8 @@ FROM expected
  LEFT JOIN actual ON actual.ledger = expected.ledger
 WHERE actual.ledger IS NULL
 ORDER BY expected.ledger
-`;const DUPLICATE_QUERY = `SELECT event_id, ledger, COUNT(*)::int AS occurrence_count
+`;
+const DUPLICATE_QUERY = `SELECT event_id, ledger, COUNT(*)::int AS occurrence_count
   FROM contract_events
   WHERE contract_id = $1 AND ledger BETWEEN $2 AND $3
   Group BY event_id, ledger
@@ -235,9 +236,7 @@ export async function checkReplayIntegrity(
     // Combine results.
     const gaps: number[] = [];
     const duplicates: ReplayIntegrityCheckResult['duplicates'] = [];
-    const firstError = chunkResults.find((
-      r) => r.error != null,
-    )?.error;
+    const firstError = chunkResults.find((r) => r.error != null)?.error;
     for (const chunk of chunkResults) {
       if (chunk.error) continue;
       gaps.push(...chunk.gaps);
@@ -305,7 +304,7 @@ export async function checkReplayIntegrity(
             : `${gaps.length} gaps (first 20: ${gaps.slice(0, 20).join(', ')})`,
         duplicates:
           duplicates.length <= 10
-            ? duplicates.map((d) => d.eventId)
+            ? duplicates.map((d) => `${d.eventId}@${d.ledger}`)
             : `${duplicates.length} duplicates`,
       });
     }

@@ -263,3 +263,15 @@ export function _resetSseSubscriptionsForTest(): void {
   sseLiveSubscribersGauge.set(0);
   sseEventListenersGauge.set(0);
 }
+
+export function deriveStreamId(txHash: string, eventIndex: number): string {
+  return `stream-${txHash}-${eventIndex}`;
+}
+
+export function eventMatchesStreamId(event: StreamEventRecord | null | undefined, streamId: string): boolean {
+  if (!event || !streamId) return false;
+  const payload = event.payload as Record<string, unknown> | undefined;
+  if (payload?.['id'] === streamId || payload?.['streamId'] === streamId) return true;
+  return deriveStreamId(event.txHash, event.eventIndex) === streamId;
+}
+

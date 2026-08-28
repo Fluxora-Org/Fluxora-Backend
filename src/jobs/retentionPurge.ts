@@ -27,13 +27,45 @@
  * Each batch is committed in its own short transaction, so a crash
  * mid-run simply restarts from wherever the last successful commit left
  * off.  Re-running the job after a crash is safe — already-purged rows
- * are gone and will not be selected again.
+ * are gone and will not be selected again.  There is **no separate
+ * checkpoint table**: eligibility (`ageColumn < cutoff`, `legal_hold`)
+ * is recomputed from live data on every run, so the already-committed
+ * batches from a prior (possibly crashed) run are simply absent from the
+ * next run's candidate set.  Re-running a fully-converged job (nothing
+ * left to purge) is always a safe no-op that reports zero rows.
+ *
+ * ## Deletion ordering
+ *
+ * Candidates within a rule are fetched oldest-first
+ * (`ORDER BY <ageColumn> ASC`).  This makes purge progress monotonic and
+ * deterministic: if a run is interrupted partway through a rule, the
+ * oldest — and therefore longest-overdue — rows are always the ones
+ * already committed, and a resumed run continues forward in time rather
+ * than potentially reprocessing an arbitrary scan order.
+ *
+ * ## Clock source
+ *
+ * All cut-off calculations for a single run share one `now` value
+ * (`options.now`, defaulting to `new Date()` at call time). It is read
+ * once in `runRetentionPurge` and threaded through every rule, so a run
+ * that spans a month/ledger boundary in wall-clock time still evaluates
+ * every rule against a single, consistent instant.
  *
  * ## Legal-hold exemption
  *
- * Any row with `legal_hold = TRUE` is unconditionally skipped and an
- * audit trail is written.  The hold must be lifted by an operator
- * before the next job run for the row to become purgeable.
+ * Any row with `legal_hold = TRUE` is unconditionally skipped.  In a
+ * real (non-dry-run) run this also writes a `PURGE_SKIPPED_LEGAL_HOLD`
+ * audit trail entry.  The hold must be lifted by an operator before the
+ * next job run for the row to become purgeable.
+ *
+ * ## Dry-run behavior
+ *
+ * `dryRun: true` makes the run fully read-only: candidate rows are still
+ * counted (so `rowsPurged`/`rowsSkipped` reflect what *would* happen),
+ * but no `DELETE`/`UPDATE` is issued against the target table and no
+ * audit-log rows are written — including `PURGE_SKIPPED_LEGAL_HOLD` for
+ * held rows, which is otherwise written outside the batch transaction.
+ * A dry run therefore leaves the database byte-for-byte unchanged.
  *
  * ## Audit trail
  *
@@ -356,12 +388,19 @@ async function processBatch(
       const primaryKey = getPrimaryKey(row);
 
       if (row.legal_hold === true) {
-        // Row is under legal hold — skip it and write an audit event.
+        // Row is under legal hold — skip it. Only write the audit event for
+        // a real run: dry-run must not mutate the database, and the skip
+        // audit write goes through the shared pool outside this transaction
+        // (see writeSkippedAuditEvent), so it is not covered by the
+        // transaction ROLLBACK/no-DELETE guarantees below.
         skipped += 1;
-        await writeSkippedAuditEvent(client, rule, primaryKey, correlationId);
+        if (!dryRun) {
+          await writeSkippedAuditEvent(client, rule, primaryKey, correlationId);
+        }
         logger.info('Retention purge: row skipped (legal hold)', correlationId, {
           table: rule.table,
           id: primaryKey,
+          dryRun,
         });
         continue;
       }
@@ -429,7 +468,10 @@ async function tableHasColumn(
  * Fetch candidate rows from the target table.
  *
  * Uses `SELECT … FOR UPDATE SKIP LOCKED` so concurrent purge workers or
- * operators modifying legal_hold do not block each other.
+ * operators modifying legal_hold do not block each other. Rows are ordered
+ * oldest-first (`ORDER BY <ageColumn> ASC`) so purge progress is
+ * deterministic and monotonic across batches and across runs (see
+ * "Deletion ordering" in the module docs).
  *
  * The SQL is **statically branched** based on `hasLegalHold` (determined
  * once per rule by {@link tableHasColumn}).  Tables that lack the column
@@ -458,6 +500,7 @@ async function fetchCandidateRows(
     `SELECT *, ${legalHoldExpr}
        FROM ${tableId}
       WHERE ${ageColId} < $1
+      ORDER BY ${ageColId} ASC
       LIMIT $2
       FOR UPDATE SKIP LOCKED`,
     [cutoff.toISOString(), batchSize]

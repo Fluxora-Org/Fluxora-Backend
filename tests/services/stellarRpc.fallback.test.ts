@@ -10,6 +10,7 @@ import { createRpcDegradationMiddleware } from '../../src/middleware/rpcDegradat
 import {
   InMemoryRpcFallbackCache,
   RedisRpcFallbackCache,
+  buildRpcFallbackCacheKey,
   type RpcFallbackCache,
 } from '../../src/redis/rpcFallbackCache.js';
 import type { RedisClient } from '../../src/redis/client.js';
@@ -136,6 +137,7 @@ describe('StellarRpcService fallback cache', () => {
   });
 
   it('isolates accountExists cache entries by hashed account parameter', async () => {
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(new AbortController().signal);
     const cache = new InMemoryRpcFallbackCache();
     const fetchMock = vi.fn(async (url: string) => ({
       status: url.endsWith('/GBEXISTS') ? 200 : 404,
@@ -145,7 +147,7 @@ describe('StellarRpcService fallback cache', () => {
     let horizonUrl = 'https://horizon.test';
     const svc = new StellarRpcService(
       () => ({ getLatestLedger: vi.fn(), horizonUrl }),
-      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60, maxRetries: 0, retryDelayMs: 0 },
     );
 
     await expect(svc.accountExists('GBEXISTS')).resolves.toBe(true);
@@ -272,7 +274,7 @@ describe('rpcFallbackCache key collisions', () => {
     const operation1 = 'getLatestLedger';
     const parts1 = ['a', 'b'];
 
-    const operation2 = 'getLatestLedger::a';
+    const operation2 = 'getLatestLedger_a';
     const parts2 = ['b'];
 
     // Ensure safe inputs (avoid relying on delimiter-forging characters).
@@ -288,6 +290,19 @@ describe('rpcFallbackCache key collisions', () => {
     // Cross-tuple reads must miss.
     await expect(cache.get<{ v: number }>(operation1, parts2)).resolves.toBeNull();
     await expect(cache.get<{ v: number }>(operation2, parts1)).resolves.toBeNull();
+  });
+
+  it('generates distinct keys for near-colliding inputs using buildRpcFallbackCacheKey', () => {
+    const key1 = buildRpcFallbackCacheKey('getAccount', ['a', 'b']);
+    const key2 = buildRpcFallbackCacheKey('getAccount', ['ab']);
+    const key3 = buildRpcFallbackCacheKey('getAccount', ['a', 'b', 'c']);
+
+    expect(key1).not.toBe(key2);
+    expect(key1).not.toBe(key3);
+    expect(key2).not.toBe(key3);
+
+    expect(key1).toContain('rpc:cache::v2::op:');
+    expect(key2).toContain('rpc:cache::v2::op:');
   });
 
   it('rejects unsafe key parts under SAFE_OPERATION', async () => {
@@ -322,7 +337,7 @@ describe('corrupt cache entries', () => {
     const result = await cache.get('testOp');
 
     expect(result).toBeNull();
-    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(fakeRedis.del).toHaveBeenCalledWith(buildRpcFallbackCacheKey('testOp'));
     expect(cache.corruptEntriesTotal).toBe(1);
     
     const metric = await fluxora_rpc_cache_corrupt_total.get();
@@ -346,7 +361,7 @@ describe('corrupt cache entries', () => {
     const result = await cache.get('testOp');
 
     expect(result).toBeNull();
-    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(fakeRedis.del).toHaveBeenCalledWith(buildRpcFallbackCacheKey('testOp'));
     expect(cache.corruptEntriesTotal).toBe(1);
 
     const metric = await fluxora_rpc_cache_corrupt_total.get();
@@ -370,7 +385,7 @@ describe('corrupt cache entries', () => {
     const result = await cache.get('testOp');
 
     expect(result).toBeNull();
-    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(fakeRedis.del).toHaveBeenCalledWith(buildRpcFallbackCacheKey('testOp'));
     expect(cache.corruptEntriesTotal).toBe(1);
 
     const metric = await fluxora_rpc_cache_corrupt_total.get();

@@ -26,6 +26,21 @@ import type { IWebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateL
 import { TokenBucketRateLimiter } from './rate-limiter.js';
 import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
 
+/** Parse Retry-After header value into milliseconds delay. */
+function parseRetryAfter(header: string | null, now: number): number | null {
+  if (!header) return null;
+  const seconds = Number.parseInt(header.trim(), 10);
+  if (!Number.isNaN(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+  // Try parsing as HTTP-date
+  const date = new Date(header);
+  if (!Number.isNaN(date.getTime())) {
+    return Math.max(0, date.getTime() - now);
+  }
+  return null;
+}
+
 interface OutboxRow {
   id: string;
   stream_id: string;
@@ -397,7 +412,17 @@ export class WebhookService {
       } else {
         // Handle non-2xx responses
         if (shouldRetry(attempt, attemptNumber, this.policy)) {
-          attempt.nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
+          // For 429 responses, respect Retry-After header if present
+          let nextRetryAt: number;
+          if (response.status === 429) {
+            const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'), Date.now());
+            nextRetryAt = retryAfterMs !== null
+              ? Date.now() + retryAfterMs
+              : calculateNextRetryTime(attemptNumber, this.policy);
+          } else {
+            nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
+          }
+          attempt.nextRetryAt = nextRetryAt;
           delivery.status = 'pending';
 
           logger.warn('Webhook delivery failed, will retry', undefined, {

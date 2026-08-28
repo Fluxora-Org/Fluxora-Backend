@@ -94,33 +94,18 @@ export function parseCookies(cookieHeader?: string): Record<string, string> {
  * @returns boolean indicating if request is cookie-session authenticated
  */
 export function isCookieAuthenticated(req: Request): boolean {
-  // Rule 1 — Bearer / Authorization header (non-blank)
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.trim().length > 0) {
-    return false;
-  }
-
-  // Rule 2 — API Key in request headers (e.g. X-API-Key: flx_...)
-  const apiKeyFromHeader = getApiKeyFromRequest(req.headers);
-  if (apiKeyFromHeader) {
-    return false;
-  }
-
-  // Rule 3 — API Key supplied as a query parameter (?x-api-key=flx_...)
-  // req.query values are strings or string arrays after Express URL parsing.
-  const queryApiKey = req.query?.['x-api-key'];
-  const normalizedQueryKey = Array.isArray(queryApiKey) ? queryApiKey[0] : queryApiKey;
-  if (normalizedQueryKey && typeof normalizedQueryKey === 'string' && normalizedQueryKey.trim().length > 0) {
-    return false;
-  }
-
-  // Rule 4 — Presence of at least one cookie → treat as browser/cookie-session request
+  // If the request carries at least one cookie in `req.headers.cookie`,
+  // we MUST treat it as a cookie-authenticated request and enforce CSRF.
+  // We no longer exempt requests that have Authorization/API keys if they ALSO have cookies,
+  // because an attacker could forge those headers/query params in a cross-origin request
+  // (e.g. ?x-api-key=) to force a CSRF bypass, while the backend auth middleware might
+  // successfully authenticate using the session cookie.
   const cookieHeader = req.headers.cookie;
-  if (!cookieHeader || cookieHeader.trim().length === 0) {
-    return false;
+  if (cookieHeader && cookieHeader.trim().length > 0) {
+    return true;
   }
 
-  return true;
+  return false;
 }
 
 /**

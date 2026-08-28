@@ -63,6 +63,8 @@ export interface RedisClient {
   /** SET key value NX PX ms — returns true when the key was created. */
   setNx(key: string, value: string, pxMs: number): Promise<boolean>;
   del(key: string): Promise<void>;
+  /** Delete only when the lock value still belongs to this owner. */
+  delIfValue?(key: string, value: string): Promise<void>;
   exists(key: string): Promise<boolean>;
   close(): Promise<void>;
   multi(): RedisPipeline;
@@ -131,6 +133,15 @@ class IORedisClient implements RedisClient {
 
   async del(key: string): Promise<void> {
     await this.client.del(key);
+  }
+
+  async delIfValue(key: string, value: string): Promise<void> {
+    await this.client.eval(
+      "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+      1,
+      key,
+      value,
+    );
   }
 
   async exists(key: string): Promise<boolean> {

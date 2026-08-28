@@ -37,6 +37,6 @@ export function deRegisterIndexerMetrics(): void {
     'indexer_replay_retries_total',
     'indexer_replay_checkpoint_sequence',
   ]) {
-    registry.removeNetric(name);
+    registry.removeSingleMetric(name);
   }
 }

@@ -2,7 +2,7 @@ import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal, isValidRejectio
 
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP = 10;
 export const DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS = 1000;
-const DEFAULT_SSE_MAX_CONNECTIONS_PER_API_KEY = 50;
+export const DEFAULT_SSE_MAX_CONNECTIONS_PER_API_KEY = 50;
 const DEFAULT_SSE_MAX_CONNECTION_DURATION_MS = 30 * 60 * 1000;
 const DEFAULT_SSE_RETRY_AFTER_SECONDS = 15;
 
@@ -52,7 +52,7 @@ export type SseConnectionAttempt =
 const activeConnectionsByIp = new Map<string, number>();
 let activeConnections = 0;
 const activeConnectionsByApiKey = new Map<string, number>();
-const activeTimers = new Set<NodeJS.Timeout>();
+const activeTimers = new Set<ReturnType<typeof setTimeout>>();
 
 function normalizeApiKey(apiKey: string | undefined): string | undefined {
   if (apiKey === undefined) return undefined;
@@ -66,7 +66,7 @@ function normalizeIp(ip: string): string {
 }
 
 function readBoundedPositiveInteger(
-  env: NodeJS.ProcessEnv,
+  env: Record<string, string | undefined>,
   name: string,
   fallback: number,
   min: number,
@@ -93,7 +93,7 @@ function readBoundedPositiveInteger(
  * budgets.
  */
 export function resolveSseConnectionLimits(
-  env: NodeJS.ProcessEnv = process.env,
+  env: Record<string, string | undefined> = process.env,
 ): SseConnectionLimits {
   return {
     maxConnectionsPerIp: readBoundedPositiveInteger(
@@ -207,7 +207,7 @@ export function tryAcquireSseConnection(
   sseActiveConnectionsGauge.set(activeConnections);
 
   let released = false;
-  let timer: NodeJS.Timeout | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const acceptedAt = Date.now();
 
   const connection: AcceptedSseConnection = {

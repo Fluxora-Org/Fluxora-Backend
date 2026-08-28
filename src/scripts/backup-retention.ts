@@ -399,7 +399,7 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
 /**
  * Represents a backed-up object with metadata.
  */
-interface BackupObject {
+export interface BackupObject {
   key: string;
   size: number;
   lastModified: Date;
@@ -410,7 +410,7 @@ interface BackupObject {
 /**
  * Retention policy tiers.
  */
-interface RetentionPolicy {
+export interface RetentionPolicy {
   dailyDays: number;
   weeklyDays: number;
   monthlyDays: number;
@@ -428,8 +428,7 @@ const DEFAULT_POLICY: RetentionPolicy = {
 /**
  * Calculates the age of an object in days.
  */
-export function calculateAgeInDays(lastModified: Date): number {
-  const now = new Date();
+export function calculateAgeInDays(lastModified: Date, now: Date = new Date()): number {
   const ageMs = now.getTime() - lastModified.getTime();
   return Math.floor(ageMs / (1000 * 60 * 60 * 24));
 }
@@ -528,6 +527,34 @@ export function filterRetainedObjects(
 }
 
 /**
+ * Shared selection oracle for identifying which objects to retain and delete.
+ * Enforces legal holds and retention policy on all available objects.
+ */
+export function selectObjectsForDeletion(
+  allObjects: BackupObject[],
+  policy: RetentionPolicy,
+  legalHolds: string[] = []
+): { retained: BackupObject[]; toDelete: BackupObject[] } {
+  // 1. Identify objects that match a legal hold
+  const heldKeys = new Set<string>();
+  for (const obj of allObjects) {
+    if (legalHolds.some(hold => obj.key === hold || obj.key.startsWith(hold))) {
+      heldKeys.add(obj.key);
+    }
+  }
+
+  // 2. Filter out held objects from retention logic
+  const objectsNotHeld = allObjects.filter(obj => !heldKeys.has(obj.key));
+  const retainedNotHeld = filterRetainedObjects(objectsNotHeld, policy);
+  
+  // 3. Compute deletions and retentions
+  const toDelete = objectsNotHeld.filter((obj) => !retainedNotHeld.find((r) => r.key === obj.key));
+  const retained = allObjects.filter(obj => !toDelete.find((d) => d.key === obj.key));
+
+  return { retained, toDelete };
+}
+
+/**
  * Fetches all backup objects from S3.
  */
 async function fetchBackupObjects(
@@ -551,7 +578,7 @@ async function fetchBackupObjects(
       for (const item of response.Contents) {
         if (!item.Key || !item.LastModified || item.Size === undefined) continue;
 
-        const ageInDays = calculateAgeInDays(item.LastModified);
+        const ageInDays = calculateAgeInDays(item.LastModified, now);
         const obj: BackupObject = {
           key: item.Key,
           size: item.Size,
@@ -628,22 +655,35 @@ async function validateBucket(client: S3Client, bucket: string): Promise<void> {
   }
 }
 
+export interface BackupRetentionOptions {
+  dryRun?: boolean;
+  prefix?: string;
+  now?: Date;
+  legalHolds?: string[];
+  confirmDeletion?: boolean;
+}
+
 /**
  * Main retention policy enforcement function.
  */
-async function enforceBackupRetention(options: {
-  dryRun?: boolean;
-  prefix?: string;
-}): Promise<void> {
+export async function enforceBackupRetention(options: BackupRetentionOptions = {}): Promise<void> {
   const bucket = process.env.S3_BACKUP_BUCKET;
   const defaultPrefix = process.env.S3_BACKUP_PREFIX ?? 'backups/';
   const prefix = options.prefix ?? defaultPrefix;
   const region = process.env.AWS_REGION ?? 'us-east-1';
   const dryRun = options.dryRun ?? false;
+  const now = options.now ?? new Date();
+  const legalHolds = options.legalHolds ?? [];
+  const confirmDeletion = options.confirmDeletion ?? false;
 
   // Validate required environment variables
   if (!bucket) {
     throw new Error('S3_BACKUP_BUCKET environment variable is required');
+  }
+
+  // Deletion confirmation check
+  if (!dryRun && !confirmDeletion) {
+    throw new Error('confirmDeletion must be true when executing actual deletion.');
   }
 
   const client = new S3Client({ region });
@@ -655,7 +695,7 @@ async function enforceBackupRetention(options: {
 
     // Fetch all backup objects
     console.log(`[INFO] Fetching backup objects from s3://${bucket}/${prefix}`);
-    const allObjects = await fetchBackupObjects(client, bucket, prefix);
+    const allObjects = await fetchBackupObjects(client, bucket, prefix, now);
 
     console.log(`[INFO] Found ${allObjects.length} backup objects`);
 
@@ -664,9 +704,8 @@ async function enforceBackupRetention(options: {
       return;
     }
 
-    // Classify and filter objects
-    const retained = filterRetainedObjects(allObjects, DEFAULT_POLICY);
-    const toDelete = allObjects.filter((obj) => !retained.find((r) => r.key === obj.key));
+    // Classify and filter objects using the shared selection oracle
+    const { retained, toDelete } = selectObjectsForDeletion(allObjects, DEFAULT_POLICY, legalHolds);
 
     // Log classification summary
     const dailyCount = allObjects.filter((o) => o.classification === 'daily').length;
@@ -743,9 +782,10 @@ async function enforceBackupRetention(options: {
  */
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const options = {
+  const options: BackupRetentionOptions = {
     dryRun: args.includes('--dry-run'),
-    prefix: undefined as string | undefined,
+    confirmDeletion: args.includes('--confirm-deletion'),
+    prefix: undefined,
   };
 
   // Parse --prefix argument
