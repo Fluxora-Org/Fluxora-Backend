@@ -316,6 +316,9 @@ export const EnvSchema = z
     REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
     ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
     WS_AUTH_REQUIRED: booleanEnv().default(false),
+    WS_ALLOWED_ORIGINS: optionalString('WS_ALLOWED_ORIGINS'),
+    WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
+    WS_RECONNECT_WINDOW_MS: integerEnv('WS_RECONNECT_WINDOW_MS', 1, 86_400_000).default(60_000),
     SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
     SSE_MAX_CONNECTIONS_PER_API_KEY: integerEnv(
       'SSE_MAX_CONNECTIONS_PER_API_KEY',
