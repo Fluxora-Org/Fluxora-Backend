@@ -102,36 +102,25 @@ function encodeCacheKeyPart(part: string): string {
 }
 
 /**
- * Builds a collision-resistant cache key.
+ * Builds a collision-resistant, versioned v2 cache key for Stellar RPC fallback caching.
  *
- * The operation name is length-prefixed (not hashed) so it stays
- * human-readable in Redis while remaining injective regardless of its
- * content. Each cache-part is validated against the strict SAFE_OPERATION
- * allow-list and then hashed, since parts often derive from
- * externally-influenced values (e.g. account addresses) that must not
- * appear in a Redis key in raw form.
- *
- * Why length-prefix rather than a naive delimiter join: two different
- * (operation, parts[]) tuples could otherwise be crafted to produce the
- * same joined string (e.g. operation `"a::b"` with parts `["c"]` vs.
- * operation `"a"` with parts `["b", "c"]`-shaped collisions). Prefixing the
- * operation with its own length removes that ambiguity.
- *
- * Key format stays stable for SAFE operations by including explicit versions.
+ * @security Security Assumptions & Collision Resistance:
+ * - Validates operation name against `SAFE_OPERATION` regex to prevent injection of unsafe characters.
+ * - Hashes operation name and each cachePart with SHA-256 prior to concatenation.
+ * - Prevents tuple collision attacks (e.g. ("op1", ["a", "b"]) vs ("op1", ["ab"]) or delimiter injection).
+ * - Incorporates key version `v2` to support key format upgrades and invalidate legacy keys safely.
  */
-function buildCacheKey(operation: string, cacheParts: readonly string[] = []): string {
-  if (!SAFE_OPERATION_NAME.test(operation)) {
+export function buildRpcFallbackCacheKey(operation: string, cacheParts: readonly string[] = []): string {
+  if (!SAFE_OPERATION.test(operation)) {
     throw new Error('RPC fallback cache operation contains unsafe characters');
   }
 
   const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
-  // Key format versioning:
-  // - Prevent collisions between different tuple shapes via length-prefixing
-  //   the operation and hashing each part.
-  // - Include key-version to allow future format upgrades.
-  return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${operation.length}:${operation}::parts:${encodedParts.join(',')}`;
+  return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
 }
+
+export const buildCacheKey = buildRpcFallbackCacheKey;
 
 
 

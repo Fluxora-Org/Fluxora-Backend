@@ -29,6 +29,31 @@ import {
 import { getStellarRpcService } from '../services/stellar-rpc.js';
 import { rowReader, INT32_MAX, BIGINT_SAFE_MAX } from '../db/rowMapping.js';
 
+function createConcurrencyLimiter(limit: number): { acquire: () => Promise<void>; release: () => void } {
+  const waiters: Array<() => void> = [];
+  let active = 0;
+
+  return {
+    acquire: () =>
+      new Promise<void>((resolve) => {
+        if (active < limit) {
+          active++;
+          resolve();
+        } else {
+          waiters.push(() => {
+            active++;
+            resolve();
+          });
+        }
+      }),
+    release: () => {
+      active--;
+      const next = waiters.shift();
+      if (next) next();
+    },
+  };
+}
+
 /** Seconds elapsed since a `process.hrtime.bigint()` start mark. */
 function elapsedSecondsSince(startedAt: bigint): number {
   return Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
@@ -331,10 +356,10 @@ export function rowToContractEvent(row: Record<string, unknown>): ContractEvent 
     block_height:     r.requireInt('block_height', { min: 0, max: BIGINT_SAFE_MAX }),
     transaction_hash: r.requireString('transaction_hash'),
     ...(row['ingested_at'] !== undefined
-      ? { ingested_at: r.optionalDate('ingested_at') }
+      ? { ingested_at: r.optionalDate('ingested_at') ?? undefined }
       : {}),
     ...(row['created_at'] !== undefined
-      ? { created_at: r.optionalDate('created_at') }
+      ? { created_at: r.optionalDate('created_at') ?? undefined }
       : {}),
   };
 }
@@ -1494,6 +1519,7 @@ function validateBatch(body: unknown): IngestContractEventsRequest {
 export class IndexerIngestionService {
   private readonly rateLimits = new Map<string, RateLimitBucket>();
   private readonly state: IndexerState;
+  private readonly writeSemaphore: { acquire: () => Promise<void>; release: () => void };
 
   constructor(private store: ContractEventStore) {
     this.state = {
@@ -1513,6 +1539,7 @@ export class IndexerIngestionService {
       ledgerThroughputSamples: [],
       lastLedgerLagUpdateAt: null,
     };
+    this.writeSemaphore = createConcurrencyLimiter(4);
   }
 
   setStore(store: ContractEventStore): void { this.store = store; }
@@ -1707,7 +1734,13 @@ export class IndexerIngestionService {
     }
 
     try {
-      const result = await this.store.insertMany(request.events);
+      await this.writeSemaphore.acquire();
+      let result;
+      try {
+        result = await this.store.insertMany(request.events);
+      } finally {
+        this.writeSemaphore.release();
+      }
       const now = new Date().toISOString();
       const maxLedger = Math.max(...events.map((e) => e.ledger));
       const safeLedger = Math.max(this.state.lastSafeLedger, maxLedger - 1);

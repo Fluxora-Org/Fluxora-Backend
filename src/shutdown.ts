@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { glogger } from './lib/logger.js';
+import { logger } from './lib/logger.js';
 
 let shuttingDown = false;
 const hooks: Array<() => Promise<void> | void> = [];
