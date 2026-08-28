@@ -17,11 +17,16 @@ import fs from 'fs';
  * @property name - Unique feature flag name.
  * @property percentage - Rollout percentage in the inclusive range 0-100.
  * @property description - Optional operator-facing note.
+ * @property minMigration - Minimum database migration timestamp (e.g.
+ *   "20260728000000") that must be applied before this flag can be enabled.
+ *   When set, the flag is silently disabled if the latest applied migration is
+ *   older than this value. Absent means no schema dependency.
  */
 export interface FeatureFlagDefinition {
   name: string;
   percentage: number;
   description?: string;
+  minMigration?: string;
 }
 
 type FlagMap = Map<string, FeatureFlagDefinition>;
@@ -92,8 +97,44 @@ function parseFlagEntry(item: unknown): FeatureFlagDefinition | undefined {
   if (typeof entry['description'] === 'string') {
     definition.description = entry['description'];
   }
+  if (typeof entry['minMigration'] === 'string' && entry['minMigration'].trim().length > 0) {
+    definition.minMigration = entry['minMigration'].trim();
+  }
 
   return definition;
+}
+
+/**
+ * Check schema compatibility for a set of feature flags.
+ *
+ * Flags with a `minMigration` requirement are tested against the latest applied
+ * migration. Incompatible flags are returned so callers can strip them or log
+ * warnings. Migration names are timestamp-prefixed strings that sort
+ * lexicographically, so a simple string comparison determines ordering.
+ *
+ * @param flags - Flag map to check.
+ * @param latestMigration - Latest applied migration name, or null if none.
+ * @returns Map of flag names that are incompatible with the current schema.
+ */
+export function checkSchemaCompatibility(
+  flags: ReadonlyMap<string, FeatureFlagDefinition>,
+  latestMigration: string | null,
+): Map<string, FeatureFlagDefinition> {
+  const incompatible: Map<string, FeatureFlagDefinition> = new Map();
+
+  for (const [name, flag] of flags) {
+    if (!flag.minMigration) continue;
+
+    if (latestMigration === null || latestMigration < flag.minMigration) {
+      incompatible.set(name, flag);
+      process.stderr.write(
+        `[featureFlags] Flag "${name}" requires migration ${flag.minMigration} ` +
+          `but latest applied is ${latestMigration ?? '(none)'} — flag disabled\n`,
+      );
+    }
+  }
+
+  return incompatible;
 }
 
 /**
@@ -106,17 +147,26 @@ function parseFlagEntry(item: unknown): FeatureFlagDefinition | undefined {
  *
  * Invalid entries are skipped so a malformed flag cannot crash the process.
  *
+ * When `latestMigration` is provided, flags whose `minMigration` requirement
+ * exceeds the latest applied migration are silently stripped from the result
+ * and a warning is logged for each.
+ *
  * @param json - Raw JSON string from env or file.
+ * @param latestMigration - Latest applied migration name, or null to skip
+ *   schema compatibility checks.
  * @returns Validated flag map.
  */
-export function parseFlagsJson(json: string): FlagMap {
+export function parseFlagsJson(
+  json: string,
+  latestMigration?: string | null,
+): FlagMap {
   const flags: FlagMap = new Map();
   let parsed: unknown;
 
   try {
     parsed = JSON.parse(json);
   } catch {
-    process.stderr.write('[featureFlags] Invalid feature flags JSON; using empty flag set\n');
+    process.stderr.write('[featureFlags] Invalid feature flags JSON — falling back to empty map\n');
     return flags;
   }
 
@@ -141,24 +191,27 @@ export function parseFlagsJson(json: string): FlagMap {
     if (definition) flags.set(definition.name, definition);
   }
 
+  if (latestMigration !== undefined) {
+    const incompatible = checkSchemaCompatibility(flags, latestMigration);
+    for (const name of incompatible.keys()) {
+      flags.delete(name);
+    }
+  }
+
   return flags;
 }
 
-function loadFlagsFromEnv(): FlagMap {
+function loadFlagsFromEnv(latestMigration?: string | null): FlagMap {
   const inlineJson = process.env['FEATURE_FLAGS_JSON'];
-  if (inlineJson?.trim()) return parseFlagsJson(inlineJson);
+  if (inlineJson?.trim()) return parseFlagsJson(inlineJson, latestMigration);
 
   const filePath = process.env['FEATURE_FLAGS_FILE']?.trim();
   if (!filePath) return new Map();
 
   try {
-    return parseFlagsJson(fs.readFileSync(filePath, 'utf8'));
+    return parseFlagsJson(fs.readFileSync(filePath, 'utf8'), latestMigration);
   } catch (err) {
-    process.stderr.write(
-      `[featureFlags] Could not read FEATURE_FLAGS_FILE: ${
-        err instanceof Error ? err.message : String(err)
-      }\n`,
-    );
+    process.stderr.write(`[featureFlags] Could not read FEATURE_FLAGS_FILE: ${err instanceof Error ? err.message : String(err)} — falling back to empty map\n`);
     return new Map();
   }
 }
@@ -169,12 +222,27 @@ function loadFlagsFromEnv(): FlagMap {
  * The active map is replaced atomically after parsing, so requests never observe
  * a partially loaded configuration.
  *
- * @returns Newly active feature flag map.
+ * When `latestMigration` is provided, flags whose `minMigration` requirement
+ * exceeds the latest applied migration are silently excluded.
+ *
+ * @param latestMigration - Latest applied migration name, or null/undefined to
+ *   skip schema compatibility checks.
+ * @returns A commit function that swaps in the newly loaded flag map.
  */
-export function reloadFlags(): ReadonlyMap<string, FeatureFlagDefinition> {
-  const nextFlags = loadFlagsFromEnv();
-  currentFlags = nextFlags;
-  return currentFlags;
+export function prepareReloadFlags(
+  latestMigration?: string | null,
+): () => ReadonlyMap<string, FeatureFlagDefinition> {
+  const nextFlags = loadFlagsFromEnv(latestMigration);
+  return () => {
+    currentFlags = nextFlags;
+    return currentFlags;
+  };
+}
+
+export function reloadFlags(
+  latestMigration?: string | null,
+): ReadonlyMap<string, FeatureFlagDefinition> {
+  return prepareReloadFlags(latestMigration)();
 }
 
 /**

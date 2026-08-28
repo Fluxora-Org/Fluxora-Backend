@@ -19,6 +19,7 @@ import { successResponse, errorResponse } from '../utils/response.js';
 import { OffsetPaginationSchema } from '../validation/paginationSchema.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import type { DedupCache } from '../redis/dedup.js';
+import { checkWebhookPreflight } from '../webhooks/preflight.js';
 
 let inboundWebhookDedupCache: DedupCache = new InMemoryDedupCache();
 
@@ -52,8 +53,16 @@ webhooksRouter.post(
   async (req, res): Promise<void> => {
     const rawBody = req.body as Buffer;
     const headers = req.headers as Record<string, string | undefined>;
-    // `verifyWebhookSignature` uses exact-optional types — only forward
-    // properties when they are actually set.
+    const contentType = headers['content-type'];
+
+    // 1. Shared Preflight (size, depth, encoding, valid json)
+    const preflight = checkWebhookPreflight(rawBody, contentType);
+    if (!preflight.ok) {
+      res.status(preflight.status).json({ error: preflight.code, message: preflight.message });
+      return;
+    }
+
+    // 2. Signature verification
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
@@ -84,18 +93,11 @@ webhooksRouter.post(
       return;
     }
 
-    let parsed: unknown;
-    try {
-      parsed = rawBody.length > 0 ? JSON.parse(rawBody.toString('utf8')) : null;
-    } catch {
-      parsed = null;
-    }
-
     res.status(200).json({
       ok: true,
       deliveryId,
       eventType: headers['x-fluxora-event'] ?? null,
-      event: parsed,
+      event: preflight.parsed,
     });
   },
 );
@@ -512,6 +514,16 @@ webhooksRouter.get('/metrics', (req, res) => {
  */
 webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, res) => {
   const requestId = req.correlationId;
+  
+  const contentType = req.header('content-type');
+  const preflight = checkWebhookPreflight(req.body, contentType);
+  if (!preflight.ok) {
+    res.status(preflight.status).json(
+      errorResponse(preflight.code as any, preflight.message, undefined, requestId)
+    );
+    return;
+  }
+
   const secret = req.query.secret as string;
   const deliveryId = req.header('x-fluxora-delivery-id');
   const timestamp = req.header('x-fluxora-timestamp');

@@ -2,7 +2,7 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type { IncomingMessage } from 'http';
 import jwt from 'jsonwebtoken';
 
-import { serviceUnavailable, unauthorizedError } from '../errors.js';
+import { serviceUnavailable, unauthorized } from '../errors.js';
 import { logger } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
@@ -136,7 +136,7 @@ export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler
     const bearerToken = getBearerToken(req.header('authorization'));
     if (!bearerToken) {
       next(
-        unauthorizedError(`${options.role} bearer token is required`, {
+        unauthorized(`${options.role} bearer token is required`, {
           role: options.role,
         }),
       );
@@ -145,7 +145,7 @@ export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler
 
     if (bearerToken !== options.token) {
       next(
-        unauthorizedError(`Invalid ${options.role} bearer token`, {
+        unauthorized(`Invalid ${options.role} bearer token`, {
           role: options.role,
         }),
       );

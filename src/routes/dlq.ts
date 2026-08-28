@@ -40,6 +40,8 @@ import { dlqRepository } from '../db/repositories/dlqRepository.js';
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
   id: string;
+  /** Tenant that owns the failed delivery. Legacy rows may omit this value. */
+  tenantId?: string;
   topic: string;
   payload: unknown;
   error: string;
@@ -81,6 +83,7 @@ dlqRouter.get(
     const limitParam  = req.query.limit;
     const offsetParam = req.query.offset;
     const topicFilter = req.query.topic;
+    const tenantFilter = req.query.tenantId;
     const requestId   = req.correlationId;
 
     let limit = 50;
@@ -102,8 +105,9 @@ dlqRouter.get(
     }
 
     const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
+    const tenantId = typeof tenantFilter === 'string' && tenantFilter.trim() !== '' ? tenantFilter.trim() : undefined;
     const [{ entries, total }, suspensions] = await Promise.all([
-      dlqRepository.findAll({ limit, offset, topic }),
+      dlqRepository.findAll({ limit, offset, ...(topic ? { topic } : {}), ...(tenantId ? { tenantId } : {}) }),
       dlqRepository.listSuspendedConsumers(),
     ]);
 
@@ -266,13 +270,17 @@ dlqRouter.delete(
   requirePermission(Permission.DLQ_DELETE),
   asyncHandler(async (req: Request, res: Response) => {
     const topicFilter = req.query.topic;
+    const tenantFilter = req.query.tenantId;
     const requestId = req.correlationId;
 
     const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
-    const purged = await dlqRepository.deleteAll(topic);
+    const tenantId = typeof tenantFilter === 'string' && tenantFilter.trim() !== '' ? tenantFilter.trim() : undefined;
+    const purged = tenantId
+      ? await dlqRepository.deleteAll(topic, tenantId)
+      : await dlqRepository.deleteAll(topic);
 
     info('DLQ entries purged', { count: purged, topicFilter, requestId });
-    recordAuditEvent('DLQ_PURGED', 'dlq', 'bulk', requestId, { purgedCount: purged, topicFilter });
+    recordAuditEvent('DLQ_PURGED', 'dlq', 'bulk', requestId, { purgedCount: purged, topicFilter, tenantId });
 
     res.json(successResponse({ message: 'DLQ entries purged', purged, topicFilter: topicFilter ?? 'all' }, requestId));
   }),

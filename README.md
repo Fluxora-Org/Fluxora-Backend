@@ -15,13 +15,17 @@ High-performance contract event indexer with optimized batch processing and Post
 
 - Node.js 18+
 - PostgreSQL 12+
-- pnpm (or npm/yarn)
+- pnpm 9.15.9 (required)
 
 ## 🛠️ Installation
 
 ```bash
+# Activate the package manager version pinned in package.json
+corepack enable
+corepack prepare pnpm@9.15.9 --activate
+
 # Install dependencies
-pnpm install
+pnpm install --frozen-lockfile
 
 # Copy environment configuration
 cp .env.example .env
@@ -29,6 +33,10 @@ cp .env.example .env
 # Edit .env with your database credentials
 # DATABASE_URL=postgresql://user:password@localhost:5432/indexer_db
 ```
+
+pnpm is the repository's only supported package manager, and `pnpm-lock.yaml`
+is the authoritative dependency lockfile. The preinstall guard intentionally
+rejects npm, Yarn, other package managers, and pnpm versions other than 9.15.9.
 
 ## 🗄️ Database Setup
 

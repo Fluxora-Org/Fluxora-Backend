@@ -87,6 +87,20 @@ Tests are in `tests/indexer/replayIntegrity.test.ts` and cover:
 | `INDEXER_REPLAY_BATCH_SIZE` | `100` | Rows per batch |
 | `INDEXER_MAX_REPLAY_RANGE_BLOCKS` | `0` (unlimited) | Max block range per replay request |
 
+## gRPC Gateway Resource Policy
+
+When `GRPC_GATEWAY_ENABLED=true`, the internal indexer gateway accepts messages
+up to **4 MiB** and sends responses under the same limit. Each unary handler is
+bounded by a **30-second** server-side deadline. Calls cancelled by the client
+are treated as terminal: the gateway removes its cancellation listener, skips
+late callbacks, and does not retry ingest or replay work because completion
+cannot be inferred from a cancelled RPC. Oversized requests are rejected by
+gRPC with `RESOURCE_EXHAUSTED`; deadline expiry returns `DEADLINE_EXCEEDED`.
+
+These limits are implemented in `src/indexer/grpcGateway.ts` and covered by
+`tests/indexer/grpcGateway.test.ts`. The policy bounds gateway buffers and
+handler lifetime; it does not cancel an already-running database operation.
+
 ## Metrics
 
 | Metric | Type | Description |

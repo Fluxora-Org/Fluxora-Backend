@@ -75,6 +75,11 @@ vi.mock('../../src/utils/logger.js', () => ({
 }));
 
 import { streamRepository } from '../../src/db/repositories/streamRepository.js';
+import {
+  allowlistedSqlIdentifier,
+  InvalidSqlIdentifierError,
+  STREAM_OFFSET_SORT_FIELDS,
+} from '../../src/db/repositories/sqlIdentifiers.js';
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -113,6 +118,22 @@ describe('streamRepository SQLi regression suite', () => {
   beforeAll(() => {
     // Pool mock is set up per-test via returnsEmpty() / explicit
     // mockQuery.mockResolvedValue(...) calls below.
+  });
+
+  // ── SQL identifier allowlisting ─────────────────────────────────────────────
+
+  describe('dynamic SQL identifiers', () => {
+    it('accepts only known sort fields and never returns caller input', () => {
+      expect(allowlistedSqlIdentifier('created_at', STREAM_OFFSET_SORT_FIELDS, 'sort field'))
+        .toBe('created_at DESC, id DESC');
+    });
+
+    for (const payload of sqliPayloads) {
+      it(`rejects an adversarial sort field before SQL construction: [${payload}]`, () => {
+        expect(() => allowlistedSqlIdentifier(payload, STREAM_OFFSET_SORT_FIELDS, 'sort field'))
+          .toThrow(InvalidSqlIdentifierError);
+      });
+    }
   });
 
   // ── getById ─────────────────────────────────────────────────────────────────

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { PostgresContractEventStore } from '../src/indexer/store.js';
+import {
+  InMemoryContractEventStore,
+  PostgresContractEventStore,
+} from '../src/indexer/store.js';
+import { RowMappingError } from '../src/db/rowMapping.js';
 import type { ContractEventRecord } from '../src/indexer/types.js';
 
 function makeRecord(eventId: string, ledger = 100, ingestedAt?: string): ContractEventRecord {
@@ -20,7 +24,7 @@ function makeRecord(eventId: string, ledger = 100, ingestedAt?: string): Contrac
 }
 
 describe('PostgresContractEventStore — ingested_at dynamic defaults', () => {
-  it('omits ingested_at from values and binds DEFAULT in SQL placeholder when omitted', async () => {
+  it('uses the database clock when ingested_at is omitted', async () => {
     let capturedSql = '';
     const capturedValues: unknown[] = [];
 
@@ -39,11 +43,11 @@ describe('PostgresContractEventStore — ingested_at dynamic defaults', () => {
 
     // Check SQL column list and placeholders
     expect(capturedSql).toContain('ingested_at');
-    // The placeholder should end with DEFAULT to trigger DB default
-    expect(capturedSql).toContain('DEFAULT)');
-    // Total parameters should be exactly 11 (event_id to ledger_hash)
-    expect(capturedValues).toHaveLength(11);
-    expect(capturedValues[10]).toBe('hash-100'); // Last param is ledgerHash
+    expect(capturedSql).toContain('COALESCE');
+    expect(capturedSql).toContain('now()');
+    expect(capturedValues).toHaveLength(12);
+    expect(capturedValues[10]).toBe('hash-100');
+    expect(capturedValues[11]).toBeNull();
   });
 
   it('binds explicit ingested_at and uses parameter placeholder when provided', async () => {
@@ -155,5 +159,44 @@ describe('20260627110000_contract_events_ingested_at_default migration', () => {
       default: null,
       notNull: false,
     });
+  });
+});
+
+describe('InMemoryContractEventStore — ingestedAt is stamped once at insert (#1316)', () => {
+  it('returns the timestamp assigned at insert time, not one minted per read', async () => {
+    const store = new InMemoryContractEventStore();
+    await store.insertMany([makeRecord('e1')]);
+
+    const first = await store.getEvents();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await store.getEvents();
+
+    expect(first.events[0]!.ingestedAt).toBe(second.events[0]!.ingestedAt);
+  });
+
+  it('stamps a valid ISO-8601 timestamp on insert', async () => {
+    const store = new InMemoryContractEventStore();
+    const before = Date.now();
+    await store.insertMany([makeRecord('e1')]);
+
+    const result = await store.getEvents();
+    const stamped = Date.parse(result.events[0]!.ingestedAt);
+
+    expect(Number.isNaN(stamped)).toBe(false);
+    expect(stamped).toBeGreaterThanOrEqual(before);
+  });
+
+  it('reports a record stored without an ingest timestamp instead of inventing one', async () => {
+    const store = new InMemoryContractEventStore();
+    await store.insertMany([makeRecord('e1')]);
+
+    // Simulate a record that bypassed insertMany, which is the only way the
+    // timestamp can be missing. Previously this was silently backfilled with
+    // the current time and returned as if it were the real ingest instant.
+    const stored = (store as unknown as { records: Map<string, ContractEventRecord> }).records;
+    const record = stored.get('e1')!;
+    delete (record as { ingestedAt?: string }).ingestedAt;
+
+    await expect(store.getEvents()).rejects.toThrow(RowMappingError);
   });
 });

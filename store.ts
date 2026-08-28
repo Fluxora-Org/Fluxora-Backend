@@ -1,0 +1,465 @@
+import { ContractEventRecord, IndexerStoreKind } from './types.js';
+import { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } from '../db/types.js';
+import {
+  rowReader,
+  describeValue,
+  RowMappingError,
+  INT32_MAX,
+  BIGINT_SAFE_MAX,
+} from '../db/rowMapping.js';
+
+export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
+
+export const STALE_CURSOR_ERROR_CODE = 'STALE_CURSOR';
+
+export class StaleCursorError extends Error {
+  public readonly code = STALE_CURSOR_ERROR_CODE;
+
+  constructor(public readonly afterEventId: string) {
+    super(`Replay cursor '${afterEventId}' no longer exists; resync from fromLedger`);
+    this.name = 'StaleCursorError';
+  }
+}
+
+/**
+ * Map a raw `contract_events` row into a typed {@link StreamEventRecord}.
+ *
+ * Contract, from `migrations/1774715131962_streams-table.ts` plus
+ * `migrations/20260624000000_add_ledger_hash_to_contract_events.ts` and
+ * `migrations/20260627110000_contract_events_ingested_at_default.ts`:
+ *
+ * | Column            | Type                       | Nullable |
+ * | ----------------- | -------------------------- | -------- |
+ * | `event_id`        | `text` PK                  | no       |
+ * | `ledger`          | `integer`                  | no       |
+ * | `contract_id`     | `text`                     | no       |
+ * | `topic`           | `text`                     | no       |
+ * | `tx_hash`         | `text`                     | no       |
+ * | `tx_index`        | `integer`                  | no       |
+ * | `operation_index` | `integer`                  | no       |
+ * | `event_index`     | `integer`                  | no       |
+ * | `payload`         | `jsonb`                    | no       |
+ * | `happened_at`     | `timestamp with time zone` | no       |
+ * | `ledger_hash`     | `text`                     | **yes**  |
+ * | `ingested_at`     | `timestamp with time zone` | no       |
+ *
+ * Two corrections over the previous inline mapper:
+ *
+ *  - `ledger_hash` is nullable by design, so a legacy row reads as `null`
+ *    rather than as a `string` that happens to hold `null` at runtime.
+ *  - `happened_at` and `ingested_at` are `timestamptz`, which `pg` parses into
+ *    `Date`. They were assigned straight to fields declared `string` and
+ *    documented as ISO-8601. They are now converted explicitly, so the runtime
+ *    value matches the declared type. HTTP responses are byte-identical:
+ *    `JSON.stringify` already rendered those `Date`s as ISO-8601.
+ *
+ * Failure policy: fail fast. This is a read path behind the replay API and the
+ * WebSocket hub. Returning a page of events whose `contractId` is silently
+ * `null` corrupts every consumer downstream; a rejected request does not.
+ *
+ * @param table — source table name, used only in error messages.
+ * @throws {RowMappingError} if any column violates the contract above.
+ */
+export function rowToStreamEventRecord(
+  row: Record<string, unknown>,
+  table = 'contract_events',
+): StreamEventRecord {
+  const r = rowReader(table, row);
+  const index = { min: 0, max: INT32_MAX };
+
+  return {
+    eventId: r.requireString('event_id'),
+    ledger: r.requireInt('ledger', index),
+    ledgerHash: r.optionalString('ledger_hash'),
+    contractId: r.requireString('contract_id'),
+    topic: r.requireString('topic'),
+    txHash: r.requireString('tx_hash'),
+    txIndex: r.requireInt('tx_index', index),
+    operationIndex: r.requireInt('operation_index', index),
+    eventIndex: r.requireInt('event_index', index),
+    payload: r.requireJsonObject('payload'),
+    happenedAt: r.requireDate('happened_at').toISOString(),
+    ingestedAt: r.requireDate('ingested_at').toISOString(),
+  };
+}
+
+/** Record of a chain reorg that evicted previously stored events. */
+export interface ReorgRecord {
+  /** The ledger at which the fork occurred — all events at or above this were evicted. */
+  forkLedger: number;
+  /** The ledger hash that was evicted from the store. */
+  evictedHash: string;
+  /** The ledger hash that replaced the evicted one (empty when not yet observed). */
+  incomingHash: string;
+  /** Event IDs that were removed as part of this rollback. */
+  removedEventIds: string[];
+  /** ISO-8601 timestamp at which the rollback was applied. */
+  rolledBackAt: string;
+}
+
+export interface ContractEventStore {
+  readonly kind: IndexerStoreKind;
+  insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult>;
+  rollbackBeforeLedger(ledger: number): Promise<void>;
+  getLedgerHash(ledger: number): Promise<string | null>;
+  /** Replay stored events with optional filtering. Append-only — never mutates. */
+  getEvents(filter?: StreamEventReplayFilter): Promise<StreamEventReplayResult>;
+}
+
+export interface PgClientLike {
+  query<T = unknown>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount?: number | null }>;
+}
+
+export class InMemoryContractEventStore implements ContractEventStore {
+  public readonly kind: IndexerStoreKind = 'memory';
+  private readonly records = new Map<string, ContractEventRecord>();
+  private readonly reorgLog: ReorgRecord[] = [];
+
+  async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
+    const insertedEventIds: string[] = [];
+    const duplicateEventIds: string[] = [];
+    const staged = new Map<string, ContractEventRecord>();
+    for (const event of events) {
+      if (this.records.has(event.eventId) || staged.has(event.eventId)) {
+        duplicateEventIds.push(event.eventId);
+        continue;
+      }
+      staged.set(event.eventId, { ...event, ingestedAt: new Date().toISOString() });
+      insertedEventIds.push(event.eventId);
+    }
+
+    for (const [id, record] of staged) {
+      this.records.set(id, record);
+    }
+
+    return { insertedEventIds, duplicateEventIds };
+  }
+
+  async rollbackBeforeLedger(forkLedger: number): Promise<void> {
+    const removedEventIds: string[] = [];
+    let evictedHash = '';
+    for (const record of this.records.values()) {
+      if (record.ledger === forkLedger) { evictedHash = record.ledgerHash; break; }
+    }
+    for (const [eventId, record] of this.records) {
+      if (record.ledger >= forkLedger) { removedEventIds.push(eventId); this.records.delete(eventId); }
+    }
+    if (removedEventIds.length > 0 || evictedHash !== '') {
+      this.reorgLog.push({ forkLedger, evictedHash, incomingHash: '', removedEventIds, rolledBackAt: new Date().toISOString() });
+    }
+  }
+
+  async getLedgerHash(ledger: number): Promise<string | null> {
+    for (const record of this.records.values()) {
+      if (record.ledger === ledger) return record.ledgerHash;
+    }
+    return null;
+  }
+
+  async getEvents(filter: StreamEventReplayFilter = {}): Promise<StreamEventReplayResult> {
+    const limit = Math.min(filter.limit ?? 100, 1000);
+    const offset = filter.offset ?? 0;
+
+    let results = [...this.records.values()] as StreamEventRecord[];
+
+    // Stable ordering: ledger asc, then eventId asc
+    results.sort((a, b) => a.ledger - b.ledger || a.eventId.localeCompare(b.eventId));
+
+    // Cursor-based: drop everything up to and including the cursor eventId
+    // (applied before other filters so the cursor position is stable)
+    if (filter.afterEventId !== undefined) {
+      const idx = results.findIndex((r) => r.eventId === filter.afterEventId);
+      if (idx === -1) {
+        throw new StaleCursorError(filter.afterEventId);
+      } else {
+        results = results.slice(idx + 1);
+      }
+    }
+
+    if (filter.fromLedger !== undefined) {
+      results = results.filter((r) => r.ledger >= filter.fromLedger!);
+    }
+    if (filter.toledger !== undefined) {
+      results = results.filter((r) => r.ledger <= filter.toledger!);
+    }
+    if (filter.contractId !== undefined) {
+      results = results.filter((r) => r.contractId === filter.contractId);
+    }
+    if (filter.topic !== undefined) {
+      results = results.filter((r) => r.topic === filter.topic);
+    }
+    if (filter.fromHappenedAt !== undefined) {
+      const fromMs = new Date(filter.fromHappenedAt).getTime();
+      results = results.filter((r) => new Date(r.happenedAt).getTime() >= fromMs);
+    }
+    if (filter.toHappenedAt !== undefined) {
+      const toMs = new Date(filter.toHappenedAt).getTime();
+      results = results.filter((r) => new Date(r.happenedAt).getTime() <= toMs);
+    }
+
+
+    const total = results.length;
+    const slice = filter.afterEventId !== undefined
+      ? results.slice(0, limit)
+      : results.slice(offset, offset + limit);
+
+    // `insertMany` stamps `ingestedAt` on every record it accepts, mirroring the
+    // `DEFAULT now()` that the Postgres store relies on. Reading is therefore a
+    // pure projection: a missing timestamp means the record bypassed the insert
+    // path, and inventing one here would both hide that and hand the caller a
+    // different value on every read of the same event.
+    const events: StreamEventRecord[] = slice.map((record) => {
+      const { ingestedAt } = record;
+      if (typeof ingestedAt !== 'string' || ingestedAt.length === 0) {
+        throw new RowMappingError(
+          'memory:contract_events',
+          'ingestedAt',
+          'stored record has no ingest timestamp',
+          describeValue(ingestedAt),
+        );
+      }
+      return { ...record, ingestedAt };
+    });
+
+    const lastEvent = events[events.length - 1];
+    const nextCursor = events.length === limit && total > limit && lastEvent
+      ? lastEvent.eventId
+      : undefined;
+
+    return {
+      events,
+      total,
+      limit,
+      offset: filter.afterEventId !== undefined ? 0 : offset,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+    };
+  }
+
+  reset(): void {
+    this.records.clear();
+    this.reorgLog.length = 0;
+  }
+
+  all(): ContractEventRecord[] {
+    return [...this.records.values()].sort((a, b) => a.eventId.localeCompare(b.eventId));
+  }
+
+  byLedger(ledger: number): ContractEventRecord[] {
+    return [...this.records.values()].filter((r) => r.ledger === ledger).sort((a, b) => a.eventIndex - b.eventIndex);
+  }
+
+  getReorgLog(): Readonly<ReorgRecord[]> { return this.reorgLog; }
+
+  ledgerCount(): number {
+    return new Set([...this.records.values()].map((r) => r.ledger)).size;
+  }
+
+  tipLedger(): number | null {
+    let tip: number | null = null;
+    for (const record of this.records.values()) {
+      if (tip === null || record.ledger > tip) tip = record.ledger;
+    }
+    return tip;
+  }
+}
+
+export class PostgresContractEventStore implements ContractEventStore {
+  public readonly kind: IndexerStoreKind = 'postgres';
+  constructor(private readonly client: PgClientLike, private readonly tableName = 'contract_events') {}
+
+  /**
+   * Inserts multiple contract events into the database.
+   *
+   * Enforces server-authoritative ingest timestamps:
+   * - If `ingestedAt` is omitted, null, or undefined on an event record, the insert uses the
+   *   database-level DEFAULT `now()` value, making the PostgreSQL server the authoritative
+   *   source for ingestion timestamps.
+   * - If an explicit `ingestedAt` timestamp is provided, it will override the database default.
+   * - This ensures existing database entries and legacy writes can define explicit timestamps
+   *   if needed, but default writes rely on the database server time.
+   *
+   * @param events List of contract events to insert.
+   * @returns List of successfully inserted and duplicate event IDs.
+   */
+  async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
+    if (events.length === 0) {
+      return { insertedEventIds: [], duplicateEventIds: [] };
+    }
+
+    const values: unknown[] = [];
+    let placeholderOffset = 1;
+    const placeholders = events.map((event) => {
+      values.push(
+        event.eventId,
+        event.ledger,
+        event.contractId,
+        event.topic,
+        event.txHash,
+        event.txIndex,
+        event.operationIndex,
+        event.eventIndex,
+        JSON.stringify(event.payload),
+        event.happenedAt,
+        event.ledgerHash
+      );
+
+      const basePlaceholders = [
+        `$${placeholderOffset}`,
+        `$${placeholderOffset + 1}`,
+        `$${placeholderOffset + 2}`,
+        `$${placeholderOffset + 3}`,
+        `$${placeholderOffset + 4}`,
+        `$${placeholderOffset + 5}`,
+        `$${placeholderOffset + 6}`,
+        `$${placeholderOffset + 7}`,
+        `$${placeholderOffset + 8}::jsonb`,
+        `$${placeholderOffset + 9}::timestamptz`,
+        `$${placeholderOffset + 10}`,
+      ];
+
+      placeholderOffset += 11;
+
+      if (event.ingestedAt !== undefined && event.ingestedAt !== null) {
+        values.push(event.ingestedAt);
+        basePlaceholders.push(`$${placeholderOffset}::timestamptz`);
+        placeholderOffset += 1;
+      } else {
+        basePlaceholders.push('DEFAULT');
+      }
+
+      return `(${basePlaceholders.join(', ')})`;
+    });
+
+    // The contract_events table is range-partitioned by happened_at.
+    // The PRIMARY KEY is (happened_at, event_id), so the ON CONFLICT target
+    // must include both columns. Using just (event_id) would fail with
+    // "there is no unique or exclusion constraint matching the ON CONFLICT
+    // specification" on a partitioned table.
+    const sql = `
+      INSERT INTO ${this.tableName} (
+        event_id, ledger, contract_id, topic, tx_hash,
+        tx_index, operation_index, event_index, payload, happened_at, ledger_hash, ingested_at
+      )
+      VALUES ${placeholders.join(', ')}
+      ON CONFLICT (happened_at, event_id) DO NOTHING
+      RETURNING event_id
+    `;
+
+    const result = await this.client.query<{ event_id: string }>(sql, values);
+    const insertedEventIds = result.rows.map((r) => r.event_id);
+    const inserted = new Set(insertedEventIds);
+    const duplicateEventIds = events
+      .map((e) => e.eventId)
+      .filter((id) => !inserted.has(id));
+
+    return { insertedEventIds, duplicateEventIds };
+  }
+
+  async rollbackBeforeLedger(ledger: number): Promise<void> {
+    await this.client.query(`DELETE FROM ${this.tableName} WHERE ledger >= $1`, [ledger]);
+  }
+
+  async getLedgerHash(ledger: number): Promise<string | null> {
+    const result = await this.client.query<{ ledger_hash: string }>(
+      `SELECT ledger_hash FROM ${this.tableName} WHERE ledger = $1 LIMIT 1`,
+      [ledger]
+    );
+    return result.rows[0]?.ledger_hash ?? null;
+  }
+
+  async getEvents(filter: StreamEventReplayFilter = {}): Promise<StreamEventReplayResult> {
+    const limit = Math.min(filter.limit ?? 100, 1000);
+    const offset = filter.offset ?? 0;
+
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+
+    if (filter.fromLedger !== undefined) {
+      values.push(filter.fromLedger);
+      conditions.push(`ledger >= $${values.length}`);
+    }
+    if (filter.toledger !== undefined) {
+      values.push(filter.toledger);
+      conditions.push(`ledger <= $${values.length}`);
+    }
+    if (filter.contractId !== undefined) {
+      values.push(filter.contractId);
+      conditions.push(`contract_id = $${values.length}`);
+    }
+    if (filter.topic !== undefined) {
+      values.push(filter.topic);
+      conditions.push(`topic = $${values.length}`);
+    }
+    if (filter.fromHappenedAt !== undefined) {
+      values.push(filter.fromHappenedAt);
+      conditions.push(`happened_at >= $${values.length}::timestamptz`);
+    }
+    if (filter.toHappenedAt !== undefined) {
+      values.push(filter.toHappenedAt);
+      conditions.push(`happened_at <= $${values.length}::timestamptz`);
+    }
+
+    // Cursor: translate afterEventId into a (ledger, event_id) boundary
+    if (filter.afterEventId !== undefined) {
+      // Fetch the cursor row's ledger so we can use a composite key comparison
+      const cursorResult = await this.client.query<{ ledger: number }>(
+        `SELECT ledger FROM ${this.tableName} WHERE event_id = $1 LIMIT 1`,
+        [filter.afterEventId],
+      );
+      const cursorRow = cursorResult.rows[0];
+      if (!cursorRow) {
+        throw new StaleCursorError(filter.afterEventId);
+      }
+
+      const cursorLedger = cursorRow.ledger;
+      values.push(cursorLedger, filter.afterEventId);
+      conditions.push(
+        `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
+      );
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countResult = await this.client.query<Record<string, unknown>>(
+      `SELECT COUNT(*) AS count FROM ${this.tableName} ${where}`,
+      values
+    );
+    // COUNT(*) always returns exactly one row. Defaulting a missing row to 0
+    // would have reported "no events" for a query that never actually ran.
+    const total = rowReader(this.tableName, countResult.rows[0] ?? {}).requireInt('count', {
+      min: 0,
+      max: BIGINT_SAFE_MAX,
+    });
+
+    const pageValues = [...values, limit, filter.afterEventId !== undefined ? 0 : offset];
+    // Query with `Record<string, unknown>` and map through the validating
+    // reader — the previous inline generic asserted a shape the database does
+    // not guarantee (`ledger_hash` is nullable, and the timestamptz columns
+    // arrive as `Date`, not `string`).
+    const dataResult = await this.client.query<Record<string, unknown>>(
+      `SELECT event_id, ledger, ledger_hash, contract_id, topic, tx_hash,
+              tx_index, operation_index, event_index, payload, happened_at, ingested_at
+       FROM ${this.tableName} ${where}
+       ORDER BY ledger ASC, event_id ASC
+       LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
+      pageValues
+    );
+
+    const events: StreamEventRecord[] = dataResult.rows.map((row) =>
+      rowToStreamEventRecord(row, this.tableName),
+    );
+
+    const lastEvent = events[events.length - 1];
+    const nextCursor = events.length === limit && total > limit && lastEvent
+      ? lastEvent.eventId
+      : undefined;
+
+    return {
+      events,
+      total,
+      limit,
+      offset: filter.afterEventId !== undefined ? 0 : offset,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+    };
+  }
+}

@@ -3,7 +3,7 @@
  *
  * Provides durable, cluster-wide IP bans with TTL expiry.
  * Uses a read-through in-memory cache for performance.
- * Gracefully degrades to local in-memory enforcement on Redis failure.
+ * Fails closed on Redis read failures so an outage cannot erase protection.
  *
  * Security & Resilience
  * - Fail-safe: Redis outage never disables banning (falls back to local cache).
@@ -194,7 +194,8 @@ export class RedisBanStore implements BanStore {
 // ---------------------------------------------------------------------------
 
 /**
- * Hybrid implementation: prefers RedisBanStore, falls back to InMemoryBanStore on error.
+ * Hybrid implementation: prefers RedisBanStore and keeps a local cache for
+ * known bans. Reads fail closed while Redis is unavailable.
  * Maintains a local read-through cache for fast checks.
  * Ensures banning is never disabled by Redis outage.
  */
@@ -230,7 +231,9 @@ export class HybridBanStore implements BanStore {
       this.onError?.(err, 'isBanned');
       this.usingFallback = true;
       this.fallbackModeCount += 1;
-      return this.fallback.isBanned(ip);
+      // An unavailable ban store must never become an allow decision. The next
+      // successful Redis read automatically restores normal admission checks.
+      return { banned: true };
     }
   }
 

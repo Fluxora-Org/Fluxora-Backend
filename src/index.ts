@@ -35,7 +35,8 @@ import {
   loadConfig,
 } from './config/env.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
-import { reloadFlags } from './config/featureFlags.js';
+import { reloadFlags, prepareReloadFlags } from './config/featureFlags.js';
+import { getLatestAppliedMigration } from './db/migrate.js';
 import { logger } from './lib/logger.js';
 import { probeStartupDependencies } from './config/health.js';
 import { startTracing } from './tracing/index.js';
@@ -254,8 +255,8 @@ if (process.env.NODE_ENV !== 'test') {
     });
 
     void refreshHotConfig({
-      applyRateLimits: (hot) => {
-        setRuntimeRateLimitConfig({
+      prepareRateLimits: (hot) => {
+        const nextConfig = {
           ip: {
             windowMs: hot.rateLimitIpWindowMs ?? 60_000,
             max: hot.rateLimitIpMax ?? 100,
@@ -271,15 +272,31 @@ if (process.env.NODE_ENV !== 'test') {
             max: hot.rateLimitAdminMax ?? 2000,
             enabled: true,
           },
-        });
+        };
+        return () => setRuntimeRateLimitConfig(nextConfig);
       },
-      applyFeatureFlags: () => {
-        reloadFlags();
+      prepareFeatureFlags: () => {
+        const databaseUrl = process.env.DATABASE_URL;
+        if (!databaseUrl) {
+          return prepareReloadFlags();
+        }
+
+        return getLatestAppliedMigration(databaseUrl)
+          .then((latestMigration) => prepareReloadFlags(latestMigration))
+          .catch((err) => {
+            logger.warn('SIGHUP: failed to query latest migration — loading flags without schema check', undefined, {
+              component: 'sighup-reload',
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return prepareReloadFlags();
+          });
       },
-      applyLogLevel: (level) => {
-        // Keep process.env.LOG_LEVEL aligned so debug() gating and any
-        // env-driven log consumers observe the hot-reloaded level.
-        process.env.LOG_LEVEL = level;
+      prepareLogLevel: (level) => {
+        return () => {
+          // Keep process.env.LOG_LEVEL aligned so debug() gating and any
+          // env-driven log consumers observe the hot-reloaded level.
+          process.env.LOG_LEVEL = level;
+        };
       },
       onSuccess: (result) => {
         recordConfigReloadSuccess({

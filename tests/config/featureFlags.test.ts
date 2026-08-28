@@ -443,3 +443,235 @@ describe('getFlags', () => {
     expect(flags.get('snapshot_flag')?.percentage).toBe(30);
   });
 });
+
+describe('parseFlagsJson with minMigration', () => {
+  const ORIG_FLAGS_JSON = process.env['FEATURE_FLAGS_JSON'];
+
+  afterEach(() => {
+    if (ORIG_FLAGS_JSON === undefined) delete process.env['FEATURE_FLAGS_JSON'];
+    else process.env['FEATURE_FLAGS_JSON'] = ORIG_FLAGS_JSON;
+  });
+
+  it('parses minMigration from array-form flags', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'flag_a', percentage: 50, minMigration: '20260728000000' },
+      { name: 'flag_b', percentage: 75 },
+    ]));
+    expect(result.size).toBe(2);
+    expect(result.get('flag_a')?.minMigration).toBe('20260728000000');
+    expect(result.get('flag_b')?.minMigration).toBeUndefined();
+  });
+
+  it('parses minMigration from object-form flags', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify({
+      flag_a: { percentage: 50, minMigration: '20260623000000' },
+    }));
+    expect(result.get('flag_a')?.minMigration).toBe('20260623000000');
+  });
+
+  it('skips non-string minMigration values', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'flag_num', percentage: 50, minMigration: 123 },
+      { name: 'flag_null', percentage: 50, minMigration: null },
+      { name: 'flag_obj', percentage: 50, minMigration: { v: 1 } },
+      { name: 'flag_empty', percentage: 50, minMigration: '   ' },
+      { name: 'flag_valid', percentage: 50, minMigration: '20260728000000' },
+    ]));
+    expect(result.size).toBe(5);
+    expect(result.get('flag_num')?.minMigration).toBeUndefined();
+    expect(result.get('flag_null')?.minMigration).toBeUndefined();
+    expect(result.get('flag_obj')?.minMigration).toBeUndefined();
+    expect(result.get('flag_empty')?.minMigration).toBeUndefined();
+    expect(result.get('flag_valid')?.minMigration).toBe('20260728000000');
+  });
+
+  it('trims whitespace from minMigration strings', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'flag', percentage: 50, minMigration: '  20260728000000  ' },
+    ]));
+    expect(result.get('flag')?.minMigration).toBe('20260728000000');
+  });
+});
+
+describe('checkSchemaCompatibility', () => {
+  it('returns empty map when no flags have minMigration', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_a', percentage: 50 },
+      { name: 'flag_b', percentage: 100 },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(0);
+  });
+
+  it('returns empty map when latestMigration satisfies minMigration', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_old', percentage: 50, minMigration: '20260601000000' },
+      { name: 'flag_same', percentage: 50, minMigration: '20260728000000' },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(0);
+  });
+
+  it('flags minMigration that exceeds latestMigration as incompatible', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_future', percentage: 50, minMigration: '20260827000000' },
+      { name: 'flag_ok', percentage: 50, minMigration: '20260601000000' },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(1);
+    expect(incompatible.has('flag_future')).toBe(true);
+    expect(incompatible.has('flag_ok')).toBe(false);
+  });
+
+  it('treats null latestMigration as incompatible with all minMigration flags', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_a', percentage: 50, minMigration: '20260601000000' },
+      { name: 'flag_b', percentage: 50, minMigration: '20260728000000' },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, null);
+    expect(incompatible.size).toBe(2);
+    expect(incompatible.has('flag_a')).toBe(true);
+    expect(incompatible.has('flag_b')).toBe(true);
+  });
+
+  it('uses lexicographic comparison for migration ordering', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_early', percentage: 50, minMigration: '20260601' },
+      { name: 'flag_late', percentage: 50, minMigration: '20260701' },
+    ]));
+    // '20260615' sorts between '20260601' and '20260701'
+    const incompatible = checkSchemaCompatibility(flags, '20260615');
+    expect(incompatible.size).toBe(1);
+    expect(incompatible.has('flag_early')).toBe(false);
+    expect(incompatible.has('flag_late')).toBe(true);
+  });
+
+  it('handles mixed compatible and incompatible flags', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'no_req', percentage: 50 },
+      { name: 'compatible', percentage: 50, minMigration: '20260601000000' },
+      { name: 'incompatible', percentage: 50, minMigration: '20260827000000' },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(1);
+    expect(incompatible.has('incompatible')).toBe(true);
+  });
+});
+
+describe('parseFlagsJson with schema compatibility', () => {
+  const ORIG_FLAGS_JSON = process.env['FEATURE_FLAGS_JSON'];
+
+  afterEach(() => {
+    if (ORIG_FLAGS_JSON === undefined) delete process.env['FEATURE_FLAGS_JSON'];
+    else process.env['FEATURE_FLAGS_JSON'] = ORIG_FLAGS_JSON;
+  });
+
+  it('strips incompatible flags when latestMigration is provided', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_ok', percentage: 50, minMigration: '20260601000000' },
+        { name: 'flag_bad', percentage: 50, minMigration: '20260827000000' },
+      ]),
+      '20260728000000',
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_ok')).toBe(true);
+    expect(result.has('flag_bad')).toBe(false);
+  });
+
+  it('retains all flags when latestMigration is null (no schema check)', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_a', percentage: 50, minMigration: '20260827000000' },
+      ]),
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_a')).toBe(true);
+  });
+
+  it('retains all flags when latestMigration is undefined (no schema check)', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_a', percentage: 50, minMigration: '20260827000000' },
+      ]),
+      undefined,
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_a')).toBe(true);
+  });
+
+  it('strips all minMigration flags on fresh DB (null latestMigration)', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_req', percentage: 50, minMigration: '20260601000000' },
+        { name: 'flag_no_req', percentage: 50 },
+      ]),
+      null,
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_no_req')).toBe(true);
+    expect(result.has('flag_req')).toBe(false);
+  });
+});
+
+describe('isEnabled with schema-gated flags', () => {
+  const ORIG_FLAGS_JSON = process.env['FEATURE_FLAGS_JSON'];
+
+  beforeEach(() => {
+    delete process.env['FEATURE_FLAGS_JSON'];
+  });
+
+  afterEach(() => {
+    if (ORIG_FLAGS_JSON === undefined) delete process.env['FEATURE_FLAGS_JSON'];
+    else process.env['FEATURE_FLAGS_JSON'] = ORIG_FLAGS_JSON;
+  });
+
+  it('returns false for a flag whose minMigration has not been applied', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
+      { name: 'future_flag', percentage: 100, minMigration: '20260827000000' },
+    ]);
+    const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
+    // Reload without schema version — flag is retained but still checkable
+    reloadFlags();
+    // The flag is in the map, but its percentage is 100 so isEnabled returns true
+    expect(isEnabled('future_flag', 'user')).toBe(true);
+
+    // Now reload WITH a schema version that doesn't satisfy the requirement
+    reloadFlags('20260728000000');
+    // Flag was stripped from the map, so isEnabled returns false
+    expect(isEnabled('future_flag', 'user')).toBe(false);
+  });
+
+  it('returns true for a flag whose minMigration has been applied', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
+      { name: 'applied_flag', percentage: 100, minMigration: '20260601000000' },
+    ]);
+    const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
+    reloadFlags('20260728000000');
+    expect(isEnabled('applied_flag', 'user')).toBe(true);
+  });
+
+  it('preserves percentage behavior for compatible flags', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
+      { name: 'pct_flag', percentage: 0, minMigration: '20260601000000' },
+    ]);
+    const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
+    reloadFlags('20260728000000');
+    // Flag is compatible (migration applied) but percentage is 0
+    expect(isEnabled('pct_flag', 'user')).toBe(false);
+  });
+});

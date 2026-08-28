@@ -60,8 +60,11 @@ export interface WebhookRetryPolicy {
   backoffMultiplier: number;
   maxBackoffMs: number;
   jitterPercent: number;
+  jitterAlgorithm?: 'full' | 'decorrelated';
   timeoutMs: number;
   retryableStatusCodes: number[];
+  /** Internal: injectable random function for deterministic testing. Not serialized. */
+  random?: () => number;
 }
 
 export const DEFAULT_RETRY_POLICY: WebhookRetryPolicy = {

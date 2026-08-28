@@ -4,6 +4,7 @@
   "description": "Contract event indexer with optimized replay batching",
   "main": "dist/index.js",
   "scripts": {
+    "preinstall": "node scripts/check-package-manager.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "test": "vitest run",

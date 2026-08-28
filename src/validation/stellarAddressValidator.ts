@@ -28,105 +28,74 @@
  * @module validation/stellarAddressValidator
  */
 
+import type { StellarNetwork } from '../config/stellar.js';
 import type { RedisClient } from '../redis/client.js';
 import type { StellarRpcService } from '../services/stellar-rpc.js';
 import { CircuitOpenError } from '../services/stellar-rpc.js';
+import {
+  isValidStellarAccountAddress,
+  networkLabel,
+  STELLAR_ACCOUNT_CACHE_PREFIX,
+} from './stellarAddress.js';
 
-export const STELLAR_ACCOUNT_CACHE_PREFIX = 'fluxora:stellar:account:';
-
-const STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE = 6 << 3;
-const STELLAR_STRKEY_LENGTH = 56;
-const STELLAR_STRKEY_DECODED_LENGTH = 35;
-const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
-const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-const STELLAR_ACCOUNT_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
-
-// SEP-23 StrKey validation for Stellar Ed25519 public keys.
-function decodeStellarBase32(value: string): number[] | null {
-  const bytes: number[] = [];
-  let bits = 0;
-  let current = 0;
-
-  for (const char of value) {
-    const digit = STELLAR_STRKEY_ALPHABET.indexOf(char);
-    if (digit === -1) return null;
-
-    current = (current << 5) | digit;
-    bits += 5;
-
-    if (bits >= 8) {
-      bytes.push((current >> (bits - 8)) & 0xff);
-      bits -= 8;
-    }
-  }
-
-  return bytes;
-}
-
-function crc16XModem(bytes: readonly number[]): number {
-  let crc = 0;
-
-  for (const byte of bytes) {
-    crc ^= byte << 8;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc & 0x8000) !== 0 ? (crc << 1) ^ 0x1021 : crc << 1;
-      crc &= 0xffff;
-    }
-  }
-
-  return crc;
-}
-
-function isValidStellarAccountAddress(value: string): boolean {
-  if (typeof value !== 'string') return false;
-  if (value.length !== STELLAR_STRKEY_LENGTH || !STELLAR_ACCOUNT_PUBLIC_KEY_REGEX.test(value)) {
-    return false;
-  }
-
-  const decoded = decodeStellarBase32(value);
-  if (decoded === null || decoded.length !== STELLAR_STRKEY_DECODED_LENGTH) {
-    return false;
-  }
-
-  if (decoded[0] !== STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE) {
-    return false;
-  }
-
-  const payload = decoded.slice(0, STELLAR_STRKEY_PAYLOAD_LENGTH);
-  const expectedChecksum = crc16XModem(payload);
-  const actualChecksum =
-    decoded[STELLAR_STRKEY_PAYLOAD_LENGTH]! | (decoded[STELLAR_STRKEY_PAYLOAD_LENGTH + 1]! << 8);
-
-  return expectedChecksum === actualChecksum;
-}
+export { STELLAR_ACCOUNT_CACHE_PREFIX };
+export { isValidStellarAccountAddress };
 
 export interface AddressValidationResult {
   valid: boolean;
-  /** Populated when valid is false and an address is malformed or absent. */
+  /**
+   * Populated when valid is false. Contains every address that failed, whether
+   * because it is malformed (wrong type, bad checksum, case variant) or because
+   * it does not exist on the configured network (wrong-network / absent).
+   */
   missingAddresses?: string[];
+  /**
+   * Distinguishes why each rejected address failed. Keyed by the offending
+   * address. `malformed` means it never reached an RPC call; `wrong-network`
+   * means the address is a structurally valid account StrKey but was not found
+   * on the configured network's ledger.
+   */
+  reasons?: Record<string, 'malformed' | 'wrong-network'>;
 }
 
 export class StellarAddressValidator {
+  /**
+   * @param rpc               Stellar RPC client, bound to the configured network.
+   * @param redis             Optional Redis client for positive-lookup caching.
+   * @param cacheTtlSeconds   TTL for cached positive lookups.
+   * @param network           The configured Stellar network (source of truth for
+   *                          what counts as a valid, on-network address).
+   */
   constructor(
     private readonly rpc: StellarRpcService,
     private readonly redis: RedisClient | null,
-    private readonly cacheTtlSeconds: number
+    private readonly cacheTtlSeconds: number,
+    private readonly network: StellarNetwork
   ) {}
 
   /**
-   * Validate that both addresses exist on-chain.
+   * Validate that both addresses exist on the configured network.
    *
-   * Returns { valid: false, missingAddresses } when one or both are malformed
-   * or absent.
+   * Two layers of rejection:
+   *   1. Format (synchronous, no RPC): malformed / wrong-type / case-variant /
+   *      bad-checksum addresses are rejected before any network call.
+   *   2. Network (asynchronous, on-chain): a structurally valid account StrKey
+   *      that does not exist on the configured network is rejected as
+   *      `wrong-network`.
+   *
+   * Returns { valid: false, missingAddresses, reasons } when any address fails.
    * Returns { valid: true } when both exist (or when the RPC is unavailable
-   * and we fail-open).
+   * and we fail-open — see {@link checkAddress}).
    */
   async validate(sender: string, recipient: string): Promise<AddressValidationResult> {
-    const malformed = [sender, recipient].filter(
-      (address) => !isValidStellarAccountAddress(address)
-    );
+    const reasons: Record<string, 'malformed' | 'wrong-network'> = {};
+    const malformed = [sender, recipient].filter((address) => {
+      const ok = isValidStellarAccountAddress(address);
+      if (!ok) reasons[address] = 'malformed';
+      return !ok;
+    });
     if (malformed.length > 0) {
-      return { valid: false, missingAddresses: malformed };
+      return { valid: false, missingAddresses: malformed, reasons };
     }
 
     const [senderExists, recipientExists] = await Promise.all([
@@ -135,11 +104,17 @@ export class StellarAddressValidator {
     ]);
 
     const missing: string[] = [];
-    if (senderExists === false) missing.push(sender);
-    if (recipientExists === false) missing.push(recipient);
+    if (senderExists === false) {
+      missing.push(sender);
+      reasons[sender] = 'wrong-network';
+    }
+    if (recipientExists === false) {
+      missing.push(recipient);
+      reasons[recipient] = 'wrong-network';
+    }
 
     if (missing.length > 0) {
-      return { valid: false, missingAddresses: missing };
+      return { valid: false, missingAddresses: missing, reasons };
     }
     return { valid: true };
   }
@@ -167,6 +142,7 @@ export class StellarAddressValidator {
           '[StellarAddressValidator] Circuit breaker OPEN — failing open for address check',
           {
             addressLength: address.length,
+            network: networkLabel(this.network),
           }
         );
         return null; // fail-open
@@ -174,6 +150,7 @@ export class StellarAddressValidator {
       // Network / provider error — fail-open with a warning
       console.warn('[StellarAddressValidator] RPC error — failing open for address check', {
         addressLength: address.length,
+        network: networkLabel(this.network),
         error: err instanceof Error ? err.message : String(err),
       });
       return null;

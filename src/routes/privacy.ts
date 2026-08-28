@@ -39,7 +39,7 @@ import {
 } from '../middleware/errorHandler.js';
 import { successResponse } from '../utils/response.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
-import { recordAuditEventToDb, recordErasureAuditLog } from '../lib/auditLog.js';
+import { recordAuditEventToDb, recordErasureAuditLog, writeAuditEntryToClient } from '../lib/auditLog.js';
 import { hashStringSHA256 } from '../lib/security.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
@@ -463,11 +463,17 @@ privacyRouter.delete(
           rowsErased = result.rowsErased;
           rowsSkippedLegalHold = result.rowsSkippedLegalHold;
 
+          // Audit writes are inside the same transaction so they commit or
+          // roll back atomically with the redaction. A failed audit write
+          // will roll back the entire operation — preferable to a silent
+          // success audit entry for a redaction that never committed.
           try {
-            await recordErasureAuditLog(
+            const truncatedId = address.length > 8 ? address.substring(0, 8) + '…' : address;
+            await writeAuditEntryToClient(
+              client,
               'GDPR_ERASURE',
               'streams',
-              address,
+              truncatedId,
               correlationId,
               {
                 requesterRole,
@@ -478,11 +484,11 @@ privacyRouter.delete(
                 action: 'GDPR_ERASURE',
               },
             );
-
-            await recordAuditEventToDb(
+            await writeAuditEntryToClient(
+              client,
               'PII_ERASURE_REQUESTED',
               'streams',
-              address.substring(0, 8) + '…',
+              truncatedId,
               correlationId,
               {
                 rowsErased,
@@ -491,15 +497,17 @@ privacyRouter.delete(
               },
             );
           } catch (auditErr) {
-            logger.error('Failed to write erasure audit entry', correlationId, {
+            logger.error('Failed to write erasure audit entry — rolling back', correlationId, {
               event: 'pii_erasure_audit_failed',
               error: auditErr instanceof Error ? auditErr.message : String(auditErr),
             });
+            await client.query('ROLLBACK');
+            throw auditErr;
           }
 
           await client.query('COMMIT');
         } catch (txErr) {
-          await client.query('ROLLBACK');
+          await client.query('ROLLBACK').catch(() => {/* already rolled back */});
           throw txErr;
         }
       });
