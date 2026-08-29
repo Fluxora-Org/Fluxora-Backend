@@ -257,7 +257,7 @@ describe('WebhookDispatcher outbox polling', () => {
       return originalQuery(sql, params);
     });
 
-    let fetchHeaders: Record<string, string> | undefined;
+    let fetchHeaders: RequestInit['headers'] | undefined;
     global.fetch = vi.fn(async (url, init) => {
       fetchHeaders = init?.headers;
       return new Response(null, { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -280,7 +280,7 @@ describe('WebhookDispatcher outbox polling', () => {
     vi.spyOn(Date, 'now').mockReturnValue(now2);
     
     const client2 = createClient([originalRow]);
-    let fetchHeaders2: Record<string, string> | undefined;
+    let fetchHeaders2: RequestInit['headers'] | undefined;
     global.fetch = vi.fn(async (url, init) => {
       fetchHeaders2 = init?.headers;
       return new Response(null, { status: 200 });

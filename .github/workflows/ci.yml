@@ -7,6 +7,30 @@ on:
     branches: [ main, develop ]
 
 jobs:
+  typecheck:
+    name: TypeScript Typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Uses tsconfig.json directly; failures block the workflow.
+      - name: Run TypeScript typecheck
+        run: pnpm run typecheck
+
   test:
     name: Test
     runs-on: ubuntu-latest

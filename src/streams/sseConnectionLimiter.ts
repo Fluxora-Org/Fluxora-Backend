@@ -113,7 +113,7 @@ export function resolveSseConnectionLimits(
     maxGlobalConnections: readBoundedPositiveInteger(
       env,
       'SSE_MAX_GLOBAL_CONNECTIONS',
-      DEFAULT_SSE_MAX_CONNECTIONS_PER_IP,
+      DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS,
       1,
       MAX_SSE_CONNECTION_LIMIT,
     ),
@@ -151,7 +151,7 @@ export function tryAcquireSseConnection(
   const activeConnectionsForIp = activeConnectionsByIp.get(normalizedIp) ?? 0;
 
   if (activeConnectionsForIp >= limits.maxConnectionsPerIp) {
-    if (isValidRejectionReason('please')) {
+    if (isValidRejectionReason('per_ip_limit')) {
       sseConnectionsRejectedTotal.inc({
         reason: 'per_ip_limit',
       });

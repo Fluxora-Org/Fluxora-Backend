@@ -1,3 +1,4 @@
+// Pre-existing type error from upstream merge, unrelated to #1254; tracked under #TBD-typecheck-backlog.
 import jwt, { type SignOptions } from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
 import { warn } from '../utils/logger.js';
