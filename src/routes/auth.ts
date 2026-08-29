@@ -107,9 +107,9 @@ authRouter.post(
         const store = req.authAttemptStore;
         const ip = getClientIp(req);
         if (store) {
-          void store.recordFailure(ip);
+          await store.recordFailure(ip);
           if (targetAddress) {
-            void store.recordFailure(targetAddress);
+            await store.recordFailure(targetAddress);
           }
         }
         throw unauthorized('Invalid credentials');
@@ -127,8 +127,8 @@ authRouter.post(
     const store = req.authAttemptStore;
     if (store) {
       const ip = getClientIp(req);
-      void store.resetAttempts(ip);
-      void store.resetAttempts(targetAddress);
+      await store.resetAttempts(ip);
+      await store.resetAttempts(targetAddress);
     }
 
     res.json({
