@@ -294,6 +294,7 @@ export interface WebhookDeliveryGateDeps {
   rateLimiter?: IWebhookRateLimiter;
   circuitBreakerStore?: WebhookCircuitBreakerStore;
   rateLimitConfig?: RateLimitConfig;
+  rateLimitDimensions?: { tenant: string; endpoint: string; outcome: string; weight: number };
 }
 
 export interface WebhookDeliveryGateResult {
@@ -312,19 +313,18 @@ function augmentPayloadWithRetry(payload: unknown, attemptNumber: number): unkno
   base['_webhookRetry'] = { attemptNumber };
   return base;
 }
-
 /**
  * Evaluate rate-limit and circuit-breaker gates before an outbound webhook attempt.
  */
 export async function checkWebhookDeliveryGate(
-  consumerUrl: string,
+  consumerKey: string,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
   deps: WebhookDeliveryGateDeps = {},
   now: number = Date.now()
 ): Promise<WebhookDeliveryGateResult> {
   const circuitBreakerStore = deps.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
 
-  const breaker = await circuitBreakerStore.checkAndClaimAttempt(consumerUrl, policy, now);
+  const breaker = await circuitBreakerStore.checkAndClaimAttempt(consumerKey, policy, now);
   if (!breaker.allowed) {
     return {
       canDeliver: false,
@@ -335,7 +335,9 @@ export async function checkWebhookDeliveryGate(
   }
 
   if (deps.rateLimiter && deps.rateLimitConfig) {
-    const limit = await deps.rateLimiter.checkLimit(consumerUrl, deps.rateLimitConfig);
+    const dimensions = deps.rateLimitDimensions ?? { tenant: 'default', endpoint: consumerKey, outcome: 'first_attempt', weight: 1 };
+    const rlConfig = { ...deps.rateLimitConfig, weight: dimensions.weight };
+    const limit = await deps.rateLimiter.checkLimit(dimensions, rlConfig);
     if (!limit.canAttempt) {
       return {
         canDeliver: false,
@@ -363,11 +365,25 @@ export async function attemptWebhookDeliveryWithRateLimit(
 ): Promise<WebhookOutboxRetryPlan & { attempt?: WebhookDeliveryAttempt }> {
   const policy = input.policy ?? DEFAULT_RETRY_POLICY;
   const now = input.now ?? Date.now();
-  // consumerUrl is optional on the input but is the rate-limit and
-  // circuit-breaker key; fall back to the stream id so callers that omit it
-  // still get per-stream isolation rather than a shared global bucket.
+  // We bound rate limiting by tenant, endpoint, and delivery outcome.
+  // Extract tenant from payload if available, else fallback to streamId.
+  const payloadObj = typeof input.payload === 'object' && input.payload !== null ? input.payload as Record<string, unknown> : {};
+  const tenant = (typeof payloadObj['tenant_id'] === 'string' ? payloadObj['tenant_id'] : null) ?? 
+                 (typeof payloadObj['tenantId'] === 'string' ? payloadObj['tenantId'] : null) ?? 
+                 input.streamId;
+  const endpoint = input.consumerUrl ?? 'unknown_endpoint';
+  const isRetry = input.attemptNumber > 1;
+  const outcome = isRetry ? 'retry' : 'first_attempt';
+  const weight = isRetry ? input.attemptNumber : 1;
+  
+  const dimensions = { tenant, endpoint, outcome, weight };
+  
+  // Circuit breaker still uses consumerUrl as key for endpoint-wide protection
   const consumerKey = input.consumerUrl ?? input.streamId;
-  const gate = await checkWebhookDeliveryGate(consumerKey, policy, deps, now);
+  const gate = await checkWebhookDeliveryGate(consumerKey, policy, {
+    ...deps,
+    rateLimitDimensions: dimensions
+  }, now);
 
   if (!gate.canDeliver) {
     return {
