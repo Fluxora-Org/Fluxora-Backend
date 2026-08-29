@@ -179,6 +179,8 @@ export function _resetRestoreJobs(): void {
 
 // ─── Restore Execution ────────────────────────────────────────────────────────
 
+const DEFAULT_BACKUP_PREFIX = 'backups/';
+
 /**
  * Validates that `backupId` is safe to use as an S3 key.
  *
@@ -337,7 +339,7 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
   const resolvedBackupId = resolveBackupObjectKey(backupId, configuredPrefix);
 
   if (targetEnvironment === 'production' && !confirmProduction) {
-    throw new Error(
+    throw new ValidationError(
       'Restoring into the production environment requires confirmProduction: true. ' +
         'Set this flag explicitly to acknowledge the risk.'
     );
@@ -345,7 +347,7 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
 
   const bucket = process.env.S3_BACKUP_BUCKET;
   if (!bucket) {
-    throw new Error('S3_BACKUP_BUCKET environment variable is required for restore operations.');
+    throw new ConfigurationError('S3_BACKUP_BUCKET environment variable is required for restore operations.');
   }
 
   const region = process.env.AWS_REGION ?? 'us-east-1';
