@@ -56,4 +56,29 @@ describe('WebSocket upgrade admission', () => {
     expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
   });
+
+  // ── Scope matrix — exact, missing, malformed, expired, cross-tenant (#1266) ──
+
+  it('rejects a malformed (non-JWT) token before upgrade', async () => {
+    await expect(
+      connect(port, { origin: 'https://app.example', token: 'not-a-jwt-at-all' }),
+    ).rejects.toBeTruthy();
+    expect(hub.clientCount).toBe(0);
+  });
+
+  it('rejects a token signed with a different (cross-tenant) secret before upgrade', async () => {
+    const crossTenant = jwt.sign({ sub: 'user-1' }, 'another-tenant-secret', { expiresIn: '5m' });
+    await expect(
+      connect(port, { origin: 'https://app.example', token: crossTenant }),
+    ).rejects.toBeTruthy();
+    expect(hub.clientCount).toBe(0);
+  });
+
+  it('rejects an expired token even when the payload is otherwise valid', async () => {
+    const expired = jwt.sign({ sub: 'user-1' }, SECRET, { expiresIn: -60 });
+    await expect(
+      connect(port, { origin: 'https://app.example', token: expired }),
+    ).rejects.toBeTruthy();
+    expect(hub.clientCount).toBe(0);
+  });
 });

@@ -13,60 +13,109 @@ import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vite
 import request from 'supertest';
 
 // ── Mock streamRepository before importing app ─────────────────────────────────
-const mockStream = vi.hoisted(() => ({
-  id: 'stream-001',
-  sender_address: 'GABCDEF123',
-  recipient_address: 'GHIJKLM456',
-  amount: '1000.0000000',
-  streamed_amount: '500.0000000',
-  remaining_amount: '500.0000000',
-  rate_per_second: '1.0000000',
-  start_time: 1700000000,
-  end_time: 1700100000,
-  status: 'active',
-  contract_id: 'CCONTRACT123',
-  transaction_hash: '0xdeadbeef',
-  event_index: 0,
-  created_at: '2026-01-01T00:00:00.000Z',
-  updated_at: '2026-01-01T00:00:00.000Z',
-}));
+// vi.hoisted is required: vi.mock factories are hoisted above top-level const
+// declarations, so any fn/mock referenced inside a factory must be created via
+// vi.hoisted to exist at factory-evaluation time.
+const gqlMocks = vi.hoisted(() => {
+  const mockStream = {
+    id: 'stream-001',
+    sender_address: 'GABCDEF123',
+    recipient_address: 'GHIJKLM456',
+    amount: '1000.0000000',
+    streamed_amount: '500.0000000',
+    remaining_amount: '500.0000000',
+    rate_per_second: '1.0000000',
+    start_time: 1700000000,
+    end_time: 1700100000,
+    status: 'active',
+    contract_id: 'CCONTRACT123',
+    transaction_hash: '0xdeadbeef',
+    event_index: 0,
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+  };
+  return {
+    mockStream,
+    mockGetById: vi.fn(),
+    mockFindWithCursor: vi.fn(),
+    mockAuditEntries: [
+      {
+        seq: 1,
+        timestamp: '2026-01-01T00:00:00.000Z',
+        action: 'STREAM_CREATED',
+        resourceType: 'stream',
+        resourceId: 'stream-001',
+        correlationId: 'req-1',
+        meta: { amount: '1000' },
+      },
+    ],
+  };
+});
 
-const mockGetById = vi.fn();
-const mockFindWithCursor = vi.fn();
+const { mockStream, mockGetById, mockFindWithCursor, mockAuditEntries } = gqlMocks;
 
 vi.mock('../../src/db/repositories/streamRepository.js', () => ({
   streamRepository: {
-    getById: mockGetById,
-    findWithCursor: mockFindWithCursor,
+    getById: gqlMocks.mockGetById,
+    findWithCursor: gqlMocks.mockFindWithCursor,
   },
 }));
 
-// ── Mock audit log ─────────────────────────────────────────────────────────────
-const mockAuditEntries = vi.hoisted(() => [
-  {
-    seq: 1,
-    timestamp: '2026-01-01T00:00:00.000Z',
-    action: 'STREAM_CREATED',
-    resourceType: 'stream',
-    resourceId: 'stream-001',
-    correlationId: 'req-1',
-    meta: { amount: '1000' },
-  },
-]);
-
 vi.mock('../../src/lib/auditLog.js', () => ({
-  getAuditEntries: vi.fn(() => mockAuditEntries),
+  getAuditEntries: vi.fn(() => gqlMocks.mockAuditEntries),
 }));
 
 // ── Mock auth middleware to pass through quickly ───────────────────────────────
-// We mock the middlware modules so the app doesn't need real JWT secret.
+// We mock the middleware modules so the app doesn't need a real JWT secret.
+// The mocked principal carries all gateway scopes so the real per-resolver
+// scope gates (which run on the real gateway) let these tests through.
 vi.mock('../../src/middleware/auth.js', () => ({
+  // Faithful stand-in: only authenticate when a Bearer token is present, and
+  // requireAuth rejects requests with no principal — mirroring the real
+  // middleware so the auth-guard tests exercise real behavior.
   authenticate: vi.fn((req, _res, next) => {
-    req.user = { role: 'admin', keyId: 'key-admin' };
+    if (req.headers.authorization) {
+      req.user = {
+        role: 'admin',
+        keyId: 'key-admin',
+        permissions: ['streams:read', 'streams:write', 'audit:read'],
+      };
+    }
     next();
   }),
-  requireAuth: vi.fn((_req, _res, next) => next()),
+  authenticateApiKey: vi.fn((_req, _res, next) => next()),
+  requireAuth: vi.fn((req, res, next) => {
+    if (!req.user && !req.keyId) {
+      res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Authentication required' } });
+      return;
+    }
+    next();
+  }),
+  // requireScope mirrors the real middleware's deny-by-default gate.
+  requireScope: () => vi.fn((req, res, next) => {
+    const isApiKeyAuth = (req as any).keyId !== undefined;
+    const isJwtAuth = req.user !== undefined;
+    if (!isApiKeyAuth && !isJwtAuth) {
+      res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Authentication required' } });
+      return;
+    }
+    next();
+  }),
   requirePermission: () => vi.fn((_req, _res, next) => next()),
+  Permission: {
+    STREAMS_READ: 'streams:read',
+    STREAMS_WRITE: 'streams:write',
+    ADMIN_PAUSE: 'admin:pause',
+    ADMIN_REINDEX: 'admin:reindex',
+    INDEXER_REPLAY: 'indexer:replay',
+    DLQ_LIST: 'dlq:list',
+    DLQ_READ: 'dlq:read',
+    DLQ_REPLAY: 'dlq:replay',
+    DLQ_DELETE: 'dlq:delete',
+    DLQ_CONSUMER_RESUME: 'dlq:consumer:resume',
+    AUDIT_READ: 'audit:read',
+    AUDIT_WRITE: 'audit:write',
+  },
 }));
 
 // ── Mock downstream deps ───────────────────────────────────────────────────────
@@ -192,8 +241,10 @@ describe('GraphQL gateway', () => {
   // ── Streams list query ───────────────────────────────────────────────────
 
   it('resolves paginated stream list', async () => {
+    // `total` is only populated when includeTotal: true is requested (the
+    // schema documents this contract on the StreamConnection.total field).
     const res = await gql({
-      query: `{ streams(limit: 10) { streams { id status } hasMore total } }`,
+      query: `{ streams(limit: 10, includeTotal: true) { streams { id status } hasMore total } }`,
     });
 
     expect(res.status).toBe(200);

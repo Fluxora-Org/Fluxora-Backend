@@ -50,17 +50,15 @@ vi.mock('../../src/lib/auditLog.js', () => ({
 }));
 
 import { adminRouter } from '../../src/routes/admin.js';
+import { correlationIdMiddleware } from '../../src/middleware/correlationId.js';
 
 // Mount only the admin router on a minimal app so this suite exercises the API
 // key routes end-to-end without depending on the full application bootstrap.
+// The real correlation-id middleware is used so the x-request-id response
+// header contract is exercised exactly as in production.
 const app = express();
 app.use(express.json());
-// Stand in for the production correlation-id middleware so handlers can thread a
-// correlation id into the audit trail.
-app.use((req, _res, next) => {
-  (req as express.Request & { correlationId?: string }).correlationId = 'test-correlation';
-  next();
-});
+app.use(correlationIdMiddleware);
 app.use('/api/admin', adminRouter);
 
 const ADMIN_KEY = 'test-admin-key-for-apikey-routes';
@@ -407,6 +405,74 @@ describe('admin API key routes', () => {
       .delete(`/api/admin/api-keys/${id}`)
       .set('Authorization', 'Bearer not-the-admin-key');
     expect(res.status).toBe(403);
+  });
+
+  // ── 6b. Scope matrix — exact, extra, expired, revoked, cross-tenant (#1266) ──
+  //
+  // The admin entrypoint is gated by a single bearer credential. The matrix
+  // proves: an exact credential passes, a missing one is 401, a wrong
+  // (cross-tenant) one is 403, a non-admin role is 403, and an expired
+  // admin JWT is 403 — while an API-key (X-API-Key) credential is never
+  // accepted as an admin credential.
+
+  it('accepts the exact admin credential', async () => {
+    const res = await authed(request(app).get('/api/admin/api-keys'));
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects an expired admin JWT with 403', async () => {
+    const jwt = require('jsonwebtoken').sign(
+      { address: 'GADMIN000000000000000000000000000000000000000000000', role: 'admin' } as any,
+      process.env.JWT_SECRET ?? 'a-very-long-secret-key-for-testing-only-12345',
+      { expiresIn: -60 },
+    );
+
+    const res = await request(app)
+      .get('/api/admin/api-keys')
+      .set('Authorization', `Bearer ${jwt}`);
+
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects a non-admin (operator) JWT with 403', async () => {
+    const jwt = require('jsonwebtoken').sign(
+      { address: 'GOPERATOR0000000000000000000000000000000000000000000', role: 'operator' } as any,
+      process.env.JWT_SECRET ?? 'a-very-long-secret-key-for-testing-only-12345',
+    );
+
+    const res = await request(app)
+      .get('/api/admin/api-keys')
+      .set('Authorization', `Bearer ${jwt}`);
+
+    expect(res.status).toBe(403);
+  });
+
+  it('never accepts an API-key (X-API-Key) credential on admin routes', async () => {
+    const apiKey = await request(app)
+      .post('/api/admin/api-keys')
+      .set('Authorization', 'Bearer ' + ADMIN_KEY)
+      .send({ name: 'credential-source' })
+      .then((r) => r.body.data.key as string);
+
+    // Presenting the just-created API key via X-API-Key must not grant admin
+    // access — the admin and API-key namespaces are separate.
+    const res = await request(app)
+      .get('/api/admin/api-keys')
+      .set('X-API-Key', apiKey);
+
+    expect([401, 403, 503]).toContain(res.status);
+    expect(res.status).not.toBe(200);
+  });
+
+  it('cross-tenant admin credential cannot observe another tenants keys', async () => {
+    await authed(request(app).post('/api/admin/api-keys').send({ name: 'tenant-a-key' }));
+
+    const res = await request(app)
+      .get('/api/admin/api-keys')
+      .set('Authorization', 'Bearer different-tenant-admin-credential');
+
+    expect(res.status).toBe(403);
+    expect(res.body).not.toHaveProperty('data');
   });
 
   // ── 7. Duplicate names ─────────────────────────────────────────────────

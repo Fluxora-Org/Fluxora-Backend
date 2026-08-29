@@ -195,7 +195,6 @@ const DEFAULT_BACKUP_PREFIX = 'backups/';
  * @param backupId - Raw input from the HTTP request body.
  * @throws {ValidationError} when the key is unsafe.
  */
-const DEFAULT_BACKUP_PREFIX = 'backups/';
 
 /**
  * Normalize a configured S3 prefix to a non-ambiguous directory boundary.
