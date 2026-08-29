@@ -16,6 +16,7 @@ import type { RedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 
 const LEADER_KEY = 'indexer:leader-election:replay';
+const FENCE_KEY = 'indexer:leader-election:replay:fence';
 const DEFAULT_LEASE_MS = 15_000;
 
 export interface IndexerLeaderElectionOptions {
@@ -34,6 +35,13 @@ export interface IndexerLeaderElection {
   tryAcquire(): Promise<boolean>;
   /** Release the lease (if held) and stop the heartbeat. */
   release(): Promise<void>;
+  /**
+   * Monotonically increasing fencing token for the current leadership epoch.
+   * A stale leader (whose lease expired and was re-acquired by another
+   * instance) retains its old, lower token; writes carrying that token must
+   * be rejected by the store so a split-brain worker cannot commit.
+   */
+  getFencingToken(): number;
 }
 
 /**
@@ -53,6 +61,10 @@ export class NoOpLeaderElection implements IndexerLeaderElection {
   async release(): Promise<void> {
     return;
   }
+
+  getFencingToken(): number {
+    return 0;
+  }
 }
 
 export class RedisIndexerLeaderElection implements IndexerLeaderElection {
@@ -60,6 +72,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
   private readonly renewIntervalMs: number;
   private readonly instanceId: string;
   private _isLeader = false;
+  private _fencingToken = 0;
   private heartbeat: NodeJS.Timeout | null = null;
 
   constructor(
@@ -89,6 +102,10 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
     try {
       const acquired = await this.redis.setNx(LEADER_KEY, this.instanceId, this.leaseMs);
       if (acquired) {
+        // Fresh acquisition: bump the shared fencing counter so any previous
+        // leader's token becomes stale. The new token is strictly greater
+        // than every token issued before this epoch.
+        this._fencingToken = await this.redis.incr(FENCE_KEY);
         this._isLeader = true;
         this.startHeartbeat();
         return true;
@@ -96,6 +113,10 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
 
       const current = await this.redis.get(LEADER_KEY);
       if (current === this.instanceId) {
+        // We already hold the lease (idempotent re-confirm). Re-read the
+        // current fencing token so a re-acquire after a reconnect observes
+        // the latest epoch.
+        this._fencingToken = await this.readFencingToken();
         this._isLeader = true;
         if (!this.heartbeat) this.startHeartbeat();
         return true;
@@ -111,6 +132,17 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
       this._isLeader = false;
       return false;
     }
+  }
+
+  getFencingToken(): number {
+    return this._fencingToken;
+  }
+
+  /** Read the current shared fencing counter (0 when never acquired). */
+  private async readFencingToken(): Promise<number> {
+    const raw = await this.redis.get(FENCE_KEY);
+    const parsed = raw === null ? 0 : Number(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
   }
 
   /**
