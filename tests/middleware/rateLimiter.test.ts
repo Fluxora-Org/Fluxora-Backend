@@ -1,6 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
-import { createRateLimiter, extractClientIdentifier, isAdminKey } from '../../src/middleware/rateLimiter.js';
+import {
+  createRateLimiter,
+  extractClientIdentifier,
+  isAdminKey,
+  normaliseIp,
+  routeKeyFromPath,
+  buildStoreKey,
+  AGGREGATE_ROUTE,
+} from '../../src/middleware/rateLimiter.js';
 import { getClientIp } from '../../src/ws/connectionLimiter.js';
 import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
 import * as overrideService from '../../src/services/tenantRateLimitOverride.service.js';
@@ -459,6 +467,218 @@ describe('rate limiter middleware — per-tenant override resolution', () => {
 
     expect(next).toHaveBeenCalled();
     expect(res.setHeader).toHaveBeenCalledWith('X-RateLimit-Limit', '20');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1260 — canonical rate-limit keys: tenant/principal collision hardening
+// ---------------------------------------------------------------------------
+
+describe('normaliseIp — canonical principal encoding', () => {
+  it('keeps IPv4 addresses as-is', () => {
+    expect(normaliseIp('1.2.3.4')).toBe('1.2.3.4');
+    expect(normaliseIp(' 10.0.0.1 ')).toBe('10.0.0.1');
+  });
+
+  it('collapses equivalent IPv6 encodings onto one canonical form', () => {
+    const compressed = normaliseIp('2001:db8::1');
+    const expanded = normaliseIp('2001:0db8:0:0:0:0:0:1');
+    const full = normaliseIp('2001:0DB8:0000:0000:0000:0000:0000:0001');
+    expect(expanded).toBe(compressed);
+    expect(full).toBe(compressed);
+    expect(compressed).toBe('2001:0db8:0000:0000:0000:0000:0000:0001');
+  });
+
+  it('folds IPv4-mapped IPv6 addresses to their IPv4 form', () => {
+    expect(normaliseIp('::ffff:1.2.3.4')).toBe('1.2.3.4');
+    expect(normaliseIp('::FFFF:10.0.0.9')).toBe('10.0.0.9');
+  });
+
+  it('falls back to unknown for empty or unparseable input', () => {
+    expect(normaliseIp('')).toBe('unknown');
+    expect(normaliseIp('   ')).toBe('unknown');
+    expect(normaliseIp('not-an-ip')).toBe('not-an-ip');
+  });
+
+  it('maps different addresses to different canonical forms', () => {
+    expect(normaliseIp('2001:db8::1')).not.toBe(normaliseIp('2001:db8::2'));
+    expect(normaliseIp('1.2.3.4')).not.toBe(normaliseIp('5.6.7.8'));
+  });
+});
+
+describe('routeKeyFromPath — collision-resistant route encoding', () => {
+  it('never conflates distinct routes that previously collided', () => {
+    // The legacy `_`-substitution mapped both of these to `api_foo_bar`.
+    expect(routeKeyFromPath('/api/foo/bar')).not.toBe(routeKeyFromPath('/api/foo_bar'));
+    expect(routeKeyFromPath('/api/foo/bar')).toBe('api_2ffoo_2fbar');
+    expect(routeKeyFromPath('/api/foo_bar')).toBe('api_2ffoo_5fbar');
+  });
+
+  it('maps the same path to the same key deterministically', () => {
+    expect(routeKeyFromPath('/api/streams')).toBe(routeKeyFromPath('/api/streams'));
+    expect(routeKeyFromPath('/api/streams')).toBe('api_2fstreams');
+  });
+
+  it('maps missing, root, and empty paths to the aggregate route', () => {
+    expect(routeKeyFromPath(undefined)).toBe(AGGREGATE_ROUTE);
+    expect(routeKeyFromPath('/')).toBe(AGGREGATE_ROUTE);
+    expect(routeKeyFromPath('///')).toBe(AGGREGATE_ROUTE);
+  });
+
+  it('bounds overly long paths with a fixed-length hash', () => {
+    const long = `/api/${'a'.repeat(500)}`;
+    const key = routeKeyFromPath(long);
+    expect(key.startsWith('h_')).toBe(true);
+    expect(key.length).toBe(2 + 64);
+    // Same path hashes identically; a different long path hashes differently.
+    expect(routeKeyFromPath(long)).toBe(key);
+    expect(routeKeyFromPath(`${long}x`)).not.toBe(key);
+  });
+});
+
+describe('buildStoreKey — canonical key namespace', () => {
+  it('separates admin principals from tenant API keys even for identical raw keys', () => {
+    const raw = 'shared-secret-string';
+    const adminKey = buildStoreKey('admin', raw, 'api_2fstreams');
+    const apiKey = buildStoreKey('apikey', raw, 'api_2fstreams');
+    expect(adminKey).not.toBe(apiKey);
+    // Both are deterministic and never contain raw key material.
+    expect(adminKey).toBe(buildStoreKey('admin', raw, 'api_2fstreams'));
+    expect(adminKey).not.toContain(raw);
+    expect(apiKey).not.toContain(raw);
+  });
+
+  it('separates different principals within the same type', () => {
+    expect(buildStoreKey('apikey', 'key-a', 'api_2fstreams')).not.toBe(
+      buildStoreKey('apikey', 'key-b', 'api_2fstreams'),
+    );
+    expect(buildStoreKey('ip', '1.2.3.4', 'api_2fstreams')).not.toBe(
+      buildStoreKey('ip', '5.6.7.8', 'api_2fstreams'),
+    );
+  });
+
+  it('uses the canonical IP form for ip principals', () => {
+    expect(buildStoreKey('ip', '::ffff:1.2.3.4', 'api_2fstreams')).toBe(
+      buildStoreKey('ip', '1.2.3.4', 'api_2fstreams'),
+    );
+    expect(buildStoreKey('ip', '2001:db8::1', 'api_2fstreams')).toBe(
+      buildStoreKey('ip', '2001:0db8:0:0:0:0:0:1', 'api_2fstreams'),
+    );
+  });
+
+  it('keeps keys bounded and versioned', () => {
+    // A 500-char raw key and a 500-char path must still produce a short key:
+    // the store sanitises to ≤256 chars, and the canonical builder must stay
+    // well under that even for adversarial input.
+    const key = buildStoreKey('apikey', 'x'.repeat(500), routeKeyFromPath(`/api/${'y'.repeat(400)}`));
+    expect(key.length).toBeLessThanOrEqual(150);
+    expect(key.startsWith('v1:apikey:')).toBe(true);
+    expect(key).not.toContain('x'.repeat(64));
+  });
+});
+
+describe('rate limiter middleware — principal isolation and expiry', () => {
+  let env: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    env = {
+      RATE_LIMIT_ENABLED: 'true',
+      RATE_LIMIT_IP_MAX: '3',
+      RATE_LIMIT_IP_WINDOW_MS: '60000',
+      RATE_LIMIT_APIKEY_MAX: '5',
+      RATE_LIMIT_APIKEY_WINDOW_MS: '60000',
+      RATE_LIMIT_ADMIN_MAX: '10',
+      RATE_LIMIT_ADMIN_WINDOW_MS: '60000',
+    };
+  });
+
+  it('treats equivalent IP encodings as one principal (shared quota)', async () => {
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const res = mockResponse();
+
+    for (let i = 0; i < 3; i++) {
+      await invoke(limiter, mockRequest({ headers: {}, ip: '1.2.3.4' }), mockResponse(), mockNext());
+    }
+
+    // IPv4-mapped IPv6 of the same address must consume the same quota.
+    const mappedNext = mockNext();
+    await invoke(limiter, mockRequest({ headers: {}, ip: '::ffff:1.2.3.4' }), res, mappedNext);
+    expect(mappedNext).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(429);
+  });
+
+  it('collapses expanded and compressed IPv6 encodings onto one counter', async () => {
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const res = mockResponse();
+
+    for (let i = 0; i < 3; i++) {
+      await invoke(limiter, mockRequest({ headers: {}, ip: '2001:db8::1' }), mockResponse(), mockNext());
+    }
+
+    const expandedNext = mockNext();
+    await invoke(
+      limiter,
+      mockRequest({ headers: {}, ip: '2001:0db8:0000:0000:0000:0000:0000:0001' }),
+      res,
+      expandedNext,
+    );
+    expect(expandedNext).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(429);
+  });
+
+  it('keeps admin-key quota in its own namespace (separate from tenant keys)', async () => {
+    env.ADMIN_API_KEY = 'admin-key-1';
+    env.RATE_LIMIT_APIKEY_MAX = '2';
+    env.RATE_LIMIT_ADMIN_MAX = '10';
+    const limiter = createRateLimiter(env, new InMemoryStore());
+
+    // Exhaust a tenant key's quota.
+    const res = mockResponse();
+    const next = mockNext();
+    for (let i = 0; i < 2; i++) {
+      await invoke(limiter, mockRequest({ headers: { 'x-api-key': 'tenant-key-a' } }), res, next);
+    }
+    const blockedNext = mockNext();
+    await invoke(limiter, mockRequest({ headers: { 'x-api-key': 'tenant-key-a' } }), res, blockedNext);
+    expect(blockedNext).not.toHaveBeenCalled();
+
+    // The admin key (a different raw string) is still fully within its own
+    // higher quota — admin traffic never touches the tenant counter.
+    const adminRes = mockResponse();
+    const adminNext = mockNext();
+    for (let i = 0; i < 5; i++) {
+      await invoke(limiter, mockRequest({ headers: { 'x-api-key': 'admin-key-1' } }), adminRes, adminNext);
+    }
+    expect(adminNext).toHaveBeenCalledTimes(5);
+    expect(adminRes.status).not.toHaveBeenCalledWith(429);
+  });
+
+  it('resets quota after the window expires (keys are bounded by TTL)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    try {
+      const limiter = createRateLimiter(env, new InMemoryStore());
+      const req = mockRequest({ headers: {}, ip: '6.6.6.6' });
+
+      for (let i = 0; i < 3; i++) {
+        await invoke(limiter, req, mockResponse(), mockNext());
+      }
+      const blockedNext = mockNext();
+      await invoke(limiter, mockRequest({ headers: {}, ip: '6.6.6.6' }), mockResponse(), blockedNext);
+      expect(blockedNext).not.toHaveBeenCalled();
+
+      // Advance past the 60s window — the counter must roll over.
+      vi.setSystemTime(new Date('2026-01-01T00:01:01.000Z'));
+      const freshNext = mockNext();
+      await invoke(limiter, mockRequest({ headers: {}, ip: '6.6.6.6' }), mockResponse(), freshNext);
+      expect(freshNext).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 });
 
