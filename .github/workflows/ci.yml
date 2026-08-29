@@ -70,11 +70,8 @@ jobs:
         run: pnpm run lint || echo "Linter not configured"
         continue-on-error: true
 
-      - name: Check pgcrypto migration order
-        run: pnpm run check:pgcrypto-order
-
-      - name: Check pgcrypto migration contract
-        run: pnpm run check:pgcrypto-contract
+      - name: Check migration naming policy
+        run: pnpm run check:migrations
 
       # Drift check: fail CI if sdk/python/ diverges from a fresh generation.
       # Re-run `pnpm generate:sdk:python` locally and commit the result to fix.
