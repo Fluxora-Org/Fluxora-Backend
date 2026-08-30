@@ -3,8 +3,9 @@
 The runner is `node-pg-migrate`. It records each migration stem in the
 `pgmigrations` table and orders files by their timestamp prefix. A rename is
 therefore a schema-history operation: an already-applied file with a new name
-looks unapplied and can run its DDL again. This PR does not rename applied
-migrations.
+looks unapplied and can run its DDL again. This change only renames the two
+non-baseline August migration files so they follow the policy; names already
+recorded in the baseline remain a database compatibility boundary.
 
 ## Dependency review
 
@@ -15,14 +16,15 @@ The two `20260727000000` files are also independent: API-key scopes and job
 dead-letter storage have no direct object dependency. Equal prefixes remain a
 real operational hazard because ordering is not an intentional contract.
 
-The `20260601_enable_pgcrypto_encrypt_addresses` migration is a separate
-broken historical name. It is included in the frozen baseline for this issue;
-the next issue addresses its execution ordering without mixing the two fixes.
+The pgcrypto migration was a separate broken historical name. Its canonical
+13-digit replacement is now the frozen baseline entry, while operators whose
+database ledger still records the old stem must use the ledger-audit helper
+before applying pending migrations.
 
 ## Freeze and guard
 
 `migrations/migration-baseline.json` freezes the names already present in the
-repository. Historical 8-, 13-, and 14-digit names remain unchanged so an
+repository. Historical names in that baseline remain unchanged so an
 already-migrated database is not asked to repeat DDL. The lint excludes
 `migrations/legacy/` because that directory is outside the runner scan path.
 

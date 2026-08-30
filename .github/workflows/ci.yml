@@ -76,6 +76,29 @@ jobs:
       - name: SDK drift check (TypeScript)
         run: node scripts/generate-sdk-ts.mjs --check
 
+      - name: Check migration naming policy
+        run: pnpm run check:migrations
+
+      # The database suites are guarded by DATABASE_URL so local/offline test
+      # runs remain lightweight. In CI, give them a real PostgreSQL schema and
+      # run the complete live-DB manifest explicitly so a future skip cannot
+      # silently remove coverage.
+      - name: Apply migrations for live database tests
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+        run: pnpm run migrate
+
+      - name: Run live database integration suites
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+        run: >-
+          pnpm exec vitest run --reporter=verbose
+          tests/db/vacuumCollector.collect.test.ts
+          tests/db/webhookOutbox.dispatchIndex.test.ts
+          tests/db/streams.compositeIndexes.test.ts
+          tests/db/logicalReplication.test.ts
+          tests/db/contractEvents.partitionPruning.test.ts
+
       # Required gate: failing tests block the pipeline.
       - name: Run tests
         env:

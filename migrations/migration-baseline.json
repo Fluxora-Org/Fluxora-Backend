@@ -9,7 +9,7 @@
   "1774715400000_audit-seq-unique",
   "1784888700000_add_dead_letter_queue_status",
   "1785082434167_webhook-delivery-store-tables",
-  "20260601_enable_pgcrypto_encrypt_addresses",
+  "1787788800000_enable_pgcrypto_encrypt_addresses",
   "20260622000000_streams_composite_pagination_indexes",
   "20260623000000_api-keys",
   "20260624000000_add_ledger_hash_to_contract_events",

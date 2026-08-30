@@ -1,6 +1,7 @@
 # pgcrypto migration ordering
 
-`20260601_enable_pgcrypto_encrypt_addresses.ts` used an eight-digit prefix.
+The pgcrypto migration originally used the invalid eight-digit prefix
+`20260601_enable_pgcrypto_encrypt_addresses.ts`.
 node-pg-migrate could not parse it, and the resulting sort placed it before
 `1000000000000_initial_schema`, even though it alters `streams`.
 

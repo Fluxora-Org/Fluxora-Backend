@@ -78,7 +78,7 @@ rows transparently.
 
 ## Migration
 
-- `migrations/20260601_enable_pgcrypto_encrypt_addresses.ts`
+- `migrations/1787788800000_enable_pgcrypto_encrypt_addresses.ts`
 
 Run migrations before starting the service.
 
