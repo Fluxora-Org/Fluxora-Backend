@@ -60,7 +60,7 @@ timestamp prefix are applied in ascending numeric order and recorded in the
 |---|---|
 | `1000000000000 – 1000000000999` | Bootstrapping tables converted from the legacy PoolClient runner (`000_*`, `001_*`, `002_*`) |
 | `1774715131962 +` | Streams, audit, webhook-outbox, DLQ, and PII tables |
-| `20260601000000 +` | Calendar-style additions (pgcrypto, pagination indexes, …) |
+| `20260622000000 +` | Calendar-style additions (pagination indexes, pgcrypto, partitioning, …) |
 
 Files without a leading digit (e.g. `run.ts`) are ignored by the scanner and
 will never appear in the `pgmigrations` ledger.

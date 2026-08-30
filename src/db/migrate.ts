@@ -176,6 +176,10 @@ export async function migrate(): Promise<void> {
     await runner({
       databaseUrl,
       dir: MIGRATIONS_DIR,
+      // Keep the checked-in migration baseline beside the migration files for
+      // naming-policy validation, but never ask node-pg-migrate to load JSON
+      // as an executable migration.
+      ignorePattern: '.*\\.json$',
       direction: 'up',
       migrationsTable: MIGRATIONS_TABLE,
       count: Infinity,
