@@ -106,16 +106,23 @@ function parseAndValidateEnvelope<T>(
 
 export interface IdempotencyStore<T = unknown> {
   /**
+   * Acquire a lock for the idempotency key.
+   * Returns true if acquired (first write), false if already exists or in progress.
+   */
+  start(key: string, tenantId: string, ttlSeconds: number): Promise<boolean>;
+
+  /**
    * Retrieve a previously stored response.
+   * Returns 'in_progress' if the request is still executing.
    * Returns null on cache miss or Redis unavailability.
    */
-  get(key: string): Promise<IdempotentEntry<T> | null>;
+  get(key: string, tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null>;
 
   /**
    * Persist a response for future replays.
    * Silently no-ops on Redis unavailability.
    */
-  set(key: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void>;
+  set(key: string, tenantId: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void>;
 
   /** Release any external resources (e.g. Redis connection) held by this store. */
   close(): Promise<void>;
@@ -159,15 +166,34 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
     this.logger = options?.logger ?? defaultLogger;
   }
 
-  private buildKey(key: string): string {
-    return `${IDEMPOTENCY_KEY_PREFIX}${key}`;
+  private buildKey(key: string, tenantId: string): string {
+    return `${IDEMPOTENCY_KEY_PREFIX}${tenantId}:${key}`;
   }
 
-  async get(key: string): Promise<IdempotentEntry<T> | null> {
+  async start(key: string, tenantId: string, ttlSeconds: number): Promise<boolean> {
     try {
-      const raw = await this.client.get(this.buildKey(key));
+      const fullKey = this.buildKey(key, tenantId);
+      const result = await this.client.set(fullKey, 'IN_PROGRESS', { ex: ttlSeconds, nx: true });
+      this.onStateChange?.(true);
+      return result === 'OK';
+    } catch (err) {
+      this.onStateChange?.(false);
+      this.logger.warn('Idempotency store: Redis start failed — failing open', correlationStore.getStore(), {
+        operation: 'start',
+        keyLength: key.length,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Fail open: assume lock acquired if Redis is down
+      return true;
+    }
+  }
+
+  async get(key: string, tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null> {
+    try {
+      const raw = await this.client.get(this.buildKey(key, tenantId));
       this.onStateChange?.(true);
       if (raw === null) return null;
+      if (raw === 'IN_PROGRESS') return 'in_progress';
 
       const result = parseAndValidateEnvelope<T>(raw);
       if (result.invalidReason !== undefined) {
@@ -190,10 +216,10 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
     }
   }
 
-  async set(key: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
+  async set(key: string, tenantId: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
     try {
       const versioned: IdempotentEntry<T> = { ...entry, version: ENVELOPE_VERSION };
-      await this.client.set(this.buildKey(key), JSON.stringify(versioned), { ex: ttlSeconds });
+      await this.client.set(this.buildKey(key, tenantId), JSON.stringify(versioned), { ex: ttlSeconds });
       this.onStateChange?.(true);
     } catch (err) {
       this.onStateChange?.(false);
@@ -217,10 +243,13 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
  * but duplicate protection is not enforced across instances or restarts.
  */
 export class NoOpIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
-  async get(_key: string): Promise<IdempotentEntry<T> | null> {
+  async start(_key: string, _tenantId: string, _ttlSeconds: number): Promise<boolean> {
+    return true;
+  }
+  async get(_key: string, _tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null> {
     return null;
   }
-  async set(_key: string, _entry: IdempotentEntry<T>, _ttlSeconds: number): Promise<void> {}
+  async set(_key: string, _tenantId: string, _entry: IdempotentEntry<T>, _ttlSeconds: number): Promise<void> {}
   async close(): Promise<void> {}
 }
 
@@ -231,14 +260,34 @@ export class NoOpIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
  * across instances).
  */
 export class InMemoryIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
-  private readonly store = new Map<string, IdempotentEntry<T>>();
+  private readonly store = new Map<string, { entry: IdempotentEntry<T> | 'in_progress'; expiresAt: number }>();
 
-  async get(key: string): Promise<IdempotentEntry<T> | null> {
-    return this.store.get(key) ?? null;
+  private buildKey(key: string, tenantId: string): string {
+    return `${tenantId}:${key}`;
   }
 
-  async set(key: string, entry: IdempotentEntry<T>, _ttlSeconds: number): Promise<void> {
-    this.store.set(key, entry);
+  async start(key: string, tenantId: string, ttlSeconds: number): Promise<boolean> {
+    const fullKey = this.buildKey(key, tenantId);
+    const existing = this.store.get(fullKey);
+    if (existing && performance.now() < existing.expiresAt) {
+      return false; // Already exists or in progress
+    }
+    this.store.set(fullKey, { entry: 'in_progress', expiresAt: performance.now() + ttlSeconds * 1000 });
+    return true;
+  }
+
+  async get(key: string, tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null> {
+    const fullKey = this.buildKey(key, tenantId);
+    const cached = this.store.get(fullKey);
+    if (!cached || performance.now() >= cached.expiresAt) {
+      return null;
+    }
+    return cached.entry;
+  }
+
+  async set(key: string, tenantId: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
+    const fullKey = this.buildKey(key, tenantId);
+    this.store.set(fullKey, { entry, expiresAt: performance.now() + ttlSeconds * 1000 });
   }
 
   clear(): void {
