@@ -31,8 +31,8 @@ const mockStream = vi.hoisted(() => ({
   updated_at: '2026-01-01T00:00:00.000Z',
 }));
 
-const mockGetById = vi.fn();
-const mockFindWithCursor = vi.fn();
+const mockGetById = vi.hoisted(() => vi.fn());
+const mockFindWithCursor = vi.hoisted(() => vi.fn());
 
 vi.mock('../../src/db/repositories/streamRepository.js', () => ({
   streamRepository: {
@@ -60,14 +60,42 @@ vi.mock('../../src/lib/auditLog.js', () => ({
 
 // ── Mock auth middleware to pass through quickly ───────────────────────────────
 // We mock the middlware modules so the app doesn't need real JWT secret.
-vi.mock('../../src/middleware/auth.js', () => ({
-  authenticate: vi.fn((req, _res, next) => {
-    req.user = { role: 'admin', keyId: 'key-admin' };
-    next();
-  }),
-  requireAuth: vi.fn((_req, _res, next) => next()),
-  requirePermission: () => vi.fn((_req, _res, next) => next()),
-}));
+vi.mock('../../src/middleware/auth.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/middleware/auth.js')>(
+    '../../src/middleware/auth.js'
+  );
+
+  return {
+    ...actual,
+    authenticate: vi.fn((req, _res, next) => {
+      const auth = req.headers.authorization;
+      if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+        req.user = { role: 'admin', keyId: 'key-admin' };
+      }
+      next();
+    }),
+    authenticateApiKey: vi.fn((req, _res, next) => {
+      const apiKey = req.headers['x-api-key'];
+      if (typeof apiKey === 'string' && apiKey.length > 0) {
+        req.user = { role: 'admin', keyId: 'key-admin' };
+      }
+      next();
+    }),
+    requireAuth: vi.fn((req, res, next) => {
+      if (!req.user) {
+        res.status(401).json({
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Authentication required to access this resource',
+          },
+        });
+        return;
+      }
+      next();
+    }),
+    requirePermission: () => vi.fn((_req, _res, next) => next()),
+  };
+});
 
 // ── Mock downstream deps ───────────────────────────────────────────────────────
 vi.mock('../../src/db/pool.js', () => ({
@@ -96,7 +124,7 @@ function authed(req: request.Test): request.Test {
   return req.set('Authorization', `Bearer ${ADMIN_KEY}`);
 }
 
-function gql(body: Record<string, unknown>) {
+function gql(body: Record<string, unknown> | Array<Record<string, unknown>>) {
   return authed(request(app).post('/api/graphql').send(body));
 }
 
@@ -161,6 +189,93 @@ describe('GraphQL gateway', () => {
     });
   });
 
+  it('rejects overly deep queries before resolver work', async () => {
+    const deepQuery = `
+      query {
+        stream(id: "stream-001") {
+          ... on Stream {
+            ... on Stream {
+              ... on Stream {
+                ... on Stream {
+                  ... on Stream {
+                    ... on Stream {
+                      id
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const res = await gql({ query: deepQuery });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].extensions.code).toBe('QUERY_TOO_DEEP');
+    expect(mockGetById).not.toHaveBeenCalled();
+  });
+
+  it('rejects high-complexity aliased queries', async () => {
+    const query = `
+      query {
+        a1: stream(id: "stream-001") { id }
+        a2: stream(id: "stream-001") { senderAddress }
+        a3: stream(id: "stream-001") { recipientAddress }
+        a4: stream(id: "stream-001") { amount }
+        a5: stream(id: "stream-001") { streamedAmount }
+        a6: stream(id: "stream-001") { remainingAmount }
+        a7: stream(id: "stream-001") { ratePerSecond }
+        a8: stream(id: "stream-001") { status }
+        a9: stream(id: "stream-001") { contractId }
+        a10: stream(id: "stream-001") { transactionHash }
+      }
+    `;
+
+    const res = await gql({ query });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].extensions.code).toBe('QUERY_TOO_COMPLEX');
+  });
+
+  it('rejects batched requests', async () => {
+    const res = await gql([
+      { query: '{ stream(id: "stream-001") { id } }' },
+      { query: '{ stream(id: "stream-001") { status } }' },
+    ] as any);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({
+      success: false,
+      error: { code: 'VALIDATION_ERROR' },
+    });
+  });
+
+  it('rejects introspection queries for non-trusted clients', async () => {
+    const res = await gql({ query: '{ __schema { queryType { name } } }' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].extensions.code).toBe('INTROSPECTION_FORBIDDEN');
+  });
+
+  it('masks internal resolver errors', async () => {
+    mockGetById.mockRejectedValue(
+      new Error('postgresql://user:pass@db.example.com:5432/app failed')
+    );
+
+    const res = await gql({ query: '{ stream(id: "stream-001") { id } }' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toBe('An unexpected error occurred');
+    expect(JSON.stringify(res.body.errors)).not.toContain('postgresql://');
+    expect(JSON.stringify(res.body.errors)).not.toContain('db.example.com');
+  });
+
   // ── Stream query ─────────────────────────────────────────────────────────
 
   it('resolves a single stream by ID', async () => {
@@ -193,7 +308,7 @@ describe('GraphQL gateway', () => {
 
   it('resolves paginated stream list', async () => {
     const res = await gql({
-      query: `{ streams(limit: 10) { streams { id status } hasMore total } }`,
+      query: `{ streams(limit: 10, includeTotal: true) { streams { id status } hasMore total } }`,
     });
 
     expect(res.status).toBe(200);
@@ -281,7 +396,9 @@ describe('GraphQL gateway', () => {
   });
 
   it('sanitises internal error messages', async () => {
-    mockGetById.mockRejectedValue(new Error('Internal detail: postgresql://user:pass@host:5432/db'));
+    mockGetById.mockRejectedValue(
+      new Error('Internal detail: postgresql://user:pass@host:5432/db')
+    );
 
     const res = await gql({
       query: `{ stream(id: "stream-001") { id } }`,
