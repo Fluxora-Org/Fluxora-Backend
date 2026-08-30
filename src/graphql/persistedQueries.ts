@@ -1,1 +1,0 @@
-export const createStore=()=>{let m=new Map;return{set(h,q){m.set(h,q)},hash(q){return q},resolve({hash:h,query}){if(h&&m.has(h)){let s=m.get(h);if(query&&query!==s)return{error:'hash mismatch'};let d=query||s;if(!/__schema|__type/.test(d))return{document:d}return{error:'introspection blocked'}}return{error:'not found'}}};export default createStore;
