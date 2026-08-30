@@ -141,7 +141,7 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  * Root value object passed to `graphql()` — each key corresponds to a
  * field on the root `Query` type.
  */
-function createRootValue(req: Request) {
+function createRootValue(_req: Request) {
   return {
     /**
      * Fetch a single stream by ID.
@@ -264,11 +264,8 @@ export const graphqlGatewayRouter = Router();
  *
  * Executes a GraphQL query against the schema.
  *
- * Authentication is required — requests without a valid Bearer token or
- * API key are rejected with 401 before any GraphQL processing begins.
- * The route-level scope gate accepts any principal that carries at least one
- * gateway scope; per-resolver gates then enforce the exact scope each field
- * requires.
+ * Authentication is required — requests without a valid Bearer token are
+ * rejected with 401 before any GraphQL processing begins.
  *
  * When the `experimental_graphql_gateway` feature flag is disabled for the
  * caller, all queries return an error in the standard `errors` envelope
@@ -278,12 +275,7 @@ export const graphqlGatewayRouter = Router();
 graphqlGatewayRouter.post(
   '/',
   authenticate,
-  authenticateApiKey,
-  // requireScope is the single gate for both principal kinds: it rejects with
-  // 401 when no principal is present and 403 when the principal carries none
-  // of the gateway scopes. (requireAuth alone would reject API-key callers,
-  // who authenticate via req.keyId rather than req.user.)
-  requireScope('streams:read', 'streams:write', 'audit:read'),
+  requireAuth,
   async (req, res) => {
     const requestId = req.correlationId;
 
@@ -414,24 +406,13 @@ graphqlGatewayRouter.post(
 
       // ── Sanitise errors ─────────────────────────────────────────────────────
       if (result.errors && result.errors.length > 0) {
-        result.errors = result.errors.map((err) => {
-          // Scope denials are intentional, safe-to-surface errors: surface a
-          // stable code without any detail about the target resource.
-          if ((err as { originalError?: unknown }).originalError instanceof GraphQLScopeDeniedError) {
-            return {
-              ...err,
-              message: 'Insufficient scopes to perform this operation',
-              extensions: { code: 'FORBIDDEN' },
-            } as unknown as GraphQLError;
-          }
-          return {
-            ...err,
-            message: sanitiseGraphQLError(err.message),
-            ...(err.extensions
-              ? { extensions: sanitiseExtensions(err.extensions) }
-              : {}),
-          } as unknown as GraphQLError;
-        });
+        result.errors = result.errors.map((err) => ({
+          ...err,
+          message: sanitiseGraphQLError(err.message),
+          ...(err.extensions
+            ? { extensions: sanitiseExtensions(err.extensions) }
+            : {}),
+        }) as unknown as GraphQLError);
       }
 
       res.json(result);
@@ -578,8 +559,7 @@ function sanitiseExtensions(
 graphqlGatewayRouter.get(
   '/',
   authenticate,
-  authenticateApiKey,
-  requireScope('streams:read', 'streams:write', 'audit:read'),
+  requireAuth,
   async (req, res) => {
     if (!isGraphQLGatewayEnabled(req)) {
       res.status(200).json({
