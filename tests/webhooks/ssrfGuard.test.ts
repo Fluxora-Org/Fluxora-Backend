@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import dns from 'node:dns';
 import https from 'node:https';
-import { WebhookDispatcher } from '../../src/webhooks/dispatcher.js';
+import { dispatchWebhook, WebhookDispatcher } from '../../src/webhooks/dispatcher.js';
 import { validateWebhookTarget, WebhookTargetValidationError } from '../../src/webhooks/ssrfGuard.js';
 import type { WebhookCircuitBreakerStore } from '../../src/redis/webhookCircuitBreakerStore.js';
 
@@ -145,6 +145,33 @@ describe('webhook SSRF guard (#1268)', () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain('Too many redirects');
     expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects an internal redirect before endpoint validation fetches the next hop', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, {
+      status: 302,
+      headers: { Location: 'https://169.254.169.254/metadata' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(dispatcher().validateEndpoint('https://8.8.8.8/health')).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an internal redirect before the convenience dispatch path fetches the next hop', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, {
+      status: 302,
+      headers: { Location: 'https://169.254.169.254/metadata' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(dispatchWebhook({
+      url: 'https://8.8.8.8/webhook',
+      secret: 'test-secret',
+      event: 'test.event',
+      payload: {},
+    })).rejects.toBeInstanceOf(WebhookTargetValidationError);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('blocks DNS rebinding when connect-time lookup changes from public to private', async () => {

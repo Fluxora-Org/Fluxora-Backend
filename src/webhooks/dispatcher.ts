@@ -47,6 +47,69 @@ interface WebhookHttpResponse {
 
 type LookupCallback = (error: Error | null, address: string, family: number) => void;
 
+type FetchRedirectOptions = Omit<RequestInit, 'redirect'>;
+
+function webhookAllowlist(): string[] | undefined {
+  try {
+    return getConfig().webhookAllowedHosts;
+  } catch {
+    // Config not initialized, proceed without allowlist.
+    return undefined;
+  }
+}
+
+/**
+ * Follow redirects for fetch-based webhook operations.
+ *
+ * The initial URL is validated by the caller. Every redirect is resolved
+ * against the URL that produced it and validated before the next fetch, so
+ * validation and delivery cannot drift into separate SSRF policies.
+ */
+async function followFetchRedirects(
+  initialUrl: string,
+  requestOptions: FetchRedirectOptions,
+  maxRedirects = 1,
+  operation = 'webhook request',
+): Promise<Response> {
+  let currentUrl = initialUrl;
+  let redirectCount = 0;
+  const allowlist = webhookAllowlist();
+
+  while (true) {
+    const response = await fetch(currentUrl, {
+      ...requestOptions,
+      redirect: 'manual',
+    });
+
+    if (response.status < 300 || response.status >= 400) {
+      return response;
+    }
+
+    const locationHeader = response.headers.get('Location');
+    if (!locationHeader) {
+      return response;
+    }
+
+    if (redirectCount >= maxRedirects) {
+      logger.error(`Too many redirects during ${operation}`);
+      throw new Error('Too many redirects');
+    }
+
+    const redirectUrl = new URL(locationHeader, currentUrl).toString();
+    try {
+      await validateWebhookTarget(redirectUrl, { allowlist });
+    } catch (error) {
+      if (error instanceof WebhookTargetValidationError) {
+        logger.error(`Redirect target rejected by SSRF guard during ${operation}`);
+      }
+      throw error;
+    }
+
+    currentUrl = redirectUrl;
+    redirectCount++;
+  }
+}
+
 /**
  * Resolve immediately before socket creation and hand Node the validated IP.
  * Returning the address prevents the HTTP client from performing a second DNS
@@ -316,14 +379,7 @@ export class WebhookDispatcher {
   ): Promise<WebhookHttpResponse> {
     let currentUrl = initialUrl;
     let redirectCount = 0;
-    let allowlist: string[] | undefined;
-
-    try {
-      const config = getConfig();
-      allowlist = config.webhookAllowedHosts;
-    } catch {
-      // Config not initialized, proceed without allowlist
-    }
+    const allowlist = webhookAllowlist();
 
     while (true) {
       const response = await this.sendWebhookHttpRequest(currentUrl, requestOptions);
@@ -477,61 +533,6 @@ export class WebhookDispatcher {
   }
 
   /**
-   * Follow redirects for validation requests.
-   */
-  private async followValidationRedirects(
-    initialUrl: string,
-    maxRedirects: number = 1,
-  ): Promise<Response> {
-    let currentUrl = initialUrl;
-    let redirectCount = 0;
-    let allowlist: string[] | undefined;
-
-    try {
-      const config = getConfig();
-      allowlist = config.webhookAllowedHosts;
-    } catch {
-      // Config not initialized, proceed without allowlist
-    }
-
-    while (true) {
-      const response = await fetch(currentUrl, {
-        method: 'HEAD',
-        redirect: 'manual',
-      });
-
-      if (response.status >= 300 && response.status < 400) {
-        const locationHeader = response.headers.get('Location');
-        if (!locationHeader) {
-          return response;
-        }
-
-        if (redirectCount >= maxRedirects) {
-          logger.error('Too many redirects during endpoint validation');
-          throw new Error('Too many redirects');
-        }
-
-        const redirectUrl = new URL(locationHeader, currentUrl).toString();
-        try {
-          await validateWebhookTarget(redirectUrl, { allowlist });
-          currentUrl = redirectUrl;
-        } catch (error) {
-          if (error instanceof WebhookTargetValidationError) {
-            logger.error('Redirect target rejected by SSRF guard during validation');
-            throw error;
-          }
-          throw error;
-        }
-
-        redirectCount++;
-        continue;
-      }
-
-      return response;
-    }
-  }
-
-  /**
    * Validate webhook endpoint reachability.
    *
    * Validation failures are logged without URL or exception text metadata to
@@ -542,7 +543,7 @@ export class WebhookDispatcher {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout for validation
 
-      const response = await this.followValidationRedirects(url);
+      const response = await followFetchRedirects(url, { method: 'HEAD' }, 1, 'endpoint validation');
 
       clearTimeout(timeoutId);
       return response.status < 500; // Accept any non-server-error status
@@ -579,74 +580,10 @@ export interface SimpleWebhookDispatch {
   ledger?: number;
 }
 
-/**
- * Follow redirects for the dispatchWebhook convenience function.
- */
-async function followDispatchWebhookRedirects(
-  initialUrl: string,
-  requestOptions: Omit<RequestInit, 'redirect'>,
-  maxRedirects: number = 1,
-): Promise<Response> {
-  let currentUrl = initialUrl;
-  let redirectCount = 0;
-  let allowlist: string[] | undefined;
-
-  try {
-    const config = getConfig();
-    allowlist = config.webhookAllowedHosts;
-  } catch {
-    // Config not initialized, proceed without allowlist
-  }
-
-  while (true) {
-    const response = await fetch(currentUrl, {
-      ...requestOptions,
-      redirect: 'manual',
-    });
-
-    if (response.status >= 300 && response.status < 400) {
-      const locationHeader = response.headers.get('Location');
-      if (!locationHeader) {
-        return response;
-      }
-
-      if (redirectCount >= maxRedirects) {
-        logger.error('Too many redirects during webhook dispatch');
-        throw new Error('Too many redirects');
-      }
-
-      const redirectUrl = new URL(locationHeader, currentUrl).toString();
-      try {
-        await validateWebhookTarget(redirectUrl, { allowlist });
-        currentUrl = redirectUrl;
-      } catch (error) {
-        if (error instanceof WebhookTargetValidationError) {
-          logger.error('Redirect target rejected by SSRF guard during webhook dispatch', undefined, {
-            reason: error.message,
-          });
-          throw error;
-        }
-        throw error;
-      }
-
-      redirectCount++;
-      continue;
-    }
-
-    return response;
-  }
-}
-
 export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void> {
   // Validate webhook target for SSRF protection before any network call
   try {
-    let allowlist: string[] | undefined;
-    try {
-      const config = getConfig();
-      allowlist = config.webhookAllowedHosts;
-    } catch {
-      // Config not initialized, proceed without allowlist
-    }
+    const allowlist = webhookAllowlist();
     await validateWebhookTarget(opts.url, {
       allowlist,
     });
@@ -685,7 +622,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   const timeoutId = setTimeout(() => controller.abort(new DOMException('Webhook delivery timeout', 'TimeoutError')), timeoutMs);
 
   try {
-    await fetch(opts.url, {
+    await followFetchRedirects(opts.url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -695,7 +632,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
       },
       body: payloadStr,
       signal: controller.signal,
-    });
+    }, 1, 'webhook dispatch');
   } finally {
     clearTimeout(timeoutId);
   }
