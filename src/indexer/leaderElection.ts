@@ -9,6 +9,41 @@
  *
  * Modeled on `RedisDistributedLock` in `src/state/adminStateLock.ts`, with
  * lease renewal added since replay runs can far outlive a single lock TTL.
+ *
+ * ## Clock-anomaly safety
+ *
+ * Lease expiry is enforced by the Redis server, which uses its own monotonic
+ * clock (server-side TTL via `SET … PX` / `PEXPIRE`). This means NTP jumps or
+ * wall-clock skew on the local node do not affect *when* the key expires in
+ * Redis — only the Redis server's clock matters for lease validity.
+ *
+ * The remaining local-clock risk is in the heartbeat scheduler: if the process
+ * is paused (GC, VM suspend, NTP step-forward) long enough that the renewal
+ * interval fires *after* the Redis TTL has already lapsed, another instance
+ * may have legitimately acquired the lease. In that case `renew()` will detect
+ * the key is held by someone else and self-revoke on the next tick — the
+ * correct safe outcome.
+ *
+ * To make this behaviour explicit and independently testable the implementation
+ * tracks `_lastRenewAttemptMs` (wall-clock time of the previous heartbeat tick)
+ * using an injectable `clockNowMs` function. When the elapsed time since the
+ * last renewal attempt **exceeds the full lease duration**, the process
+ * conservatively self-revokes without contacting Redis — any leader that was
+ * unable to contact Redis for a full lease period cannot know whether its lease
+ * is still valid, so dropping leadership is the safe choice.
+ *
+ * Backward clock jumps (NTP step-back, monotonic counter reset after reboot)
+ * are handled by clamping: elapsed time is treated as zero whenever
+ * `clockNowMs() < _lastRenewAttemptMs`, so a backward step never causes a
+ * spurious self-revocation.
+ *
+ * ### Fencing token
+ *
+ * Every fresh acquisition atomically increments a shared Redis counter
+ * (`FENCE_KEY`). Callers that write to shared state must carry the fencing
+ * token and the backing store must reject writes carrying a token older than
+ * the current epoch — this prevents a stale leader that missed revocation from
+ * committing writes after a new leader has taken over (split-brain prevention).
  */
 
 import * as crypto from 'node:crypto';
@@ -26,6 +61,18 @@ export interface IndexerLeaderElectionOptions {
   renewIntervalMs?: number;
   /** Identifier for this instance. Default `${pid}:${randomUUID()}`. */
   instanceId?: string;
+  /**
+   * Monotonic clock source used to detect missed-renewal windows caused by
+   * local wall-clock anomalies (forward jumps, GC pauses, VM suspend/resume).
+   *
+   * Defaults to `Date.now`. In tests, inject a controlled function to simulate
+   * clock anomalies without relying on `vi.useFakeTimers`.
+   *
+   * The implementation uses this clock **only** to detect whether a heartbeat
+   * fired so late that the full lease duration has elapsed since the previous
+   * renewal attempt. Lease expiry itself is always enforced by the Redis server.
+   */
+  clockNowMs?: () => number;
 }
 
 export interface IndexerLeaderElection {
@@ -71,9 +118,20 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
   private readonly leaseMs: number;
   private readonly renewIntervalMs: number;
   private readonly instanceId: string;
+  private readonly clockNowMs: () => number;
   private _isLeader = false;
   private _fencingToken = 0;
   private heartbeat: NodeJS.Timeout | null = null;
+  /**
+   * Wall-clock timestamp of the last heartbeat attempt, as reported by
+   * `clockNowMs`. Initialised to 0 (no renewal attempted yet).
+   *
+   * Used exclusively to detect missed-renewal windows: if the current time
+   * minus this value exceeds `leaseMs`, the process was paused or the clock
+   * jumped forward long enough that the Redis TTL has almost certainly lapsed,
+   * so the implementation self-revokes rather than issuing a speculative GET.
+   */
+  private _lastRenewAttemptMs = 0;
 
   constructor(
     private readonly redis: RedisClient,
@@ -82,6 +140,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
     this.leaseMs = opts.leaseMs ?? DEFAULT_LEASE_MS;
     this.renewIntervalMs = opts.renewIntervalMs ?? Math.floor(this.leaseMs / 3);
     this.instanceId = opts.instanceId ?? `${process.pid}:${crypto.randomUUID()}`;
+    this.clockNowMs = opts.clockNowMs ?? (() => Date.now());
   }
 
   isLeader(): boolean {
@@ -107,6 +166,9 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
         // than every token issued before this epoch.
         this._fencingToken = await this.redis.incr(FENCE_KEY);
         this._isLeader = true;
+        // Record the clock time of this acquisition as the first "renewal
+        // attempt" so the forward-jump guard has a baseline to compare against.
+        this._lastRenewAttemptMs = this.clockNowMs();
         this.startHeartbeat();
         return true;
       }
@@ -118,7 +180,10 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
         // the latest epoch.
         this._fencingToken = await this.readFencingToken();
         this._isLeader = true;
-        if (!this.heartbeat) this.startHeartbeat();
+        if (!this.heartbeat) {
+          this._lastRenewAttemptMs = this.clockNowMs();
+          this.startHeartbeat();
+        }
         return true;
       }
 
@@ -191,8 +256,40 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
    * Renew the lease TTL, but only while we still hold it. Like `release()`,
    * this is a check-then-extend sequence rather than a Lua-atomic
    * compare-and-expire.
+   *
+   * ### Clock-anomaly guard
+   *
+   * Before contacting Redis, the implementation checks whether the local clock
+   * has advanced by more than `leaseMs` since the previous renewal attempt.
+   * This catches forward jumps (NTP corrections, GC pauses, VM resume) where
+   * the heartbeat timer fired so late that the Redis TTL has almost certainly
+   * already lapsed.  In that case the process self-revokes immediately —
+   * contacting Redis at this point would only confirm what we already know.
+   *
+   * Backward jumps are safe: elapsed time is clamped to zero when
+   * `clockNowMs() < _lastRenewAttemptMs`, so a backward step never triggers
+   * a spurious self-revocation.
    */
   private async renew(): Promise<void> {
+    const now = this.clockNowMs();
+    const elapsed = Math.max(0, now - this._lastRenewAttemptMs);
+
+    // Forward-jump guard: if the local clock has advanced by a full lease
+    // duration since the last renewal, the TTL has almost certainly expired
+    // on the Redis side. Self-revoke without checking Redis.
+    if (this._lastRenewAttemptMs > 0 && elapsed >= this.leaseMs) {
+      logger.warn('Indexer leader election: clock anomaly detected — elapsed time since last renewal exceeds lease duration, self-revoking', undefined, {
+        instanceId: this.instanceId,
+        elapsedMs: elapsed,
+        leaseMs: this.leaseMs,
+      });
+      this._isLeader = false;
+      this.stopHeartbeat();
+      return;
+    }
+
+    this._lastRenewAttemptMs = now;
+
     try {
       const current = await this.redis.get(LEADER_KEY);
       if (current !== this.instanceId) {
