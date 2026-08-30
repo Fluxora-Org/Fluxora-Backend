@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { isIP } from 'node:net';
 import type { Request, Response, NextFunction } from 'express';
 import type { RateLimitConfig, RateLimitStatus, RateLimitStore, RouteRateLimitConfig } from '../types/rateLimit.js';
 import { getRateLimitConfig, getRouteRateLimitConfig } from '../config/rateLimits.js';
@@ -34,27 +35,147 @@ function secondsUntil(resetAt: number): number {
 }
 
 /**
+ * Hash a string with SHA-256 and return the 64-char hex digest.
+ *
+ * Used for API keys (so raw key material never reaches the store) and as a
+ * collision-resistant fallback for overly long route segments.
+ */
+function sha256Hex(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+/**
  * Hash an API key with SHA-256 so raw key material is never written to Redis.
  * Returns a 64-char hex digest.
  */
 function hashApiKey(key: string): string {
-  return crypto.createHash('sha256').update(key).digest('hex');
+  return sha256Hex(key);
 }
 
-function buildStoreKey(
-  identifierType: 'ip' | 'apiKey',
+// ---------------------------------------------------------------------------
+// Canonical rate-limit key namespace
+// ---------------------------------------------------------------------------
+//
+// Every key written by this middleware (and read back by GET /api/rate-limits)
+// conforms to one canonical shape:
+//
+//   v1:{principalType}:{principalKey}:{routeKey}
+//
+//   - principalType ∈ { ip, apikey, admin } — admin keys live in their own
+//     namespace so a tenant key whose raw string equals the admin key can
+//     never consume (or be consumed by) the admin quota, and vice versa.
+//   - principalKey — for `ip`, the canonical form of the client address
+//     (IPv6 expanded, IPv4-mapped IPv6 folded to IPv4); for `apikey`/`admin`,
+//     the SHA-256 hex digest of the raw key so key material never reaches
+//     Redis.
+//   - routeKey — an injective encoding of the request path: two different
+//     paths can never collide, while the same path always maps to the same
+//     key. The reserved segment `global` is the per-principal aggregate
+//     counter read by GET /api/rate-limits when no path is requested.
+//
+// The Redis store prefixes the whole key with `fluxora:rl:` and sanitises it
+// to a bounded length, so keys are bounded (≤ ~320 chars) and carry a TTL of
+// one window, after which they expire automatically.
+
+export type RateLimitPrincipalType = 'ip' | 'apikey' | 'admin';
+
+/** Route segment of the per-principal aggregate counter. */
+export const AGGREGATE_ROUTE = 'global';
+
+/** Longest readable route segment before falling back to a hash. */
+const MAX_ROUTE_SEGMENT_LENGTH = 96;
+
+/**
+ * Canonicalise a client IP for use as a key component.
+ *
+ * Equivalent encodings of the same address collapse onto one key so a client
+ * cannot split its quota across encodings:
+ *   - IPv4 addresses are kept as-is (trimmed).
+ *   - IPv6 addresses are expanded to the full zero-padded lowercase form
+ *     (e.g. `2001:db8::1` and `2001:0db8:0:0:0:0:0:1` map to the same key).
+ *   - IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) fold to the IPv4 form so
+ *     a dual-stack client is counted once.
+ *   - Empty or unparseable values fall back to `unknown` so a malformed
+ *     identifier can never raise and never collides with a real address.
+ */
+export function normaliseIp(ip: string): string {
+  const trimmed = ip.trim();
+  if (trimmed === '') return 'unknown';
+  if (isIP(trimmed) === 4) return trimmed;
+  if (isIP(trimmed) === 6) return canonicalIpv6(trimmed);
+  return trimmed;
+}
+
+function canonicalIpv6(ip: string): string {
+  const lower = ip.toLowerCase();
+  // IPv4-mapped IPv6 — fold to the equivalent IPv4 address.
+  const v4Mapped = lower.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4Mapped) return v4Mapped[1]!;
+
+  // Expand `::` and zero-pad every hextet to the canonical 8-group form.
+  const [head, tail] = lower.split('::');
+  const headParts = head ? head.split(':').filter((s) => s !== '') : [];
+  const tailParts = tail ? tail.split(':').filter((s) => s !== '') : [];
+  const missing = 8 - headParts.length - tailParts.length;
+  const parts = [
+    ...headParts,
+    ...Array(Math.max(missing, 0)).fill('0'),
+    ...tailParts,
+  ];
+  return parts.map((h) => h.padStart(4, '0')).join(':');
+}
+
+/**
+ * Derive a collision-resistant route segment from a request path.
+ *
+ * The previous `_`-substitution conflated distinct routes (e.g. `/api/foo/bar`
+ * and `/api/foo_bar` produced the same key). Characters outside `[A-Za-z0-9]`
+ * are now percent-style encoded (`_` + hex), which is injective. Overly long
+ * paths fall back to a fixed-length SHA-256 so truncation can never merge two
+ * distinct routes either. `undefined`, `/`, and empty paths map to the
+ * per-principal aggregate route.
+ */
+export function routeKeyFromPath(path: string | undefined): string {
+  if (!path || path === '/') return AGGREGATE_ROUTE;
+  const cleaned = path.replace(/^\/+|\/+$/g, '');
+  if (!cleaned) return AGGREGATE_ROUTE;
+
+  let encoded = '';
+  for (const ch of cleaned) {
+    if (/[A-Za-z0-9]/.test(ch)) encoded += ch;
+    else encoded += `_${ch.charCodeAt(0).toString(16).padStart(2, '0')}`;
+  }
+
+  if (encoded.length <= MAX_ROUTE_SEGMENT_LENGTH) return encoded;
+  return `h_${sha256Hex(cleaned)}`;
+}
+
+/**
+ * Build the canonical store key for a principal and route.
+ *
+ * @param principalType - namespace of the principal (`ip` | `apikey` | `admin`).
+ * @param identifier    - raw principal (IP address or API key material).
+ * @param routeKey      - output of {@link routeKeyFromPath}.
+ */
+export function buildStoreKey(
+  principalType: RateLimitPrincipalType,
   identifier: string,
   routeKey: string,
 ): string {
-  // API keys are hashed before reaching the store; IPs are passed as-is.
-  // The SlidingWindowStore will sanitise the identifier further.
-  const id = identifierType === 'apiKey' ? hashApiKey(identifier) : identifier;
-  return `${identifierType}:${id}:${routeKey}`;
+  const principalKey =
+    principalType === 'ip' ? normaliseIp(identifier) : hashApiKey(identifier);
+  return `v1:${principalType}:${principalKey}:${routeKey}`;
 }
 
-function routeKeyFromPath(path: string | undefined): string {
-  if (!path) return 'global';
-  return path.replace(/\//g, '_').replace(/^_/, '') || 'global';
+/**
+ * Map an extracted identifier + admin flag onto the canonical principal type.
+ */
+function principalTypeFor(
+  identifierType: 'ip' | 'apiKey',
+  isAdmin: boolean,
+): RateLimitPrincipalType {
+  if (identifierType === 'ip') return 'ip';
+  return isAdmin ? 'admin' : 'apikey';
 }
 
 function buildErrorBody(
@@ -293,8 +414,14 @@ export function createRateLimiter(
       return next();
     }
 
+    const principalType = principalTypeFor(identifierType, isAdmin);
     const routeKey = routeKeyFromPath(path);
-    const storeKey = buildStoreKey(identifierType, identifier, routeKey);
+    const storeKey = buildStoreKey(principalType, identifier, routeKey);
+    // Per-principal aggregate counter: read by GET /api/rate-limits so the
+    // status endpoint reflects total usage across every route, not just the
+    // current one. It is informational (never enforced), so a failure to
+    // record it must not affect the request.
+    const aggregateKey = buildStoreKey(principalType, identifier, AGGREGATE_ROUTE);
 
     let count: number;
     let resetAt: number;
@@ -307,6 +434,9 @@ export function createRateLimiter(
       // Detect which backend was used
       storeBackend =
         store instanceof HybridStore && store.usingFallback ? 'memory' : 'redis';
+      await store.increment(aggregateKey, config.windowMs, effectiveLimit).catch(() => {
+        // Aggregate counter is best-effort; never fail the request over it.
+      });
     } catch (err) {
       // Should not reach here (HybridStore swallows errors), but be safe
       logger.warn('Unexpected rate-limit store error; allowing request', undefined, {
@@ -385,8 +515,12 @@ export function createRateLimiter(
     const routeConfig = path ? getRouteRateLimitConfig(path) : null;
     const { effectiveLimit } = resolveEffectiveLimit(config, routeConfig, method ?? 'GET');
 
-    const routeKey = routeKeyFromPath(path);
-    const storeKey = buildStoreKey(identifierType, identifier, routeKey);
+    // Without an explicit path the status endpoint reports the per-principal
+    // aggregate so `remaining` reflects usage across all routes.
+    const principalType = principalTypeFor(identifierType, isAdmin);
+    const routeKey =
+      path !== undefined ? routeKeyFromPath(path) : AGGREGATE_ROUTE;
+    const storeKey = buildStoreKey(principalType, identifier, routeKey);
 
     let count = 0;
     let resetAt = Date.now() + config.windowMs;

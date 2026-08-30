@@ -104,6 +104,18 @@ describe('GET /api/rate-limits', () => {
     expect(res.body.remaining).toBe(0);
   });
 
+  it('aggregates usage across different routes for the same principal (#1260)', async () => {
+    const app = createTestApp(createTestEnv({ RATE_LIMIT_IP_MAX: '4' }));
+    // Two different routes, same caller — the status endpoint must report the
+    // combined count, not the per-route count of the status path itself.
+    await request(app).get('/api/test-streams');
+    await request(app).get('/api/other-route');
+    await request(app).get('/api/test-streams');
+    const res = await request(app).get('/api/rate-limits').expect(200);
+    expect(res.body.remaining).toBe(1);
+    expect(res.body.limit).toBe(4);
+  });
+
   it('returns correct status for API key caller', async () => {
     const app = createTestApp(createTestEnv({ RATE_LIMIT_APIKEY_MAX: '7' }));
     const res = await request(app)
