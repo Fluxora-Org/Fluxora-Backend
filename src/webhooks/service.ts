@@ -26,6 +26,21 @@ import type { IWebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateL
 import { TokenBucketRateLimiter } from './rate-limiter.js';
 import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
 
+/** Parse Retry-After header value into milliseconds delay. */
+function parseRetryAfter(header: string | null, now: number): number | null {
+  if (!header) return null;
+  const seconds = Number.parseInt(header.trim(), 10);
+  if (!Number.isNaN(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+  // Try parsing as HTTP-date
+  const date = new Date(header);
+  if (!Number.isNaN(date.getTime())) {
+    return Math.max(0, date.getTime() - now);
+  }
+  return null;
+}
+
 interface OutboxRow {
   id: string;
   stream_id: string;
@@ -246,8 +261,13 @@ function classifyPoisonFailure(
   payload: unknown,
   endpointUrl: string,
   statusCode: number | undefined,
-  policy: EnhancedRetryPolicy
+  policy: EnhancedRetryPolicy,
+  error?: string
 ): DLQReasonCode | null {
+  if (error && error.includes('Webhook delivery timeout')) {
+    return 'timeout';
+  }
+
   // Check for structurally invalid payload
   try {
     validateWebhookPayload(payload);
@@ -392,7 +412,17 @@ export class WebhookService {
       } else {
         // Handle non-2xx responses
         if (shouldRetry(attempt, attemptNumber, this.policy)) {
-          attempt.nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
+          // For 429 responses, respect Retry-After header if present
+          let nextRetryAt: number;
+          if (response.status === 429) {
+            const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'), Date.now());
+            nextRetryAt = retryAfterMs !== null
+              ? Date.now() + retryAfterMs
+              : calculateNextRetryTime(attemptNumber, this.policy);
+          } else {
+            nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
+          }
+          attempt.nextRetryAt = nextRetryAt;
           delivery.status = 'pending';
 
           logger.warn('Webhook delivery failed, will retry', undefined, {
@@ -554,7 +584,7 @@ export class WebhookService {
     correlationId?: string
   ): Promise<Response> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(new DOMException('Webhook delivery timeout', 'TimeoutError')), this.policy.timeoutMs);
 
     try {
       const headers: Record<string, string> = {
@@ -592,7 +622,7 @@ export class WebhookService {
           if (done) break;
           bytesRead += value.length;
           if (bytesRead > maxBytes) {
-            controller.abort();
+            controller.abort(new Error('Webhook response exceeds maximum allowed size'));
             throw new Error('Webhook response exceeds maximum allowed size');
           }
         }
@@ -958,10 +988,11 @@ export class WebhookDispatcher {
       payload,
       endpoint.endpointUrl,
       attempt.statusCode,
-      this.policy
+      this.policy,
+      attempt.error
     );
 
-    if (failureReasonCode === 'poison') {
+    if (failureReasonCode === 'poison' || failureReasonCode === 'timeout') {
       delivery.status = 'permanent_failure';
       delivery.attempts.push(attempt);
 

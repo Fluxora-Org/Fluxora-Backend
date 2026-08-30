@@ -24,7 +24,8 @@ vi.mock('../src/db/pool.js', () => ({
 
 import { app } from '../src/app.js';
 import { generateToken } from '../src/lib/auth.js';
-import { initializeConfig } from '../src/config/env.js';
+import { initializeConfig, getConfig } from '../src/config/env.js';
+import jwt from 'jsonwebtoken';
 
 describe('Auth Protected Routes', () => {
   let token: string;
@@ -306,6 +307,98 @@ describe('Auth Protected Routes', () => {
       expect(res.body.error.code).toBe('UNAUTHORIZED');
       expect(res.body.error.message).toBeDefined();
       expect(typeof res.body.error.message).toBe('string');
+    });
+  describe('JWT Token Verification Strictness', () => {
+    it('should reject tokens with wrong algorithm (e.g. HS512 instead of HS256)', async () => {
+      const { jwtSecret } = getConfig();
+      const badToken = jwt.sign({ address, role: 'operator' }, jwtSecret, {
+        algorithm: 'HS512',
+        issuer: 'fluxora',
+        audience: 'fluxora'
+      });
+      const res = await request(app).post('/api/streams').set('Authorization', `Bearer ${badToken}`).send({});
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject tokens with wrong issuer', async () => {
+      const { jwtSecret } = getConfig();
+      const badToken = jwt.sign({ address, role: 'operator' }, jwtSecret, {
+        algorithm: 'HS256',
+        issuer: 'wrong-issuer',
+        audience: 'fluxora'
+      });
+      const res = await request(app).post('/api/streams').set('Authorization', `Bearer ${badToken}`).send({});
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject tokens with wrong audience', async () => {
+      const { jwtSecret } = getConfig();
+      const badToken = jwt.sign({ address, role: 'operator' }, jwtSecret, {
+        algorithm: 'HS256',
+        issuer: 'fluxora',
+        audience: 'wrong-audience'
+      });
+      const res = await request(app).post('/api/streams').set('Authorization', `Bearer ${badToken}`).send({});
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject tokens missing required claims (issuer, audience)', async () => {
+      const { jwtSecret } = getConfig();
+      const badToken = jwt.sign({ address, role: 'operator' }, jwtSecret, {
+        algorithm: 'HS256'
+      });
+      const res = await request(app).post('/api/streams').set('Authorization', `Bearer ${badToken}`).send({});
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject expired tokens', async () => {
+      const { jwtSecret } = getConfig();
+      const badToken = jwt.sign({ address, role: 'operator' }, jwtSecret, {
+        algorithm: 'HS256',
+        issuer: 'fluxora',
+        audience: 'fluxora',
+        expiresIn: '-1h'
+      });
+      const res = await request(app).post('/api/streams').set('Authorization', `Bearer ${badToken}`).send({});
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject tokens with not-before in the future', async () => {
+      const { jwtSecret } = getConfig();
+      const badToken = jwt.sign({ address, role: 'operator' }, jwtSecret, {
+        algorithm: 'HS256',
+        issuer: 'fluxora',
+        audience: 'fluxora',
+        notBefore: '1h'
+      });
+      const res = await request(app).post('/api/streams').set('Authorization', `Bearer ${badToken}`).send({});
+      expect(res.status).toBe(401);
+    });
+
+    it('should support key rotation via jwtSecretPrevious', async () => {
+      const config = getConfig();
+      
+      // Simulate an old token signed with the "previous" key
+      const oldSecret = 'old-secret-old-secret-old-secret';
+      config.jwtSecretPrevious = oldSecret;
+      
+      const rotatedToken = jwt.sign({ address, role: 'operator' }, oldSecret, {
+        algorithm: 'HS256',
+        issuer: 'fluxora',
+        audience: 'fluxora'
+      });
+      const res = await request(app).post('/api/streams').set('Authorization', `Bearer ${rotatedToken}`).send({
+        sender: 'GCSX22222222222222222222222222222222222222222222222222UV',
+        recipient: 'GDRX22222222222222222222222222222222222222222222222222UV',
+        depositAmount: '100',
+        ratePerSecond: '1'
+      });
+      
+      // We expect it to succeed because the middleware falls back to jwtSecretPrevious
+      expect(res.status).toBe(201);
+      
+      // Cleanup
+      config.jwtSecretPrevious = undefined;
     });
   });
 });

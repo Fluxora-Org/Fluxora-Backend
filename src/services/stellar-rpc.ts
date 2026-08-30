@@ -81,6 +81,21 @@ export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCall
   healthCheckFailureThreshold?: number;
   /** Stable provider label for metrics (default "primary"). */
   providerLabel?: string;
+  /**
+   * Per-operation timeout overrides, in milliseconds. Keys are operation names
+   * (e.g. `"getLatestLedger"`, `"accountExists"`). When an operation is listed
+   * here its deadline takes precedence over the global `timeoutMs`. Callers can
+   * still override on a per-call basis via `RpcCallOptions.timeoutMs`.
+   *
+   * Example:
+   * ```ts
+   * operationDeadlines: {
+   *   getLatestLedger: 2_000,  // fast — used by health checks
+   *   accountExists:   8_000,  // generous — Horizon lookup
+   * }
+   * ```
+   */
+  operationDeadlines?: Record<string, number>;
 }
 
 interface RpcRequestMetadata {
@@ -147,6 +162,44 @@ function classifyError(err: unknown): RpcFailureKind {
   if (/network|connection|socket/i.test(message)) return 'NETWORK';
 
   return 'PROVIDER';
+}
+
+/**
+ * Retryable-status classification for errors already raised as
+ * {@link RpcProviderError} by our own call sites (e.g. the config-validation
+ * and HTTP-status checks inside `accountExists`).
+ *
+ * Retries must not paper over permanent errors, and permanent errors must
+ * not pay the full jittered-backoff delay before surfacing. Only failures
+ * that are plausibly transient are retried:
+ *
+ *   - TIMEOUT / NETWORK          — connection-level hiccups, safe to retry.
+ *   - PROVIDER with status 429   — rate limited; retry with backoff.
+ *   - PROVIDER with status >=500 — upstream server error; retry.
+ *   - everything else            — permanent: a 4xx client/request error, a
+ *     malformed response, or a config error (e.g. a missing horizonUrl) —
+ *     and is surfaced immediately without consuming retry budget.
+ *
+ * `getLatestLedger` and `accountExists` are both read-only, idempotent
+ * operations, so retrying them carries no duplicate-submission risk — this
+ * only needs to decide whether a retry can plausibly *succeed*, not whether
+ * it is safe to attempt.
+ *
+ * Errors that have not yet been classified into an `RpcProviderError` (i.e.
+ * raw transport errors thrown directly by a `RawRpcClient` implementation)
+ * are intentionally left to the outer per-call timeout/classification in
+ * {@link StellarRpcService.callWithTimeout} rather than retried here, so a
+ * single call's overall timeout budget cannot be silently multiplied by
+ * per-attempt backoff sleeps.
+ */
+export function isRetryableRpcError(err: unknown): boolean {
+  if (!(err instanceof RpcProviderError)) return false;
+  if (err.kind === 'TIMEOUT' || err.kind === 'NETWORK') return true;
+  if (err.kind !== 'PROVIDER') return false;
+
+  if (err.statusCode === 429) return true;
+  if (err.statusCode !== undefined && err.statusCode >= 500) return true;
+  return false;
 }
 
 // ── Circuit breaker ───────────────────────────────────────────────────────────
@@ -255,6 +308,7 @@ export class StellarRpcService {
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
+  private readonly operationDeadlines: Record<string, number>;
   private readonly fallbackCache: RpcFallbackCache;
   private readonly fallbackCacheTtlSeconds: number;
   private readonly fallbackCacheEarlyExpiryBeta: number;
@@ -277,6 +331,7 @@ export class StellarRpcService {
     this.timeoutMs = opts.timeoutMs ?? 5_000;
     this.maxRetries = opts.maxRetries ?? 3;
     this.retryDelayMs = opts.retryDelayMs ?? 1_000;
+    this.operationDeadlines = opts.operationDeadlines ?? {};
     this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
     this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
     this.fallbackCacheEarlyExpiryBeta = Math.max(0, opts.fallbackCacheEarlyExpiryBeta ?? 0);
@@ -400,7 +455,7 @@ export class StellarRpcService {
           maxDelayMs: this.retryDelayMs * 5,
           maxAttempts: this.maxRetries + 1,
         },
-        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+        isRetryableRpcError
       ),
       opts,
     );
@@ -458,7 +513,7 @@ export class StellarRpcService {
           maxDelayMs: this.retryDelayMs * 5,
           maxAttempts: this.maxRetries + 1,
         },
-        (err) => err instanceof RpcProviderError && err.kind !== 'CANCELLED'
+        isRetryableRpcError
       ),
       opts,
     );
@@ -563,13 +618,23 @@ export class StellarRpcService {
     await this.fallbackCache.set(operation, value, this.fallbackCacheTtlSeconds, cacheParts);
   }
 
+  /**
+   * Resolve the effective deadline for an operation, in priority order:
+   *   1. Per-call override (`RpcCallOptions.timeoutMs`)
+   *   2. Per-operation default (`operationDeadlines[operation]`)
+   *   3. Global default (`this.timeoutMs`)
+   */
+  resolveDeadline(operation: string, opts: RpcCallOptions = {}): number {
+    return opts.timeoutMs ?? this.operationDeadlines[operation] ?? this.timeoutMs;
+  }
+
   private async callWithTimeout<T>(
     fn: () => Promise<T>,
     operation: string,
     opts: RpcCallOptions = {},
   ): Promise<T> {
     const start = Date.now();
-    const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
+    const timeoutMs = this.resolveDeadline(operation, opts);
     const signal = opts.signal;
 
     // Reject immediately if already aborted
@@ -649,6 +714,30 @@ function logFailure(operation: string, err: RpcProviderError, durationMs: number
   });
 }
 
+/**
+ * Parse a JSON string of per-operation deadlines into a typed map.
+ * Returns an empty object when the input is undefined, empty, or invalid.
+ * Each value is clamped to a minimum of 1 ms.
+ */
+export function parseOperationDeadlines(
+  raw: string | undefined,
+): Record<string, number> {
+  if (!raw || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+    const result: Record<string, number> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'number' && value >= 1) {
+        result[key] = Math.floor(value);
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
 // ── Singleton ─────────────────────────────────────────────────────────────────
 
 function buildRefreshKey(operation: string, cacheParts: readonly string[]): string {
@@ -683,6 +772,9 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       throw new RpcProviderError('No Stellar RPC client configured', 'PROVIDER');
     });
     const redisFallbackCache = createConfiguredRpcFallbackCache();
+    const operationDeadlines = parseOperationDeadlines(
+      process.env.STELLAR_RPC_OPERATION_DEADLINES,
+    );
     _service = new StellarRpcService(client, {
       failureThreshold: parseInt(process.env.RPC_CB_FAILURE_THRESHOLD ?? '5', 10),
       windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
@@ -690,6 +782,7 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
       maxRetries: parseInt(process.env.STELLAR_RPC_MAX_RETRIES ?? '3', 10),
       retryDelayMs: parseInt(process.env.STELLAR_RPC_RETRY_DELAY ?? '1000', 10),
+      operationDeadlines,
       fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
       fallbackCacheEarlyExpiryBeta: parseFloat(process.env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA ?? '0'),
       fallbackCache: redisFallbackCache,

@@ -293,6 +293,15 @@ await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
 - Inbound client messages are capped by `MAX_MESSAGE_BYTES`.
 - Inbound client messages are rate-limited per connection.
 - Optional WebSocket JWT authentication can reject unauthenticated upgrades.
+- When `WS_ALLOWED_ORIGINS` is configured, browser upgrades require an exact
+  match against one of its comma-separated origins. Requests without an
+  `Origin` header remain compatible with non-browser clients.
+- JWTs are verified, including expiration, before the upgrade completes. A
+  refreshed token is used by opening a new connection; there is no unauthenticated
+  health-probe path when `WS_AUTH_REQUIRED=true`.
+- Reconnect attempts are limited per client IP by `WS_RECONNECT_LIMIT` within
+  `WS_RECONNECT_WINDOW_MS`, including attempts whose previous sockets already
+  closed.
 - Backpressure metadata must not include sensitive stream payload contents.
 
 ---

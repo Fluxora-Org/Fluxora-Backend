@@ -2,6 +2,7 @@ import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId, getActiveTraceContext, buildTraceparent } from '../tracing/middleware.js';
 
 import { logger } from '../lib/logger.js';
+import { redactKeysInString } from '../pii/sanitizer.js';
 
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
@@ -10,8 +11,12 @@ import { calculateNextRetryTime, shouldRetry, resolveCircuitBreakerDeferral, cou
 import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import type { EnhancedRetryPolicy } from './retry.js';
-import { validateWebhookTarget, WebhookTargetValidationError } from './ssrfGuard.js';
+import { validateWebhookIPAddress, validateWebhookTarget, WebhookTargetValidationError } from './ssrfGuard.js';
 import { getConfig } from '../config/env.js';
+import dns from 'node:dns';
+import http from 'node:http';
+import https from 'node:https';
+import type { IncomingMessage } from 'node:http';
 
 export interface WebhookDispatchOptions {
   url: string;
@@ -31,6 +36,47 @@ export interface WebhookDispatchResult {
   error?: string;
   nextRetryAt?: number;
   shouldRetry: boolean;
+}
+
+interface WebhookHttpResponse {
+  status: number;
+  statusText: string;
+  ok: boolean;
+  headers: Headers;
+}
+
+type LookupCallback = (error: Error | null, address: string, family: number) => void;
+
+/**
+ * Resolve immediately before socket creation and hand Node the validated IP.
+ * Returning the address prevents the HTTP client from performing a second DNS
+ * lookup that could receive a rebinding answer.
+ */
+function lookupWebhookTarget(
+  hostname: string,
+  options: number | dns.LookupOneOptions,
+  callback: LookupCallback,
+): void {
+  const family = typeof options === 'number' ? options : options.family;
+  dns.lookup(hostname, { family, all: false }, (error, address, resolvedFamily) => {
+    if (error) {
+      callback(error, address, resolvedFamily);
+      return;
+    }
+
+    try {
+      validateWebhookIPAddress(address);
+      callback(null, address, resolvedFamily);
+    } catch (validationError) {
+      callback(
+        validationError instanceof Error
+          ? validationError
+          : new WebhookTargetValidationError('Resolved webhook address was rejected'),
+        address,
+        resolvedFamily,
+      );
+    }
+  });
 }
 
 /**
@@ -85,7 +131,7 @@ export class WebhookDispatcher {
       });
     } catch (error) {
       if (error instanceof WebhookTargetValidationError) {
-        logger.error('Webhook target rejected by SSRF guard', undefined, {
+        logger.error('Webhook target rejected by SSRF guard', effectiveCorrelationId, {
           deliveryId,
           eventType,
           reason: error.message,
@@ -102,7 +148,7 @@ export class WebhookDispatcher {
     const gate = await circuitBreakerStore.checkAndClaimAttempt(url, enhancedPolicy);
     if (!gate.allowed) {
       const nextRetryAt = resolveCircuitBreakerDeferral(gate, enhancedPolicy).getTime();
-      logger.warn('Webhook delivery deferred by circuit breaker', undefined, {
+      logger.warn('Webhook delivery deferred by circuit breaker', effectiveCorrelationId, {
         deliveryId,
         attemptNumber,
         state: gate.state,
@@ -135,7 +181,7 @@ export class WebhookDispatcher {
 
       if (response.ok) {
         await circuitBreakerStore.recordSuccess(url, enhancedPolicy as CircuitBreakerPolicy);
-        logger.info('Webhook delivered successfully', undefined, {
+        logger.info('Webhook delivered successfully', effectiveCorrelationId, {
           deliveryId,
           eventType,
           statusCode: response.status,
@@ -150,7 +196,7 @@ export class WebhookDispatcher {
       }
 
       // Handle non-2xx responses
-      const errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+      const errorMessage = redactKeysInString(`HTTP ${response.status}: ${response.statusText}`);
       attempt.error = errorMessage;
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
@@ -161,7 +207,7 @@ export class WebhookDispatcher {
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
         
-        logger.warn('Webhook delivery failed, will retry', undefined, {
+        logger.warn('Webhook delivery failed, will retry', effectiveCorrelationId, {
           deliveryId,
           eventType,
           statusCode: response.status,
@@ -177,7 +223,7 @@ export class WebhookDispatcher {
         };
       }
 
-      logger.error('Webhook delivery failed permanently', undefined, {
+      logger.error('Webhook delivery failed permanently', effectiveCorrelationId, {
         deliveryId,
         eventType,
         statusCode: response.status,
@@ -191,16 +237,18 @@ export class WebhookDispatcher {
         shouldRetry: false,
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorMessage = redactKeysInString(error instanceof Error ? error.message : String(error));
       
-      // Check if it's WebhookTargetValidationError, which are non-retryable
+      // Check if it's WebhookTargetValidationError or TimeoutError, which are non-retryable
       let isNonRetryable = false;
       if (error instanceof WebhookTargetValidationError) {
+        isNonRetryable = true;
+      } else if (error instanceof DOMException && error.name === 'TimeoutError') {
         isNonRetryable = true;
       }
       
       if (isNonRetryable) {
-        logger.error('Webhook delivery failed permanently with error', undefined, {
+        logger.error('Webhook delivery failed permanently with error', effectiveCorrelationId, {
           deliveryId,
           eventType,
           attemptNumber,
@@ -228,7 +276,7 @@ export class WebhookDispatcher {
       if (retryable) {
         const nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
         
-        logger.warn('Webhook delivery failed with error, will retry', undefined, {
+        logger.warn('Webhook delivery failed with error, will retry', effectiveCorrelationId, {
           deliveryId,
           eventType,
           attemptNumber,
@@ -242,7 +290,7 @@ export class WebhookDispatcher {
         };
       }
 
-      logger.error('Webhook delivery failed permanently with error', undefined, {
+      logger.error('Webhook delivery failed permanently with error', effectiveCorrelationId, {
         deliveryId,
         eventType,
         attemptNumber,
@@ -261,11 +309,11 @@ export class WebhookDispatcher {
    */
   private async followRedirects(
     initialUrl: string,
-    requestOptions: Omit<RequestInit, 'redirect'>,
+    requestOptions: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
     deliveryId: string,
     eventType: string,
     maxRedirects: number = 1,
-  ): Promise<Response> {
+  ): Promise<WebhookHttpResponse> {
     let currentUrl = initialUrl;
     let redirectCount = 0;
     let allowlist: string[] | undefined;
@@ -278,10 +326,7 @@ export class WebhookDispatcher {
     }
 
     while (true) {
-      const response = await fetch(currentUrl, {
-        ...requestOptions,
-        redirect: 'manual',
-      });
+      const response = await this.sendWebhookHttpRequest(currentUrl, requestOptions);
 
       if (response.status >= 300 && response.status < 400) {
         const locationHeader = response.headers.get('Location');
@@ -326,6 +371,48 @@ export class WebhookDispatcher {
     }
   }
 
+  private async sendWebhookHttpRequest(
+    url: string,
+    requestOptions: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
+  ): Promise<WebhookHttpResponse> {
+    const parsedUrl = new URL(url);
+    return new Promise((resolve, reject) => {
+      const options = {
+        method: requestOptions.method,
+        headers: requestOptions.headers,
+        lookup: lookupWebhookTarget,
+        signal: requestOptions.signal,
+      };
+      const handleResponse = (response: IncomingMessage) => {
+        // The dispatcher intentionally ignores webhook response bodies. Drain
+        // them so the connection can be reused while preserving the response
+        // metadata consumed by dispatch().
+        response.resume();
+        const status = response.statusCode ?? 0;
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(response.headers)) {
+          if (typeof value === 'string') {
+            headers.set(name, value);
+          } else if (Array.isArray(value)) {
+            headers.set(name, value.join(', '));
+          }
+        }
+        resolve({
+          status,
+          statusText: response.statusMessage ?? '',
+          ok: status >= 200 && status < 300,
+          headers,
+        });
+      };
+      const request = parsedUrl.protocol === 'https:'
+        ? https.request(parsedUrl, options, handleResponse)
+        : http.request(parsedUrl, options, handleResponse);
+
+      request.once('error', reject);
+      request.end(requestOptions.body);
+    });
+  }
+
   /**
    * Send HTTP request to webhook endpoint.
    *
@@ -340,9 +427,9 @@ export class WebhookDispatcher {
     timestamp: string,
     signature: string,
     correlationId?: string,
-  ): Promise<Response> {
+  ): Promise<WebhookHttpResponse> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.policy.timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(new DOMException('Webhook delivery timeout', 'TimeoutError')), this.policy.timeoutMs);
 
     try {
       const headers: Record<string, string> = {
@@ -595,7 +682,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   // Add AbortController timeout to prevent slow-loris attacks
   const controller = new AbortController();
   const timeoutMs = DEFAULT_RETRY_POLICY.timeoutMs;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(new DOMException('Webhook delivery timeout', 'TimeoutError')), timeoutMs);
 
   try {
     await fetch(opts.url, {

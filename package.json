@@ -4,6 +4,7 @@
   "description": "Contract event indexer with optimized replay batching",
   "main": "dist/index.js",
   "scripts": {
+    "preinstall": "node scripts/check-package-manager.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "test": "vitest run",
@@ -13,6 +14,7 @@
     "dev": "ts-node src/index.ts",
     "start": "node dist/src/index.js",
     "migrate": "tsx src/db/migrate.ts",
+    "check:migrations": "node scripts/check-migration-names.mjs",
     "seed": "ts-node scripts/seed-test-data.ts",
     "benchmark": "ts-node scripts/benchmark.ts",
     "verify": "ts-node scripts/verify-setup.ts",

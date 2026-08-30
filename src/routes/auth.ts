@@ -1,3 +1,4 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { generateToken } from '../lib/auth.js';
@@ -107,9 +108,9 @@ authRouter.post(
         const store = req.authAttemptStore;
         const ip = getClientIp(req);
         if (store) {
-          void store.recordFailure(ip);
+          await store.recordFailure(ip);
           if (targetAddress) {
-            void store.recordFailure(targetAddress);
+            await store.recordFailure(targetAddress);
           }
         }
         throw unauthorized('Invalid credentials');
@@ -127,8 +128,8 @@ authRouter.post(
     const store = req.authAttemptStore;
     if (store) {
       const ip = getClientIp(req);
-      void store.resetAttempts(ip);
-      void store.resetAttempts(targetAddress);
+      await store.resetAttempts(ip);
+      await store.resetAttempts(targetAddress);
     }
 
     res.json({

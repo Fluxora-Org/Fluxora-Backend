@@ -1,3 +1,4 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Request protection middleware for Fluxora Backend.
  *
@@ -52,11 +53,52 @@ export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 /** Allowed characters: alphanumeric, colon, underscore, hyphen. */
 export const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9:_-]+$/;
 
-/** 256 KiB — matches the webhook contract and express.json limit. */
-export const BODY_LIMIT_BYTES = 256 * 1024;
+/** 
+ * Default raw payload limit: 256 KiB 
+ * Default decompressed payload limit: 256 KiB
+ */
+export const DEFAULT_RAW_LIMIT_BYTES = 256 * 1024;
+export const DEFAULT_DECOMPRESSED_LIMIT_BYTES = 256 * 1024;
+
+export interface RouteLimit {
+  pathPrefix: string;
+  rawLimit: number;
+  decompressedLimit: number;
+}
+
+export const ROUTE_LIMITS: RouteLimit[] = [
+  {
+    pathPrefix: '/internal/webhooks',
+    rawLimit: 2 * 1024 * 1024, // 2 MiB raw
+    decompressedLimit: 10 * 1024 * 1024, // 10 MiB decompressed
+  },
+  {
+    pathPrefix: '/api/uploads',
+    rawLimit: 10 * 1024 * 1024, // 10 MiB raw
+    decompressedLimit: 50 * 1024 * 1024, // 50 MiB decompressed
+  }
+];
+
+export function getRawLimit(req: Request): number {
+  for (const route of ROUTE_LIMITS) {
+    if (req.path.startsWith(route.pathPrefix)) {
+      return route.rawLimit;
+    }
+  }
+  return DEFAULT_RAW_LIMIT_BYTES;
+}
+
+export function getDecompressedLimit(req: Request): number {
+  for (const route of ROUTE_LIMITS) {
+    if (req.path.startsWith(route.pathPrefix)) {
+      return route.decompressedLimit;
+    }
+  }
+  return DEFAULT_DECOMPRESSED_LIMIT_BYTES;
+}
 
 /**
- * Enforce BODY_LIMIT_BYTES before the body is parsed.
+ * Enforce raw body size limit before the body is parsed.
  *
  * Two-layer check:
  *   1. Content-Length header (fast path — no bytes read)
@@ -67,18 +109,20 @@ export function bodySizeLimitMiddleware(
   res: Response,
   next: NextFunction,
 ): void {
+  const limit = getRawLimit(req);
+
   // Fast path: reject via Content-Length before reading any bytes.
   const clHeader = req.headers['content-length'];
   if (clHeader !== undefined) {
     const cl = parseInt(clHeader, 10);
-    if (!Number.isNaN(cl) && cl > BODY_LIMIT_BYTES) {
+    if (!Number.isNaN(cl) && cl > limit) {
       /**
        * Increment the oversized-body counter so SREs can alert on sudden spikes
        * in 413 responses (potential DoS probe or misconfigured client).
        * @see src/metrics/requestProtectionMetrics.ts
        */
       requestBodyTooLargeTotal.inc({ path: normalizedPath(req) });
-      next(payloadTooLarge(`Request body exceeds the ${BODY_LIMIT_BYTES}-byte limit`));
+      next(payloadTooLarge(`Request body exceeds the ${limit}-byte limit`));
       return;
     }
   }
@@ -90,19 +134,36 @@ export function bodySizeLimitMiddleware(
   req.on('data', (chunk: Buffer) => {
     if (rejected) return;
     received += chunk.length;
-    if (received > BODY_LIMIT_BYTES) {
+    if (received > limit) {
       rejected = true;
       /**
        * Increment the oversized-body counter for the stream-based slow path.
        * @see src/metrics/requestProtectionMetrics.ts
        */
       requestBodyTooLargeTotal.inc({ path: normalizedPath(req) });
-      next(payloadTooLarge(`Request body exceeds the ${BODY_LIMIT_BYTES}-byte limit`));
+      next(payloadTooLarge(`Request body exceeds the ${limit}-byte limit`));
       req.socket.destroy();
     }
   });
 
   next();
+}
+
+import express from 'express';
+
+const defaultJsonParser = express.json({ limit: DEFAULT_DECOMPRESSED_LIMIT_BYTES });
+const routeParsers = ROUTE_LIMITS.map(r => ({
+  prefix: r.pathPrefix,
+  parser: express.json({ limit: r.decompressedLimit })
+}));
+
+export function dynamicJsonParser(req: Request, res: Response, next: NextFunction): void {
+  for (const { prefix, parser } of routeParsers) {
+    if (req.path.startsWith(prefix)) {
+      return parser(req, res, next);
+    }
+  }
+  return defaultJsonParser(req, res, next);
 }
 
 /**

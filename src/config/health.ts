@@ -54,6 +54,7 @@ export interface DependencyHealth {
   latency?: number;
   error?: string;
   lastChecked: string;
+  degradedSince?: string;
 }
 
 export interface HealthReport {
@@ -504,12 +505,20 @@ export class HealthCheckManager {
         status = 'healthy';
       }
 
+      const prevHealth = this.lastResults.get(checker.name);
+      let degradedSince: string | undefined;
+      
+      if (status === 'degraded') {
+        degradedSince = prevHealth?.status === 'degraded' ? prevHealth.degradedSince : new Date().toISOString();
+      }
+
       const health: DependencyHealth = {
         name: checker.name,
         status,
         latency,
         ...(result.error !== undefined ? { error: result.error } : {}),
         lastChecked: new Date().toISOString(),
+        ...(degradedSince !== undefined ? { degradedSince } : {}),
       };
 
       this.lastResults.set(checker.name, health);

@@ -12,7 +12,7 @@ import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.j
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders } from './middleware/pii.js';
 import type { Config } from './config/env.js';
-import { loadConfig } from './config/env.js';
+import { loadConfig, initializeConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
 import { createGrpcHealthServer, startGrpcHealthServer, stopGrpcHealthServer } from './health/grpcHealth.js';
 import { createRedisClient } from './redis/client.js';
@@ -34,7 +34,7 @@ import { errorHandler } from './middleware/errorHandler.js';
 import {
   bodySizeLimitMiddleware,
   requestTimeoutMiddleware,
-  BODY_LIMIT_BYTES,
+  dynamicJsonParser,
 } from './middleware/requestProtection.js';
 import { apiVersionMiddleware } from './middleware/apiVersion.js';
 import { requireJsonContentType } from './middleware/contentType.js';
@@ -58,10 +58,12 @@ import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse } from './utils/response.js';
-import { ApiError } from './errors.js';
+import { ApiError, notFound } from './errors.js';
 import { docsRouter } from './routes/docs.js';
 import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { getStreamHub } from './ws/hub.js';
+import { getPool } from './db/pool.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 
@@ -432,6 +434,22 @@ export function createApp(options: AppOptions = {}): Express {
     addShutdownHook(() => stopBackgroundJobs());
   }
 
+  addShutdownHook(async () => {
+    const hub = getStreamHub();
+    if (hub) {
+      await new Promise<void>((resolve) => {
+        hub.close(() => resolve());
+      });
+    }
+  });
+
+  addShutdownHook(async () => {
+    const pool = getPool();
+    if (pool) {
+      await pool.end();
+    }
+  });
+
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
   const appConfig = options.config ?? loadConfig();
   void wireIdempotencyStore(appConfig);
@@ -480,7 +498,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
-  app.use(express.json({ limit: BODY_LIMIT_BYTES }));
+  app.use(dynamicJsonParser);
   app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
@@ -537,13 +555,17 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   app.use((_req: Request, _res: Response, next: NextFunction) => {
-    next(new ApiError(404, 'NOT_FOUND', 'The requested resource was not found'));
+    next(notFound('The requested resource was'));
   });
 
   app.use(errorHandler);
 
   return app;
 }
+
+// Initialize the config singleton so getConfig() works in all route handlers
+// and services that run after module load. No-op if already initialized.
+initializeConfig();
 
 export const app = createApp();
 export default app;

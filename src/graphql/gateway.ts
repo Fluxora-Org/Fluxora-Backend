@@ -27,6 +27,7 @@ import {
   type SelectionNode,
   type SelectionSetNode,
 } from 'graphql';
+import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
 import { authenticate, requireAuth } from '../middleware/auth.js';
@@ -52,6 +53,20 @@ const MAX_QUERY_DEPTH = 3;
 
 /** Maximum GraphQL field complexity before rejecting the request. */
 const MAX_QUERY_COMPLEXITY = 15;
+
+// ── Persisted-query helpers ───────────────────────────────────────────────────
+
+export function hashQuery(query: string): string {
+  return createHash('sha256').update(query, 'utf8').digest('hex');
+}
+
+const persistedQueryStore = new Map<string, string>();
+
+export function registerPersistedQuery(query: string): string {
+  const hash = hashQuery(query);
+  persistedQueryStore.set(hash, query);
+  return hash;
+}
 
 // ── GraphQL request validation ───────────────────────────────────────────────
 
@@ -204,12 +219,6 @@ function rejectGraphQLError(res: any, code: string, message: string): void {
 
 // ── Resolver helpers ──────────────────────────────────────────────────────────
 
-/**
- * Resolve a feature-flag requester ID from the Express request.
- *
- * Uses the same strategy as REST routes: API-key record ID when available,
- * otherwise a synthetic identifier derived from the auth state.
- */
 function resolveRequesterId(req: Request): string {
   const user = (req as any).user;
   if (user?.keyId) return `key:${user.keyId}`;
@@ -217,33 +226,20 @@ function resolveRequesterId(req: Request): string {
   return 'anonymous';
 }
 
-/**
- * Check whether the GraphQL gateway is enabled for the current request.
- */
 export function isGraphQLGatewayEnabled(req: Request): boolean {
   return isEnabled(GRAPHQL_GATEWAY_FLAG, resolveRequesterId(req));
 }
 
 // ── Root value (resolvers) ────────────────────────────────────────────────────
 
-/**
- * Root value object passed to `graphql()` — each key corresponds to a
- * field on the root `Query` type.
- */
 function createRootValue(req: Request) {
   return {
-    /**
-     * Fetch a single stream by ID.
-     */
     async stream(args: { id: string }) {
       const record = await streamRepository.getById(args.id);
       if (!record) return null;
       return mapStream(record);
     },
 
-    /**
-     * Paginated stream list with optional filters.
-     */
     async streams(args: {
       limit?: number;
       status?: string;
@@ -271,9 +267,6 @@ function createRootValue(req: Request) {
       };
     },
 
-    /**
-     * Query in-memory audit-log entries.
-     */
     auditEntries(args: { limit?: number; offset?: number; actionType?: string }) {
       const limit = Math.min(Math.max(args.limit ?? 20, 1), MAX_AUDIT_PAGE_SIZE);
       const offset = Math.max(args.offset ?? 0, 0);
@@ -345,25 +338,11 @@ function mapStream(record: {
 
 export const graphqlGatewayRouter = Router();
 
-/**
- * POST /api/graphql
- *
- * Executes a GraphQL query against the schema.
- *
- * Authentication is required — requests without a valid Bearer token or
- * API key are rejected with 401 before any GraphQL processing begins.
- *
- * When the `experimental_graphql_gateway` feature flag is disabled for the
- * caller, all queries return an error in the standard `errors` envelope
- * (HTTP 200 with `errors[0].message`), consistent with how feature-flagged
- * endpoints in the REST API behave.
- */
 graphqlGatewayRouter.post('/', authenticate, requireAuth, async (req, res) => {
-  const requestId = req.correlationId;
+  const requestId = (res.req as any)?.id ?? (req as any).correlationId;
   const start = Date.now();
 
   try {
-    // ── Feature-flag gate ──────────────────────────────────────────────────
     if (!isGraphQLGatewayEnabled(req)) {
       res.status(200).json({
         errors: [
@@ -376,7 +355,6 @@ graphqlGatewayRouter.post('/', authenticate, requireAuth, async (req, res) => {
       return;
     }
 
-    // ── Parse request body ─────────────────────────────────────────────────
     const rawBody = req.body ?? {};
     if (Array.isArray(rawBody)) {
       res
@@ -392,9 +370,101 @@ graphqlGatewayRouter.post('/', authenticate, requireAuth, async (req, res) => {
       return;
     }
 
-    const { query: queryText, variables, operationName } = rawBody;
+    const { query: queryText, variables, operationName, extensions } = rawBody;
+    let source: string | undefined = queryText;
 
-    if (!queryText || typeof queryText !== 'string') {
+    // Persisted query resolution (Admin addition)
+    if (extensions !== undefined && extensions !== null) {
+      if (typeof extensions !== 'object' || Array.isArray(extensions)) {
+        res
+          .status(400)
+          .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
+        return;
+      }
+
+      const persistedQuery = (extensions as Record<string, unknown>).persistedQuery;
+
+      if (persistedQuery !== undefined) {
+        if (typeof persistedQuery !== 'object' || persistedQuery === null || Array.isArray(persistedQuery)) {
+          res
+            .status(400)
+            .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid persistedQuery extension.', undefined, requestId));
+          return;
+        }
+
+        const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
+
+        if (version !== 1) {
+          res
+            .status(400)
+            .json(
+              errorResponse(
+                'PERSISTED_QUERY_UNSUPPORTED_VERSION',
+                'Unsupported persisted query version.',
+                undefined,
+                requestId
+              )
+            );
+          return;
+        }
+
+        if (typeof sha256Hash !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256Hash)) {
+          res
+            .status(400)
+            .json(
+              errorResponse(
+                'PERSISTED_QUERY_INVALID_HASH',
+                'Persisted query hash must be a SHA-256 hex string.',
+                undefined,
+                requestId
+              )
+            );
+          return;
+        }
+
+        const hash = sha256Hash.toLowerCase();
+
+        if (source !== undefined) {
+          if (typeof source !== 'string') {
+            res
+              .status(400)
+              .json(errorResponse('VALIDATION_ERROR', 'GraphQL query must be a string.', undefined, requestId));
+            return;
+          }
+
+          const actualHash = hashQuery(source);
+          if (actualHash !== hash) {
+            res.status(200).json({
+              errors: [
+                {
+                  message: 'PersistedQueryHashMismatch',
+                  extensions: { code: 'PERSISTED_QUERY_HASH_MISMATCH' },
+                },
+              ],
+            });
+            return;
+          }
+
+          persistedQueryStore.set(hash, source);
+        } else {
+          const cachedQuery = persistedQueryStore.get(hash);
+          if (!cachedQuery) {
+            res.status(200).json({
+              errors: [
+                {
+                  message: 'PersistedQueryNotFound',
+                  extensions: { code: 'PERSISTED_QUERY_NOT_FOUND' },
+                },
+              ],
+            });
+            return;
+          }
+          source = cachedQuery;
+        }
+      }
+    }
+
+    if (!source || typeof source !== 'string') {
       res
         .status(400)
         .json(
@@ -408,9 +478,10 @@ graphqlGatewayRouter.post('/', authenticate, requireAuth, async (req, res) => {
       return;
     }
 
+    // Static Query Enforcement (Your addition)
     let document: DocumentNode;
     try {
-      document = parse(queryText);
+      document = parse(source);
     } catch (parseError) {
       res
         .status(400)
@@ -450,24 +521,20 @@ graphqlGatewayRouter.post('/', authenticate, requireAuth, async (req, res) => {
       return;
     }
 
-    // ── Execute query ───────────────────────────────────────────────────────
+    // Execute GraphQL Query
     const rootValue = createRootValue(req);
     const context = { req, res, requestId };
 
     const result = await graphql({
       schema: executableSchema,
-      source: queryText,
+      source,
       rootValue,
       contextValue: context,
       variableValues: variables ?? undefined,
       operationName: operationName ?? undefined,
     });
 
-    // ── Sanitise errors ─────────────────────────────────────────────────────
     if (result.errors && result.errors.length > 0) {
-      // Spreading a GraphQLError yields a plain object (no toJSON), which is
-      // fine here because the result is serialised by res.json() immediately
-      // below and never used as a GraphQLError again.
       result.errors = result.errors.map((err) => ({
         ...err,
         message: sanitiseGraphQLError(err.message),
@@ -477,7 +544,6 @@ graphqlGatewayRouter.post('/', authenticate, requireAuth, async (req, res) => {
 
     res.json(result);
   } catch (err) {
-    // Catch-all for internal errors that the graphql() call did not capture.
     logger.error('GraphQL gateway unexpected error', requestId, {
       error: err instanceof Error ? err.message : String(err),
     });
@@ -494,9 +560,6 @@ graphqlGatewayRouter.post('/', authenticate, requireAuth, async (req, res) => {
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
-/**
- * Sanitise a GraphQL error message so internal details are never leaked.
- */
 function sanitiseGraphQLError(message: string): string {
   const sanitised = sanitiseErrorMessage(message)
     .replace(/\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.ts:\d+:\d+/g, '[redacted-path]')
@@ -506,7 +569,6 @@ function sanitiseGraphQLError(message: string): string {
     .replace(/Error: /g, '')
     .trim();
 
-  // If the message becomes empty or contains only punctuation, return a generic
   if (
     !sanitised ||
     /^[\s.,!?;:-]+$/.test(sanitised) ||
@@ -519,9 +581,6 @@ function sanitiseGraphQLError(message: string): string {
   return sanitised;
 }
 
-/**
- * Sanitise error extensions — keep only known-safe codes.
- */
 function sanitiseExtensions(
   extensions: Readonly<Record<string, unknown>>
 ): Record<string, unknown> {
@@ -537,12 +596,8 @@ function sanitiseExtensions(
   return safe;
 }
 
-// ── GET handler — schema introspection for tooling ─────────────────────────────
+// ── GET handler ───────────────────────────────────────────────────────────────
 
-/**
- * GET /api/graphql?sdl — returns the raw SDL string for tooling (e.g. codegen).
- * Only available when the feature flag is enabled for the caller.
- */
 graphqlGatewayRouter.get('/', authenticate, requireAuth, async (req, res) => {
   if (!isGraphQLGatewayEnabled(req)) {
     res.status(200).json({
@@ -561,7 +616,6 @@ graphqlGatewayRouter.get('/', authenticate, requireAuth, async (req, res) => {
     return;
   }
 
-  // Return a simple health/status response for GET without ?sdl
   res.json({
     data: {
       __typename: 'GraphQLGateway',

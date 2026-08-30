@@ -11,12 +11,18 @@
  */
 import { z } from 'zod';
 import { MAX_DECIMAL_INTEGER_PART, STELLAR_DECIMALS } from '../serialization/decimal.js';
+import { STELLAR_ACCOUNT_PUBLIC_KEY_REGEX } from './stellarAddress.js';
 
 /** Regex for valid decimal strings: optional sign, digits, optional fraction */
 export const DECIMAL_STRING_REGEX = /^[+-]?\d+(\.\d+)?$/;
 
-/** Regex for valid Stellar public keys: G followed by 55 base32 characters */
-export const STELLAR_PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
+/**
+ * Regex for valid Stellar account public keys: G followed by 55 base32
+ * characters. Shared single source of truth is `STELLAR_ACCOUNT_PUBLIC_KEY_REGEX`
+ * from ./stellarAddress.js — see that module for the full, checksum-aware
+ * validation contract used at every boundary.
+ */
+export const STELLAR_PUBLIC_KEY_REGEX = STELLAR_ACCOUNT_PUBLIC_KEY_REGEX;
 
 /**
  * Reusable decimal-string field schema.

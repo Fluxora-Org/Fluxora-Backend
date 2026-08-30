@@ -217,7 +217,7 @@ describe("streamEventService duplicate-event suppression (Issue #923)", () => {
     }).map(({ type, txId, eventIdx }): StreamEvent => {
       const transactionHash = `tx-hash-${txId}`;
       const eventIndex = eventIdx;
-      const streamId = deriveStreamId(transactionHash, eventIndex);
+      const streamId = `${transactionHash}-${eventIndex}`;
 
       if (type === "StreamCreated") {
         return {

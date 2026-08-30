@@ -3,12 +3,12 @@ import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal, isValidRejectio
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP = 10;
 export const DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS = 1000;
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_API_KEY = 50;
-export const DEFAULT_SSE_MAX_CONNECTION_DURATION_MS = 30 * 60 * 1000;
-export const DEFAULT_SSE_RETRY_AFTER_SECONDS = 15;
+const DEFAULT_SSE_MAX_CONNECTION_DURATION_MS = 30 * 60 * 1000;
+const DEFAULT_SSE_RETRY_AFTER_SECONDS = 15;
 
 const MAX_SSE_CONNECTION_LIMIT = 100_000;
-const MAX_SSE_CONNECTION_DURATION_MS = 86_400_000;
-const MAX_SSE_RETRY_AFTER_SECONDS = 86_400;
+const MAX_SSE_CONNECTION_DURATION_MS = 86400_000;
+const MAX_SSE_RETRY_AFTER_SECONDS = 86400;
 
 export type SseConnectionRejectionReason =
   | 'per_ip_limit'
@@ -31,7 +31,7 @@ export interface AcceptedSseConnection {
    * Release the active SSE connection exactly once.
    *
    * The route can safely call this from close, abort, timeout, write-error,
-   * and pre-header failure paths without double-decrementing the per-IP/global
+   * and pre-header failure paths without double-decreminting the per-IP/global
    * counters or the active Prometheus gauge.
    */
   release(): void;
@@ -52,6 +52,7 @@ export type SseConnectionAttempt =
 const activeConnectionsByIp = new Map<string, number>();
 let activeConnections = 0;
 const activeConnectionsByApiKey = new Map<string, number>();
+const activeTimers = new Set<ReturnType<typeof setTimeout>>();
 
 function normalizeApiKey(apiKey: string | undefined): string | undefined {
   if (apiKey === undefined) return undefined;
@@ -65,7 +66,7 @@ function normalizeIp(ip: string): string {
 }
 
 function readBoundedPositiveInteger(
-  env: NodeJS.ProcessEnv,
+  env: Record<string, string | undefined>,
   name: string,
   fallback: number,
   min: number,
@@ -92,7 +93,7 @@ function readBoundedPositiveInteger(
  * budgets.
  */
 export function resolveSseConnectionLimits(
-  env: NodeJS.ProcessEnv = process.env,
+  env: Record<string, string | undefined> = process.env,
 ): SseConnectionLimits {
   return {
     maxConnectionsPerIp: readBoundedPositiveInteger(
@@ -151,7 +152,9 @@ export function tryAcquireSseConnection(
 
   if (activeConnectionsForIp >= limits.maxConnectionsPerIp) {
     if (isValidRejectionReason('per_ip_limit')) {
-      sseConnectionsRejectedTotal.inc({ reason: 'per_ip_limit' });
+      sseConnectionsRejectedTotal.inc({
+        reason: 'per_ip_limit',
+      });
     }
     return {
       ok: false,
@@ -204,39 +207,55 @@ export function tryAcquireSseConnection(
   sseActiveConnectionsGauge.set(activeConnections);
 
   let released = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const acceptedAt = Date.now();
 
-  return {
-    ok: true,
-    connection: {
-      ip: normalizedIp,
-      acceptedAt,
-      limits,
-      release(): void {
-        if (released) return;
-        released = true;
+  const connection: AcceptedSseConnection = {
+    ip: normalizedIp,
+    acceptedAt,
+    limits,
+    release(): void {
+      if (released) return;
+      released = true;
 
-        const currentForIp = activeConnectionsByIp.get(normalizedIp) ?? 0;
-        if (currentForIp <= 1) {
-          activeConnectionsByIp.delete(normalizedIp);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        activeTimers.delete(timer);
+        timer = undefined;
+      }
+
+      const currentForIp = activeConnectionsByIp.get(normalizedIp) ?? 0;
+      if (currentForIp <= 1) {
+        activeConnectionsByIp.delete(normalizedIp);
+      } else {
+        activeConnectionsByIp.set(normalizedIp, currentForIp - 1);
+      }
+
+      if (normalizedKey !== undefined) {
+        const currentForKey = activeConnectionsByApiKey.get(normalizedKey) ?? 0;
+        if (currentForKey <= 1) {
+          activeConnectionsByApiKey.delete(normalizedKey);
         } else {
-          activeConnectionsByIp.set(normalizedIp, currentForIp - 1);
+          activeConnectionsByApiKey.set(normalizedKey, currentForKey - 1);
         }
+      }
 
-        if (normalizedKey !== undefined) {
-          const currentForKey = activeConnectionsByApiKey.get(normalizedKey) ?? 0;
-          if (currentForKey <= 1) {
-            activeConnectionsByApiKey.delete(normalizedKey);
-          } else {
-            activeConnectionsByApiKey.set(normalizedKey, currentForKey - 1);
-          }
-        }
-
-        activeConnections = Math.max(0, activeConnections - 1);
-        sseActiveConnectionsGauge.set(activeConnections);
-      },
+      activeConnections = Math.max(0, activeConnections - 1);
+      sseActiveConnectionsGauge.set(activeConnections);
     },
   };
+
+  if (limits.maxConnectionDurationMs > 0) {
+    timer = setTimeout(() => {
+      connection.release();
+    }, limits.maxConnectionDurationMs);
+    activeTimers.add(timer);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+  }
+
+  return { ok: true, connection };
 }
 
 export function getActiveSseConnectionCount(): number {
@@ -249,6 +268,10 @@ export function getActiveSseConnectionCountForIp(ip: string): number {
 
 /** Reset limiter state between tests without touching the rejection counter. */
 export function _resetSseConnectionLimiter(): void {
+  for (const timer of activeTimers) {
+    clearTimeout(timer);
+  }
+  activeTimers.clear();
   activeConnectionsByIp.clear();
   activeConnectionsByApiKey.clear();
   activeConnections = 0;
