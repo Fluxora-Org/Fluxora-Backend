@@ -242,6 +242,10 @@ export const EnvSchema = z
       (value) => (value === '' ? undefined : value),
       z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional()
     ),
+    API_KEY_PEPPER_PREVIOUS: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'API_KEY_PEPPER_PREVIOUS must be at least 32 characters').optional()
+    ),
     INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
     ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
 
@@ -570,6 +574,7 @@ export interface Config {
   apiKeys: string[];
   /** Server-side pepper for API-key hashing. Never logged. */
   apiKeyPepper?: string | undefined;
+  apiKeyPepperPrevious?: string | undefined;
   indexerWorkerToken: string;
 
   /** OIDC issuer base URL. Undefined means OIDC login is disabled. */
@@ -795,6 +800,7 @@ function toConfig(env: ParsedEnv): Config {
       .map((key) => key.trim())
       .filter((key) => key.length > 0),
     apiKeyPepper: env.API_KEY_PEPPER,
+    apiKeyPepperPrevious: env.API_KEY_PEPPER_PREVIOUS,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
 
     oidcIssuerUrl: env.OIDC_ISSUER_URL,

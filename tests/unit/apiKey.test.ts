@@ -1,9 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { ApiKeyRecord, ApiKeyView } from '../../src/db/types.js';
 
+let _testCurrentPepper = 'test-pepper-32-chars-long-secret-key-pepper!';
+let _testPreviousPepper: string | undefined = undefined;
 vi.mock('../../src/config/env.js', () => ({
   getConfig: () => ({
-    apiKeyPepper: 'test-pepper-32-chars-long-secret-key-pepper!',
+    apiKeyPepper: _testCurrentPepper,
+    apiKeyPepperPrevious: _testPreviousPepper,
   }),
 }));
 
@@ -26,6 +29,13 @@ vi.mock('../../src/db/repositories/apiKeyRepository.js', () => ({
       const existing = inMemoryKeys.get(id);
       if (!existing) return undefined;
       const updated = { ...existing, ...patch };
+      inMemoryKeys.set(id, updated);
+      return updated;
+    }),
+    updateKeyHash: vi.fn(async (id: string, keyHash: string) => {
+      const existing = inMemoryKeys.get(id);
+      if (!existing) return undefined;
+      const updated = { ...existing, keyHash };
       inMemoryKeys.set(id, updated);
       return updated;
     }),
@@ -307,6 +317,32 @@ describe('src/lib/apiKey.ts unit tests', () => {
 
       const record = await getApiKeyRecord(created.key);
       expect(record).toBeUndefined();
+    });
+
+    it('rehashes stored digest when previous pepper matches (rehash-on-use)', async () => {
+      // Create a key with the old pepper
+      _testCurrentPepper = 'old-pepper-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      _testPreviousPepper = undefined;
+      const created = await createApiKey('migrate-key');
+
+      // Inspect stored record and ensure it was hashed with the old pepper
+      const stored = Array.from(inMemoryKeys.values()).find((k) => k.id === created.id)!;
+      const oldHash = stored.keyHash;
+
+      // Rotate server to new pepper but keep previous pepper configured
+      _testPreviousPepper = _testCurrentPepper;
+      _testCurrentPepper = 'new-pepper-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+      // Use crypto to compute expected new digest from raw key and same salt
+      const { createHmac } = await import('crypto');
+      const expectedNew = createHmac('sha256', _testCurrentPepper).update(stored.salt).update(created.key).digest('hex');
+
+      // Validate: this should succeed (because previous pepper matches) and trigger a background rehash
+      expect(await isValidApiKey(created.key)).toBe(true);
+
+      // Verify stored digest was updated to the new pepper-derived value
+      const updated = Array.from(inMemoryKeys.values()).find((k) => k.id === created.id)!;
+      expect(updated.keyHash).toBe(expectedNew);
     });
   });
 

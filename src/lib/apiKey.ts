@@ -82,6 +82,15 @@ function getPepper(): string {
 }
 
 /**
+ * Optional previous pepper used during a migration window. When present we
+ * accept keys hashed with either the current or previous pepper and re-hash
+ * the stored digest with the current pepper on first successful use.
+ */
+function getPreviousPepper(): string | undefined {
+  return getConfig().apiKeyPepperPrevious;
+}
+
+/**
  * Derive the stored digest for a raw key.
  *
  * Computes `HMAC-SHA256(pepper, salt || rawKey)` and returns it as hex. The
@@ -92,8 +101,12 @@ function getPepper(): string {
  * @param salt   - Per-key random salt, hex-encoded.
  * @returns Hex-encoded HMAC digest suitable for storage.
  */
+function hashWithPepper(rawKey: string, salt: string, pepper: string): string {
+  return createHmac('sha256', pepper).update(salt).update(rawKey).digest('hex');
+}
+
 function hashKey(rawKey: string, salt: string): string {
-  return createHmac('sha256', getPepper()).update(salt).update(rawKey).digest('hex');
+  return hashWithPepper(rawKey, salt, getPepper());
 }
 
 /** Generate a new random raw key, e.g. `flx_<64 hex chars>`. */
@@ -267,11 +280,35 @@ export async function findRecordByRawKey(rawKey: string): Promise<ApiKeyRecord |
   const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
 
   let matchedRecord: ApiKeyRecord | undefined;
+  const previousPepper = getPreviousPepper();
   for (const candidate of candidates) {
     // Compare every candidate (do not early-return) so timing does not reveal
     // which row, if any, matched within a colliding prefix bucket.
-    if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
+    const currentDigest = hashWithPepper(rawKey, candidate.salt, getPepper());
+    if (hashesMatch(currentDigest, candidate.keyHash)) {
       matchedRecord = candidate;
+      continue;
+    }
+
+    // If a previous pepper is configured, allow a match against it and
+    // re-hash the stored digest using the current pepper so future auths use
+    // the latest server-side secret without forcing a global key rotation.
+    if (previousPepper) {
+      const prevDigest = hashWithPepper(rawKey, candidate.salt, previousPepper);
+      if (hashesMatch(prevDigest, candidate.keyHash)) {
+        matchedRecord = candidate;
+        // Best-effort update: do not fail authentication if the DB update
+        // races or errors — authentication succeeded regardless.
+        try {
+          const newHash = currentDigest;
+          // Persist new hash so subsequent validations succeed with current pepper.
+          // Use repository method that only updates the digest to minimize churn.
+          // eslint-disable-next-line @typescript-eslint/no-floating-promises
+          apiKeyRepository.updateKeyHash(candidate.id, newHash);
+        } catch (err) {
+          // Swallow DB errors: auth must not fail because the rehash write failed.
+        }
+      }
     }
   }
   endTimer({ outcome: matchedRecord ? 'success' : 'failure' });
