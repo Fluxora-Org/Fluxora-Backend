@@ -30,6 +30,7 @@ import {
   ErrorClassifier,
   createBuiltInHooks,
 } from '../../src/tracing/builtin.js';
+import { correlationStore } from '../../src/tracing/middleware.js';
 
 describe('Distributed Tracing Hooks', () => {
   beforeEach(() => {
@@ -238,6 +239,31 @@ describe('Distributed Tracing Hooks', () => {
   });
 
   describe('Built-in hooks - SpanBuffer', () => {
+    it('routes span logs through the structured logger with request correlation', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      const buffer = new SpanBuffer({ logEvents: true, logLevel: 'info' });
+      const tracer = new Tracer({ enabled: true, hooks: buffer });
+
+      correlationStore.run('request-correlation-123', () => {
+        tracer.startSpan({
+          traceId: 'trace-123',
+          userId: 'user-456',
+          tags: { operation: 'test' },
+        });
+      });
+
+      const line = writeSpy.mock.calls
+        .map(([value]) => String(value))
+        .find((value) => value.includes('"message":"[tracing] span.start"'));
+      expect(line).toBeDefined();
+      expect(JSON.parse(line as string)).toMatchObject({
+        level: 'info',
+        message: '[tracing] span.start',
+        correlationId: 'request-correlation-123',
+      });
+      writeSpy.mockRestore();
+    });
+
     it('buffers spans in memory', () => {
       const buffer = new SpanBuffer({ maxSpans: 100, logEvents: false });
       const tracer = new Tracer({ enabled: true, hooks: buffer });

@@ -667,6 +667,10 @@ export interface BackupRetentionOptions {
 /**
  * Main retention policy enforcement function.
  */
+// Deliberate CLI exception: this standalone command is also used as an
+// operator-facing terminal tool and can run before request logging exists.
+// Its console calls are documented and excluded from the production no-console
+// rule; request/job code must use src/lib/logger.ts instead.
 export async function enforceBackupRetention(options: BackupRetentionOptions = {}): Promise<void> {
   const bucket = process.env.S3_BACKUP_BUCKET;
   const defaultPrefix = process.env.S3_BACKUP_PREFIX ?? 'backups/';
