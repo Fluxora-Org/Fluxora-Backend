@@ -356,7 +356,18 @@ export class JobQueue {
    * Maps the supplied options to pg‑boss configuration keys.
    */
   private toSendOptions(opts?: JobSendOptions): Record<string, unknown> {
-    const s: Record<string, unknown> = {};
+    // ── Invariant: no-loss under worker crash ──────────────────────────────
+    // Every job sent through this queue MUST carry an expireInSeconds value so
+    // pg-boss can move a job from `active` back to `failed` (and subsequently
+    // retry it) when the worker that locked it disappears.  Without this cap a
+    // crashed worker leaves the job in `active` forever and it is silently lost.
+    //
+    // We apply DEFAULT_EXPIRE_SECONDS when the caller omits expireInSeconds,
+    // rather than leaving the field absent.  Callers that need a different
+    // window can still supply their own value; this only acts as a safety net.
+    const s: Record<string, unknown> = {
+      expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+    };
     if (!opts) return s;
     if (opts.retryLimit !== undefined) {
       if (typeof opts.retryLimit !== 'number' || !Number.isFinite(opts.retryLimit) || opts.retryLimit < 0) {
