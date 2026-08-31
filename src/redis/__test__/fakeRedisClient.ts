@@ -180,6 +180,14 @@ export class FakeRedisClient implements RedisClient {
         return true;
     }
 
+    async incr(key: string): Promise<number> {
+        this.maybeThrow('incr');
+        const current = Number(this.strings.get(key) ?? '0');
+        const next = current + 1;
+        this.strings.set(key, String(next));
+        return next;
+    }
+
     async del(key: string): Promise<void> {
         this.maybeThrow('del');
         this.strings.delete(key);

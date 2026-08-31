@@ -66,6 +66,8 @@ export interface RedisClient {
   /** Delete only when the lock value still belongs to this owner. */
   delIfValue?(key: string, value: string): Promise<void>;
   exists(key: string): Promise<boolean>;
+  /** Atomically increment an integer counter; returns the new value. */
+  incr(key: string): Promise<number>;
   close(): Promise<void>;
   multi(): RedisPipeline;
   zcount(key: string, min: string | number, max: string | number): Promise<number>;
@@ -133,6 +135,10 @@ class IORedisClient implements RedisClient {
 
   async del(key: string): Promise<void> {
     await this.client.del(key);
+  }
+
+  async incr(key: string): Promise<number> {
+    return this.client.incr(key);
   }
 
   async delIfValue(key: string, value: string): Promise<void> {
@@ -520,6 +526,7 @@ export class NoOpRedisClient implements RedisClient {
   async setNx(): Promise<boolean> { return true; }
   async del(): Promise<void> { return; }
   async exists(): Promise<boolean> { return false; }
+  async incr(): Promise<number> { return 1; }
   async close(): Promise<void> { return; }
   multi(): RedisPipeline {
     const noop: RedisPipeline = {
