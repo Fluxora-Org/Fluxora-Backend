@@ -19,6 +19,7 @@
     "benchmark": "ts-node scripts/benchmark.ts",
     "verify": "ts-node scripts/verify-setup.ts",
     "lint": "eslint src tests --ext .ts",
+    "lint:ci": "node scripts/lint-changed-files.mjs",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
