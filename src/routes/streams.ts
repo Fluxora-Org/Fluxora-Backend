@@ -636,12 +636,16 @@ streamsRouter.get(
       if (recipientFilter) queryParams.recipient = recipientFilter;
       if (include_total === 'true') queryParams.include_total = 'true';
 
-      sendEarlyHints(res, {
-        baseUrl: '/api/streams',
-        hasMore: true,
-        nextCursor,
-        queryParams,
-      });
+      sendEarlyHints(
+        res,
+        {
+          baseUrl: '/api/streams',
+          hasMore: true,
+          nextCursor,
+          queryParams,
+        },
+        req,
+      );
     }
 
     const response: {
