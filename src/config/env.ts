@@ -9,6 +9,7 @@ import {
   type PinnedStellarAddressKind,
   type PinnedStellarNetwork,
 } from './stellarContracts.js';
+import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
 export {
   STELLAR_CONTRACT_ALLOWLIST,
@@ -179,16 +180,22 @@ export const EnvSchema = z
 
     DATABASE_URL: urlString('DATABASE_URL'),
     DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
-    DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
-    DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
-    DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
-    DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
+    DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(LIMITS.DB_POOL_MIN),
+    DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(LIMITS.DB_POOL_MAX),
+    DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(
+      LIMITS.DB_CONNECTION_TIMEOUT
+    ),
+    DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(LIMITS.DB_IDLE_TIMEOUT),
     SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
-    STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+    STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(
+      LIMITS.STATEMENT_TIMEOUT_MS
+    ),
+    /** Max requests allowed to queue on the primary pool before fast-failing with 503. */
+    POOL_QUEUE_LIMIT: integerEnv('POOL_QUEUE_LIMIT', 1).default(LIMITS.POOL_QUEUE_LIMIT),
     /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. 0 = disabled. */
     REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
     /** Max requests allowed to queue on the replica pool before fast-failing. */
-    REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(25),
+    REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(LIMITS.REPLICA_QUEUE_LIMIT),
 
     REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
     REDIS_ENABLED: booleanEnv().default(true),
@@ -199,6 +206,26 @@ export const EnvSchema = z
     REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
     // Comma-separated list of cluster nodes: host:port,host:port
     REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
+    /** TCP connect timeout for each Redis client, in ms. */
+    REDIS_CONNECT_TIMEOUT_MS: integerEnv('REDIS_CONNECT_TIMEOUT_MS', 1, 60000).default(
+      LIMITS.REDIS_CONNECT_TIMEOUT_MS
+    ),
+    /** Command retries per request before a Redis call fails. */
+    REDIS_MAX_RETRIES_PER_REQUEST: integerEnv('REDIS_MAX_RETRIES_PER_REQUEST', 0).default(
+      LIMITS.REDIS_MAX_RETRIES_PER_REQUEST
+    ),
+    /** Base delay of the Redis reconnect backoff, in ms. */
+    REDIS_RETRY_BASE_DELAY_MS: integerEnv('REDIS_RETRY_BASE_DELAY_MS', 0).default(
+      LIMITS.REDIS_RETRY_BASE_DELAY_MS
+    ),
+    /** Ceiling of the Redis reconnect backoff, in ms. */
+    REDIS_RETRY_MAX_DELAY_MS: integerEnv('REDIS_RETRY_MAX_DELAY_MS', 0).default(
+      LIMITS.REDIS_RETRY_MAX_DELAY_MS
+    ),
+    /** Reconnect attempts before ioredis stops retrying. */
+    REDIS_RETRY_MAX_ATTEMPTS: integerEnv('REDIS_RETRY_MAX_ATTEMPTS', 1).default(
+      LIMITS.REDIS_RETRY_MAX_ATTEMPTS
+    ),
 
     STELLAR_NETWORK: z.enum(['testnet', 'mainnet', 'local']).optional(),
     STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
@@ -207,9 +234,13 @@ export const EnvSchema = z
     HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
     CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
     STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
-    STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(10000),
-    STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(3),
-    STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
+    STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(LIMITS.STELLAR_RPC_TIMEOUT),
+    STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(
+      LIMITS.STELLAR_RPC_MAX_RETRIES
+    ),
+    STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(
+      LIMITS.STELLAR_RPC_RETRY_DELAY
+    ),
     /**
      * Per-operation timeout overrides for Stellar RPC calls.
      * Format: JSON object mapping operation names to timeouts in ms.
@@ -283,12 +314,8 @@ export const EnvSchema = z
      */
     TRACING_ENABLED: booleanEnv().default(false),
     TRACING_SAMPLE_RATE: z.preprocess(parseNumber, z.number().min(0).max(1)).default(1),
-    TRACING_SAMPLING_STRATEGY: z
-      .enum(['head', 'tail', 'always', 'never'])
-      .default('head'),
-    TRACING_HEAD_SAMPLE_RATE: z
-      .preprocess(parseNumber, z.number().min(0).max(1))
-      .optional(),
+    TRACING_SAMPLING_STRATEGY: z.enum(['head', 'tail', 'always', 'never']).default('head'),
+    TRACING_HEAD_SAMPLE_RATE: z.preprocess(parseNumber, z.number().min(0).max(1)).optional(),
     TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
     TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
     TRACING_OTEL_ENABLED: booleanEnv().default(false),
@@ -301,6 +328,7 @@ export const EnvSchema = z
     FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
     WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
     WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+    WEBHOOK_BATCH_MAX_BACKOFF_MS: integerEnv('WEBHOOK_BATCH_MAX_BACKOFF_MS', 1).default(60_000),
     WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
     WEBHOOK_RETRY_BURST: integerEnv('WEBHOOK_RETRY_BURST', 0).default(0),
     WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv(
@@ -380,7 +408,11 @@ export const EnvSchema = z
     /** Require backfill checkpoints to advance in ledger order. */
     INDEXER_BACKFILL_STRICT_ORDER: booleanEnv().default(true),
     /** Number of ordered batches completed before the checkpoint advances. */
-    INDEXER_BACKFILL_COMMIT_INTERVAL: integerEnv('INDEXER_BACKFILL_COMMIT_INTERVAL', 1, 10000).default(1),
+    INDEXER_BACKFILL_COMMIT_INTERVAL: integerEnv(
+      'INDEXER_BACKFILL_COMMIT_INTERVAL',
+      1,
+      10000
+    ).default(1),
     /** Maximum retries for a failed backfill batch. */
     INDEXER_BACKFILL_MAX_RETRIES: integerEnv('INDEXER_BACKFILL_MAX_RETRIES', 0, 100).default(3),
     /** Delay between backfill batch retries. */
@@ -388,10 +420,14 @@ export const EnvSchema = z
     INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
     DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
     ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
-    RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
-    RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
-    RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
-    RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+    RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(
+      LIMITS.RPC_CB_FAILURE_THRESHOLD
+    ),
+    RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(LIMITS.RPC_CB_WINDOW_MS),
+    RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(
+      LIMITS.RPC_CB_RESET_TIMEOUT_MS
+    ),
+    RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
     RATE_LIMIT_ENABLED: booleanEnv().default(true),
@@ -403,6 +439,10 @@ export const EnvSchema = z
     RATE_LIMIT_ADMIN_MAX: integerEnv('RATE_LIMIT_ADMIN_MAX', 1).optional(),
     RATE_LIMIT_TRUST_PROXY: booleanEnv().default(true),
     RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
+    TRUSTED_PROXY_COUNT: integerEnv('TRUSTED_PROXY_COUNT', 0, 100).default(0),
+    TRUSTED_PROXIES: optionalString('TRUSTED_PROXIES'),
+    WS_TRUSTED_PROXIES: optionalString('WS_TRUSTED_PROXIES'),
+    RATE_LIMIT_TRUSTED_PROXIES: optionalString('RATE_LIMIT_TRUSTED_PROXIES'),
     AWS_REGION: optionalString('AWS_REGION'),
     AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
 
@@ -608,6 +648,11 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
+  webhookRetryBurst: number;
+  webhookCircuitBreakerThreshold: number;
+  webhookCircuitBreakerResetMs: number;
+  webhookBatchMaxBackoffMs: number;
+  webhookMaxResponseBytes: number;
   webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
@@ -838,8 +883,15 @@ function toConfig(env: ParsedEnv): Config {
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
     webhookRetryRps: env.WEBHOOK_RETRY_RPS,
+    webhookRetryBurst: env.WEBHOOK_RETRY_BURST,
+    webhookCircuitBreakerThreshold: env.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD,
+    webhookCircuitBreakerResetMs: env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS,
+    webhookBatchMaxBackoffMs: env.WEBHOOK_BATCH_MAX_BACKOFF_MS,
+    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
-      ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',')
+          .map((h) => h.trim())
+          .filter((h) => h.length > 0)
       : undefined,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,

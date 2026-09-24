@@ -27,6 +27,7 @@ import { SerializationLogger, debug, info, warn } from '../../utils/logger.js';
 import {
   API_STREAM_STATUS_VALUES,
   assertApiTransition,
+  enforceStreamScope,
   fingerprintInput,
   parseCreateStreamBody,
   withDbErrors,
@@ -150,6 +151,14 @@ async function cancelStreamHandler(req: Request, res: Response): Promise<void> {
   const record = await withDbErrors(() => streamRepository.getById(id));
   if (!record) throw notFound('Stream', id);
 
+  // Tenant ownership check: an authenticated, scoped caller can only cancel
+  // their own streams. req.callerAddress is set by enforceStreamScope when
+  // the JWT payload contains an address (non-operator role).
+  if (req.callerAddress && record.sender_address !== req.callerAddress) {
+    // Return 404 to avoid leaking the existence of another tenant's resource.
+    throw notFound('Stream', id);
+  }
+
   assertApiTransition(id, record.status, 'cancelled', { includeRequestedStatus: false });
   await withStatusConflicts(id, record.status, 'cancelled', () =>
     streamRepository.updateStream(id, { status: 'cancelled' }, requestId ?? ''),
@@ -211,6 +220,7 @@ export function registerWriteRoutes(router: Router): void {
     requireAuth,
     authenticateApiKey,
     requireScope('streams:write'),
+    enforceStreamScope,
     asyncHandler(cancelStreamHandler),
   );
   router.patch('/:id/status', asyncHandler(updateStreamStatusHandler));

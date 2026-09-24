@@ -25,16 +25,22 @@ import {
   redisCommandQueueLength,
   redisConnectionStatus,
   redisQueueLengthWarningsTotal,
+  redisReconnectsTotal,
+  redisCommandFailuresTotal,
   statusToValue,
   syncRedisGauges,
   deRegisterRedisPoolMetrics,
+  recordRedisReconnect,
+  recordRedisCommandFailure,
 } from '../../src/metrics/redisPool.js';
 import {
   collectRedisSaturationStats,
   startRedisSaturationMetrics,
   stopRedisSaturationMetrics,
   _resetTrackedClients,
+  _trackClient,
 } from '../../src/redis/client.js';
+import { EventEmitter } from 'node:events';
 import { registry } from '../../src/metrics.js';
 import { logger } from '../../src/lib/logger.js';
 
@@ -63,6 +69,8 @@ async function counterValue(
 beforeEach(() => {
   deRegisterRedisPoolMetrics();
   redisQueueLengthWarningsTotal.reset();
+  redisReconnectsTotal.reset();
+  redisCommandFailuresTotal.reset();
   _resetTrackedClients();
 });
 
@@ -70,6 +78,8 @@ afterEach(() => {
   stopRedisSaturationMetrics();
   deRegisterRedisPoolMetrics();
   redisQueueLengthWarningsTotal.reset();
+  redisReconnectsTotal.reset();
+  redisCommandFailuresTotal.reset();
   _resetTrackedClients();
 });
 
@@ -399,5 +409,73 @@ describe('re-registration after deregister', () => {
     const val = await redisCommandQueueLength.get();
     const entry = val.values.find((v) => v.labels['instance'] === 'default');
     expect(entry?.value).toBe(7);
+  });
+});
+
+
+// ── Reconnect vs command-failure counters (separate failure paths) ───────────
+
+describe('redis_reconnects_total / redis_command_failures_total', () => {
+  it('recordRedisReconnect increments only the reconnect counter', async () => {
+    recordRedisReconnect('default');
+    recordRedisReconnect('default');
+
+    expect(await counterValue(redisReconnectsTotal, 'default')).toBe(2);
+    expect(await counterValue(redisCommandFailuresTotal, 'default')).toBe(0);
+  });
+
+  it('recordRedisCommandFailure increments only the command-failure counter', async () => {
+    recordRedisCommandFailure('default');
+    recordRedisCommandFailure('default');
+    recordRedisCommandFailure('default');
+
+    expect(await counterValue(redisCommandFailuresTotal, 'default')).toBe(3);
+    expect(await counterValue(redisReconnectsTotal, 'default')).toBe(0);
+  });
+
+  it('reconnect and command-failure counters remain independent when both fire', async () => {
+    recordRedisReconnect('default');
+    recordRedisCommandFailure('default');
+    recordRedisReconnect('default');
+
+    expect(await counterValue(redisReconnectsTotal, 'default')).toBe(2);
+    expect(await counterValue(redisCommandFailuresTotal, 'default')).toBe(1);
+  });
+
+  it('drives reconnect via tracked client reconnecting event and asserts published value', async () => {
+    const fake = new EventEmitter() as EventEmitter & {
+      status: string;
+      commandQueue: { length: number };
+    };
+    fake.status = 'ready';
+    fake.commandQueue = { length: 0 };
+
+    _trackClient('default', fake as never);
+
+    // Drive the failure path: emit reconnecting (not a command error)
+    fake.emit('reconnecting');
+    fake.emit('reconnecting');
+
+    expect(await counterValue(redisReconnectsTotal, 'default')).toBe(2);
+    // Command failures must stay untouched — different cause, different counter
+    expect(await counterValue(redisCommandFailuresTotal, 'default')).toBe(0);
+  });
+
+  it('instance labels stay bounded to application-controlled names', async () => {
+    recordRedisReconnect('idempotency');
+    recordRedisCommandFailure('rate-limit');
+
+    const reconnectData = await redisReconnectsTotal.get();
+    const failureData = await redisCommandFailuresTotal.get();
+
+    for (const entry of [...reconnectData.values, ...failureData.values]) {
+      const label = entry.labels['instance'];
+      expect(typeof label).toBe('string');
+      // No error messages / keys / hosts as labels
+      expect(label).not.toMatch(/Error|ECONN|localhost|:\d+/);
+    }
+
+    expect(reconnectData.values.some((v) => v.labels['instance'] === 'idempotency')).toBe(true);
+    expect(failureData.values.some((v) => v.labels['instance'] === 'rate-limit')).toBe(true);
   });
 });

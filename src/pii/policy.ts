@@ -71,40 +71,48 @@ export interface PurgeableRetentionRule extends RetentionRule {
   purgeAction: 'delete' | 'redact';
 }
 
-/**
- * Field-level classification for stream records.
- *
- * Stellar public keys are pseudonymous — they do not directly identify
- * a person — but they can be correlated with exchange KYC records or
- * on-chain activity, so we treat them as SENSITIVE.
- */
-export const STREAM_FIELD_POLICIES: Record<string, FieldPolicy> = {
+export const STREAM_FIELD_POLICIES: Record<keyof import('../db/types.js').StreamRecord, FieldPolicy> = {
   id: {
     classification: DataClassification.INTERNAL,
     redactInLogs: false,
     rationale: 'System-generated identifier with no off-chain meaning.',
   },
-  sender: {
+  sender_address: {
     classification: DataClassification.SENSITIVE,
     redactInLogs: true,
     rationale: 'Stellar public key — pseudonymous but correlatable.',
   },
-  recipient: {
+  recipient_address: {
     classification: DataClassification.SENSITIVE,
     redactInLogs: true,
     rationale: 'Stellar public key — pseudonymous but correlatable.',
   },
-  depositAmount: {
+  amount: {
     classification: DataClassification.INTERNAL,
     redactInLogs: false,
     rationale: 'On-chain amount; publicly observable via Horizon.',
   },
-  ratePerSecond: {
+  streamed_amount: {
+    classification: DataClassification.INTERNAL,
+    redactInLogs: false,
+    rationale: 'On-chain amount; publicly observable via Horizon.',
+  },
+  remaining_amount: {
+    classification: DataClassification.INTERNAL,
+    redactInLogs: false,
+    rationale: 'On-chain amount; publicly observable via Horizon.',
+  },
+  rate_per_second: {
     classification: DataClassification.INTERNAL,
     redactInLogs: false,
     rationale: 'Derived from on-chain contract state.',
   },
-  startTime: {
+  start_time: {
+    classification: DataClassification.PUBLIC,
+    redactInLogs: false,
+    rationale: 'Unix timestamp; publicly observable.',
+  },
+  end_time: {
     classification: DataClassification.PUBLIC,
     redactInLogs: false,
     rationale: 'Unix timestamp; publicly observable.',
@@ -114,6 +122,31 @@ export const STREAM_FIELD_POLICIES: Record<string, FieldPolicy> = {
     redactInLogs: false,
     rationale: 'Stream lifecycle state; no privacy implications.',
   },
+  contract_id: {
+    classification: DataClassification.PUBLIC,
+    redactInLogs: false,
+    rationale: 'Contract ID.',
+  },
+  transaction_hash: {
+    classification: DataClassification.PUBLIC,
+    redactInLogs: false,
+    rationale: 'Transaction hash.',
+  },
+  event_index: {
+    classification: DataClassification.PUBLIC,
+    redactInLogs: false,
+    rationale: 'Event index.',
+  },
+  created_at: {
+    classification: DataClassification.INTERNAL,
+    redactInLogs: false,
+    rationale: 'Internal timestamp.',
+  },
+  updated_at: {
+    classification: DataClassification.INTERNAL,
+    redactInLogs: false,
+    rationale: 'Internal timestamp.',
+  }
 };
 
 /**
@@ -245,6 +278,16 @@ export const REQUEST_FIELD_POLICIES: Record<string, FieldPolicy> = {
     classification: DataClassification.SENSITIVE,
     redactInLogs: true,
     rationale: 'Internal row identifiers can expose database structure.',
+  },
+  sender: {
+    classification: DataClassification.SENSITIVE,
+    redactInLogs: true,
+    rationale: 'Stellar address in API requests.',
+  },
+  recipient: {
+    classification: DataClassification.SENSITIVE,
+    redactInLogs: true,
+    rationale: 'Stellar address in API requests.',
   },
 };
 

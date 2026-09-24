@@ -81,12 +81,20 @@ Secret values are never included in validation messages.
 | `RATE_LIMIT_ADMIN_WINDOW_MS`      | integer ms                                     | route default                                                                                            |
 | `RATE_LIMIT_ADMIN_MAX`            | integer                                        | route default                                                                                            |
 | `RATE_LIMIT_TRUST_PROXY`          | boolean                                        | `true`                                                                                                   |
+| `TRUSTED_PROXY_COUNT`             | integer (hop count)                            | `0`                                                                                                      |
+| `TRUSTED_PROXIES`                 | comma-separated IPs                            | unset                                                                                                    |
+| `WS_TRUSTED_PROXIES`              | comma-separated IPs                            | unset                                                                                                    |
 | `RATE_LIMIT_ALLOWLIST_IPS`        | comma-separated IPs                            | unset                                                                                                    |
 | `AWS_REGION`                      | string                                         | unset                                                                                                    |
 | `AWS_DEFAULT_REGION`              | string                                         | unset                                                                                                    |
 | `FLUXORA_SHUTDOWN`                | boolean                                        | unset; internal graceful shutdown flag                                                                   |
 
 Booleans accept `true`, `false`, `1`, and `0`.
+
+Connection-pool sizes, acquisition/statement timeouts and retry budgets for
+PostgreSQL, Redis and the Stellar RPC endpoint are collected in
+[connection-limits.md](./connection-limits.md), which is checked against
+`EnvSchema` by `src/config/connectionLimits.test.ts`.
 
 ## Feature Flags
 

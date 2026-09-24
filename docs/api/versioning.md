@@ -27,6 +27,18 @@ If a request specifies any of the following values in the `Accept-Version` heade
 
 If the `Accept-Version` header is omitted entirely or left blank, the API will safely default to **`v1`**. This ensures existing clients or simple scripts do not break without the header.
 
+### Response Echo
+
+Every accepted request echoes the version the server actually resolved in the `X-API-Version` response
+header, so a client can assert which contract served it without re-deriving it from its own request:
+
+```http
+HTTP/1.1 200 OK
+X-API-Version: v1
+```
+
+Requests that are refused carry no `X-API-Version` header, because no version was resolved.
+
 ## Error Handling
 
 If a client requests a version that does not exist or is no longer supported (for example, `v2` or `beta`), the server will immediately reject the request with a `400 Bad Request` status.
@@ -39,6 +51,21 @@ The response payload will be a structured JSON error indicating the unsupported 
   "supported": ["v1"]
 }
 ```
+
+No `X-API-Version` header is set on the refusal response: the request was never bound to a served
+contract.
+
+## Programmatic Contract
+
+The selection and refusal rules live in `src/middleware/apiVersion.ts` and are exported for callers and
+tests that need to assert them without duplicating the strings:
+
+| Export | Value | Meaning |
+|---|---|---|
+| `SUPPORTED_VERSIONS` | `["v1"]` | Versions the service currently serves |
+| `DEFAULT_API_VERSION` | `"v1"` | Version resolved when `Accept-Version` is omitted or blank |
+| `ACCEPT_VERSION_HEADER` | `"accept-version"` | Request header used for negotiation |
+| `API_VERSION_RESPONSE_HEADER` | `"X-API-Version"` | Response header echoing the resolved version |
 
 ## Future Upgrade Path
 

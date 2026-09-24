@@ -558,8 +558,8 @@ describe('refreshHotConfig + last snapshot', () => {
 describe('SIGHUP reload with schema compatibility', () => {
   it('prepareReloadFlags with latestMigration strips incompatible flags', () => {
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag_ok', percentage: 100, minMigration: '20260601000000' },
-      { name: 'flag_bad', percentage: 100, minMigration: '20260827000000' },
+      { name: 'flag_ok', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+      { name: 'flag_bad', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
     ]);
 
     const commit = prepareReloadFlags('20260728000000');
@@ -571,7 +571,7 @@ describe('SIGHUP reload with schema compatibility', () => {
 
   it('prepareReloadFlags without latestMigration retains all flags', () => {
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag_a', percentage: 100, minMigration: '20260827000000' },
+      { name: 'flag_a', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
     ]);
 
     const commit = prepareReloadFlags();
@@ -582,8 +582,8 @@ describe('SIGHUP reload with schema compatibility', () => {
 
   it('prepareReloadFlags with null latestMigration strips all minMigration flags', () => {
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag_req', percentage: 100, minMigration: '20260601000000' },
-      { name: 'flag_no_req', percentage: 100 },
+      { name: 'flag_req', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+      { name: 'flag_no_req', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
 
     const commit = prepareReloadFlags(null);
@@ -595,8 +595,8 @@ describe('SIGHUP reload with schema compatibility', () => {
 
   it('refreshHotConfig prepareFeatureFlags callback strips incompatible flags', async () => {
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag_ok', percentage: 100, minMigration: '20260601000000' },
-      { name: 'flag_bad', percentage: 100, minMigration: '20260827000000' },
+      { name: 'flag_ok', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+      { name: 'flag_bad', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
     ]);
 
     await refreshHotConfig({
@@ -612,7 +612,7 @@ describe('SIGHUP reload with schema compatibility', () => {
 
   it('DB query failure in SIGHUP handler falls back to loading all flags', async () => {
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag_a', percentage: 100, minMigration: '20260827000000' },
+      { name: 'flag_a', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
     ]);
 
     const failQuery = async (): Promise<string | null> => {

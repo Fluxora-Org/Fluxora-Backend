@@ -31,19 +31,23 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import protobuf from 'protobufjs';
 import { getConfig } from '../config/env.js';
-import {
-  indexerIngestionService,
-  indexerService,
-} from './service.js';
+import { indexerIngestionService } from './ingestion.js';
+import { indexerService } from './service.js';
 import { logger } from '../lib/logger.js';
 import { ReplayRequestSchema } from '../validation/schemas.js';
 
 /**
- * Keep protobuf decoding and response buffering bounded.  The limit is large
- * enough for a normal ingestion batch, but small enough to prevent an
- * unauthenticated peer from reserving unbounded memory before auth runs.
+ * gRPC Gateway Limits
+ * 
+ * Keep protobuf decoding, response buffering, and concurrent streams bounded.
+ * These limits prevent unauthenticated peers from reserving unbounded memory or
+ * exhausting connection resources before authentication runs.
+ * 
+ * - Max Message Bytes: 4MB. Exceeding this produces RESOURCE_EXHAUSTED.
+ * - Max Concurrent Streams: 100 per client. Exceeding this delays requests or produces UNAVAILABLE.
  */
 export const GRPC_GATEWAY_MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
+export const GRPC_GATEWAY_MAX_CONCURRENT_STREAMS = 100;
 export const GRPC_GATEWAY_DEADLINE_MS = 30_000;
 
 // ── Proto definition (inline — no disk reads in production) ─────────────────
@@ -627,8 +631,9 @@ async function handleGetReplayStatus(
  */
 export function createGrpcGatewayServer(): grpc.Server {
   const server = new grpc.Server({
-    maxReceiveMessageLength: GRPC_GATEWAY_MAX_MESSAGE_BYTES,
-    maxSendMessageLength: GRPC_GATEWAY_MAX_MESSAGE_BYTES,
+    'grpc.max_receive_message_length': GRPC_GATEWAY_MAX_MESSAGE_BYTES,
+    'grpc.max_send_message_length': GRPC_GATEWAY_MAX_MESSAGE_BYTES,
+    'grpc.max_concurrent_streams': GRPC_GATEWAY_MAX_CONCURRENT_STREAMS,
   });
 
   server.addService(INDEXER_SERVICE_DEFINITION, {

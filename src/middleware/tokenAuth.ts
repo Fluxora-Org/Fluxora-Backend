@@ -6,6 +6,8 @@ import { serviceUnavailable, unauthorized } from '../errors.js';
 import { logger } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
+import { verifyIdToken } from '../services/oidcProvider.js';
+import { isRevoked } from '../redis/jwtRevocationStore.js';
 
 // ── WebSocket JWT auth ────────────────────────────────────────────────────────
 
@@ -118,18 +120,9 @@ function getBearerToken(headerValue: string | undefined): string | null {
 export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler {
   const authEnabled = options.required || Boolean(options.token);
 
-  return (req: Request, _res: Response, next: NextFunction) => {
+  return async (req: Request, _res: Response, next: NextFunction) => {
     if (!authEnabled) {
       next();
-      return;
-    }
-
-    if (!options.token) {
-      next(
-        serviceUnavailable(`${options.role} authentication is required but not configured`, {
-          role: options.role,
-        }),
-      );
       return;
     }
 
@@ -143,15 +136,30 @@ export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler
       return;
     }
 
-    if (bearerToken !== options.token) {
+    if (options.token && bearerToken === options.token) {
+      next();
+      return;
+    }
+
+    try {
+      const decoded = await verifyIdToken(bearerToken);
+      const jti = decoded.claims?.jti;
+      
+      if (jti) {
+        const revoked = await isRevoked(jti);
+        if (revoked) {
+          next(unauthorized(`Token revoked`, { role: options.role }));
+          return;
+        }
+      }
+      
+      next();
+    } catch (err) {
       next(
         unauthorized(`Invalid ${options.role} bearer token`, {
           role: options.role,
         }),
       );
-      return;
     }
-
-    next();
   };
 }

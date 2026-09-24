@@ -8,7 +8,7 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import { logger } from '../logging/logger.js';
-import { redactKeysInString } from '../pii/sanitizer.js';
+import { redactKeysInString, sanitize } from '../pii/sanitizer.js';
 
 /**
  * Attaches response headers that instruct clients and intermediaries
@@ -20,6 +20,78 @@ export function privacyHeaders(_req: Request, res: Response, next: NextFunction)
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Privacy-Policy', '/api/privacy/policy');
   next();
+}
+
+/**
+ * Applies the field policy to JSON at the last response write point. Express
+ * routes, direct `res.send` calls, and error handlers all pass through here.
+ * Sanitizing the serialized JSON keeps Date and custom `toJSON` behavior intact.
+ */
+export function sanitizeResponses(req: Request, res: Response, next: NextFunction): void {
+  const send = res.send.bind(res);
+
+  res.send = ((body?: unknown): Response => {
+    const contentType = res.getHeader('Content-Type');
+    const mediaType =
+      typeof contentType === 'string'
+        ? contentType.split(';', 1)[0]?.trim().toLowerCase()
+        : undefined;
+    const serialized =
+      typeof body === 'string' ? body : Buffer.isBuffer(body) ? body.toString('utf8') : undefined;
+
+    if (
+      serialized === undefined ||
+      !mediaType ||
+      (mediaType !== 'application/json' && !mediaType.endsWith('+json'))
+    ) {
+      return send(body);
+    }
+
+    // The public policy document describes field rules rather than returning
+    // personal data. Keep its published shape intact for clients and auditors.
+    if (req.method === 'GET' && req.path === '/api/privacy/policy' && res.statusCode < 400) {
+      return send(body);
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(serialized);
+    } catch {
+      // An invalid JSON response cannot be checked against the policy.
+      res.status(500);
+      return send('{"error":"Response serialization failed"}');
+    }
+
+    const sanitized = sanitize(parsed as Record<string, unknown>);
+    if (
+      req.method === 'POST' &&
+      req.path === '/api/auth/session' &&
+      res.statusCode >= 200 &&
+      res.statusCode < 300 &&
+      isRecord(parsed) &&
+      isRecord(sanitized)
+    ) {
+      // The session endpoint must return its newly issued token and the
+      // authenticated user's address. Every other policy field stays redacted.
+      if (typeof parsed.token === 'string') sanitized.token = parsed.token;
+      if (
+        isRecord(parsed.user) &&
+        isRecord(sanitized.user) &&
+        typeof parsed.user.address === 'string'
+      ) {
+        sanitized.user.address = parsed.user.address;
+      }
+    }
+    res.removeHeader('Content-Length');
+    res.removeHeader('ETag');
+    return send(JSON.stringify(sanitized));
+  }) as Response['send'];
+
+  next();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**
@@ -64,4 +136,22 @@ export function safeErrorHandler(
     error: 'Internal server error',
     message: 'An unexpected error occurred. No sensitive data has been included in this response.',
   });
+}
+
+/**
+ * Sanitizes all outbound JSON responses to ensure no PII escapes.
+ * Failures to sanitize result in a 500 error, failing closed.
+ */
+export function responseSanitizer(req: Request, res: Response, next: NextFunction): void {
+  const originalJson = res.json;
+  res.json = function(body: any) {
+    try {
+      body = sanitize(body);
+    } catch (e) {
+      logger.error('failed to sanitize response body', req.correlationId as string, { error: e });
+      return res.status(500).send('Internal server error');
+    }
+    return originalJson.call(this, body);
+  };
+  next();
 }
