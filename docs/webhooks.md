@@ -1,5 +1,41 @@
 # Webhooks
 
+## Delivery store selection (`WEBHOOK_DELIVERY_STORE`)
+
+The operator-facing delivery / outbox / DLQ management routes
+(`src/routes/webhooks.ts`) read and write through an `IWebhookDeliveryStore`.
+`src/webhooks/storeFactory.ts` selects the active implementation once, at process
+startup:
+
+| `WEBHOOK_DELIVERY_STORE` value                                    | Implementation                   | Durable |
+|-------------------------------------------------------------------|----------------------------------|---------|
+| unset, `memory`, or any unrecognised value                        | `WebhookDeliveryStore` (in-memory) | no    |
+| `postgres`                                                        | `PgWebhookDeliveryStore` (Postgres write-through) | yes |
+
+Selection rule:
+
+- Matching is case-insensitive and surrounding whitespace is trimmed.
+- Only the exact value `postgres` selects the durable backend. Every other value
+  — including typos such as `postgresql` or `pg` — falls back to the in-memory
+  store, so an unrecognised value can never silently disable the durable path.
+- If the Postgres backend fails to initialise (for example the shared pool cannot
+  be created), the failure is logged and the factory falls back to the in-memory
+  store rather than crashing the process.
+- When `NODE_ENV=production` and the in-memory store is active, a startup warning
+  is emitted because outbox items, DLQ entries, and delivery-status records will
+  be lost on restart.
+- The active backend is logged at startup (`Webhook delivery store: using …`),
+  so each environment's choice is visible in the process logs.
+
+Both implementations satisfy one shared contract test —
+[`tests/webhooks/store.contract.test.ts`](../tests/webhooks/store.contract.test.ts) —
+which runs the same behaviour suite against each store and asserts that a fixed
+sequence of operations produces identical observable results. Switching stores
+therefore does not change observable behaviour.
+
+Set `WEBHOOK_DELIVERY_STORE=postgres` in production for a durable store shared
+across replicas.
+
 ## Outbox dispatcher
 
 Stream writes enqueue rows in `webhook_outbox` inside the same database transaction as the stream update. The live dispatcher in `src/webhooks/service.ts` polls that table and sends each event to the configured consumer endpoint.
