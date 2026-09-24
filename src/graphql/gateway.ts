@@ -233,9 +233,8 @@ function rejectGraphQLError(res: Response, code: string, message: string): void 
 // ── Resolver helpers ──────────────────────────────────────────────────────────
 
 function resolveRequesterId(req: Request): string {
-  const user = (req as any).user;
-  if (user?.keyId) return `key:${user.keyId}`;
-  if (user?.address) return `address:${user.address}`;
+  if (req.keyId) return `key:${req.keyId}`;
+  if (req.user?.address) return `address:${req.user.address}`;
   return 'anonymous';
 }
 
@@ -255,8 +254,7 @@ export function isGraphQLGatewayEnabled(req: Request): boolean {
 function callerScopes(req: Request): string[] {
   if (req.keyId !== undefined) {
     // API-key scopes are authoritative when a key is present (REST precedence).
-    const keyScopes = (req as Request & { keyScopes?: unknown }).keyScopes;
-    return Array.isArray(keyScopes) ? keyScopes : [];
+    return Array.isArray(req.keyScopes) ? req.keyScopes : [];
   }
   const permissions = req.user?.permissions;
   return Array.isArray(permissions) ? permissions : [];
@@ -406,7 +404,7 @@ graphqlGatewayRouter.post(
   requireScope('streams:read'),
   requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
-  const requestId = (res.req as any)?.id ?? (req as any).correlationId;
+  const requestId = res.req?.id ?? req.correlationId;
   const start = Date.now();
 
   try {

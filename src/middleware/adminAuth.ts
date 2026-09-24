@@ -49,7 +49,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   if (!adminKey) {
     recordOutcome('failure');
     warn('Admin authorization refused — ADMIN_API_KEY is not configured', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+      correlationId: req.correlationId ?? req.id,
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
@@ -64,7 +64,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   if (!header) {
     recordOutcome('failure');
     warn('Admin authorization refused — missing Authorization header', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+      correlationId: req.correlationId ?? req.id,
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
@@ -76,7 +76,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   if (header.length > MAX_AUTHORIZATION_HEADER_LENGTH) {
     recordOutcome('failure');
     warn('Admin authorization refused — Authorization header too large', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+      correlationId: req.correlationId ?? req.id,
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
@@ -90,7 +90,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   if (parts.length !== 2 || parts[0] !== 'Bearer') {
     recordOutcome('failure');
     warn('Admin authorization refused — invalid Authorization header scheme', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+      correlationId: req.correlationId ?? req.id,
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
@@ -103,7 +103,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   if (!token) {
     recordOutcome('failure');
     warn('Admin authorization refused — missing Bearer token', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+      correlationId: req.correlationId ?? req.id,
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
@@ -114,7 +114,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
 
   // Constant-time-ish comparison to reduce timing side-channels.
   if (token.length === adminKey.length && timingSafeEqual(token, adminKey)) {
-    (req as any).user = { role: 'admin' };
+    req.user = { address: '', role: 'admin' };
     recordOutcome('success');
     next();
     return;
@@ -125,7 +125,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
     const payload = verifyToken(token);
     const role = payload?.role;
     if (role === 'admin' || role === 'data-protection-officer') {
-      (req as any).user = payload;
+      req.user = payload;
       recordOutcome('success');
       next();
       return;
@@ -136,7 +136,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
 
   recordOutcome('failure');
   warn('Admin authorization refused — invalid admin credentials', {
-    correlationId: (req as any).correlationId ?? (req as any).id,
+    correlationId: req.correlationId ?? req.id,
     path: req.originalUrl || req.path,
     method: req.method,
     ip: req.ip,
