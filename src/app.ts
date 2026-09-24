@@ -65,6 +65,8 @@ import { startVacuumCollector } from './metrics/vacuumCollector.js';
 import { startBusinessEventCollector } from './metrics/businessEventCollector.js';
 import { getStreamHub } from './ws/hub.js';
 import { getPool } from './db/pool.js';
+import { gracefulDrain as drainWsConnections } from './ws/connectionLimiter.js';
+import { webhookDispatcher } from './webhooks/service.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 import { responseSizeLimitMiddleware } from './middleware/responseSizeLimit.js';
@@ -416,13 +418,19 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   // Shutdown hook ordering (runs after server.close() drains HTTP):
-  //   1. Drain SSE — close open event-stream responses with retry:0.
-  //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
-  //   3. Release the indexer leader-election lease — must happen before Redis
+  //   1. Drain SSE — write retry:0 to open event-stream responses.
+  //   2. Drain WS — reject new upgrades and let hub.gracefulClose() (below)
+  //      send close frame 1001 to every connected client.
+  //   3. Stop webhook outbox — await any in-flight delivery batch so no work
+  //      is abandoned mid-flight.
+  //   4. Stop indexer — signal replay loop to stop at next safe batch boundary.
+  //   5. Release the indexer leader-election lease — must happen before Redis
   //      is closed, and after replay has been signalled to stop, so another
   //      instance can take over promptly instead of waiting out the full lease.
-  //   4. Quit Redis — close all tracked Redis sockets.
+  //   6. Quit Redis — close all tracked Redis sockets.
   addShutdownHook(() => drainSseEventBus(appConfig.sseDrainTimeoutMs));
+  addShutdownHook(() => drainWsConnections(null, appConfig.sseDrainTimeoutMs));
+  addShutdownHook(() => webhookDispatcher.stop());
   addShutdownHook(() => requestStopReplay());
   addShutdownHook(() => getIndexerLeaderElection().release());
   addShutdownHook(() => quitAllRedisClients());
@@ -445,20 +453,16 @@ export function createApp(options: AppOptions = {}): Express {
     addShutdownHook(() => stopBackgroundJobs());
   }
 
+  // Send close frame 1001 to every connected WebSocket client so they
+  // reconnect rather than hanging, then shut down the WebSocketServer.
   addShutdownHook(async () => {
     const hub = getStreamHub();
-    if (hub) {
-      await new Promise<void>((resolve) => {
-        hub.close(() => resolve());
-      });
-    }
+    if (hub) await hub.gracefulClose();
   });
 
   addShutdownHook(async () => {
     const pool = getPool();
-    if (pool) {
-      await pool.end();
-    }
+    if (pool) await pool.end();
   });
 
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).

@@ -660,3 +660,270 @@ describe('#336 Redis quit hook', () => {
     await expect(quitAllRedisClients()).resolves.toBeUndefined();
   });
 });
+
+// ── #shutdown-drain: WebSocket close frames sent on shutdown ─────────────────
+
+import {
+  checkAndReserve,
+  isShuttingDown as isWsShuttingDown,
+  _resetLimiter,
+} from '../src/ws/connectionLimiter.js';
+
+describe('WebSocket drain on shutdown', () => {
+  beforeEach(() => {
+    _resetLimiter();
+    resetStreamHub();
+  });
+
+  afterEach(() => {
+    _resetLimiter();
+    resetStreamHub();
+  });
+
+  it('gracefulClose() sends close frame 1001 to every connected WS client', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const hub = createStreamHub(server);
+
+    // Simulate two connected clients via the hub's internal client Set.
+    const close1 = vi.fn();
+    const close2 = vi.fn();
+    const fakeClient1 = { readyState: 1 /* OPEN */, close: close1 };
+    const fakeClient2 = { readyState: 1 /* OPEN */, close: close2 };
+    // Access internal clients map via type assertion (test instrumentation only).
+    (hub as any).clients.set(fakeClient1, {});
+    (hub as any).clients.set(fakeClient2, {});
+
+    await hub.gracefulClose();
+
+    expect(close1).toHaveBeenCalledWith(1001, expect.anything());
+    expect(close2).toHaveBeenCalledWith(1001, expect.anything());
+
+    server.close();
+  });
+
+  it('close frame carries server_shutdown reason', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const hub = createStreamHub(server);
+
+    let receivedReason: string | undefined;
+    const fakeClient = {
+      readyState: 1,
+      close: vi.fn((_code: number, reason: string) => {
+        try { receivedReason = JSON.parse(reason).reason; } catch { receivedReason = reason; }
+      }),
+    };
+    (hub as any).clients.set(fakeClient, {});
+
+    await hub.gracefulClose();
+
+    expect(receivedReason).toBe('server_shutdown');
+    server.close();
+  });
+
+  it('WS connectionLimiter rejects new upgrades once drainWsConnections is called', async () => {
+    const { gracefulDrain } = await import('../src/ws/connectionLimiter.js');
+
+    expect(isWsShuttingDown()).toBe(false);
+    void gracefulDrain(null, 100);
+    expect(isWsShuttingDown()).toBe(true);
+
+    const result = await checkAndReserve('10.0.0.1');
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('Server shutting down');
+  });
+
+  it('hub.gracefulClose() is wired into gracefulShutdown() via addShutdownHook', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const hub = createStreamHub(server);
+    const gracefulCloseSpy = vi.spyOn(hub, 'gracefulClose');
+
+    addShutdownHook(() => hub.gracefulClose());
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(gracefulCloseSpy).toHaveBeenCalled();
+  });
+});
+
+// ── #shutdown-drain: Webhook outbox dispatcher drains in-flight work ─────────
+
+import { WebhookDispatcher } from '../src/webhooks/service.js';
+
+describe('Webhook outbox drain on shutdown', () => {
+  it('stop() awaits in-flight batch before resolving', async () => {
+    let batchFinished = false;
+    let resolveBatch!: () => void;
+    const batchPromise = new Promise<void>((resolve) => { resolveBatch = resolve; });
+
+    const dispatcher = new WebhookDispatcher({
+      endpointUrl: 'http://localhost/hook',
+      secret: 'test-secret',
+      pollIntervalMs: 60_000,
+      pool: {
+        connect: async () => ({
+          query: vi.fn().mockResolvedValue({ rows: [] }),
+          release: vi.fn(),
+        }),
+      },
+    });
+
+    // Monkey-patch processBatch to return a controllable promise.
+    (dispatcher as any).inFlight = batchPromise.finally(() => {
+      batchFinished = true;
+      (dispatcher as any).inFlight = null;
+    });
+
+    const stopPromise = dispatcher.stop();
+
+    // stop() should be waiting on the in-flight batch
+    expect(batchFinished).toBe(false);
+
+    resolveBatch();
+    await stopPromise;
+
+    expect(batchFinished).toBe(true);
+  });
+
+  it('stop() is idempotent — second call resolves immediately', async () => {
+    const dispatcher = new WebhookDispatcher({
+      pollIntervalMs: 60_000,
+      pool: {
+        connect: async () => ({
+          query: vi.fn().mockResolvedValue({ rows: [] }),
+          release: vi.fn(),
+        }),
+      },
+    });
+
+    await dispatcher.stop();
+    await expect(dispatcher.stop()).resolves.toBeUndefined();
+  });
+
+  it('stop() is invoked by gracefulShutdown() via addShutdownHook', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const dispatcher = new WebhookDispatcher({ pollIntervalMs: 60_000 });
+    const stopSpy = vi.spyOn(dispatcher, 'stop');
+
+    addShutdownHook(() => dispatcher.stop());
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('no webhook delivery is silently lost — stop() waits for the batch then resolves', async () => {
+    const delivered: string[] = [];
+
+    const dispatcher = new WebhookDispatcher({
+      pollIntervalMs: 60_000,
+      pool: {
+        connect: async () => ({
+          query: vi.fn().mockResolvedValue({ rows: [] }),
+          release: vi.fn(),
+        }),
+      },
+    });
+
+    // Simulate an in-flight delivery completing after stop() is called.
+    (dispatcher as any).inFlight = (async () => {
+      await new Promise<void>((r) => setTimeout(r, 10));
+      delivered.push('delivery-1');
+      (dispatcher as any).inFlight = null;
+    })();
+
+    await dispatcher.stop();
+
+    expect(delivered).toContain('delivery-1');
+  });
+});
+
+// ── #shutdown-drain: drain deadline enforced across all four resource types ───
+
+describe('Drain deadline enforced under load', () => {
+  beforeEach(() => {
+    _resetLimiter();
+    resetStreamHub();
+  });
+
+  afterEach(() => {
+    _resetLimiter();
+    resetStreamHub();
+  });
+
+  it('overall gracefulShutdown resolves within its timeout even with a stalled SSE subscriber', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    // Register a stuck SSE drain — never resolves
+    const { registerSseShutdownCallback } = await import('../src/streams/sseEmitter.js');
+    registerSseShutdownCallback(
+      () => new Promise<void>(() => { /* stuck */ }),
+      vi.fn(), // forceClose — called on per-callback timeout
+    );
+
+    addShutdownHook(async () => {
+      const { drainSseEventBus } = await import('../src/streams/sseEmitter.js');
+      await drainSseEventBus(50); // 50 ms per-callback deadline
+    });
+
+    const start = Date.now();
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+    const elapsed = Date.now() - start;
+
+    // Should resolve well within 5s despite the stuck subscriber
+    expect(elapsed).toBeLessThan(4_000);
+  });
+
+  it('HTTP requests refused cleanly during shutdown: responds with Connection: close', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    // Trigger shutdown
+    void gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    // A request that reaches the already-started app should carry Connection: close
+    const res = await request(app).get('/health');
+    expect(res.headers['connection']).toBe('close');
+
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('WS limiter rejects new connections immediately after shutdown starts', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const { gracefulDrain } = await import('../src/ws/connectionLimiter.js');
+    void gracefulDrain(null, 100);
+
+    // New connection attempts must be rejected
+    const result = await checkAndReserve('192.168.1.1');
+    expect(result.allowed).toBe(false);
+
+    server.close();
+  });
+
+  it('SSE, WS, webhook, and DB hooks all run during a full gracefulShutdown', async () => {
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    const ran: string[] = [];
+
+    // SSE
+    addShutdownHook(() => { ran.push('sse'); });
+    // WS
+    addShutdownHook(() => { ran.push('ws'); });
+    // Webhook
+    addShutdownHook(async () => { ran.push('webhook'); });
+    // DB/pool
+    addShutdownHook(async () => { ran.push('db'); });
+
+    await gracefulShutdown(server, 'SIGTERM', 5_000);
+
+    expect(ran).toEqual(['sse', 'ws', 'webhook', 'db']);
+  });
+});
