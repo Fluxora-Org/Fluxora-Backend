@@ -1,4 +1,9 @@
-import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal, isValidRejectionReason } from '../metrics/businessMetrics.js';
+import {
+  sseActiveConnectionsGauge,
+  sseConnectionsRejectedTotal,
+  isValidRejectionReason,
+  type SseConnectionRejectionReason,
+} from '../metrics/businessMetrics.js';
 
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP = 10;
 export const DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS = 1000;
@@ -10,10 +15,8 @@ const MAX_SSE_CONNECTION_LIMIT = 100_000;
 const MAX_SSE_CONNECTION_DURATION_MS = 86400_000;
 const MAX_SSE_RETRY_AFTER_SECONDS = 86400;
 
-export type SseConnectionRejectionReason =
-  | 'per_ip_limit'
-  | 'per_key_limit'
-  | 'global_limit';
+// Re-export the canonical type so route handlers and tests can import from one place.
+export type { SseConnectionRejectionReason } from '../metrics/businessMetrics.js';
 
 export interface SseConnectionLimits {
   maxConnectionsPerIp: number;
@@ -170,7 +173,9 @@ export function tryAcquireSseConnection(
   if (normalizedKey !== undefined) {
     const activeForKey = activeConnectionsByApiKey.get(normalizedKey) ?? 0;
     if (activeForKey >= limits.maxConnectionsPerApiKey) {
-      sseConnectionsRejectedTotal.inc({ reason: 'per_key_limit' });
+      if (isValidRejectionReason('per_key_limit')) {
+        sseConnectionsRejectedTotal.inc({ reason: 'per_key_limit' });
+      }
       return {
         ok: false,
         reason: 'per_key_limit',

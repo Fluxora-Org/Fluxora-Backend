@@ -29,7 +29,71 @@ export interface LogRecord {
   [key: string]: unknown;
 }
 
-function write(level: LogLevel, message: string, correlationId?: string, meta?: Record<string, unknown>): void {
+/**
+ * Log levels ordered from most to least verbose. The order is load-bearing: a
+ * record is emitted when its level ranks at or above the active level (see
+ * {@link isLevelEnabled}).
+ */
+export const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warn', 'error'];
+
+export const LOG_LEVEL_PRIORITY: Readonly<Record<LogLevel, number>> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+};
+
+export function isLogLevel(value: unknown): value is LogLevel {
+  return typeof value === 'string' && (LOG_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * Resolve the level the logger starts with.
+ *
+ * `LOG_LEVEL` wins when it holds a valid level. Otherwise production-like
+ * environments default to `info` (the schema default) while test and local
+ * environments default to `debug`, so nothing is silently dropped there.
+ */
+function resolveInitialLogLevel(): LogLevel {
+  const configured = process.env.LOG_LEVEL;
+  if (isLogLevel(configured)) return configured;
+  return process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging'
+    ? 'info'
+    : 'debug';
+}
+
+let activeLogLevel: LogLevel = resolveInitialLogLevel();
+
+/**
+ * Whether a record at `level` should be emitted for the active level.
+ *
+ * `error` is unconditionally enabled: error output is the one failure signal
+ * operators must never be able to silence through configuration.
+ */
+export function isLevelEnabled(level: LogLevel, active: LogLevel = activeLogLevel): boolean {
+  if (level === 'error') return true;
+  return LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[active];
+}
+
+/** Set the active log level. Invalid values are ignored; the active level is returned. */
+export function setLogLevel(level: LogLevel): LogLevel {
+  if (isLogLevel(level)) activeLogLevel = level;
+  return activeLogLevel;
+}
+
+/** The level the logger is currently filtering at. */
+export function getLogLevel(): LogLevel {
+  return activeLogLevel;
+}
+
+function write(
+  level: LogLevel,
+  message: string,
+  correlationId?: string,
+  meta?: Record<string, unknown>,
+  options: { force?: boolean } = {}
+): void {
+  if (!options.force && !isLevelEnabled(level)) return;
   // Sanitize the message and metadata
   const sanitizedMessage = redactKeysInString(message);
   const sanitizedMeta = meta ? sanitize(meta) : undefined;
@@ -57,6 +121,17 @@ function write(level: LogLevel, message: string, correlationId?: string, meta?: 
   // Errors thrown by the bridge are swallowed inside forwardToOtel() so they
   // can never interfere with the primary logging path.
   forwardToOtel(level, sanitizedMessage, currentCorrelationId, sanitizedMeta);
+}
+
+/**
+ * Emit a record that bypasses level filtering.
+ *
+ * Reserved for boot-time diagnostics (for example the effective log level)
+ * that must always be visible, even when the configured level would otherwise
+ * suppress them.
+ */
+export function writeAlways(level: LogLevel, message: string, meta?: Record<string, unknown>): void {
+  write(level, message, undefined, meta, { force: true });
 }
 
 /**

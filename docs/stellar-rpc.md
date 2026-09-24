@@ -66,6 +66,46 @@ Closed-circuit cache behavior emits:
 
 Redis cache read/write failures are logged as warnings and treated as misses or no-op writes. The fallback cache must not become a hard dependency for normal RPC calls.
 
+## Degradation Mode (HTTP Responses)
+
+`rpcDegradationMiddleware` turns circuit-breaker state into an explicit,
+self-describing HTTP contract so callers can always tell degraded data from
+fresh data.
+
+### Entry criteria
+
+The backend is **degraded** whenever the circuit breaker is not `CLOSED`
+(i.e. `OPEN` or `HALF_OPEN`). The breaker trips to `OPEN` once
+`RPC_CB_FAILURE_THRESHOLD` (default 5) failures are observed within
+`RPC_CB_WINDOW_MS` (default 30 000 ms), and it stays `OPEN` for
+`RPC_CB_RESET_TIMEOUT_MS` (default 60 000 ms) before a probe is admitted.
+
+### Markers on every response
+
+| Header / outcome | Value | Meaning |
+| --- | --- | --- |
+| `X-Degradation-State` | `CLOSED` / `OPEN` / `HALF_OPEN` | Current circuit state; present on every response. |
+| `Warning` | `199 fluxora-backend "Stellar RPC unavailable - data may be stale"` | Set on allowed read requests (GET/HEAD/OPTIONS) while degraded. |
+| `X-RPC-Cache` | `stale` | Set when the body came from the last-known-good fallback cache instead of a live RPC call. |
+| `503 SERVICE_UNAVAILABLE` | body `degradation: { circuitState, failureCount, openedAt }` | Mutating requests (POST/PUT/PATCH/DELETE) are rejected while degraded. |
+
+### Exit / automatic recovery
+
+Recovery is automatic: after the reset timeout elapses, the next call is
+admitted as a `HALF_OPEN` probe. A successful probe closes the breaker and
+normal responses resume; a failed probe reopens it. No manual intervention is
+required.
+
+### Observability
+
+Entry to and exit from degradation are logged (`event:
+rpc_degradation_transition`) and exported as Prometheus metrics:
+
+- `rpc_degradation_transitions_total{from,to}` — incremented on each observed
+  transition, e.g. `{from="CLOSED",to="OPEN"}` for entry and
+  `{from="OPEN",to="CLOSED"}` for automatic recovery.
+- `rpc_degraded_mode` — gauge, `1` while degraded and `0` when healthy.
+
 ## Security Notes
 
 - Cached values are JSON only and are parsed with `JSON.parse`; no dynamic code execution is used.

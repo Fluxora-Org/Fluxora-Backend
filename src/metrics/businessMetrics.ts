@@ -3,7 +3,7 @@ import { registry } from '../metrics.js';
 
 export type StreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
 export type WebhookDeliveryOutcome = 'success' | 'failed';
-export type SseConnectionRejectionReason = 'per_ip_limit' | 'global_limit';
+export type SseConnectionRejectionReason = 'per_ip_limit' | 'per_key_limit' | 'global_limit';
 
 const VALID_STREAM_STATUSES: readonly StreamStatus[] = [
   'active',
@@ -14,6 +14,7 @@ const VALID_STREAM_STATUSES: readonly StreamStatus[] = [
 const VALID_OUTCOMES: readonly WebhookDeliveryOutcome[] = ['success', 'failed'];
 const VALID_REJECTION_REASONS: readonly SseConnectionRejectionReason[] = [
   'per_ip_limit',
+  'per_key_limit',
   'global_limit',
 ];
 

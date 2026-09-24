@@ -19,3 +19,10 @@ export const down = `
 ALTER TABLE contract_events ALTER COLUMN ingested_at DROP DEFAULT;
 ALTER TABLE contract_events ALTER COLUMN ingested_at DROP NOT NULL;
 `;
+
+/**
+ * The up migration replaces pre-existing NULL values with NOW(). The schema
+ * can be rolled back, but those original NULL values cannot be reconstructed.
+ */
+export const irreversibleReason =
+  'Backfilled NULL contract_events.ingested_at values cannot be restored by down.';

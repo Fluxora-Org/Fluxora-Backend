@@ -16,6 +16,7 @@
  */
 
 import { redactableFields } from './policy.js';
+import { redactSecretsInString } from './secretPatterns.js';
 
 export const REDACTED = '[REDACTED]';
 
@@ -55,10 +56,12 @@ export function isStellarKey(value: string): boolean {
  * in larger text (log lines, error messages).
  */
 export function redactKeysInString(input: string): string {
-  return input
-    .replace(STELLAR_KEY_GLOBAL_RE, (match) => maskStellarKey(match))
-    .replace(BEARER_TOKEN_RE, 'Bearer [REDACTED]')
-    .replace(SENSITIVE_STRING_FIELD_RE, '$1: [REDACTED]');
+  return redactSecretsInString(
+    input
+      .replace(STELLAR_KEY_GLOBAL_RE, (match) => maskStellarKey(match))
+      .replace(BEARER_TOKEN_RE, 'Bearer [REDACTED]')
+      .replace(SENSITIVE_STRING_FIELD_RE, '$1: [REDACTED]'),
+  );
 }
 
 /**

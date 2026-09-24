@@ -1,6 +1,7 @@
 import { getPool, query } from '../db/pool.js';
 import { createId } from '@paralleldrive/cuid2';
-import { ApiError } from '../errors.js';
+import { ApiError, ApiErrorCode } from '../errors.js';
+import { getOverrideCeiling, type OverrideCeiling } from '../config/rateLimits.js';
 
 export interface RateLimitOverride {
   id: string;
@@ -72,10 +73,48 @@ export async function getOverrideById(id: string): Promise<RateLimitOverride | n
   return result.rows[0] ? rowToOverride(result.rows[0]) : null;
 }
 
+/**
+ * Assert that an override stays within the global ceiling.
+ *
+ * Overrides are tighten-only: a tenant override replaces the global API-key
+ * tier config on the request path, so accepting a `maxRequests` above that
+ * tier's limit would promote a protective global limit into a per-tenant
+ * setting.  A breach is refused before any row is written, and the route layer
+ * audits the refusal.
+ *
+ * `ceiling` is injectable so callers/tests can pin the bound; production call
+ * sites resolve the live global config via getOverrideCeiling().
+ */
+export function assertOverrideWithinCeiling(
+  params: Pick<CreateOverrideParams, 'maxRequests' | 'windowMs'>,
+  ceiling: OverrideCeiling = getOverrideCeiling(
+    process.env as Record<string, string | undefined>,
+  ),
+): void {
+  if (params.maxRequests > ceiling.maxRequests) {
+    throw new ApiError(
+      422,
+      ApiErrorCode.UNPROCESSABLE_ENTITY,
+      `maxRequests ${params.maxRequests} exceeds the global ceiling of ${ceiling.maxRequests}`,
+      { maxRequests: params.maxRequests, ceiling: ceiling.maxRequests },
+    );
+  }
+  if (params.windowMs > ceiling.windowMs) {
+    throw new ApiError(
+      422,
+      ApiErrorCode.UNPROCESSABLE_ENTITY,
+      `windowMs ${params.windowMs} exceeds the maximum allowed window of ${ceiling.windowMs}`,
+      { windowMs: params.windowMs, ceiling: ceiling.windowMs },
+    );
+  }
+}
+
 export async function createOverride(
   params: CreateOverrideParams,
   createdBy: string,
 ): Promise<RateLimitOverride> {
+  assertOverrideWithinCeiling(params);
+
   const pool = getPool();
   const id = createId();
   const result = await query<Record<string, unknown>>(

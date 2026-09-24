@@ -89,6 +89,8 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
   apiKey: RateLimitConfig;
   admin: RateLimitConfig;
   trustProxy: boolean;
+  trustedProxyCount: number;
+  trustedProxies: Set<string>;
   allowlistIps: Set<string>;
 } {
   const enabled = env.RATE_LIMIT_ENABLED !== 'false';
@@ -125,6 +127,26 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
       };
 
   const trustProxy = env.RATE_LIMIT_TRUST_PROXY !== 'false';
+  const trustedProxyCount =
+    parseInt(
+      env.TRUSTED_PROXY_COUNT ??
+        env.TRUST_PROXY_HOPS ??
+        env.RATE_LIMIT_TRUSTED_PROXY_COUNT ??
+        '',
+      10
+    ) || 0;
+
+  const trustedProxies = new Set<string>();
+  const proxiesEnv =
+    env.TRUSTED_PROXIES ??
+    env.WS_TRUSTED_PROXIES ??
+    env.RATE_LIMIT_TRUSTED_PROXIES ??
+    '';
+  if (proxiesEnv) {
+    for (const entry of proxiesEnv.split(',').map((s) => s.trim()).filter(Boolean)) {
+      trustedProxies.add(entry);
+    }
+  }
 
   // Parse allowlist IPs for health probes
   const allowlistIps = new Set<string>();
@@ -135,7 +157,36 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
     }
   }
 
-  return { ip, apiKey, admin, trustProxy, allowlistIps };
+  return { ip, apiKey, admin, trustProxy, trustedProxyCount, trustedProxies, allowlistIps };
+}
+
+/**
+ * Global ceiling that a per-tenant rate-limit override may not exceed.
+ *
+ * All seeded tiers in this file already bound how much traffic a principal may
+ * send.  A tenant override replaces the API-key tier config on the request path
+ * (see middleware/rateLimiter.ts), so an override larger than the API-key
+ * tier's `max` would silently turn the protective global limit into a
+ * per-tenant setting — the global limit would constrain nothing.  The ceiling
+ * is therefore the global API-key tier limit: overrides are tighten-only.
+ */
+export interface OverrideCeiling {
+  maxRequests: number;
+  windowMs: number;
+}
+
+/**
+ * Resolve the active global ceiling for tenant rate-limit overrides.
+ *
+ * Prefers the hot-reloaded runtime config (SIGHUP / PUT /api/rate-limits/config)
+ * so the ceiling always matches the limit that is actually enforced, falling
+ * back to the env-seeded API-key tier default.
+ */
+export function getOverrideCeiling(
+  env: Record<string, string | undefined>,
+): OverrideCeiling {
+  const { apiKey } = getRateLimitConfig(env);
+  return { maxRequests: apiKey.max, windowMs: MAX_WINDOW_MS };
 }
 
 /**

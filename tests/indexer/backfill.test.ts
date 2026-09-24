@@ -22,7 +22,7 @@ describe('OrderedBackfillScheduler', () => {
       batchSize: 10,
     });
 
-    const result = await scheduler.run(0, 49);
+    const result = await scheduler.run(0, 49, 100);
     expect(result.ok).toBe(true);
     expect(result.lastCheckpointLedger).toBe(49);
     expect(maxActive).toBeLessThanOrEqual(2);
@@ -43,7 +43,7 @@ describe('OrderedBackfillScheduler', () => {
       maxRetries: 0,
     });
 
-    const result = await scheduler.run(0, 29);
+    const result = await scheduler.run(0, 29, 100);
     expect(result.ok).toBe(false);
     // Batch [10,19] failed, so the checkpoint stops at the end of batch [0,9].
     expect(result.lastCheckpointLedger).toBe(9);
@@ -69,7 +69,7 @@ describe('OrderedBackfillScheduler', () => {
       retryDelayMs: 0,
     });
 
-    const result = await scheduler.run(0, 29);
+    const result = await scheduler.run(0, 29, 100);
     expect(result.ok).toBe(true);
     expect(result.lastCheckpointLedger).toBe(29);
     expect(attempts.get(10)).toBe(2);
@@ -89,7 +89,7 @@ describe('OrderedBackfillScheduler', () => {
       retryDelayMs: 0,
     });
 
-    const result = await scheduler.run(0, 39);
+    const result = await scheduler.run(0, 39, 100);
     expect(result.ok).toBe(false);
     expect(result.lastCheckpointLedger).toBe(19);
     expect(result.failures).toHaveLength(1);
@@ -110,9 +110,20 @@ describe('OrderedBackfillScheduler', () => {
       batchSize: 10,
     });
 
-    const result = await scheduler.run(0, 19);
+    const result = await scheduler.run(0, 19, 100);
     expect(result.ok).toBe(true);
     expect(result.lastCheckpointLedger).toBe(19);
     expect(processed).toEqual([0, 10]);
+  });
+
+  it('throws RangeError if backfill attempts to outrun the live cursor', async () => {
+    const scheduler = new OrderedBackfillScheduler(async () => {}, {
+      concurrency: 1,
+      batchSize: 10,
+    });
+
+    await expect(scheduler.run(0, 50, 40)).rejects.toThrow(
+      'Backfill cannot advance past live cursor (40)'
+    );
   });
 });

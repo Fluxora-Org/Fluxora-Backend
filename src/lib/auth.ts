@@ -1,4 +1,13 @@
 // Pre-existing type error from upstream merge, unrelated to #1254; tracked under #TBD-typecheck-backlog.
+/**
+ * JWT primitives — NOT an authentication entry point (#1579).
+ *
+ * generateToken signs session tokens (POST /api/auth/session). verifyToken
+ * checks signature, issuer, audience and expiry only. HTTP handlers must not
+ * call verifyToken directly: use `authenticate` + `requireAuth` /
+ * `requirePermission` from src/middleware/auth.ts, which add the revocation
+ * check and payload validation on top of this. See docs/auth.md.
+ */
 import jwt, { type SignOptions } from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
 import { warn } from '../utils/logger.js';
@@ -77,8 +86,8 @@ export function verifyToken(token: string): UserPayload {
   } catch (error) {
     if (jwtSecretPrevious) {
       try {
-        return jwt.verify(token, jwtSecretPrevious, verifyOptions) as unknown as UserPayload;
-      } catch (prevError) {
+        return jwt.verify(token, jwtSecretPrevious, verifyOptions) as UserPayload;
+      } catch {
         // Fall through to throw the original error
       }
     }

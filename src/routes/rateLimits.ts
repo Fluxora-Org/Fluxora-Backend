@@ -47,7 +47,16 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
    */
   rateLimitsRouter.get('/', async (req: Request, res: Response) => {
     const { identifier, identifierType } = limiter.extractClientIdentifier(req);
-    const path = typeof req.query.path === 'string' ? req.query.path : undefined;
+    if (req.query.path !== undefined && typeof req.query.path !== 'string') {
+      res.status(400).json({ error: 'Query parameter "path" must be a string.' });
+      return;
+    }
+    if (req.query.method !== undefined && typeof req.query.method !== 'string') {
+      res.status(400).json({ error: 'Query parameter "method" must be a string.' });
+      return;
+    }
+
+    const path = req.query.path as string | undefined;
     const method = typeof req.query.method === 'string' ? req.query.method.toUpperCase() : undefined;
 
     // getStatus now queries the live Redis store (or in-memory fallback).

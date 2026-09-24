@@ -35,6 +35,28 @@
  * mirror still reflects the intended state, and the next cleanup/restart will
  * reconcile.  For the use cases here (operator inspection, DLQ triage) this
  * is an acceptable trade-off.
+ *
+ * ## Outbox Claim Lease and Dispatcher Crash Recovery
+ *
+ * To guarantee delivery while preventing duplicate concurrent sends across
+ * workers, outbox rows are claimed with an expiring lease:
+ *
+ * 1. `claimReadyOutboxItems(opts)` transitions due items from `'pending'` to
+ *    `'in_flight'`, setting `locked_by` to the worker ID and `locked_at` to
+ *    the claim timestamp.
+ * 2. **Documented lease period**: The claim lease duration is governed by
+ *    `lockTimeoutMs` (defaulting to `DEFAULT_CLAIM_LOCK_TIMEOUT_MS = 30_000` ms / 30 seconds).
+ * 3. **Dispatcher crash recovery**: If a dispatcher worker dies or crashes
+ *    mid-delivery holding a claim without acknowledging or releasing, the row
+ *    remains locked until the lease period elapses (`lockedAt + lockTimeoutMs < now`).
+ * 4. Once the lease expires:
+ *    - Surviving workers re-claim the row via `claimReadyOutboxItems` or
+ *      `reclaimStuckItems`.
+ *    - Or `releaseExpiredLeases()` can be called to return expired in-flight
+ *      rows back to `'pending'` state.
+ * 5. When the redelivery attempt succeeds, `markOutboxItemDelivered()` is
+ *    called, removing the item from the queue and ensuring the released row
+ *    is redelivered **exactly once**.
  */
 
 import type { Pool } from 'pg';
@@ -45,8 +67,13 @@ import {
   type OutboxItem,
   type ClaimOptions,
   type DeadLetterQueueItem,
+  DEFAULT_CLAIM_LOCK_TIMEOUT_MS,
 } from './store.js';
 import { logger } from '../lib/logger.js';
+
+export { DEFAULT_CLAIM_LOCK_TIMEOUT_MS };
+/** Documented alias for the default outbox claim lease period in milliseconds (30,000 ms = 30s). */
+export const DEFAULT_OUTBOX_LEASE_MS = DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PgWebhookDeliveryStore
@@ -283,10 +310,7 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
     const removed = this.mirror.removeFromOutbox(id);
     if (removed) {
       this.persistAsync(
-        this.pool.query(
-          `UPDATE webhook_outbox_items SET status = 'delivered' WHERE id = $1`,
-          [id]
-        ),
+        this.pool.query(`UPDATE webhook_outbox_items SET status = 'delivered' WHERE id = $1`, [id]),
         'outbox remove'
       );
     }
@@ -296,10 +320,10 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
   updateOutboxItemAttempt(id: string, attempts: number): void {
     this.mirror.updateOutboxItemAttempt(id, attempts);
     this.persistAsync(
-      this.pool.query(
-        `UPDATE webhook_outbox_items SET attempts = $1 WHERE id = $2`,
-        [attempts, id]
-      ),
+      this.pool.query(`UPDATE webhook_outbox_items SET attempts = $1 WHERE id = $2`, [
+        attempts,
+        id,
+      ]),
       'outbox attempt update'
     );
   }
@@ -309,13 +333,22 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
     if (claimed.length > 0) {
       const ids = claimed.map((i) => i.id);
       const workerId = opts?.workerId ?? 'default-worker';
-      this.persistAsync(
-        this.pool.query(
-          `UPDATE webhook_outbox_items
+      const now = opts?.now;
+      const query = now !== undefined
+        ? {
+            text: `UPDATE webhook_outbox_items
+           SET status = 'in_flight', locked_by = $1, locked_at = to_timestamp($2 / 1000.0)
+           WHERE id = ANY($3::text[])`,
+            values: [workerId, now, ids],
+          }
+        : {
+            text: `UPDATE webhook_outbox_items
            SET status = 'in_flight', locked_by = $1, locked_at = NOW()
            WHERE id = ANY($2::text[])`,
-          [workerId, ids]
-        ),
+            values: [workerId, ids],
+          };
+      this.persistAsync(
+        this.pool.query(query.text, query.values),
         'outbox claim'
       );
     }
@@ -323,7 +356,47 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
   }
 
   reclaimStuckItems(opts?: ClaimOptions): OutboxItem[] {
-    return this.mirror.reclaimStuckItems(opts);
+    const reclaimed = this.mirror.reclaimStuckItems(opts);
+    if (reclaimed.length > 0) {
+      const ids = reclaimed.map((i) => i.id);
+      const workerId = opts?.workerId ?? 'default-worker';
+      const now = opts?.now;
+      const query = now !== undefined
+        ? {
+            text: `UPDATE webhook_outbox_items
+           SET status = 'in_flight', locked_by = $1, locked_at = to_timestamp($2 / 1000.0)
+           WHERE id = ANY($3::text[])`,
+            values: [workerId, now, ids],
+          }
+        : {
+            text: `UPDATE webhook_outbox_items
+           SET status = 'in_flight', locked_by = $1, locked_at = NOW()
+           WHERE id = ANY($2::text[])`,
+            values: [workerId, ids],
+          };
+      this.persistAsync(
+        this.pool.query(query.text, query.values),
+        'outbox reclaim stuck items'
+      );
+    }
+    return reclaimed;
+  }
+
+  releaseExpiredLeases(opts?: { lockTimeoutMs?: number; now?: number }): OutboxItem[] {
+    const released = this.mirror.releaseExpiredLeases(opts);
+    if (released.length > 0) {
+      const ids = released.map((i) => i.id);
+      this.persistAsync(
+        this.pool.query(
+          `UPDATE webhook_outbox_items
+           SET status = 'pending', locked_by = NULL, locked_at = NULL
+           WHERE id = ANY($1::text[])`,
+          [ids]
+        ),
+        'outbox release expired leases'
+      );
+    }
+    return released;
   }
 
   releaseOutboxItem(id: string, workerId: string): boolean {
@@ -388,18 +461,15 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
     return id;
   }
 
-  getDeadLetterQueueItems(limit?: number): DeadLetterQueueItem[] {
-    return this.mirror.getDeadLetterQueueItems(limit);
+  getDeadLetterQueueItems(limit?: number, offset?: number): DeadLetterQueueItem[] {
+    return this.mirror.getDeadLetterQueueItems(limit, offset);
   }
 
   processDeadLetterQueueItem(id: string, processedAt?: number): boolean {
     const processed = this.mirror.processDeadLetterQueueItem(id, processedAt);
     if (processed) {
       this.persistAsync(
-        this.pool.query(
-          `UPDATE webhook_dlq SET processed_at = NOW() WHERE id = $1`,
-          [id]
-        ),
+        this.pool.query(`UPDATE webhook_dlq SET processed_at = NOW() WHERE id = $1`, [id]),
         'dlq process'
       );
     }
@@ -422,7 +492,13 @@ export class PgWebhookDeliveryStore implements IWebhookDeliveryStore {
     return this.mirror.isDuplicateDelivery(deliveryId);
   }
 
-  getMetrics(): { totalDeliveries: number; successfulDeliveries: number; failedDeliveries: number; dlqItems: number; outboxItems: number } {
+  getMetrics(): {
+    totalDeliveries: number;
+    successfulDeliveries: number;
+    failedDeliveries: number;
+    dlqItems: number;
+    outboxItems: number;
+  } {
     return this.mirror.getMetrics();
   }
 

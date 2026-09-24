@@ -59,6 +59,33 @@ export const dbPoolExhaustedTotal =
     registers: [registry],
   });
 
+/** Bounded set of DB query failure classes recorded by dbQueryErrorsTotal. */
+export const DB_ERROR_TYPES = ['pool_exhausted', 'query_timeout', 'duplicate_entry', 'other'] as const;
+
+export type DbErrorType = (typeof DB_ERROR_TYPES)[number];
+
+/**
+ * Counter of PostgreSQL query failures, partitioned by error_type.
+ *
+ * Emitted on EVERY query failure path — pool exhaustion (fast-fail before
+ * execution), statement_timeout (PG 57014), unique-violation (PG 23505), and
+ * any other driver/connection error. Without it the metrics that only fire on
+ * the success path (e.g. dbSlowQueriesTotal) go quiet exactly when queries
+ * start failing, so the dashboard flatlines instead of spiking at the moment
+ * of an incident.
+ *
+ * Labels: error_type — must take one of the DB_ERROR_TYPES values so label
+ * cardinality is bounded at 4 series regardless of how many queries fail.
+ */
+export const dbQueryErrorsTotal =
+  (registry.getSingleMetric('fluxora_db_query_errors_total') as Counter<'error_type'>) ||
+  new Counter({
+    name: 'fluxora_db_query_errors_total',
+    help: `Total number of PostgreSQL query failures, partitioned by error_type (${DB_ERROR_TYPES.join(', ')})`,
+    labelNames: ['error_type'] as const,
+    registers: [registry],
+  });
+
 /**
  * Gauge for PostgreSQL replication lag in seconds.
  * Reports null if replication lag is not measurable (e.g., no replica configured or lag check failed).
@@ -78,5 +105,6 @@ export function deRegisterDbMetrics(): void {
   registry.removeSingleMetric('fluxora_db_pool_idle_connections');
   registry.removeSingleMetric('fluxora_db_pool_waiting_requests');
   registry.removeSingleMetric('fluxora_db_pool_exhausted_total');
+  registry.removeSingleMetric('fluxora_db_query_errors_total');
   registry.removeSingleMetric('fluxora_db_replication_lag_seconds');
 }
