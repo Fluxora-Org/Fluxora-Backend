@@ -331,6 +331,17 @@ export interface StreamHubOptions {
   healthProbeIntervalMs?: number;
   /** Number of consecutive missed pongs before termination. Default 2. */
   healthProbeMaxMissed?: number;
+  /**
+   * Outbound `bufferedAmount` (in bytes) above which an OPEN connection is
+   * classified as **stalled** by the health probe rather than healthy.
+   *
+   * An open socket is not necessarily healthy: when frames buffer faster
+   * than the peer drains them, the outbound queue saturates and the
+   * connection is effectively stalled. Defaults to `BACKPRESSURE_DROP_BYTES`
+   * (1 MiB) — the point at which the hub starts dropping frames for the
+   * client. Values below 0 are ignored and the default is used.
+   */
+  healthProbeStallBytes?: number;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -369,6 +380,7 @@ export class StreamHub extends EventEmitter {
 
   private readonly healthProbeIntervalMs: number;
   private readonly healthProbeMaxMissed: number;
+  private readonly healthProbeStallBytes: number;
   private readonly healthProbeTimer: NodeJS.Timeout | undefined;
 
   public getEventStore(): ContractEventStore | undefined {
@@ -444,6 +456,10 @@ export class StreamHub extends EventEmitter {
 
     this.healthProbeIntervalMs = options?.healthProbeIntervalMs ?? 30_000;
     this.healthProbeMaxMissed = options?.healthProbeMaxMissed ?? 2;
+    this.healthProbeStallBytes =
+      typeof options?.healthProbeStallBytes === 'number' && options.healthProbeStallBytes >= 0
+        ? options.healthProbeStallBytes
+        : BACKPRESSURE_DROP_BYTES;
 
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
@@ -1504,6 +1520,7 @@ export class StreamHub extends EventEmitter {
 
   private runHealthProbes(): void {
     let healthyCount = 0;
+    let stalledCount = 0;
     let unhealthyCount = 0;
 
     for (const [ws, state] of this.clients.entries()) {
@@ -1512,14 +1529,26 @@ export class StreamHub extends EventEmitter {
       if (state.missedPongs >= this.healthProbeMaxMissed) {
         unhealthyCount++;
         ws.terminate();
+        continue;
+      }
+
+      // An OPEN socket is not automatically healthy. If the outbound queue is
+      // saturated above the stall threshold, frames are buffering faster than
+      // the peer drains them — report it as stalled rather than healthy so the
+      // health signal reflects the actual failure state. The liveness probe is
+      // still applied so a stalled client that also stops ponging escalates to
+      // unhealthy on a later pass.
+      if (ws.bufferedAmount > this.healthProbeStallBytes) {
+        stalledCount++;
       } else {
         healthyCount++;
-        state.missedPongs++;
-        ws.ping();
       }
+
+      state.missedPongs++;
+      ws.ping();
     }
 
-    updateWsHealthMetrics(healthyCount, unhealthyCount);
+    updateWsHealthMetrics(healthyCount, unhealthyCount, stalledCount);
   }
 
   async close(cb?: () => void): Promise<void> {
@@ -1548,6 +1577,16 @@ export class StreamHub extends EventEmitter {
 
   async _resetDedup(): Promise<void> {
     await this.dedup.clear();
+  }
+
+  /**
+   * Run a single health-probe pass synchronously. Exposed for tests that
+   * disable the interval timer (`healthProbeIntervalMs: 0`) and need to drive
+   * the probe deterministically. Production code relies on the timer; this
+   * method intentionally does not alter probe semantics.
+   */
+  _runHealthProbes(): void {
+    this.runHealthProbes();
   }
 
   _resetMetrics(): void {

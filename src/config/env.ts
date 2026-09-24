@@ -439,6 +439,10 @@ export const EnvSchema = z
     RATE_LIMIT_ADMIN_MAX: integerEnv('RATE_LIMIT_ADMIN_MAX', 1).optional(),
     RATE_LIMIT_TRUST_PROXY: booleanEnv().default(true),
     RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
+    TRUSTED_PROXY_COUNT: integerEnv('TRUSTED_PROXY_COUNT', 0, 100).default(0),
+    TRUSTED_PROXIES: optionalString('TRUSTED_PROXIES'),
+    WS_TRUSTED_PROXIES: optionalString('WS_TRUSTED_PROXIES'),
+    RATE_LIMIT_TRUSTED_PROXIES: optionalString('RATE_LIMIT_TRUSTED_PROXIES'),
     AWS_REGION: optionalString('AWS_REGION'),
     AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
 

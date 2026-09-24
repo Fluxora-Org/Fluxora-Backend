@@ -296,20 +296,22 @@ webhooksRouter.get('/deliveries', (req, res) => {
  * List outbox items (for monitoring)
  */
 webhooksRouter.get('/outbox', (req, res) => {
-  const paginationParsed = OffsetPaginationSchema.safeParse(req.query);
-  if (!paginationParsed.success) {
-    const first = paginationParsed.error.issues[0];
+  // #1555: the outbox is an unbounded queue, so this listing is paginated
+  // (limit 1–100, default 100) instead of returning every item. The default
+  // keeps existing callers with ≤ 100 items seeing the same list.
+  const parsed = OffsetPaginationSchema.safeParse(req.query);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
     res.status(400).json({
       error: {
-        code: 'VALIDATION_ERROR',
+        code: 'INVALID_PAGINATION',
         message: first?.message ?? 'Invalid pagination parameters',
       },
     });
     return;
   }
-
-  const limit = paginationParsed.data.limit ?? DEFAULT_PAGE_LIMIT;
-  const offset = paginationParsed.data.offset ?? 0;
+  const limit = parsed.data.limit ?? 100;
+  const offset = parsed.data.offset ?? 0;
 
   const { priority, status = 'ready' } = req.query;
 
@@ -342,13 +344,14 @@ webhooksRouter.get('/outbox', (req, res) => {
   }
 
   const total = items.length;
-  const paginated = items.slice(offset, offset + limit);
+  const page = items.slice(offset, offset + limit);
 
   res.json({
     total,
     limit,
     offset,
-    items: paginated.map((item) => ({
+    has_more: offset + page.length < total,
+    items: page.map(item => ({
       id: item.id,
       deliveryId: item.deliveryId,
       eventId: item.eventId,
@@ -617,9 +620,9 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
   const contentType = req.header('content-type');
   const preflight = checkWebhookPreflight(req.body, contentType);
   if (!preflight.ok) {
-    res
-      .status(preflight.status)
-      .json(errorResponse(preflight.code as any, preflight.message, undefined, requestId));
+    res.status(preflight.status).json(
+      errorResponse(preflight.code, preflight.message, undefined, requestId)
+    );
     return;
   }
 

@@ -211,7 +211,7 @@ Admin auth is tested in `tests/middleware/adminAuth.test.ts` (267 lines):
 
 ### 4. Token Auth Middleware (`src/middleware/tokenAuth.ts`)
 
-**Purpose**: WebSocket JWT auth and partner/admin bearer token auth.
+**Purpose**: WebSocket JWT auth only. (`createBearerTokenAuth` was removed in #1579 — see docs/auth.md.)
 
 #### Edge Case Behavior
 
@@ -228,25 +228,14 @@ Admin auth is tested in `tests/middleware/adminAuth.test.ts` (267 lines):
   - Prometheus counter with `reason` label
   - Audit entry for `INVALID_TOKEN` and `AUTH_NOT_CONFIGURED` (not `MISSING_TOKEN`)
 
-##### Bearer Token Auth (`createBearerTokenAuth`)
-
-- **Disabled auth**: If `required` is false and no token configured, bypasses entirely
-- **Unconfigured**: Returns 503 if auth required but token not configured
-- **Missing header**: Returns 401 if `Authorization` header is missing
-- **Invalid scheme**: Returns 401 if not `Bearer` scheme
-- **Token mismatch**: Returns 401 if token doesn't match configured value
-- **Edge case**: Whitespace handling via `getBearerToken` helper
-
 #### Current Test Coverage
 
 Token auth is tested in `tests/middleware/tokenAuth.test.ts` (new file):
 - ✅ WebSocket token verification (all failure modes)
-- ✅ Bearer token auth middleware
 - ✅ Observability (logging, metrics, audit)
 - ✅ Unconfigured secret behavior
 - ✅ Token extraction order (header vs query)
 - ✅ Whitespace handling
-- ✅ Both partner and administrator roles
 
 **Status**: Token auth middleware now has comprehensive test coverage.
 

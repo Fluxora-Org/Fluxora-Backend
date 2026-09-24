@@ -81,6 +81,9 @@ Secret values are never included in validation messages.
 | `RATE_LIMIT_ADMIN_WINDOW_MS`      | integer ms                                     | route default                                                                                            |
 | `RATE_LIMIT_ADMIN_MAX`            | integer                                        | route default                                                                                            |
 | `RATE_LIMIT_TRUST_PROXY`          | boolean                                        | `true`                                                                                                   |
+| `TRUSTED_PROXY_COUNT`             | integer (hop count)                            | `0`                                                                                                      |
+| `TRUSTED_PROXIES`                 | comma-separated IPs                            | unset                                                                                                    |
+| `WS_TRUSTED_PROXIES`              | comma-separated IPs                            | unset                                                                                                    |
 | `RATE_LIMIT_ALLOWLIST_IPS`        | comma-separated IPs                            | unset                                                                                                    |
 | `AWS_REGION`                      | string                                         | unset                                                                                                    |
 | `AWS_DEFAULT_REGION`              | string                                         | unset                                                                                                    |

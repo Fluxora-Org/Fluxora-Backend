@@ -150,6 +150,117 @@ async function timed<T>(operation: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Per-tenant query helper.  Every tenant-scoped read through the repository
+ * layer must go through this before any other find/getById path.  Returns
+ * rows scoped by `sender_address = tenantId`; it is the structural isolation
+ * boundary for the streams table (which has no `tenant_id` column).
+ */
+export async function findForTenant(
+  tenantId: string,
+  filter: StreamFilter,
+  pagination: PaginationOptions,
+): Promise<PaginatedStreams> {
+  return streamRepository.find(
+    {
+      ...filter,
+      sender_address: tenantId,
+    },
+    pagination,
+  );
+}
+
+/**
+ * Per-tenant cursor list.  Equivalent to `findWithCursor` plus the
+ * tenant constraint.
+ */
+export async function findForTenantWithCursor(
+  tenantId: string,
+  filter: StreamFilter,
+  limit: number,
+  afterId?: string,
+  includeTotal?: boolean,
+  options?: { forcePrimary?: boolean },
+): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
+  return streamRepository.findWithCursor(
+    {
+      ...filter,
+      sender_address: tenantId,
+    },
+    limit,
+    afterId,
+    includeTotal,
+    { forcePrimary: options?.forcePrimary },
+  );
+}
+
+/**
+ * Per-tenant retrieval.  Returns the row only if the caller's tenant owns it.
+ * Ownership is established by `sender_address` matching the tenantId, which
+ * is the authenticated principal (Stellar public key) of the requesting tenant.
+ * This is the structural check that normal tenant-scoped lookups must use.
+ */
+export async function getForTenant(
+  tenantId: string,
+  id: string,
+): Promise<StreamRecord | undefined> {
+  const record = await streamRepository.getById(id);
+  if (!record) return undefined;
+  if (record.sender_address !== tenantId) {
+    // Foreign tenants return no row: 404 keeps the existence of other
+    // tenants' resources hidden.
+    return undefined;
+  }
+  return record;
+}
+
+/**
+ * Per-tenant existence check.  Returns true only when the authenticated
+ * tenant owns the row (sender_address matches tenantId).
+ */
+export async function existsForTenant(
+  tenantId: string,
+  id: string,
+): Promise<boolean> {
+  const record = await streamRepository.getById(id);
+  if (!record) return false;
+  return record.sender_address === tenantId;
+}
+
+/**
+ * Count streams for a tenant.
+ *
+ * Since the streams table does not have a `tenant_id` column, the tenant
+ * is identified by `sender_address` matching the tenantId (the authenticated
+ * principal).  Applies any additional filter predicates on top of the
+ * sender constraint.
+ */
+export async function countForTenant(
+  tenantId: string,
+  filter: StreamFilter,
+): Promise<number> {
+  const result = await streamRepository.find(
+    { ...filter, sender_address: tenantId },
+    { limit: 1, offset: 0 },
+  );
+  return result.total;
+}
+
+/** Count streams for a tenant.
+ *
+ * NOTE: the streams table has no tenant column, so a strict per-tenant
+ * count is not structurally possible.  This is retained as the
+ * privileged-administration entry point and is deliberately NOT exposed
+ * through the tenant-scoped wrapper.
+ */
+export async function countByTenant(
+  _tenantId: string,
+  _filter: StreamFilter,
+): Promise<number> {
+  // Foreign-tenant reads are deliberately refused at the route layer.
+  throw new Error('cross-tenant count is not permitted');
+}
+
 export const streamRepository = {
   /**
    * Insert a stream from a blockchain event.

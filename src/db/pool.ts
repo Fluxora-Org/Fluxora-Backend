@@ -159,6 +159,16 @@ export function resolvePoolConfig(): PoolConfig {
 
 let _pool: pg.Pool | null = null;
 
+/**
+ * Resolve the `pool` label for a pool instance.
+ *
+ * Pools built by `createPool()` carry their own name; structurally compatible
+ * fakes (tests, embedded callers) fall back to "default".
+ */
+function poolNameOf(pool: pg.Pool): string {
+  return (pool as pg.Pool & { _poolName?: string })._poolName ?? 'default';
+}
+
 /** Sync pool gauges from current pool state (both unlabeled legacy and labeled). */
 function syncGauges(pool: pg.Pool, poolName: string): void {
   const active = pool.totalCount - pool.idleCount;
@@ -166,8 +176,18 @@ function syncGauges(pool: pg.Pool, poolName: string): void {
   dbPoolActiveConnections.set(active < 0 ? 0 : active);
   dbPoolIdleConnections.set(pool.idleCount);
   dbPoolWaitingRequests.set(pool.waitingCount);
-  // Labeled gauges — supports multiple named pools
-  syncPoolGauges(pool, poolName);
+  // Labeled gauges — supports multiple named pools. capacity + queueLimit feed
+  // the saturation ratios so saturation is visible before the pool exhausts.
+  syncPoolGauges(
+    {
+      totalCount: pool.totalCount,
+      idleCount: pool.idleCount,
+      waitingCount: pool.waitingCount,
+      capacity: (pool as pg.Pool & { options?: { max?: number } }).options?.max,
+      queueLimit: (pool as pg.Pool & { _queueLimit?: number })._queueLimit,
+    },
+    poolName,
+  );
 }
 
 export function createPool(config?: PoolConfig): pg.Pool {
@@ -205,9 +225,10 @@ export function createPool(config?: PoolConfig): pg.Pool {
     // use PREPARE.  In session mode we explicitly enable it (default in pg).
   });
 
-  // Store queueLimit and poolMode on the pool instance for use in query()
+  // Store queueLimit, poolMode and poolName on the pool instance for use in query()
   (pool as pg.Pool & { _queueLimit?: number; _poolMode?: string })._queueLimit = cfg.queueLimit;
   (pool as pg.Pool & { _queueLimit?: number; _poolMode?: string })._poolMode = cfg.poolMode ?? 'session';
+  (pool as pg.Pool & { _poolName?: string })._poolName = poolName;
 
   // Apply statement_timeout on every new physical connection.
   // SET LOCAL scopes the timeout to the current transaction; for non-transactional
@@ -354,6 +375,9 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   if (pool.waitingCount >= limit) {
     dbPoolExhaustedTotal.inc();
     dbQueryErrorsTotal.inc({ error_type: 'pool_exhausted' });
+    // Publish the failure state before refusing the request so the saturation
+    // gauges move on the exact path that fast-fails (queue at its limit).
+    syncGauges(pool, poolNameOf(pool));
     logger.warn('Postgres pool exhausted', undefined, {
       event: 'pool_exhausted',
       total: pool.totalCount,

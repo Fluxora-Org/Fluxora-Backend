@@ -32,6 +32,10 @@ import {
   indexerIngestionService,
 } from '../indexer/ingestion.js';
 import { indexerService } from '../indexer/service.js';
+  indexerService,
+  replayLock,
+  replayState,
+} from '../indexer/service.js';
 import { IndexerDependencyState } from '../indexer/types.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { successResponse, errorResponse } from '../utils/response.js';
@@ -198,6 +202,10 @@ indexerRouter.post(
     if (from_block !== undefined && to_block !== undefined && from_block > to_block) {
       res.status(400).json(
         errorResponse('VALIDATION_ERROR', 'from_block cannot be greater than to_block', undefined, requestId),
+    // Guard against concurrent control operations
+    if (replayLock.isHeld() || indexerService.getReplayProgress().isReplaying) {
+      res.status(409).json(
+        errorResponse('CONFLICT', 'Replay operation already in progress', undefined, requestId),
       );
       return;
     }
@@ -224,6 +232,12 @@ indexerRouter.post(
       ledger,
       from_block,
       to_block,
+    indexerService.replayEvents({ contract_id, ledger, from_block, to_block }).catch((err: unknown) => {
+      logger.error('Replay failed', correlationId, {
+        contract_id,
+        ledger,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
 
     indexerService.replayEvents({ contract_id, ledger, from_block, to_block })
@@ -279,6 +293,8 @@ indexerRouter.get(
 
 // ── Test helpers (consumed by tests only) ────────────────────────────────────
 
+export { replayLock, replayState };
+
 export function setIndexerIngestAuthToken(token: string): void {
   indexerWorkerToken = token;
 }
@@ -298,6 +314,8 @@ export function resetIndexerState(): void {
   indexerIngestionService.setStore(defaultIndexerEventStore);
   indexerIngestionService.resetRuntimeState();
   indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+  replayLock.release();
+  replayState.endReplay();
 }
 
 export function getIndexerHealth() {

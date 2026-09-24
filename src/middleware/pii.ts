@@ -137,3 +137,21 @@ export function safeErrorHandler(
     message: 'An unexpected error occurred. No sensitive data has been included in this response.',
   });
 }
+
+/**
+ * Sanitizes all outbound JSON responses to ensure no PII escapes.
+ * Failures to sanitize result in a 500 error, failing closed.
+ */
+export function responseSanitizer(req: Request, res: Response, next: NextFunction): void {
+  const originalJson = res.json;
+  res.json = function(body: any) {
+    try {
+      body = sanitize(body);
+    } catch (e) {
+      logger.error('failed to sanitize response body', req.correlationId as string, { error: e });
+      return res.status(500).send('Internal server error');
+    }
+    return originalJson.call(this, body);
+  };
+  next();
+}

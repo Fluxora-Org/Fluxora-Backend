@@ -60,9 +60,9 @@ describe('connectionLimiter (Redis-backed bans)', () => {
       expect(getClientIp(req)).toBe('8.8.8.8');
     });
 
-    it('handles multiple IPs in X-Forwarded-For', () => {
+    it('handles multiple IPs in X-Forwarded-For by ignoring spoofed client entries beyond trusted proxy', () => {
       const req = mockRequest('127.0.0.1', '1.2.3.4, 5.6.7.8');
-      expect(getClientIp(req)).toBe('1.2.3.4');
+      expect(getClientIp(req)).toBe('5.6.7.8');
     });
   });
 

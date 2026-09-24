@@ -89,6 +89,8 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
   apiKey: RateLimitConfig;
   admin: RateLimitConfig;
   trustProxy: boolean;
+  trustedProxyCount: number;
+  trustedProxies: Set<string>;
   allowlistIps: Set<string>;
 } {
   const enabled = env.RATE_LIMIT_ENABLED !== 'false';
@@ -125,6 +127,26 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
       };
 
   const trustProxy = env.RATE_LIMIT_TRUST_PROXY !== 'false';
+  const trustedProxyCount =
+    parseInt(
+      env.TRUSTED_PROXY_COUNT ??
+        env.TRUST_PROXY_HOPS ??
+        env.RATE_LIMIT_TRUSTED_PROXY_COUNT ??
+        '',
+      10
+    ) || 0;
+
+  const trustedProxies = new Set<string>();
+  const proxiesEnv =
+    env.TRUSTED_PROXIES ??
+    env.WS_TRUSTED_PROXIES ??
+    env.RATE_LIMIT_TRUSTED_PROXIES ??
+    '';
+  if (proxiesEnv) {
+    for (const entry of proxiesEnv.split(',').map((s) => s.trim()).filter(Boolean)) {
+      trustedProxies.add(entry);
+    }
+  }
 
   // Parse allowlist IPs for health probes
   const allowlistIps = new Set<string>();
@@ -135,7 +157,7 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
     }
   }
 
-  return { ip, apiKey, admin, trustProxy, allowlistIps };
+  return { ip, apiKey, admin, trustProxy, trustedProxyCount, trustedProxies, allowlistIps };
 }
 
 /**
