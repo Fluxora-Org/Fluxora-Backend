@@ -25,6 +25,8 @@ import {
   redisQueueLengthWarningsTotal,
   statusToValue,
   syncRedisGauges,
+  recordRedisReconnect,
+  recordRedisCommandFailure,
 } from '../metrics/redisPool.js';
 
 function defaultRetryStrategy(times: number): number | null {
@@ -114,44 +116,70 @@ function attachLogListeners(client: Redis | Cluster, mode: string): void {
 // ---------------------------------------------------------------------------
 
 class IORedisClient implements RedisClient {
-  constructor(private readonly client: Redis | Cluster) {}
+  constructor(
+    private readonly client: Redis | Cluster,
+    private readonly instanceName: string,
+  ) {}
 
-  async get(key: string): Promise<string | null> {
-    return this.client.get(key) as Promise<string | null>;
-  }
-
-  async set(key: string, value: string, options?: { ex?: number }): Promise<void> {
-    if (options?.ex) {
-      await this.client.set(key, value, 'EX', options.ex);
-    } else {
-      await this.client.set(key, value);
+  /**
+   * Run a Redis command and count rejections as command failures
+   * (separate from reconnect counters).
+   */
+  private async withCommandMetrics<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      recordRedisCommandFailure(this.instanceName);
+      throw err;
     }
   }
 
-  async setNx(key: string, value: string, pxMs: number): Promise<boolean> {
-    const result = await this.client.set(key, value, 'PX', pxMs, 'NX');
-    return result === 'OK';
-  }
-
-  async del(key: string): Promise<void> {
-    await this.client.del(key);
-  }
-
-  async incr(key: string): Promise<number> {
-    return this.client.incr(key);
-  }
-
-  async delIfValue(key: string, value: string): Promise<void> {
-    await this.client.eval(
-      "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
-      1,
-      key,
-      value,
+  async get(key: string): Promise<string | null> {
+    return this.withCommandMetrics(
+      () => this.client.get(key) as Promise<string | null>,
     );
   }
 
+  async set(key: string, value: string, options?: { ex?: number }): Promise<void> {
+    return this.withCommandMetrics(async () => {
+      if (options?.ex) {
+        await this.client.set(key, value, 'EX', options.ex);
+      } else {
+        await this.client.set(key, value);
+      }
+    });
+  }
+
+  async setNx(key: string, value: string, pxMs: number): Promise<boolean> {
+    return this.withCommandMetrics(async () => {
+      const result = await this.client.set(key, value, 'PX', pxMs, 'NX');
+      return result === 'OK';
+    });
+  }
+
+  async del(key: string): Promise<void> {
+    return this.withCommandMetrics(async () => {
+      await this.client.del(key);
+    });
+  }
+
+  async incr(key: string): Promise<number> {
+    return this.withCommandMetrics(() => this.client.incr(key));
+  }
+
+  async delIfValue(key: string, value: string): Promise<void> {
+    return this.withCommandMetrics(async () => {
+      await this.client.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        1,
+        key,
+        value,
+      );
+    });
+  }
+
   async exists(key: string): Promise<boolean> {
-    return (await this.client.exists(key)) === 1;
+    return this.withCommandMetrics(async () => (await this.client.exists(key)) === 1);
   }
 
   async close(): Promise<void> {
@@ -160,6 +188,7 @@ class IORedisClient implements RedisClient {
 
   multi(): RedisPipeline {
     const pipeline = this.client.multi();
+    const instanceName = this.instanceName;
     const wrapper: RedisPipeline = {
       zadd(key, nx, score, member) {
         pipeline.zadd(key, 'NX', score, member);
@@ -177,15 +206,20 @@ class IORedisClient implements RedisClient {
         pipeline.pexpire(key, ms);
         return wrapper;
       },
-      exec() {
-        return pipeline.exec() as Promise<Array<[Error | null, unknown]>>;
+      async exec() {
+        try {
+          return (await pipeline.exec()) as Array<[Error | null, unknown]>;
+        } catch (err) {
+          recordRedisCommandFailure(instanceName);
+          throw err;
+        }
       },
     };
     return wrapper;
   }
 
   async zcount(key: string, min: string | number, max: string | number): Promise<number> {
-    return this.client.zcount(key, min, max);
+    return this.withCommandMetrics(() => this.client.zcount(key, min, max));
   }
 }
 
@@ -216,7 +250,7 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
     const instanceName = 'default';
     _trackClient(instanceName, raw);
 
-    return new IORedisClient(raw);
+    return new IORedisClient(raw, instanceName);
   }
 
   private async _createStandalone(
@@ -327,9 +361,19 @@ export interface RedisSaturationStats {
  */
 const _trackedClients = new Map<string, Redis | Cluster>();
 
-/** Register a raw ioredis client for saturation-metrics tracking. */
-function _trackClient(instanceName: string, client: Redis | Cluster): void {
+/**
+ * Register a raw ioredis client for saturation-metrics tracking and wire
+ * reconnect / failure counters.
+ *
+ * Reconnects (`reconnecting` events) increment {@link recordRedisReconnect}.
+ * Command failures are counted in {@link IORedisClient}, not here — so the two
+ * failure modes stay on separate counters.
+ */
+export function _trackClient(instanceName: string, client: Redis | Cluster): void {
   _trackedClients.set(instanceName, client);
+  client.on('reconnecting', () => {
+    recordRedisReconnect(instanceName);
+  });
 }
 
 /**
