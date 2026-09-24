@@ -48,6 +48,8 @@ const PREFIX_LENGTH = 8;
 const SALT_BYTES = 16;
 /** Raw key entropy in bytes (rendered as hex). */
 const RAW_KEY_BYTES = 32;
+/** HMAC-SHA256 digest size in bytes. */
+const DIGEST_BYTES = 32;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -105,13 +107,22 @@ function generateRawKey(): string {
  * Constant-time comparison of two hex digests.
  *
  * Operates on a single candidate row so authentication time does not leak
- * which (if any) stored hash matched. Length mismatches short-circuit safely.
+ * which (if any) stored hash matched. Inputs are normalized to fixed-size
+ * buffers before comparison so malformed lengths do not short-circuit.
  */
 function hashesMatch(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'hex');
   const bufB = Buffer.from(b, 'hex');
-  if (bufA.length === 0 || bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
+  const paddedA = Buffer.alloc(DIGEST_BYTES);
+  const paddedB = Buffer.alloc(DIGEST_BYTES);
+  bufA.copy(paddedA, 0, 0, DIGEST_BYTES);
+  bufB.copy(paddedB, 0, 0, DIGEST_BYTES);
+
+  // Always compare fixed-size buffers. Length and digest validity are checked
+  // after the constant-time operation so malformed candidates do not take a
+  // faster branch.
+  const equal = timingSafeEqual(paddedA, paddedB);
+  return equal && bufA.length === DIGEST_BYTES && bufB.length === DIGEST_BYTES;
 }
 
 // ---------------------------------------------------------------------------
