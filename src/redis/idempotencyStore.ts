@@ -173,9 +173,9 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   async start(key: string, tenantId: string, ttlSeconds: number): Promise<boolean> {
     try {
       const fullKey = this.buildKey(key, tenantId);
-      const result = await this.client.set(fullKey, 'IN_PROGRESS', { ex: ttlSeconds, nx: true });
+      const acquired = await this.client.setNx(fullKey, 'IN_PROGRESS', ttlSeconds * 1000);
       this.onStateChange?.(true);
-      return result === 'OK';
+      return acquired;
     } catch (err) {
       this.onStateChange?.(false);
       this.logger.warn('Idempotency store: Redis start failed — failing open', correlationStore.getStore(), {

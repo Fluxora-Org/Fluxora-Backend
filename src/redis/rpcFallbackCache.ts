@@ -117,7 +117,7 @@ export function buildRpcFallbackCacheKey(operation: string, cacheParts: readonly
 
   const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
-  return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
+  return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${operation}::parts:${encodedParts.join(',')}`;
 }
 
 export const buildCacheKey = buildRpcFallbackCacheKey;

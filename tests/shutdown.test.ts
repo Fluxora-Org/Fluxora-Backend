@@ -593,7 +593,7 @@ describe('#336 Redis quit hook', () => {
           async exists() { return false; },
           close: callCount === 1 ? close1 : close2,
           multi() { return null as any; },
-          async zcount() { return 0; },
+          async zcount() { return 0; }, incr() { return Promise.resolve(0); },
         };
         return stub;
       },
@@ -623,7 +623,7 @@ describe('#336 Redis quit hook', () => {
           async exists() { return false; },
           close,
           multi() { return null as any; },
-          async zcount() { return 0; },
+          async zcount() { return 0; }, incr() { return Promise.resolve(0); },
         };
       },
     });
@@ -649,7 +649,7 @@ describe('#336 Redis quit hook', () => {
           async exists() { return false; },
           close,
           multi() { return null as any; },
-          async zcount() { return 0; },
+          async zcount() { return 0; }, incr() { return Promise.resolve(0); },
         };
       },
     });

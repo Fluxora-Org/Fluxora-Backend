@@ -58,7 +58,7 @@ describe('RedisIdempotencyStore', () => {
 
   it('returns the stored entry on cache hit', async () => {
     const entry = makeEntry();
-    await store.set('', 'tenant-a', 'tenant-a', entry, 3600);
+    await store.set('key-1', 'tenant-a', entry, 3600);
     const result = await store.get('key-1', 'tenant-a');
     expect(result).toEqual(entry);
   });
@@ -67,9 +67,9 @@ describe('RedisIdempotencyStore', () => {
     const entry = makeEntry({ statusCode: 201, body: { data: { id: 'stream-xyz' }, meta: { requestId: 'r1' } } });
     await store.set('', 'tenant-a', entry, 60);
     const result = await store.get('', 'tenant-a');
-    expect(result?.statusCode).toBe(201);
-    expect(result?.body).toEqual(entry.body);
-    expect(result?.requestFingerprint).toBe(entry.requestFingerprint);
+    expect((result as any)?.statusCode).toBe(201);
+    expect((result as any)?.body).toEqual(entry.body);
+    expect((result as any)?.requestFingerprint).toBe(entry.requestFingerprint);
   });
 
   it('stores under the namespaced key (fluxora:idempotency: prefix)', async () => {
@@ -99,8 +99,8 @@ describe('RedisIdempotencyStore', () => {
     const e2 = makeEntry({ requestFingerprint: 'fp-2' });
     await store.set('', 'tenant-a', e1, 60);
     await store.set('', 'tenant-a', e2, 60);
-    expect((await store.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-1');
-    expect((await store.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-2');
+    expect(((await store.get('', 'tenant-a')) as any)?.requestFingerprint).toBe('fp-1');
+    expect(((await store.get('', 'tenant-a')) as any)?.requestFingerprint).toBe('fp-2');
   });
 
   // ── Graceful degradation ──────────────────────────────────────────────────
@@ -156,7 +156,7 @@ describe('RedisIdempotencyStore', () => {
     const entry2 = makeEntry({ requestFingerprint: 'fp-ok' });
     await store.set('', 'tenant-a', entry2, 60);
     const result = await store.get('', 'tenant-a');
-    expect(result?.requestFingerprint).toBe('fp-ok');
+    expect((result as any)?.requestFingerprint).toBe('fp-ok');
     vi.restoreAllMocks();
   });
 });
@@ -443,9 +443,9 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     await store.set('', 'tenant-a', entry, 60);
     const result = await store.get('', 'tenant-a');
     expect(result).not.toBeNull();
-    expect(result?.requestFingerprint).toBe(entry.requestFingerprint);
-    expect(result?.statusCode).toBe(entry.statusCode);
-    expect(result?.version).toBe(ENVELOPE_VERSION);
+    expect((result as any)?.requestFingerprint).toBe(entry.requestFingerprint);
+    expect((result as any)?.statusCode).toBe(entry.statusCode);
+    expect((result as any)?.version).toBe(ENVELOPE_VERSION);
     expect(warnSpy).not.toHaveBeenCalled();
   });
 });
@@ -481,9 +481,9 @@ describe('RedisIdempotencyStore — cross-instance replay', () => {
 
     const replayed = await instanceB.get('', 'tenant-a');
     expect(replayed).not.toBeNull();
-    expect(replayed?.statusCode).toBe(201);
-    expect(replayed?.requestFingerprint).toBe(entry.requestFingerprint);
-    expect(replayed?.body).toEqual(entry.body);
+    expect((replayed as any)?.statusCode).toBe(201);
+    expect((replayed as any)?.requestFingerprint).toBe(entry.requestFingerprint);
+    expect((replayed as any)?.body).toEqual(entry.body);
   });
 
   it('instance B detects a conflict (same key, different fingerprint) written by instance A', async () => {
@@ -493,15 +493,15 @@ describe('RedisIdempotencyStore — cross-instance replay', () => {
     const retrieved = await instanceB.get('', 'tenant-a');
     // The route handler (not the store) enforces the 409 — the store just
     // returns the stored entry so the caller can compare fingerprints.
-    expect(retrieved?.requestFingerprint).toBe('fp-from-instance-a');
+    expect((retrieved as any)?.requestFingerprint).toBe('fp-from-instance-a');
   });
 
   it('instance A and B store to isolated keys', async () => {
     await instanceA.set('', 'tenant-a', makeEntry({ requestFingerprint: 'fp-a' }), 60);
     await instanceB.set('', 'tenant-a', makeEntry({ requestFingerprint: 'fp-b' }), 60);
 
-    expect((await instanceA.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-b');
-    expect((await instanceB.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-a');
+    expect(((await instanceA.get('', 'tenant-a')) as any)?.requestFingerprint).toBe('fp-b');
+    expect(((await instanceB.get('', 'tenant-a')) as any)?.requestFingerprint).toBe('fp-a');
   });
 
   it('TTL is forwarded correctly from config-derived value', async () => {

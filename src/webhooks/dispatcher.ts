@@ -436,7 +436,7 @@ export class WebhookDispatcher {
       const options = {
         method: requestOptions.method,
         headers: requestOptions.headers,
-        lookup: lookupWebhookTarget,
+        lookup: lookupWebhookTarget as any,
         signal: requestOptions.signal,
       };
       const handleResponse = (response: IncomingMessage) => {

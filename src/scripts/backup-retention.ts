@@ -561,7 +561,8 @@ export function selectObjectsForDeletion(
 async function fetchBackupObjects(
   client: S3Client,
   bucket: string,
-  prefix: string
+  prefix: string,
+  now: Date = new Date()
 ): Promise<BackupObject[]> {
   const objects: BackupObject[] = [];
   let continuationToken: string | undefined;

@@ -93,7 +93,7 @@ describe('Redis-outage policy — docs/security/redis-outage-policy.md', () => {
       const redis = new FakeRedisClient();
       const limiter = createWebhookRateLimiter(redis);
       redis.throwOnNext('exec');
-      const result = await limiter.checkLimit('https://consumer.example/webhook', {
+      const result = await limiter.checkLimit({ tenant: 'test', endpoint: 'https://consumer.example/webhook', outcome: 'first_attempt' }, {
         limit: 10,
         windowMs: 1000,
         burst: 0,
@@ -105,7 +105,7 @@ describe('Redis-outage policy — docs/security/redis-outage-policy.md', () => {
       const redis = new FakeRedisClient();
       const store = new RedisWebhookCircuitBreakerStore(redis);
       redis.throwOnNext('get');
-      const result = await store.checkAndClaimAttempt('https://consumer.example/webhook', {
+      const result = await store.checkAndClaimAttempt({ tenant: 'test', endpoint: 'https://consumer.example/webhook', outcome: 'first_attempt' } as any, {
         circuitBreakerThreshold: 10,
       });
       expect(result.allowed).toBe(true);

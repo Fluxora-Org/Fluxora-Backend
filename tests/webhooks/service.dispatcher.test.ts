@@ -51,8 +51,8 @@ function createDispatcher(
     batchSize: 5,
     policy,
     pool: {
-      connect: vi.fn(async () => client),
-    },
+      connect: vi.fn(async () => client as any),
+    } as any,
     circuitBreakerStore: breaker,
   });
 }
@@ -254,7 +254,7 @@ describe('WebhookDispatcher outbox polling', () => {
       if (sql.includes('UPDATE webhook_outbox SET processed = true')) {
         throw new Error('Simulated crash during DB acknowledgement');
       }
-      return originalQuery(sql, params);
+      return (originalQuery as any)(sql, params);
     });
 
     let fetchHeaders: RequestInit['headers'] | undefined;
@@ -574,8 +574,8 @@ describe('WebhookDispatcher outbox polling', () => {
         batchSize: 5,
         policy: poisonPolicy,
         pool: {
-          connect: vi.fn(async () => client),
-        },
+          connect: vi.fn(async () => client as any),
+        } as any,
         circuitBreakerStore: breaker,
       });
 

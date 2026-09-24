@@ -182,7 +182,8 @@ describe('connectionLimiter (Redis-backed bans)', () => {
         async exists() { return false; },
         async close() {},
         multi() { return { zadd() {return this;}, zremrangebyscore(){return this;}, zcard(){return this;}, pexpire(){return this;}, async exec() {return [];} } as any; },
-        async zcount() { return 0; }
+        async zcount() { return 0; },
+        async incr() { return 0; }
       };
 
       const store = createBanStore(fakeRedis);

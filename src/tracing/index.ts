@@ -82,8 +82,8 @@ export function startTracing(): boolean {
       resource: new Resource({
         [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'fluxora-backend',
         [ATTR_SERVICE_VERSION]: process.env.npm_package_version ?? '0.0.0',
-      }),
-      traceExporter: exporter,
+      }) as any,
+      traceExporter: exporter as any,
       instrumentations: [
         // Propagates W3C traceparent on inbound HTTP and outbound fetch/http calls.
         new HttpInstrumentation({
