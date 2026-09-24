@@ -62,6 +62,7 @@ import { ApiError, notFound } from './errors.js';
 import { docsRouter } from './routes/docs.js';
 import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { startBusinessEventCollector } from './metrics/businessEventCollector.js';
 import { getStreamHub } from './ws/hub.js';
 import { getPool } from './db/pool.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
@@ -430,6 +431,7 @@ export function createApp(options: AppOptions = {}): Express {
 
   if (options.pool) {
     app.locals.vacuumInterval = startVacuumCollector(options.pool);
+    app.locals.businessEventInterval = startBusinessEventCollector(options.pool);
     startBackgroundJobs(options.pool);
     addShutdownHook(() => stopBackgroundJobs());
   }
