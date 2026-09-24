@@ -87,6 +87,11 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
     name: 'idx_webhook_outbox_items_ready',
     where: "status = 'pending'",
   });
+  // Partial index for reclaiming stuck in-flight rows whose lease expired
+  pgm.createIndex('webhook_outbox_items', 'locked_at', {
+    name: 'idx_webhook_outbox_items_in_flight',
+    where: "status = 'in_flight'",
+  });
 
   // ── webhook_dlq ───────────────────────────────────────────────────────────
   // Dead-letter queue for permanently failed webhook deliveries.

@@ -138,6 +138,7 @@ export interface IWebhookDeliveryStore {
   claimReadyOutboxItems(opts?: ClaimOptions): OutboxItem[];
   reclaimStuckItems(opts?: ClaimOptions): OutboxItem[];
   releaseOutboxItem(id: string, workerId: string): boolean;
+  releaseExpiredLeases(opts?: { lockTimeoutMs?: number; now?: number }): OutboxItem[];
   markOutboxItemDelivered(id: string, workerId: string): boolean;
   addToDeadLetterQueue(delivery: WebhookDelivery, failureReason: string, reasonCode?: DLQReasonCode): string;
   getDeadLetterQueueItems(limit?: number): DeadLetterQueueItem[];
@@ -447,6 +448,39 @@ export class WebhookDeliveryStore implements IWebhookDeliveryStore {
     item.lockedAt = undefined;
     item.lockedBy = undefined;
     return true;
+  }
+
+  /**
+   * Release claimed outbox items whose lock lease has expired back to 'pending'.
+   *
+   * When a worker claims an item and dies/crashes before acknowledging delivery,
+   * the item remains 'in_flight' until its lease expires (`lockedAt + lockTimeoutMs < now`).
+   * This method resets such items to `status = 'pending'` and clears the lock fields,
+   * making them available for normal polling and delivery by any available worker.
+   *
+   * @param opts Configuration for lease timeout and current time reference.
+   * @returns Array of OutboxItems that were released.
+   */
+  releaseExpiredLeases(opts?: { lockTimeoutMs?: number; now?: number }): OutboxItem[] {
+    const lockTimeoutMs = opts?.lockTimeoutMs ?? DEFAULT_CLAIM_LOCK_TIMEOUT_MS;
+    const now = opts?.now ?? Date.now();
+    const reclaimWindow = now - lockTimeoutMs;
+    const released: OutboxItem[] = [];
+
+    for (const item of this.outbox.values()) {
+      if (
+        item.status === 'in_flight' &&
+        item.lockedAt != null &&
+        item.lockedAt < reclaimWindow
+      ) {
+        item.status = 'pending';
+        item.lockedAt = undefined;
+        item.lockedBy = undefined;
+        released.push(item);
+      }
+    }
+
+    return released;
   }
 
   /**
