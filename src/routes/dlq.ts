@@ -37,6 +37,7 @@ import { info } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { dlqRepository } from '../db/repositories/dlqRepository.js';
+import { OffsetPaginationSchema, DEFAULT_PAGE_LIMIT } from '../validation/paginationSchema.js';
 
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
@@ -81,29 +82,18 @@ dlqRouter.get(
   '/',
   requirePermission(Permission.DLQ_LIST),
   asyncHandler(async (req: Request, res: Response) => {
-    const limitParam  = req.query.limit;
-    const offsetParam = req.query.offset;
     const topicFilter = req.query.topic;
     const tenantFilter = req.query.tenantId;
     const requestId   = req.correlationId;
 
-    let limit = 50;
-    if (limitParam !== undefined) {
-      const parsed = Number.parseInt(String(limitParam), 10);
-      if (Number.isNaN(parsed) || parsed < 1 || parsed > 100) {
-        throw validationError('limit must be an integer between 1 and 100');
-      }
-      limit = parsed;
+    const parsed = OffsetPaginationSchema.safeParse(req.query);
+    if (!parsed.success) {
+      const firstIssue = parsed.error.issues[0];
+      throw validationError(firstIssue?.message ?? 'Invalid pagination parameters');
     }
 
-    let offset = 0;
-    if (offsetParam !== undefined) {
-      const parsed = Number.parseInt(String(offsetParam), 10);
-      if (Number.isNaN(parsed) || parsed < 0) {
-        throw validationError('offset must be a non-negative integer');
-      }
-      offset = parsed;
-    }
+    const limit  = parsed.data.limit  ?? DEFAULT_PAGE_LIMIT;
+    const offset = parsed.data.offset ?? 0;
 
     const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
     const tenantId = typeof tenantFilter === 'string' && tenantFilter.trim() !== '' ? tenantFilter.trim() : undefined;

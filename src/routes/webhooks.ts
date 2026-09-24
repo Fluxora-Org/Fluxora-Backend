@@ -16,7 +16,7 @@ import { verifyWebhookSignature } from '../webhooks/signature.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
-import { OffsetPaginationSchema } from '../validation/paginationSchema.js';
+import { OffsetPaginationSchema, DEFAULT_PAGE_LIMIT } from '../validation/paginationSchema.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import type { DedupCache } from '../redis/dedup.js';
 import { checkWebhookPreflight } from '../webhooks/preflight.js';
@@ -256,14 +256,14 @@ webhooksRouter.get('/deliveries', (req, res) => {
     const first = parsed.error.issues[0];
     res.status(400).json({
       error: {
-        code: 'INVALID_PAGINATION',
+        code: 'VALIDATION_ERROR',
         message: first?.message ?? 'Invalid pagination parameters',
       },
     });
     return;
   }
 
-  const limit = parsed.data.limit ?? 100;
+  const limit = parsed.data.limit ?? DEFAULT_PAGE_LIMIT;
   const offset = parsed.data.offset ?? 0;
   const { status } = req.query;
 
@@ -296,6 +296,21 @@ webhooksRouter.get('/deliveries', (req, res) => {
  * List outbox items (for monitoring)
  */
 webhooksRouter.get('/outbox', (req, res) => {
+  const paginationParsed = OffsetPaginationSchema.safeParse(req.query);
+  if (!paginationParsed.success) {
+    const first = paginationParsed.error.issues[0];
+    res.status(400).json({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: first?.message ?? 'Invalid pagination parameters',
+      },
+    });
+    return;
+  }
+
+  const limit = paginationParsed.data.limit ?? DEFAULT_PAGE_LIMIT;
+  const offset = paginationParsed.data.offset ?? 0;
+
   const { priority, status = 'ready' } = req.query;
 
   if (
@@ -326,9 +341,14 @@ webhooksRouter.get('/outbox', (req, res) => {
     items = items.filter((item) => item.attempts >= item.maxAttempts);
   }
 
+  const total = items.length;
+  const paginated = items.slice(offset, offset + limit);
+
   res.json({
-    total: items.length,
-    items: items.map((item) => ({
+    total,
+    limit,
+    offset,
+    items: paginated.map((item) => ({
       id: item.id,
       deliveryId: item.deliveryId,
       eventId: item.eventId,
@@ -353,14 +373,14 @@ webhooksRouter.get('/dlq', (req, res) => {
     const first = parsed.error.issues[0];
     res.status(400).json({
       error: {
-        code: 'INVALID_PAGINATION',
+        code: 'VALIDATION_ERROR',
         message: first?.message ?? 'Invalid pagination parameters',
       },
     });
     return;
   }
 
-  const limit = parsed.data.limit ?? 50;
+  const limit = parsed.data.limit ?? DEFAULT_PAGE_LIMIT;
   const offset = parsed.data.offset ?? 0;
 
   const items = webhookDeliveryStore.getDeadLetterQueueItems(limit, offset);
