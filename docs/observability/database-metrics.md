@@ -105,6 +105,50 @@ groups:
           summary: "Pool {{ $labels.pool }} utilisation above 90%"
 ```
 
+## Query-failure metrics (actionable failure paths)
+
+Every failed `query()` call — pool exhaustion fast-fail, `statement_timeout` (PG 57014), unique violation (PG 23505), or any other driver/connection error — is recorded by a dedicated counter (`src/metrics/dbMetrics.ts`). Without it, dashboards flatline the moment queries start failing because the success-only metrics (e.g. slow-query counter) go quiet exactly during an incident.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fluxora_db_query_errors_total` | Counter | `error_type` | Total failed queries, partitioned by error class |
+| `fluxora_db_pool_exhausted_total` | Counter | — | Dedicated pool-exhaustion counter (still emitted for legacy dashboards) |
+
+`error_type` is a **bounded enum** — label cardinality is capped at 4 series no matter how many queries fail:
+
+| `error_type` | Trigger |
+|---|---|
+| `pool_exhausted` | Waiting queue length ≥ `POOL_QUEUE_LIMIT` (fast-fail before execution) |
+| `query_timeout` | Query canceled by `statement_timeout` (PG `57014`) |
+| `duplicate_entry` | Unique constraint violation (PG `23505`) |
+| `other` | Any other driver / connection / SQL error |
+
+### Intended alert thresholds
+
+```yaml
+      # warning — any query is failing; investigate DB connectivity/latency
+      - alert: DbQueryFailures
+        expr: rate(fluxora_db_query_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Query failures detected: the '{{ $labels.error_type }}' class is above zero"
+
+      # critical — pool exhaustion is an availability event (503s)
+      - alert: DbPoolExhausted
+        expr: rate(fluxora_db_pool_exhausted_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Postgres pool queue limit reached"
+```
+
+### Slow queries on the failure path
+
+`fluxora_db_slow_queries_total` is now incremented on the **failure path as well as the success path** (e.g. a query that hangs for 8s and then hits `statement_timeout`). The slow-query counter therefore keeps rising during an outage instead of freezing at the value of the last successful query, giving SREs a leading spike before errors surface.
+
 ## Grafana dashboard queries
 
 ```promql
@@ -119,6 +163,9 @@ db_pool_waiting
 
 # Total pool exhaustion events (counter from dbMetrics.ts)
 rate(fluxora_db_pool_exhausted_total[5m])
+
+# Query failure rate by error class (counter from dbMetrics.ts)
+rate(fluxora_db_query_errors_total[5m])
 ```
 
 ## Security notes

@@ -94,6 +94,15 @@ Counter name: `fluxora_db_slow_queries_total`
 Label: `table_hint` — the extracted table name (or `unknown`).  
 Scraped at: `GET /metrics`
 
+> Slow queries are counted on the **failure path too**: a query that hangs and is then canceled by `statement_timeout` still increments `fluxora_db_slow_queries_total`, so the counter keeps rising during an incident instead of flatlining.
+
+Every failed query is also recorded by `fluxora_db_query_errors_total{error_type}`, where `error_type` is a bounded enum (`pool_exhausted`, `query_timeout`, `duplicate_entry`, `other`). Alert when the failure rate is non-zero:
+
+```promql
+# warning — any query failing for 5 minutes
+rate(fluxora_db_query_errors_total[5m]) > 0
+```
+
 ## Prometheus scrape configuration
 
 `GET /metrics` is protected by the same `ADMIN_API_KEY` Bearer token used by other admin routes. Prometheus scrape jobs must supply the token via the `Authorization` header.
