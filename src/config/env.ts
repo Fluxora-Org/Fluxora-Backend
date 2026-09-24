@@ -283,12 +283,8 @@ export const EnvSchema = z
      */
     TRACING_ENABLED: booleanEnv().default(false),
     TRACING_SAMPLE_RATE: z.preprocess(parseNumber, z.number().min(0).max(1)).default(1),
-    TRACING_SAMPLING_STRATEGY: z
-      .enum(['head', 'tail', 'always', 'never'])
-      .default('head'),
-    TRACING_HEAD_SAMPLE_RATE: z
-      .preprocess(parseNumber, z.number().min(0).max(1))
-      .optional(),
+    TRACING_SAMPLING_STRATEGY: z.enum(['head', 'tail', 'always', 'never']).default('head'),
+    TRACING_HEAD_SAMPLE_RATE: z.preprocess(parseNumber, z.number().min(0).max(1)).optional(),
     TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
     TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
     TRACING_OTEL_ENABLED: booleanEnv().default(false),
@@ -301,6 +297,7 @@ export const EnvSchema = z
     FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
     WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
     WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+    WEBHOOK_BATCH_MAX_BACKOFF_MS: integerEnv('WEBHOOK_BATCH_MAX_BACKOFF_MS', 1).default(60_000),
     WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
     WEBHOOK_RETRY_BURST: integerEnv('WEBHOOK_RETRY_BURST', 0).default(0),
     WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv(
@@ -380,7 +377,11 @@ export const EnvSchema = z
     /** Require backfill checkpoints to advance in ledger order. */
     INDEXER_BACKFILL_STRICT_ORDER: booleanEnv().default(true),
     /** Number of ordered batches completed before the checkpoint advances. */
-    INDEXER_BACKFILL_COMMIT_INTERVAL: integerEnv('INDEXER_BACKFILL_COMMIT_INTERVAL', 1, 10000).default(1),
+    INDEXER_BACKFILL_COMMIT_INTERVAL: integerEnv(
+      'INDEXER_BACKFILL_COMMIT_INTERVAL',
+      1,
+      10000
+    ).default(1),
     /** Maximum retries for a failed backfill batch. */
     INDEXER_BACKFILL_MAX_RETRIES: integerEnv('INDEXER_BACKFILL_MAX_RETRIES', 0, 100).default(3),
     /** Delay between backfill batch retries. */
@@ -608,6 +609,11 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
+  webhookRetryBurst: number;
+  webhookCircuitBreakerThreshold: number;
+  webhookCircuitBreakerResetMs: number;
+  webhookBatchMaxBackoffMs: number;
+  webhookMaxResponseBytes: number;
   webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
@@ -836,8 +842,15 @@ function toConfig(env: ParsedEnv): Config {
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
     webhookRetryRps: env.WEBHOOK_RETRY_RPS,
+    webhookRetryBurst: env.WEBHOOK_RETRY_BURST,
+    webhookCircuitBreakerThreshold: env.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD,
+    webhookCircuitBreakerResetMs: env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS,
+    webhookBatchMaxBackoffMs: env.WEBHOOK_BATCH_MAX_BACKOFF_MS,
+    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
-      ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',')
+          .map((h) => h.trim())
+          .filter((h) => h.length > 0)
       : undefined,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
