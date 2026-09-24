@@ -38,6 +38,32 @@ export interface ReplayProgressCheckpoint {
 
 export interface ContractEventStore {
   readonly kind: IndexerStoreKind;
+  /**
+   * Insert one or more contract events into the store.
+   *
+   * ## Idempotency guarantee — #1523
+   *
+   * This method is unconditionally idempotent with respect to `eventId`.
+   * Re-inserting a record whose `eventId` already exists is always a no-op:
+   * the existing row is never mutated and no error is thrown.  The event ID
+   * is returned in `duplicateEventIds` so callers can observe the skip without
+   * having to query the store separately.
+   *
+   * The idempotency key is `ContractEventRecord.eventId`, derived as:
+   *
+   *   `${txHash}-${eventIndex}`
+   *
+   * Both implementations enforce this guarantee through different mechanisms:
+   * - `InMemoryContractEventStore` — Map.has() check before staging
+   * - `PostgresContractEventStore` — `ON CONFLICT (event_id) DO NOTHING` on
+   *   `contract_event_dedup`, which is a non-partitioned sentinel table that
+   *   provides a global uniqueness constraint even though `contract_events` is
+   *   range-partitioned by `happened_at`
+   *
+   * Callers are therefore safe to replay any ledger range — after a crash,
+   * a leader handover, or a chain reorganisation — without additional
+   * deduplication logic at the call site.
+   */
   insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult>;
   rollbackBeforeLedger(ledger: number): Promise<void>;
   getLedgerHash(ledger: number): Promise<string | null>;
