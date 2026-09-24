@@ -4,10 +4,10 @@ import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from '.
 import {
   getPinnedAddressNetwork,
   isValidStellarContractAddress,
-  STELLAR_CONTRACT_ALLOWLIST,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
   STELLAR_NETWORK_PASSPHRASES,
   type PinnedStellarAddressKind,
-  type PinnedStellarNetwork,
 } from './stellarContracts.js';
 import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
@@ -15,7 +15,10 @@ export {
   STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
   isValidStellarContractAddress,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
 } from './stellarContracts.js';
+export { resolveNetwork } from './stellar.js';
 
 type NodeEnv = 'development' | 'staging' | 'production' | 'test';
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -154,7 +157,7 @@ function validatePinnedAddress(
   ctx: z.RefinementCtx,
   network: StellarNetwork,
   kind: PinnedStellarAddressKind,
-  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS' | 'CONTRACT_ADDRESS_STREAMING' | string,
   address: string
 ): void {
   if (network === 'local') return;
@@ -232,7 +235,12 @@ export const EnvSchema = z
     STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
     HORIZON_URL: optionalUrlString('HORIZON_URL'),
     HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
-    CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
+    CONTRACT_ADDRESS_STREAMING: z
+      .preprocess((value) => (value === '' ? undefined : value), z.string().trim().optional())
+      .refine(
+        (val) => val === undefined || isValidStellarContractAddress(val),
+        'CONTRACT_ADDRESS_STREAMING must be a valid Stellar contract StrKey'
+      ),
     STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
     STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(LIMITS.STELLAR_RPC_TIMEOUT),
     STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(
@@ -531,6 +539,15 @@ export const EnvSchema = z
       'STELLAR_TOKEN_ADDRESS',
       env.STELLAR_TOKEN_ADDRESS
     );
+    if (env.CONTRACT_ADDRESS_STREAMING) {
+      validatePinnedAddress(
+        ctx,
+        stellarNetwork,
+        'streaming',
+        'CONTRACT_ADDRESS_STREAMING',
+        env.CONTRACT_ADDRESS_STREAMING
+      );
+    }
 
     const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
     if (hasApiKeys && env.API_KEY_PEPPER === undefined) {
@@ -794,8 +811,9 @@ function resolveNetwork(env: ParsedEnv): StellarNetwork {
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
+  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? env.STELLAR_CONTRACT_ADDRESS;
   return {
-    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    streaming,
     contract: env.STELLAR_CONTRACT_ADDRESS,
     token: env.STELLAR_TOKEN_ADDRESS,
   };
@@ -805,6 +823,9 @@ function toConfig(env: ParsedEnv): Config {
   const stellarNetwork = resolveNetwork(env);
   const networkDefaults = STELLAR_NETWORKS[stellarNetwork];
   const isProduction = env.NODE_ENV === 'production';
+  const contractAddresses = resolveContractAddresses(stellarNetwork, env);
+
+  assertNetworkMatchesContracts(stellarNetwork, contractAddresses);
 
   return {
     port: env.PORT,
@@ -966,6 +987,12 @@ export function initializeConfig(): Config {
   }
 
   configInstance = loadConfig();
+  if (process.env.NODE_ENV !== 'test') {
+    logActiveStellarConfig({
+      network: configInstance.stellarNetwork,
+      contractAddresses: configInstance.contractAddresses,
+    });
+  }
   return configInstance;
 }
 

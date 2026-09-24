@@ -43,3 +43,31 @@ export interface ContractAddresses {
   token?: string;
   [key: string]: string | undefined;
 }
+
+export function resolveNetwork(
+  env: {
+    NODE_ENV?: string;
+    STELLAR_NETWORK?: StellarNetwork;
+  } = process.env as { NODE_ENV?: string; STELLAR_NETWORK?: StellarNetwork }
+): StellarNetwork {
+  if (
+    env.STELLAR_NETWORK === 'mainnet' ||
+    env.STELLAR_NETWORK === 'testnet' ||
+    env.STELLAR_NETWORK === 'local'
+  ) {
+    return env.STELLAR_NETWORK;
+  }
+  return env.NODE_ENV === 'production' ? 'mainnet' : 'testnet';
+}
+
+export {
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
+  getAddressPinnedNetwork,
+  getPinnedAddressNetwork,
+  isValidStellarContractAddress,
+  STELLAR_CONTRACT_ALLOWLIST,
+  STELLAR_NETWORK_PASSPHRASES,
+  type PinnedStellarNetwork,
+  type PinnedStellarAddressKind,
+} from './stellarContracts.js';

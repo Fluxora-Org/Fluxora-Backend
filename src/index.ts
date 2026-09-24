@@ -31,6 +31,8 @@ import {
   captureStartupEnvSnapshot,
   refreshHotConfig,
   getConfig,
+  logActiveStellarConfig,
+  assertNetworkMatchesContracts,
 } from './config/env.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { prepareReloadFlags } from './config/featureFlags.js';
@@ -53,6 +55,15 @@ if (process.env.NODE_ENV !== 'test') {
   // Apply and record the effective log level before anything else logs, so the
   // active threshold for this environment is always visible at startup.
   logActiveLogLevel({ logLevel: cfg.logLevel, nodeEnv: cfg.nodeEnv });
+
+  // Log active Stellar network and configured contract addresses at startup.
+  logActiveStellarConfig({
+    network: cfg.stellarNetwork,
+    contractAddresses: cfg.contractAddresses,
+  });
+
+  // Assert configured network matches contract addresses.
+  assertNetworkMatchesContracts(cfg.stellarNetwork, cfg.contractAddresses);
 
   /**
    * Startup initialization sequence:
