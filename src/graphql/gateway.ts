@@ -31,12 +31,19 @@
  *   message so stack traces or DB details never leak to clients.
  */
 
-import { Router, type Request } from 'express';
-import { graphql, type GraphQLError } from 'graphql';
+import { Router, type Request, type Response } from 'express';
+import {
+  graphql,
+  parse,
+  type DocumentNode,
+  type GraphQLError,
+  type SelectionNode,
+  type SelectionSetNode,
+} from 'graphql';
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { errorResponse } from '../utils/response.js';
@@ -53,6 +60,12 @@ const MAX_STREAM_PAGE_SIZE = 100;
 
 /** Maximum page size for audit-log pagination. */
 const MAX_AUDIT_PAGE_SIZE = 100;
+
+/** Maximum GraphQL query nesting depth before rejecting the request. */
+const MAX_QUERY_DEPTH = 3;
+
+/** Maximum GraphQL field complexity before rejecting the request. */
+const MAX_QUERY_COMPLEXITY = 15;
 
 // ── Persisted-query helpers ───────────────────────────────────────────────────
 
@@ -72,6 +85,155 @@ export function registerPersistedQuery(query: string): string {
   const hash = hashQuery(query);
   persistedQueryStore.set(hash, query);
   return hash;
+}
+
+// ── GraphQL request validation ───────────────────────────────────────────────
+
+function getQueryFragments(document: DocumentNode): Map<string, SelectionSetNode> {
+  const fragments = new Map<string, SelectionSetNode>();
+  for (const definition of document.definitions) {
+    if (definition.kind === 'FragmentDefinition') {
+      fragments.set(definition.name.value, definition.selectionSet);
+    }
+  }
+  return fragments;
+}
+
+function visitSelectionSet(
+  selectionSet: SelectionSetNode,
+  fragments: Map<string, SelectionSetNode>,
+  callback: (selection: SelectionNode) => void,
+  visitedFragments = new Set<string>()
+): void {
+  for (const selection of selectionSet.selections) {
+    callback(selection);
+
+    if (selection.kind === 'Field' && selection.selectionSet) {
+      visitSelectionSet(selection.selectionSet, fragments, callback, visitedFragments);
+      continue;
+    }
+
+    if (selection.kind === 'FragmentSpread') {
+      const fragmentName = selection.name.value;
+      if (visitedFragments.has(fragmentName)) continue;
+      const fragment = fragments.get(fragmentName);
+      if (fragment) {
+        visitedFragments.add(fragmentName);
+        visitSelectionSet(fragment, fragments, callback, visitedFragments);
+      }
+      continue;
+    }
+
+    if (selection.kind === 'InlineFragment' && selection.selectionSet) {
+      visitSelectionSet(selection.selectionSet, fragments, callback, visitedFragments);
+    }
+  }
+}
+
+function computeQueryDepth(document: DocumentNode): number {
+  const fragments = getQueryFragments(document);
+  let maxDepth = 0;
+
+  for (const definition of document.definitions) {
+    if (definition.kind !== 'OperationDefinition' || !definition.selectionSet) {
+      continue;
+    }
+
+    const visit = (
+      selectionSet: SelectionSetNode,
+      currentDepth: number,
+      seenFragments = new Set<string>()
+    ) => {
+      maxDepth = Math.max(maxDepth, currentDepth);
+      for (const selection of selectionSet.selections) {
+        const nextDepth = currentDepth + 1;
+
+        if (selection.kind === 'Field' && selection.selectionSet) {
+          visit(selection.selectionSet, nextDepth, seenFragments);
+          continue;
+        }
+
+        if (selection.kind === 'FragmentSpread') {
+          const fragmentName = selection.name.value;
+          if (seenFragments.has(fragmentName)) continue;
+          const fragment = fragments.get(fragmentName);
+          if (fragment) {
+            seenFragments.add(fragmentName);
+            visit(fragment, nextDepth, seenFragments);
+          }
+          continue;
+        }
+
+        if (selection.kind === 'InlineFragment' && selection.selectionSet) {
+          visit(selection.selectionSet, nextDepth, seenFragments);
+        }
+      }
+    };
+
+    visit(definition.selectionSet, 0);
+  }
+
+  return maxDepth + 1;
+}
+
+function computeQueryComplexity(document: DocumentNode): number {
+  const fragments = getQueryFragments(document);
+  let complexity = 0;
+
+  for (const definition of document.definitions) {
+    if (definition.kind !== 'OperationDefinition' || !definition.selectionSet) {
+      continue;
+    }
+
+    visitSelectionSet(definition.selectionSet, fragments, () => {
+      complexity += 1;
+    });
+  }
+
+  return complexity;
+}
+
+function isIntrospectionQuery(document: DocumentNode): boolean {
+  let found = false;
+
+  const visit = (selectionSet?: SelectionSetNode) => {
+    if (!selectionSet || found) return;
+    for (const selection of selectionSet.selections) {
+      if (selection.kind === 'Field') {
+        const fieldName = selection.name.value;
+        if (fieldName === '__schema' || fieldName === '__type') {
+          found = true;
+          return;
+        }
+        if (selection.selectionSet) {
+          visit(selection.selectionSet);
+        }
+      } else if (selection.kind === 'FragmentSpread') {
+        continue;
+      } else if (selection.kind === 'InlineFragment' && selection.selectionSet) {
+        visit(selection.selectionSet);
+      }
+    }
+  };
+
+  for (const definition of document.definitions) {
+    if (definition.kind === 'OperationDefinition') {
+      visit(definition.selectionSet);
+    }
+  }
+
+  return found;
+}
+
+function rejectGraphQLError(res: Response, code: string, message: string): void {
+  res.status(200).json({
+    errors: [
+      {
+        message,
+        extensions: { code },
+      },
+    ],
+  });
 }
 
 // ── Resolver helpers ──────────────────────────────────────────────────────────
@@ -141,7 +303,7 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  * Root value object passed to `graphql()` — each key corresponds to a
  * field on the root `Query` type.
  */
-function createRootValue(_req: Request) {
+function createRootValue(req: Request) {
   return {
     /**
      * Fetch a single stream by ID.
@@ -305,7 +467,8 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
+        const persistedQuery = extensions as { version?: unknown; sha256Hash?: unknown };
+        const { version, sha256Hash } = persistedQuery;
 
         if (version !== 1) {
           res
@@ -375,23 +538,65 @@ graphqlGatewayRouter.post(
           source = cachedQuery;
         }
       }
-    }
 
-    if (!source || typeof source !== 'string') {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'VALIDATION_ERROR',
-            'GraphQL request must include a "query" string field.',
-            undefined,
-            requestId
-          )
+      if (!source || typeof source !== 'string') {
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'VALIDATION_ERROR',
+              'GraphQL request must include a "query" string field.',
+              undefined,
+              requestId
+            )
+          );
+        return;
+      }
+
+      // ── Static query enforcement ───────────────────────────────────────────
+      let document: DocumentNode;
+      try {
+        document = parse(source);
+      } catch {
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'GRAPHQL_PARSE_ERROR',
+              'GraphQL query could not be parsed.',
+              undefined,
+              requestId
+            )
+          );
+        return;
+      }
+
+      if (isIntrospectionQuery(document)) {
+        rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
+        return;
+      }
+
+      const queryDepth = computeQueryDepth(document);
+      if (queryDepth > MAX_QUERY_DEPTH) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_DEEP',
+          `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
         );
         return;
       }
 
-      // ── Execute query ───────────────────────────────────────────────────────
+      const queryComplexity = computeQueryComplexity(document);
+      if (queryComplexity > MAX_QUERY_COMPLEXITY) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_COMPLEX',
+          `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
+        );
+        return;
+      }
+
+      // ── Execute query ──────────────────────────────────────────────────────
       const rootValue = createRootValue(req);
       const context = { req, res, requestId };
 
@@ -404,7 +609,7 @@ graphqlGatewayRouter.post(
         operationName: operationName ?? undefined,
       });
 
-      // ── Sanitise errors ─────────────────────────────────────────────────────
+      // ── Sanitise errors ────────────────────────────────────────────────────
       if (result.errors && result.errors.length > 0) {
         result.errors = result.errors.map((err) => ({
           ...err,
@@ -430,88 +635,8 @@ graphqlGatewayRouter.post(
         ],
       });
     }
-
-    // Static Query Enforcement (Your addition)
-    let document: DocumentNode;
-    try {
-      document = parse(source);
-    } catch (parseError) {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'GRAPHQL_PARSE_ERROR',
-            'GraphQL query could not be parsed.',
-            undefined,
-            requestId
-          )
-        );
-      return;
-    }
-
-    if (isIntrospectionQuery(document)) {
-      rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
-      return;
-    }
-
-    const queryDepth = computeQueryDepth(document);
-    if (queryDepth > MAX_QUERY_DEPTH) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_DEEP',
-        `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
-      );
-      return;
-    }
-
-    const queryComplexity = computeQueryComplexity(document);
-    if (queryComplexity > MAX_QUERY_COMPLEXITY) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_COMPLEX',
-        `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
-      );
-      return;
-    }
-
-    // Execute GraphQL Query
-    const rootValue = createRootValue(req);
-    const context = { req, res, requestId };
-
-    const result = await graphql({
-      schema: executableSchema,
-      source,
-      rootValue,
-      contextValue: context,
-      variableValues: variables ?? undefined,
-      operationName: operationName ?? undefined,
-    });
-
-    if (result.errors && result.errors.length > 0) {
-      result.errors = result.errors.map((err) => ({
-        ...err,
-        message: sanitiseGraphQLError(err.message),
-        ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
-      })) as unknown as typeof result.errors;
-    }
-
-    res.json(result);
-  } catch (err) {
-    logger.error('GraphQL gateway unexpected error', requestId, {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    res.status(500).json({
-      errors: [
-        {
-          message: 'Internal server error',
-          extensions: { code: 'INTERNAL_ERROR' },
-        },
-      ],
-    });
   }
-});
-
-// ── Error sanitisation ─────────────────────────────────────────────────────────
+);
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
@@ -521,11 +646,18 @@ graphqlGatewayRouter.post(
 function sanitiseGraphQLError(message: string): string {
   const sanitised = sanitiseErrorMessage(message)
     .replace(/\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.ts:\d+:\d+/g, '[redacted-path]')
+    .replace(/https?:\/\/[^\s]+/g, '[redacted-url]')
+    .replace(/postgresql:\/\/[^\s]+/gi, '[redacted-url]')
+    .replace(/mongodb:\/\/[^\s]+/gi, '[redacted-url]')
     .replace(/Error: /g, '')
     .trim();
 
-  // If the message becomes empty or contains only punctuation, return a generic
-  if (!sanitised || /^[\s.,!?;:-]+$/.test(sanitised)) {
+  if (
+    !sanitised ||
+    /^[\s.,!?;:-]+$/.test(sanitised) ||
+    /\[redacted-url\]|(?:postgresql|mysql|mongodb|redis):\/\//i.test(sanitised) ||
+    /[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9.-]+\.[A-Za-z]{2,})/.test(sanitised)
+  ) {
     return 'An unexpected error occurred';
   }
 

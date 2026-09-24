@@ -30,7 +30,9 @@
     "generate:sdk:python": "node scripts/generate-sdk-python.mjs",
     "check:sdk:python": "node scripts/generate-sdk-python.mjs --check",
     "generate:sdk:ts": "node scripts/generate-sdk-ts.mjs",
-    "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check"
+    "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check",
+    "generate:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts",
+    "check:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts --check"
   },
   "keywords": [
     "indexer",
@@ -81,6 +83,8 @@
     "@typescript-eslint/eslint-plugin": "^8.59.0",
     "@typescript-eslint/parser": "^8.59.0",
     "@vitest/coverage-v8": "^3.2.6",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "aws-sdk-client-mock": "^4.1.0",
     "eslint": "^10.2.1",
     "eslint-config-prettier": "^10.1.8",

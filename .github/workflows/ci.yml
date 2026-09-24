@@ -114,6 +114,10 @@ jobs:
       - name: SDK drift check (TypeScript)
         run: node scripts/generate-sdk-ts.mjs --check
 
+      # Fixtures must match OpenAPI examples (same source as example contract tests)
+      - name: SDK fixtures drift check
+        run: pnpm run check:sdk:fixtures
+
       - name: Check migration naming policy
         run: pnpm run check:migrations
 
