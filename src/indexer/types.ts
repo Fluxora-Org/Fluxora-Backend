@@ -11,6 +11,13 @@
  *   (content hash). The hash is the authoritative identity for reorg detection:
  *   two blocks at the same sequence number with different hashes mean a fork.
  * - `ingestedAt` is always set by the store, never trusted from the caller.
+ *
+ * Field provenance
+ * ----------------------------------
+ * For each type below, `types.provenance.md` (kept beside this file) documents
+ * whether every field is read from chain data (naming the Stellar ledger
+ * structure it comes from) or computed by the indexer (stating the derivation).
+ * When adding or renaming a field here, update that document in the same commit.
  */
 
 // -----------------------------------------------------------------------
