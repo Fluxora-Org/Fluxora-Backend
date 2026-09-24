@@ -9,6 +9,7 @@ import {
   type PinnedStellarAddressKind,
   type PinnedStellarNetwork,
 } from './stellarContracts.js';
+import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
 export {
   STELLAR_CONTRACT_ALLOWLIST,
@@ -179,16 +180,22 @@ export const EnvSchema = z
 
     DATABASE_URL: urlString('DATABASE_URL'),
     DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
-    DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
-    DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
-    DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
-    DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
+    DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(LIMITS.DB_POOL_MIN),
+    DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(LIMITS.DB_POOL_MAX),
+    DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(
+      LIMITS.DB_CONNECTION_TIMEOUT
+    ),
+    DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(LIMITS.DB_IDLE_TIMEOUT),
     SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
-    STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+    STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(
+      LIMITS.STATEMENT_TIMEOUT_MS
+    ),
+    /** Max requests allowed to queue on the primary pool before fast-failing with 503. */
+    POOL_QUEUE_LIMIT: integerEnv('POOL_QUEUE_LIMIT', 1).default(LIMITS.POOL_QUEUE_LIMIT),
     /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. 0 = disabled. */
     REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
     /** Max requests allowed to queue on the replica pool before fast-failing. */
-    REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(25),
+    REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(LIMITS.REPLICA_QUEUE_LIMIT),
 
     REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
     REDIS_ENABLED: booleanEnv().default(true),
@@ -199,6 +206,26 @@ export const EnvSchema = z
     REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
     // Comma-separated list of cluster nodes: host:port,host:port
     REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
+    /** TCP connect timeout for each Redis client, in ms. */
+    REDIS_CONNECT_TIMEOUT_MS: integerEnv('REDIS_CONNECT_TIMEOUT_MS', 1, 60000).default(
+      LIMITS.REDIS_CONNECT_TIMEOUT_MS
+    ),
+    /** Command retries per request before a Redis call fails. */
+    REDIS_MAX_RETRIES_PER_REQUEST: integerEnv('REDIS_MAX_RETRIES_PER_REQUEST', 0).default(
+      LIMITS.REDIS_MAX_RETRIES_PER_REQUEST
+    ),
+    /** Base delay of the Redis reconnect backoff, in ms. */
+    REDIS_RETRY_BASE_DELAY_MS: integerEnv('REDIS_RETRY_BASE_DELAY_MS', 0).default(
+      LIMITS.REDIS_RETRY_BASE_DELAY_MS
+    ),
+    /** Ceiling of the Redis reconnect backoff, in ms. */
+    REDIS_RETRY_MAX_DELAY_MS: integerEnv('REDIS_RETRY_MAX_DELAY_MS', 0).default(
+      LIMITS.REDIS_RETRY_MAX_DELAY_MS
+    ),
+    /** Reconnect attempts before ioredis stops retrying. */
+    REDIS_RETRY_MAX_ATTEMPTS: integerEnv('REDIS_RETRY_MAX_ATTEMPTS', 1).default(
+      LIMITS.REDIS_RETRY_MAX_ATTEMPTS
+    ),
 
     STELLAR_NETWORK: z.enum(['testnet', 'mainnet', 'local']).optional(),
     STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
@@ -207,9 +234,13 @@ export const EnvSchema = z
     HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
     CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
     STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
-    STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(10000),
-    STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(3),
-    STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
+    STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(LIMITS.STELLAR_RPC_TIMEOUT),
+    STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(
+      LIMITS.STELLAR_RPC_MAX_RETRIES
+    ),
+    STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(
+      LIMITS.STELLAR_RPC_RETRY_DELAY
+    ),
     /**
      * Per-operation timeout overrides for Stellar RPC calls.
      * Format: JSON object mapping operation names to timeouts in ms.
@@ -388,10 +419,14 @@ export const EnvSchema = z
     INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
     DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
     ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
-    RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
-    RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
-    RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
-    RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+    RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(
+      LIMITS.RPC_CB_FAILURE_THRESHOLD
+    ),
+    RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(LIMITS.RPC_CB_WINDOW_MS),
+    RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(
+      LIMITS.RPC_CB_RESET_TIMEOUT_MS
+    ),
+    RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
     RATE_LIMIT_ENABLED: booleanEnv().default(true),

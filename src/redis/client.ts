@@ -17,6 +17,7 @@
  */
 
 import type { Redis, Cluster } from 'ioredis';
+import { resolveConnectionLimit } from '../config/connectionLimits.js';
 import { logger } from '../logging/logger.js';
 import { calculateNextRetryDelay } from '../lib/retry.js';
 import {
@@ -29,9 +30,9 @@ import {
 
 function defaultRetryStrategy(times: number): number | null {
   const delay = calculateNextRetryDelay(times - 1, {
-    baseDelayMs: 50,
-    maxDelayMs: 2000,
-    maxAttempts: 10,
+    baseDelayMs: resolveConnectionLimit('REDIS_RETRY_BASE_DELAY_MS'),
+    maxDelayMs: resolveConnectionLimit('REDIS_RETRY_MAX_DELAY_MS'),
+    maxAttempts: resolveConnectionLimit('REDIS_RETRY_MAX_ATTEMPTS'),
   });
   return delay === 0 ? null : delay;
 }
@@ -232,10 +233,10 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
     const client = new ioredis.Redis(port, host, {
       password,
       lazyConnect: true,
-      maxRetriesPerRequest: 3,
+      maxRetriesPerRequest: resolveConnectionLimit('REDIS_MAX_RETRIES_PER_REQUEST'),
       retryStrategy: defaultRetryStrategy,
       enableReadyCheck: true,
-      connectTimeout: 5000,
+      connectTimeout: resolveConnectionLimit('REDIS_CONNECT_TIMEOUT_MS'),
     });
     await client.connect();
     return client;
@@ -266,10 +267,10 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
       name,
       password,
       lazyConnect: true,
-      maxRetriesPerRequest: 3,
+      maxRetriesPerRequest: resolveConnectionLimit('REDIS_MAX_RETRIES_PER_REQUEST'),
       retryStrategy: defaultRetryStrategy,
       enableReadyCheck: true,
-      connectTimeout: 5000,
+      connectTimeout: resolveConnectionLimit('REDIS_CONNECT_TIMEOUT_MS'),
     });
     await client.connect();
     return client;
@@ -296,8 +297,8 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
     const client = new ioredis.Cluster(nodes, {
       redisOptions: {
         password,
-        connectTimeout: 5000,
-        maxRetriesPerRequest: 3,
+        connectTimeout: resolveConnectionLimit('REDIS_CONNECT_TIMEOUT_MS'),
+        maxRetriesPerRequest: resolveConnectionLimit('REDIS_MAX_RETRIES_PER_REQUEST'),
       },
       clusterRetryStrategy: defaultRetryStrategy,
       lazyConnect: true,

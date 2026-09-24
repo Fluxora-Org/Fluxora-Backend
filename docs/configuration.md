@@ -88,6 +88,11 @@ Secret values are never included in validation messages.
 
 Booleans accept `true`, `false`, `1`, and `0`.
 
+Connection-pool sizes, acquisition/statement timeouts and retry budgets for
+PostgreSQL, Redis and the Stellar RPC endpoint are collected in
+[connection-limits.md](./connection-limits.md), which is checked against
+`EnvSchema` by `src/config/connectionLimits.test.ts`.
+
 ## Feature Flags
 
 Fluxora ships a LaunchDarkly-style feature flag service (`src/config/featureFlags.ts`)
