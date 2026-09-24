@@ -48,7 +48,28 @@ let cachedSpec: Record<string, unknown> | null = null;
 
 function getSpec(): Record<string, unknown> {
   if (!cachedSpec) {
-    cachedSpec = buildOpenApiSpec();
+    const rawSpec = buildOpenApiSpec();
+    const spec = JSON.parse(JSON.stringify(rawSpec));
+
+    if (spec.paths) {
+      for (const path of Object.keys(spec.paths)) {
+        if (
+          path.startsWith('/api/admin') ||
+          path.startsWith('/admin') ||
+          path.startsWith('/internal')
+        ) {
+          delete spec.paths[path];
+        }
+      }
+    }
+
+    if (spec.tags) {
+      spec.tags = spec.tags.filter(
+        (t: any) => !['admin', 'indexer', 'webhooks'].includes(t.name)
+      );
+    }
+
+    cachedSpec = spec;
   }
   return cachedSpec;
 }

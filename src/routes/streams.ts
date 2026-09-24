@@ -1068,6 +1068,7 @@ streamsRouter.delete(
   requireAuth,
   authenticateApiKey,
   requireScope('streams:write'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.correlationId;
@@ -1084,6 +1085,14 @@ streamsRouter.delete(
     }
 
     if (!record) throw notFound('Stream', id);
+
+    // Tenant ownership check: an authenticated, scoped caller can only cancel
+    // their own streams. req.callerAddress is set by enforceStreamScope when
+    // the JWT payload contains an address (non-operator role).
+    if (req.callerAddress && record!.sender_address !== req.callerAddress) {
+      // Return 404 to avoid leaking the existence of another tenant's resource.
+      throw notFound('Stream', id);
+    }
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
     if (!guard.ok) {

@@ -161,6 +161,25 @@ describe('GET /api/rate-limits', () => {
     expect(res.body.method).toBe('POST');
     expect(res.body.limit).toBe(5); // Global IP limit since no route-specific config for test-streams
   });
+
+  it('returns 400 for malformed path or method', async () => {
+    const app = createTestApp(createTestEnv());
+    let res = await request(app).get('/api/rate-limits?path[]=array').expect(400);
+    expect(res.body.error).toMatch(/path/i);
+
+    res = await request(app).get('/api/rate-limits?method[]=array').expect(400);
+    expect(res.body.error).toMatch(/method/i);
+  });
+
+  it('explicitly exposes only the caller\'s own limits and ignores arbitrary identifier overriding', async () => {
+    const app = createTestApp(createTestEnv({ RATE_LIMIT_APIKEY_MAX: '7', RATE_LIMIT_ADMIN_MAX: '20' }));
+    // Try to pass admin key via query to spoof identity
+    const res = await request(app)
+      .get(`/api/rate-limits?identifier=${ADMIN_KEY}&keyId=${ADMIN_KEY}`)
+      .set('X-API-Key', 'my-test-key')
+      .expect(200);
+    expect(res.body.limit).toBe(7); // Must still be the user's key limit, not 20
+  });
 });
 
 describe('API endpoints rate limiting', () => {
@@ -310,6 +329,11 @@ describe('GET /api/rate-limits/config', () => {
     await request(app).get('/api/rate-limits/config').expect(401);
   });
 
+  it('returns 401 for insufficient/wrong auth', async () => {
+    const app = createTestApp(createTestEnv());
+    await request(app).get('/api/rate-limits/config').set('Authorization', 'Bearer wrong-key').expect(401);
+  });
+
   it('returns defaults when no runtime override set', async () => {
     const app = createTestApp(createTestEnv());
     const res = await authed(request(app).get('/api/rate-limits/config')).expect(200);
@@ -343,6 +367,11 @@ describe('PUT /api/rate-limits/config', () => {
   it('requires admin auth', async () => {
     const app = createTestApp(createTestEnv());
     await request(app).put('/api/rate-limits/config').send({ ip: { max: 50 } }).expect(401);
+  });
+
+  it('returns 401 for insufficient/wrong auth', async () => {
+    const app = createTestApp(createTestEnv());
+    await request(app).put('/api/rate-limits/config').set('Authorization', 'Bearer wrong-key').send({ ip: { max: 50 } }).expect(401);
   });
 
   it('updates ip tier max', async () => {
@@ -479,6 +508,22 @@ describe('PUT /api/rate-limits/config', () => {
     ).expect(200);
     expect(res.body.config.ip.enabled).toBe(false);
     expect(res.body.config.apiKey.enabled).toBe(true);
+  });
+
+  it('returns 400 when max is 0 (boundary value)', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { max: 0 } })
+    ).expect(400);
+    expect(res.body.error).toMatch(/max/i);
+  });
+
+  it('accepts when max is 1 (boundary value)', async () => {
+    const app = createTestApp(createTestEnv());
+    const res = await authed(
+      request(app).put('/api/rate-limits/config').send({ ip: { max: 1 } })
+    ).expect(200);
+    expect(res.body.config.ip.max).toBe(1);
   });
 });
 

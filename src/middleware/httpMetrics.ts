@@ -1,19 +1,50 @@
 import type { Request, Response, NextFunction } from 'express';
 import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
+import { sanitizeMetricLabels } from '../pii/secretPatterns.js';
+
+/** Single label for requests that never matched an Express route. */
+export const UNMATCHED_ROUTE = 'unmatched';
+
+/**
+ * Resolve the Prometheus `route` label from the matched Express route template.
+ *
+ * Uses `baseUrl + route.path` (the pattern, e.g. `/users/:id`) so path
+ * parameters never appear as distinct series. Unmatched requests share one
+ * fixed label to keep cardinality bounded.
+import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /**
  * Normalise the matched route so cardinality stays bounded.
- * Falls back to the raw path only when no Express route was matched,
- * which keeps the label set predictable for Prometheus.
+ *
+ * Prefers the Express route template when available. Falls back to the raw
+ * path only after running it through {@link normalizeRouteLabel}, which
+ * buckets UUIDs, numeric ids, Stellar addresses, and other high-cardinality
+ * segments so path parameters cannot grow the Prometheus series set without
+ * limit.
+ *
+ * @see docs/observability/metric-cardinality.md
  */
 export function resolveRoute(req: Request): string {
-  const raw = req.route?.path
-    ? `${req.baseUrl}${req.route.path}`
-    : (req.originalUrl.split('?')[0] ?? req.originalUrl);
+  if (!req.route?.path) {
+    return UNMATCHED_ROUTE;
+  }
+
+  const raw = `${req.baseUrl ?? ''}${req.route.path}`;
 
   // Collapse trailing slash to keep label cardinality predictable,
   // but preserve the bare root path "/".
-  return raw.length > 1 && raw.endsWith('/') ? raw.slice(0, -1) : raw;
+  const collapsed =
+    raw.length > 1 && raw.endsWith('/') ? raw.slice(0, -1) : raw;
+
+  // Express route templates already use `:param` placeholders — leave them.
+  // Unmatched / fallback paths may contain real ids; bucket those.
+  if (req.route?.path) {
+    return collapsed.length > 1 && collapsed.endsWith('/')
+      ? collapsed.slice(0, -1)
+      : collapsed;
+  }
+
+  return normalizeRouteLabel(collapsed);
 }
 
 /**
@@ -34,11 +65,12 @@ export function httpMetrics(req: Request, res: Response, next: NextFunction): vo
     const durationSec = durationNs / 1e9;
 
     const route = resolveRoute(req);
-    const labels = {
+    // Defence-in-depth: never let secret-shaped values become Prometheus labels.
+    const labels = sanitizeMetricLabels({
       method: req.method,
       route,
       status_code: String(res.statusCode),
-    };
+    });
 
     httpRequestsTotal.inc(labels);
     httpRequestDurationSeconds.observe(labels, durationSec);

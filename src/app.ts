@@ -10,7 +10,7 @@ import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
 import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
-import { privacyHeaders } from './middleware/pii.js';
+import { privacyHeaders, sanitizeResponses } from './middleware/pii.js';
 import type { Config } from './config/env.js';
 import { loadConfig, initializeConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
@@ -58,14 +58,16 @@ import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse } from './utils/response.js';
-import { ApiError, notFound } from './errors.js';
+import { notFound } from './errors.js';
 import { docsRouter } from './routes/docs.js';
 import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
+import { startBusinessEventCollector } from './metrics/businessEventCollector.js';
 import { getStreamHub } from './ws/hub.js';
 import { getPool } from './db/pool.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
+import { responseSizeLimitMiddleware } from './middleware/responseSizeLimit.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -391,8 +393,16 @@ async function wireIndexerLeaderElection(config: Config): Promise<void> {
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   const env = options.env ?? (process.env as Record<string, string | undefined>);
-  const { trustProxy } = getRateLimitConfig(env);
-  app.set('trust proxy', trustProxy);
+  const { trustProxy, trustedProxyCount, trustedProxies } = getRateLimitConfig(env);
+  if (!trustProxy) {
+    app.set('trust proxy', false);
+  } else if (trustedProxyCount > 0) {
+    app.set('trust proxy', trustedProxyCount);
+  } else if (trustedProxies.size > 0) {
+    app.set('trust proxy', Array.from(trustedProxies));
+  } else {
+    app.set('trust proxy', 1);
+  }
   const rateLimiter = createRateLimiter(env);
 
   startRuntimeMetrics();
@@ -430,6 +440,7 @@ export function createApp(options: AppOptions = {}): Express {
 
   if (options.pool) {
     app.locals.vacuumInterval = startVacuumCollector(options.pool);
+    app.locals.businessEventInterval = startBusinessEventCollector(options.pool);
     startBackgroundJobs(options.pool);
     addShutdownHook(() => stopBackgroundJobs());
   }
@@ -493,8 +504,12 @@ export function createApp(options: AppOptions = {}): Express {
   // every canary-tagged request carries a correlation ID end-to-end in logs.
   app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
+  app.use(sanitizeResponses);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
+  // #1555: cap every buffered response body (see docs/response-limits.md).
+  // Registered before all routers so it wraps res.send for every route.
+  app.use(responseSizeLimitMiddleware);
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
@@ -503,6 +518,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
   app.use(requestLoggerMiddleware);
+  app.use(responseSanitizer);
   app.use(serverTimingMiddleware());
   app.use(httpMetrics);
   app.use(createDeprecationMiddleware(routeDeprecations));

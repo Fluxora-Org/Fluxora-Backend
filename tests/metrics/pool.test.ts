@@ -10,6 +10,9 @@
  *  - syncPoolGauges: multiple named pools tracked independently
  *  - syncPoolGauges: pool exhaustion simulation (waiting >> 0)
  *  - syncPoolGauges: zero-wait baseline
+ *  - syncPoolGauges: saturation ratio rises BEFORE the pool is exhausted
+ *  - syncPoolGauges: queue saturation reaches 1 on the exhaustion failure path
+ *  - saturation gauges: bounded label cardinality (single `pool` label)
  *  - deRegisterPoolMetrics: removes all three gauges
  *  - Re-registration after deregister works (idempotent pattern)
  *  - Security: label value is application-controlled, not user input
@@ -20,6 +23,8 @@ import {
   dbPoolActive,
   dbPoolIdle,
   dbPoolWaiting,
+  dbPoolSaturationRatio,
+  dbPoolQueueSaturationRatio,
   dbPoolNegativeActive,
   syncPoolGauges,
   deRegisterPoolMetrics,
@@ -44,11 +49,15 @@ async function gaugeValue(gauge: typeof dbPoolActive, poolName: string): Promise
 beforeEach(() => {
   deRegisterPoolMetrics();
   dbPoolNegativeActive.reset();
+  dbPoolSaturationRatio.reset();
+  dbPoolQueueSaturationRatio.reset();
 });
 
 afterEach(() => {
   deRegisterPoolMetrics();
   dbPoolNegativeActive.reset();
+  dbPoolSaturationRatio.reset();
+  dbPoolQueueSaturationRatio.reset();
 });
 
 // ── Gauge registration ────────────────────────────────────────────────────────
@@ -310,5 +319,142 @@ describe('syncPoolGauges — negative active anomaly detection', () => {
     expect(entry?.value ?? 0).toBe(0);
 
     warnSpy.mockRestore();
+  });
+});
+
+// ── syncPoolGauges: saturation is visible BEFORE exhaustion ───────────────────
+
+describe('syncPoolGauges — saturation before exhaustion', () => {
+  it('publishes a non-zero saturation ratio while waiting is still 0', async () => {
+    // 8 of 10 connections checked out, nothing queued yet.
+    syncPoolGauges({ totalCount: 10, idleCount: 2, waitingCount: 0, capacity: 10 }, 'default');
+
+    // The wait queue is untouched …
+    expect(await gaugeValue(dbPoolWaiting, 'default')).toBe(0);
+    // … but the pool is already 80% saturated, so an operator gets lead time.
+    expect(await gaugeValue(dbPoolSaturationRatio, 'default')).toBeCloseTo(0.8, 5);
+  });
+
+  it('rises monotonically as connections are checked out, before anything queues', async () => {
+    const seen: number[] = [];
+
+    for (const idleCount of [9, 8, 6, 4, 2, 0]) {
+      syncPoolGauges({ totalCount: 10, idleCount, waitingCount: 0, capacity: 10 }, 'default');
+      seen.push(await gaugeValue(dbPoolSaturationRatio, 'default'));
+    }
+
+    expect(seen).toEqual([...seen].sort((a, b) => a - b));
+    expect(seen[0]).toBeCloseTo(0.1, 5);
+    expect(seen[seen.length - 1]).toBeCloseTo(1, 5);
+    // The queue never moved off 0 during the whole ramp.
+    expect(await gaugeValue(dbPoolWaiting, 'default')).toBe(0);
+  });
+
+  it('crosses the documented warning threshold (0.80) while idle headroom remains', async () => {
+    syncPoolGauges({ totalCount: 10, idleCount: 2, waitingCount: 0, capacity: 10 }, 'default');
+
+    const saturation = await gaugeValue(dbPoolSaturationRatio, 'default');
+    expect(saturation).toBeGreaterThanOrEqual(0.8);
+    expect(saturation).toBeLessThan(0.95);
+    expect(await gaugeValue(dbPoolIdle, 'default')).toBeGreaterThan(0);
+  });
+
+  it('clamps saturation to 1 when active exceeds the configured capacity', async () => {
+    syncPoolGauges({ totalCount: 12, idleCount: 0, waitingCount: 0, capacity: 10 }, 'default');
+
+    expect(await gaugeValue(dbPoolSaturationRatio, 'default')).toBe(1);
+  });
+
+  it('does not publish a saturation series when capacity is unknown', async () => {
+    syncPoolGauges(makePoolState(5, 0, 0), 'default');
+
+    const data = await dbPoolSaturationRatio.get();
+    expect(data.values.find((v) => v.labels['pool'] === 'default')).toBeUndefined();
+  });
+});
+
+// ── syncPoolGauges: queue saturation on the exhaustion failure path ───────────
+
+describe('syncPoolGauges — queue saturation on the pool-exhausted failure path', () => {
+  it('stays at 0 while the queue is empty', async () => {
+    syncPoolGauges(
+      { totalCount: 10, idleCount: 0, waitingCount: 0, capacity: 10, queueLimit: 50 },
+      'default',
+    );
+
+    expect(await gaugeValue(dbPoolQueueSaturationRatio, 'default')).toBe(0);
+  });
+
+  it('grows before the limit is reached', async () => {
+    syncPoolGauges(
+      { totalCount: 10, idleCount: 0, waitingCount: 25, capacity: 10, queueLimit: 50 },
+      'default',
+    );
+
+    expect(await gaugeValue(dbPoolQueueSaturationRatio, 'default')).toBeCloseTo(0.5, 5);
+  });
+
+  it('reaches 1 at the limit — the exact state where query() fast-fails', async () => {
+    // src/db/pool.ts `query()` throws PoolExhaustedError when waitingCount >= queueLimit.
+    syncPoolGauges(
+      { totalCount: 10, idleCount: 0, waitingCount: 50, capacity: 10, queueLimit: 50 },
+      'default',
+    );
+
+    expect(await gaugeValue(dbPoolQueueSaturationRatio, 'default')).toBe(1);
+    expect(await gaugeValue(dbPoolSaturationRatio, 'default')).toBe(1);
+  });
+
+  it('stays clamped at 1 when the queue overshoots the limit', async () => {
+    syncPoolGauges(
+      { totalCount: 10, idleCount: 0, waitingCount: 75, capacity: 10, queueLimit: 50 },
+      'default',
+    );
+
+    expect(await gaugeValue(dbPoolQueueSaturationRatio, 'default')).toBe(1);
+  });
+
+  it('does not publish a queue-ratio series when the queue limit is unknown', async () => {
+    syncPoolGauges({ totalCount: 10, idleCount: 0, waitingCount: 50, capacity: 10 }, 'default');
+
+    const data = await dbPoolQueueSaturationRatio.get();
+    expect(data.values.find((v) => v.labels['pool'] === 'default')).toBeUndefined();
+  });
+});
+
+// ── saturation gauges: bounded label cardinality ──────────────────────────────
+
+describe('saturation gauges — bounded label cardinality', () => {
+  it('expose only the single `pool` label', () => {
+    // @ts-expect-error accessing internal labelNames
+    expect(dbPoolSaturationRatio.labelNames).toEqual(['pool']);
+    // @ts-expect-error accessing internal labelNames
+    expect(dbPoolQueueSaturationRatio.labelNames).toEqual(['pool']);
+  });
+
+  it('does not create a new series when the same pool is synced repeatedly', async () => {
+    for (let waiting = 0; waiting <= 50; waiting++) {
+      syncPoolGauges(
+        { totalCount: 10, idleCount: 0, waitingCount: waiting, capacity: 10, queueLimit: 50 },
+        'default',
+      );
+    }
+
+    const data = await dbPoolQueueSaturationRatio.get();
+    expect(data.values.filter((v) => v.labels['pool'] === 'default')).toHaveLength(1);
+  });
+
+  it('keeps one series per distinct trusted pool name (cardinality = number of pools)', async () => {
+    syncPoolGauges(
+      { totalCount: 10, idleCount: 5, waitingCount: 0, capacity: 10, queueLimit: 50 },
+      'default',
+    );
+    syncPoolGauges(
+      { totalCount: 5, idleCount: 1, waitingCount: 2, capacity: 5, queueLimit: 20 },
+      'read-replica',
+    );
+
+    const data = await dbPoolQueueSaturationRatio.get();
+    expect(data.values.map((v) => v.labels['pool']).sort()).toEqual(['default', 'read-replica']);
   });
 });

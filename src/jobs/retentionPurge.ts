@@ -80,14 +80,25 @@
  *
  * ## Security assumptions
  *
- * - Table and column names in `PURGEABLE_RETENTION_SCHEDULE` are
- *   developer-controlled constants (not user input) and are safely
- *   interpolated into SQL with identifier quoting.
- * - The job runs with the application's DB principal, which must have
- *   `DELETE` on target tables.  It does NOT require super-user access.
- * - The `legal_hold` check is performed inside the same transaction as
- *   the delete, preventing a TOCTOU race where a hold is set between
- *   the check and the delete.
+  * - Table and column names in `PURGEABLE_RETENTION_SCHEDULE` are
+  *   developer-controlled constants (not user input) and are safely
+  *   interpolated into SQL with identifier quoting.
+  * - The job runs with the application's DB principal, which must have
+  *   `DELETE` on target tables.  It does NOT require super-user access.
+  * - `audit_logs` is append-only at the storage layer (see migration
+  *   `1790208000000_audit-logs-append-only`): the `fluxora_app` application
+  *   role holds only `SELECT, INSERT` on `audit_logs`, and a
+  *   `BEFORE UPDATE OR DELETE` trigger rejects mutations from every other
+  *   session.  Retention deletes on `audit_logs` are the single exception:
+  *   they must run as the dedicated `fluxora_retention` role.  In
+  *   single-role deployments (app and migrations share one principal) the
+  *   job instead sets `SET LOCAL app.allow_audit_delete = 'on'` inside the
+  *   short batch transaction for the `audit_logs` rule only — normal
+  *   request paths never set this flag, so their UPDATE/DELETE attempts
+  *   still fail at the database rather than only in application code.
+  * - The `legal_hold` check is performed inside the same transaction as
+  *   the delete, preventing a TOCTOU race where a hold is set between
+  *   the check and the delete.
  */
 
 import { logger } from '../lib/logger.js';
@@ -97,6 +108,14 @@ import { recordAuditEventToDb } from '../lib/auditLog.js';
 import { PURGEABLE_RETENTION_SCHEDULE, PurgeableRetentionRule } from '../pii/policy.js';
 
 const STREAM_REDACTION_TOMBSTONE = '[REDACTED:DATA_RETENTION]';
+
+/**
+ * Transaction-local opt-in recognised by the `audit_logs_prevent_mutation`
+ * trigger (migration `1790208000000_audit-logs-append-only`). Set via
+ * `SET LOCAL` inside the batch transaction for the `audit_logs` rule only.
+ * Must match `AUDIT_DELETE_BYPASS_SETTING` in the migration.
+ */
+const AUDIT_DELETE_BYPASS = 'app.allow_audit_delete';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -382,6 +401,19 @@ async function processBatch(
     if (candidates.length === 0) {
       await client.query('COMMIT');
       return { purged: 0, skipped: 0 };
+    }
+
+    // `audit_logs` is append-only at the storage layer: the guard trigger
+    // rejects DELETE unless the session runs as `fluxora_retention` or opts
+    // in via this transaction-local flag. Set it only for the audit_logs
+    // rule — every other rule must never carry the bypass — and only when
+    // this batch actually has candidates, so no-op transactions never carry
+    // it either. Production deployments should prefer connecting this job
+    // as `fluxora_retention`; the flag exists so single-role deployments
+    // keep working. SET LOCAL is scoped to this transaction and vanishes on
+    // COMMIT/ROLLBACK.
+    if (rule.table === 'audit_logs' && !dryRun) {
+      await client.query(`SET LOCAL ${AUDIT_DELETE_BYPASS} = 'on'`);
     }
 
     for (const row of candidates) {

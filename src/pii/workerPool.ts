@@ -67,6 +67,15 @@ export interface WorkerPoolOptions {
    * Must not contain non-cloneable values (functions, symbols, handles).
    */
   workerData?: Record<string, unknown>;
+
+  /**
+   * Maximum number of pending tasks allowed in the queue.
+   * When the queue reaches this limit, new tasks are immediately rejected
+   * with a PoolQueueFullError, applying backpressure instead of dropping work
+   * or queuing infinitely.
+   * Default: 1000
+   */
+  maxQueueSize?: number;
 }
 
 export class PoolShutdownError extends Error {
@@ -74,6 +83,13 @@ export class PoolShutdownError extends Error {
     super('WorkerPool has been shut down');
     this.name = 'PoolShutdownError';
     
+  }
+}
+
+export class PoolQueueFullError extends Error {
+  constructor() {
+    super('WorkerPool queue is full (backpressure applied)');
+    this.name = 'PoolQueueFullError';
   }
 }
 
@@ -133,6 +149,7 @@ export class WorkerPool {
   private readonly workerUrl: URL;
   private readonly workerData: Record<string, unknown> | undefined;
   private readonly maxWorkers: number;
+  private readonly maxQueueSize: number;
   private nextTaskId = 0;
   private activeTasks = 0;
   private shutdownFlag = false;
@@ -142,6 +159,7 @@ export class WorkerPool {
   constructor(workerUrl: URL, options?: WorkerPoolOptions) {
     this.workerUrl = workerUrl;
     this.maxWorkers = resolveWorkerCount(options?.maxWorkers);
+    this.maxQueueSize = options?.maxQueueSize ?? 1000;
     this.workerData = options?.workerData;
   }
 
@@ -189,6 +207,8 @@ export class WorkerPool {
         this.dispatch(idle, task);
       } else if (this.slots.length < this.maxWorkers) {
         this.createWorkerAndDispatch(task);
+      } else if (this.queue.length >= this.maxQueueSize) {
+        reject(new PoolQueueFullError());
       } else {
         this.queue.push(task);
       }

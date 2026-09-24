@@ -3,17 +3,36 @@ import { logger } from '../../src/lib/logger.js';
 import { recordAuditEvent, _resetAuditLog, getAuditEntries } from '../../src/lib/auditLog.js';
 import { Tracer } from '../../src/tracing/hooks.js';
 import { sanitizeError } from '../../src/pii/sanitizer.js';
+import { redactableFields } from '../../src/pii/policy.js';
 
 const ADDRESS = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
 const TOKEN = 'Bearer test-token-value-1256';
 const PAYLOAD = '{"email":"person@example.test","database-id":"row-secret-1256"}';
 const CORRELATION_ID = 'corr-1256-stable';
+const GENERIC_SECRET = 'secret-value-1256';
+
+function generatePolicyPayload(): Record<string, string> {
+  const payload: Record<string, string> = {};
+  for (const field of redactableFields()) {
+    if (field === 'address' || field === 'sender' || field === 'recipient') {
+      payload[field] = ADDRESS;
+    } else if (field.includes('token') || field.includes('authorization')) {
+      payload[field] = TOKEN;
+    } else if (field === 'payload' || field === 'body') {
+      payload[field] = PAYLOAD;
+    } else {
+      payload[field] = GENERIC_SECRET;
+    }
+  }
+  return payload;
+}
 
 function assertForbiddenValues(value: unknown): void {
   const serialized = JSON.stringify(value);
   expect(serialized).not.toContain(ADDRESS);
   expect(serialized).not.toContain(TOKEN);
   expect(serialized).not.toContain(PAYLOAD);
+  expect(serialized).not.toContain(GENERIC_SECRET);
 }
 
 function captureOutput(fn: () => void): string {
@@ -33,12 +52,9 @@ function captureOutput(fn: () => void): string {
 
 describe('observability PII redaction contract', () => {
   it('redacts logger messages and metadata while preserving correlation IDs', () => {
+    const payload = generatePolicyPayload();
     const output = captureOutput(() => {
-      logger.info(`delivery failed for ${ADDRESS} with ${TOKEN}`, CORRELATION_ID, {
-        address: ADDRESS,
-        payload: PAYLOAD,
-        diagnostic: `authorization=${TOKEN}`,
-      });
+      logger.info(`delivery failed for ${ADDRESS} with ${TOKEN}`, CORRELATION_ID, payload);
     });
 
     assertForbiddenValues(output);
@@ -46,15 +62,16 @@ describe('observability PII redaction contract', () => {
   });
 
   it('redacts trace attributes, status messages, and error hook context', () => {
+    const payload = generatePolicyPayload();
     const onEvent = vi.fn();
     const onSpanEnd = vi.fn();
     const onError = vi.fn();
     const tracer = new Tracer({ enabled: true, hooks: { onEvent, onSpanEnd, onError } });
     const span = tracer.startSpan({ traceId: CORRELATION_ID });
 
-    tracer.recordEvent(span, 'webhook.failure', { address: ADDRESS, payload: PAYLOAD, token: TOKEN });
+    tracer.recordEvent(span, 'webhook.failure', payload);
     tracer.endSpan(span, 'error', `failed for ${ADDRESS} with ${TOKEN}`);
-    tracer.recordError(CORRELATION_ID, new Error(`payload=${PAYLOAD}`), { address: ADDRESS, token: TOKEN });
+    tracer.recordError(CORRELATION_ID, new Error(`payload=${PAYLOAD}`), payload);
 
     assertForbiddenValues(span);
     assertForbiddenValues(onEvent.mock.calls[0]);
@@ -64,12 +81,9 @@ describe('observability PII redaction contract', () => {
   });
 
   it('redacts audit metadata and internal identifiers without changing correlation IDs', () => {
+    const payload = generatePolicyPayload();
     _resetAuditLog();
-    recordAuditEvent('STREAM_CREATED', 'stream', ADDRESS, CORRELATION_ID, {
-      address: ADDRESS,
-      payload: PAYLOAD,
-      token: TOKEN,
-    });
+    recordAuditEvent('STREAM_CREATED', 'stream', ADDRESS, CORRELATION_ID, payload);
 
     const entry = getAuditEntries()[0];
     assertForbiddenValues(entry);
@@ -77,10 +91,44 @@ describe('observability PII redaction contract', () => {
   });
 
   it('does not retain raw payloads in serialized error objects', () => {
+    const payload = generatePolicyPayload();
     const error = new Error(`webhook failed: payload=${PAYLOAD}`);
     error.stack = `Error: ${TOKEN}\n    at ${ADDRESS}`;
+    Object.assign(error, payload);
 
     const sanitized = sanitizeError(error);
     assertForbiddenValues(sanitized);
+  });
+
+  it('redacts every policy-named field across all egress paths', async () => {
+    const { redactableFields } = await import('../../src/pii/policy.js');
+    const { sanitize } = await import('../../src/pii/sanitizer.js');
+    const fields = Array.from(redactableFields());
+    
+    // Create a payload containing all known sensitive fields
+    const payload: Record<string, string> = {};
+    for (const f of fields) {
+      payload[f] = 'SECRET_VALUE_FOR_EGRESS_TEST';
+    }
+
+    // 1. Sanitizer (used by safeErrorHandler and other internals)
+    const sanitized = sanitize(payload);
+    expect(JSON.stringify(sanitized)).not.toContain('SECRET_VALUE_FOR_EGRESS_TEST');
+
+    // 2. Logger
+    const output = captureOutput(() => {
+      logger.info('test message', 'corr-id', payload);
+    });
+    expect(output).not.toContain('SECRET_VALUE_FOR_EGRESS_TEST');
+
+    // 3. Tracer hook / logsBridge
+    const onEvent = vi.fn();
+    const tracer = new Tracer({ enabled: true, hooks: { onEvent } });
+    const span = tracer.startSpan({ traceId: 'corr-id' });
+    tracer.recordEvent(span, 'test.event', payload);
+    
+    if (onEvent.mock.calls.length > 0) {
+      expect(JSON.stringify(onEvent.mock.calls[0])).not.toContain('SECRET_VALUE_FOR_EGRESS_TEST');
+    }
   });
 });
