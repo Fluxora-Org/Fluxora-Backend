@@ -154,6 +154,7 @@ Response:
 Scripted database backup, restore, and partition retention operations are managed via `src/scripts/db-ops.ts`.
 - `backupDatabase` / `restoreDatabase`: Support local custom-format dumps as well as zero-disk S3 streaming.
 - `dropOldPartitions`: Detaches and drops range partitions older than a specified threshold. Runs in `dryRun = true` mode by default.
+- Destructive restore and partition-drop operations print their target environment, require an explicit `confirm: true` flag, and require `acknowledgeProduction: true` when targeting production. Use `dryRun: true` first to report the planned change.
 
 For complete details on operator ergonomics, security controls, credential protection, and region resolution, see [docs/database.md](docs/database.md#scripted-database-operations--operator-ergonomics).
 

@@ -164,6 +164,29 @@ The `contract_events` table is partitioned by `happened_at` to ensure bounded gr
 4. Validate that detached partitions are backed up per the existing S3 retention policy before actually dropping them.
 5. Run the function in `dryRun = true` mode initially to audit partitions that will be dropped.
 
+### Destructive operation safety
+
+`restoreDatabase` and `dropOldPartitions` are guarded before any database or
+S3 operation runs. Each operation prints the target environment and requires
+`confirm: true`; a production target additionally requires
+`acknowledgeProduction: true`. Set `dryRun: true` to report the planned source,
+target, and number of partitions that would be changed without executing the
+operation.
+
+```ts
+const result = await dropOldPartitions(pool, 'contract_events', 30, {
+  dryRun: true,
+  targetEnvironment: 'staging',
+})
+
+// After reviewing the dry-run result, explicitly confirm a live run:
+await dropOldPartitions(pool, 'contract_events', 30, {
+  dryRun: false,
+  targetEnvironment: 'staging',
+  confirm: true,
+})
+```
+
 ### Partition Pre-creation
 
 To avoid rows landing in the unindexed `DEFAULT` partition, the background job `src/jobs/partitionMaintenance.ts` pre-creates monthly partitions ahead of schedule for every range-partitioned table it manages.
