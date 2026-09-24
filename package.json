@@ -30,7 +30,9 @@
     "generate:sdk:python": "node scripts/generate-sdk-python.mjs",
     "check:sdk:python": "node scripts/generate-sdk-python.mjs --check",
     "generate:sdk:ts": "node scripts/generate-sdk-ts.mjs",
-    "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check"
+    "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check",
+    "check:sdk:version": "node scripts/check-sdk-version-sync.mjs",
+    "check:sdk": "pnpm check:sdk:python && pnpm check:sdk:ts && pnpm check:sdk:version"
   },
   "keywords": [
     "indexer",

@@ -270,6 +270,18 @@ See [docs/indexer.md](docs/indexer.md) for comprehensive documentation including
 - Troubleshooting guide
 - Monitoring recommendations
 
+## 📦 Client SDKs
+
+Two generated clients are versioned in lockstep with the API and published from
+tagged releases:
+
+- **TypeScript** — `@fluxora/sdk` on [npm](https://www.npmjs.com/package/@fluxora/sdk): `npm install @fluxora/sdk`
+- **Python** — `fluxora-sdk` on [PyPI](https://pypi.org/project/fluxora-sdk/): `pip install fluxora-sdk`
+
+Both SDK versions are copied from `openapi.yaml` `info.version` and are checked
+by `pnpm check:sdk`. See [docs/sdk-publishing.md](docs/sdk-publishing.md) for the
+versioning policy and release process.
+
 ## 🏗️ Architecture
 
 ```
