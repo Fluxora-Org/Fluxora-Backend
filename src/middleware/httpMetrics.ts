@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
+import { sanitizeMetricLabels } from '../pii/secretPatterns.js';
 
 /**
  * Normalise the matched route so cardinality stays bounded.
@@ -34,11 +35,12 @@ export function httpMetrics(req: Request, res: Response, next: NextFunction): vo
     const durationSec = durationNs / 1e9;
 
     const route = resolveRoute(req);
-    const labels = {
+    // Defence-in-depth: never let secret-shaped values become Prometheus labels.
+    const labels = sanitizeMetricLabels({
       method: req.method,
       route,
       status_code: String(res.statusCode),
-    };
+    });
 
     httpRequestsTotal.inc(labels);
     httpRequestDurationSeconds.observe(labels, durationSec);
