@@ -368,6 +368,11 @@ MIT
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes with tests
+   - Protecting a new route? Use the guards from `src/middleware/auth.ts`,
+     the authoritative auth entry point. See [docs/auth.md](docs/auth.md),
+     "Which authentication helper to use".
+   - Returning a collection? Paginate it and add its bound to
+     [docs/response-limits.md](docs/response-limits.md).
 4. Ensure tests pass: `pnpm test`
 5. Submit a pull request
 

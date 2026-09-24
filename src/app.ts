@@ -58,7 +58,7 @@ import { routeDeprecations } from './config/deprecations.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse } from './utils/response.js';
-import { ApiError, notFound } from './errors.js';
+import { notFound } from './errors.js';
 import { docsRouter } from './routes/docs.js';
 import { graphqlGatewayRouter } from './graphql/gateway.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
@@ -66,6 +66,7 @@ import { getStreamHub } from './ws/hub.js';
 import { getPool } from './db/pool.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
+import { responseSizeLimitMiddleware } from './middleware/responseSizeLimit.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -495,6 +496,9 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(privacyHeaders);
   app.use(cspNonceMiddleware);
   app.use(createHelmetMiddleware());
+  // #1555: cap every buffered response body (see docs/response-limits.md).
+  // Registered before all routers so it wraps res.send for every route.
+  app.use(responseSizeLimitMiddleware);
   app.use(bodySizeLimitMiddleware);
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);

@@ -7,7 +7,7 @@ import { info } from '../utils/logger.js';
 import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { revoke } from '../redis/jwtRevocationStore.js';
-import { Permission, requirePermission } from '../middleware/auth.js';
+import { Permission, authenticate, requirePermission } from '../middleware/auth.js';
 import { authLockoutMiddleware } from '../middleware/authLockout.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 
@@ -104,7 +104,7 @@ authRouter.post(
         if (!req.body.role) {
           targetRole = verified.role;
         }
-      } catch (err) {
+      } catch {
         const store = req.authAttemptStore;
         const ip = getClientIp(req);
         if (store) {
@@ -200,6 +200,9 @@ const RevokeRequestSchema = z.object({
  */
 authRouter.post(
   '/revoke',
+  // #1579: requirePermission only reads req.user; without `authenticate`
+  // first nothing set it, so every caller (admins included) got 401.
+  authenticate,
   requirePermission(Permission.ADMIN_PAUSE), // Admin-only: any admin permission suffices
   asyncHandler(async (req: Request, res: Response) => {
     const result = RevokeRequestSchema.safeParse(req.body);

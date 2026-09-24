@@ -1,8 +1,22 @@
-import type { NextFunction, Request, RequestHandler, Response } from 'express';
+/**
+ * Streaming-transport token check — NOT an HTTP authentication entry point (#1579).
+ *
+ * verifyWsToken authenticates WebSocket upgrades (src/ws/hub.ts) and is the
+ * extra `?token=` check on the SSE / long-poll stream routes, where browsers
+ * cannot set headers. Those stream routes are still guarded by
+ * authenticateApiKey + requireScope from src/middleware/auth.ts first; this is
+ * an addition, never a replacement. verifyWsToken checks the JWT signature
+ * only (no issuer / audience / revocation checks), so it must not be the sole
+ * guard on any HTTP route. See docs/auth.md.
+ *
+ * createBearerTokenAuth (static shared-token bearer check) was removed in
+ * #1579: no route used it, it compared tokens with `!==` instead of in
+ * constant time, and requireAdminAuth already covers static-token admin
+ * access properly.
+ */
 import type { IncomingMessage } from 'http';
 import jwt from 'jsonwebtoken';
 
-import { serviceUnavailable, unauthorized } from '../errors.js';
 import { logger } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
@@ -96,62 +110,4 @@ function _recordWsAuthFailure(code: WsAuthFailureCode, req: IncomingMessage): vo
   if (AUDIT_WORTHY.has(code)) {
     recordAuditEvent('WS_AUTH_FAILURE', 'ws_connection', req.socket?.remoteAddress ?? 'unknown', undefined, { reason: code });
   }
-}
-
-export interface TokenAuthOptions {
-  role: 'partner' | 'administrator';
-  token?: string;
-  required: boolean;
-}
-
-function getBearerToken(headerValue: string | undefined): string | null {
-  if (!headerValue) return null;
-
-  const [scheme, value] = headerValue.split(' ', 2);
-  if (scheme !== 'Bearer' || !value) {
-    return null;
-  }
-
-  return value.trim();
-}
-
-export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler {
-  const authEnabled = options.required || Boolean(options.token);
-
-  return (req: Request, _res: Response, next: NextFunction) => {
-    if (!authEnabled) {
-      next();
-      return;
-    }
-
-    if (!options.token) {
-      next(
-        serviceUnavailable(`${options.role} authentication is required but not configured`, {
-          role: options.role,
-        }),
-      );
-      return;
-    }
-
-    const bearerToken = getBearerToken(req.header('authorization'));
-    if (!bearerToken) {
-      next(
-        unauthorized(`${options.role} bearer token is required`, {
-          role: options.role,
-        }),
-      );
-      return;
-    }
-
-    if (bearerToken !== options.token) {
-      next(
-        unauthorized(`Invalid ${options.role} bearer token`, {
-          role: options.role,
-        }),
-      );
-      return;
-    }
-
-    next();
-  };
 }
