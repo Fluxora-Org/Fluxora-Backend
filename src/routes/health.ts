@@ -92,11 +92,7 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
   }
 
   if (!healthManager) {
-    res.status(503).json({
-      status: 'unhealthy',
-      reason: 'Health manager not configured',
-      dependencies: {},
-    });
+    res.status(503).json(errorResponse('SERVICE_UNAVAILABLE', 'Health manager not configured', { dependencies: {} }));
     return;
   }
 

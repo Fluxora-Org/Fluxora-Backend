@@ -77,10 +77,9 @@ export function errorHandler(
         errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
       );
     } else {
-      res.status(err.statusCode).json({
-        success: false,
-        message: 'Internal server error',
-      });
+      res.status(err.statusCode).json(
+        errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId)
+      );
     }
     return;
   }
@@ -118,10 +117,9 @@ export function errorHandler(
     ...traceSpanIds,
   });
 
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-  });
+  res.status(500).json(
+    errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId)
+  );
 }
 
 /** Async handler wrapper */

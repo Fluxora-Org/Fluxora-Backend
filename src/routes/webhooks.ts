@@ -58,7 +58,7 @@ webhooksRouter.post(
     // 1. Shared Preflight (size, depth, encoding, valid json)
     const preflight = checkWebhookPreflight(rawBody, contentType);
     if (!preflight.ok) {
-      res.status(preflight.status).json({ error: preflight.code, message: preflight.message });
+      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
       return;
     }
 
@@ -81,7 +81,7 @@ webhooksRouter.post(
     const verification = verifyWebhookSignature(verifyInput);
 
     if (!verification.ok) {
-      res.status(verification.status).json({ error: verification.code, message: verification.message });
+      res.status(verification.status).json(errorResponse(verification.code, verification.message));
       return;
     }
 
@@ -89,7 +89,7 @@ webhooksRouter.post(
     
     const isNew = await inboundWebhookDedupCache.add('webhook', deliveryId);
     if (!isNew) {
-      res.status(409).json({ error: 'duplicate_delivery', message: 'Duplicate delivery id' });
+      res.status(409).json(errorResponse('DUPLICATE_DELIVERY', 'Duplicate delivery id'));
       return;
     }
 
@@ -118,16 +118,14 @@ webhooksRouter.use(requireAdminAuth);
  * Queue a webhook delivery for reliable processing
  */
 webhooksRouter.post('/queue', express.json(), async (req, res) => {
+  const requestId = req.correlationId;
   try {
     const { event, endpointUrl, secret, priority = 'normal' } = req.body;
 
     if (!event || !endpointUrl || !secret) {
-      res.status(400).json({
-        error: {
-          code: 'INVALID_REQUEST',
-          message: 'Missing required fields: event, endpointUrl, secret',
-        },
-      });
+      res.status(400).json(
+        errorResponse('VALIDATION_ERROR', 'Missing required fields: event, endpointUrl, secret', undefined, requestId)
+      );
       return;
     }
 
@@ -154,22 +152,18 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
       priority,
     });
 
-    res.status(202).json({
-      ok: true,
+    res.status(202).json(successResponse({
       outboxId,
       message: 'Webhook queued for delivery',
-    });
+    }, requestId));
   } catch (error) {
     logger.error('Error queueing webhook', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'QUEUE_ERROR',
-        message: 'Failed to queue webhook',
-      },
-    });
+    res.status(500).json(
+      errorResponse('QUEUE_ERROR', 'Failed to queue webhook', undefined, requestId)
+    );
   }
 });
 
@@ -220,15 +214,13 @@ webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): voi
  * List all webhook deliveries (for monitoring/debugging)
  */
 webhooksRouter.get('/deliveries', (req, res) => {
+  const requestId = req.correlationId;
   const parsed = OffsetPaginationSchema.safeParse(req.query);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
-    res.status(400).json({
-      error: {
-        code: 'INVALID_PAGINATION',
-        message: first?.message ?? 'Invalid pagination parameters',
-      },
-    });
+    res.status(400).json(
+      errorResponse('VALIDATION_ERROR', first?.message ?? 'Invalid pagination parameters', undefined, requestId)
+    );
     return;
   }
 
@@ -245,7 +237,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
   const total = deliveries.length;
   const paginated = deliveries.slice(offset, offset + limit);
 
-  res.json({
+  res.json(successResponse({
     total,
     deliveries: paginated.map(delivery => ({
       id: delivery.id,
@@ -257,7 +249,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
       createdAt: new Date(delivery.createdAt).toISOString(),
       updatedAt: new Date(delivery.updatedAt).toISOString(),
     })),
-  });
+  }, requestId));
 });
 
 /**
@@ -265,6 +257,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
  * List outbox items (for monitoring)
  */
 webhooksRouter.get('/outbox', (req, res) => {
+  const requestId = req.correlationId;
   const { priority, status = 'ready' } = req.query;
   
   let items = webhookDeliveryStore.getAllOutboxItems();
@@ -282,7 +275,7 @@ webhooksRouter.get('/outbox', (req, res) => {
     items = items.filter(item => item.attempts >= item.maxAttempts);
   }
 
-  res.json({
+  res.json(successResponse({
     total: items.length,
     items: items.map(item => ({
       id: item.id,
@@ -296,7 +289,7 @@ webhooksRouter.get('/outbox', (req, res) => {
       scheduledFor: new Date(item.scheduledFor).toISOString(),
       createdAt: new Date(item.createdAt).toISOString(),
     })),
-  });
+  }, requestId));
 });
 
 /**
@@ -304,15 +297,13 @@ webhooksRouter.get('/outbox', (req, res) => {
  * List dead-letter queue items
  */
 webhooksRouter.get('/dlq', (req, res) => {
+  const requestId = req.correlationId;
   const parsed = OffsetPaginationSchema.safeParse(req.query);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
-    res.status(400).json({
-      error: {
-        code: 'INVALID_PAGINATION',
-        message: first?.message ?? 'Invalid pagination parameters',
-      },
-    });
+    res.status(400).json(
+      errorResponse('VALIDATION_ERROR', first?.message ?? 'Invalid pagination parameters', undefined, requestId)
+    );
     return;
   }
 
@@ -320,7 +311,7 @@ webhooksRouter.get('/dlq', (req, res) => {
   
   const items = webhookDeliveryStore.getDeadLetterQueueItems(limit);
 
-  res.json({
+  res.json(successResponse({
     total: items.length,
     items: items.map(item => ({
       id: item.id,
@@ -333,7 +324,7 @@ webhooksRouter.get('/dlq', (req, res) => {
       createdAt: new Date(item.createdAt).toISOString(),
       processedAt: item.processedAt ? new Date(item.processedAt).toISOString() : null,
     })),
-  });
+  }, requestId));
 });
 
 /**
@@ -357,6 +348,7 @@ webhooksRouter.get('/dlq', (req, res) => {
  */
 webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
   const { dlqId } = req.params;
+  const requestId = req.correlationId;
   // `secret` is the per-delivery HMAC signing key for the re-queued outbox
   // item, NOT an authorization credential.  Omitting it reuses the original.
   const { secret } = req.body ?? {};
@@ -367,12 +359,9 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
     const dlqItem = dlqItems.find(item => item.id === dlqId);
     
     if (!dlqItem) {
-      res.status(404).json({
-        error: {
-          code: 'DLQ_ITEM_NOT_FOUND',
-          message: `Dead-letter queue item ${dlqId} not found`,
-        },
-      });
+      res.status(404).json(
+        errorResponse('NOT_FOUND', `Dead-letter queue item ${dlqId} not found`, undefined, requestId)
+      );
       return;
     }
 
@@ -380,12 +369,9 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
     const processed = webhookDeliveryStore.processDeadLetterQueueItem(dlqId);
     
     if (!processed) {
-      res.status(500).json({
-        error: {
-          code: 'DLQ_PROCESS_ERROR',
-          message: 'Failed to process DLQ item',
-        },
-      });
+      res.status(500).json(
+        errorResponse('DLQ_PROCESS_ERROR', 'Failed to process DLQ item', undefined, requestId)
+      );
       return;
     }
 
@@ -416,23 +402,19 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
       deliveryId: dlqItem.deliveryId,
     });
 
-    res.json({
-      ok: true,
+    res.json(successResponse({
       outboxId,
       message: 'DLQ item queued for retry',
-    });
+    }, requestId));
   } catch (error) {
     logger.error('Error retrying DLQ item', undefined, {
       dlqId,
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'DLQ_RETRY_ERROR',
-        message: 'Failed to retry DLQ item',
-      },
-    });
+    res.status(500).json(
+      errorResponse('DLQ_RETRY_ERROR', 'Failed to retry DLQ item', undefined, requestId)
+    );
   }
 });
 
@@ -441,23 +423,24 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
  * Look up Redis-backed circuit breaker state for a consumer endpoint.
  */
 webhooksRouter.get('/circuit-breakers', async (req, res) => {
+  const requestId = req.correlationId;
   const endpointUrl = typeof req.query.endpointUrl === 'string' ? req.query.endpointUrl : undefined;
   if (!endpointUrl) {
-    res.json({
+    res.json(successResponse({
       total: 0,
       states: [],
       note: 'Provide endpointUrl query parameter to inspect Redis-backed circuit breaker state',
-    });
+    }, requestId));
     return;
   }
 
   const state = await getWebhookCircuitBreakerStore().getState(endpointUrl);
   if (!state) {
-    res.json({ total: 0, states: [] });
+    res.json(successResponse({ total: 0, states: [] }, requestId));
     return;
   }
 
-  res.json({
+  res.json(successResponse({
     total: 1,
     states: [{
       endpointUrl,
@@ -466,7 +449,7 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
       lastFailureTime: null,
       nextAttemptTime: state.resetAt > 0 ? new Date(state.resetAt).toISOString() : null,
     }],
-  });
+  }, requestId));
 });
 
 /**
@@ -474,6 +457,7 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
  * Reset circuit breaker for an endpoint
  */
 webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => {
+  const requestId = req.correlationId;
   const { endpointUrl } = req.params;
   
   // URL decode the endpoint URL
@@ -482,11 +466,10 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => 
   await getWebhookCircuitBreakerStore().recordSuccess(decodedUrl, {});
   logger.info('Circuit breaker reset requested', undefined, { endpointUrl: decodedUrl });
 
-  res.json({
-    ok: true,
+  res.json(successResponse({
     message: 'Circuit breaker reset requested',
     endpointUrl: decodedUrl,
-  });
+  }, requestId));
 });
 
 /**
@@ -494,6 +477,7 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => 
  * Get webhook delivery metrics
  */
 webhooksRouter.get('/metrics', (req, res) => {
+  const requestId = req.correlationId;
   const metrics = webhookDeliveryStore.getMetrics();
   
   // Calculate success rate
@@ -501,11 +485,11 @@ webhooksRouter.get('/metrics', (req, res) => {
     ? (metrics.successfulDeliveries / metrics.totalDeliveries) * 100 
     : 0;
 
-  res.json({
+  res.json(successResponse({
     ...metrics,
     successRate: Math.round(successRate * 100) / 100,
     failureRate: Math.round((100 - successRate) * 100) / 100,
-  });
+  }, requestId));
 });
 
 /**
@@ -560,6 +544,7 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
  * That check has been removed — requireAdminAuth above provides real auth.
  */
 webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
+  const requestId = req.correlationId;
   try {
     const readyItems = webhookDeliveryStore.getReadyOutboxItems();
     let processed = 0;
@@ -585,24 +570,20 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
       }
     }
 
-    res.json({
-      ok: true,
+    res.json(successResponse({
       processed,
       errors,
       total: readyItems.length,
       message: 'Outbox processing completed',
-    });
+    }, requestId));
   } catch (error) {
     logger.error('Error processing webhook outbox', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'OUTBOX_PROCESSING_ERROR',
-        message: 'Failed to process webhook outbox',
-      },
-    });
+    res.status(500).json(
+      errorResponse('OUTBOX_PROCESSING_ERROR', 'Failed to process webhook outbox', undefined, requestId)
+    );
   }
 });
 
@@ -642,6 +623,7 @@ webhooksRouter.post('/retry', express.json(), async (req, res) => {
  * Clean up old webhook data (internal endpoint for maintenance)
  */
 webhooksRouter.post('/cleanup', express.json(), (req, res) => {
+  const requestId = req.correlationId;
   const { olderThanDays = 7 } = req.body;
   const olderThanMs = olderThanDays * 24 * 60 * 60 * 1000;
 
@@ -654,22 +636,19 @@ webhooksRouter.post('/cleanup', express.json(), (req, res) => {
       errors: result.errors.length,
     });
 
-    res.json({
-      ok: true,
+    res.json(successResponse({
       cleaned: result.cleaned,
       errors: result.errors,
       olderThanDays,
-    });
+      message: 'Webhook cleanup completed',
+    }, requestId));
   } catch (error) {
     logger.error('Error during webhook cleanup', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'CLEANUP_ERROR',
-        message: 'Failed to cleanup webhook data',
-      },
-    });
+    res.status(500).json(
+      errorResponse('CLEANUP_ERROR', 'Failed to cleanup webhook data', undefined, requestId)
+    );
   }
 });

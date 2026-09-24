@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from 'express';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 import { verifyToken } from '../lib/auth.js';
 import crypto from 'crypto';
+import { errorResponse } from '../utils/response.js';
 
 /**
  * Maximum allowed length for the `Authorization` header value, in bytes.
@@ -47,36 +48,36 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
 
   if (!adminKey) {
     recordOutcome('failure');
-    res.status(503).json({
-      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
-    });
+    res.status(503).json(
+      errorResponse('SERVICE_UNAVAILABLE', 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.')
+    );
     return;
   }
 
   const header = req.headers.authorization;
   if (!header) {
     recordOutcome('failure');
-    res.status(401).json({ error: 'Missing Authorization header.' });
+    res.status(401).json(errorResponse('UNAUTHORIZED', 'Missing Authorization header.'));
     return;
   }
 
   if (header.length > MAX_AUTHORIZATION_HEADER_LENGTH) {
     recordOutcome('failure');
-    res.status(401).json({ error: 'Authorization header too large.' });
+    res.status(401).json(errorResponse('UNAUTHORIZED', 'Authorization header too large.'));
     return;
   }
 
   const parts = header.split(' ');
   if (parts.length !== 2 || parts[0] !== 'Bearer') {
     recordOutcome('failure');
-    res.status(401).json({ error: 'Authorization header must use Bearer scheme.' });
+    res.status(401).json(errorResponse('UNAUTHORIZED', 'Authorization header must use Bearer scheme.'));
     return;
   }
 
   const token = parts[1];
   if (!token) {
     recordOutcome('failure');
-    res.status(401).json({ error: 'Bearer token is missing.' });
+    res.status(401).json(errorResponse('UNAUTHORIZED', 'Bearer token is missing.'));
     return;
   }
 
@@ -103,7 +104,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   }
 
   recordOutcome('failure');
-  res.status(403).json({ error: 'Invalid admin credentials.' });
+  res.status(403).json(errorResponse('FORBIDDEN', 'Invalid admin credentials.'));
   return;
 }
 

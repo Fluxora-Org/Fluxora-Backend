@@ -94,7 +94,7 @@ import { canonicalizeBody } from '../middleware/idempotency.js';
 import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
-import { successResponse, idempotentReplayResponse } from '../utils/response.js';
+import { successResponse, idempotentReplayResponse, errorResponse } from '../utils/response.js';
 import { sendEarlyHints } from '../utils/earlyHints.js';
 import { streamRepository, StatusConflictError } from '../db/repositories/streamRepository.js';
 import { PoolExhaustedError } from '../db/pool.js';
@@ -519,7 +519,7 @@ export function enforceStreamScope(req: Request, res: Response, next: NextFuncti
   const callerAddress = req.user.address as string | undefined;
   if (!callerAddress) {
     // Should not happen if authenticate middleware is working, but safe fail.
-    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    res.status(500).json(errorResponse('INTERNAL_ERROR', 'Caller address missing', undefined, req.correlationId));
     return;
   }
 
@@ -1211,24 +1211,14 @@ streamsRouter.get(
     const authResult = verifyWsToken(req, jwtSecret);
 
     if (wsAuthRequired && !authResult.ok) {
-      res.status(401).json({
-        success: false,
-        error: {
-          code: 'UNAUTHORIZED',
-          message: `Authentication required: ${authResult.code}`,
-          requestId,
-        },
-      });
+      res.status(401).json(
+        errorResponse('UNAUTHORIZED', `Authentication required: ${authResult.code}`, undefined, requestId),
+      );
       return;
     } else if (!wsAuthRequired && !authResult.ok && authResult.code === 'INVALID_TOKEN') {
-      res.status(401).json({
-        success: false,
-        error: {
-          code: 'UNAUTHORIZED',
-          message: 'Invalid or expired authentication token',
-          requestId,
-        },
-      });
+      res.status(401).json(
+        errorResponse('UNAUTHORIZED', 'Invalid or expired authentication token', undefined, requestId),
+      );
       return;
     }
 
@@ -1563,24 +1553,14 @@ streamsRouter.get(
     const authResult = verifyWsToken(req, jwtSecret);
 
     if (wsAuthRequired && !authResult.ok) {
-      res.status(401).json({
-        success: false,
-        error: {
-          code: 'UNAUTHORIZED',
-          message: `Authentication required: ${authResult.code}`,
-          requestId,
-        },
-      });
+      res.status(401).json(
+        errorResponse('UNAUTHORIZED', `Authentication required: ${authResult.code}`, undefined, requestId),
+      );
       return;
     } else if (!wsAuthRequired && !authResult.ok && authResult.code === 'INVALID_TOKEN') {
-      res.status(401).json({
-        success: false,
-        error: {
-          code: 'UNAUTHORIZED',
-          message: 'Invalid or expired authentication token',
-          requestId,
-        },
-      });
+      res.status(401).json(
+        errorResponse('UNAUTHORIZED', 'Invalid or expired authentication token', undefined, requestId),
+      );
       return;
     }
 

@@ -3,6 +3,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { generateToken } from '../lib/auth.js';
 import { validationError, unauthorized, asyncHandler } from '../middleware/errorHandler.js';
+import { successResponse } from '../utils/response.js';
 import { info } from '../utils/logger.js';
 import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
@@ -132,10 +133,7 @@ authRouter.post(
       await store.resetAttempts(targetAddress);
     }
 
-    res.json({
-      token,
-      user: { address: targetAddress, role: targetRole },
-    });
+    res.json(successResponse({ token, user: { address: targetAddress, role: targetRole } }, requestId));
   })
 );
 
@@ -223,11 +221,10 @@ authRouter.post(
       requestId,
     });
 
-    res.json({
-      success: true,
+    res.json(successResponse({
       jti,
       revoked: revocation.revoked,
       ttl: revocation.ttlSeconds,
-    });
+    }, requestId));
   })
 );

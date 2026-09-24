@@ -89,3 +89,44 @@ export function errorResponse(
         },
     };
 }
+
+/**
+ * Runtime validator for the canonical error envelope shape.
+ *
+ * Intended for use in tests to assert that any JSON body emitted by a route
+ * on an error path strictly matches the documented ErrorEnvelope contract.
+ *
+ * Usage:
+ *   import { isErrorEnvelope } from '../utils/response.js';
+ *   expect(isErrorEnvelope(body)).toBe(true);
+ *
+ * Returns true only when:
+ *   - body.success === false
+ *   - body.error is a non-null object
+ *   - body.error.code is a non-empty string
+ *   - body.error.message is a non-empty string
+ *   - body.error.details (if present) may be any type
+ *   - body.error.requestId (if present) is a string
+ *   - no extra top-level keys beyond {success, error} are present
+ */
+export function isErrorEnvelope(body: unknown): body is ErrorEnvelope {
+    if (typeof body !== 'object' || body === null) return false;
+    const b = body as Record<string, unknown>;
+
+    // success must be exactly false
+    if (b['success'] !== false) return false;
+
+    // no extra top-level keys
+    const topKeys = Object.keys(b);
+    if (!topKeys.every((k) => k === 'success' || k === 'error')) return false;
+
+    const err = b['error'];
+    if (typeof err !== 'object' || err === null) return false;
+    const e = err as Record<string, unknown>;
+
+    if (typeof e['code'] !== 'string' || e['code'] === '') return false;
+    if (typeof e['message'] !== 'string' || e['message'] === '') return false;
+    if ('requestId' in e && typeof e['requestId'] !== 'string') return false;
+
+    return true;
+}
