@@ -83,4 +83,36 @@ describe('observability PII redaction contract', () => {
     const sanitized = sanitizeError(error);
     assertForbiddenValues(sanitized);
   });
+
+  it('redacts every policy-named field across all egress paths', async () => {
+    const { redactableFields } = await import('../../src/pii/policy.js');
+    const { sanitize } = await import('../../src/pii/sanitizer.js');
+    const fields = Array.from(redactableFields());
+    
+    // Create a payload containing all known sensitive fields
+    const payload: Record<string, string> = {};
+    for (const f of fields) {
+      payload[f] = 'SECRET_VALUE_FOR_EGRESS_TEST';
+    }
+
+    // 1. Sanitizer (used by safeErrorHandler and other internals)
+    const sanitized = sanitize(payload);
+    expect(JSON.stringify(sanitized)).not.toContain('SECRET_VALUE_FOR_EGRESS_TEST');
+
+    // 2. Logger
+    const output = captureOutput(() => {
+      logger.info('test message', 'corr-id', payload);
+    });
+    expect(output).not.toContain('SECRET_VALUE_FOR_EGRESS_TEST');
+
+    // 3. Tracer hook / logsBridge
+    const onEvent = vi.fn();
+    const tracer = new Tracer({ enabled: true, hooks: { onEvent } });
+    const span = tracer.startSpan({ traceId: 'corr-id' });
+    tracer.recordEvent(span, 'test.event', payload);
+    
+    if (onEvent.mock.calls.length > 0) {
+      expect(JSON.stringify(onEvent.mock.calls[0])).not.toContain('SECRET_VALUE_FOR_EGRESS_TEST');
+    }
+  });
 });
