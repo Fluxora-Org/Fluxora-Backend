@@ -76,6 +76,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # Real Redis for the AdminStateLock integration suite
+      # (tests/state/adminStateLock.concurrentReindex.test.ts). The suite is
+      # gated on REDIS_INTEGRATION=true and asserts distributed-lock
+      # contention and lease-based crash recovery against a live server.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -128,6 +142,11 @@ jobs:
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
           REPLAY_BATCH_SIZE: 100
+          # Run the AdminStateLock real-Redis integration suite against the
+          # Redis service above so lock contention/lease coverage executes on
+          # every CI build instead of staying skipped.
+          REDIS_INTEGRATION: 'true'
+          REDIS_TEST_URL: redis://localhost:6379
         run: pnpm test:coverage:ci
 
       - name: Upload coverage to Codecov
