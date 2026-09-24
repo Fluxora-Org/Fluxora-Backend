@@ -229,6 +229,7 @@ The per-client gauges below expose `ws.bufferedAmount` directly so operators can
 | `fluxora_ws_backpressure_buffered_bytes` | Gauge | `connection_id` (UUID v4) | Current `ws.bufferedAmount` per connected `/ws/streams` client, in bytes. Sampled every 5s by the hub's collector and rounded to non-negative integers. |
 | `fluxora_ws_max_buffered_bytes` | Gauge | — | Maximum `ws.bufferedAmount` observed across all live clients at the most recent sample. Useful for dashboards: spikes here precede drops. |
 | `fluxora_ws_slow_clients` | Gauge | — | Count of live clients whose `bufferedAmount` exceeds the slow threshold (default 1 MiB). |
+| `fluxora_ws_connection_health_total` | Gauge | `status` (closed set: `healthy`, `stalled`, `unhealthy`) | Live connections by health status. `stalled` counts `OPEN` connections whose outbound queue is saturated above `healthProbeStallBytes` (default 1 MiB) — an open-but-not-draining connection is reported as stalled, never healthy. Cardinality is fixed at 3. |
 | `fluxora_ws_broadcast_batch_flush_seconds` | Histogram | — | Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush. Bounded O(1) cardinality (zero labels). |
 
 ### Micro-Batch Broadcast Flush Latency
@@ -265,6 +266,7 @@ The aggregated `fluxora_ws_max_buffered_bytes` and `fluxora_ws_slow_clients` car
 |------------------|---------|-------------|
 | `backpressureCollector.intervalMs` | `5000` | Poll interval. Set to `0` to disable the periodic collector entirely (gauge updates still happen during broadcast / send activity). |
 | `backpressureCollector.slowThresholdBytes` | `1048576` (1 MiB) | Threshold above which a client is counted in `fluxora_ws_slow_clients`. |
+| `healthProbeStallBytes` | `1048576` (1 MiB) | Outbound `bufferedAmount` above which an `OPEN` connection is counted in `fluxora_ws_connection_health_total{status="stalled"}` instead of `healthy`. Defaults to `BACKPRESSURE_DROP_BYTES`. |
 
 ### PromQL examples
 
@@ -286,11 +288,18 @@ Alert: more than 5 slow clients sustained over 5 minutes:
 fluxora_ws_slow_clients > 5
 ```
 
+Alert: any open connection stalled beyond a heartbeat interval (2 minutes):
+
+```promql
+fluxora_ws_connection_health_total{status="stalled"} > 0
+```
+
 ### Thresholding strategy
 
 - **`fluxora_ws_slow_clients > 0` for > 2 min**: investigate the highest entries of `topk(5, fluxora_ws_backpressure_buffered_bytes)` and look for one or two clients with `correlation_id` entries repeated in the structured `ws_backpressure` warning logs.
 - **`max(fluxora_ws_backpressure_buffered_bytes) > 4 MiB`** (terminate threshold): one or more clients are about to be force-closed by the hub. Operators can proactively identify the offending connection via `topk(1, fluxora_ws_backpressure_buffered_bytes)`.
 - **`fluxora_ws_max_buffered_bytes` rising without `fluxora_ws_slow_clients` rising**: one client is filling up but stays below the slow threshold — still worth checking `topk(1, ...)` to confirm it's not unbounded.
+- **`fluxora_ws_connection_health_total{status="stalled"} > 0` for > 2 min**: at least one `OPEN` connection is not draining its outbound queue (network partition or wedged consumer). Cross-reference `topk(5, fluxora_ws_backpressure_buffered_bytes)` to identify the peer before the hub escalates to drop/terminate.
 
 ### Affected source files
 
