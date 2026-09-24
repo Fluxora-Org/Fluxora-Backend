@@ -31,12 +31,12 @@
  *   message so stack traces or DB details never leak to clients.
  */
 
-import { Router, type Request } from 'express';
-import { graphql, type GraphQLError } from 'graphql';
+import { Router, type Request, type Response } from 'express';
+import { graphql, parse, type DocumentNode, type GraphQLError, Kind } from 'graphql';
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
+import { authenticate, authenticateApiKey, requireAuth, requireScope } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { errorResponse } from '../utils/response.js';
@@ -53,6 +53,86 @@ const MAX_STREAM_PAGE_SIZE = 100;
 
 /** Maximum page size for audit-log pagination. */
 const MAX_AUDIT_PAGE_SIZE = 100;
+
+/** Maximum query nesting depth allowed. */
+export const MAX_QUERY_DEPTH = 6;
+
+/** Maximum cumulative query complexity allowed. */
+export const MAX_QUERY_COMPLEXITY = 15;
+
+/** Compute query depth across fields, fragment spreads, and inline fragments. */
+export function computeQueryDepth(node: unknown, depth = 0): number {
+  if (!node || typeof node !== 'object') return depth;
+  const astNode = node as { kind?: string; selectionSet?: { selections?: unknown[] }; definitions?: unknown[] };
+  let currentDepth = depth;
+  if (astNode.kind === Kind.FIELD || astNode.kind === Kind.INLINE_FRAGMENT || astNode.kind === Kind.FRAGMENT_SPREAD) {
+    currentDepth += 1;
+  }
+  let max = currentDepth;
+  if (astNode.selectionSet?.selections) {
+    for (const sel of astNode.selectionSet.selections) {
+      const childDepth = computeQueryDepth(sel, currentDepth);
+      if (childDepth > max) max = childDepth;
+    }
+  }
+  if (astNode.definitions) {
+    for (const def of astNode.definitions) {
+      const defDepth = computeQueryDepth(def, 0);
+      if (defDepth > max) max = defDepth;
+    }
+  }
+  return max;
+}
+
+/** Compute query complexity by counting field selections. */
+export function computeQueryComplexity(node: unknown): number {
+  if (!node || typeof node !== 'object') return 0;
+  const astNode = node as { kind?: string; selectionSet?: { selections?: unknown[] }; definitions?: unknown[] };
+  let count = astNode.kind === Kind.FIELD ? 1 : 0;
+  if (astNode.selectionSet?.selections) {
+    for (const sel of astNode.selectionSet.selections) {
+      count += computeQueryComplexity(sel);
+    }
+  }
+  if (astNode.definitions) {
+    for (const def of astNode.definitions) {
+      count += computeQueryComplexity(def);
+    }
+  }
+  return count;
+}
+
+/** Return true if the query attempts schema or type introspection. */
+export function isIntrospectionQuery(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false;
+  const astNode = node as { kind?: string; name?: { value?: string }; selectionSet?: { selections?: unknown[] }; definitions?: unknown[] };
+  if (astNode.kind === Kind.FIELD && (astNode.name?.value === '__schema' || astNode.name?.value === '__type')) {
+    return true;
+  }
+  if (astNode.selectionSet?.selections) {
+    for (const sel of astNode.selectionSet.selections) {
+      if (isIntrospectionQuery(sel)) return true;
+    }
+  }
+  if (astNode.definitions) {
+    for (const def of astNode.definitions) {
+      if (isIntrospectionQuery(def)) return true;
+    }
+  }
+  return false;
+}
+
+/** Helper to reject a request with a standard GraphQL error envelope. */
+export function rejectGraphQLError(res: Response, code: string, message: string): void {
+  res.status(200).json({
+    errors: [
+      {
+        message,
+        extensions: { code },
+      },
+    ],
+  });
+}
 
 // ── Persisted-query helpers ───────────────────────────────────────────────────
 
@@ -141,7 +221,7 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  * Root value object passed to `graphql()` — each key corresponds to a
  * field on the root `Query` type.
  */
-function createRootValue(_req: Request) {
+function createRootValue(req: Request) {
   return {
     /**
      * Fetch a single stream by ID.
@@ -275,7 +355,8 @@ export const graphqlGatewayRouter = Router();
 graphqlGatewayRouter.post(
   '/',
   authenticate,
-  requireAuth,
+  authenticateApiKey,
+  requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
     const requestId = req.correlationId;
 
@@ -305,88 +386,138 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
+        const persistedQuery = (extensions as Record<string, unknown>).persistedQuery;
+        if (persistedQuery !== undefined && persistedQuery !== null) {
+          if (typeof persistedQuery !== 'object' || Array.isArray(persistedQuery)) {
+            res.status(400).json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid persistedQuery payload.', undefined, requestId));
+            return;
+          }
 
-        if (version !== 1) {
-          res
-            .status(400)
-            .json(
-              errorResponse(
-                'PERSISTED_QUERY_UNSUPPORTED_VERSION',
-                'Unsupported persisted query version.',
-                undefined,
-                requestId
-              )
-            );
-          return;
-        }
+          const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
 
-        if (typeof sha256Hash !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256Hash)) {
-          res
-            .status(400)
-            .json(
-              errorResponse(
-                'PERSISTED_QUERY_INVALID_HASH',
-                'Persisted query hash must be a SHA-256 hex string.',
-                undefined,
-                requestId
-              )
-            );
-          return;
-        }
-
-        const hash = sha256Hash.toLowerCase();
-
-        if (source !== undefined) {
-          if (typeof source !== 'string') {
+          if (version !== 1) {
             res
               .status(400)
-              .json(errorResponse('VALIDATION_ERROR', 'GraphQL query must be a string.', undefined, requestId));
+              .json(
+                errorResponse(
+                  'PERSISTED_QUERY_UNSUPPORTED_VERSION',
+                  'Unsupported persisted query version.',
+                  undefined,
+                  requestId
+                )
+              );
             return;
           }
 
-          const actualHash = hashQuery(source);
-          if (actualHash !== hash) {
-            res.status(200).json({
-              errors: [
-                {
-                  message: 'PersistedQueryHashMismatch',
-                  extensions: { code: 'PERSISTED_QUERY_HASH_MISMATCH' },
-                },
-              ],
-            });
+          if (typeof sha256Hash !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256Hash)) {
+            res
+              .status(400)
+              .json(
+                errorResponse(
+                  'PERSISTED_QUERY_INVALID_HASH',
+                  'Persisted query hash must be a SHA-256 hex string.',
+                  undefined,
+                  requestId
+                )
+              );
             return;
           }
 
-          persistedQueryStore.set(hash, source);
-        } else {
-          const cachedQuery = persistedQueryStore.get(hash);
-          if (!cachedQuery) {
-            res.status(200).json({
-              errors: [
-                {
-                  message: 'PersistedQueryNotFound',
-                  extensions: { code: 'PERSISTED_QUERY_NOT_FOUND' },
-                },
-              ],
-            });
-            return;
+          const hash = sha256Hash.toLowerCase();
+
+          if (source !== undefined) {
+            if (typeof source !== 'string') {
+              res
+                .status(400)
+                .json(errorResponse('VALIDATION_ERROR', 'GraphQL query must be a string.', undefined, requestId));
+              return;
+            }
+
+            const actualHash = hashQuery(source);
+            if (actualHash !== hash) {
+              res.status(200).json({
+                errors: [
+                  {
+                    message: 'PersistedQueryHashMismatch',
+                    extensions: { code: 'PERSISTED_QUERY_HASH_MISMATCH' },
+                  },
+                ],
+              });
+              return;
+            }
+
+            persistedQueryStore.set(hash, source);
+          } else {
+            const cachedQuery = persistedQueryStore.get(hash);
+            if (!cachedQuery) {
+              res.status(200).json({
+                errors: [
+                  {
+                    message: 'PersistedQueryNotFound',
+                    extensions: { code: 'PERSISTED_QUERY_NOT_FOUND' },
+                  },
+                ],
+              });
+              return;
+            }
+            source = cachedQuery;
           }
-          source = cachedQuery;
         }
       }
-    }
 
-    if (!source || typeof source !== 'string') {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'VALIDATION_ERROR',
-            'GraphQL request must include a "query" string field.',
-            undefined,
-            requestId
-          )
+      if (!source || typeof source !== 'string') {
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'VALIDATION_ERROR',
+              'GraphQL request must include a "query" string field.',
+              undefined,
+              requestId
+            )
+          );
+        return;
+      }
+
+      // ── Static Query Enforcement ───────────────────────────────────────────
+      let document: DocumentNode;
+      try {
+        document = parse(source);
+      } catch (parseError) {
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'GRAPHQL_PARSE_ERROR',
+              'GraphQL query could not be parsed.',
+              undefined,
+              requestId
+            )
+          );
+        return;
+      }
+
+      if (isIntrospectionQuery(document)) {
+        rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
+        return;
+      }
+
+      const queryDepth = computeQueryDepth(document);
+      if (queryDepth > MAX_QUERY_DEPTH) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_DEEP',
+          `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
+        );
+        return;
+      }
+
+      const queryComplexity = computeQueryComplexity(document);
+      if (queryComplexity > MAX_QUERY_COMPLEXITY) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_COMPLEX',
+          `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
         );
         return;
       }
@@ -406,13 +537,20 @@ graphqlGatewayRouter.post(
 
       // ── Sanitise errors ─────────────────────────────────────────────────────
       if (result.errors && result.errors.length > 0) {
-        result.errors = result.errors.map((err) => ({
-          ...err,
-          message: sanitiseGraphQLError(err.message),
-          ...(err.extensions
-            ? { extensions: sanitiseExtensions(err.extensions) }
-            : {}),
-        }) as unknown as GraphQLError);
+        result.errors = result.errors.map((err) => {
+          if ((err as { originalError?: unknown }).originalError instanceof GraphQLScopeDeniedError) {
+            return {
+              ...err,
+              message: 'Insufficient scopes to perform this operation',
+              extensions: { code: 'FORBIDDEN' },
+            } as unknown as GraphQLError;
+          }
+          return {
+            ...err,
+            message: sanitiseGraphQLError(err.message),
+            ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
+          } as unknown as GraphQLError;
+        });
       }
 
       res.json(result);
@@ -430,88 +568,7 @@ graphqlGatewayRouter.post(
         ],
       });
     }
-
-    // Static Query Enforcement (Your addition)
-    let document: DocumentNode;
-    try {
-      document = parse(source);
-    } catch (parseError) {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'GRAPHQL_PARSE_ERROR',
-            'GraphQL query could not be parsed.',
-            undefined,
-            requestId
-          )
-        );
-      return;
-    }
-
-    if (isIntrospectionQuery(document)) {
-      rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
-      return;
-    }
-
-    const queryDepth = computeQueryDepth(document);
-    if (queryDepth > MAX_QUERY_DEPTH) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_DEEP',
-        `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
-      );
-      return;
-    }
-
-    const queryComplexity = computeQueryComplexity(document);
-    if (queryComplexity > MAX_QUERY_COMPLEXITY) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_COMPLEX',
-        `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
-      );
-      return;
-    }
-
-    // Execute GraphQL Query
-    const rootValue = createRootValue(req);
-    const context = { req, res, requestId };
-
-    const result = await graphql({
-      schema: executableSchema,
-      source,
-      rootValue,
-      contextValue: context,
-      variableValues: variables ?? undefined,
-      operationName: operationName ?? undefined,
-    });
-
-    if (result.errors && result.errors.length > 0) {
-      result.errors = result.errors.map((err) => ({
-        ...err,
-        message: sanitiseGraphQLError(err.message),
-        ...(err.extensions ? { extensions: sanitiseExtensions(err.extensions) } : {}),
-      })) as unknown as typeof result.errors;
-    }
-
-    res.json(result);
-  } catch (err) {
-    logger.error('GraphQL gateway unexpected error', requestId, {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    res.status(500).json({
-      errors: [
-        {
-          message: 'Internal server error',
-          extensions: { code: 'INTERNAL_ERROR' },
-        },
-      ],
-    });
-  }
-});
-
-// ── Error sanitisation ─────────────────────────────────────────────────────────
+  });
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────
 
@@ -519,6 +576,10 @@ graphqlGatewayRouter.post(
  * Sanitise a GraphQL error message so internal details are never leaked.
  */
 function sanitiseGraphQLError(message: string): string {
+  if (/(?:postgresql|postgres|redis):\/\//i.test(message)) {
+    return 'An unexpected error occurred';
+  }
+
   const sanitised = sanitiseErrorMessage(message)
     .replace(/\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.ts:\d+:\d+/g, '[redacted-path]')
     .replace(/Error: /g, '')
@@ -559,7 +620,8 @@ function sanitiseExtensions(
 graphqlGatewayRouter.get(
   '/',
   authenticate,
-  requireAuth,
+  authenticateApiKey,
+  requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
     if (!isGraphQLGatewayEnabled(req)) {
       res.status(200).json({

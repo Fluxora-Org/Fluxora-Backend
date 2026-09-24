@@ -110,8 +110,7 @@ import {
 } from '../validation/schemas.js';
 import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
-import { isTerminalStatus } from '../streams/status.js';
-import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
+import { streamsCreatedTotal } from '../metrics/businessMetrics.js';
 import { isValidStreamStatus } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { recordServerTimingPhase } from '../middleware/serverTiming.js';
@@ -137,8 +136,6 @@ import {
 } from '../streams/longPoll.js';
 import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
 import {
-  RedisIdempotencyStore,
-  NoOpIdempotencyStore,
   InMemoryIdempotencyStore,
   type IdempotencyStore,
   ENVELOPE_VERSION,
@@ -1782,7 +1779,7 @@ streamsRouter.get(
 
           if (foundEvent) return;
         } catch (err) {
-          if (err instanceof StaleCursorError || (err as any)?.name === 'StaleCursorError') {
+          if (err instanceof StaleCursorError || (err as { name?: string })?.name === 'StaleCursorError') {
             cleanup('stale_cursor');
             throw validationError(
               'Replay cursor no longer exists; resync from fromLedger',

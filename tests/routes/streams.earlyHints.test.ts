@@ -195,7 +195,7 @@ describe('sendEarlyHints', () => {
 
     // Now writeProcessing should have been called
     expect(res.writeProcessing).toHaveBeenCalledTimes(1);
-    const call = (res.writeProcessing as any).mock.calls[0];
+    const call = (res.writeProcessing as unknown as { mock: { calls: string[][] } }).mock.calls[0];
     expect(call[0]).toBe('Link');
     expect(call[1]).toContain('rel="next"');
     expect(call[1]).toContain('cursorABC123');
@@ -211,7 +211,7 @@ describe('sendEarlyHints', () => {
 
     await new Promise((resolve) => setImmediate(resolve));
 
-    const call = (res.writeProcessing as any).mock.calls[0];
+    const call = (res.writeProcessing as unknown as { mock: { calls: string[][] } }).mock.calls[0];
     expect(call[1]).toContain('status=active');
     expect(call[1]).toContain('sender=GABC123');
   });
@@ -228,7 +228,7 @@ describe('sendEarlyHints', () => {
   });
 
   it('handles writeProcessing errors gracefully', async () => {
-    (res.writeProcessing as any) = vi.fn(() => {
+    (res as unknown as { writeProcessing: unknown }).writeProcessing = vi.fn(() => {
       throw new Error('writeProcessing failed');
     });
 
@@ -287,8 +287,8 @@ describe('sendEarlyHintsWithBoth', () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(res.writeProcessing).toHaveBeenCalledTimes(2);
-    const calls = (res.writeProcessing as any).mock.calls;
-    const linkValues = calls.map((c: any[]) => c[1]);
+    const calls = (res.writeProcessing as unknown as { mock: { calls: string[][] } }).mock.calls;
+    const linkValues = calls.map((c: string[]) => c[1]);
 
     // Check for next and prev relations
     expect(linkValues.some((l: string) => l.includes('rel="next"'))).toBe(true);
@@ -308,7 +308,7 @@ describe('sendEarlyHintsWithBoth', () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(res.writeProcessing).toHaveBeenCalledTimes(1);
-    const call = (res.writeProcessing as any).mock.calls[0];
+    const call = (res.writeProcessing as unknown as { mock: { calls: string[][] } }).mock.calls[0];
     expect(call[1]).toContain('rel="next"');
   });
 
@@ -326,7 +326,7 @@ describe('sendEarlyHintsWithBoth', () => {
 
     // Only next link should be sent
     expect(res.writeProcessing).toHaveBeenCalledTimes(1);
-    const call = (res.writeProcessing as any).mock.calls[0];
+    const call = (res.writeProcessing as unknown as { mock: { calls: string[][] } }).mock.calls[0];
     expect(call[1]).toContain('rel="next"');
   });
 
@@ -379,10 +379,10 @@ vi.mock('../../src/db/pool.js', () => ({
 
 // Mock authentication middleware to allow requests
 vi.mock('../../src/middleware/auth.js', () => ({
-  authenticateApiKey: (_req: any, _res: any, next: any) => next(),
-  requireScope: () => (_req: any, _res: any, next: any) => next(),
-  authenticate: (_req: any, _res: any, next: any) => next(),
-  requireAuth: (_req: any, _res: any, next: any) => next(),
+  authenticateApiKey: (_req: unknown, _res: unknown, next: () => void) => next(),
+  requireScope: () => (_req: unknown, _res: unknown, next: () => void) => next(),
+  authenticate: (_req: unknown, _res: unknown, next: () => void) => next(),
+  requireAuth: (_req: unknown, _res: unknown, next: () => void) => next(),
 }));
 
 function makeRow(id: string) {

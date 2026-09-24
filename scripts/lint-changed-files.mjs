@@ -23,15 +23,36 @@ const ROOT = new URL('../', import.meta.url);
 const pathname = (p) => new URL(p, ROOT).pathname;
 
 /**
+ * Verify whether a git reference resolves to a valid commit object.
+ */
+export function refExists(ref) {
+  const check = spawnSync(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
+    { cwd: pathname('.'), encoding: 'utf8' },
+  );
+  return check.status === 0;
+}
+
+/**
  * Base revision to diff against. For PRs we diff against the merged base
  * branch so the change set is exactly what this PR introduces. Locally the
  * documented rollout default is the shared `origin/main`.
  */
 export function baseRef() {
+  if (process.env.LINT_BASE) {
+    return process.env.LINT_BASE;
+  }
   if (process.env.CI && process.env.GITHUB_EVENT_NAME === 'pull_request' && process.env.GITHUB_BASE_REF) {
     return `origin/${process.env.GITHUB_BASE_REF}`;
   }
-  return process.env.LINT_BASE || 'upstream/main';
+  if (refExists('origin/main')) {
+    return 'origin/main';
+  }
+  if (refExists('main')) {
+    return 'main';
+  }
+  return 'origin/main';
 }
 
 /**
@@ -40,8 +61,8 @@ export function baseRef() {
  * honoured for testing and ad-hoc single-file runs.
  */
 export function changedTypeScriptFiles(base = baseRef()) {
-  if (process.env.LINT_FILES) {
-    return process.env.LINT_FILES.split('\n').filter((f) => f.endsWith('.ts'));
+  if (process.env.LINT_FILES !== undefined) {
+    return process.env.LINT_FILES ? process.env.LINT_FILES.split('\n').filter((f) => f.endsWith('.ts')) : [];
   }
   const diff = spawnSync(
     'git',
@@ -49,7 +70,11 @@ export function changedTypeScriptFiles(base = baseRef()) {
     { cwd: pathname('.'), encoding: 'utf8' },
   );
   if (diff.status !== 0) {
-    throw new Error(`Unable to determine changed files against ${base}: ${diff.stderr.trim()}`);
+    const stderr = diff.stderr.trim();
+    const hint = stderr.includes('unknown revision') || stderr.includes('ambiguous argument')
+      ? ` Ensure '${base}' is fetched and available (in GitHub Actions, set 'fetch-depth: 0' on actions/checkout).`
+      : '';
+    throw new Error(`Unable to determine changed files against ${base}: ${stderr}.${hint}`);
   }
   return diff.stdout
     .split('\n')

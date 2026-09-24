@@ -4,10 +4,8 @@ import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from '.
 import {
   getPinnedAddressNetwork,
   isValidStellarContractAddress,
-  STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
   type PinnedStellarAddressKind,
-  type PinnedStellarNetwork,
 } from './stellarContracts.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
 export {
