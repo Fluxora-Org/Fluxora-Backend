@@ -22,8 +22,78 @@
  * @module utils/earlyHints
  */
 
-import type { Response } from 'express';
+import type { IncomingMessage } from 'node:http';
+import type { Request, Response } from 'express';
 import { debug, warn } from './logger.js';
+import { getConfig } from '../config/env.js';
+
+/**
+ * Standard HTTP request header used by clients to advertise support for HTTP 103 Early Hints.
+ */
+export const EARLY_HINTS_HEADER = 'early-hints';
+
+/**
+ * Helper to extract a header string value safely across Express Request and raw Node IncomingMessage.
+ */
+function getHeaderValue(req: Request | IncomingMessage, name: string): string | undefined {
+  if (typeof (req as Request).header === 'function') {
+    const val = (req as Request).header(name);
+    if (val !== undefined) return val;
+  }
+  const val = req.headers?.[name.toLowerCase()];
+  if (Array.isArray(val)) return val[0];
+  return val;
+}
+
+/**
+ * Determine whether a client advertises support for HTTP 103 Early Hints.
+ *
+ * Early hints are an optimization. Sending 1xx informational responses to clients
+ * or intermediaries that do not understand them can cause connection drops or protocol
+ * framing errors.
+ *
+ * A client advertises support by sending one of the following request headers:
+ * - `Early-Hints: 1` (or `true`)
+ * - `X-Early-Hints: 1` (or `true`)
+ * - `Accept-Early-Hints: 1` (or `true`)
+ *
+ * @param req - Express Request or Node.js IncomingMessage
+ * @returns true if the client explicitly advertised support for Early Hints
+ */
+export function clientSupportsEarlyHints(req?: Request | IncomingMessage): boolean {
+  if (!req) return false;
+
+  const values = [
+    getHeaderValue(req, 'early-hints'),
+    getHeaderValue(req, 'x-early-hints'),
+    getHeaderValue(req, 'accept-early-hints'),
+  ];
+
+  return values.some(
+    (v) => v !== undefined && (v === '1' || v.toLowerCase() === 'true')
+  );
+}
+
+/**
+ * Helper to check whether Early Hints is globally enabled in config.
+ * Falls back to process.env.EARLY_HINTS_ENABLED if getConfig() is not yet initialized.
+ */
+export function isEarlyHintsConfigEnabled(): boolean {
+  if (
+    process.env['EARLY_HINTS_ENABLED'] === 'false' ||
+    process.env['EARLY_HINTS_ENABLED'] === '0' ||
+    process.env['ENABLE_EARLY_HINTS'] === 'false' ||
+    process.env['ENABLE_EARLY_HINTS'] === '0'
+  ) {
+    return false;
+  }
+
+  try {
+    return getConfig().earlyHintsEnabled;
+  } catch {
+    return true;
+  }
+}
 
 /**
  * Configuration for Early Hints generation.
@@ -39,6 +109,16 @@ export interface EarlyHintsConfig {
   queryParams?: Record<string, string>;
   /** Maximum number of Link headers to send in Early Hints (advisory). */
   maxLinks?: number;
+  /**
+   * Explicit override for client support check (e.g., for testing or programmatic control).
+   * When specified, overrides inspecting request headers.
+   */
+  clientSupportsHints?: boolean;
+  /**
+   * Explicit override for enabling/disabling Early Hints.
+   * When specified, overrides global EARLY_HINTS_ENABLED configuration.
+   */
+  enabled?: boolean;
 }
 
 /**
