@@ -369,6 +369,12 @@ vi.mock('../../src/db/pool.js', () => ({
       this.name = 'PoolExhaustedError';
     }
   },
+  QueryTimeoutError: class QueryTimeoutError extends Error {
+    constructor() {
+      super('query timeout');
+      this.name = 'QueryTimeoutError';
+    }
+  },
 }));
 
 // Mock authentication middleware to allow requests
@@ -577,5 +583,59 @@ describe('GET /api/streams — Early Hints integration', () => {
 
     expect(response.body.data).toHaveProperty('total');
     expect(response.body.data.total).toBe(100);
+  });
+
+  it('delivers identical response payloads whether client advertises Early-Hints or not', async () => {
+    const rows = [makeRow('stream1'), makeRow('stream2')];
+    mockFindWithCursor.mockResolvedValue({
+      streams: rows,
+      hasMore: true,
+    });
+
+    // Request with Early-Hints advertised
+    const supportingRes = await request(app)
+      .get('/api/streams')
+      .set('Early-Hints', '1')
+      .expect(200);
+
+    // Request without Early-Hints (non-supporting client or intermediary stripped)
+    const nonSupportingRes = await request(app)
+      .get('/api/streams')
+      .expect(200);
+
+    expect(supportingRes.body.data.has_more).toBe(true);
+    expect(nonSupportingRes.body.data.has_more).toBe(true);
+    expect(supportingRes.body.data.streams).toEqual(nonSupportingRes.body.data.streams);
+    expect(supportingRes.body.data.next_cursor).toEqual(nonSupportingRes.body.data.next_cursor);
+    expect(supportingRes.body.data).toEqual(nonSupportingRes.body.data);
+    expect(supportingRes.body.success).toBe(nonSupportingRes.body.success);
+  });
+
+  it('serves valid responses when Early Hints feature is disabled by configuration', async () => {
+    const originalEnv = process.env['EARLY_HINTS_ENABLED'];
+    process.env['EARLY_HINTS_ENABLED'] = 'false';
+
+    try {
+      const rows = [makeRow('stream1'), makeRow('stream2')];
+      mockFindWithCursor.mockResolvedValueOnce({
+        streams: rows,
+        hasMore: true,
+      });
+
+      const response = await request(app)
+        .get('/api/streams')
+        .set('Early-Hints', '1')
+        .expect(200);
+
+      expect(response.body.data.has_more).toBe(true);
+      expect(response.body.data.streams).toHaveLength(2);
+      expect(typeof response.body.data.next_cursor).toBe('string');
+    } finally {
+      if (originalEnv !== undefined) {
+        process.env['EARLY_HINTS_ENABLED'] = originalEnv;
+      } else {
+        delete process.env['EARLY_HINTS_ENABLED'];
+      }
+    }
   });
 });
