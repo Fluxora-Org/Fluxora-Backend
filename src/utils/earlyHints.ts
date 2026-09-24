@@ -176,6 +176,8 @@ export function isSafeCursor(cursor: string): boolean {
  * is not supported, this function silently degrades.
  *
  * Design:
+ * - Checks if Early Hints is enabled via configuration
+ * - Checks if the client advertised support for Early Hints (safe degradation)
  * - Checks if the client supports HTTP/2 or HTTP/1.1 with Early Hints
  * - Builds a Link header for the next page (if hasMore && nextCursor provided)
  * - Writes the 103 response without waiting or blocking the current handler
@@ -188,10 +190,27 @@ export function isSafeCursor(cursor: string): boolean {
  *
  * @param res - Express response object
  * @param config - configuration including base URL, cursor, and query params
+ * @param req - optional Express Request for client capability checking (defaults to res.req)
  * @returns void (fire-and-forget; never throws)
  */
-export function sendEarlyHints(res: Response, config: EarlyHintsConfig): void {
+export function sendEarlyHints(res: Response, config: EarlyHintsConfig, req?: Request): void {
   try {
+    // Feature flag guard: verify Early Hints is enabled
+    const isEnabled = config.enabled ?? isEarlyHintsConfigEnabled();
+    if (!isEnabled) {
+      debug('Early Hints: feature disabled by configuration, skipping 103');
+      return;
+    }
+
+    // Client capability guard: verify client advertised support
+    const request = req ?? (res.req as Request | undefined);
+    const clientSupported =
+      config.clientSupportsHints ?? (request ? clientSupportsEarlyHints(request) : true);
+    if (!clientSupported) {
+      debug('Early Hints: client did not advertise support, skipping 103');
+      return;
+    }
+
     // Early return: if response has started, we cannot send informational responses
     if (res.headersSent) {
       debug('Early Hints: response already started, skipping 103');
@@ -265,6 +284,8 @@ export function sendEarlyHints(res: Response, config: EarlyHintsConfig): void {
  * @param nextCursor - opaque cursor for the next page
  * @param prevCursor - opaque cursor for the previous page (optional)
  * @param queryParams - query parameters to preserve
+ * @param req - optional Express Request for client capability checking (defaults to res.req)
+ * @param options - optional overrides for enabled flag and clientSupportsHints
  * @returns void
  */
 export function sendEarlyHintsWithBoth(
@@ -274,8 +295,24 @@ export function sendEarlyHintsWithBoth(
   nextCursor?: string | null,
   prevCursor?: string | null,
   queryParams?: Record<string, string>,
+  req?: Request,
+  options?: { enabled?: boolean; clientSupportsHints?: boolean },
 ): void {
   try {
+    const isEnabled = options?.enabled ?? isEarlyHintsConfigEnabled();
+    if (!isEnabled) {
+      debug('Early Hints (multi): feature disabled by configuration, skipping 103');
+      return;
+    }
+
+    const request = req ?? (res.req as Request | undefined);
+    const clientSupported =
+      options?.clientSupportsHints ?? (request ? clientSupportsEarlyHints(request) : true);
+    if (!clientSupported) {
+      debug('Early Hints (multi): client did not advertise support, skipping 103');
+      return;
+    }
+
     if (res.headersSent) return;
 
     const links: string[] = [];
@@ -320,3 +357,4 @@ export function sendEarlyHintsWithBoth(
     });
   }
 }
+
