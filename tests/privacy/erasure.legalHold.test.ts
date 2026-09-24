@@ -237,7 +237,7 @@ describe('DELETE /api/privacy/erasure — audit atomicity', () => {
       .set('Authorization', 'Bearer admin-token');
 
     const calls = mockWriteAuditEntryToClient.mock.calls;
-    const gdprCall = calls.find(([_client, action]: [unknown, string]) => action === 'GDPR_ERASURE');
+    const gdprCall = calls.find((args: any[]) => args[1] === 'GDPR_ERASURE');
     expect(gdprCall).toBeDefined();
     // meta should include rowsErased
     expect(gdprCall![5]).toMatchObject({ rowsErased: 2, outcome: 'success' });

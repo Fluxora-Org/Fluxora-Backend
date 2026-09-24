@@ -198,7 +198,7 @@ describe('runRetentionPurge — legal-hold precedence', () => {
     await runRetentionPurge(baseOptions(pool));
 
     const skippedCalls = (recordAuditEventToDb as ReturnType<typeof vi.fn>).mock.calls.filter(
-      ([action]: [string]) => action === 'PURGE_SKIPPED_LEGAL_HOLD',
+      (args: any[]) => args[0] === 'PURGE_SKIPPED_LEGAL_HOLD',
     );
     expect(skippedCalls.length).toBe(2);
   });
@@ -234,7 +234,7 @@ describe('runRetentionPurge — streams redact path', () => {
     await runRetentionPurge(baseOptions(pool));
 
     const updateCalls = client.query.mock.calls
-      .map(([sql]: [string]) => sql)
+      .map((args: any[]) => args[0])
       .filter((s: string) => s.trim().startsWith('UPDATE'));
 
     expect(updateCalls.length).toBeGreaterThanOrEqual(1);
@@ -252,7 +252,7 @@ describe('runRetentionPurge — streams redact path', () => {
     await runRetentionPurge(baseOptions(pool));
 
     const updateCalls = client.query.mock.calls
-      .map(([sql]: [string]) => sql)
+      .map((args: any[]) => args[0])
       .filter((s: string) => s.trim().startsWith('UPDATE'));
 
     const updateSql = updateCalls[0] as string;
@@ -268,7 +268,7 @@ describe('runRetentionPurge — streams redact path', () => {
     await runRetentionPurge(baseOptions(pool));
 
     const updateCalls = client.query.mock.calls
-      .map(([sql]: [string]) => sql)
+      .map((args: any[]) => args[0])
       .filter((s: string) => s.trim().startsWith('UPDATE'));
 
     const updateSql = updateCalls[0] as string;
@@ -291,7 +291,7 @@ describe('runRetentionPurge — dryRun mode', () => {
     const result = await runRetentionPurge(opts);
 
     const mutatingCalls = client.query.mock.calls
-      .map(([sql]: [string]) => sql.trim())
+      .map((args: any[]) => args[0].trim())
       .filter((s: string) => s.startsWith('DELETE') || s.startsWith('UPDATE'));
 
     expect(mutatingCalls).toHaveLength(0);
@@ -314,7 +314,7 @@ describe('runRetentionPurge — dryRun mode', () => {
     await runRetentionPurge({ ...baseOptions(pool), dryRun: true });
 
     const initiatedCalls = (recordAuditEventToDb as ReturnType<typeof vi.fn>).mock.calls.filter(
-      ([action]: [string]) => action === 'PURGE_INITIATED',
+      (args: any[]) => args[0] === 'PURGE_INITIATED',
     );
     expect(initiatedCalls).toHaveLength(0);
   });
@@ -337,7 +337,7 @@ describe('runRetentionPurge — dryRun mode', () => {
     const result = await runRetentionPurge({ ...baseOptions(pool), dryRun: true });
 
     const skippedCalls = (recordAuditEventToDb as ReturnType<typeof vi.fn>).mock.calls.filter(
-      ([action]: [string]) => action === 'PURGE_SKIPPED_LEGAL_HOLD',
+      (args: any[]) => args[0] === 'PURGE_SKIPPED_LEGAL_HOLD',
     );
     expect(skippedCalls).toHaveLength(0);
 
@@ -358,7 +358,7 @@ describe('runRetentionPurge — dryRun mode', () => {
     await runRetentionPurge({ ...baseOptions(pool), dryRun: false });
 
     const skippedCalls = (recordAuditEventToDb as ReturnType<typeof vi.fn>).mock.calls.filter(
-      ([action]: [string]) => action === 'PURGE_SKIPPED_LEGAL_HOLD',
+      (args: any[]) => args[0] === 'PURGE_SKIPPED_LEGAL_HOLD',
     );
     expect(skippedCalls).toHaveLength(1);
   });
@@ -372,7 +372,7 @@ describe('runRetentionPurge — deletion ordering', () => {
     await runRetentionPurge(baseOptions(pool));
 
     const selectSqls = client.query.mock.calls
-      .map(([sql]: [string]) => sql as string)
+      .map((args: any[]) => args[0] as string)
       .filter((s: string) => s.includes('FOR UPDATE SKIP LOCKED'));
 
     expect(selectSqls.length).toBeGreaterThan(0);
@@ -404,7 +404,7 @@ describe('runRetentionPurge — PURGE_INITIATED audit', () => {
 
     // Two batches with purged > 0 → two PURGE_INITIATED INSERT statements via client.query
     const insertAuditCalls = client.query.mock.calls
-      .map(([sql]: [string]) => sql)
+      .map((args: any[]) => args[0])
       .filter((s: string) => s.includes('PURGE_INITIATED'));
 
     expect(insertAuditCalls.length).toBe(2);
@@ -450,7 +450,7 @@ describe('runRetentionPurge — partial batch termination', () => {
     // One SELECT for the partial batch + one empty SELECT = 2 FOR-UPDATE-SKIP-LOCKED calls
     // for the streams rule. Plus one each for audit_logs and webhook_outbox = 4 total.
     const selectCalls = client.query.mock.calls
-      .map(([sql]: [string]) => sql)
+      .map((args: any[]) => args[0])
       .filter((s: string) => s.includes('FOR UPDATE SKIP LOCKED'));
     expect(selectCalls.length).toBe(4); // audit_logs:1, streams:2, webhook_outbox:1
   });

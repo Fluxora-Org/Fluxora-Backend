@@ -772,7 +772,7 @@ graphqlGatewayRouter.post(
       return;
     }
 
-    // Execute GraphQL Query
+    // ── Execute query ───────────────────────────────────────────────────────
     const rootValue = createRootValue(req);
     const context = { req, res, requestId };
 
@@ -785,6 +785,7 @@ graphqlGatewayRouter.post(
       operationName: operationName ?? undefined,
     });
 
+    // ── Sanitise errors ─────────────────────────────────────────────────────
     if (result.errors && result.errors.length > 0) {
       result.errors = result.errors.map((err) => {
         if ((err as { originalError?: unknown }).originalError instanceof GraphQLScopeDeniedError) {
@@ -804,6 +805,7 @@ graphqlGatewayRouter.post(
 
     res.json(result);
   } catch (err) {
+    // Catch-all for internal errors that the graphql() call did not capture.
     logger.error('GraphQL gateway unexpected error', requestId, {
       error: err instanceof Error ? err.message : String(err),
     });

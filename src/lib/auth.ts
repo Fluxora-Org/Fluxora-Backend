@@ -74,15 +74,15 @@ export function generateToken(payload: UserPayload): string {
 export function verifyToken(token: string): UserPayload {
   const { jwtSecret, jwtSecretPrevious } = getConfig();
   
-  const verifyOptions = {
-    algorithms: [JWT_ALGORITHM],
+  const verifyOptions: jwt.VerifyOptions = {
+    algorithms: [JWT_ALGORITHM as jwt.Algorithm],
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
     clockTolerance: CLOCK_TOLERANCE_SECONDS,
-  } as const;
+  };
 
   try {
-    return jwt.verify(token, jwtSecret, verifyOptions) as UserPayload;
+    return jwt.verify(token, jwtSecret, verifyOptions) as unknown as UserPayload;
   } catch (error) {
     if (jwtSecretPrevious) {
       try {

@@ -47,8 +47,7 @@ const mockClient: RedisClient = {
   close: vi.fn(),
   del: vi.fn(),
   multi: vi.fn() as any,
-  zcount: vi.fn(),
-};
+  zcount: vi.fn(), incr: vi.fn(), };
 
 const mockFactory: RedisClientFactory = {
   createClient: async () => mockClient,

@@ -957,7 +957,16 @@ streamsRouter.post(
     }
 
     const requestFingerprint = fingerprintInput(normalizedInput);
-    const existingResponse = await idempotencyStore.get(idempotencyKey);
+    const tenantId = req.keyId || req.user?.address || 'anonymous';
+    const existingResponse = await idempotencyStore.get(idempotencyKey, tenantId);
+
+    if (existingResponse === 'in_progress') {
+      throw new ApiError(
+        409,
+        ApiErrorCode.CONFLICT,
+        'A request with this Idempotency-Key is currently in progress',
+      );
+    }
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
@@ -1020,6 +1029,7 @@ streamsRouter.post(
     const responseEnvelope = successResponse(stream, requestId);
     await idempotencyStore.set(
       idempotencyKey,
+      tenantId,
       { version: ENVELOPE_VERSION, requestFingerprint, statusCode: 201, body: responseEnvelope },
       idempotencyTtlSeconds,
     );
