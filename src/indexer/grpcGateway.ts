@@ -31,10 +31,8 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import protobuf from 'protobufjs';
 import { getConfig } from '../config/env.js';
-import {
-  indexerIngestionService,
-  indexerService,
-} from './service.js';
+import { indexerIngestionService } from './ingestion.js';
+import { indexerService } from './service.js';
 import { logger } from '../lib/logger.js';
 import { ReplayRequestSchema } from '../validation/schemas.js';
 

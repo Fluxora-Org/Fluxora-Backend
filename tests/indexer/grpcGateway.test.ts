@@ -18,11 +18,13 @@ import * as grpc from '@grpc/grpc-js';
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 // Mock the indexer service singletons so tests never touch the DB.
-vi.mock('../../src/indexer/service.js', () => ({
+vi.mock('../../src/indexer/ingestion.js', () => ({
   indexerIngestionService: {
     ingest: vi.fn(),
     getEvents: vi.fn(),
   },
+}));
+vi.mock('../../src/indexer/service.js', () => ({
   indexerService: {
     replayEvents: vi.fn(),
     getReplayProgress: vi.fn(),
@@ -55,7 +57,8 @@ import {
   GRPC_GATEWAY_MAX_MESSAGE_BYTES,
   GRPC_GATEWAY_DEADLINE_MS,
 } from '../../src/indexer/grpcGateway.js';
-import { indexerIngestionService, indexerService } from '../../src/indexer/service.js';
+import { indexerIngestionService } from '../../src/indexer/ingestion.js';
+import { indexerService } from '../../src/indexer/service.js';
 import { getConfig } from '../../src/config/env.js';
 
 // Typed mocks for convenience

@@ -30,8 +30,8 @@ import {
   INDEXER_RATE_LIMIT_WINDOW_MS,
   defaultIndexerEventStore,
   indexerIngestionService,
-  indexerService,
-} from '../indexer/service.js';
+} from '../indexer/ingestion.js';
+import { indexerService } from '../indexer/service.js';
 import { IndexerDependencyState } from '../indexer/types.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { successResponse, errorResponse } from '../utils/response.js';
