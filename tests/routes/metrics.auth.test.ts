@@ -77,7 +77,6 @@ describe('GET /metrics auth', () => {
     expect(res.text).toContain('# HELP');
   });
 
-  it('returns 503 and logs warning when ADMIN_API_KEY is not configured', async () => {
   it('health endpoint remains unauthenticated', async () => {
     const res = await request(app).get('/health');
     expect(res.status).toBe(200);
@@ -145,6 +144,9 @@ describe('GET /metrics auth', () => {
       .get('/metrics')
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(503);
+    expect(res.body).toEqual({
+      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
+    });
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Admin authorization refused — ADMIN_API_KEY is not configured'),
       expect.objectContaining({
@@ -170,9 +172,6 @@ describe('GET /metrics auth', () => {
 
     // No raw secret tokens
     expect(metricsText).not.toContain(ADMIN_KEY);
-    expect(res.body).toEqual({
-      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
-    });
   });
 
   it('returns 500 when metrics generation fails', async () => {

@@ -31,7 +31,7 @@ import {
   defaultIndexerEventStore,
   indexerIngestionService,
 } from '../indexer/ingestion.js';
-import { indexerService } from '../indexer/service.js';
+import {
   indexerService,
   replayLock,
   replayState,
@@ -202,6 +202,10 @@ indexerRouter.post(
     if (from_block !== undefined && to_block !== undefined && from_block > to_block) {
       res.status(400).json(
         errorResponse('VALIDATION_ERROR', 'from_block cannot be greater than to_block', undefined, requestId),
+      );
+      return;
+    }
+
     // Guard against concurrent control operations
     if (replayLock.isHeld() || indexerService.getReplayProgress().isReplaying) {
       res.status(409).json(
@@ -232,12 +236,6 @@ indexerRouter.post(
       ledger,
       from_block,
       to_block,
-    indexerService.replayEvents({ contract_id, ledger, from_block, to_block }).catch((err: unknown) => {
-      logger.error('Replay failed', correlationId, {
-        contract_id,
-        ledger,
-        error: err instanceof Error ? err.message : String(err),
-      });
     });
 
     indexerService.replayEvents({ contract_id, ledger, from_block, to_block })
