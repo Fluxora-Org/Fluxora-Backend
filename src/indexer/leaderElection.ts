@@ -49,6 +49,7 @@
 import * as crypto from 'node:crypto';
 import type { RedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
+import { indexerLeaderElectionFailuresTotal } from '../metrics/indexerMetrics.js';
 
 const LEADER_KEY = 'indexer:leader-election:replay';
 const FENCE_KEY = 'indexer:leader-election:replay:fence';
@@ -194,6 +195,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
         instanceId: this.instanceId,
         error: err instanceof Error ? err.message : String(err),
       });
+      indexerLeaderElectionFailuresTotal.inc({ reason: 'acquire_error' });
       this._isLeader = false;
       return false;
     }
@@ -283,6 +285,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
         elapsedMs: elapsed,
         leaseMs: this.leaseMs,
       });
+      indexerLeaderElectionFailuresTotal.inc({ reason: 'clock_anomaly' });
       this._isLeader = false;
       this.stopHeartbeat();
       return;
@@ -314,6 +317,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
         instanceId: this.instanceId,
         error: err instanceof Error ? err.message : String(err),
       });
+      indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_error' });
       this._isLeader = false;
       this.stopHeartbeat();
     }
