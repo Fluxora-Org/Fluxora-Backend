@@ -68,20 +68,58 @@ Fluxora can return a W3C-compatible `Server-Timing` response header for the stre
 
 - Middleware creates a request-scoped registry attached to `res.locals` when `SERVER_TIMING_ENABLED=true`.
 - Streams route handlers record named phases by pushing sanitized values into the registry. Current streams responses include `db` and `serialize`; paths that make Stellar RPC calls may also record `stellar_rpc`.
-- The final header is emitted once per response and contains only phase names and durations.
 - Responses without recorded phases omit the header, even when the feature is enabled.
+- The header is gated by environment and caller to prevent information disclosure and timing-oracle attacks.
+
+### Environment & Caller Gating
+
+To protect backend architecture topology and prevent timing-oracle attacks in production:
+
+1. **Production Configuration (`NODE_ENV=production`)**:
+   - **Absent by default**: Detailed stage timings are absent for public, unauthenticated, and unauthorized callers, regardless of `SERVER_TIMING_ENABLED`.
+   - **Authorized & Opt-in Only**: Timing headers are ONLY emitted if the caller is **both** authorized **and** has explicitly opted in.
+   - **Component Name Masking**: Timing names emitted in production are automatically masked to architecture-neutral, abstract tier names (e.g., `data`, `render`, `upstream`, `lookup`, `job`, `security`) or a generic `process` label. Internal component names (such as `db`, `postgres`, `serialize`, `stellar_rpc`) are never revealed to callers.
+
+2. **Development / Test Configuration (`NODE_ENV !== 'production'`)**:
+   - When `SERVER_TIMING_ENABLED=true`, detailed stage timings (e.g., `db`, `serialize`, `stellar_rpc`) are emitted directly to facilitate local debugging and browser DevTools profiling.
+   - Component name masking can optionally be forced via `SERVER_TIMING_MASK_COMPONENTS=true` or middleware options.
+
+### Authorization Requirements (Production)
+
+A caller is authorized to receive timing metrics in production if any of the following criteria are met:
+- JWT identity carrying an `admin`, `operator`, or `data-protection-officer` role, or an administrative permission (`admin:pause`, `admin:reindex`, `timing:read`).
+- API key (`X-API-Key`) containing `admin`, `operator`, or `timing` scopes.
+- Shared secret match via `Authorization: Bearer <ADMIN_API_KEY>` or dedicated `X-Server-Timing-Key: <SERVER_TIMING_SECRET>`.
+
+### Opt-In Signals
+
+Authorized callers must explicitly opt in to timing emission via any of the following mechanisms:
+- Request Header: `X-Server-Timing: 1` (or `true`, `enabled`)
+- Request Header: `Server-Timing: 1` (or `true`, `enabled`)
+- Request Header: `Prefer: server-timing`
+- Query Parameter: `?timing=1` (or `?timing=true`, `?server-timing=1`)
 
 ### Security guarantees
 
 - The header contains no hostnames, query strings, URLs, or PII.
 - Phase names are restricted to a safe token format and durations are rounded to milliseconds.
+- Internal component names are masked in production so no infrastructure details or component layers are disclosed.
 - The feature is disabled by default and adds negligible overhead when `SERVER_TIMING_ENABLED` is unset or false.
 
-### Example
+### Examples
 
+**Development environment (`NODE_ENV=development`):**
 ```http
 Server-Timing: db;dur=12.5, serialize;dur=3.75
 ```
+
+**Production environment (`NODE_ENV=production`, authorized and opt-in caller):**
+```http
+Server-Timing: data;dur=12.5, render;dur=3.75
+```
+
+**Production environment (unauthorized or default request):**
+*(Header is omitted entirely)*
 
 ### Prometheus Counter
 
@@ -93,6 +131,15 @@ fluxora_db_slow_queries_total{table_hint="streams"} 3
 Counter name: `fluxora_db_slow_queries_total`  
 Label: `table_hint` — the extracted table name (or `unknown`).  
 Scraped at: `GET /metrics`
+
+> Slow queries are counted on the **failure path too**: a query that hangs and is then canceled by `statement_timeout` still increments `fluxora_db_slow_queries_total`, so the counter keeps rising during an incident instead of flatlining.
+
+Every failed query is also recorded by `fluxora_db_query_errors_total{error_type}`, where `error_type` is a bounded enum (`pool_exhausted`, `query_timeout`, `duplicate_entry`, `other`). Alert when the failure rate is non-zero:
+
+```promql
+# warning — any query failing for 5 minutes
+rate(fluxora_db_query_errors_total[5m]) > 0
+```
 
 ## Prometheus scrape configuration
 

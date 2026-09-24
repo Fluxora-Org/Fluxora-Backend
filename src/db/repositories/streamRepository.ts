@@ -56,6 +56,8 @@ import {
   streamSelectColumns,
   senderAddressFilterCondition,
   recipientAddressFilterCondition,
+  StreamQueryBuilder,
+  MAX_STREAM_LIMIT,
 } from '../queries/streams.js';
 
 
@@ -71,7 +73,7 @@ const REPO = 'streamRepository';
  * Both `findWithCursor` (cursor pagination) and `find` (offset pagination)
  * honour this constant so the two paths are always in agreement.
  */
-export const MAX_PAGE_SIZE = 100;
+export const MAX_PAGE_SIZE = MAX_STREAM_LIMIT;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -385,7 +387,8 @@ export const streamRepository = {
     options?: { forcePrimary?: boolean },
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
-      const effectiveLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
+      const builder = new StreamQueryBuilder(limit);
+      const effectiveLimit = builder.effectiveLimit;
       if (effectiveLimit !== limit) {
         debug('findWithCursor: limit clamped', { requested: limit, effective: effectiveLimit });
       }
@@ -430,7 +433,15 @@ export const streamRepository = {
       if (keySet.previous) cursorParams.push(keySet.previous);
 
       const cursorSort = allowlistedSqlIdentifier('id', STREAM_CURSOR_SORT_FIELDS, 'stream cursor sort field');
-      const dataSql = `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${whereCursor} ORDER BY ${cursorSort} ASC LIMIT $${limitParamIndex}`;
+      const dataSql = builder.buildCursorQuery({
+        columns: streamSelectColumns(keyIndex, previousKeyIndex),
+        keyIndex,
+        previousKeyIndex,
+        whereClause: whereCursor,
+        sortField: cursorSort,
+        sortDirection: 'ASC',
+        limitParamIndex,
+      });
       const [dataResult, countResult] = await Promise.all([
         query<Record<string, unknown>>(pool, dataSql, cursorParams),
         includeTotal
@@ -489,7 +500,8 @@ export const streamRepository = {
    */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
-      const effectiveLimit = Math.min(Math.max(pagination.limit, 1), MAX_PAGE_SIZE);
+      const builder = new StreamQueryBuilder(pagination.limit);
+      const effectiveLimit = builder.effectiveLimit;
       if (effectiveLimit !== pagination.limit) {
         debug('find: limit clamped', { requested: pagination.limit, effective: effectiveLimit });
       }
@@ -532,11 +544,22 @@ export const streamRepository = {
       if (keySet.previous) params.push(keySet.previous);
 
       const offsetSort = allowlistedSqlIdentifier('created_at', STREAM_OFFSET_SORT_FIELDS, 'stream offset sort field');
+      const limitParamIndex = params.length + 1;
+      const offsetParamIndex = params.length + 2;
+      const dataSql = builder.buildOffsetQuery({
+        columns: streamSelectColumns(keyIndex, previousKeyIndex),
+        keyIndex,
+        previousKeyIndex,
+        whereClause: where,
+        sortClause: offsetSort,
+        limitParamIndex,
+        offsetParamIndex,
+      });
       const [countResult, dataResult] = await Promise.all([
         query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY ${offsetSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          dataSql,
           [...params, effectiveLimit, pagination.offset],
         ),
       ]);

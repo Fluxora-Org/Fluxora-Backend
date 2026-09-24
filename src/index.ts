@@ -35,6 +35,7 @@ import {
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { prepareReloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
+import { logActiveLogLevel, setLogLevel } from './config/logger.js';
 import { probeStartupDependencies } from './config/health.js';
 import { startTracing } from './tracing/index.js';
 import { initLogsBridge } from './tracing/logsBridge.js';
@@ -48,6 +49,10 @@ let server: ReturnType<typeof app.listen> | undefined;
 if (process.env.NODE_ENV !== 'test') {
   // app.ts calls initializeConfig() at module load, so getConfig() is safe here.
   const cfg = getConfig();
+
+  // Apply and record the effective log level before anything else logs, so the
+  // active threshold for this environment is always visible at startup.
+  logActiveLogLevel({ logLevel: cfg.logLevel, nodeEnv: cfg.nodeEnv });
 
   /**
    * Startup initialization sequence:
@@ -189,7 +194,10 @@ if (process.env.NODE_ENV !== 'test') {
         return () => setRuntimeRateLimitConfig(nextConfig);
       },
       prepareFeatureFlags: () => prepareReloadFlags(),
-      prepareLogLevel: (level) => () => { process.env.LOG_LEVEL = level; },
+      prepareLogLevel: (level) => () => {
+        process.env.LOG_LEVEL = level;
+        setLogLevel(level);
+      },
       onSuccess: (result) => {
         recordConfigReloadSuccess({
           changed: result.changed,

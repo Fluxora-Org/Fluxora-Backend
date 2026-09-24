@@ -62,7 +62,7 @@ import crypto from 'crypto';
 import { logger } from '../lib/logger.js';
 import { traceSpan } from '../tracing/hooks.js';
 import { getCorrelationId } from '../tracing/middleware.js';
-import { dbSlowQueriesTotal, dbPoolActiveConnections, dbPoolIdleConnections, dbPoolWaitingRequests, dbPoolExhaustedTotal } from '../metrics/dbMetrics.js';
+import { dbSlowQueriesTotal, dbPoolActiveConnections, dbPoolIdleConnections, dbPoolWaitingRequests, dbPoolExhaustedTotal, dbQueryErrorsTotal, type DbErrorType } from '../metrics/dbMetrics.js';
 import { syncPoolGauges } from '../metrics/pool.js';
 
 const { Pool } = pg;
@@ -298,6 +298,43 @@ export function extractTableHint(sql: string): string {
 }
 
 /**
+ * Emit slow-query telemetry (structured OCSF log + Prometheus counter) when a
+ * query exceeded the threshold.
+ *
+ * Called from BOTH the success and the failure path. Recording failures keeps
+ * the counter rising while queries are dying (e.g. statement_timeout after a
+ * long hang); if it only ran on success, the dashboard would flatline at the
+ * exact moment an incident starts.
+ */
+function reportSlowQuery(latencyMs: number, thresholdMs: number, sql: string, correlationId?: string): void {
+  if (thresholdMs > 0 && latencyMs < thresholdMs) return;
+  const queryHash = crypto.createHash('sha256').update(sql).digest('hex').slice(0, 16);
+  const tableHint = extractTableHint(sql);
+  logger.slowQuery({
+    query_hash: queryHash,
+    duration_ms: latencyMs,
+    table_hint: tableHint,
+    ...(correlationId ? { correlation_id: correlationId } : {}),
+  });
+  dbSlowQueriesTotal.inc({ table_hint: tableHint });
+}
+
+/**
+ * Classify a failed query into a bounded DbErrorType and increment the
+ * failure counter. Mirrors the error mapping performed below, so every
+ * rejected query() leaves a metric trace with bounded label cardinality.
+ */
+function recordQueryError(err: unknown): void {
+  let errorType: DbErrorType = 'other';
+  if ((err as NodeJS.ErrnoException & { code?: string }).code === PG_QUERY_CANCELED) {
+    errorType = 'query_timeout';
+  } else if ((err as NodeJS.ErrnoException & { code?: string }).code === PG_UNIQUE_VIOLATION) {
+    errorType = 'duplicate_entry';
+  }
+  dbQueryErrorsTotal.inc({ error_type: errorType });
+}
+
+/**
  * Run a query against the pool.
  * - Throws PoolExhaustedError when waiting queue exceeds POOL_QUEUE_LIMIT.
  * - Throws QueryTimeoutError when the query is canceled by statement_timeout (PG 57014).
@@ -316,6 +353,7 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   // This prevents unbounded queuing and gives callers a deterministic 503.
   if (pool.waitingCount >= limit) {
     dbPoolExhaustedTotal.inc();
+    dbQueryErrorsTotal.inc({ error_type: 'pool_exhausted' });
     logger.warn('Postgres pool exhausted', undefined, {
       event: 'pool_exhausted',
       total: pool.totalCount,
@@ -331,20 +369,14 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
     const start = Date.now();
     try {
       const result = await pool.query<T>(sql, params);
-      const latency = Date.now() - start;
-      if (thresholdMs > 0 && latency >= thresholdMs) {
-        const queryHash = crypto.createHash('sha256').update(sql).digest('hex').slice(0, 16);
-        const tableHint = extractTableHint(sql);
-        logger.slowQuery({
-          query_hash: queryHash,
-          duration_ms: latency,
-          table_hint: tableHint,
-          ...(correlationId ? { correlation_id: correlationId } : {}),
-        });
-        dbSlowQueriesTotal.inc({ table_hint: tableHint });
-      }
+      reportSlowQuery(Date.now() - start, thresholdMs, sql, correlationId);
       return result;
     } catch (err) {
+      // Emit failure-path telemetry BEFORE re-throwing so the dashboard
+      // reflects the incident: slow-query counter keeps rising, and the
+      // bounded error_type counter records every failed query.
+      reportSlowQuery(Date.now() - start, thresholdMs, sql, correlationId);
+      recordQueryError(err);
       if ((err as NodeJS.ErrnoException & { code?: string }).code === PG_QUERY_CANCELED) {
         throw new QueryTimeoutError();
       }

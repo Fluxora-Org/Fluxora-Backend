@@ -248,7 +248,11 @@ describe('dropOldPartitions – fixture-driven expiry classification', () => {
       },
     ]);
 
-    const result = await dropOldPartitions(pool, 'contract_events', 30, false);
+    const result = await dropOldPartitions(pool, 'contract_events', 30, {
+      dryRun: false,
+      confirm: true,
+      targetEnvironment: 'staging',
+    });
 
     expect(result.droppedPartitions).toContain('contract_events_2020_01');
     expect(result.droppedPartitions).not.toContain('contract_events_2050_01');
@@ -328,7 +332,11 @@ describe('dropOldPartitions – fixture-driven expiry classification', () => {
       },
     ]);
 
-    const result = await dropOldPartitions(pool, 'contract_events', 30, false);
+    const result = await dropOldPartitions(pool, 'contract_events', 30, {
+      dryRun: false,
+      confirm: true,
+      targetEnvironment: 'staging',
+    });
 
     expect(result.message).not.toContain('[DRY RUN]');
     expect(result.message).toContain('contract_events');
@@ -489,7 +497,11 @@ describe('dropOldPartitions – realistic multi-month partition scenario', () =>
   it('live run executes DROP TABLE for each expired partition in the scenario', async () => {
     const pool = makeFakePool(multiMonthFixture);
 
-    const result = await dropOldPartitions(pool, 'contract_events', 90, false);
+    const result = await dropOldPartitions(pool, 'contract_events', 90, {
+      dryRun: false,
+      confirm: true,
+      targetEnvironment: 'staging',
+    });
 
     const queryCalls = (pool.query as ReturnType<typeof vi.fn>).mock.calls as [string, ...unknown[]][];
     const dropCalls = queryCalls.filter(([sql]) => /DROP/i.test(sql));
@@ -520,5 +532,40 @@ describe('dropOldPartitions – realistic multi-month partition scenario', () =>
     expect(result.droppedPartitions).toContain('ce_2026_01');
     expect(result.droppedPartitions).toContain('ce_2026_02');
     expect(result.droppedPartitions).toContain('ce_2026_04');
+  });
+});
+
+describe('dropOldPartitions – confirmation guards', () => {
+  const expiredPartition = {
+    partition_name: 'contract_events_2020_01',
+    partition_bound: PG_BOUND_YEAR_2020,
+  };
+
+  it('refuses a live operation without confirmation before querying the database', async () => {
+    const pool = makeFakePool([expiredPartition]);
+    const logSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await dropOldPartitions(pool, 'contract_events', 30, false);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('confirm: true');
+    expect(result.droppedPartitions).toHaveLength(0);
+    expect(pool.query).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.flat().join(' ')).toContain('target environment: unspecified');
+    logSpy.mockRestore();
+  });
+
+  it('requires a separate production acknowledgement', async () => {
+    const pool = makeFakePool([expiredPartition]);
+
+    const result = await dropOldPartitions(pool, 'contract_events', 30, {
+      dryRun: false,
+      confirm: true,
+      targetEnvironment: 'production',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('acknowledgeProduction: true');
+    expect(pool.query).not.toHaveBeenCalled();
   });
 });

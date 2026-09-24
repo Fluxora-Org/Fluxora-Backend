@@ -1,15 +1,23 @@
 import type { Request, Response, NextFunction } from 'express';
 import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
+import { sanitizeMetricLabels } from '../pii/secretPatterns.js';
+
+/** Single label for requests that never matched an Express route. */
+export const UNMATCHED_ROUTE = 'unmatched';
 
 /**
- * Normalise the matched route so cardinality stays bounded.
- * Falls back to the raw path only when no Express route was matched,
- * which keeps the label set predictable for Prometheus.
+ * Resolve the Prometheus `route` label from the matched Express route template.
+ *
+ * Uses `baseUrl + route.path` (the pattern, e.g. `/users/:id`) so path
+ * parameters never appear as distinct series. Unmatched requests share one
+ * fixed label to keep cardinality bounded.
  */
 export function resolveRoute(req: Request): string {
-  const raw = req.route?.path
-    ? `${req.baseUrl}${req.route.path}`
-    : (req.originalUrl.split('?')[0] ?? req.originalUrl);
+  if (!req.route?.path) {
+    return UNMATCHED_ROUTE;
+  }
+
+  const raw = `${req.baseUrl ?? ''}${req.route.path}`;
 
   // Collapse trailing slash to keep label cardinality predictable,
   // but preserve the bare root path "/".
@@ -34,11 +42,12 @@ export function httpMetrics(req: Request, res: Response, next: NextFunction): vo
     const durationSec = durationNs / 1e9;
 
     const route = resolveRoute(req);
-    const labels = {
+    // Defence-in-depth: never let secret-shaped values become Prometheus labels.
+    const labels = sanitizeMetricLabels({
       method: req.method,
       route,
       status_code: String(res.statusCode),
-    };
+    });
 
     httpRequestsTotal.inc(labels);
     httpRequestDurationSeconds.observe(labels, durationSec);
