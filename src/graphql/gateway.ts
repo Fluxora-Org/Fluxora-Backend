@@ -305,7 +305,8 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const { version, sha256Hash } = persistedQuery as { version?: unknown; sha256Hash?: unknown };
+        const persistedQuery = (extensions as Record<string, unknown>).persistedQuery;
+        const { version, sha256Hash } = (persistedQuery ?? {}) as { version?: unknown; sha256Hash?: unknown };
 
         if (version !== 1) {
           res
@@ -375,7 +376,6 @@ graphqlGatewayRouter.post(
           source = cachedQuery;
         }
       }
-    }
 
     if (!source || typeof source !== 'string') {
       res
@@ -389,49 +389,9 @@ graphqlGatewayRouter.post(
           )
         );
         return;
-      }
-
-      // ── Execute query ───────────────────────────────────────────────────────
-      const rootValue = createRootValue(req);
-      const context = { req, res, requestId };
-
-      const result = await graphql({
-        schema: executableSchema,
-        source,
-        rootValue,
-        contextValue: context,
-        variableValues: variables ?? undefined,
-        operationName: operationName ?? undefined,
-      });
-
-      // ── Sanitise errors ─────────────────────────────────────────────────────
-      if (result.errors && result.errors.length > 0) {
-        result.errors = result.errors.map((err) => ({
-          ...err,
-          message: sanitiseGraphQLError(err.message),
-          ...(err.extensions
-            ? { extensions: sanitiseExtensions(err.extensions) }
-            : {}),
-        }) as unknown as GraphQLError);
-      }
-
-      res.json(result);
-    } catch (err) {
-      // Catch-all for internal errors that the graphql() call did not capture.
-      logger.error('GraphQL gateway unexpected error', requestId, {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      res.status(500).json({
-        errors: [
-          {
-            message: 'Internal server error',
-            extensions: { code: 'INTERNAL_ERROR' },
-          },
-        ],
-      });
     }
 
-    // Static Query Enforcement (Your addition)
+    // Static Query Enforcement
     let document: DocumentNode;
     try {
       document = parse(source);
@@ -474,7 +434,7 @@ graphqlGatewayRouter.post(
       return;
     }
 
-    // Execute GraphQL Query
+    // ── Execute query ───────────────────────────────────────────────────────
     const rootValue = createRootValue(req);
     const context = { req, res, requestId };
 
@@ -487,6 +447,7 @@ graphqlGatewayRouter.post(
       operationName: operationName ?? undefined,
     });
 
+    // ── Sanitise errors ─────────────────────────────────────────────────────
     if (result.errors && result.errors.length > 0) {
       result.errors = result.errors.map((err) => ({
         ...err,
@@ -497,6 +458,7 @@ graphqlGatewayRouter.post(
 
     res.json(result);
   } catch (err) {
+    // Catch-all for internal errors that the graphql() call did not capture.
     logger.error('GraphQL gateway unexpected error', requestId, {
       error: err instanceof Error ? err.message : String(err),
     });
