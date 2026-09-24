@@ -123,3 +123,23 @@ profiles), see [`k6/README`](../../k6/main.js) and run:
 k6 run k6/main.js
 k6 run -e PROFILE=load k6/main.js
 ```
+
+
+---
+
+## Performance budget (hottest endpoints)
+
+Latency budgets for `/health` and `/api/streams*` live in
+[`k6/performance-budget.json`](../../k6/performance-budget.json) and are
+documented in [`docs/performance-budget.md`](../../docs/performance-budget.md).
+
+- k6 thresholds are derived from that file — exceeding them fails the run.
+- `k6 run k6/main.js` writes a comparable summary to
+  `k6/results/performance-budget-summary.json`.
+- Evaluate the summary (or prove a double-latency regression fails) with:
+
+```bash
+node scripts/check-performance-budget.mjs --summary k6/results/performance-budget-summary.json
+node scripts/check-performance-budget.mjs --fixture-regression
+pnpm run check:performance-budget
+```
