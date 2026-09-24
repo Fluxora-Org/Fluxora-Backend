@@ -36,7 +36,7 @@ import { graphql, type GraphQLError } from 'graphql';
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
+import { authenticate, authenticateApiKey, requireScope, requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { errorResponse } from '../utils/response.js';
@@ -141,7 +141,7 @@ function assertCallerScope(req: Request, ...required: string[]): void {
  * Root value object passed to `graphql()` — each key corresponds to a
  * field on the root `Query` type.
  */
-function createRootValue(_req: Request) {
+function createRootValue(req: Request) {
   return {
     /**
      * Fetch a single stream by ID.
@@ -389,49 +389,6 @@ graphqlGatewayRouter.post(
           )
         );
         return;
-    }
-
-    // Static Query Enforcement
-    let document: DocumentNode;
-    try {
-      document = parse(source);
-    } catch (parseError) {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'GRAPHQL_PARSE_ERROR',
-            'GraphQL query could not be parsed.',
-            undefined,
-            requestId
-          )
-        );
-      return;
-    }
-
-    if (isIntrospectionQuery(document)) {
-      rejectGraphQLError(res, 'INTROSPECTION_FORBIDDEN', 'GraphQL introspection is disabled.');
-      return;
-    }
-
-    const queryDepth = computeQueryDepth(document);
-    if (queryDepth > MAX_QUERY_DEPTH) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_DEEP',
-        `Query exceeds the maximum depth of ${MAX_QUERY_DEPTH}.`
-      );
-      return;
-    }
-
-    const queryComplexity = computeQueryComplexity(document);
-    if (queryComplexity > MAX_QUERY_COMPLEXITY) {
-      rejectGraphQLError(
-        res,
-        'QUERY_TOO_COMPLEX',
-        `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
-      );
-      return;
     }
 
     // ── Execute query ───────────────────────────────────────────────────────
