@@ -263,6 +263,9 @@ For a table with 10M events:
 
 ## 📚 Documentation
 
+**Operations / alerting:** see the [Alerting Signals Runbook](docs/observability/alerting-runbook.md) for metric → threshold → first diagnostic → escalation mapping across all collectors. Deeper topic docs live under `docs/observability/`.
+
+
 See [docs/indexer.md](docs/indexer.md) for comprehensive documentation including:
 - Detailed API reference
 - Database schema and indexes
