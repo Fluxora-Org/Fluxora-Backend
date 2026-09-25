@@ -539,7 +539,9 @@ registry.registerPath({
     query: z.object({
       limit: z.string().optional().openapi({
         example: '20',
-        description: 'Page size (1–100, default 20).',
+        description:
+          'Page size (1–100, default 20). ' +
+          'A request above the maximum is rejected with 400 VALIDATION_ERROR.',
       }),
       cursor: z
         .string()
