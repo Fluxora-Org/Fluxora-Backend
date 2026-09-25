@@ -1,29 +1,20 @@
 import { Counter, Histogram, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
+import type { ApiStreamStatus as StreamStatus } from '../streams/status.js';
+import { isApiStreamStatus as isValidStreamStatus } from '../streams/status.js';
 
-export type StreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+export type { StreamStatus };
+export { isValidStreamStatus };
+
 export type WebhookDeliveryOutcome = 'success' | 'failed';
 export type SseConnectionRejectionReason = 'per_ip_limit' | 'per_key_limit' | 'global_limit';
 
-const VALID_STREAM_STATUSES: readonly StreamStatus[] = [
-  'active',
-  'paused',
-  'completed',
-  'cancelled',
-];
 const VALID_OUTCOMES: readonly WebhookDeliveryOutcome[] = ['success', 'failed'];
 const VALID_REJECTION_REASONS: readonly SseConnectionRejectionReason[] = [
   'per_ip_limit',
   'per_key_limit',
   'global_limit',
 ];
-
-/**
- * Returns true if the value is a known StreamStatus label value.
- */
-export function isValidStreamStatus(value: string): value is StreamStatus {
-  return (VALID_STREAM_STATUSES as readonly string[]).includes(value);
-}
 
 /**
  * Returns true if the value is a known webhook delivery outcome label value.

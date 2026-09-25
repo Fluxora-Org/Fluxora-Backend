@@ -5,11 +5,14 @@ import {
   assertReportedStatusMatchesChain,
   defaultChainStatusForStartTime,
   deriveStreamStatus,
+  deriveStreamStatusFromSchedule,
   isReportedStreamStatus,
+  isValidApiTransition,
   mapChainStatusToApiStatus,
   type ApiStreamStatus,
   type ChainStateObservation,
   type ChainStreamStatus,
+  type StreamScheduleInput,
 } from './status.js';
 
 describe('mapChainStatusToApiStatus', () => {
@@ -238,5 +241,138 @@ describe('assertReportedStatusMatchesChain', () => {
 
     const right = assertReportedStatusMatchesChain('unknown', fixture({ chainStatus: 'matured' }));
     expect(right.ok).toBe(true);
+  });
+});
+
+describe('deriveStreamStatusFromSchedule', () => {
+  const START = 1_700_000_000;
+  const END = START + 1_000;
+  const schedule = (overrides: Partial<StreamScheduleInput> = {}): StreamScheduleInput => ({
+    startTime: START,
+    endTime: END,
+    status: 'active',
+    now: START + 500,
+    ...overrides,
+  });
+
+  it('reports active before the cliff and exactly at the cliff', () => {
+    expect(deriveStreamStatusFromSchedule(schedule({ now: START - 1 })).status).toBe('active');
+    expect(deriveStreamStatusFromSchedule(schedule({ now: START })).status).toBe('active');
+  });
+
+  it('reports active between cliff and maturity and exactly before maturity', () => {
+    expect(deriveStreamStatusFromSchedule(schedule({ now: START + 1 })).status).toBe('active');
+    expect(deriveStreamStatusFromSchedule(schedule({ now: END - 1 })).status).toBe('active');
+  });
+
+  it('reports completed exactly at maturity and after it', () => {
+    expect(deriveStreamStatusFromSchedule(schedule({ now: END })).status).toBe('completed');
+    expect(deriveStreamStatusFromSchedule(schedule({ now: END + 1 })).status).toBe('completed');
+  });
+
+  it('keeps an indefinite stream (endTime 0) active past the cliff', () => {
+    expect(deriveStreamStatusFromSchedule(schedule({ endTime: 0, now: END + 5_000 })).status).toBe(
+      'active',
+    );
+  });
+
+  it('lets paused take precedence over the clock at cliff and maturity', () => {
+    expect(deriveStreamStatusFromSchedule(schedule({ status: 'paused', now: START - 1 })).status).toBe(
+      'paused',
+    );
+    expect(deriveStreamStatusFromSchedule(schedule({ status: 'paused', now: END })).status).toBe(
+      'paused',
+    );
+    expect(deriveStreamStatusFromSchedule(schedule({ status: 'paused', now: END + 1 })).status).toBe(
+      'paused',
+    );
+  });
+
+  it('lets completed and cancelled beat the clock at every boundary', () => {
+    for (const status of ['completed', 'cancelled'] as const) {
+      expect(deriveStreamStatusFromSchedule(schedule({ status, now: START - 1 })).status).toBe(status);
+      expect(deriveStreamStatusFromSchedule(schedule({ status, now: END })).status).toBe(status);
+    }
+  });
+
+  it('marks the derived status terminal only for completed and cancelled', () => {
+    expect(deriveStreamStatusFromSchedule(schedule()).terminal).toBe(false);
+    expect(deriveStreamStatusFromSchedule(schedule({ status: 'paused' })).terminal).toBe(false);
+    expect(deriveStreamStatusFromSchedule(schedule({ now: END })).terminal).toBe(true);
+    expect(deriveStreamStatusFromSchedule(schedule({ status: 'cancelled' })).terminal).toBe(true);
+  });
+
+  it('is deterministic for identical inputs', () => {
+    const a = deriveStreamStatusFromSchedule(schedule({ now: END - 1 }));
+    const b = deriveStreamStatusFromSchedule(schedule({ now: END - 1 }));
+    expect(a).toEqual(b);
+  });
+
+  it('agrees with the transition state machine at every boundary', () => {
+    const cases: Array<[StreamScheduleInput, ApiStreamStatus]> = [
+      [schedule({ now: START - 1 }), 'active'],
+      [schedule({ now: START }), 'active'],
+      [schedule({ now: END - 1 }), 'active'],
+      [schedule({ now: END }), 'completed'],
+      [schedule({ status: 'paused', now: END }), 'paused'],
+      [schedule({ status: 'paused', now: START - 1 }), 'paused'],
+      [schedule({ status: 'completed', now: START - 1 }), 'completed'],
+      [schedule({ status: 'cancelled', now: END }), 'cancelled'],
+    ];
+
+    for (const [input, expected] of cases) {
+      const derived = deriveStreamStatusFromSchedule(input).status;
+      expect(derived).toBe(expected);
+      expect(isValidApiTransition(derived, derived)).toBe(false);
+    }
+  });
+
+  it('agrees with defaultChainStatusForStartTime across the start boundary', () => {
+    for (const now of [START - 1, START, START + 1]) {
+      const chain = defaultChainStatusForStartTime(START, now);
+      const derived = deriveStreamStatusFromSchedule(schedule({ now })).status;
+      expect(derived).toBe(chain === 'pending' ? 'active' : chain);
+    }
+  });
+});
+
+describe('single source of status (consumer agreement)', () => {
+  it('exposes one shared API status list that every boundary case belongs to', () => {
+    const START = 1_700_000_000;
+    const END = START + 1_000;
+    const statuses = new Set<ApiStreamStatus>();
+    for (const now of [START - 1, START, END - 1, END, END + 1]) {
+      statuses.add(
+        deriveStreamStatusFromSchedule({ startTime: START, endTime: END, status: 'active', now })
+          .status,
+      );
+    }
+    statuses.add(
+      deriveStreamStatusFromSchedule({ startTime: START, endTime: END, status: 'paused', now: END })
+        .status,
+    );
+    statuses.add(
+      deriveStreamStatusFromSchedule({
+        startTime: START,
+        endTime: END,
+        status: 'cancelled',
+        now: START,
+      }).status,
+    );
+
+    for (const status of statuses) {
+      expect(API_STREAM_STATUSES).toContain(status);
+    }
+  });
+
+  it('shares the transition table with the DB invariants', async () => {
+    const { STREAM_INVARIANTS } = await import('../db/types.js');
+    const { VALID_API_TRANSITIONS } = await import('./status.js');
+    expect(STREAM_INVARIANTS.validTransitions).toBe(VALID_API_TRANSITIONS);
+  });
+
+  it('shares the status list with the pagination schema', async () => {
+    const { STREAM_STATUS_VALUES } = await import('../validation/paginationSchema.js');
+    expect(STREAM_STATUS_VALUES).toBe(API_STREAM_STATUSES);
   });
 });

@@ -26,6 +26,31 @@
  *   Never pass a bare domain interface to `query<T>()`. Query with
  *   `Record<string, unknown>` and map through `rowToRecord()` (see README.md).
  *
+ * Pagination ordering guarantee:
+ *   Both paginated read paths impose a total order on the streams table, so a
+ *   traversal never repeats or skips a row that existed when it began:
+ *
+ *   • `findWithCursor` (keyset) orders by `id ASC`.  `id` is the streams
+ *     primary key (`TEXT NOT NULL`, see
+ *     `migrations/1774715131962_streams-table.ts`), therefore the ordering key
+ *     is unique and total and the exclusive predicate `id > $afterId`
+ *     partitions the result set across page boundaries.  The ordering key is
+ *     additionally constrained at the SQL-character level:
+ *     `allowlistedSqlIdentifier(..., STREAM_CURSOR_SORT_FIELDS, ...)` can only
+ *     resolve to `id` (sqlIdentifiers.ts), so no caller or filter can switch
+ *     the cursor to a non-unique column.
+ *   • `find` (offset) orders by `created_at DESC, id DESC`.  `created_at` is
+ *     not unique (rows written in the same transaction/millisecond share a
+ *     value), so the unique `id` column is appended as a tiebreaker, making
+ *     the composite key total and the OFFSET windows disjoint.
+ *
+ *   Concurrent inserts: a row that exists when a traversal starts is returned
+ *   exactly once.  A row inserted mid-traversal is returned only if its `id`
+ *   sorts strictly after the caller's current cursor (and then at most once);
+ *   a row inserted at or before the cursor is not returned by that traversal.
+ *
+ *   Covered by tests/streamsRepository.property.test.ts.
+ *
  * @module db/repositories/streamRepository
  */
 
@@ -480,11 +505,37 @@ export const streamRepository = {
   /**
    * Cursor-based paginated list with optional filters.
    *
+   * **Ordering guarantee**: rows are ordered by `id ASC`, and `afterId` is an
+   * exclusive lower bound (`WHERE id > $afterId`).  `id` is the streams table
+   * primary key — `TEXT NOT NULL` and unique (see
+   * `migrations/1774715131962_streams-table.ts`) — so the ordering key is
+   * both unique and total.  The sort field is mirrored by the
+   * `STREAM_CURSOR_SORT_FIELDS` allowlist in `sqlIdentifiers.ts`, whose only
+   * entry is `id`; the cursor can never be switched to a non-unique column.
+   * Every page is therefore a disjoint slice of the ordered result set: no row
+   * that existed when the traversal started is repeated or skipped when a tie
+   * would otherwise straddle a page boundary.
+   *
+   * Concurrent inserts during a traversal follow from the same predicate: a
+   * row whose `id` sorts strictly after the current cursor may be returned by
+   * a later page (at most once), while a row inserted at or before the cursor
+   * is not returned by that traversal.  The ordering is evaluated under the
+   * database collation, which is stable for the lifetime of the traversal.
+   *
+   * The composite indexes from
+   * `migrations/20260622000000_streams_composite_pagination_indexes.ts`
+   * (`idx_streams_status_id`, `idx_streams_sender_id`,
+   * `idx_streams_contract_id`) cover the filtered `ORDER BY id ASC` scans.
+   *
+   * Asserted by the property-based tests in
+   * `tests/streamsRepository.property.test.ts`.
+   *
    * @param filter - Column-level predicates to narrow the result set.
    * @param limit  - Desired page size. Clamped to {@link MAX_PAGE_SIZE} at the
    *   repository layer so callers cannot trigger unbounded reads regardless of
    *   how the route layer is configured.
-   * @param afterId       - Exclusive lower bound for keyset pagination.
+   * @param afterId       - Exclusive lower bound for keyset pagination. Pass
+   *   the `id` of the last row of the previous page; omit for the first page.
    * @param includeTotal  - When `true`, a separate COUNT(*) query is executed
    *   and returned as `total`.
    * @param options       - Optional routing overrides.  Pass `{ forcePrimary: true }`

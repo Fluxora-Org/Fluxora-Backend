@@ -10,6 +10,7 @@ import {
   extendZodWithOpenApi,
 } from '@asteasolutions/zod-to-openapi';
 import { ApiKeyCreatedSchema as _ApiKeyCreatedBase } from '../lib/apiKey.js';
+import { API_STREAM_STATUSES } from '../streams/status.js';
 
 extendZodWithOpenApi(z);
 
@@ -64,7 +65,7 @@ const StellarAddress = registry.register(
 
 const StreamStatus = registry.register(
   'StreamStatus',
-  z.enum(['active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' })
+  z.enum(API_STREAM_STATUSES).openapi({ example: 'active' })
 );
 
 const StreamObject = registry.register(
@@ -286,6 +287,13 @@ const errorResponses = {
   },
   '404': {
     description: 'Not found',
+    headers: commonResponseHeaders,
+    content: { 'application/json': { schema: ErrorEnvelope } },
+  },
+  '406': {
+    description:
+      'Not acceptable — the `Accept` header cannot be satisfied. ' +
+      'This API only produces `application/json` (plus `application/*+json` vendor types).',
     headers: commonResponseHeaders,
     content: { 'application/json': { schema: ErrorEnvelope } },
   },
@@ -698,6 +706,7 @@ registry.registerPath({
       },
     },
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -751,6 +760,7 @@ registry.registerPath({
     },
     '404': errorResponses['404'],
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -766,6 +776,7 @@ registry.registerPath({
     },
     '404': errorResponses['404'],
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -816,6 +827,7 @@ registry.registerPath({
     '401': errorResponses['401'],
     '409': errorResponses['409'],
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -839,6 +851,7 @@ registry.registerPath({
     '404': errorResponses['404'],
     '409': errorResponses['409'],
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -868,6 +881,7 @@ registry.registerPath({
     '404': errorResponses['404'],
     '409': errorResponses['409'],
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -910,6 +924,7 @@ registry.registerPath({
     },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -937,6 +952,7 @@ registry.registerPath({
     },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1014,6 +1030,7 @@ registry.registerPath({
       description: 'Full PII policy including trustBoundaries array',
       content: { 'application/json': { schema: PrivacyPolicyResponseSchema } },
     },
+    '406': errorResponses['406'],
   },
 });
 
@@ -1027,6 +1044,7 @@ registry.registerPath({
       description: 'Retention schedule',
       content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
     },
+    '406': errorResponses['406'],
   },
 });
 
@@ -1046,6 +1064,7 @@ registry.registerPath({
         },
       },
     },
+    '406': errorResponses['406'],
   },
 });
 
@@ -1070,6 +1089,7 @@ registry.registerPath({
       },
     },
     '401': errorResponses['401'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1085,6 +1105,7 @@ registry.registerPath({
       content: { 'application/json': { schema: successSchema(z.record(z.string(), z.boolean())) } },
     },
     '401': errorResponses['401'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1122,6 +1143,7 @@ registry.registerPath({
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1137,6 +1159,7 @@ registry.registerPath({
       content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
     },
     '401': errorResponses['401'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1159,6 +1182,7 @@ registry.registerPath({
     },
     '401': errorResponses['401'],
     '409': errorResponses['409'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1197,6 +1221,7 @@ registry.registerPath({
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '503': errorResponses['503'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1216,6 +1241,7 @@ registry.registerPath({
       },
     },
     '401': errorResponses['401'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1242,6 +1268,7 @@ registry.registerPath({
     },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1259,6 +1286,7 @@ registry.registerPath({
     },
     '401': errorResponses['401'],
     '404': errorResponses['404'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1273,6 +1301,7 @@ registry.registerPath({
     '204': { description: 'Key revoked' },
     '401': errorResponses['401'],
     '404': errorResponses['404'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1310,6 +1339,7 @@ registry.registerPath({
     },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1405,6 +1435,7 @@ registry.registerPath({
       description: 'Rate-limit status',
       content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
     },
+    '406': errorResponses['406'],
   },
 });
 
@@ -1420,6 +1451,7 @@ registry.registerPath({
       content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
     },
     '401': errorResponses['401'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -1470,6 +1502,7 @@ registry.registerPath({
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '409': errorResponses['409'],
+    '406': errorResponses['406'],
   },
 });
 
@@ -2010,6 +2043,11 @@ export function buildOpenApiSpec(): Record<string, unknown> {
         'Fluxora exposes real-time stream updates on the WebSocket endpoint `/ws/streams` (Switching Protocols upgrade).\n' +
         'Clients can connect and send JSON control frames over the open channel. ' +
         'See components `WebSocketSubscribeMessage`, `WebSocketUnsubscribeMessage`, and `WebSocketSubscriptionFilter` for client payload schemas.\n\n' +
+        '### Content Negotiation\n' +
+        'The API only produces `application/json`. The supported `Accept` media ranges are ' +
+        '`application/json`, `application/*`, `application/*+json` (vendor JSON subtypes), and `*/*`. ' +
+        'A request whose `Accept` header cannot be satisfied by any of these — or that disallows them ' +
+        'with `q=0` — is rejected with `406 Not Acceptable` and the standard error envelope.\n\n' +
         'Covers stream CRUD, health, admin, indexer ingestion, webhook delivery, and observability.',
       contact: {
         name: 'Fluxora Engineering',

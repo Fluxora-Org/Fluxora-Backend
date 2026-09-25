@@ -46,6 +46,7 @@ import { isEnabled } from '../config/featureFlags.js';
 import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import type { StreamFilter, StreamStatus } from '../db/types.js';
+import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { errorResponse } from '../utils/response.js';
 import { logger } from '../lib/logger.js';
@@ -385,7 +386,11 @@ function mapStream(record: {
     ratePerSecond: record.rate_per_second,
     startTime: record.start_time,
     endTime: record.end_time,
-    status: record.status,
+    status: deriveStreamStatusFromSchedule({
+      startTime: record.start_time,
+      endTime: record.end_time,
+      status: record.status as ApiStreamStatus,
+    }).status,
     contractId: record.contract_id,
     transactionHash: record.transaction_hash,
     eventIndex: record.event_index,
