@@ -134,6 +134,21 @@ function optionalString(name: string) {
   );
 }
 
+function operationDeadlinesEnv() {
+  return z.preprocess(
+    (value) => {
+      if (value === undefined || value === '') return {};
+      if (typeof value !== 'string') return value;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    },
+    z.record(z.string(), z.number().int().min(1, 'RPC operation deadlines must be at least 1ms')),
+  );
+}
+
 function requiredStellarContractAddress(name: string) {
   return z
     .string()
@@ -246,7 +261,7 @@ export const EnvSchema = z
      * Format: JSON object mapping operation names to timeouts in ms.
      * Example: '{"getLatestLedger":2000,"accountExists":8000}'
      */
-    STELLAR_RPC_OPERATION_DEADLINES: z.string().optional(),
+    STELLAR_RPC_OPERATION_DEADLINES: operationDeadlinesEnv(),
 
     JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
     JWT_SECRET_PREVIOUS: z.preprocess(
@@ -428,6 +443,10 @@ export const EnvSchema = z
       LIMITS.RPC_CB_RESET_TIMEOUT_MS
     ),
     RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
+    RPC_FALLBACK_CACHE_TTL_SECONDS: integerEnv('RPC_FALLBACK_CACHE_TTL_SECONDS', 1).default(300),
+    RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA: z.preprocess(parseNumber, z.number().min(0).default(0)),
+    RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
+    RPC_HEALTH_CHECK_FAILURE_THRESHOLD: integerEnv('RPC_HEALTH_CHECK_FAILURE_THRESHOLD', 1).default(3),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
     RATE_LIMIT_ENABLED: booleanEnv().default(true),
@@ -602,6 +621,18 @@ export interface Config {
 
   stellarNetwork: StellarNetwork;
   stellarRpcUrl: string;
+  stellarRpcTimeout: number;
+  stellarRpcMaxRetries: number;
+  stellarRpcRetryDelay: number;
+  stellarRpcOperationDeadlines: Record<string, number>;
+  rpcCircuitBreakerFailureThreshold: number;
+  rpcCircuitBreakerWindowMs: number;
+  rpcCircuitBreakerResetTimeoutMs: number;
+  rpcTimeoutMs: number;
+  rpcFallbackCacheTtlSeconds: number;
+  rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcHealthCheckIntervalMs: number;
+  rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
@@ -831,6 +862,18 @@ function toConfig(env: ParsedEnv): Config {
 
     stellarNetwork,
     stellarRpcUrl: env.STELLAR_RPC_URL,
+    stellarRpcTimeout: env.STELLAR_RPC_TIMEOUT,
+    stellarRpcMaxRetries: env.STELLAR_RPC_MAX_RETRIES,
+    stellarRpcRetryDelay: env.STELLAR_RPC_RETRY_DELAY,
+    stellarRpcOperationDeadlines: env.STELLAR_RPC_OPERATION_DEADLINES,
+    rpcCircuitBreakerFailureThreshold: env.RPC_CB_FAILURE_THRESHOLD,
+    rpcCircuitBreakerWindowMs: env.RPC_CB_WINDOW_MS,
+    rpcCircuitBreakerResetTimeoutMs: env.RPC_CB_RESET_TIMEOUT_MS,
+    rpcTimeoutMs: env.RPC_TIMEOUT_MS,
+    rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
+    rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
+    rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
