@@ -31,18 +31,18 @@ import { tenantRateLimitOverridesRouter } from './admin/tenantRateLimitOverrides
 
 export const adminRouter = Router();
 
+// Every admin route requires a valid Bearer token.
+adminRouter.use(requireAdminAuth);
+
 /**
  * GET /api/admin/status/read-only
- * Read-only endpoint for pause-flag visibility without admin credentials.
- * Exposes non-sensitive service posture only.
+ * Read-only endpoint for pause-flag visibility.
+ * Note: Now covered by admin credentials.
  */
 adminRouter.get('/status/read-only', (req, res) => {
   const requestId = req.correlationId;
   res.json(successResponse({ pauseFlags: getPauseFlags() }, requestId));
 });
-
-// Every admin route requires a valid Bearer token.
-adminRouter.use(requireAdminAuth);
 
 // Per-tenant rate limit override management
 adminRouter.use('/rate-limits/overrides', tenantRateLimitOverridesRouter);
