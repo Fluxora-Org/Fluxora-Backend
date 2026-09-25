@@ -33,7 +33,7 @@ import {
 } from './hooks.js';
 import { traceLogError } from './traceLogger.js';
 
-const TRACING_DIR = dirname(fileURLToPath(import.meta.url));
+const TRACING_DIR = __dirname;
 
 /** Modules created by the #1518 split, mapped to the concern each one owns. */
 const SPLIT_MODULES: Record<string, string> = {
