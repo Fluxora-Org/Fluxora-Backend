@@ -35,6 +35,7 @@ import { Router, type Request, type Response } from 'express';
 import {
   graphql,
   parse,
+  GraphQLError,
   type DocumentNode,
   type SelectionNode,
   type SelectionSetNode,
@@ -42,7 +43,6 @@ import {
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
 import { authenticate, authenticateApiKey, requireScope, requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
