@@ -1,0 +1,25 @@
+{
+  "exceptions": [
+    {
+      "id": "CVE-2024-12345",
+      "package": "example-vulnerable-package",
+      "severity": "moderate",
+      "reason": "The vulnerable code path requires user input to innerHTML, which our application never uses. All user content is sanitized before rendering.",
+      "approvedBy": "security-team@example.com",
+      "approvedDate": "2024-01-15",
+      "expiryDate": "2024-02-15",
+      "ticketUrl": "https://github.com/org/repo/issues/123",
+      "notes": "Monitoring upstream for fix. Alternative package evaluation in progress."
+    },
+    {
+      "id": "GHSA-abcd-1234-efgh",
+      "package": "transitive-dependency",
+      "severity": "high",
+      "reason": "Transitive dependency vulnerability with no available fix. Direct dependency update does not resolve the issue. Awaiting maintainer response.",
+      "approvedBy": "tech-lead@example.com",
+      "approvedDate": "2024-01-10",
+      "expiryDate": "2024-01-30",
+      "ticketUrl": "https://github.com/org/repo/issues/456"
+    }
+  ]
+}

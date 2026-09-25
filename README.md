@@ -214,6 +214,29 @@ The test suite includes:
 3. **Concurrent Operation Prevention**: Only one replay at a time
 4. **Transaction Safety**: Automatic rollback on errors
 5. **Webhook Delivery Logging**: Outbound webhook dispatch logs use the shared structured logger and include only stable identifiers (`deliveryId`, `eventType`, `attemptNumber`) plus `statusCode` when available. Webhook secrets, raw payloads, signatures, and endpoint URLs are excluded from log metadata.
+6. **Dependency Audit Enforcement**: Automated security scanning with mandatory exception review process
+
+### Dependency Security Audit
+
+All npm dependencies are automatically scanned for vulnerabilities during CI builds. The audit enforces moderate+ severity levels and blocks builds on unexcepted vulnerabilities or expired exceptions.
+
+```bash
+# Run security audit
+pnpm run audit:security
+
+# Check for expired exceptions
+pnpm run audit:check-expired
+
+# List active exceptions
+pnpm run audit:list-exceptions
+```
+
+**Remediation Windows**:
+- Critical: 7 days
+- High: 14 days  
+- Moderate: 30 days
+
+Exceptions require documented justification, approval, and expiry dates. See [docs/security/dependency-audit-policy.md](docs/security/dependency-audit-policy.md) for the complete policy and exception process.
 
 ### Webhook Delivery Logging
 

@@ -31,7 +31,10 @@
     "check:sdk:python": "node scripts/generate-sdk-python.mjs --check",
     "generate:sdk:ts": "node scripts/generate-sdk-ts.mjs",
     "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check",
-    "check:performance-budget": "node scripts/check-performance-budget.mjs"
+    "check:performance-budget": "node scripts/check-performance-budget.mjs",
+    "audit:security": "node scripts/audit-security.mjs",
+    "audit:check-expired": "node scripts/audit-security.mjs --check-expired",
+    "audit:list-exceptions": "node scripts/audit-security.mjs --list-exceptions"
   },
   "keywords": [
     "indexer",

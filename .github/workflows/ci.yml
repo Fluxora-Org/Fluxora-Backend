@@ -163,8 +163,11 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # Required gate: audit failures block the pipeline.
-      - name: Run security audit
-        run: pnpm audit --audit-level=moderate
+      # Enforces dependency security policy with reviewed exception process.
+      # Exceptions are validated against .audit-exceptions.json.
+      # See docs/security/dependency-audit-policy.md for policy details.
+      - name: Run security audit with exception validation
+        run: node scripts/audit-security.mjs
 
   docker:
     name: Docker Build

@@ -12,9 +12,51 @@ isolated and reset between runs.
 
 ## Dependency audit (pnpm)
 
-The repository's CI will run `pnpm audit --audit-level=high --json` and
-fail the build on any high/critical advisories unless an explicit
-exception is recorded in `.pnpm-audit-exceptions` (see CI docs).
+The repository enforces dependency security through automated vulnerability scanning in CI.
+
+### Policy Overview
+
+- **Audit Level**: Moderate and above (moderate, high, critical)
+- **Enforcement**: Builds fail on unexcepted vulnerabilities
+- **Exceptions**: Managed via `.audit-exceptions.json` with mandatory expiry dates
+- **Tool**: `scripts/audit-security.mjs` validates both vulnerabilities and exceptions
+
+### Quick Reference
+
+```bash
+# Run full audit with exception validation
+node scripts/audit-security.mjs
+
+# Check only for expired exceptions
+node scripts/audit-security.mjs --check-expired
+
+# List all active exceptions
+node scripts/audit-security.mjs --list-exceptions
+```
+
+### Remediation Windows
+
+| Severity | Time to Remediate |
+|----------|------------------|
+| Critical | 7 days           |
+| High     | 14 days          |
+| Moderate | 30 days          |
+| Low      | 90 days (advisory) |
+
+### Exception Process
+
+When a vulnerability cannot be immediately remediated:
+
+1. Assess exploitability and impact
+2. Document exception in `.audit-exceptions.json`
+3. Set expiry date (within policy limits)
+4. Get approval from security team (high/critical) or tech lead (moderate/low)
+5. Link tracking issue in `ticketUrl` field
+6. Submit PR with exception for review
+
+Expired exceptions cause build failures, forcing re-evaluation.
+
+**Full policy**: See [docs/security/dependency-audit-policy.md](./security/dependency-audit-policy.md) for complete details on the exception process, remediation windows, and governance.
 
 ## mTLS Client Certificate Validation
 
