@@ -34,6 +34,7 @@
 import { Router, type Request, type Response } from 'express';
 import {
   graphql,
+  GraphQLError,
   parse,
   type DocumentNode,
   type SelectionNode,
@@ -42,8 +43,7 @@ import {
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
-import { authenticate, authenticateApiKey, requireScope, requireAuth } from '../middleware/auth.js';
+import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
 import { getAuditEntries } from '../lib/auditLog.js';
@@ -313,7 +313,7 @@ function createRootValue(req: Request) {
       if (args.contractId) filter.contract_id = args.contractId;
 
       const result = await streamRepository.findWithCursor(
-        filter as any,
+        filter,
         limit,
         args.afterId,
         includeTotal
@@ -410,7 +410,6 @@ graphqlGatewayRouter.post(
   requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
   const requestId = res.req?.id ?? req.correlationId;
-  const start = Date.now();
 
     try {
       if (!isGraphQLGatewayEnabled(req)) {
@@ -519,7 +518,7 @@ graphqlGatewayRouter.post(
       let document: DocumentNode;
       try {
         document = parse(source);
-      } catch (parseError) {
+      } catch {
         res.status(400).json(
           errorResponse('GRAPHQL_PARSE_ERROR', 'GraphQL query could not be parsed.', undefined, requestId),
         );

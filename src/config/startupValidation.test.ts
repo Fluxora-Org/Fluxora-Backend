@@ -148,6 +148,7 @@ describe('validateStellarContractsConfig()', () => {
       testnet: {
         contract: ['CBADCONTRACTADDRESS'],
         token: [VALID_TESTNET_TOKEN],
+        streaming: [VALID_TESTNET_CONTRACT],
       },
     });
 
