@@ -41,7 +41,7 @@ Secret values are never included in validation messages.
 | `REQUEST_TIMEOUT_MS`              | integer ms, 1000-300000                        | `30000`                                                                                                  |
 | `LOG_LEVEL`                       | `debug`, `info`, `warn`, `error`               | `info`                                                                                                   |
 | `METRICS_ENABLED`                 | boolean                                        | `true`                                                                                                   |
-| `CORS_ALLOWED_ORIGINS`            | comma-separated origins                        | unset                                                                                                    |
+| `CORS_ALLOWED_ORIGINS`            | comma-separated exact origins                  | unset — denies all production origins                                                                     |
 | `TRACING_ENABLED`                 | boolean                                        | `false`                                                                                                  |
 | `TRACING_SAMPLE_RATE`             | number, 0-1                                    | `1`                                                                                                      |
 | `TRACING_OTEL_ENABLED`            | boolean                                        | `false`                                                                                                  |
