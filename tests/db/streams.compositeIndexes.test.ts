@@ -68,6 +68,7 @@ function planUsesIndex(planJson: unknown, indexName: string): boolean {
   return serialized.includes(indexName);
 }
 
+// Keep-gated and intentionally excluded from issue #1248; tracked as live-DB coverage.
 describe.skipIf(!isLiveDb)('streams composite pagination indexes (live DB)', () => {
   let client: pg.Client;
 

@@ -30,6 +30,7 @@ import {
   ErrorClassifier,
   createBuiltInHooks,
 } from '../../src/tracing/builtin.js';
+import { correlationStore } from '../../src/tracing/middleware.js';
 
 describe('Distributed Tracing Hooks', () => {
   beforeEach(() => {
@@ -219,8 +220,9 @@ describe('Distributed Tracing Hooks', () => {
         throw new Error('Hook error');
       };
 
-      // Spy on console.error to verify error is logged
-      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      // #1518: hook failures are reported through structured logging on
+      // stderr rather than a raw console.error call.
+      const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
       const tracer = new Tracer({
         enabled: true,
@@ -232,12 +234,40 @@ describe('Distributed Tracing Hooks', () => {
         tracer.startSpan({ traceId: 'trace-123' });
       }).not.toThrow();
 
-      expect(consoleError).toHaveBeenCalled();
-      consoleError.mockRestore();
+      expect(stderrWrite).toHaveBeenCalled();
+      const record = JSON.parse(String(stderrWrite.mock.calls[0][0]));
+      expect(record.level).toBe('error');
+      expect(record.message).toContain('Hook error');
+      stderrWrite.mockRestore();
     });
   });
 
   describe('Built-in hooks - SpanBuffer', () => {
+    it('routes span logs through the structured logger with request correlation', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      const buffer = new SpanBuffer({ logEvents: true, logLevel: 'info' });
+      const tracer = new Tracer({ enabled: true, hooks: buffer });
+
+      correlationStore.run('request-correlation-123', () => {
+        tracer.startSpan({
+          traceId: 'trace-123',
+          userId: 'user-456',
+          tags: { operation: 'test' },
+        });
+      });
+
+      const line = writeSpy.mock.calls
+        .map(([value]) => String(value))
+        .find((value) => value.includes('"message":"[tracing] span.start"'));
+      expect(line).toBeDefined();
+      expect(JSON.parse(line as string)).toMatchObject({
+        level: 'info',
+        message: '[tracing] span.start',
+        correlationId: 'request-correlation-123',
+      });
+      writeSpy.mockRestore();
+    });
+
     it('buffers spans in memory', () => {
       const buffer = new SpanBuffer({ maxSpans: 100, logEvents: false });
       const tracer = new Tracer({ enabled: true, hooks: buffer });
@@ -606,6 +636,89 @@ describe('shouldSampleTail()', () => {
     for (let i = 0; i < 100; i++) {
       expect(shouldSampleTail(errorSpan, config)).toBe(true);
       expect(shouldSampleTail(okSpan, config)).toBe(false);
+    }
+  });
+});
+
+describe('Attribute Bounding and Sampling Overrides', () => {
+  it('bounds dynamic route attributes to matched prefix or OTHER', () => {
+    const tracer = new Tracer({
+      enabled: true,
+      sampling: {
+        strategy: 'head',
+        sampleRate: 0.5,
+        perRouteOverrides: {
+          '/api/users': 1.0,
+          '/health': 0.0
+        }
+      }
+    });
+
+    // Match exact
+    let span = tracer.startSpan({ traceId: 'trace-1', tags: { route: '/health' } });
+    expect(span.context.tags?.['route']).toBe('/health');
+
+    // Match prefix
+    span = tracer.startSpan({ traceId: 'trace-2', tags: { route: '/api/users/12345/profile' } });
+    expect(span.context.tags?.['route']).toBe('/api/users');
+
+    // No match -> OTHER
+    span = tracer.startSpan({ traceId: 'trace-3', tags: { route: '/api/unknown/123' } });
+    expect(span.context.tags?.['route']).toBe('OTHER');
+  });
+
+  it('bounds dynamic tenant attributes to matched key or OTHER', () => {
+    const tracer = new Tracer({
+      enabled: true,
+      sampling: {
+        strategy: 'head',
+        sampleRate: 0.5,
+        perTenantOverrides: {
+          'tenant-A': 1.0
+        }
+      }
+    });
+
+    let span = tracer.startSpan({ traceId: 'trace-1', tags: { tenant: 'tenant-A' } });
+    expect(span.context.tags?.['tenant']).toBe('tenant-A');
+
+    span = tracer.startSpan({ traceId: 'trace-2', tags: { tenant: 'tenant-B-unknown' } });
+    expect(span.context.tags?.['tenant']).toBe('OTHER');
+  });
+
+  it('fuzzes route and tenant values to assert bounded attributes', () => {
+    const tracer = new Tracer({
+      enabled: true,
+      sampling: {
+        strategy: 'head',
+        sampleRate: 1.0,
+        perRouteOverrides: { '/known': 1.0 },
+        perTenantOverrides: { 'known-tenant': 1.0 }
+      }
+    });
+
+    for (let i = 0; i < 100; i++) {
+      const randomRoute = `/random/${Math.random().toString(36).substring(7)}`;
+      const randomTenant = `tenant-${Math.random().toString(36).substring(7)}`;
+      const span = tracer.startSpan({
+        traceId: `trace-${i}`,
+        tags: { route: randomRoute, tenant: randomTenant }
+      });
+
+      expect(span.context.tags?.['route']).toBe('OTHER');
+      expect(span.context.tags?.['tenant']).toBe('OTHER');
+    }
+  });
+
+  it('fuzzes invalid sample rates safely (bounds to [0,1])', () => {
+    const invalidRates = [NaN, Infinity, -Infinity, -1, 1.5, -0.0001, 1.0001, 2];
+    for (const rate of invalidRates) {
+      const result = shouldSampleHead('any-trace-id', rate);
+      if (Number.isNaN(rate) || !Number.isFinite(rate)) {
+        expect(result).toBe(false);
+      } else {
+        expect(typeof result).toBe('boolean');
+      }
     }
   });
 });

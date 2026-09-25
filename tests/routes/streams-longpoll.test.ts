@@ -211,7 +211,7 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
-  it('holds connection open and times out with null data when no event arrives', async () => {
+  it('holds connection open and times out with distinguishable timeout response when no event arrives', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 
     const start = Date.now();
@@ -221,12 +221,53 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(res.body.data).toBeNull();
+    expect(res.body.status).toBe('timeout');
+    expect(res.body.retryAfterSeconds).toBe(15);
+    expect(res.headers['retry-after']).toBe('15');
     expect(res.body.meta).toHaveProperty('timestamp');
     expect(elapsed).toBeGreaterThanOrEqual(950);
     expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
-  it('delivers live event immediately when emitted via sseEventBus', async () => {
+  it('times out at exactly the configured hold duration with timeout status', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+    process.env.LONG_POLL_MAX_CONNECTION_DURATION_MS = '2000';
+
+    const start = Date.now();
+    const res = await requestPoll('/api/streams/stream-123/poll?timeout=2');
+    const elapsed = Date.now() - start;
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toBeNull();
+    expect(res.body.status).toBe('timeout');
+    expect(res.body.retryAfterSeconds).toBe(15);
+    expect(res.headers['retry-after']).toBe('15');
+    expect(elapsed).toBeGreaterThanOrEqual(1900);
+    expect(elapsed).toBeLessThan(3000);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
+  });
+
+  it('times out past the configured hold duration with timeout status', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+    process.env.LONG_POLL_MAX_CONNECTION_DURATION_MS = '2000';
+
+    const start = Date.now();
+    const res = await requestPoll('/api/streams/stream-123/poll?timeout=3');
+    const elapsed = Date.now() - start;
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toBeNull();
+    expect(res.body.status).toBe('timeout');
+    expect(res.body.retryAfterSeconds).toBe(15);
+    expect(res.headers['retry-after']).toBe('15');
+    expect(elapsed).toBeGreaterThanOrEqual(2900);
+    expect(elapsed).toBeLessThan(4000);
+    expect(getActiveLongPollConnectionCount()).toBe(0);
+  });
+
+  it('delivers live event immediately when emitted via sseEventBus without timeout status', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 
     const pollPromise = requestPoll('/api/streams/stream-123/poll?timeout=5');
@@ -254,11 +295,14 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
       payload: { amount: '100', status: 'active' },
       correlationId: expect.any(String),
     });
+    expect(res.body.status).toBeUndefined();
+    expect(res.body.retryAfterSeconds).toBeUndefined();
+    expect(res.headers['retry-after']).toBeUndefined();
     expect(getActiveLongPollConnectionCount()).toBe(0);
     expect(getLiveSseSubscriberCount('stream-123')).toBe(0);
   });
 
-  it('replays historical event immediately if found after since', async () => {
+  it('replays historical event immediately if found after since without timeout status', async () => {
     mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
 
     const historicalEvent = {
@@ -284,6 +328,9 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
       payload: { id: 'stream-123', depositAmount: '500' },
       correlationId: expect.any(String),
     });
+    expect(res.body.status).toBeUndefined();
+    expect(res.body.retryAfterSeconds).toBeUndefined();
+    expect(res.headers['retry-after']).toBeUndefined();
     expect(mockGetEvents).toHaveBeenCalledWith({
       afterEventId: 'evt-99',
       limit: 100,
@@ -375,6 +422,9 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
+    expect(res.body.status).toBe('timeout');
+    expect(res.body.retryAfterSeconds).toBe(15);
+    expect(res.headers['retry-after']).toBe('15');
     expect(getActiveLongPollConnectionCount()).toBe(0);
   });
 
@@ -407,5 +457,72 @@ describe('GET /api/streams/:id/poll (Long-Polling Fallback Endpoint)', () => {
 
     expect(getActiveLongPollConnectionCount()).toBe(0);
     expect(sseEventBus.listenerCount(SSE_STREAM_UPDATE_EVENT)).toBe(initialListeners);
+  });
+  it('handles gap of unrelated events by paginating until a matching event is found', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const unrelatedEvents = Array(100).fill(null).map((_, i) => ({
+      eventId: `evt-unrelated-${i}`,
+      txHash: 'b'.repeat(64),
+      eventIndex: i,
+      payload: { id: 'stream-other' },
+    }));
+
+    const matchingEvent = {
+      eventId: 'evt-matching-101',
+      txHash: 'a'.repeat(64),
+      eventIndex: 101,
+      payload: { id: 'stream-123', depositAmount: '500' },
+    };
+
+    mockGetEvents
+      .mockResolvedValueOnce({
+        events: unrelatedEvents,
+        total: 101,
+        nextCursor: 'evt-unrelated-99',
+      })
+      .mockResolvedValueOnce({
+        events: [matchingEvent],
+        total: 101,
+      });
+
+    const res = await requestPoll('/api/streams/stream-123/poll?since=evt-0');
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.eventId).toBe('evt-matching-101');
+    expect(mockGetEvents).toHaveBeenCalledTimes(2);
+    expect(mockGetEvents).toHaveBeenNthCalledWith(1, { afterEventId: 'evt-0', limit: 100 });
+    expect(mockGetEvents).toHaveBeenNthCalledWith(2, { afterEventId: 'evt-unrelated-99', limit: 100 });
+    expect(getActiveLongPollConnectionCount()).toBe(0);
+  });
+
+  it('handles duplicate requests gracefully (at-least-once semantics)', async () => {
+    mockGetById.mockResolvedValue(makeDbRecord({ id: 'stream-123' }));
+
+    const historicalEvent = {
+      eventId: 'evt-100',
+      txHash: 'a'.repeat(64),
+      eventIndex: 0,
+      payload: { id: 'stream-123', depositAmount: '500' },
+    };
+
+    mockGetEvents.mockResolvedValue({
+      events: [historicalEvent],
+      total: 1,
+    });
+
+    const [res1, res2] = await Promise.all([
+      requestPoll('/api/streams/stream-123/poll?since=evt-99'),
+      requestPoll('/api/streams/stream-123/poll?since=evt-99'),
+    ]);
+
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    expect(res1.body.data.eventId).toBe('evt-100');
+    expect(res2.body.data.eventId).toBe('evt-100');
+    expect(res1.body.status).toBeUndefined();
+    expect(res2.body.status).toBeUndefined();
+    expect(mockGetEvents).toHaveBeenCalledTimes(2);
   });
 });

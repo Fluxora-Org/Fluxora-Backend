@@ -135,6 +135,20 @@ export const apiKeyRepository = {
     return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
   },
 
+  /**
+   * Update only the stored key_hash for an existing key. Used during a
+   * pepper migration when a key is re-hashed on first use.
+   */
+  async updateKeyHash(id: string, keyHash: string): Promise<ApiKeyRecord | undefined> {
+    const pool = getPool();
+    const result = await query<Record<string, unknown>>(
+      pool,
+      `UPDATE api_keys SET key_hash = $2 WHERE id = $1 RETURNING ${SELECT_COLUMNS}`,
+      [id, keyHash],
+    );
+    return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
+  },
+
   /** Return all key records (active and revoked), newest first. */
   async listAll(): Promise<ApiKeyRecord[]> {
     const pool = getPool();

@@ -405,7 +405,7 @@ if (REDIS_INTEGRATION_ENABLED) {
     });
   });
 } else {
-  // Skip integration tests unless explicitly enabled.
+  // Keep-gated: requires a real Redis service; tracked by issue #1248.
   describe.skip('Integration: AdminStateLock with real Redis (disabled)', () => {
     it('skipped — set REDIS_INTEGRATION=true to run', () => {});
   });

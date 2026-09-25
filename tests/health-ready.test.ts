@@ -97,13 +97,13 @@ describe('GET /health/ready — all dependencies healthy', () => {
 // ── Degraded classification ───────────────────────────────────────────────────
 
 describe('GET /health/ready — degraded classification', () => {
-  it('returns 200 when a dependency is degraded (not 503)', async () => {
+  it('returns 503 during startup when a dependency is degraded', async () => {
     const app = buildApp([degradedChecker('postgres'), healthyChecker('stellar_rpc')]);
     const res = await request(app).get('/health/ready');
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
   });
 
-  it('response status is "degraded" when any dependency is degraded', async () => {
+  it('response status is "degraded" when any dependency is degraded (during startup)', async () => {
     const app = buildApp([degradedChecker('postgres'), healthyChecker('stellar_rpc')]);
     const res = await request(app).get('/health/ready');
     expect(res.body.status).toBe('degraded');
@@ -116,22 +116,22 @@ describe('GET /health/ready — degraded classification', () => {
     expect(res.body.dependencies.stellar_rpc).toBe('healthy');
   });
 
-  it('redis degraded → overall degraded, still 200', async () => {
+  it('redis degraded → overall degraded, returns 503 during startup', async () => {
     const app = buildApp([
       healthyChecker('postgres'),
       degradedChecker('redis'),
       healthyChecker('stellar_rpc'),
     ]);
     const res = await request(app).get('/health/ready');
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     expect(res.body.status).toBe('degraded');
     expect(res.body.dependencies.redis).toBe('degraded');
   });
 
-  it('stellar_rpc degraded → overall degraded, still 200', async () => {
+  it('stellar_rpc degraded → overall degraded, returns 503 during startup', async () => {
     const app = buildApp([healthyChecker('postgres'), degradedChecker('stellar_rpc')]);
     const res = await request(app).get('/health/ready');
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     expect(res.body.status).toBe('degraded');
   });
 
@@ -140,6 +140,76 @@ describe('GET /health/ready — degraded classification', () => {
     const res = await request(app).get('/health/ready');
     expect(res.status).toBe(503);
     expect(res.body.status).toBe('unhealthy');
+  });
+});
+
+// ── Grace period behavior ─────────────────────────────────────────────────────
+
+describe('GET /health/ready — grace period behavior', () => {
+  it('returns 200 when a dependency is degraded after startup, within grace period', async () => {
+    const app = buildApp([degradedChecker('postgres'), healthyChecker('stellar_rpc')]);
+    const manager = app.locals.healthManager as HealthCheckManager;
+    // Fast-forward startTime to > 30s ago
+    Object.defineProperty(manager, 'startTime', { value: Date.now() - 40000 });
+    
+    // First check establishes degradedSince
+    await request(app).get('/health/ready');
+    
+    // Second check is within the 30s grace period from degradedSince
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('degraded');
+  });
+
+  it('returns 503 when a dependency is degraded longer than the grace period', async () => {
+    const app = buildApp([degradedChecker('postgres'), healthyChecker('stellar_rpc')]);
+    const manager = app.locals.healthManager as HealthCheckManager;
+    Object.defineProperty(manager, 'startTime', { value: Date.now() - 80000 });
+    
+    // First check sets degradedSince to current time
+    await request(app).get('/health/ready');
+    
+    // Simulate time passing beyond 30s
+    const oldResults = (manager as any).lastResults.get('postgres');
+    oldResults.degradedSince = new Date(Date.now() - 35000).toISOString();
+    
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+  });
+
+  it('recovers from degraded state when dependency becomes healthy again', async () => {
+    let currentStatus = 'degraded';
+    const flappyChecker: HealthChecker = {
+      name: 'postgres',
+      async check() { 
+        if (currentStatus === 'degraded') return { latency: 1, degraded: true };
+        return { latency: 1 };
+      }
+    };
+    
+    const app = buildApp([flappyChecker]);
+    const manager = app.locals.healthManager as HealthCheckManager;
+    Object.defineProperty(manager, 'startTime', { value: Date.now() - 40000 });
+    
+    // Check while degraded
+    let res = await request(app).get('/health/ready');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('degraded');
+    
+    // Simulate time passing beyond 30s
+    const oldResults = (manager as any).lastResults.get('postgres');
+    oldResults.degradedSince = new Date(Date.now() - 35000).toISOString();
+    
+    // Now it should return 503
+    res = await request(app).get('/health/ready');
+    expect(res.status).toBe(503);
+    
+    // Now it recovers
+    currentStatus = 'healthy';
+    res = await request(app).get('/health/ready');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('healthy');
   });
 });
 

@@ -71,7 +71,11 @@ export class RedisDistributedLock implements Lock {
             acquire: async () => this.acquire(),
             release: async () => {
               try {
-                await this.redis.del(lockKey);
+                if (this.redis.delIfValue) {
+                  await this.redis.delIfValue(lockKey, lockValue);
+                } else if (await this.redis.get(lockKey) === lockValue) {
+                  await this.redis.del(lockKey);
+                }
               } catch (err) {
                 logger.warn('Failed to release admin state lock', undefined, {
                   lockKey,

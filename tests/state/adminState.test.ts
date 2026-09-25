@@ -32,6 +32,7 @@ describe('adminState', () => {
 
   afterEach(() => {
     _resetForTest();
+    fs.rmSync(adminStateFile, { recursive: true, force: true });
 
     if (originalAdminStateFile !== undefined) {
       process.env.ADMIN_STATE_FILE = originalAdminStateFile;
@@ -94,10 +95,18 @@ describe('adminState', () => {
       expect(getPauseFlags()).toEqual({ streamCreation: false, ingestion: false });
     });
 
-    // ESM does not allow spying on `node:fs` named exports, so this scenario
-    // is skipped — see https://vitest.dev/guide/browser/#limitations.
-    it.skip('throws and keeps prior state when persistence write fails', () => {
-      // Originally exercised the failure path via a writeFileSync spy.
+    it('throws and keeps prior state when persistence write fails', async () => {
+      await setPauseFlags({ streamCreation: true });
+
+      // Make the destination a directory so the atomic rename fails without
+      // mocking node:fs or depending on ESM module spying.
+      fs.rmSync(adminStateFile, { force: true });
+      fs.mkdirSync(adminStateFile);
+
+      await expect(setPauseFlags({ ingestion: true })).rejects.toBeInstanceOf(
+        AdminStatePersistenceError,
+      );
+      expect(getPauseFlags()).toEqual({ streamCreation: true, ingestion: false });
     });
 
     it('handles concurrent writes safely via distributed lock', async () => {

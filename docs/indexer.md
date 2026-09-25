@@ -79,6 +79,76 @@ Tests are in `tests/indexer/replayIntegrity.test.ts` and cover:
 
 ---
 
+## Backfill Scheduling and Live-Indexing Yield
+
+`src/indexer/backfillScheduler.ts` runs historical backfill as a background,
+best-effort workload with **bounded concurrency** and an **ordered
+checkpoint**. Live (tip-following) indexing always has priority: a backfill
+that runs flat out during a busy period competes for the same RPC and database
+capacity and *increases* the ledger lag that `src/metrics/indexerLag.ts`
+measures — the opposite of what the operator wanted.
+
+### The schedule
+
+1. Batches are processed in ascending `index` order, with at most `concurrency`
+   handlers in flight at once.
+2. Before a worker claims its next batch it reads the **live-indexing lag**
+   (the same quantity as the `indexer_ledger_lag` gauge, i.e. tip minus
+   last-indexed ledger) via the `liveIndexingLag` callback.
+3. If the lag is **greater than or equal to** `maxLiveIndexingLag`, the worker
+   waits and starts no new batch. The backfill is now **paused**.
+4. While paused, the lag is re-checked every `yieldPollIntervalMs`. As soon as
+   it falls **below** the threshold, the backfill **resumes automatically** — no
+   operator action and no restart required.
+5. All workers share a single pause gate, so one sustained lagging period emits
+   exactly one `paused` → `resumed` transition, regardless of `concurrency`.
+
+Yielding is **disabled** — and the scheduler behaves exactly as before — when
+`liveIndexingLag` is omitted or `maxLiveIndexingLag` is `<= 0` (the default).
+
+A lag reader that throws is treated as “no lag recorded” so a transient
+metrics/DB glitch cannot stall the backfill forever; the failed read is not
+surfaced as a batch failure.
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `liveIndexingLag` | — | Reader for the current live-indexing lag in ledgers. Omit to disable yielding. |
+| `maxLiveIndexingLag` | `0` (disabled) | Pause while lag `>=` this value. Must be `> 0` to enable yielding. |
+| `yieldPollIntervalMs` | `1000` | Interval between lag re-checks while paused. |
+| `onYield` | — | Called once per pause, with the triggering lag. |
+| `onResume` | — | Called once per resume, with the lag observed at resumption. |
+
+### Observability
+
+The pause/resume decision is observable three ways:
+
+| Signal | Meaning |
+|--------|---------|
+| `onYield(lag)` / `onResume(lag)` callbacks | Per-scheduler decisions, for callers that persist or forward them |
+| `indexer_backfill_paused` gauge | `1` while paused, `0` while running |
+| `indexer_backfill_yield_events_total{event}` | `paused` / `resumed` transition counts |
+
+An operator alert can be written as “the backfill has been paused for more than
+N minutes”, which is a direct signal that live indexing is behind.
+
+### Validation
+
+`tests/indexer/backfillScheduler.test.ts` exercises the condition against the
+real scheduler and asserts the documented outcome:
+
+- **Pauses when live indexing lags** — with a lag above the threshold no handler
+  is invoked until the lag drops.
+- **Resumes automatically** — once the lag falls below the threshold the
+  remaining batches are processed without any new call.
+- **Reports the decision once** — a sustained lagging period with several
+  concurrent workers yields exactly one `onYield` and one `onResume`.
+- **Runs unchanged when disabled** — omitting `liveIndexingLag` (or setting
+  `maxLiveIndexingLag <= 0`) never pauses.
+
+---
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -86,6 +156,20 @@ Tests are in `tests/indexer/replayIntegrity.test.ts` and cover:
 | `INDEXER_REPLAY_BUDGET_MS` | `0` (no budget) | Max wall-clock duration for a single replay run |
 | `INDEXER_REPLAY_BATCH_SIZE` | `100` | Rows per batch |
 | `INDEXER_MAX_REPLAY_RANGE_BLOCKS` | `0` (unlimited) | Max block range per replay request |
+
+## gRPC Gateway Resource Policy
+
+When `GRPC_GATEWAY_ENABLED=true`, the internal indexer gateway accepts messages
+up to **4 MiB** and sends responses under the same limit. Each unary handler is
+bounded by a **30-second** server-side deadline. Calls cancelled by the client
+are treated as terminal: the gateway removes its cancellation listener, skips
+late callbacks, and does not retry ingest or replay work because completion
+cannot be inferred from a cancelled RPC. Oversized requests are rejected by
+gRPC with `RESOURCE_EXHAUSTED`; deadline expiry returns `DEADLINE_EXCEEDED`.
+
+These limits are implemented in `src/indexer/grpcGateway.ts` and covered by
+`tests/indexer/grpcGateway.test.ts`. The policy bounds gateway buffers and
+handler lifetime; it does not cancel an already-running database operation.
 
 ## Metrics
 
@@ -98,3 +182,6 @@ Tests are in `tests/indexer/replayIntegrity.test.ts` and cover:
 | `indexer_replay_integrity_gaps_total` | Counter | Ledger gaps detected by integrity check |
 | `indexer_replay_integrity_duplicates_total` | Counter | Duplicate events detected by integrity check |
 | `indexer_mtls_validation_failures_total` | Counter | mTLS certificate validation failures |
+| `indexer_ledger_lag` | Gauge | Live-indexing lag in ledgers (yield input for the backfill scheduler) |
+| `indexer_backfill_paused` | Gauge | `1` while the backfill is paused to yield to live indexing |
+| `indexer_backfill_yield_events_total` | Counter | Backfill yield transitions, by `event` (`paused`/`resumed`) |

@@ -159,6 +159,22 @@ describe('dlqRepository.purgeTerminalEntries', () => {
     const [[, , params]] = mockQuery.mock.calls;
     expect(params[1]).toBe(cutoff); // passed as parameter, not interpolated
   });
+
+  it('limits a purge to one tenant and supports dry-run without DELETE', async () => {
+    mockQuery.mockResolvedValue({ rowCount: 0, rows: [{ count: 2 }] });
+
+    const count = await dlqRepository.purgeTerminalEntries(500, '2026-01-01T00:00:00.000Z', {
+      tenantId: 'tenant-a',
+      dryRun: true,
+    });
+
+    expect(count).toBe(2);
+    const [[, sql, params]] = mockQuery.mock.calls;
+    expect(sql).toContain('SELECT COUNT(*)');
+    expect(sql).not.toContain('DELETE FROM');
+    expect(sql).toContain('tenant_id = $3');
+    expect(params).toEqual([500, '2026-01-01T00:00:00.000Z', 'tenant-a']);
+  });
 });
 
 // ── runDlqPurge (job-level) ─────────────────────────────────────────────────
@@ -297,6 +313,24 @@ describe('runDlqPurge', () => {
     expect(result.retentionDays).toBe(90);
     const [[, , params]] = mockQuery.mock.calls;
     expect(params[1]).toBeDefined();
+  });
+
+  it('rejects retention windows beyond the one-year safety maximum', async () => {
+    await expect(runDlqPurge({ retentionDays: 366 })).rejects.toThrow('between 0 and 365');
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('dry-run reports candidates without emitting a deletion audit event', async () => {
+    mockQuery.mockResolvedValue({ rowCount: 0, rows: [{ count: 4 }] });
+    const result = await runDlqPurge({
+      retentionDays: 30,
+      tenantId: 'tenant-a',
+      dryRun: true,
+      now: new Date('2026-07-29T00:00:00Z'),
+    });
+    expect(result.rowsPurged).toBe(4);
+    expect(result.dryRun).toBe(true);
+    expect(mockRecordAuditEvent).not.toHaveBeenCalled();
   });
 });
 

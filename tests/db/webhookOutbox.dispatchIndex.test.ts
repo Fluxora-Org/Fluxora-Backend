@@ -85,6 +85,7 @@ function planUsesIndex(planJson: unknown, indexName: string): boolean {
   return JSON.stringify(planJson).includes(indexName);
 }
 
+// Keep-gated and intentionally excluded from issue #1248; tracked as live-DB coverage.
 describe.skipIf(!isLiveDb)('webhook_outbox dispatch index (live DB)', () => {
   let client: pg.Client;
 

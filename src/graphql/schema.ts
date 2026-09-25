@@ -1,3 +1,4 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * GraphQL schema for Fluxora Backend experimental federation gateway.
  *
@@ -13,6 +14,11 @@
  */
 
 import { buildSchema } from 'graphql';
+import { API_STREAM_STATUSES } from '../streams/status.js';
+
+const streamStatusEnumValues = API_STREAM_STATUSES
+  .map((s) => `    ${s}`)
+  .join('\n');
 
 /**
  * GraphQL schema definition string (SDL).
@@ -32,10 +38,7 @@ export const typeDefs = `
   Stream status enum matching the Fluxora domain.
   """
   enum StreamStatus {
-    active
-    paused
-    completed
-    cancelled
+${streamStatusEnumValues}
   }
 
   """

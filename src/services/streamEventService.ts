@@ -1,3 +1,4 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Stream Event Service - Maps blockchain events to database records
  *
@@ -10,7 +11,7 @@
 
 import { streamRepository } from "../db/repositories/streamRepository.js";
 import { CreateStreamInput, StreamStatus } from "../db/types.js";
-import { info, warn, error as logError, debug } from "../utils/logger.js";
+import { info, warn, error as logError, debug } from "../lib/logger.js";
 import { getStreamHub } from "../ws/hub.js";
 import { enrichActiveSpanWithStream, traceSpan } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";

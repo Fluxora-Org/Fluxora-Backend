@@ -15,13 +15,17 @@ High-performance contract event indexer with optimized batch processing and Post
 
 - Node.js 18+
 - PostgreSQL 12+
-- pnpm (or npm/yarn)
+- pnpm 9.15.9 (required)
 
 ## 🛠️ Installation
 
 ```bash
+# Activate the package manager version pinned in package.json
+corepack enable
+corepack prepare pnpm@9.15.9 --activate
+
 # Install dependencies
-pnpm install
+pnpm install --frozen-lockfile
 
 # Copy environment configuration
 cp .env.example .env
@@ -29,6 +33,10 @@ cp .env.example .env
 # Edit .env with your database credentials
 # DATABASE_URL=postgresql://user:password@localhost:5432/indexer_db
 ```
+
+pnpm is the repository's only supported package manager, and `pnpm-lock.yaml`
+is the authoritative dependency lockfile. The preinstall guard intentionally
+rejects npm, Yarn, other package managers, and pnpm versions other than 9.15.9.
 
 ## 🗄️ Database Setup
 
@@ -52,7 +60,7 @@ timestamp prefix are applied in ascending numeric order and recorded in the
 |---|---|
 | `1000000000000 – 1000000000999` | Bootstrapping tables converted from the legacy PoolClient runner (`000_*`, `001_*`, `002_*`) |
 | `1774715131962 +` | Streams, audit, webhook-outbox, DLQ, and PII tables |
-| `20260601000000 +` | Calendar-style additions (pgcrypto, pagination indexes, …) |
+| `20260622000000 +` | Calendar-style additions (pagination indexes, pgcrypto, partitioning, …) |
 
 Files without a leading digit (e.g. `run.ts`) are ignored by the scanner and
 will never appear in the `pgmigrations` ledger.
@@ -146,6 +154,7 @@ Response:
 Scripted database backup, restore, and partition retention operations are managed via `src/scripts/db-ops.ts`.
 - `backupDatabase` / `restoreDatabase`: Support local custom-format dumps as well as zero-disk S3 streaming.
 - `dropOldPartitions`: Detaches and drops range partitions older than a specified threshold. Runs in `dryRun = true` mode by default.
+- Destructive restore and partition-drop operations print their target environment, require an explicit `confirm: true` flag, and require `acknowledgeProduction: true` when targeting production. Use `dryRun: true` first to report the planned change.
 
 For complete details on operator ergonomics, security controls, credential protection, and region resolution, see [docs/database.md](docs/database.md#scripted-database-operations--operator-ergonomics).
 
@@ -255,6 +264,9 @@ For a table with 10M events:
 
 ## 📚 Documentation
 
+**Operations / alerting:** see the [Alerting Signals Runbook](docs/observability/alerting-runbook.md) for metric → threshold → first diagnostic → escalation mapping across all collectors. Deeper topic docs live under `docs/observability/`.
+
+
 See [docs/indexer.md](docs/indexer.md) for comprehensive documentation including:
 - Detailed API reference
 - Database schema and indexes
@@ -360,6 +372,11 @@ MIT
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes with tests
+   - Protecting a new route? Use the guards from `src/middleware/auth.ts`,
+     the authoritative auth entry point. See [docs/auth.md](docs/auth.md),
+     "Which authentication helper to use".
+   - Returning a collection? Paginate it and add its bound to
+     [docs/response-limits.md](docs/response-limits.md).
 4. Ensure tests pass: `pnpm test`
 5. Submit a pull request
 

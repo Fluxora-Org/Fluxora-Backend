@@ -84,6 +84,7 @@ export interface ConsumerSuspension {
 function rowToEntry(row: Record<string, unknown>): DlqEntry {
   return {
     id:            row['id']             as string,
+    tenantId:      row['tenant_id']      as string | undefined,
     topic:         row['topic']          as string,
     payload:       row['payload']        as unknown,
     error:         row['error']          as string,
@@ -117,10 +118,11 @@ export const dlqRepository = {
     await query(
       pool,
       `INSERT INTO dead_letter_queue
-         (id, topic, payload, error, attempts, correlation_id, first_failed_at, last_failed_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+         (id, tenant_id, topic, payload, error, attempts, correlation_id, first_failed_at, last_failed_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         entry.id,
+        entry.tenantId ?? null,
         entry.topic,
         safeSerializePayload(entry.payload),
         entry.error,
@@ -137,6 +139,7 @@ export const dlqRepository = {
     limit: number;
     offset: number;
     topic?: string;
+    tenantId?: string;
   }): Promise<{ entries: DlqEntry[]; total: number }> {
     const pool = getPool();
     const conditions: string[] = [];
@@ -146,6 +149,10 @@ export const dlqRepository = {
     if (opts.topic) {
       conditions.push(`topic = $${idx++}`);
       params.push(opts.topic);
+    }
+    if (opts.tenantId) {
+      conditions.push(`tenant_id = $${idx++}`);
+      params.push(opts.tenantId);
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -195,10 +202,14 @@ export const dlqRepository = {
     return (result.rowCount ?? 0) > 0;
   },
 
-  async deleteAll(topic?: string): Promise<number> {
+  async deleteAll(topic?: string, tenantId?: string): Promise<number> {
     const pool = getPool();
-    if (topic) {
-      const result = await query(pool, 'DELETE FROM dead_letter_queue WHERE topic = $1', [topic]);
+    if (topic || tenantId) {
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+      if (topic) { conditions.push(`topic = $${params.length + 1}`); params.push(topic); }
+      if (tenantId) { conditions.push(`tenant_id = $${params.length + 1}`); params.push(tenantId); }
+      const result = await query(pool, `DELETE FROM dead_letter_queue WHERE ${conditions.join(' AND ')}`, params);
       return result.rowCount ?? 0;
     }
     const result = await query(pool, 'DELETE FROM dead_letter_queue');
@@ -227,26 +238,24 @@ export const dlqRepository = {
    * @param cutoffDate — ISO-8601 timestamp; entries older than this are eligible.
    * @returns The number of rows deleted.
    */
-  async purgeTerminalEntries(batchSize: number, cutoffDate: string): Promise<number> {
+  async purgeTerminalEntries(
+    batchSize: number,
+    cutoffDate: string,
+    options: { tenantId?: string; dryRun?: boolean } = {},
+  ): Promise<number> {
     const pool = getPool();
-    const result = await query(
-      pool,
-      `DELETE FROM dead_letter_queue
-       WHERE id IN (
-         SELECT id FROM dead_letter_queue
-          WHERE (
-            -- Resolved: explicitly replayed by an operator
-            status = 'replayed'
-            OR
-            -- Exhausted: dead entries beyond retention window;
-            -- recent last_failed_at implies still pending/in-flight.
-            (status = 'dead' AND last_failed_at < $2)
-          )
-          ORDER BY last_failed_at ASC
-          LIMIT $1
-       )`,
-      [batchSize, cutoffDate],
-    );
+    const params: unknown[] = [batchSize, cutoffDate];
+    const tenantClause = options.tenantId
+      ? ` AND tenant_id = $${params.push(options.tenantId)}`
+      : ' AND tenant_id IS NULL';
+    const candidateQuery = `SELECT id FROM dead_letter_queue
+      WHERE last_failed_at < $2 AND (status = 'replayed' OR status = 'dead')${tenantClause}
+      ORDER BY last_failed_at ASC LIMIT $1`;
+    if (options.dryRun) {
+      const result = await query(pool, `SELECT COUNT(*)::int AS count FROM (${candidateQuery}) eligible`, params);
+      return Number(result.rows[0]?.count ?? 0);
+    }
+    const result = await query(pool, `DELETE FROM dead_letter_queue WHERE id IN (${candidateQuery})`, params);
     return result.rowCount ?? 0;
   },
 

@@ -16,7 +16,7 @@ function randomHex(): string {
   return result;
 }
 
-function computeLockoutDuration(attemptCount: number): number {
+export function computeLockoutDuration(attemptCount: number): number {
   const exponent = attemptCount - THRESHOLD;
   const seconds = Math.pow(2, exponent) * 60;
   return Math.min(seconds, MAX_LOCKOUT_SECONDS);
@@ -63,7 +63,7 @@ export class AuthAttemptStore {
     if (count >= THRESHOLD) {
       const lockoutSeconds = computeLockoutDuration(count);
       const lockoutKey = buildLockoutKey(key);
-      const expiryTimestamp = String(Date.now() + lockoutSeconds * 1000);
+      const expiryTimestamp = String(now + lockoutSeconds * 1000);
       await this.client.set(lockoutKey, expiryTimestamp, { ex: lockoutSeconds });
     }
   }

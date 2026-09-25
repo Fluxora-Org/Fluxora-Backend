@@ -156,6 +156,27 @@ describe('WorkerPool', () => {
     expect(fallback).toHaveBeenCalledOnce();
     expect((result as { current: string }).current).toBe('fallback-hash');
   });
+
+  it('rejects with PoolQueueFullError when max queue size is reached', async () => {
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
+    pool = new WorkerPool(workerUrl, { maxWorkers: 1, maxQueueSize: 1 });
+
+    // Enqueue task 1 (occupies the single worker)
+    const p1 = pool.exec({ type: 'hash', taskId: 0, address, keys });
+    
+    // Wait briefly so the worker processes and becomes busy
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Enqueue task 2 (enters the queue, which has max size 1)
+    const p2 = pool.exec({ type: 'hash', taskId: 1, address, keys });
+
+    // Enqueue task 3 (should be rejected since queue is full)
+    const p3 = pool.exec({ type: 'hash', taskId: 2, address, keys });
+
+    await expect(p3).rejects.toThrow('WorkerPool queue is full (backpressure applied)');
+    
+    await Promise.all([p1, p2]);
+  });
 });
 
 // ── batchComputeAddressHashes ──────────────────────────────────────────────
@@ -294,6 +315,54 @@ describe('batchComputeAddressHashes', () => {
       expect(results1[i].current).toBe(computeAddressHash(addrs1[i], key));
       expect(results2[i].current).toBe(computeAddressHash(addrs2[i], key));
     }
+  });
+});
+
+// ── Worker HashErrorMessage → rejection ────────────────────────────────────
+//
+// Before the fix, a worker that posted { type: 'error', taskId, error: '...' }
+// would cause the pool to RESOLVE the task promise with the error-shaped
+// object instead of rejecting it.  Callers expecting a HashResultMessage
+// would get a HashErrorMessage silently, making the bug impossible to
+// detect without explicit type checking downstream.
+
+describe('WorkerPool — HashErrorMessage causes rejection', () => {
+  it('rejects the task promise when the worker message has type "error"', async () => {
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
+    const pool = new WorkerPool(workerUrl, { maxWorkers: 1 });
+
+    // Register a fallback that simulates a worker posting an error-shaped message
+    pool.setFallback((_msg: unknown) => {
+      return { type: 'error', taskId: 0, error: 'hmac computation failed' };
+    });
+
+    // Force fallback by marking all workers failed
+    (pool as any).allWorkersFailed = true;
+
+    await expect(
+      pool.exec({ type: 'hash', taskId: 0, address, keys })
+    ).rejects.toThrow('hmac computation failed');
+
+    await pool.shutdown();
+  });
+
+  it('resolves normally when the worker message has type "result"', async () => {
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
+    const p = new WorkerPool(workerUrl, { maxWorkers: 1 });
+
+    p.setFallback((_msg: unknown) => {
+      return { type: 'result', taskId: 0, current: 'aabbcc', previous: undefined };
+    });
+
+    (p as any).allWorkersFailed = true;
+
+    const result = await p.exec<{ type: string; current: string }>({
+      type: 'hash', taskId: 0, address, keys,
+    });
+
+    expect(result.type).toBe('result');
+    expect(result.current).toBe('aabbcc');
+    await p.shutdown();
   });
 });
 

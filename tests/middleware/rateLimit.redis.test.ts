@@ -91,6 +91,49 @@ describe('SlidingWindowStore with FakeRedisClient', () => {
     // The SlidingWindowStore should surface the pipeline error rather than reading undefined
     await expect(store.increment('key', 60_000, 100)).rejects.toThrow('Redis pipeline command at index 2 failed: Simulated ZCARD failure');
   });
+
+  it('sets a bounded TTL equal to the window on every increment (#1260)', async () => {
+    const WINDOW_MS = 45_000;
+    await store.increment('tenant-a:principal:route', WINDOW_MS, 100);
+
+    const redisKeys = client.getSortedSetKeys();
+    expect(redisKeys).toHaveLength(1);
+    // Keys live under the fluxora:rl: namespace and are sanitised to a bounded
+    // length — the raw principal never appears verbatim.
+    const redisKey = redisKeys[0]!;
+    expect(redisKey.startsWith('fluxora:rl:')).toBe(true);
+    expect(redisKey.length).toBeLessThanOrEqual(320);
+    // Unsafe key-injection characters from the raw identifier are stripped
+    // from the segment that carries the identifier (only the namespace prefix
+    // may contain colons).
+    const segment = redisKey.slice('fluxora:rl:'.length);
+    expect(segment).not.toContain(':');
+    // TTL is refreshed to exactly one window on each increment.
+    expect(client.getTtl(redisKey)).toBe(WINDOW_MS);
+
+    await store.increment('tenant-a:principal:route', WINDOW_MS, 100);
+    expect(client.getTtl(redisKey)).toBe(WINDOW_MS);
+    // A second principal gets its own key and its own TTL.
+    await store.increment('tenant-b:principal:route', WINDOW_MS, 100);
+    expect(client.getSortedSetKeys()).toHaveLength(2);
+  });
+
+  it('sanitises long identifiers into bounded keys without collisions for distinct inputs', async () => {
+    const longA = `tenant-${'a'.repeat(600)}:principal:route`;
+    const longB = `tenant-${'b'.repeat(600)}:principal:route`;
+
+    await store.increment(longA, 60_000, 100);
+    await store.increment(longB, 60_000, 100);
+
+    const keys = client.getSortedSetKeys();
+    expect(keys).toHaveLength(2);
+    for (const k of keys) {
+      expect(k.length).toBeLessThanOrEqual(320);
+    }
+    // Distinct principals must never collapse onto one key, even when both
+    // inputs exceed the sanitisation budget.
+    expect(keys[0]).not.toBe(keys[1]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -161,6 +204,32 @@ describe('HybridStore', () => {
 
     const result = await hybrid.getCount('key', 60_000);
     expect(result.count).toBe(0);
+    expect(hybrid.usingFallback).toBe(true);
+  });
+
+  it('keeps tenants isolated while degraded (fallback counters never merge) (#1260)', async () => {
+    // Simulate a Redis outage: primary always throws, so every call lands in
+    // the in-memory fallback — the exact failover path documented for outages.
+    const primary: RateLimitStore = {
+      async increment() { throw new Error('Redis down'); },
+      async getCount() { throw new Error('Redis down'); },
+      async close() {},
+    };
+    const fallback = new InMemoryStore();
+    const hybrid = new HybridStore(primary, fallback, () => {});
+
+    // Tenant A exhausts its fallback quota.
+    const limit = 2;
+    const a1 = await hybrid.increment('tenant-a', 60_000, limit);
+    const a2 = await hybrid.increment('tenant-a', 60_000, limit);
+    expect(a1.count).toBe(1);
+    expect(a2.count).toBe(2);
+
+    // Tenant B starts fresh — the outage must not merge tenants.
+    const b1 = await hybrid.increment('tenant-b', 60_000, limit);
+    expect(b1.count).toBe(1);
+    const bCount = await hybrid.getCount('tenant-b', 60_000);
+    expect(bCount.count).toBe(1);
     expect(hybrid.usingFallback).toBe(true);
   });
 

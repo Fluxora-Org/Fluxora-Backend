@@ -4,23 +4,28 @@ import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from '.
 import {
   getPinnedAddressNetwork,
   isValidStellarContractAddress,
-  STELLAR_CONTRACT_ALLOWLIST,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
   STELLAR_NETWORK_PASSPHRASES,
   type PinnedStellarAddressKind,
-  type PinnedStellarNetwork,
 } from './stellarContracts.js';
+import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
 export {
   STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
   isValidStellarContractAddress,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
 } from './stellarContracts.js';
+export { resolveNetwork } from './stellar.js';
 
 type NodeEnv = 'development' | 'staging' | 'production' | 'test';
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const SECRET_ENV_NAMES = new Set([
   'JWT_SECRET',
+  'JWT_SECRET_PREVIOUS',
   'INDEXER_WORKER_TOKEN',
   'WEBHOOK_SECRET',
   'WEBHOOK_SECRET_PREVIOUS',
@@ -132,6 +137,21 @@ function optionalString(name: string) {
   );
 }
 
+function operationDeadlinesEnv() {
+  return z.preprocess(
+    (value) => {
+      if (value === undefined || value === '') return {};
+      if (typeof value !== 'string') return value;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    },
+    z.record(z.string(), z.number().int().min(1, 'RPC operation deadlines must be at least 1ms')),
+  );
+}
+
 function requiredStellarContractAddress(name: string) {
   return z
     .string()
@@ -152,7 +172,7 @@ function validatePinnedAddress(
   ctx: z.RefinementCtx,
   network: StellarNetwork,
   kind: PinnedStellarAddressKind,
-  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS' | 'CONTRACT_ADDRESS_STREAMING' | string,
   address: string
 ): void {
   if (network === 'local') return;
@@ -178,16 +198,22 @@ export const EnvSchema = z
 
     DATABASE_URL: urlString('DATABASE_URL'),
     DATABASE_REPLICA_URL: optionalUrlString('DATABASE_REPLICA_URL'),
-    DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(2),
-    DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(10),
-    DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(5000),
-    DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(30000),
+    DB_POOL_MIN: integerEnv('DB_POOL_MIN', 1, 100).default(LIMITS.DB_POOL_MIN),
+    DB_POOL_MAX: integerEnv('DB_POOL_MAX', 1, 100).default(LIMITS.DB_POOL_MAX),
+    DB_CONNECTION_TIMEOUT: integerEnv('DB_CONNECTION_TIMEOUT', 1000, 60000).default(
+      LIMITS.DB_CONNECTION_TIMEOUT
+    ),
+    DB_IDLE_TIMEOUT: integerEnv('DB_IDLE_TIMEOUT', 1000, 600000).default(LIMITS.DB_IDLE_TIMEOUT),
     SLOW_QUERY_THRESHOLD_MS: integerEnv('SLOW_QUERY_THRESHOLD_MS', 0).default(1000),
-    STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(5000),
+    STATEMENT_TIMEOUT_MS: integerEnv('STATEMENT_TIMEOUT_MS', 0).default(
+      LIMITS.STATEMENT_TIMEOUT_MS
+    ),
+    /** Max requests allowed to queue on the primary pool before fast-failing with 503. */
+    POOL_QUEUE_LIMIT: integerEnv('POOL_QUEUE_LIMIT', 1).default(LIMITS.POOL_QUEUE_LIMIT),
     /** Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. 0 = disabled. */
     REPLICA_STATEMENT_TIMEOUT_MS: integerEnv('REPLICA_STATEMENT_TIMEOUT_MS', 0).optional(),
     /** Max requests allowed to queue on the replica pool before fast-failing. */
-    REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(25),
+    REPLICA_QUEUE_LIMIT: integerEnv('REPLICA_QUEUE_LIMIT', 1).default(LIMITS.REPLICA_QUEUE_LIMIT),
 
     REDIS_URL: urlString('REDIS_URL').default('redis://localhost:6379'),
     REDIS_ENABLED: booleanEnv().default(true),
@@ -198,19 +224,58 @@ export const EnvSchema = z
     REDIS_SENTINEL_NAME: optionalString('REDIS_SENTINEL_NAME'),
     // Comma-separated list of cluster nodes: host:port,host:port
     REDIS_CLUSTER_NODES: optionalString('REDIS_CLUSTER_NODES'),
+    /** TCP connect timeout for each Redis client, in ms. */
+    REDIS_CONNECT_TIMEOUT_MS: integerEnv('REDIS_CONNECT_TIMEOUT_MS', 1, 60000).default(
+      LIMITS.REDIS_CONNECT_TIMEOUT_MS
+    ),
+    /** Command retries per request before a Redis call fails. */
+    REDIS_MAX_RETRIES_PER_REQUEST: integerEnv('REDIS_MAX_RETRIES_PER_REQUEST', 0).default(
+      LIMITS.REDIS_MAX_RETRIES_PER_REQUEST
+    ),
+    /** Base delay of the Redis reconnect backoff, in ms. */
+    REDIS_RETRY_BASE_DELAY_MS: integerEnv('REDIS_RETRY_BASE_DELAY_MS', 0).default(
+      LIMITS.REDIS_RETRY_BASE_DELAY_MS
+    ),
+    /** Ceiling of the Redis reconnect backoff, in ms. */
+    REDIS_RETRY_MAX_DELAY_MS: integerEnv('REDIS_RETRY_MAX_DELAY_MS', 0).default(
+      LIMITS.REDIS_RETRY_MAX_DELAY_MS
+    ),
+    /** Reconnect attempts before ioredis stops retrying. */
+    REDIS_RETRY_MAX_ATTEMPTS: integerEnv('REDIS_RETRY_MAX_ATTEMPTS', 1).default(
+      LIMITS.REDIS_RETRY_MAX_ATTEMPTS
+    ),
 
     STELLAR_NETWORK: z.enum(['testnet', 'mainnet', 'local']).optional(),
     STELLAR_CONTRACT_ADDRESS: requiredStellarContractAddress('STELLAR_CONTRACT_ADDRESS'),
     STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
     HORIZON_URL: optionalUrlString('HORIZON_URL'),
     HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
-    CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
+    CONTRACT_ADDRESS_STREAMING: z
+      .preprocess((value) => (value === '' ? undefined : value), z.string().trim().optional())
+      .refine(
+        (val) => val === undefined || isValidStellarContractAddress(val),
+        'CONTRACT_ADDRESS_STREAMING must be a valid Stellar contract StrKey'
+      ),
     STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
-    STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(10000),
-    STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(3),
-    STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
+    STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(LIMITS.STELLAR_RPC_TIMEOUT),
+    STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(
+      LIMITS.STELLAR_RPC_MAX_RETRIES
+    ),
+    STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(
+      LIMITS.STELLAR_RPC_RETRY_DELAY
+    ),
+    /**
+     * Per-operation timeout overrides for Stellar RPC calls.
+     * Format: JSON object mapping operation names to timeouts in ms.
+     * Example: '{"getLatestLedger":2000,"accountExists":8000}'
+     */
+    STELLAR_RPC_OPERATION_DEADLINES: operationDeadlinesEnv(),
 
     JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+    JWT_SECRET_PREVIOUS: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'JWT_SECRET_PREVIOUS must be at least 32 characters').optional()
+    ),
     PGCRYPTO_KEY: z.preprocess(
       (value) => (value === '' ? undefined : value),
       z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional()
@@ -230,6 +295,10 @@ export const EnvSchema = z
     API_KEY_PEPPER: z.preprocess(
       (value) => (value === '' ? undefined : value),
       z.string().min(32, 'API_KEY_PEPPER must be at least 32 characters').optional()
+    ),
+    API_KEY_PEPPER_PREVIOUS: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.string().min(32, 'API_KEY_PEPPER_PREVIOUS must be at least 32 characters').optional()
     ),
     INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
     ADMIN_API_KEY: optionalString('ADMIN_API_KEY'),
@@ -251,6 +320,10 @@ export const EnvSchema = z
       .default(1024 * 1024),
     MAX_JSON_DEPTH: integerEnv('MAX_JSON_DEPTH', 1, 1000).default(20),
     REQUEST_TIMEOUT_MS: integerEnv('REQUEST_TIMEOUT_MS', 1000, 300000).default(30000),
+    GRAPHQL_PERSISTED_QUERY_ALLOWLIST: optionalString('GRAPHQL_PERSISTED_QUERY_ALLOWLIST'),
+    GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION: booleanEnv().default(true),
+    GRAPHQL_UNPERSISTED_QUERY_POLICY: z.enum(['allow', 'reject']).default('allow'),
+    GRAPHQL_INTROSPECTION_ENABLED: booleanEnv().default(true),
 
     LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
     METRICS_ENABLED: booleanEnv().default(true),
@@ -264,12 +337,8 @@ export const EnvSchema = z
      */
     TRACING_ENABLED: booleanEnv().default(false),
     TRACING_SAMPLE_RATE: z.preprocess(parseNumber, z.number().min(0).max(1)).default(1),
-    TRACING_SAMPLING_STRATEGY: z
-      .enum(['head', 'tail', 'always', 'never'])
-      .default('head'),
-    TRACING_HEAD_SAMPLE_RATE: z
-      .preprocess(parseNumber, z.number().min(0).max(1))
-      .optional(),
+    TRACING_SAMPLING_STRATEGY: z.enum(['head', 'tail', 'always', 'never']).default('head'),
+    TRACING_HEAD_SAMPLE_RATE: z.preprocess(parseNumber, z.number().min(0).max(1)).optional(),
     TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
     TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
     TRACING_OTEL_ENABLED: booleanEnv().default(false),
@@ -282,6 +351,7 @@ export const EnvSchema = z
     FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
     WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
     WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+    WEBHOOK_BATCH_MAX_BACKOFF_MS: integerEnv('WEBHOOK_BATCH_MAX_BACKOFF_MS', 1).default(60_000),
     WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
     WEBHOOK_RETRY_BURST: integerEnv('WEBHOOK_RETRY_BURST', 0).default(0),
     WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv(
@@ -311,6 +381,10 @@ export const EnvSchema = z
     REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
     ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
     WS_AUTH_REQUIRED: booleanEnv().default(false),
+    WS_ALLOWED_ORIGINS: optionalString('WS_ALLOWED_ORIGINS'),
+    WS_MAX_CONNECTIONS_PER_IP: integerEnv('WS_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+    WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
+    WS_RECONNECT_WINDOW_MS: integerEnv('WS_RECONNECT_WINDOW_MS', 1, 86_400_000).default(60_000),
     SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
     SSE_MAX_CONNECTIONS_PER_API_KEY: integerEnv(
       'SSE_MAX_CONNECTIONS_PER_API_KEY',
@@ -351,13 +425,37 @@ export const EnvSchema = z
     INDEXER_STALL_THRESHOLD_MS: integerEnv('INDEXER_STALL_THRESHOLD_MS', 1000).default(
       5 * 60 * 1000
     ),
+    /** Maximum number of backfill batches processed concurrently. */
+    INDEXER_BACKFILL_CONCURRENCY: integerEnv('INDEXER_BACKFILL_CONCURRENCY', 1, 64).default(1),
+    /** Number of ledger ranges in a single backfill batch. */
+    INDEXER_BACKFILL_BATCH_SIZE: integerEnv('INDEXER_BACKFILL_BATCH_SIZE', 1, 100000).default(100),
+    /** Require backfill checkpoints to advance in ledger order. */
+    INDEXER_BACKFILL_STRICT_ORDER: booleanEnv().default(true),
+    /** Number of ordered batches completed before the checkpoint advances. */
+    INDEXER_BACKFILL_COMMIT_INTERVAL: integerEnv(
+      'INDEXER_BACKFILL_COMMIT_INTERVAL',
+      1,
+      10000
+    ).default(1),
+    /** Maximum retries for a failed backfill batch. */
+    INDEXER_BACKFILL_MAX_RETRIES: integerEnv('INDEXER_BACKFILL_MAX_RETRIES', 0, 100).default(3),
+    /** Delay between backfill batch retries. */
+    INDEXER_BACKFILL_RETRY_DELAY_MS: integerEnv('INDEXER_BACKFILL_RETRY_DELAY_MS', 0).default(1000),
     INDEXER_LAST_SUCCESSFUL_SYNC_AT: optionalString('INDEXER_LAST_SUCCESSFUL_SYNC_AT'),
     DEPLOYMENT_CHECKLIST_VERSION: z.string().min(1).default('2026-03-27'),
     ADMIN_STATE_FILE: optionalString('ADMIN_STATE_FILE'),
-    RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
-    RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
-    RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
-    RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+    RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(
+      LIMITS.RPC_CB_FAILURE_THRESHOLD
+    ),
+    RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(LIMITS.RPC_CB_WINDOW_MS),
+    RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(
+      LIMITS.RPC_CB_RESET_TIMEOUT_MS
+    ),
+    RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
+    RPC_FALLBACK_CACHE_TTL_SECONDS: integerEnv('RPC_FALLBACK_CACHE_TTL_SECONDS', 1).default(300),
+    RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA: z.preprocess(parseNumber, z.number().min(0).default(0)),
+    RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
+    RPC_HEALTH_CHECK_FAILURE_THRESHOLD: integerEnv('RPC_HEALTH_CHECK_FAILURE_THRESHOLD', 1).default(3),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
     RATE_LIMIT_ENABLED: booleanEnv().default(true),
@@ -369,6 +467,10 @@ export const EnvSchema = z
     RATE_LIMIT_ADMIN_MAX: integerEnv('RATE_LIMIT_ADMIN_MAX', 1).optional(),
     RATE_LIMIT_TRUST_PROXY: booleanEnv().default(true),
     RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
+    TRUSTED_PROXY_COUNT: integerEnv('TRUSTED_PROXY_COUNT', 0, 100).default(0),
+    TRUSTED_PROXIES: optionalString('TRUSTED_PROXIES'),
+    WS_TRUSTED_PROXIES: optionalString('WS_TRUSTED_PROXIES'),
+    RATE_LIMIT_TRUSTED_PROXIES: optionalString('RATE_LIMIT_TRUSTED_PROXIES'),
     AWS_REGION: optionalString('AWS_REGION'),
     AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
 
@@ -457,6 +559,15 @@ export const EnvSchema = z
       'STELLAR_TOKEN_ADDRESS',
       env.STELLAR_TOKEN_ADDRESS
     );
+    if (env.CONTRACT_ADDRESS_STREAMING) {
+      validatePinnedAddress(
+        ctx,
+        stellarNetwork,
+        'streaming',
+        'CONTRACT_ADDRESS_STREAMING',
+        env.CONTRACT_ADDRESS_STREAMING
+      );
+    }
 
     const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
     if (hasApiKeys && env.API_KEY_PEPPER === undefined) {
@@ -528,17 +639,31 @@ export interface Config {
 
   stellarNetwork: StellarNetwork;
   stellarRpcUrl: string;
+  stellarRpcTimeout: number;
+  stellarRpcMaxRetries: number;
+  stellarRpcRetryDelay: number;
+  stellarRpcOperationDeadlines: Record<string, number>;
+  rpcCircuitBreakerFailureThreshold: number;
+  rpcCircuitBreakerWindowMs: number;
+  rpcCircuitBreakerResetTimeoutMs: number;
+  rpcTimeoutMs: number;
+  rpcFallbackCacheTtlSeconds: number;
+  rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcHealthCheckIntervalMs: number;
+  rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
 
   jwtSecret: string;
+  jwtSecretPrevious?: string | undefined;
   pgcryptoKey?: string | undefined;
   pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
   /** Server-side pepper for API-key hashing. Never logged. */
   apiKeyPepper?: string | undefined;
+  apiKeyPepperPrevious?: string | undefined;
   indexerWorkerToken: string;
 
   /** OIDC issuer base URL. Undefined means OIDC login is disabled. */
@@ -549,6 +674,10 @@ export interface Config {
   maxRequestSizeBytes: number;
   maxJsonDepth: number;
   requestTimeoutMs: number;
+  graphqlPersistedQueryAllowlist: string[];
+  graphqlPersistedQueryHashVerification: boolean;
+  graphqlUnpersistedQueryPolicy: 'allow' | 'reject';
+  graphqlIntrospectionEnabled: boolean;
 
   logLevel: LogLevel;
   metricsEnabled: boolean;
@@ -568,6 +697,11 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
+  webhookRetryBurst: number;
+  webhookCircuitBreakerThreshold: number;
+  webhookCircuitBreakerResetMs: number;
+  webhookBatchMaxBackoffMs: number;
+  webhookMaxResponseBytes: number;
   webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
@@ -577,6 +711,9 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
+  wsAuthRequired: boolean;
+  wsMaxConnectionsPerIp: number;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -604,6 +741,18 @@ export interface Config {
   grpcGatewayPort: number;
   /** When true, reject non-TLS indexer worker connections (fail-closed). */
   indexerMtlsRequired: boolean;
+  /** Maximum number of backfill batches processed concurrently. */
+  indexerBackfillConcurrency: number;
+  /** Number of ledger ranges in a single backfill batch. */
+  indexerBackfillBatchSize: number;
+  /** Require backfill checkpoints to advance in ledger order. */
+  indexerBackfillStrictOrder: boolean;
+  /** Number of ordered batches completed before the checkpoint advances. */
+  indexerBackfillCommitInterval: number;
+  /** Maximum retries for a failed backfill batch. */
+  indexerBackfillMaxRetries: number;
+  /** Delay between backfill batch retries. */
+  indexerBackfillRetryDelayMs: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -697,8 +846,9 @@ function resolveNetwork(env: ParsedEnv): StellarNetwork {
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
+  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? env.STELLAR_CONTRACT_ADDRESS;
   return {
-    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    streaming,
     contract: env.STELLAR_CONTRACT_ADDRESS,
     token: env.STELLAR_TOKEN_ADDRESS,
   };
@@ -708,6 +858,9 @@ function toConfig(env: ParsedEnv): Config {
   const stellarNetwork = resolveNetwork(env);
   const networkDefaults = STELLAR_NETWORKS[stellarNetwork];
   const isProduction = env.NODE_ENV === 'production';
+  const contractAddresses = resolveContractAddresses(stellarNetwork, env);
+
+  assertNetworkMatchesContracts(stellarNetwork, contractAddresses);
 
   return {
     port: env.PORT,
@@ -734,11 +887,24 @@ function toConfig(env: ParsedEnv): Config {
 
     stellarNetwork,
     stellarRpcUrl: env.STELLAR_RPC_URL,
+    stellarRpcTimeout: env.STELLAR_RPC_TIMEOUT,
+    stellarRpcMaxRetries: env.STELLAR_RPC_MAX_RETRIES,
+    stellarRpcRetryDelay: env.STELLAR_RPC_RETRY_DELAY,
+    stellarRpcOperationDeadlines: env.STELLAR_RPC_OPERATION_DEADLINES,
+    rpcCircuitBreakerFailureThreshold: env.RPC_CB_FAILURE_THRESHOLD,
+    rpcCircuitBreakerWindowMs: env.RPC_CB_WINDOW_MS,
+    rpcCircuitBreakerResetTimeoutMs: env.RPC_CB_RESET_TIMEOUT_MS,
+    rpcTimeoutMs: env.RPC_TIMEOUT_MS,
+    rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
+    rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
+    rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
 
     jwtSecret: env.JWT_SECRET,
+    jwtSecretPrevious: env.JWT_SECRET_PREVIOUS,
     pgcryptoKey: env.PGCRYPTO_KEY,
     pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
     jwtExpiresIn: env.JWT_EXPIRES_IN,
@@ -747,6 +913,7 @@ function toConfig(env: ParsedEnv): Config {
       .map((key) => key.trim())
       .filter((key) => key.length > 0),
     apiKeyPepper: env.API_KEY_PEPPER,
+    apiKeyPepperPrevious: env.API_KEY_PEPPER_PREVIOUS,
     indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
 
     oidcIssuerUrl: env.OIDC_ISSUER_URL,
@@ -755,6 +922,14 @@ function toConfig(env: ParsedEnv): Config {
     maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
     maxJsonDepth: env.MAX_JSON_DEPTH,
     requestTimeoutMs: env.REQUEST_TIMEOUT_MS,
+    graphqlPersistedQueryAllowlist: env.GRAPHQL_PERSISTED_QUERY_ALLOWLIST
+      ? env.GRAPHQL_PERSISTED_QUERY_ALLOWLIST.split(',')
+          .map((hash) => hash.trim())
+          .filter((hash) => hash.length > 0)
+      : [],
+    graphqlPersistedQueryHashVerification: env.GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION,
+    graphqlUnpersistedQueryPolicy: env.GRAPHQL_UNPERSISTED_QUERY_POLICY,
+    graphqlIntrospectionEnabled: env.GRAPHQL_INTROSPECTION_ENABLED,
 
     logLevel: env.LOG_LEVEL,
     metricsEnabled: env.METRICS_ENABLED,
@@ -774,8 +949,15 @@ function toConfig(env: ParsedEnv): Config {
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
     webhookRetryRps: env.WEBHOOK_RETRY_RPS,
+    webhookRetryBurst: env.WEBHOOK_RETRY_BURST,
+    webhookCircuitBreakerThreshold: env.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD,
+    webhookCircuitBreakerResetMs: env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS,
+    webhookBatchMaxBackoffMs: env.WEBHOOK_BATCH_MAX_BACKOFF_MS,
+    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
-      ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',')
+          .map((h) => h.trim())
+          .filter((h) => h.length > 0)
       : undefined,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
@@ -785,6 +967,8 @@ function toConfig(env: ParsedEnv): Config {
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    wsAuthRequired: env.WS_AUTH_REQUIRED,
+    wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
@@ -802,6 +986,12 @@ function toConfig(env: ParsedEnv): Config {
     grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
     grpcGatewayPort: env.GRPC_GATEWAY_PORT,
     indexerMtlsRequired: env.INDEXER_MTLS_REQUIRED ?? isProduction,
+    indexerBackfillConcurrency: env.INDEXER_BACKFILL_CONCURRENCY,
+    indexerBackfillBatchSize: env.INDEXER_BACKFILL_BATCH_SIZE,
+    indexerBackfillStrictOrder: env.INDEXER_BACKFILL_STRICT_ORDER,
+    indexerBackfillCommitInterval: env.INDEXER_BACKFILL_COMMIT_INTERVAL,
+    indexerBackfillMaxRetries: env.INDEXER_BACKFILL_MAX_RETRIES,
+    indexerBackfillRetryDelayMs: env.INDEXER_BACKFILL_RETRY_DELAY_MS,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
@@ -846,6 +1036,12 @@ export function initializeConfig(): Config {
   }
 
   configInstance = loadConfig();
+  if (process.env.NODE_ENV !== 'test') {
+    logActiveStellarConfig({
+      network: configInstance.stellarNetwork,
+      contractAddresses: configInstance.contractAddresses,
+    });
+  }
   return configInstance;
 }
 
@@ -1098,6 +1294,11 @@ export function reloadHotConfig(): HotConfig {
  *                without killing the process.
  */
 export async function refreshHotConfig(apply?: {
+  /** Two-phase commit style (preferred): return a commit fn from preparation. */
+  prepareRateLimits?: (hot: HotConfig) => () => void;
+  prepareFeatureFlags?: (hot: HotConfig) => () => void;
+  prepareLogLevel?: (level: LogLevel) => () => void;
+  /** Legacy direct-apply style (still supported). */
   applyRateLimits?: (hot: HotConfig) => void;
   applyFeatureFlags?: () => void;
   applyLogLevel?: (level: LogLevel) => void;
@@ -1135,10 +1336,30 @@ export async function refreshHotConfig(apply?: {
       const changed =
         previous === null || hotConfigFingerprint(previous) !== hotConfigFingerprint(hot);
 
-      // Apply side effects in a fixed order for deterministic deploys/retries.
-      apply?.applyRateLimits?.(hot);
-      apply?.applyFeatureFlags?.();
-      apply?.applyLogLevel?.(hot.logLevel);
+      // Resolve prepare callbacks — prefer the prepare* form (two-phase commit);
+      // fall back to the legacy apply* form for backward compatibility.
+      const commitRateLimits = apply?.prepareRateLimits
+        ? apply.prepareRateLimits(hot)
+        : apply?.applyRateLimits
+          ? () => apply.applyRateLimits!(hot)
+          : undefined;
+
+      const commitFeatureFlags = apply?.prepareFeatureFlags
+        ? apply.prepareFeatureFlags(hot)
+        : apply?.applyFeatureFlags
+          ? () => apply.applyFeatureFlags!()
+          : undefined;
+
+      const commitLogLevel = apply?.prepareLogLevel
+        ? apply.prepareLogLevel(hot.logLevel)
+        : apply?.applyLogLevel
+          ? () => apply.applyLogLevel!(hot.logLevel)
+          : undefined;
+
+      // Commit side effects in a fixed order for deterministic deploys/retries.
+      commitRateLimits?.();
+      commitFeatureFlags?.();
+      commitLogLevel?.();
 
       lastHotConfig = hot;
       reloadGeneration += 1;

@@ -2,7 +2,7 @@
  * Indexer domain types for Fluxora Backend.
  *
  * Design constraints
- * ------------------
+ * ----------------------------------
  * - All amount / balance fields are `DecimalString` (a branded string alias).
  *   This prevents floating-point coercion at the type boundary and makes it
  *   impossible to accidentally pass a raw `number` where financial precision
@@ -11,11 +11,18 @@
  *   (content hash). The hash is the authoritative identity for reorg detection:
  *   two blocks at the same sequence number with different hashes mean a fork.
  * - `ingestedAt` is always set by the store, never trusted from the caller.
+ *
+ * Field provenance
+ * ----------------------------------
+ * For each type below, `types.provenance.md` (kept beside this file) documents
+ * whether every field is read from chain data (naming the Stellar ledger
+ * structure it comes from) or computed by the indexer (stating the derivation).
+ * When adding or renaming a field here, update that document in the same commit.
  */
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // Primitive branded types
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 
 /**
  * A non-empty string that represents a decimal number (e.g. "100.0000000").
@@ -29,15 +36,15 @@ export type DecimalString = string & { readonly __brand: 'DecimalString' };
  * Throws if the value does not match the decimal pattern.
  */
 export function toDecimalString(value: string): DecimalString {
-  if (!/^[+-]?\d+(\.\d+)?$/.test(value.trim())) {
+  if (!/^[0+\-]?\d+(\.\d+)?$/.test(value.trim())) {
     throw new TypeError(`Invalid decimal string: "${value}"`);
   }
   return value as DecimalString;
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // Block / ledger types
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 
 /**
  * Minimal representation of a Stellar ledger header as seen by the indexer.
@@ -73,11 +80,36 @@ export type IndexedTransaction = {
  * A single contract event emitted within a transaction.
  * This is the primary unit of storage in the indexer.
  *
+ * ## Idempotency key
+ *
+ * `eventId` is the globally unique identifier for a contract event and is
+ * the idempotency key for ingestion.  It is derived from the chain as:
+ *
+ *   `${txHash}-${eventIndex}`
+ *
+ * where `txHash` is the hex-encoded transaction hash and `eventIndex` is the
+ * zero-based position of the event within that transaction.  This composite
+ * ensures uniqueness: the same transaction cannot emit two events with the
+ * same index, and the same event cannot appear in two transactions.
+ *
+ * **Replay guarantee**: inserting a `ContractEventRecord` whose `eventId`
+ * already exists in the store is always a safe no-op.  The store uses
+ * `ON CONFLICT (event_id) DO NOTHING` (Postgres) or an equivalent in-memory
+ * Map check to silently discard the duplicate without mutating the existing
+ * row or returning an error.  Callers may therefore replay any ledger range —
+ * after a crash, a leader handover, or a chain reorganisation — without
+ * additional deduplication logic at the call site.
+ *
  * Security note: `payload` is an opaque JSON object sourced from the chain.
  * Any amount-like fields inside `payload` must be validated as DecimalString
  * by the consumer before arithmetic operations.
  */
 export type ContractEventRecord = {
+  /**
+   * Globally unique event identity, derived as `${txHash}-${eventIndex}`.
+   * This is the idempotency key: re-inserting a record with the same eventId
+   * is a silent no-op — the existing row is never mutated.
+   */
   eventId: string;
   ledger: number;
   contractId: string;
@@ -94,9 +126,9 @@ export type ContractEventRecord = {
   ingestedAt?: string;
 };
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // Ingest request / result types
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 
 export type IngestContractEventsRequest = {
   events: ContractEventRecord[];
@@ -109,9 +141,9 @@ export type IngestContractEventsResult = {
   duplicateEventIds: string[];
 };
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------
 // Store / health types
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
 
 export type IndexerStoreKind = 'memory' | 'postgres';
 
@@ -152,4 +184,64 @@ export type IndexerHealthSnapshot = {
   lastSafeLedger: number;
   reorgDetected: boolean;
   reorgHeight?: number | undefined;
+};
+
+// -----------------------------------------------------------------------
+// Backfill / catch-up types
+// -----------------------------------------------------------------------
+
+/**
+ * Configuration controlling the bounded concurrency of backfill.
+ * - `workerCount`: maximum number of batches processed in parallel.
+ * - `batchSize`: number of ledgers (or events) per batch.
+ * - `maxRetries`: per-batch retry budget before a batch is marked failed.
+ */
+export type BackfillConfig = {
+  workerCount: number;
+  batchSize: number;
+  maxRetries: number;
+};
+
+/**
+ * A durable checkpoint marking the highest ledger that has been fully ingested.
+ * Checkpoints must be committed in order — a later ledger cannot be checkpointed
+ * until all earlier ledgers are durably stored.
+ */
+export type BackfillCheckpoint = {
+  ledger: number;
+  ledgerHash: string;
+  updatedAt: string;
+};
+
+/**
+ * A unit of backfill work. Batches are processed in ledger order, but each batch
+ * may be retried independently within the configured retry budget.
+ */
+export type BackfillBatch = {
+  batchId: string;
+  startLedger: number;
+  endLedger: number;
+};
+
+/**
+ * The outcome of processing a single backfill batch.
+ */
+export type BackfillBatchOutcome = {
+  batchId: string;
+  ok: boolean;
+  insertedCount: number;
+  duplicateCount: number;
+  error?: string;
+};
+
+/**
+ * Represents in-progress backfill state. Useful for resumable progress and tests
+ * that need to inject slow/failed batches.
+ */
+export type BackfillState = {
+  config: BackfillConfig;
+  checkpoint: BackfillCheckpoint;
+  inFlight: BackfillBatch[];
+  completed: BackfillBatchOutcome[];
+  failed: BackfillBatchOutcome[];
 };

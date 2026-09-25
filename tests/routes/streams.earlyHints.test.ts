@@ -517,6 +517,22 @@ describe('GET /api/streams — Early Hints integration', () => {
     expect(parsed).toHaveProperty('lastId');
     expect(parsed.v).toBe(1);
     expect(parsed.lastId).toBe('stream3'); // last row ID
+    expect(parsed.scope).toContain('order');
+  });
+
+  it('rejects reusing a cursor with a different filter scope', async () => {
+    mockFindWithCursor.mockResolvedValueOnce({
+      streams: [makeRow('stream1'), makeRow('stream2')],
+      hasMore: true,
+    });
+    const first = await request(app).get('/api/streams').expect(200);
+    const cursor = first.body.data.next_cursor as string;
+
+    await request(app)
+      .get('/api/streams')
+      .query({ cursor, status: 'active' })
+      .expect(400);
+    expect(mockFindWithCursor).toHaveBeenCalledTimes(1);
   });
 
   it('respects limit parameter', async () => {

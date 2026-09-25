@@ -11,7 +11,7 @@
  * - Blocks private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7)
  * - Blocks other reserved ranges (0.0.0.0/8, 240.0.0.0/4, etc.)
  * - Requires HTTPS by default (configurable)
- * - Resolves hostnames and validates resolved IPs to defeat DNS rebinding
+ * - Resolves hostnames and validates resolved IPs before dispatch
  * - Supports optional host allowlist via options parameter
  * - Handles IPv4-mapped IPv6 addresses and alternative IP encodings
  *
@@ -19,6 +19,8 @@
  */
 
 import { logger } from '../lib/logger.js';
+import { isIP } from 'node:net';
+import dns from 'node:dns';
 
 /**
  * Error thrown when a webhook target URL fails SSRF validation.
@@ -66,17 +68,23 @@ function ipv4ToBigInt(ip: string): bigint {
  * Handles IPv4-mapped IPv6 addresses (::ffff:x.x.x.x).
  */
 function ipv6ToBigInt(ip: string): bigint {
-  // Handle IPv4-mapped IPv6 (::ffff:x.x.x.x)
-  const v4Match = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  let normalized = ip.replace(/^\[|\]$/g, '').toLowerCase();
+  const v4Match = normalized.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
   if (v4Match) {
-    // Map IPv4 into the IPv6 space
-    const v4BigInt = ipv4ToBigInt(v4Match[1]);
-    return (0xffffn << 96n) + v4BigInt;
+    const v4 = ipv4ToBigInt(v4Match[2]);
+    normalized = `${v4Match[1]}${(v4 >> 16n).toString(16)}:${(v4 & 0xffffn).toString(16)}`;
   }
 
-  // Parse standard IPv6
-  const sections = ip.split(':');
-  if (sections.length !== 8) {
+  const compressed = normalized.split('::');
+  if (compressed.length > 2) {
+    throw new Error(`Invalid IPv6 address: ${ip}`);
+  }
+  const left = compressed[0] ? compressed[0].split(':') : [];
+  const right = compressed.length === 2 && compressed[1] ? compressed[1].split(':') : [];
+  const sections = compressed.length === 2
+    ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right]
+    : left;
+  if (sections.length !== 8 || sections.some(section => !/^[0-9a-f]{1,4}$/i.test(section))) {
     throw new Error(`Invalid IPv6 address: ${ip}`);
   }
 
@@ -177,42 +185,38 @@ function isBlockedIPv4(ip: string): { blocked: boolean; reason?: string } {
  * Check if an IPv6 address is loopback or link-local.
  */
 function isBlockedIPv6(ip: string): { blocked: boolean; reason?: string } {
-  // IPv6 loopback (::1)
-  if (ip === '::1' || ip === '0:0:0:0:0:0:0:1') {
-    return { blocked: true, reason: 'IPv6 loopback address' };
+  try {
+    const value = ipv6ToBigInt(ip);
+    if (value === 1n) return { blocked: true, reason: 'IPv6 loopback address' };
+
+    // IPv4-mapped addresses must inherit the policy of their IPv4 value.
+    if ((value >> 32n) === 0xffffn) {
+      const mappedIPv4 = [24n, 16n, 8n, 0n]
+        .map(shift => Number((value >> shift) & 0xffn))
+        .join('.');
+      return isBlockedIPv4(mappedIPv4);
+    }
+
+    if ((value >> 118n) === 0x3fan) {
+      return { blocked: true, reason: 'IPv6 link-local address' };
+    }
+    if ((value >> 121n) === 0x7en) {
+      return { blocked: true, reason: 'IPv6 unique local address (private)' };
+    }
+    return { blocked: false };
+  } catch {
+    return { blocked: true, reason: 'Unparseable IPv6 address' };
   }
-  
-  // IPv4-mapped loopback (::ffff:127.0.0.1)
-  const v4MappedLoopback = ip.match(/^::ffff:127\.\d+\.\d+\.\d+$/i);
-  if (v4MappedLoopback) {
-    return { blocked: true, reason: 'IPv4-mapped loopback address' };
-  }
-  
-  // Link-local (fe80::/10)
-  if (ip.startsWith('fe80:') || ip.startsWith('FE80:')) {
-    return { blocked: true, reason: 'IPv6 link-local address' };
-  }
-  
-  // Unique local (fc00::/7) - private IPv6 range
-  const firstTwoHex = parseInt(ip.substring(0, 2), 16);
-  if ((firstTwoHex & 0xfe) === 0xfc) {
-    return { blocked: true, reason: 'IPv6 unique local address (private)' };
-  }
-  
-  return { blocked: false };
 }
 
 /**
  * Resolve a hostname to its IP addresses.
- * This is used to defeat DNS rebinding attacks.
+ * This provides validation-time protection; callers that require rebinding
+ * resistance must also validate the address selected at connection time.
  */
 async function resolveHostname(hostname: string): Promise<string[]> {
   try {
-    // Use Node.js DNS resolution
-    const dns = await import('dns');
-    const { lookup } = dns.promises;
-    
-    const { address, family } = await lookup(hostname, { all: false });
+    const { address } = await dns.promises.lookup(hostname, { all: false });
     
     // Convert to array for consistent interface
     return [address];
@@ -275,24 +279,25 @@ function validateAllowlist(hostname: string, allowlist: string[] | undefined): v
 /**
  * Validate that an IP address is not in a blocked range.
  */
-function validateIPAddress(ip: string): void {
-  // Check if it's IPv4 or IPv6
-  const isIPv6 = ip.includes(':');
-  
-  if (isIPv6) {
-    const result = isBlockedIPv6(ip);
+export function validateWebhookIPAddress(ip: string): void {
+  const normalizedIp = ip.replace(/^\[|\]$/g, '');
+  const family = isIP(normalizedIp);
+  if (family === 6) {
+    const result = isBlockedIPv6(normalizedIp);
     if (result.blocked) {
       throw new WebhookTargetValidationError(
-        `Blocked IPv6 address: ${ip} (${result.reason})`
+        `Blocked IPv6 address: ${normalizedIp} (${result.reason})`
+      );
+    }
+  } else if (family === 4) {
+    const result = isBlockedIPv4(normalizedIp);
+    if (result.blocked) {
+      throw new WebhookTargetValidationError(
+        `Blocked IPv4 address: ${normalizedIp} (${result.reason})`
       );
     }
   } else {
-    const result = isBlockedIPv4(ip);
-    if (result.blocked) {
-      throw new WebhookTargetValidationError(
-        `Blocked IPv4 address: ${ip} (${result.reason})`
-      );
-    }
+    throw new WebhookTargetValidationError(`Unparseable IP address: ${ip}`);
   }
 }
 
@@ -353,17 +358,17 @@ export async function validateWebhookTarget(
     validateAllowlist(hostname, allowlist);
 
     // Check if hostname is already an IP address
-    const isIP = /^[\d.:]+$/.test(hostname);
+    const isDirectIP = isIP(hostname.replace(/^\[|\]$/g, '')) !== 0;
 
-    if (isIP) {
+    if (isDirectIP) {
       // Direct IP address - validate it
-      validateIPAddress(hostname);
+      validateWebhookIPAddress(hostname);
     } else {
       // Hostname - resolve and validate all IPs
       const resolvedIPs = await resolveHostname(hostname);
       
       for (const ip of resolvedIPs) {
-        validateIPAddress(ip);
+        validateWebhookIPAddress(ip);
       }
     }
 

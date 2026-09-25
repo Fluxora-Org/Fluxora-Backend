@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { logger } from '../lib/logger.js';
-import type { IWebhookRateLimiter, RateLimitConfig, RateLimitResult } from '../redis/webhookRateLimit.js';
-import { validateRateLimitConfig } from '../redis/webhookRateLimit.js';
+import type { IWebhookRateLimiter, RateLimitConfig, RateLimitResult, RateLimitDimensions } from '../redis/webhookRateLimit.js';
+import { validateRateLimitConfig, hashDimensions } from '../redis/webhookRateLimit.js';
 import { updateWebhookBucketFill } from '../metrics/requestProtectionMetrics.js';
 
 interface TokenBucket {
@@ -30,12 +30,13 @@ export class TokenBucketRateLimiter implements IWebhookRateLimiter {
     this.buckets.clear();
   }
 
-  async checkLimit(consumerUrl: string, config: RateLimitConfig): Promise<RateLimitResult> {
+  async checkLimit(dimensions: RateLimitDimensions, config: RateLimitConfig): Promise<RateLimitResult> {
     validateRateLimitConfig(config);
-    const key = hashUrl(consumerUrl);
+    const key = hashDimensions(dimensions);
     const now = Date.now();
     const capacity = config.burst > 0 ? config.burst : config.limit;
     const refillRate = config.limit / config.windowMs;
+    const weight = config.weight ?? 1;
 
     let bucket = this.buckets.get(key);
     if (!bucket) {
@@ -52,20 +53,20 @@ export class TokenBucketRateLimiter implements IWebhookRateLimiter {
 
     updateWebhookBucketFill(key, bucket.tokens);
 
-    if (bucket.tokens >= 1.0) {
-      bucket.tokens -= 1.0;
+    if (bucket.tokens >= weight) {
+      bucket.tokens -= weight;
       return { canAttempt: true, retryAfterMs: null };
     }
 
-    const tokensNeeded = 1.0 - bucket.tokens;
+    const tokensNeeded = weight - bucket.tokens;
     const retryAfterMs = Math.ceil(tokensNeeded / refillRate);
     return { canAttempt: false, retryAfterMs };
   }
 
-  async recordFailure(_consumerUrl: string, _config: RateLimitConfig): Promise<void> {}
+  async recordFailure(_dimensions: RateLimitDimensions, _config: RateLimitConfig): Promise<void> {}
 
-  getBucketLevel(consumerUrl: string, config?: RateLimitConfig): number {
-    const key = hashUrl(consumerUrl);
+  getBucketLevel(dimensions: RateLimitDimensions, config?: RateLimitConfig): number {
+    const key = hashDimensions(dimensions);
     const bucket = this.buckets.get(key);
     if (!bucket) return 0;
     if (config) {
@@ -96,6 +97,3 @@ export class TokenBucketRateLimiter implements IWebhookRateLimiter {
   }
 }
 
-function hashUrl(url: string): string {
-  return createHash('sha256').update(url).digest('hex').slice(0, 16);
-}

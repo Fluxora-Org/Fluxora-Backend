@@ -1,15 +1,11 @@
 import { z } from 'zod';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { STELLAR_PUBLIC_KEY_REGEX } from '../validation/schemas.js';
+import { isValidStellarAccountAddress } from '../validation/stellarAddress.js';
 import { logger } from '../lib/logger.js';
 
 const MAX_FILTER_VALUE_LENGTH = 256;
 const MAX_INBOUND_MESSAGE_BYTES = 4_096;
-const STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE = 6 << 3;
-const STELLAR_STRKEY_LENGTH = 56;
-const STELLAR_STRKEY_DECODED_LENGTH = 35;
-const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
-const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 /**
  * Maximum allowed message size in bytes (issue #674).
@@ -18,64 +14,15 @@ const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
  */
 export const MAX_MESSAGE_BYTES = 4_096;
 
-// SEP-23 StrKey validation for Stellar Ed25519 public keys: base32 shape,
-// version byte, and CRC16-XModem checksum.
-function decodeStellarBase32(value: string): number[] | null {
-  const bytes: number[] = [];
-  let bits = 0;
-  let current = 0;
-
-  for (const char of value) {
-    const digit = STELLAR_STRKEY_ALPHABET.indexOf(char);
-    if (digit === -1) return null;
-
-    current = (current << 5) | digit;
-    bits += 5;
-
-    if (bits >= 8) {
-      bytes.push((current >> (bits - 8)) & 0xff);
-      bits -= 8;
-    }
-  }
-
-  return bytes;
-}
-
-function crc16XModem(bytes: readonly number[]): number {
-  let crc = 0;
-
-  for (const byte of bytes) {
-    crc ^= byte << 8;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc & 0x8000) !== 0 ? (crc << 1) ^ 0x1021 : crc << 1;
-      crc &= 0xffff;
-    }
-  }
-
-  return crc;
-}
-
+// SEP-23 StrKey validation for Stellar Ed25519 public keys is provided by the
+// shared, network-aware contract in ../validation/stellarAddress.js so that the
+// WebSocket boundary applies exactly the same rules as REST routes and the
+// indexer ingest path. The local alias preserves the historical function name.
 export function isValidStellarPublicKey(value: string): boolean {
-  const candidate = value.trim();
-  if (candidate.length !== STELLAR_STRKEY_LENGTH || !STELLAR_PUBLIC_KEY_REGEX.test(candidate)) {
-    return false;
-  }
-
-  const decoded = decodeStellarBase32(candidate);
-  if (decoded === null || decoded.length !== STELLAR_STRKEY_DECODED_LENGTH) {
-    return false;
-  }
-
-  if (decoded[0] !== STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE) {
-    return false;
-  }
-
-  const payload = decoded.slice(0, STELLAR_STRKEY_PAYLOAD_LENGTH);
-  const expectedChecksum = crc16XModem(payload);
-  const actualChecksum = decoded[STELLAR_STRKEY_PAYLOAD_LENGTH]!
-    | (decoded[STELLAR_STRKEY_PAYLOAD_LENGTH + 1]! << 8);
-
-  return expectedChecksum === actualChecksum;
+  // The shared validator is strict about surrounding whitespace (addresses are
+  // exactly 56 chars), whereas this boundary historically tolerated trailing
+  // spaces; preserve that tolerance by trimming before delegating.
+  return isValidStellarAccountAddress(value.trim());
 }
 
 const streamIdSchema = z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH);

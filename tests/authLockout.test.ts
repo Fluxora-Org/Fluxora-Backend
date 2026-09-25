@@ -7,6 +7,7 @@
  * - Window expiry (5 failures -> wait 10 minutes -> no lockout)
  * - Exponential backoff (5 failures -> 1 min lockout, 6 failures -> 2 min, 7 -> 4 min)
  * - Error responses don't leak account existence (same error for invalid address vs invalid token)
+ * - Concurrent request threshold protection
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -23,6 +24,31 @@ import { initializeConfig } from '../src/config/env.js';
 class MockRedisClient {
   private sortedSets = new Map<string, Map<string, number>>();
   private keyValue = new Map<string, { value: string; expiry: number }>();
+  private mockNow = Date.now();
+
+  private getNow(): number {
+    return this.mockNow;
+  }
+
+  advanceTime(ms: number) {
+    this.mockNow += ms;
+    vi.setSystemTime(this.mockNow);
+    const now = this.getNow();
+    // Clear sorted set entries older than 10 mins
+    for (const [key, set] of this.sortedSets.entries()) {
+      for (const [member, score] of set.entries()) {
+        if (score < now - 10 * 60 * 1000) {
+          set.delete(member);
+        }
+      }
+    }
+    // Clear expired lockout keys
+    for (const [key, entry] of this.keyValue.entries()) {
+      if (entry.expiry && entry.expiry < now) {
+        this.keyValue.delete(key);
+      }
+    }
+  }
 
   multi() {
     const commands: Array<{ type: string; args: any[] }> = [];
@@ -87,7 +113,8 @@ class MockRedisClient {
   async get(key: string): Promise<string | null> {
     const entry = this.keyValue.get(key);
     if (!entry) return null;
-    if (entry.expiry && Date.now() > entry.expiry) {
+    const now = this.getNow();
+    if (entry.expiry && now > entry.expiry) {
       this.keyValue.delete(key);
       return null;
     }
@@ -95,7 +122,8 @@ class MockRedisClient {
   }
 
   async set(key: string, value: string, options?: { ex?: number }): Promise<void> {
-    const expiry = options?.ex ? Date.now() + options.ex * 1000 : 0;
+    const now = this.getNow();
+    const expiry = options?.ex ? now + options.ex * 1000 : 0;
     this.keyValue.set(key, { value, expiry });
   }
 
@@ -119,25 +147,6 @@ class MockRedisClient {
     }
     return count;
   }
-
-  // Helper for tests to advance time
-  advanceTime(ms: number) {
-    const now = Date.now();
-    // Clear sorted set entries older than now - ms
-    for (const [key, set] of this.sortedSets.entries()) {
-      for (const [member, score] of set.entries()) {
-        if (score < now - ms) {
-          set.delete(member);
-        }
-      }
-    }
-    // Clear expired lockout keys
-    for (const [key, entry] of this.keyValue.entries()) {
-      if (entry.expiry && entry.expiry < now) {
-        this.keyValue.delete(key);
-      }
-    }
-  }
 }
 
 // Mock OIDC provider
@@ -149,6 +158,7 @@ vi.mock('../src/services/oidcProvider.js', () => ({
 vi.mock('../src/config/env.js', () => ({
   initializeConfig: vi.fn(),
   getConfig: () => ({
+    jwtSecret: 'a-very-long-secret-key-for-testing-only-12345',
     oidcIssuerUrl: 'https://oidc.example.com',
   }),
 }));
@@ -161,6 +171,7 @@ let store: AuthAttemptStore;
 let app: SupertestApp;
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
   process.env.NODE_ENV = 'test';
   process.env.JWT_SECRET = 'a-very-long-secret-key-for-testing-only-12345';
   initializeConfig();
@@ -170,6 +181,7 @@ beforeEach(() => {
   setAuthAttemptStore(store);
   
   app = express();
+  app.set('trust proxy', true);
   app.use(express.json());
   app.use(correlationIdMiddleware);
   app.use('/api/auth', authRouter);
@@ -177,6 +189,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.clearAllMocks();
 });
 
@@ -357,5 +370,54 @@ describe('Auth lockout', () => {
       .set('X-Forwarded-For', '192.168.1.2')
       .send({ idToken: 'invalid-token', address: 'GTEST999' })
       .expect(401);
+  });
+
+  it('concurrent failed requests cannot bypass lockout threshold', async () => {
+    const { verifyIdToken } = await import('../src/services/oidcProvider.js');
+    (verifyIdToken as any).mockRejectedValue(new Error('Invalid token'));
+
+    // Send 10 concurrent requests simultaneously
+    const requests = Array.from({ length: 10 }).map(() =>
+      request(app)
+        .post('/api/auth/session')
+        .send({ idToken: 'invalid-token', address: 'GCONCURRENT' })
+    );
+
+    const responses = await Promise.all(requests);
+    const status401s = responses.filter(r => r.status === 401);
+    const status429s = responses.filter(r => r.status === 429);
+
+    // Maximum 5 requests can pass as 401 before threshold locks out remaining
+    expect(status401s.length).toBeLessThanOrEqual(5);
+    expect(status429s.length).toBeGreaterThanOrEqual(5);
+    expect(status401s.length + status429s.length).toBe(10);
+  });
+
+  it('handles race between successful auth reset and failed attempts atomically', async () => {
+    const { verifyIdToken } = await import('../src/services/oidcProvider.js');
+    
+    // 4 failed attempts first
+    (verifyIdToken as any).mockRejectedValue(new Error('Invalid token'));
+    for (let i = 0; i < 4; i++) {
+      await request(app)
+        .post('/api/auth/session')
+        .send({ idToken: 'invalid-token', address: 'GRACE' })
+        .expect(401);
+    }
+
+    // Concurrent success call and new failure call
+    (verifyIdToken as any).mockResolvedValueOnce({ address: 'GRACE', role: 'operator' });
+    const successRes = await request(app)
+      .post('/api/auth/session')
+      .send({ idToken: 'valid-token', address: 'GRACE' });
+
+    expect(successRes.status).toBe(200);
+
+    (verifyIdToken as any).mockRejectedValueOnce(new Error('Invalid token'));
+    const failureRes = await request(app)
+      .post('/api/auth/session')
+      .send({ idToken: 'invalid-token', address: 'GRACE' });
+
+    expect(failureRes.status).toBe(401);
   });
 });

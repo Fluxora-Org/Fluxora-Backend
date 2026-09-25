@@ -16,6 +16,7 @@
  */
 
 import { redactableFields } from './policy.js';
+import { redactSecretsInString } from './secretPatterns.js';
 
 export const REDACTED = '[REDACTED]';
 
@@ -24,6 +25,12 @@ const STELLAR_KEY_RE = /^G[A-Z2-7]{55}$/;
 
 /** Global variant used for scanning free-form strings. */
 const STELLAR_KEY_GLOBAL_RE = /G[A-Z2-7]{55}/g;
+/**
+ * Only redact actual bearer tokens, not ordinary language like
+ * "Authorization header must use Bearer scheme.".
+ */
+const BEARER_TOKEN_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}(?=\s|$|["'\]])/gi;
+const SENSITIVE_STRING_FIELD_RE = /(password|secret|token|credential|authorization|api[-_]?key|payload|body|query|database[-_]?id|row[-_]?id)\s*[:=]\s*(['"]?)[^\s,'"}]+\2/gi;
 
 /**
  * Masks a Stellar public key, preserving the first 4 and last 4
@@ -53,7 +60,12 @@ export function isStellarKey(value: string): boolean {
  * in larger text (log lines, error messages).
  */
 export function redactKeysInString(input: string): string {
-  return input.replace(STELLAR_KEY_GLOBAL_RE, (match) => maskStellarKey(match));
+  return redactSecretsInString(
+    input
+      .replace(STELLAR_KEY_GLOBAL_RE, (match) => maskStellarKey(match))
+      .replace(BEARER_TOKEN_RE, 'Bearer [REDACTED]')
+      .replace(SENSITIVE_STRING_FIELD_RE, '$1: [REDACTED]'),
+  );
 }
 
 /**
@@ -144,5 +156,5 @@ function sanitizeValue(value: unknown, fields: Set<string>): unknown {
   }
 
   // Primitive (string, number, boolean, bigint, symbol) — pass through.
-  return value;
+  return typeof value === 'string' ? redactKeysInString(value) : value;
 }

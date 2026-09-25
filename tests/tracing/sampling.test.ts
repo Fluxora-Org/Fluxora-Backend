@@ -108,20 +108,21 @@ describe('resolvePerRouteOverride', () => {
   };
 
   it('returns exact match', () => {
-    expect(resolvePerRouteOverride('/health', overrides)).toBe(0);
-    expect(resolvePerRouteOverride('/api/streams', overrides)).toBe(1);
+    expect(resolvePerRouteOverride('/health', overrides)).toEqual({ rate: 0, key: '/health' });
+    expect(resolvePerRouteOverride('/api/streams', overrides)).toEqual({ rate: 1, key: '/api/streams' });
   });
 
   it('returns longest prefix match when no exact match', () => {
-    expect(resolvePerRouteOverride('/api/streams/abc', overrides)).toBe(1);
+    expect(resolvePerRouteOverride('/api/streams/abc', overrides)).toEqual({ rate: 1, key: '/api/streams' });
   });
 
   it('returns shorter prefix when longer does not match', () => {
-    expect(resolvePerRouteOverride('/api/webhooks', overrides)).toBe(0.5);
+    expect(resolvePerRouteOverride('/api/webhooks', overrides)).toEqual({ rate: 0.5, key: '/api' });
   });
 
-  it('returns undefined when no match at all', () => {
-    expect(resolvePerRouteOverride('/internal/indexer', overrides)).toBeUndefined();
+  it('returns undefined for unmatched path', () => {
+    expect(resolvePerRouteOverride('/static/css/style.css', overrides)).toBeUndefined();
+    expect(resolvePerRouteOverride('/healthcheck', overrides)).toBeUndefined();
   });
 });
 

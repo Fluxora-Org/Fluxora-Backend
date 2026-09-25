@@ -1,7 +1,8 @@
-import { Gauge } from 'prom-client';
+import { Counter, Gauge } from 'prom-client';
 import type pg from 'pg';
 import { registry } from '../metrics.js';
 import { logger } from '../lib/logger.js';
+import { rowReader, RowMappingError, BIGINT_SAFE_MAX } from '../db/rowMapping.js';
 
 // Tables with high write throughput that accumulate dead tuples fastest.
 export const MONITORED_TABLES = [
@@ -39,6 +40,15 @@ export const pgLastAutovacuumAgeSeconds =
     name: 'fluxora_pg_last_autovacuum_age_seconds',
     help: 'Seconds since the last autovacuum on each monitored table; -1 when autovacuum has never run',
     labelNames: ['table'] as const,
+    registers: [registry],
+  });
+
+export const pgVacuumRowsRejectedTotal =
+  (registry.getSingleMetric('fluxora_pg_vacuum_rows_rejected_total') as Counter<'column'>) ||
+  new Counter({
+    name: 'fluxora_pg_vacuum_rows_rejected_total',
+    help: 'Vacuum stat rows quarantined because a column violated its contract',
+    labelNames: ['column'] as const,
     registers: [registry],
   });
 
@@ -80,18 +90,38 @@ interface VacuumRow {
  * to `pool.query<T>()` — pg requires `QueryResultRow`. Query with
  * `Record<string, unknown>` and map through this helper instead.
  * See `src/db/repositories/README.md`.
+ *
+ * Contract, derived from the shape of {@link VACUUM_STATS_SQL}:
+ *
+ * | Column            | Source                          | Nullable |
+ * | ----------------- | ------------------------------- | -------- |
+ * | `table_name`      | `pg_class.relname`              | no       |
+ * | `n_dead_tup`      | `SUM(s.n_dead_tup)` → `numeric` | no       |
+ * | `n_live_tup`      | `SUM(s.n_live_tup)` → `numeric` | no       |
+ * | `last_autovacuum` | `MAX(s.last_autovacuum)`        | **yes**  |
+ *
+ * Tuple counts are non-negative and summed across partitions, so they are read
+ * as `bigint`-range integers and re-emitted as canonical decimal strings. The
+ * `string` shape is kept because {@link collectVacuumMetrics} parses it back,
+ * but the value is now guaranteed to survive `parseInt` — previously a NULL
+ * became `'0'` and a wrongly-typed value became `'NaN'`, and both were fed
+ * straight into a Gauge as a real reading.
+ *
+ * `last_autovacuum` is genuinely nullable: a table that has never been
+ * autovacuumed reports NULL, which the collector surfaces as the sentinel -1
+ * rather than as an age.
+ *
+ * @throws {RowMappingError} if any column violates the contract above.
  */
 export function rowToVacuumRow(row: Record<string, unknown>): VacuumRow {
+  const r = rowReader('pg_stat_user_tables', row);
+  const bounds = { min: 0, max: BIGINT_SAFE_MAX };
+
   return {
-    table_name: String(row['table_name'] ?? ''),
-    n_dead_tup: String(row['n_dead_tup'] ?? '0'),
-    n_live_tup: String(row['n_live_tup'] ?? '0'),
-    last_autovacuum:
-      row['last_autovacuum'] === null || row['last_autovacuum'] === undefined
-        ? null
-        : row['last_autovacuum'] instanceof Date
-          ? row['last_autovacuum']
-          : new Date(String(row['last_autovacuum'])),
+    table_name: r.requireString('table_name'),
+    n_dead_tup: String(r.requireInt('n_dead_tup', bounds)),
+    n_live_tup: String(r.requireInt('n_live_tup', bounds)),
+    last_autovacuum: r.optionalDate('last_autovacuum'),
   };
 }
 
@@ -103,16 +133,36 @@ export function rowToVacuumRow(row: Record<string, unknown>): VacuumRow {
  * a transient DB outage cannot crash the metrics collection loop.
  */
 export async function collectVacuumMetrics(pool: pg.Pool): Promise<void> {
-  let rows: VacuumRow[];
+  let rawRows: Record<string, unknown>[];
 
   try {
     const result = await pool.query<Record<string, unknown>>(VACUUM_STATS_SQL, [MONITORED_TABLES]);
-    rows = result.rows.map(rowToVacuumRow);
+    rawRows = result.rows;
   } catch (err) {
     logger.warn('Vacuum metrics collection failed — skipping this interval', undefined, {
       error: err instanceof Error ? err.message : String(err),
     });
     return;
+  }
+
+  // Quarantine, not fail-fast: one unmappable row must not blank out the
+  // gauges for the other monitored tables, and must not kill the collection
+  // loop. A rejected row is counted and logged so the quarantine is visible —
+  // dropping it silently would be the same failure mode as coercing it.
+  const rows: VacuumRow[] = [];
+  for (const rawRow of rawRows) {
+    try {
+      rows.push(rowToVacuumRow(rawRow));
+    } catch (err) {
+      if (!(err instanceof RowMappingError)) throw err;
+      pgVacuumRowsRejectedTotal.inc({ column: err.column });
+      logger.warn('Skipping unmappable vacuum stat row', undefined, {
+        table: err.table,
+        column: err.column,
+        reason: err.reason,
+        received: err.received,
+      });
+    }
   }
 
   for (const row of rows) {
@@ -159,4 +209,5 @@ export function deRegisterVacuumMetrics(): void {
   registry.removeSingleMetric('fluxora_pg_dead_tuples');
   registry.removeSingleMetric('fluxora_pg_bloat_ratio');
   registry.removeSingleMetric('fluxora_pg_last_autovacuum_age_seconds');
+  registry.removeSingleMetric('fluxora_pg_vacuum_rows_rejected_total');
 }

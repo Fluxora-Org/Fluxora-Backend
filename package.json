@@ -4,6 +4,7 @@
   "description": "Contract event indexer with optimized replay batching",
   "main": "dist/index.js",
   "scripts": {
+    "preinstall": "node scripts/check-package-manager.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "test": "vitest run",
@@ -13,10 +14,12 @@
     "dev": "ts-node src/index.ts",
     "start": "node dist/src/index.js",
     "migrate": "tsx src/db/migrate.ts",
+    "check:migrations": "node scripts/check-migration-names.mjs",
     "seed": "ts-node scripts/seed-test-data.ts",
     "benchmark": "ts-node scripts/benchmark.ts",
     "verify": "ts-node scripts/verify-setup.ts",
     "lint": "eslint src tests --ext .ts",
+    "lint:ci": "node scripts/lint-changed-files.mjs",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
@@ -27,7 +30,8 @@
     "generate:sdk:python": "node scripts/generate-sdk-python.mjs",
     "check:sdk:python": "node scripts/generate-sdk-python.mjs --check",
     "generate:sdk:ts": "node scripts/generate-sdk-ts.mjs",
-    "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check"
+    "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check",
+    "check:performance-budget": "node scripts/check-performance-budget.mjs"
   },
   "keywords": [
     "indexer",

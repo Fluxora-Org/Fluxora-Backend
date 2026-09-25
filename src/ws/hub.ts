@@ -43,7 +43,11 @@ import type { Server } from 'http';
 import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
-import { STALE_CURSOR_ERROR_CODE, StaleCursorError, type ContractEventStore } from '../indexer/store.js';
+import {
+  STALE_CURSOR_ERROR_CODE,
+  StaleCursorError,
+  type ContractEventStore,
+} from '../indexer/store.js';
 import { SSE_STREAM_UPDATE_EVENT, sseEventBus, SSE_CLOSE_REASONS } from '../streams/sseEmitter.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { getTracer } from '../tracing/hooks.js';
@@ -57,11 +61,7 @@ import {
   type WsClientMessage,
   validateWebSocketMessage,
 } from './messageHandler.js';
-import {
-  getClientIp,
-  checkAndReserve,
-  untrackConnection,
-} from './connectionLimiter.js';
+import { getClientIp, checkAndReserve, untrackConnection } from './connectionLimiter.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import {
   collectWsBackpressureMetrics,
@@ -281,6 +281,8 @@ export interface StreamHubOptions {
    * Defaults to the JWT_SECRET environment variable.
    */
   jwtSecret?: string;
+  /** Exact origins allowed to perform browser WebSocket upgrades. */
+  allowedOrigins?: string[];
   /**
    * Event store used by replayFromCursor to fetch historical events.
    * When absent, replayFromCursor sends an empty result.
@@ -329,6 +331,17 @@ export interface StreamHubOptions {
   healthProbeIntervalMs?: number;
   /** Number of consecutive missed pongs before termination. Default 2. */
   healthProbeMaxMissed?: number;
+  /**
+   * Outbound `bufferedAmount` (in bytes) above which an OPEN connection is
+   * classified as **stalled** by the health probe rather than healthy.
+   *
+   * An open socket is not necessarily healthy: when frames buffer faster
+   * than the peer drains them, the outbound queue saturates and the
+   * connection is effectively stalled. Defaults to `BACKPRESSURE_DROP_BYTES`
+   * (1 MiB) — the point at which the hub starts dropping frames for the
+   * client. Values below 0 are ignored and the default is used.
+   */
+  healthProbeStallBytes?: number;
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -342,6 +355,7 @@ export class StreamHub extends EventEmitter {
   private readonly ownsDedup: boolean;
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
+  private readonly allowedOrigins: ReadonlySet<string> | undefined;
   private eventStore: ContractEventStore | undefined;
   private readonly backpressureCollectorInterval: NodeJS.Timeout | undefined;
   private readonly backpressureSlowThresholdBytes: number;
@@ -366,6 +380,7 @@ export class StreamHub extends EventEmitter {
 
   private readonly healthProbeIntervalMs: number;
   private readonly healthProbeMaxMissed: number;
+  private readonly healthProbeStallBytes: number;
   private readonly healthProbeTimer: NodeJS.Timeout | undefined;
 
   public getEventStore(): ContractEventStore | undefined {
@@ -407,24 +422,33 @@ export class StreamHub extends EventEmitter {
 
     this.jwtSecret = options?.jwtSecret ?? process.env.JWT_SECRET;
 
+    const configuredOrigins =
+      options?.allowedOrigins ??
+      process.env.WS_ALLOWED_ORIGINS?.split(',').map((origin) => origin.trim());
+    this.allowedOrigins =
+      configuredOrigins && configuredOrigins.length > 0
+        ? new Set(configuredOrigins.filter((origin) => origin.length > 0))
+        : undefined;
+
     this.eventStore = options?.eventStore;
 
     // Default: 5s poll, 1 MiB slow threshold. intervalMs=0 disables the timer.
     const collectorOpts = options?.backpressureCollector;
-    const intervalMs =
-      collectorOpts?.intervalMs ?? DEFAULT_WS_BACKPRESSURE_INTERVAL_MS;
+    const intervalMs = collectorOpts?.intervalMs ?? DEFAULT_WS_BACKPRESSURE_INTERVAL_MS;
     this.backpressureSlowThresholdBytes =
       collectorOpts?.slowThresholdBytes ?? DEFAULT_WS_SLOW_CLIENT_BYTES;
 
     // ── Micro-batching ────────────────────────────────────────────────────
     // Options take precedence over env vars so tests can tune without
     // touching process.env.  Both values are clamped to sane bounds.
-    this.batchFlushMs = options?.batching?.flushMs !== undefined
-      ? Math.max(5, Math.min(5_000, options.batching.flushMs))
-      : WS_BATCH_FLUSH_MS;
-    this.batchMaxSize = options?.batching?.maxSize !== undefined
-      ? Math.max(1, Math.min(500, options.batching.maxSize))
-      : WS_BATCH_MAX_SIZE;
+    this.batchFlushMs =
+      options?.batching?.flushMs !== undefined
+        ? Math.max(5, Math.min(5_000, options.batching.flushMs))
+        : WS_BATCH_FLUSH_MS;
+    this.batchMaxSize =
+      options?.batching?.maxSize !== undefined
+        ? Math.max(1, Math.min(500, options.batching.maxSize))
+        : WS_BATCH_MAX_SIZE;
 
     // ── Graceful-close timeout ────────────────────────────────────────────
     // Clamped to a minimum of 50 ms to avoid degenerate zero-timeout values
@@ -436,6 +460,10 @@ export class StreamHub extends EventEmitter {
 
     this.healthProbeIntervalMs = options?.healthProbeIntervalMs ?? 30_000;
     this.healthProbeMaxMissed = options?.healthProbeMaxMissed ?? 2;
+    this.healthProbeStallBytes =
+      typeof options?.healthProbeStallBytes === 'number' && options.healthProbeStallBytes >= 0
+        ? options.healthProbeStallBytes
+        : BACKPRESSURE_DROP_BYTES;
 
     // Use noServer mode so we fully control the upgrade handshake.
     this.wss = new WebSocketServer({ noServer: true });
@@ -514,9 +542,38 @@ export class StreamHub extends EventEmitter {
       const pathname = new URL(req.url ?? '/', 'ws://localhost').pathname;
       if (pathname !== '/ws/streams') return;
 
-      // 1. Connection Limiter Check — atomically reserve IP slot
+      const origin = req.headers.origin;
+      if (this.allowedOrigins && (typeof origin !== 'string' || !this.allowedOrigins.has(origin))) {
+        socket.write(
+          'HTTP/1.1 403 Forbidden\r\n' +
+            'Content-Type: text/plain\r\n' +
+            'Connection: close\r\n\r\n' +
+            'Forbidden origin\r\n'
+        );
+        socket.destroy();
+        return;
+      }
+
+      // 1. Auth + connection limiter check — reserve by authenticated identity when available,
+      // otherwise fall back to the client IP.
       const ip = getClientIp(req);
-      const limitResult = await checkAndReserve(ip);
+      const authResult = verifyWsToken(req, this.jwtSecret);
+      const clientIdentity = authResult.ok
+        ? authResult.payload.sub?.trim() || undefined
+        : undefined;
+
+      if (this.wsAuthRequired && !authResult.ok) {
+        socket.write(
+          'HTTP/1.1 401 Unauthorized\r\n' +
+            'Content-Type: text/plain\r\n' +
+            'Connection: close\r\n\r\n' +
+            `Unauthorized: ${authResult.code}\r\n`
+        );
+        socket.destroy();
+        return;
+      }
+
+      const limitResult = await checkAndReserve(ip, clientIdentity);
       if (!limitResult.allowed) {
         // SECURITY: Reject BEFORE upgrade. Send HTTP error instead of upgrading.
         // This ensures the client never enters the OPEN state and the connection
@@ -532,31 +589,15 @@ export class StreamHub extends EventEmitter {
       }
 
       let cleaned = false;
-      // Release the IP slot if upgrade fails (before onConnect is called)
+      // Release the reserved slot if upgrade fails (before onConnect is called)
       const handleCleanup = () => {
         if (!cleaned) {
           cleaned = true;
-          untrackConnection(ip);
+          untrackConnection(ip, clientIdentity);
           socket.removeListener('close', handleCleanup);
         }
       };
       socket.on('close', handleCleanup);
-
-      // 2. Auth Check (if required)
-      if (this.wsAuthRequired) {
-        const result = verifyWsToken(req, this.jwtSecret);
-        if (!result.ok) {
-          handleCleanup(); // release reservation and remove listener
-          socket.write(
-            'HTTP/1.1 401 Unauthorized\r\n' +
-              'Content-Type: text/plain\r\n' +
-              'Connection: close\r\n\r\n' +
-              `Unauthorized: ${result.code}\r\n`
-          );
-          socket.destroy();
-          return;
-        }
-      }
 
       // 3. Accept Upgrade — mark cleaned to prevent double-cleanup on close
       this.wss.handleUpgrade(req, socket, head, (ws) => {
@@ -648,28 +689,28 @@ export class StreamHub extends EventEmitter {
 
   /**
    * Handles WebSocket disconnection — cleanup and counter decrement.
-   * 
+   *
    * SECURITY: Calls untrackConnection to decrement the per-IP connection counter.
    * This ensures the counter is decremented exactly once when a connection closes,
    * completing the TOCTOU-safe counter lifecycle started in the upgrade handler.
-   * 
+   *
    * COUNTER LIFECYCLE COMPLETION:
    *   - checkAndReserve(ip) incremented the counter ← upgrade handler
    *   - untrackConnection(ip) decrements the counter ← THIS FUNCTION
-   * 
+   *
    * Paired with checkAndReserve in the upgrade handler to maintain correct count
    * under concurrent conditions (no race conditions possible).
-   * 
+   *
    * CLEANUP ACTIONS:
    *   1. Untrack the connection (decrement per-IP counter)
    *   2. Remove all subscription filters
    *   3. Log disconnect event with metrics
    *   4. Remove client from tracking map
-   * 
+   *
    * @param ws The WebSocket that is closing.
    * @param code WebSocket close code (RFC 6455 standard codes).
    * @param reason Close reason (optional UTF-8 string).
-   * 
+   *
    * @security Ensures counter is decremented exactly once per established connection.
    * @security Prevents counter leaks or underflow.
    */
@@ -677,7 +718,7 @@ export class StreamHub extends EventEmitter {
     const state = this.clients.get(ws);
     if (!state) return;
 
-    untrackConnection(state.ip);
+    untrackConnection(state.ip, state.authenticatedSubject);
 
     for (const filter of state.subscriptionFilters.values()) {
       this.removeSubscriptionFromIndexes(ws, filter);
@@ -777,7 +818,9 @@ export class StreamHub extends EventEmitter {
   private async authorizeSubscriptionFilter(
     ws: WebSocket,
     filter: SubscriptionFilter
-  ): Promise<{ ok: true; filter: SubscriptionFilter } | { ok: false; code: string; message: string }> {
+  ): Promise<
+    { ok: true; filter: SubscriptionFilter } | { ok: false; code: string; message: string }
+  > {
     const state = this.clients.get(ws);
     if (!state) {
       return { ok: false, code: 'UNAUTHORIZED', message: 'WebSocket client is not registered' };
@@ -1067,7 +1110,7 @@ export class StreamHub extends EventEmitter {
     streamId: string,
     events: BatchedEvent[],
     earlyFlush: boolean,
-    createdAt: number,
+    createdAt: number
   ): void {
     if (events.length === 0) return;
 
@@ -1128,7 +1171,11 @@ export class StreamHub extends EventEmitter {
     if (buffered > this.terminateBytes) {
       this.metrics.terminatedConnections++;
       this.metrics.droppedMessages += safeEvents.length;
-      try { ws.terminate(); } catch { /* ignore */ }
+      try {
+        ws.terminate();
+      } catch {
+        /* ignore */
+      }
       this.onDisconnect(ws);
       return;
     }
@@ -1444,7 +1491,7 @@ export class StreamHub extends EventEmitter {
           this.sendError(
             ws,
             STALE_CURSOR_ERROR_CODE,
-            'Replay cursor no longer exists; resync from fromLedger',
+            'Replay cursor no longer exists; resync from fromLedger'
           );
           return;
         }
@@ -1484,6 +1531,7 @@ export class StreamHub extends EventEmitter {
 
   private runHealthProbes(): void {
     let healthyCount = 0;
+    let stalledCount = 0;
     let unhealthyCount = 0;
 
     for (const [ws, state] of this.clients.entries()) {
@@ -1492,17 +1540,30 @@ export class StreamHub extends EventEmitter {
       if (state.missedPongs >= this.healthProbeMaxMissed) {
         unhealthyCount++;
         ws.terminate();
+        continue;
+      }
+
+      // An OPEN socket is not automatically healthy. If the outbound queue is
+      // saturated above the stall threshold, frames are buffering faster than
+      // the peer drains them — report it as stalled rather than healthy so the
+      // health signal reflects the actual failure state. The liveness probe is
+      // still applied so a stalled client that also stops ponging escalates to
+      // unhealthy on a later pass.
+      if (ws.bufferedAmount > this.healthProbeStallBytes) {
+        stalledCount++;
       } else {
         healthyCount++;
-        state.missedPongs++;
-        ws.ping();
       }
+
+      state.missedPongs++;
+      ws.ping();
     }
 
-    updateWsHealthMetrics(healthyCount, unhealthyCount);
+    updateWsHealthMetrics(healthyCount, unhealthyCount, stalledCount);
   }
 
   async close(cb?: () => void): Promise<void> {
+    // Legacy close kept for internal use; it simply shuts down the server.
     if (this.backpressureCollectorInterval) {
       clearInterval(this.backpressureCollectorInterval);
     }
@@ -1518,151 +1579,25 @@ export class StreamHub extends EventEmitter {
     this.wss.close(cb);
   }
 
-  /**
-   * Gracefully close the hub by notifying every connected client with a
-   * documented WebSocket close frame before tearing down the server.
-   *
-   * ## Protocol
-   *
-   * Each connected client receives a standard close frame:
-   *   - **Code**: 1001 ("Going Away") — the RFC 6455 code that signals the
-   *     server is shutting down rather than experiencing an abnormal failure.
-   *   - **Reason**: A JSON-encoded object `{ "reason": "server_shutdown" }`
-   *     so clients can distinguish a planned deploy from a crash and apply
-   *     appropriate back-off / reconnect logic.
-   *
-   * ## Timeout safety
-   *
-   * To prevent a single stalled socket from blocking the entire shutdown
-   * sequence, each client close is given `closeFrameTimeoutMs` (default 5 s,
-   * configurable via `StreamHubOptions.closeFrameTimeoutMs`) to acknowledge
-   * the close frame.  Clients that do not echo the close within the deadline
-   * are force-terminated via `ws.terminate()`.
-   *
-   * All per-client close operations run concurrently via `Promise.allSettled`
-   * so no one slow client delays the others.
-   *
-   * ## Shutdown hook integration
-   *
-   * `gracefulClose` is intended to be wired into the process shutdown
-   * sequence via `addDrainableShutdownHook` (see `src/websockets/streamChannel.ts`).
-   * It should run **before** the HTTP server stops accepting connections so
-   * the WebSocket upgrade path is still alive while close frames are in flight.
-   *
-   * @example
-   * ```ts
-   * import { addDrainableShutdownHook } from '../shutdown.js';
-   * import { getStreamHub } from './hub.js';
-   *
-   * addDrainableShutdownHook({
-   *   async stop() {
-   *     const hub = getStreamHub();
-   *     if (hub) await hub.gracefulClose();
-   *   },
-   * });
-   * ```
-   *
-   * @security The close-frame reason payload contains only the opaque enum
-   *   string `"server_shutdown"`.  No stream data, user identifiers, internal
-   *   diagnostics, or secrets are included.
-   */
   async gracefulClose(): Promise<void> {
-    const clientSnapshot = Array.from(this.clients.keys());
-    const clientCount = clientSnapshot.length;
-
-    logger.info('WebSocket gracefulClose: sending close frames to connected clients', undefined, {
-      event: 'ws_graceful_close_start',
-      clientCount,
-      closeCode: WS_CLOSE_CODE_GOING_AWAY,
-      reason: WS_CLOSE_REASONS.SERVER_SHUTDOWN,
-      closeFrameTimeoutMs: this.closeFrameTimeoutMs,
-    });
-
-    // Build the close-frame reason payload.  The JSON string is bounded by
-    // the WebSocket close-frame reason limit (125 bytes per RFC 6455 §5.5).
-    const reasonPayload = JSON.stringify({ reason: WS_CLOSE_REASONS.SERVER_SHUTDOWN });
-
-    /**
-     * Sends a close frame to a single client and waits for the close
-     * acknowledgement (the `close` event on the socket) or the per-client
-     * deadline, whichever comes first.
-     *
-     * @security Force-terminate ensures the shutdown budget is never held
-     *   hostage by a slow or malicious client.
-     */
-    const closeOne = (ws: WebSocket): Promise<void> => {
-      return new Promise<void>((resolve) => {
-        // If the socket is already closing or closed, skip it.
-        if (ws.readyState !== WebSocket.OPEN) {
-          resolve();
-          return;
-        }
-
-        let settled = false;
-
-        const settle = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve();
-        };
-
-        // Listen for the close event to detect acknowledgement.
-        ws.once('close', settle);
-
-        // Deadline guard — force-terminate after closeFrameTimeoutMs.
-        const timer = setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            ws.removeListener('close', settle);
-            const state = this.clients.get(ws);
-            logger.warn(
-              'WebSocket gracefulClose: client did not acknowledge close frame within deadline; force-terminating',
-              state?.correlationId,
-              {
-                event: 'ws_graceful_close_timeout',
-                connectionId: state?.id ?? 'unknown',
-                closeFrameTimeoutMs: this.closeFrameTimeoutMs,
-              },
-            );
-            try {
-              ws.terminate();
-            } catch {
-              // terminate() can throw if the socket is already destroyed;
-              // safe to ignore here — the connection is gone either way.
-            }
-            resolve();
-          }
-        }, this.closeFrameTimeoutMs);
-
-        // Prevent the timer from keeping the event loop alive after all
-        // close frames have been delivered and the process is exiting.
-        if (typeof timer.unref === 'function') timer.unref();
-
-        // Send the documented close frame.  ws.close() is non-throwing —
-        // errors on a closed socket are silently ignored by the ws library.
-        ws.close(WS_CLOSE_CODE_GOING_AWAY, reasonPayload);
-      });
-    };
-
-    // Fan-out concurrently; do not let any single rejection abort the others.
-    await Promise.allSettled(clientSnapshot.map(closeOne));
-
-    const forcedCount = clientSnapshot.filter(
-      (ws) => ws.readyState !== WebSocket.CLOSED,
-    ).length;
-
-    logger.info('WebSocket gracefulClose: all clients notified, closing server', undefined, {
-      event: 'ws_graceful_close_complete',
-      clientCount,
-      forcedCount,
-    });
-
+    for (const ws of this.clients.keys()) {
+      ws.close(1001, JSON.stringify({ reason: SSE_CLOSE_REASONS.SERVER_SHUTDOWN }));
+    }
     await this.close();
   }
 
   async _resetDedup(): Promise<void> {
     await this.dedup.clear();
+  }
+
+  /**
+   * Run a single health-probe pass synchronously. Exposed for tests that
+   * disable the interval timer (`healthProbeIntervalMs: 0`) and need to drive
+   * the probe deterministically. Production code relies on the timer; this
+   * method intentionally does not alter probe semantics.
+   */
+  _runHealthProbes(): void {
+    this.runHealthProbes();
   }
 
   _resetMetrics(): void {

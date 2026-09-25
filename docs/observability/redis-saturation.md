@@ -9,6 +9,8 @@ Fluxora Backend exposes three Prometheus Gauges that track the health and satura
 | `redis_command_queue_length` | Gauge | `instance` | Number of commands waiting in the Redis command queue |
 | `redis_connection_status` | Gauge | `instance` | Connection status as a numeric enum (see below) |
 | `redis_queue_length_warnings_total` | Counter | `instance` | Total number of times the command queue exceeded the warning threshold |
+| `redis_reconnects_total` | Counter | `instance` | Total Redis reconnect attempts (`reconnecting` events). Separate from command failures. |
+| `redis_command_failures_total` | Counter | `instance` | Total Redis command failures (rejected commands). Separate from reconnects. |
 
 The `instance` label identifies which logical Redis connection the metric represents (e.g. `default`, `dedup`, `idempotency`). Currently all connections use the `default` label.
 
@@ -22,6 +24,29 @@ The `instance` label identifies which logical Redis connection the metric repres
 | 3 | `ready` / `connect` | Authenticated and ready to accept commands |
 | 4 | `close` | Connection closed (may re-enter connecting) |
 | -1 | `unknown` | Unexpected status string |
+
+
+## Reconnects vs command failures
+
+A reconnect and a failed command have different causes and different responses.
+They are counted on **separate** counters so alerts can distinguish transport
+churn from application-visible command errors:
+
+- `redis_reconnects_total` — incremented only on the ioredis `reconnecting` event
+  (wired in `_trackClient`).
+- `redis_command_failures_total` — incremented only when a Redis command promise
+  rejects (wired in `IORedisClient.withCommandMetrics`).
+
+Both series use only the bounded `instance` label (application-controlled names
+such as `default`, `dedup`, `idempotency`). Error messages, keys, and hosts are
+never used as labels.
+
+### Intended alert thresholds
+
+| Metric | Threshold | Window | Rationale |
+|---|---|---|---|
+| `redis_reconnects_total` | `rate(...[5m]) > 0.1` | 5m | Sustained reconnect churn (~30+/5m) indicates unstable Redis connectivity |
+| `redis_command_failures_total` | `rate(...[5m]) > 1` | 2m | Elevated command error rate impacting rate limiting / idempotency / revocation |
 
 ## How it works
 
@@ -68,6 +93,14 @@ redis_connection_status{instance="default"} 3
 # HELP redis_queue_length_warnings_total Total number of times the Redis command queue exceeded the warning threshold, labeled by instance
 # TYPE redis_queue_length_warnings_total counter
 redis_queue_length_warnings_total{instance="default"} 0
+
+# HELP redis_reconnects_total Total Redis reconnect attempts (ioredis reconnecting events), labeled by instance. Alert when rate > 0.1/s over 5m.
+# TYPE redis_reconnects_total counter
+redis_reconnects_total{instance="default"} 0
+
+# HELP redis_command_failures_total Total Redis command failures (rejected commands), labeled by instance. Alert when rate > 1/s over 5m.
+# TYPE redis_command_failures_total counter
+redis_command_failures_total{instance="default"} 0
 ```
 
 ## Alerting rules
@@ -118,6 +151,24 @@ groups:
           severity: warning
         annotations:
           summary: "Redis instance {{ $labels.instance }} hit the queue-length warning threshold in the last 5 minutes"
+
+      # Sustained reconnect churn — separate from command failures.
+      - alert: RedisReconnectChurn
+        expr: rate(redis_reconnects_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis instance {{ $labels.instance }} reconnect rate {{ $value }}/s exceeds 0.1/s"
+
+      # Elevated command error rate — separate from reconnects.
+      - alert: RedisCommandFailureRate
+        expr: rate(redis_command_failures_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis instance {{ $labels.instance }} command failure rate {{ $value }}/s exceeds 1/s"
 ```
 
 ## Grafana dashboard queries
@@ -131,6 +182,12 @@ redis_connection_status
 
 # Warning rate
 rate(redis_queue_length_warnings_total[5m])
+
+# Reconnect rate (separate from command failures)
+rate(redis_reconnects_total[5m])
+
+# Command failure rate (separate from reconnects)
+rate(redis_command_failures_total[5m])
 ```
 
 ## Security notes
@@ -141,7 +198,7 @@ rate(redis_queue_length_warnings_total[5m])
 
 ## References
 
-- Source: `src/metrics/redisPool.ts` — gauge definitions and `syncRedisGauges()`
+- Source: `src/metrics/redisPool.ts` — gauge/counter definitions, `syncRedisGauges()`, `recordRedisReconnect()`, `recordRedisCommandFailure()`
 - Source: `src/redis/client.ts` — polling loop, tracking, and rate-limited warnings
 - Integration: `src/app.ts` — lifecycle hooks (start/stop on app start/shutdown)
 - Similar pattern: `docs/observability/database-metrics.md` — pg.Pool connection pool metrics

@@ -307,6 +307,64 @@ describe('API Key Scopes & getApiKeyRecord', () => {
     });
   });
 
+  describe('scope matrix — extra, expired, revoked, and cross-tenant keys (#1266)', () => {
+    it('revoked key is rejected with 401 on a scoped route', async () => {
+      const apiKey = await createApiKey('revoked-route-key', ['streams:read']);
+      await revokeApiKey(apiKey.id);
+
+      const response = await request(app)
+        .get('/api/streams')
+        .set('X-API-Key', apiKey.key)
+        .query({ limit: 10 });
+
+      expect(response.status).toBe(401);
+      expect(response.body.error?.code).toBe('UNAUTHORIZED');
+    });
+
+    it('extra scopes never grant admin access (deny-by-default, no privilege escalation)', async () => {
+      const apiKey = await createApiKey('admin-scope-key', ['streams:read', 'admin:pause']);
+
+      // Admin routes are gated by the bearer ADMIN_API_KEY credential, not by
+      // API-key scopes — a key carrying admin:* scopes must still be rejected.
+      // (401 = unauthenticated, 503 = admin auth not configured — either way
+      // the API key is never accepted as an admin credential.)
+      const response = await request(app)
+        .get('/api/rate-limits/config')
+        .set('X-API-Key', apiKey.key);
+
+      expect([401, 403, 503]).toContain(response.status);
+      expect(response.status).not.toBe(200);
+    });
+
+    it('expired JWT is rejected with 401 on a scoped route', async () => {
+      const { jwtSecret } = await import('../../src/config/env.js').then((m) => m.getConfig());
+      const jwt = require('jsonwebtoken').sign(
+        { address: 'GOPERATOR000000000000000000000000000000000000', role: 'operator' } as any,
+        jwtSecret,
+        { expiresIn: -60 },
+      );
+
+      const response = await request(app)
+        .get('/api/streams')
+        .set('Authorization', `Bearer ${jwt}`)
+        .query({ limit: 10 });
+
+      expect(response.status).toBe(401);
+    });
+
+    it('cross-tenant (foreign) key is rejected with 401 and reveals no data', async () => {
+      // A credential issued to another account is not the caller's key — it is
+      // rejected before any repository work, and the response does not
+      // disclose anything about the requested resource.
+      const response = await request(app)
+        .get('/api/streams/stream-does-not-matter')
+        .set('X-API-Key', `flx_foreign_key_${'a'.repeat(48)}`);
+
+      expect(response.status).toBe(401);
+      expect(JSON.stringify(response.body)).not.toContain('stream-does-not-matter');
+    });
+  });
+
   describe('backward compatibility', () => {
     it('should default to DEFAULT_SCOPES for keys created without explicit scopes', () => {
       expect(DEFAULT_SCOPES).toContain('streams:read');

@@ -23,7 +23,7 @@ import { z } from 'zod';
 import { getConfig } from '../config/env.js';
 import { apiKeyRepository } from '../db/repositories/apiKeyRepository.js';
 import { recordAuditEventToDb } from './auditLog.js';
-import type { ApiKeyRecord, ApiKeyCreated } from '../db/types.js';
+import type { ApiKeyRecord, ApiKeyCreated, ApiKeyView } from '../db/types.js';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 
 /**
@@ -48,6 +48,8 @@ const PREFIX_LENGTH = 8;
 const SALT_BYTES = 16;
 /** Raw key entropy in bytes (rendered as hex). */
 const RAW_KEY_BYTES = 32;
+/** HMAC-SHA256 digest size in bytes. */
+const DIGEST_BYTES = 32;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,6 +84,15 @@ function getPepper(): string {
 }
 
 /**
+ * Optional previous pepper used during a migration window. When present we
+ * accept keys hashed with either the current or previous pepper and re-hash
+ * the stored digest with the current pepper on first successful use.
+ */
+function getPreviousPepper(): string | undefined {
+  return getConfig().apiKeyPepperPrevious;
+}
+
+/**
  * Derive the stored digest for a raw key.
  *
  * Computes `HMAC-SHA256(pepper, salt || rawKey)` and returns it as hex. The
@@ -92,8 +103,12 @@ function getPepper(): string {
  * @param salt   - Per-key random salt, hex-encoded.
  * @returns Hex-encoded HMAC digest suitable for storage.
  */
+function hashWithPepper(rawKey: string, salt: string, pepper: string): string {
+  return createHmac('sha256', pepper).update(salt).update(rawKey).digest('hex');
+}
+
 function hashKey(rawKey: string, salt: string): string {
-  return createHmac('sha256', getPepper()).update(salt).update(rawKey).digest('hex');
+  return hashWithPepper(rawKey, salt, getPepper());
 }
 
 /** Generate a new random raw key, e.g. `flx_<64 hex chars>`. */
@@ -105,13 +120,22 @@ function generateRawKey(): string {
  * Constant-time comparison of two hex digests.
  *
  * Operates on a single candidate row so authentication time does not leak
- * which (if any) stored hash matched. Length mismatches short-circuit safely.
+ * which (if any) stored hash matched. Inputs are normalized to fixed-size
+ * buffers before comparison so malformed lengths do not short-circuit.
  */
 function hashesMatch(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'hex');
   const bufB = Buffer.from(b, 'hex');
-  if (bufA.length === 0 || bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
+  const paddedA = Buffer.alloc(DIGEST_BYTES);
+  const paddedB = Buffer.alloc(DIGEST_BYTES);
+  bufA.copy(paddedA, 0, 0, DIGEST_BYTES);
+  bufB.copy(paddedB, 0, 0, DIGEST_BYTES);
+
+  // Always compare fixed-size buffers. Length and digest validity are checked
+  // after the constant-time operation so malformed candidates do not take a
+  // faster branch.
+  const equal = timingSafeEqual(paddedA, paddedB);
+  return equal && bufA.length === DIGEST_BYTES && bufB.length === DIGEST_BYTES;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +143,27 @@ function hashesMatch(a: string, b: string): boolean {
 // ---------------------------------------------------------------------------
 
 /**
+ * Project an internal {@link ApiKeyRecord} to its safe display shape.
+ *
+ * Strips `keyHash` and `salt` so the credential material never leaves the
+ * service boundary. Call this before serialising any record into an HTTP
+ * response, a log line, or any other outbound channel.
+ *
+ * @param record - Full internal record fetched from the repository.
+ * @returns A view safe for serialisation into HTTP responses.
+ */
+export function toApiKeyView(record: ApiKeyRecord): ApiKeyView {
+  return {
+    id: record.id,
+    name: record.name,
+    prefix: record.prefix,
+    createdAt: record.createdAt,
+    rotatedAt: record.rotatedAt,
+    active: record.active,
+    scopes: record.scopes,
+  };
+}
+
 /**
  * Creates a new API key with optional scopes. Returns the record plus the raw key (shown once).
  *
@@ -212,10 +257,15 @@ export async function revokeApiKey(id: string, correlationId?: string): Promise<
 }
 
 /**
- * Returns all stored key records (hashes only — raw keys are never stored).
+ * Returns all stored key records projected to safe display fields.
+ *
+ * `keyHash` and `salt` are stripped before returning — only the non-secret
+ * display fields (`id`, `name`, `prefix`, `createdAt`, `rotatedAt`, `active`,
+ * `scopes`) are included in each entry.
  */
-export async function listApiKeys(): Promise<ApiKeyRecord[]> {
-  return apiKeyRepository.listAll();
+export async function listApiKeys(): Promise<ApiKeyView[]> {
+  const records = await apiKeyRepository.listAll();
+  return records.map(toApiKeyView);
 }
 
 /**
@@ -241,11 +291,35 @@ export async function findRecordByRawKey(rawKey: string): Promise<ApiKeyRecord |
   const candidates = await apiKeyRepository.findActiveByPrefix(prefix);
 
   let matchedRecord: ApiKeyRecord | undefined;
+  const previousPepper = getPreviousPepper();
   for (const candidate of candidates) {
     // Compare every candidate (do not early-return) so timing does not reveal
     // which row, if any, matched within a colliding prefix bucket.
-    if (hashesMatch(hashKey(rawKey, candidate.salt), candidate.keyHash)) {
+    const currentDigest = hashWithPepper(rawKey, candidate.salt, getPepper());
+    if (hashesMatch(currentDigest, candidate.keyHash)) {
       matchedRecord = candidate;
+      continue;
+    }
+
+    // If a previous pepper is configured, allow a match against it and
+    // re-hash the stored digest using the current pepper so future auths use
+    // the latest server-side secret without forcing a global key rotation.
+    if (previousPepper) {
+      const prevDigest = hashWithPepper(rawKey, candidate.salt, previousPepper);
+      if (hashesMatch(prevDigest, candidate.keyHash)) {
+        matchedRecord = candidate;
+        // Best-effort update: do not fail authentication if the DB update
+        // races or errors — authentication succeeded regardless.
+        try {
+          const newHash = currentDigest;
+          // Persist new hash so subsequent validations succeed with current pepper.
+          // Use repository method that only updates the digest to minimize churn.
+          // eslint-disable-next-line @typescript-eslint/no-floating-promises
+          apiKeyRepository.updateKeyHash(candidate.id, newHash);
+        } catch (err) {
+          // Swallow DB errors: auth must not fail because the rehash write failed.
+        }
+      }
     }
   }
   endTimer({ outcome: matchedRecord ? 'success' : 'failure' });

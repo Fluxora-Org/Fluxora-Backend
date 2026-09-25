@@ -15,7 +15,7 @@
  *  - DecimalString precision preservation through the full stack
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../src/app.js';
 import {
@@ -29,6 +29,16 @@ import {
   setIndexerIngestAuthToken,
 } from '../src/routes/indexer.js';
 import { toDecimalString } from '../src/indexer/types.js';
+import type { Pool } from 'pg';
+import {
+  IndexerService,
+  ReplayForcedStopError,
+  _resetStopReplay,
+  requestStopReplay,
+  replayLock,
+  replayState,
+} from '../src/indexer/service.js';
+import { NoOpLeaderElection } from '../src/indexer/leaderElection.js';
 
 const INDEXER_TOKEN = 'test-indexer-token';
 const INGEST_ENDPOINT = '/internal/indexer/contract-events';
@@ -740,5 +750,250 @@ describe('GET /internal/indexer/events/replay — cursor-based replay', () => {
 
     const res = await getReplay({ afterEventId: 'e1', topic: 'stream.created' }).expect(200);
     expect(res.body.data.events.map((e: any) => e.eventId)).toEqual(['e3']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1297 Replay cancellation (cooperative checkpoints + forced-timeout)
+//
+// These tests drive IndexerService.replayEvents() directly with a controllable
+// mock pool so we can prove the in-memory indexer lock, the leader lease, and
+// the in-memory progress state are always left consistent when a stop is
+// requested — before start, during fetch, during commit, and after completion.
+// ---------------------------------------------------------------------------
+
+describe('#1297 replay cancellation without leaving the indexer lock held', () => {
+  function row(id: string) {
+    return {
+      event_id: id,
+      contract_id: 'CCONTRACT123',
+      ledger: 1,
+      event_type: 'stream.created',
+      event_data: {},
+      block_height: 1,
+      transaction_hash: `tx-${id}`,
+    };
+  }
+
+  const REPLAY_REQUEST = { contract_id: 'CCONTRACT123', ledger: 1 } as const;
+
+  type MockOptions = {
+    count?: number;
+    /** Result rows for each successive fetch query, in order. */
+    batches?: Record<string, unknown>[][];
+    /** Trigger requestStopReplay on the Nth fetch (1-indexed), no hang. */
+    stopOnFetchNumber?: number;
+    /** Trigger requestStopReplay on COMMIT (and never resolve if hang). */
+    stopOnCommit?: boolean;
+    /** When triggering a stop, never resolve the in-flight query. */
+    hang?: boolean;
+  };
+
+  function makePool(opts: MockOptions) {
+    const batches = opts.batches ?? [];
+    let fetchCall = 0;
+    const queries: string[] = [];
+    const fakeClient = {
+      query(sql: string, _params?: unknown[]) {
+        queries.push(sql);
+        if (sql === 'BEGIN') return Promise.resolve({ rows: [] });
+        if (sql === 'COMMIT') {
+          if (opts.stopOnCommit) {
+            requestStopReplay();
+            if (opts.hang) return new Promise<never>(() => {});
+          }
+          return Promise.resolve({ rows: [] });
+        }
+        if (sql === 'ROLLBACK') return Promise.resolve({ rows: [] });
+        if (sql.includes('COUNT')) {
+          return Promise.resolve({ rows: [{ count: String(opts.count ?? 0) }] });
+        }
+        if (sql.includes('FROM replay_cursors') && sql.includes('completed_at IS NULL')) {
+          // No pre-existing active cursor.
+          return Promise.resolve({ rows: [] });
+        }
+        if (sql.includes('INSERT INTO replay_cursors')) {
+          return Promise.resolve({
+            rows: [
+              {
+                id: 'cur-1',
+                contract_id: 'CCONTRACT123',
+                ledger: 1,
+                from_block: null,
+                to_block: null,
+                total_rows: opts.count ?? 0,
+                last_committed_offset: 0,
+                started_at: new Date(),
+                completed_at: null,
+              },
+            ],
+          });
+        }
+        if (sql.includes('indexer_replay_progress')) {
+          return Promise.resolve({ rows: [] });
+        }
+        if (sql.includes('historical_events') && sql.includes('ORDER BY')) {
+          const rows = batches[fetchCall++] ?? [];
+          if (opts.stopOnFetchNumber !== undefined && fetchCall === opts.stopOnFetchNumber) {
+            requestStopReplay();
+            if (opts.hang) return new Promise<never>(() => {});
+          }
+          return Promise.resolve({ rows });
+        }
+        if (sql.includes('last_committed_offset')) {
+          return Promise.resolve({ rows: [] });
+        }
+        return Promise.resolve({ rows: [] });
+      },
+      release() {},
+    };
+    const pool = {
+      connect: () => Promise.resolve(fakeClient),
+      _queries: queries,
+    };
+    return { pool: pool as unknown as Pool, queries };
+  }
+
+  function makeService(forcedTimeoutMs: number, pool: Pool) {
+    return new IndexerService(
+      pool,
+      250,
+      0,
+      0,
+      undefined,
+      new NoOpLeaderElection(),
+      forcedTimeoutMs,
+    );
+  }
+
+  // A short forced timeout keeps the hang-based tests fast and deterministic.
+  const FORCED_TIMEOUT_MS = 10;
+
+  afterEach(() => {
+    _resetStopReplay();
+    replayLock.release();
+  });
+
+  it('cancel-before-start: does not acquire the lock or touch the DB', async () => {
+    const { pool, queries } = makePool({ count: 3, batches: [[row('a')], [row('b')], [row('c')]] });
+    const service = makeService(FORCED_TIMEOUT_MS, pool);
+
+    // A stop was requested before the replay began (e.g. shutdown signal).
+    requestStopReplay();
+
+    await service.replayEvents({ ...REPLAY_REQUEST });
+
+    // Nothing was started: no lock held, no progress state, no DB work.
+    expect(replayLock.isHeld()).toBe(false);
+    expect(replayState.getState().isReplaying).toBe(false);
+    expect(queries.length).toBe(0);
+
+    // The stale stop flag was cleared so a subsequent replay can proceed.
+    expect(replayLock.isHeld()).toBe(false);
+    const { pool: pool2, queries: queries2 } = makePool({
+      count: 1,
+      batches: [[row('a')]],
+    });
+    const service2 = makeService(FORCED_TIMEOUT_MS, pool2);
+    await service2.replayEvents({ ...REPLAY_REQUEST });
+    expect(replayLock.isHeld()).toBe(false);
+    expect(queries2.some((q) => q.includes('completed_at = now()'))).toBe(true);
+  });
+
+  it('cancel during fetch (cooperative checkpoint): rolls back, releases lock, leaves cursor in-progress', async () => {
+    // Stop on the first fetch; the batch is rolled back before commit.
+    const { pool, queries } = makePool({
+      count: 3,
+      batches: [[row('a')], [row('b')], [row('c')]],
+      stopOnFetchNumber: 1,
+      hang: false,
+    });
+    const service = makeService(FORCED_TIMEOUT_MS, pool);
+
+    await service.replayEvents({ ...REPLAY_REQUEST });
+
+    // Lock released and progress cleared.
+    expect(replayLock.isHeld()).toBe(false);
+    expect(replayState.getState().isReplaying).toBe(false);
+    // The in-flight batch was NOT committed, so the cursor must remain
+    // in-progress (no completion marker) — a future run resumes safely.
+    expect(queries.some((q) => q.includes('completed_at = now()'))).toBe(false);
+    // The stop flag was cleared so the next run is not permanently blocked.
+    expect(replayLock.isHeld()).toBe(false);
+  });
+
+  it('cancel during fetch forced-timeout: force-unwinds a hung fetch and releases the lock', async () => {
+    // Stop requested mid-fetch and the fetch never resolves — the forced
+    // timeout must fire and unwind, releasing the indexer lock.
+    const { pool } = makePool({
+      count: 3,
+      batches: [[row('a')], [row('b')], [row('c')]],
+      stopOnFetchNumber: 1,
+      hang: true,
+    });
+    const service = makeService(FORCED_TIMEOUT_MS, pool);
+
+    await expect(service.replayEvents({ ...REPLAY_REQUEST })).rejects.toThrow(
+      ReplayForcedStopError,
+    );
+
+    // Even though the DB wait hung, the lock and lease are released.
+    expect(replayLock.isHeld()).toBe(false);
+    expect(replayState.getState().isReplaying).toBe(false);
+  });
+
+  it('cancel during commit forced-timeout: force-unwinds a hung commit and releases the lock', async () => {
+    // First batch fetches & would commit; the COMMIT hangs after a stop is
+    // requested mid-commit. The forced timeout must unwind and release the lock.
+    const { pool } = makePool({
+      count: 3,
+      batches: [[row('a')], [row('b')], [row('c')]],
+      stopOnCommit: true,
+      hang: true,
+    });
+    const service = makeService(FORCED_TIMEOUT_MS, pool);
+
+    await expect(service.replayEvents({ ...REPLAY_REQUEST })).rejects.toThrow(
+      ReplayForcedStopError,
+    );
+
+    expect(replayLock.isHeld()).toBe(false);
+    expect(replayState.getState().isReplaying).toBe(false);
+  });
+
+  it('cancels cleanly at a batch boundary (after a committed batch)', async () => {
+    // First batch commits; stop is requested on the *second* fetch so the loop
+    // top checkpoint breaks at a safe boundary.
+    const { pool, queries } = makePool({
+      count: 3,
+      batches: [[row('a')], [row('b')], [row('c')]],
+      stopOnFetchNumber: 2,
+      hang: false,
+    });
+    const service = makeService(FORCED_TIMEOUT_MS, pool);
+
+    await service.replayEvents({ ...REPLAY_REQUEST });
+
+    expect(replayLock.isHeld()).toBe(false);
+    expect(replayState.getState().isReplaying).toBe(false);
+    // The first batch was durably committed (offset advanced)…
+    expect(queries.some((q) => q.includes('last_committed_offset'))).toBe(true);
+    // …but the run as a whole was cancelled, so the cursor is NOT completed.
+    expect(queries.some((q) => q.includes('completed_at = now()'))).toBe(false);
+  });
+
+  it('after completion: lock released, progress cleared, and cursor marked complete', async () => {
+    const { pool, queries } = makePool({
+      count: 3,
+      batches: [[row('a')], [row('b')], [row('c')]],
+    });
+    const service = makeService(FORCED_TIMEOUT_MS, pool);
+
+    await service.replayEvents({ ...REPLAY_REQUEST });
+
+    expect(replayLock.isHeld()).toBe(false);
+    expect(replayState.getState().isReplaying).toBe(false);
+    // The run finished naturally, so the durable cursor is completed.
+    expect(queries.some((q) => q.includes('completed_at = now()'))).toBe(true);
   });
 });

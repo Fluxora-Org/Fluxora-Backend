@@ -41,7 +41,7 @@ Secret values are never included in validation messages.
 | `REQUEST_TIMEOUT_MS`              | integer ms, 1000-300000                        | `30000`                                                                                                  |
 | `LOG_LEVEL`                       | `debug`, `info`, `warn`, `error`               | `info`                                                                                                   |
 | `METRICS_ENABLED`                 | boolean                                        | `true`                                                                                                   |
-| `CORS_ALLOWED_ORIGINS`            | comma-separated origins                        | unset                                                                                                    |
+| `CORS_ALLOWED_ORIGINS`            | comma-separated exact origins                  | unset — denies all production origins                                                                     |
 | `TRACING_ENABLED`                 | boolean                                        | `false`                                                                                                  |
 | `TRACING_SAMPLE_RATE`             | number, 0-1                                    | `1`                                                                                                      |
 | `TRACING_OTEL_ENABLED`            | boolean                                        | `false`                                                                                                  |
@@ -60,6 +60,9 @@ Secret values are never included in validation messages.
 | `REQUIRE_ADMIN_AUTH`              | boolean                                        | `false`                                                                                                  |
 | `ADMIN_API_TOKEN`                 | string                                         | unset                                                                                                    |
 | `WS_AUTH_REQUIRED`                | boolean                                        | `false`                                                                                                  |
+| `WS_ALLOWED_ORIGINS`              | comma-separated origins                        | unset                                                                                                    |
+| `WS_RECONNECT_LIMIT`              | integer                                        | `20`                                                                                                     |
+| `WS_RECONNECT_WINDOW_MS`          | integer milliseconds                           | `60000`                                                                                                  |
 | `INDEXER_ENABLED`                 | boolean                                        | `false`                                                                                                  |
 | `WORKER_ENABLED`                  | boolean                                        | `false`                                                                                                  |
 | `INDEXER_STALL_THRESHOLD_MS`      | integer ms, minimum 1000                       | `300000`                                                                                                 |
@@ -70,6 +73,10 @@ Secret values are never included in validation messages.
 | `RPC_CB_WINDOW_MS`                | integer ms                                     | `30000`                                                                                                  |
 | `RPC_CB_RESET_TIMEOUT_MS`         | integer ms                                     | `60000`                                                                                                  |
 | `RPC_TIMEOUT_MS`                  | integer ms                                     | `5000`                                                                                                   |
+| `RPC_FALLBACK_CACHE_TTL_SECONDS`  | integer seconds, minimum 1                     | `300`                                                                                                    |
+| `RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA` | number, minimum 0                         | `0` (disabled)                                                                                            |
+| `RPC_HEALTH_CHECK_INTERVAL_MS`    | integer ms, minimum 0                          | `0` (disabled)                                                                                            |
+| `RPC_HEALTH_CHECK_FAILURE_THRESHOLD` | integer, minimum 1                         | `3`                                                                                                      |
 | `RATE_LIMIT_ENABLED`              | boolean                                        | `true`                                                                                                   |
 | `RATE_LIMIT_IP_WINDOW_MS`         | integer ms                                     | route default                                                                                            |
 | `RATE_LIMIT_IP_MAX`               | integer                                        | route default                                                                                            |
@@ -78,12 +85,20 @@ Secret values are never included in validation messages.
 | `RATE_LIMIT_ADMIN_WINDOW_MS`      | integer ms                                     | route default                                                                                            |
 | `RATE_LIMIT_ADMIN_MAX`            | integer                                        | route default                                                                                            |
 | `RATE_LIMIT_TRUST_PROXY`          | boolean                                        | `true`                                                                                                   |
+| `TRUSTED_PROXY_COUNT`             | integer (hop count)                            | `0`                                                                                                      |
+| `TRUSTED_PROXIES`                 | comma-separated IPs                            | unset                                                                                                    |
+| `WS_TRUSTED_PROXIES`              | comma-separated IPs                            | unset                                                                                                    |
 | `RATE_LIMIT_ALLOWLIST_IPS`        | comma-separated IPs                            | unset                                                                                                    |
 | `AWS_REGION`                      | string                                         | unset                                                                                                    |
 | `AWS_DEFAULT_REGION`              | string                                         | unset                                                                                                    |
 | `FLUXORA_SHUTDOWN`                | boolean                                        | unset; internal graceful shutdown flag                                                                   |
 
 Booleans accept `true`, `false`, `1`, and `0`.
+
+Connection-pool sizes, acquisition/statement timeouts and retry budgets for
+PostgreSQL, Redis and the Stellar RPC endpoint are collected in
+[connection-limits.md](./connection-limits.md), which is checked against
+`EnvSchema` by `src/config/connectionLimits.test.ts`.
 
 ## Feature Flags
 

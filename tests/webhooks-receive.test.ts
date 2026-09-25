@@ -174,10 +174,73 @@ describe('POST /internal/webhooks/receive', () => {
         'x-fluxora-timestamp': now,
         'x-fluxora-signature': sig,
         'x-fluxora-event': 'stream.created',
-        'Content-Type': 'application/octet-stream',
+        'Content-Type': 'application/json',
       })
       .send(oversizedBody);
 
     expect(res.status).toBe(413);
+  });
+
+  it('rejects deeply nested json (400)', async () => {
+    // MAX_JSON_DEPTH is 32
+    const depth = 33;
+    const deeplyNested = '{'.repeat(depth) + '}' + '}'.repeat(depth - 1);
+    const now = Math.floor(Date.now() / 1000).toString();
+    const sig = computeWebhookSignature(SECRET, now, deeplyNested);
+
+    const res = await request(app)
+      .post(ENDPOINT)
+      .set({
+        'x-fluxora-delivery-id': 'deliv-deep',
+        'x-fluxora-timestamp': now,
+        'x-fluxora-signature': sig,
+        'x-fluxora-event': 'stream.created',
+        'Content-Type': 'application/json',
+      })
+      .send(deeplyNested);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('payload_too_deep');
+  });
+
+  it('rejects invalid encoding (400)', async () => {
+    // Generate an invalid utf-8 byte sequence
+    const invalidBody = Buffer.from([0xFF, 0xFE, 0xFD]);
+    const now = Math.floor(Date.now() / 1000).toString();
+    const sig = computeWebhookSignature(SECRET, now, invalidBody);
+
+    const res = await request(app)
+      .post(ENDPOINT)
+      .set({
+        'x-fluxora-delivery-id': 'deliv-encoding',
+        'x-fluxora-timestamp': now,
+        'x-fluxora-signature': sig,
+        'x-fluxora-event': 'stream.created',
+        'Content-Type': 'application/json',
+      })
+      // supertest/superagent JSON-serializes non-string `.send()` payloads
+      // once a `Content-Type: application/json` header is set (even Buffers),
+      // which would silently mangle these raw invalid-UTF-8 bytes into
+      // `{"type":"Buffer","data":[...]}` before it reaches the server. A
+      // no-op serializer keeps the exact byte sequence we signed on the wire.
+      .serialize((data) => data)
+      .send(invalidBody);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_encoding');
+  });
+
+  it('rejects missing or non-json content-type (415)', async () => {
+    const { body, headers } = makeHeaders();
+    delete (headers as any)['Content-Type'];
+
+    const res = await request(app)
+      .post(ENDPOINT)
+      .set(headers)
+      .set('Content-Type', 'text/plain')
+      .send(body);
+
+    expect(res.status).toBe(415);
+    expect(res.body.error).toBe('unsupported_media_type');
   });
 });

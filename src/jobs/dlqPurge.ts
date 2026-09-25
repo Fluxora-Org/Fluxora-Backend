@@ -63,6 +63,8 @@ const DEFAULT_BATCH_SIZE = 500;
 
 /** Fallback retention days when the env var is absent (belt-and-suspenders). */
 const DEFAULT_RETENTION_DAYS = 30;
+/** Hard upper bound preventing an accidental all-history purge. */
+export const MAX_RETENTION_DAYS = 365;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -95,6 +97,12 @@ export interface DlqPurgeOptions {
    * Useful for tying job audit events to a scheduled-job trace.
    */
   correlationId?: string;
+
+  /** Restrict the operation to one tenant. Unscoped runs only see legacy NULL-tenant rows. */
+  tenantId?: string;
+
+  /** Count eligible rows without deleting them. */
+  dryRun?: boolean;
 }
 
 /**
@@ -113,6 +121,7 @@ export interface DlqPurgeResult {
   retentionDays: number;
   /** Batch size that was used. */
   batchSize: number;
+  dryRun: boolean;
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -141,6 +150,8 @@ export async function runDlqPurge(
     retentionDays = config.dlq.retentionDays || DEFAULT_RETENTION_DAYS,
     now = new Date(),
     correlationId,
+    tenantId,
+    dryRun = false,
   } = options;
 
   const startedAt = new Date().toISOString();
@@ -155,7 +166,11 @@ export async function runDlqPurge(
       cutoffDate: now.toISOString(),
       retentionDays,
       batchSize,
+      dryRun,
     };
+  }
+  if (!Number.isFinite(retentionDays) || retentionDays > MAX_RETENTION_DAYS) {
+    throw new RangeError(`retentionDays must be a finite number between 0 and ${MAX_RETENTION_DAYS}`);
   }
 
   const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
@@ -170,7 +185,7 @@ export async function runDlqPurge(
   // ── Execute purge ───────────────────────────────────────────────────────
   let rowsPurged: number;
   try {
-    rowsPurged = await dlqRepository.purgeTerminalEntries(batchSize, cutoffDate);
+    rowsPurged = await dlqRepository.purgeTerminalEntries(batchSize, cutoffDate, { tenantId, dryRun });
   } catch (err) {
     logger.error('DLQ retention purge: repository call failed', correlationId, {
       cutoffDate,
@@ -183,7 +198,7 @@ export async function runDlqPurge(
   const finishedAt = new Date().toISOString();
 
   // ── Audit (only when rows were actually deleted) ────────────────────────
-  if (rowsPurged > 0) {
+  if (rowsPurged > 0 && !dryRun) {
     recordAuditEvent(
       'DLQ_RETENTION_PURGED',
       'dead_letter_queue',
@@ -194,6 +209,8 @@ export async function runDlqPurge(
         cutoffDate,
         retentionDays,
         batchSize,
+        tenantId,
+        dryRun,
       },
     );
   }
@@ -205,6 +222,7 @@ export async function runDlqPurge(
     cutoffDate,
     retentionDays,
     batchSize,
+    dryRun,
   };
 
   logger.info('DLQ retention purge complete', correlationId, { ...summary });

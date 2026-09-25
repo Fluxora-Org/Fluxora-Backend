@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ApiError, serviceUnavailable, unauthorizedError } from '../src/errors.js';
+import { ApiError, serviceUnavailable, unauthorized, ApiErrorCode } from '../src/errors.js';
 
 describe('src/errors.ts', () => {
   describe('ApiError', () => {
@@ -27,21 +27,20 @@ describe('src/errors.ts', () => {
 
   describe('serviceUnavailable', () => {
     it('returns a 503 ApiError', () => {
-      const err = serviceUnavailable('DB is down', { retryAfter: 30 });
+      const err = serviceUnavailable('DB is down');
       expect(err).toBeInstanceOf(ApiError);
       expect(err.statusCode).toBe(503);
-      expect(err.code).toBe('service_unavailable');
+      expect(err.code).toBe(ApiErrorCode.SERVICE_UNAVAILABLE);
       expect(err.message).toBe('DB is down');
-      expect(err.details).toEqual({ retryAfter: 30 });
     });
   });
 
-  describe('unauthorizedError', () => {
+  describe('unauthorized', () => {
     it('returns a 401 ApiError', () => {
-      const err = unauthorizedError('Invalid token');
+      const err = unauthorized('Invalid token');
       expect(err).toBeInstanceOf(ApiError);
       expect(err.statusCode).toBe(401);
-      expect(err.code).toBe('unauthorized');
+      expect(err.code).toBe(ApiErrorCode.UNAUTHORIZED);
       expect(err.message).toBe('Invalid token');
     });
   });

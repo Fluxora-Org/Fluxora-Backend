@@ -1,14 +1,19 @@
 import { type Pool } from 'pg';
 import { PgBoss } from 'pg-boss';
-import type {
-  ConstructorOptions,
-  Job,
-} from 'pg-boss';
+import type { ConstructorOptions, Job } from 'pg-boss';
 import { logger } from '../lib/logger.js';
 import { resolvePoolConfig } from '../db/pool.js';
 import { runPartitionMaintenance } from './partitionMaintenance.js';
 import { runDlqPurge } from './dlqPurge.js';
+import { runRetentionPurge } from './retentionPurge.js';
 import { jobDlqEntriesTotal } from '../metrics/businessMetrics.js';
+import {
+  configureBackgroundJob,
+  recordBackgroundJobFailure,
+  recordBackgroundJobSuccess,
+} from '../metrics/jobMetrics.js';
+import { getCorrelationId, correlationStore } from '../tracing/middleware.js';
+import { traceSpan } from '../tracing/hooks.js';
 
 // ── Retry / expiry defaults ───────────────────────────────────────────────────
 //
@@ -41,6 +46,8 @@ export const DEFAULT_RETRY_BACKOFF = true;
  */
 export const DEFAULT_EXPIRE_SECONDS = 900; // 15 minutes
 
+export const BACKGROUND_JOB_INTERVAL_SECONDS = 24 * 60 * 60;
+
 // ── Internal types ────────────────────────────────────────────────────────────
 
 /**
@@ -56,7 +63,10 @@ interface DlqJobPayload {
   /** Original job ID (UUID). */
   id?: unknown;
   /** Application‑level data the job was created with. */
-  data?: unknown;
+  data?: {
+    correlationId?: string;
+    payload: unknown;
+  };
   /**
    * Error output captured when the job exceeded its retry limit.
    * May be a plain string, an `{ message: string }` object, or arbitrary JSON.
@@ -112,6 +122,7 @@ export interface JobRegistrationOptions {
   deadLetter?: string;
   pollingIntervalSeconds?: number;
   localConcurrency?: number;
+  expectedIntervalSeconds?: number;
 }
 
 /**
@@ -214,6 +225,12 @@ export class JobQueue {
     if (typeof handler !== 'function') {
       throw new TypeError('register: handler must be a function');
     }
+    if (options.expectedIntervalSeconds !== undefined) {
+      configureBackgroundJob(
+        name as Parameters<typeof configureBackgroundJob>[0],
+        options.expectedIntervalSeconds
+      );
+    }
     this.handlers.set(name, { handler, options });
   }
 
@@ -228,19 +245,56 @@ export class JobQueue {
     await this.boss.start();
     for (const [name, reg] of this.handlers) {
       const workOpts: Record<string, unknown> = {};
-      if (reg.options.localConcurrency !== undefined) workOpts.localConcurrency = reg.options.localConcurrency;
-      if (reg.options.pollingIntervalSeconds !== undefined) workOpts.pollingIntervalSeconds = reg.options.pollingIntervalSeconds;
+      if (reg.options.localConcurrency !== undefined)
+        workOpts.localConcurrency = reg.options.localConcurrency;
+      if (reg.options.pollingIntervalSeconds !== undefined)
+        workOpts.pollingIntervalSeconds = reg.options.pollingIntervalSeconds;
       await this.boss.work(name, workOpts, async (jobs: Job[]) => {
         for (const job of jobs) {
+          const startedAt = process.hrtime.bigint();
+          let correlationId = job.id;
+          let jobData = job.data;
+
+          if (jobData && typeof jobData === 'object' && '__payload' in jobData) {
+            if (
+              '__correlationId' in jobData &&
+              typeof (jobData as any).__correlationId === 'string'
+            ) {
+              correlationId = (jobData as any).__correlationId;
+            }
+            jobData = (jobData as any).__payload;
+          }
+
           try {
-            const ctx: JobHandlerContext = { id: job.id, name, data: job.data };
-            await reg.handler(ctx);
-          } catch (err) {
-            logger.error('Job handler failed', undefined, {
-              jobName: name,
-              jobId: job.id,
-              error: err instanceof Error ? err.message : String(err),
+            const ctx: JobHandlerContext = { id: job.id, name, data: jobData };
+            await correlationStore.run(correlationId, async () => {
+              await traceSpan(
+                'job.process',
+                correlationId,
+                { 'job.name': name, 'job.id': job.id },
+                async () => {
+                  await reg.handler(ctx);
+                }
+              );
             });
+            recordBackgroundJobSuccess(
+              name as Parameters<typeof recordBackgroundJobSuccess>[0],
+              Number(process.hrtime.bigint() - startedAt) / 1_000_000_000
+            );
+          } catch (err) {
+            recordBackgroundJobFailure(
+              name as Parameters<typeof recordBackgroundJobFailure>[0],
+              Number(process.hrtime.bigint() - startedAt) / 1_000_000_000
+            );
+            logger.error(
+              'Job handler failed',
+              correlationId !== 'unknown' ? correlationId : undefined,
+              {
+                jobName: name,
+                jobId: job.id,
+                error: err instanceof Error ? err.message : String(err),
+              }
+            );
             throw err;
           }
         }
@@ -285,7 +339,12 @@ export class JobQueue {
       throw new TypeError('send: name must be a non-empty string');
     }
     const sendOpts = this.toSendOptions(options);
-    return this.boss.send(name, data as object | null, sendOpts);
+
+    let correlationId = getCorrelationId();
+    if (correlationId === 'unknown') correlationId = '';
+    const wrappedData = correlationId ? { __payload: data, __correlationId: correlationId } : data;
+
+    return this.boss.send(name, wrappedData as object | null, sendOpts);
   }
 
   /**
@@ -299,7 +358,12 @@ export class JobQueue {
    * The job will be executed according to the cron schedule. If the job throws,
    * pg‑boss will apply the retry configuration before eventually moving it to the dead‑letter queue.
    */
-  async schedule(name: string, cron: string, data?: unknown, options?: JobScheduleOptions): Promise<void> {
+  async schedule(
+    name: string,
+    cron: string,
+    data?: unknown,
+    options?: JobScheduleOptions
+  ): Promise<void> {
     if (typeof name !== 'string' || name.trim() === '') {
       throw new TypeError('schedule: name must be a non-empty string');
     }
@@ -311,7 +375,14 @@ export class JobQueue {
       ...(options?.tz ? { tz: options.tz } : {}),
       ...(options?.key ? { key: options.key } : {}),
     };
-    return this.boss.schedule(name, cron, (data ?? null) as object | null, schedOpts);
+
+    let correlationId = getCorrelationId();
+    if (correlationId === 'unknown') correlationId = '';
+    const wrappedData = correlationId
+      ? { __payload: data ?? null, __correlationId: correlationId }
+      : (data ?? null);
+
+    return this.boss.schedule(name, cron, wrappedData as object | null, schedOpts);
   }
 
   /**
@@ -327,29 +398,56 @@ export class JobQueue {
    * Maps the supplied options to pg‑boss configuration keys.
    */
   private toSendOptions(opts?: JobSendOptions): Record<string, unknown> {
-    const s: Record<string, unknown> = {};
+    // ── Invariant: no-loss under worker crash ──────────────────────────────
+    // Every job sent through this queue MUST carry an expireInSeconds value so
+    // pg-boss can move a job from `active` back to `failed` (and subsequently
+    // retry it) when the worker that locked it disappears.  Without this cap a
+    // crashed worker leaves the job in `active` forever and it is silently lost.
+    //
+    // We apply DEFAULT_EXPIRE_SECONDS when the caller omits expireInSeconds,
+    // rather than leaving the field absent.  Callers that need a different
+    // window can still supply their own value; this only acts as a safety net.
+    const s: Record<string, unknown> = {
+      expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+    };
     if (!opts) return s;
     if (opts.retryLimit !== undefined) {
-      if (typeof opts.retryLimit !== 'number' || !Number.isFinite(opts.retryLimit) || opts.retryLimit < 0) {
+      if (
+        typeof opts.retryLimit !== 'number' ||
+        !Number.isFinite(opts.retryLimit) ||
+        opts.retryLimit < 0
+      ) {
         throw new TypeError('toSendOptions: retryLimit must be a non-negative finite number');
       }
       s.retryLimit = opts.retryLimit;
     }
     if (opts.retryDelay !== undefined) {
-      if (typeof opts.retryDelay !== 'number' || !Number.isFinite(opts.retryDelay) || opts.retryDelay < 0) {
+      if (
+        typeof opts.retryDelay !== 'number' ||
+        !Number.isFinite(opts.retryDelay) ||
+        opts.retryDelay < 0
+      ) {
         throw new TypeError('toSendOptions: retryDelay must be a non-negative finite number');
       }
       s.retryDelay = opts.retryDelay;
     }
     if (opts.retryBackoff !== undefined) s.retryBackoff = opts.retryBackoff;
     if (opts.retryDelayMax !== undefined) {
-      if (typeof opts.retryDelayMax !== 'number' || !Number.isFinite(opts.retryDelayMax) || opts.retryDelayMax < 0) {
+      if (
+        typeof opts.retryDelayMax !== 'number' ||
+        !Number.isFinite(opts.retryDelayMax) ||
+        opts.retryDelayMax < 0
+      ) {
         throw new TypeError('toSendOptions: retryDelayMax must be a non-negative finite number');
       }
       s.retryDelayMax = opts.retryDelayMax;
     }
     if (opts.expireInSeconds !== undefined) {
-      if (typeof opts.expireInSeconds !== 'number' || !Number.isFinite(opts.expireInSeconds) || opts.expireInSeconds < 0) {
+      if (
+        typeof opts.expireInSeconds !== 'number' ||
+        !Number.isFinite(opts.expireInSeconds) ||
+        opts.expireInSeconds < 0
+      ) {
         throw new TypeError('toSendOptions: expireInSeconds must be a non-negative finite number');
       }
       s.expireInSeconds = opts.expireInSeconds;
@@ -363,7 +461,11 @@ export class JobQueue {
     if (opts.startAfter !== undefined) s.startAfter = opts.startAfter;
     if (opts.singletonKey !== undefined) s.singletonKey = opts.singletonKey;
     if (opts.singletonSeconds !== undefined) {
-      if (typeof opts.singletonSeconds !== 'number' || !Number.isFinite(opts.singletonSeconds) || opts.singletonSeconds < 0) {
+      if (
+        typeof opts.singletonSeconds !== 'number' ||
+        !Number.isFinite(opts.singletonSeconds) ||
+        opts.singletonSeconds < 0
+      ) {
         throw new TypeError('toSendOptions: singletonSeconds must be a non-negative finite number');
       }
       s.singletonSeconds = opts.singletonSeconds;
@@ -462,6 +564,8 @@ export function startBackgroundJobs(pool: Pool): void {
   }
   const queue = new JobQueue(pool);
   setJobQueue(queue);
+  configureBackgroundJob('queue', 5 * 60);
+  recordBackgroundJobSuccess('queue', 0);
 
   queue.register(
     'partition-maintenance',
@@ -477,32 +581,41 @@ export function startBackgroundJobs(pool: Pool): void {
           behindSchedule: t.behindSchedule,
         })),
       });
+    },
+    {
+      retryLimit: DEFAULT_RETRY_LIMIT,
+      retryDelay: DEFAULT_RETRY_DELAY,
+      retryBackoff: DEFAULT_RETRY_BACKOFF,
+      expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+      deadLetter: DEAD_LETTER_QUEUE,
+      expectedIntervalSeconds: BACKGROUND_JOB_INTERVAL_SECONDS,
+    }
+  );
 
-      // Purge expired dead‑letter entries alongside the daily maintenance
-      // to keep the DLQ table size bounded without a dedicated cron.
-      try {
-        const deleted = await purgeJobDeadLetter(pool, DEFAULT_DLQ_RETENTION_DAYS);
-        if (deleted > 0) {
-          logger.info('DLQ retention purge removed entries', ctx.id, { deletedCount: deleted });
-        }
-      } catch (dlqErr) {
-        logger.error('DLQ retention purge failed, continuing', ctx.id, {
-          error: dlqErr instanceof Error ? dlqErr.message : String(dlqErr),
-        });
-      }
+  queue.register(
+    'retention-purge',
+    async (ctx) => {
+      await runRetentionPurge({ correlationId: ctx.id });
+    },
+    {
+      retryLimit: DEFAULT_RETRY_LIMIT,
+      retryDelay: DEFAULT_RETRY_DELAY,
+      retryBackoff: DEFAULT_RETRY_BACKOFF,
+      expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+      deadLetter: DEAD_LETTER_QUEUE,
+      expectedIntervalSeconds: BACKGROUND_JOB_INTERVAL_SECONDS,
+    }
+  );
 
-      // Purge terminal-state dead_letter_queue entries beyond retention window.
-      try {
-        const dlqResult = await runDlqPurge({ correlationId: ctx.id });
-        if (dlqResult.rowsPurged > 0) {
-          logger.info('DLQ retention purge: cleared terminal dead_letter_queue entries', ctx.id, {
-            rowsPurged: dlqResult.rowsPurged,
-            cutoffDate: dlqResult.cutoffDate,
-          });
-        }
-      } catch (dlqPurgeErr) {
-        logger.error('DLQ retention purge of dead_letter_queue failed, continuing', ctx.id, {
-          error: dlqPurgeErr instanceof Error ? dlqPurgeErr.message : String(dlqPurgeErr),
+  queue.register(
+    'dead-letter-purge',
+    async (ctx) => {
+      const deleted = await purgeJobDeadLetter(pool, DEFAULT_DLQ_RETENTION_DAYS);
+      const dlqResult = await runDlqPurge({ correlationId: ctx.id });
+      if (deleted > 0 || dlqResult.rowsPurged > 0) {
+        logger.info('Dead-letter purge removed entries', ctx.id, {
+          jobDeadLetterDeleted: deleted,
+          deadLetterQueueDeleted: dlqResult.rowsPurged,
         });
       }
     },
@@ -512,98 +625,96 @@ export function startBackgroundJobs(pool: Pool): void {
       retryBackoff: DEFAULT_RETRY_BACKOFF,
       expireInSeconds: DEFAULT_EXPIRE_SECONDS,
       deadLetter: DEAD_LETTER_QUEUE,
-    },
+      expectedIntervalSeconds: BACKGROUND_JOB_INTERVAL_SECONDS,
+    }
   );
 
-  queue.register(
-    DEAD_LETTER_QUEUE,
-    async (ctx) => {
-      // pg-boss delivers the original job's metadata as ctx.data when routing
-      // to a dead-letter queue.  We use the DlqJobPayload interface to make
-      // the extraction explicit and type-safe rather than casting to `any`.
-      const payload: DlqJobPayload =
-        ctx.data !== null && typeof ctx.data === 'object'
-          ? (ctx.data as DlqJobPayload)
-          : {};
+  queue.register(DEAD_LETTER_QUEUE, async (ctx) => {
+    // pg-boss delivers the original job's metadata as ctx.data when routing
+    // to a dead-letter queue.  We use the DlqJobPayload interface to make
+    // the extraction explicit and type-safe rather than casting to `any`.
+    const payload: DlqJobPayload =
+      ctx.data !== null && typeof ctx.data === 'object' ? (ctx.data as DlqJobPayload) : {};
 
-      // Use nullish coalescing (??) so that an explicit empty-string value
-      // from pg-boss is preserved rather than being coerced to 'unknown' the
-      // way the || operator would behave.
-      const originalJobName =
-        typeof payload.name === 'string' && payload.name !== '' ? payload.name : 'unknown';
-      const originalJobId =
-        typeof payload.id === 'string' && payload.id !== '' ? payload.id : 'unknown';
-      const originalPayload = payload.data ?? null;
+    // Use nullish coalescing (??) so that an explicit empty-string value
+    // from pg-boss is preserved rather than being coerced to 'unknown' the
+    // way the || operator would behave.
+    const originalJobName =
+      typeof payload.name === 'string' && payload.name !== '' ? payload.name : 'unknown';
+    const originalJobId =
+      typeof payload.id === 'string' && payload.id !== '' ? payload.id : 'unknown';
+    let originalPayload = payload.data ?? null;
+    if (originalPayload && typeof originalPayload === 'object' && '__payload' in originalPayload) {
+      originalPayload = (originalPayload as any).__payload;
+    }
 
-      let errorMessage = 'Unknown error';
-      if (payload.output !== undefined && payload.output !== null) {
-        if (typeof payload.output === 'string') {
-          errorMessage = payload.output;
-        } else if (
-          typeof payload.output === 'object' &&
-          'message' in payload.output &&
-          typeof (payload.output as Record<string, unknown>).message === 'string'
-        ) {
-          errorMessage = (payload.output as Record<string, unknown>).message as string;
-        } else {
-          errorMessage = JSON.stringify(payload.output);
-        }
+    let errorMessage = 'Unknown error';
+    if (payload.output !== undefined && payload.output !== null) {
+      if (typeof payload.output === 'string') {
+        errorMessage = payload.output;
+      } else if (
+        typeof payload.output === 'object' &&
+        'message' in payload.output &&
+        typeof (payload.output as Record<string, unknown>).message === 'string'
+      ) {
+        errorMessage = (payload.output as Record<string, unknown>).message as string;
+      } else {
+        errorMessage = JSON.stringify(payload.output);
       }
+    }
 
-      // Normalise retrycount / retryCount: both keys must be coerced to a
-      // number, and we default to 0 only when both are absent or non-numeric.
-      // We use ?? (not ||) so that a legitimate value of 0 is not discarded.
-      const rawRetry = payload.retrycount ?? payload.retryCount;
-      const retryCount =
-        typeof rawRetry === 'number' && Number.isFinite(rawRetry) ? rawRetry : 0;
+    // Normalise retrycount / retryCount: both keys must be coerced to a
+    // number, and we default to 0 only when both are absent or non-numeric.
+    // We use ?? (not ||) so that a legitimate value of 0 is not discarded.
+    const rawRetry = payload.retrycount ?? payload.retryCount;
+    const retryCount = typeof rawRetry === 'number' && Number.isFinite(rawRetry) ? rawRetry : 0;
 
-      logger.error('Job permanently failed and moved to DLQ', ctx.id, {
-        jobName: originalJobName,
-        jobId: originalJobId,
-        retryCount,
-        error: errorMessage,
-      });
+    logger.error('Job permanently failed and moved to DLQ', ctx.id, {
+      jobName: originalJobName,
+      jobId: originalJobId,
+      retryCount,
+      error: errorMessage,
+    });
 
-      // Apply size budgets before persisting, so oversized entries don't
-      // cause INSERT failures or bloat the dead‑letter table.
-      const finalErrorMessage = truncateUtf8(errorMessage, DLQ_MAX_ERROR_BYTES);
+    // Apply size budgets before persisting, so oversized entries don't
+    // cause INSERT failures or bloat the dead‑letter table.
+    const finalErrorMessage = truncateUtf8(errorMessage, DLQ_MAX_ERROR_BYTES);
 
-      let finalPayload: unknown = originalPayload;
-      if (finalPayload !== null) {
-        try {
-          const payloadJson = JSON.stringify(finalPayload);
-          if (Buffer.byteLength(payloadJson, 'utf-8') > DLQ_MAX_PAYLOAD_BYTES) {
-            finalPayload = { _truncated: true };
-          }
-        } catch {
+    let finalPayload: unknown = originalPayload;
+    if (finalPayload !== null) {
+      try {
+        const payloadJson = JSON.stringify(finalPayload);
+        if (Buffer.byteLength(payloadJson, 'utf-8') > DLQ_MAX_PAYLOAD_BYTES) {
           finalPayload = { _truncated: true };
         }
+      } catch {
+        finalPayload = { _truncated: true };
       }
+    }
 
-      // Increment the observable counter so on-call can alert on DLQ growth.
-      jobDlqEntriesTotal.inc({ job_name: originalJobName });
+    // Increment the observable counter so on-call can alert on DLQ growth.
+    jobDlqEntriesTotal.inc({ job_name: originalJobName });
 
-      // Persist to job_dead_letter.  Wrap in try/catch so that a transient DB
-      // failure does NOT cause pg-boss to requeue this DLQ entry (which would
-      // create a confusing retry loop on a terminal event).
-      try {
-        await pool.query(
-          `INSERT INTO job_dead_letter (job_name, job_id, payload, error_message, retry_count)
+    // Persist to job_dead_letter.  Wrap in try/catch so that a transient DB
+    // failure does NOT cause pg-boss to requeue this DLQ entry (which would
+    // create a confusing retry loop on a terminal event).
+    try {
+      await pool.query(
+        `INSERT INTO job_dead_letter (job_name, job_id, payload, error_message, retry_count)
            VALUES ($1, $2, $3, $4, $5)`,
-          [originalJobName, originalJobId, finalPayload, finalErrorMessage, retryCount],
-        );
-      } catch (insertErr) {
-        // Log but do not re-throw: the job is terminally failed.  A failed
-        // DLQ insert is surfaced via the error log and the metric above; the
-        // pg-boss job itself will still be marked as completed (not retried).
-        logger.error('Failed to persist DLQ entry to job_dead_letter', ctx.id, {
-          jobName: originalJobName,
-          jobId: originalJobId,
-          error: insertErr instanceof Error ? insertErr.message : String(insertErr),
-        });
-      }
-    },
-  );
+        [originalJobName, originalJobId, finalPayload, finalErrorMessage, retryCount]
+      );
+    } catch (insertErr) {
+      // Log but do not re-throw: the job is terminally failed.  A failed
+      // DLQ insert is surfaced via the error log and the metric above; the
+      // pg-boss job itself will still be marked as completed (not retried).
+      logger.error('Failed to persist DLQ entry to job_dead_letter', ctx.id, {
+        jobName: originalJobName,
+        jobId: originalJobId,
+        error: insertErr instanceof Error ? insertErr.message : String(insertErr),
+      });
+    }
+  });
 
   queue.start().catch((err: Error) => {
     logger.error('Failed to start job queue', undefined, { error: err.message });
@@ -619,15 +730,79 @@ export function startBackgroundJobs(pool: Pool): void {
       logger.error('Failed to schedule partition maintenance', undefined, { error: err.message });
     });
 
-  queue.send('partition-maintenance', {}, {
-    retryLimit: DEFAULT_RETRY_LIMIT,
-    retryDelay: DEFAULT_RETRY_DELAY,
-    retryBackoff: DEFAULT_RETRY_BACKOFF,
-    expireInSeconds: DEFAULT_EXPIRE_SECONDS,
-    deadLetter: DEAD_LETTER_QUEUE,
-  }).catch((err: Error) => {
-    logger.error('Failed to enqueue startup partition maintenance', undefined, { error: err.message });
-  });
+  queue
+    .schedule('retention-purge', '30 0 * * *', undefined, {
+      retryLimit: DEFAULT_RETRY_LIMIT,
+      retryDelay: DEFAULT_RETRY_DELAY,
+      retryBackoff: DEFAULT_RETRY_BACKOFF,
+    })
+    .catch((err: Error) => {
+      logger.error('Failed to schedule retention purge', undefined, { error: err.message });
+    });
+
+  queue
+    .schedule('dead-letter-purge', '0 1 * * *', undefined, {
+      retryLimit: DEFAULT_RETRY_LIMIT,
+      retryDelay: DEFAULT_RETRY_DELAY,
+      retryBackoff: DEFAULT_RETRY_BACKOFF,
+    })
+    .catch((err: Error) => {
+      logger.error('Failed to schedule dead-letter purge', undefined, { error: err.message });
+    });
+
+  queue
+    .send(
+      'partition-maintenance',
+      {},
+      {
+        retryLimit: DEFAULT_RETRY_LIMIT,
+        retryDelay: DEFAULT_RETRY_DELAY,
+        retryBackoff: DEFAULT_RETRY_BACKOFF,
+        expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+        deadLetter: DEAD_LETTER_QUEUE,
+      }
+    )
+    .catch((err: Error) => {
+      logger.error('Failed to enqueue startup partition maintenance', undefined, {
+        error: err.message,
+      });
+    });
+
+  queue
+    .send(
+      'retention-purge',
+      {},
+      {
+        retryLimit: DEFAULT_RETRY_LIMIT,
+        retryDelay: DEFAULT_RETRY_DELAY,
+        retryBackoff: DEFAULT_RETRY_BACKOFF,
+        expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+        deadLetter: DEAD_LETTER_QUEUE,
+      }
+    )
+    .catch((err: Error) => {
+      logger.error('Failed to enqueue startup retention purge', undefined, {
+        error: err.message,
+      });
+    });
+
+  queue
+    .send(
+      'dead-letter-purge',
+      {},
+      {
+        retryLimit: DEFAULT_RETRY_LIMIT,
+        retryDelay: DEFAULT_RETRY_DELAY,
+        retryBackoff: DEFAULT_RETRY_BACKOFF,
+        expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+        deadLetter: DEAD_LETTER_QUEUE,
+      }
+    )
+    .catch((err: Error) => {
+      logger.error('Failed to enqueue startup dead-letter purge', undefined, {
+        error: err.message,
+      });
+    });
 }
 
 /**
@@ -675,7 +850,7 @@ export async function stopBackgroundJobs(): Promise<void> {
  */
 export async function purgeJobDeadLetter(
   pool: Pool,
-  retentionDays: number = DEFAULT_DLQ_RETENTION_DAYS,
+  retentionDays: number = DEFAULT_DLQ_RETENTION_DAYS
 ): Promise<number> {
   if (pool == null) {
     throw new Error('purgeJobDeadLetter requires a valid PostgreSQL pool');
@@ -686,7 +861,7 @@ export async function purgeJobDeadLetter(
 
   const result = await pool.query(
     `DELETE FROM job_dead_letter WHERE failed_at < NOW() - INTERVAL '1 day' * $1`,
-    [retentionDays],
+    [retentionDays]
   );
 
   const deletedCount = result.rowCount ?? 0;

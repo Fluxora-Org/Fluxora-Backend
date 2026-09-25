@@ -5,23 +5,26 @@ import request from 'supertest';
 import { vi } from 'vitest';
 import { WebSocket } from 'ws';
 
-vi.mock('../src/ws/messageHandler', () => ({
-  isValidStellarPublicKey: (value: string) => value.startsWith('G'),
-  parseHandshakeSubscriptionFilter: () => ({ ok: true, filter: null }),
-  parseWsClientMessage: (message: { type?: string; streamId?: string; stream_id?: string }) => {
-    if (message.type === 'subscribe' || message.type === 'unsubscribe') {
-      return {
-        ok: true,
-        message: {
-          type: message.type,
-          filter: { streamId: message.streamId ?? message.stream_id },
-        },
-      };
-    }
-
-    return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${message.type}` };
-  },
-}));
+vi.mock('../src/ws/messageHandler', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/ws/messageHandler')>();
+  return {
+    ...actual,
+    isValidStellarPublicKey: (value: string) => value.startsWith('G'),
+    parseHandshakeSubscriptionFilter: () => ({ ok: true, filter: null }),
+    parseWsClientMessage: (message: { type?: string; streamId?: string; stream_id?: string }) => {
+      if (message.type === 'subscribe' || message.type === 'unsubscribe') {
+        return {
+          ok: true,
+          message: {
+            type: message.type,
+            filter: { streamId: message.streamId ?? message.stream_id },
+          },
+        };
+      }
+      return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${message.type}` };
+    },
+  };
+});
 
 import {
   correlationIdMiddleware,
@@ -373,6 +376,7 @@ describe('correlation ID propagation across transports', () => {
 
   it('attaches the initiating correlation ID to websocket broadcast events', async () => {
     const { server: wsServer, hub, port: wsPort } = await setupWs();
+    vi.spyOn(hub as any, 'authorizeSubscriptionFilter').mockResolvedValue({ ok: true, filter: { streamId: 'stream-1' } });
 
     try {
       const clientCorrelationId = '123e4567-e89b-12d3-a456-426614174001';
@@ -471,5 +475,49 @@ describe('correlation ID propagation across transports', () => {
     expect(isValidCorrelationId(regeneratedId)).toBe(true);
     expect(res.setHeader).toHaveBeenCalledWith(CORRELATION_ID_HEADER, regeneratedId);
     expect(headers[CORRELATION_ID_HEADER]).toBe(regeneratedId);
+  });
+
+  it('starts a request that schedules a job and webhook and asserts one traceable correlation chain without high-cardinality leakage', async () => {
+    let capturedWebhookHeaders: Record<string, string> | undefined;
+    global.fetch = (async (_url: string, options?: RequestInit) => {
+      capturedWebhookHeaders = options?.headers as Record<string, string>;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const { JobQueue, setJobQueue, getJobQueue } = await import('../src/jobs/queue');
+    const mockBoss = { send: vi.fn().mockResolvedValue('job-1') };
+    const testQueue = JobQueue.withBoss(mockBoss as any);
+    setJobQueue(testQueue);
+
+    const testApp = express();
+    testApp.use(correlationIdMiddleware);
+    testApp.post('/trigger', async (req, res) => {
+      try {
+        const corr = getCorrelationId();
+        await getJobQueue()!.send('test-job', { data: 'value' });
+        await webhookDispatcher.dispatch({
+          url: 'https://example.com/webhook',
+          secret: 'secret',
+          payload: JSON.stringify({ foo: 'bar' }),
+          deliveryId: 'deliv-xyz',
+          eventType: 'test',
+        });
+        res.json({ correlationId: corr });
+      } catch (err) {
+        res.status(500).json({ error: String(err) });
+      }
+    });
+
+    const res = await request(testApp).post('/trigger').set(CORRELATION_ID_HEADER, '123e4567-e89b-12d3-a456-426614174002');
+    
+    expect(res.status).toBe(200);
+    expect(res.body.correlationId).toBe('123e4567-e89b-12d3-a456-426614174002');
+    expect(capturedWebhookHeaders?.[CORRELATION_ID_HEADER]).toBe('123e4567-e89b-12d3-a456-426614174002');
+    expect(mockBoss.send).toHaveBeenCalledWith('test-job', {
+      __payload: { data: 'value' },
+      __correlationId: '123e4567-e89b-12d3-a456-426614174002',
+    }, expect.any(Object));
+
+    setJobQueue(null);
   });
 });

@@ -13,60 +13,109 @@ import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vite
 import request from 'supertest';
 
 // ── Mock streamRepository before importing app ─────────────────────────────────
-const mockStream = vi.hoisted(() => ({
-  id: 'stream-001',
-  sender_address: 'GABCDEF123',
-  recipient_address: 'GHIJKLM456',
-  amount: '1000.0000000',
-  streamed_amount: '500.0000000',
-  remaining_amount: '500.0000000',
-  rate_per_second: '1.0000000',
-  start_time: 1700000000,
-  end_time: 1700100000,
-  status: 'active',
-  contract_id: 'CCONTRACT123',
-  transaction_hash: '0xdeadbeef',
-  event_index: 0,
-  created_at: '2026-01-01T00:00:00.000Z',
-  updated_at: '2026-01-01T00:00:00.000Z',
-}));
+// vi.hoisted is required: vi.mock factories are hoisted above top-level const
+// declarations, so any fn/mock referenced inside a factory must be created via
+// vi.hoisted to exist at factory-evaluation time.
+const gqlMocks = vi.hoisted(() => {
+  const mockStream = {
+    id: 'stream-001',
+    sender_address: 'GABCDEF123',
+    recipient_address: 'GHIJKLM456',
+    amount: '1000.0000000',
+    streamed_amount: '500.0000000',
+    remaining_amount: '500.0000000',
+    rate_per_second: '1.0000000',
+    start_time: 1700000000,
+    end_time: Math.floor(Date.now() / 1000) + 3600,
+    status: 'active',
+    contract_id: 'CCONTRACT123',
+    transaction_hash: '0xdeadbeef',
+    event_index: 0,
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+  };
+  return {
+    mockStream,
+    mockGetById: vi.fn(),
+    mockFindWithCursor: vi.fn(),
+    mockAuditEntries: [
+      {
+        seq: 1,
+        timestamp: '2026-01-01T00:00:00.000Z',
+        action: 'STREAM_CREATED',
+        resourceType: 'stream',
+        resourceId: 'stream-001',
+        correlationId: 'req-1',
+        meta: { amount: '1000' },
+      },
+    ],
+  };
+});
 
-const mockGetById = vi.fn();
-const mockFindWithCursor = vi.fn();
+const { mockStream, mockGetById, mockFindWithCursor, mockAuditEntries } = gqlMocks;
 
 vi.mock('../../src/db/repositories/streamRepository.js', () => ({
   streamRepository: {
-    getById: mockGetById,
-    findWithCursor: mockFindWithCursor,
+    getById: gqlMocks.mockGetById,
+    findWithCursor: gqlMocks.mockFindWithCursor,
   },
 }));
 
-// ── Mock audit log ─────────────────────────────────────────────────────────────
-const mockAuditEntries = vi.hoisted(() => [
-  {
-    seq: 1,
-    timestamp: '2026-01-01T00:00:00.000Z',
-    action: 'STREAM_CREATED',
-    resourceType: 'stream',
-    resourceId: 'stream-001',
-    correlationId: 'req-1',
-    meta: { amount: '1000' },
-  },
-]);
-
 vi.mock('../../src/lib/auditLog.js', () => ({
-  getAuditEntries: vi.fn(() => mockAuditEntries),
+  getAuditEntries: vi.fn(() => gqlMocks.mockAuditEntries),
 }));
 
 // ── Mock auth middleware to pass through quickly ───────────────────────────────
-// We mock the middlware modules so the app doesn't need real JWT secret.
+// We mock the middleware modules so the app doesn't need a real JWT secret.
+// The mocked principal carries all gateway scopes so the real per-resolver
+// scope gates (which run on the real gateway) let these tests through.
 vi.mock('../../src/middleware/auth.js', () => ({
+  // Faithful stand-in: only authenticate when a Bearer token is present, and
+  // requireAuth rejects requests with no principal — mirroring the real
+  // middleware so the auth-guard tests exercise real behavior.
   authenticate: vi.fn((req, _res, next) => {
-    req.user = { role: 'admin', keyId: 'key-admin' };
+    if (req.headers.authorization) {
+      req.user = {
+        role: 'admin',
+        keyId: 'key-admin',
+        permissions: ['streams:read', 'streams:write', 'audit:read'],
+      };
+    }
     next();
   }),
-  requireAuth: vi.fn((_req, _res, next) => next()),
+  authenticateApiKey: vi.fn((_req, _res, next) => next()),
+  requireAuth: vi.fn((req, res, next) => {
+    if (!req.user && !req.keyId) {
+      res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Authentication required' } });
+      return;
+    }
+    next();
+  }),
+  // requireScope mirrors the real middleware's deny-by-default gate.
+  requireScope: () => vi.fn((req, res, next) => {
+    const isApiKeyAuth = (req as any).keyId !== undefined;
+    const isJwtAuth = req.user !== undefined;
+    if (!isApiKeyAuth && !isJwtAuth) {
+      res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Authentication required' } });
+      return;
+    }
+    next();
+  }),
   requirePermission: () => vi.fn((_req, _res, next) => next()),
+  Permission: {
+    STREAMS_READ: 'streams:read',
+    STREAMS_WRITE: 'streams:write',
+    ADMIN_PAUSE: 'admin:pause',
+    ADMIN_REINDEX: 'admin:reindex',
+    INDEXER_REPLAY: 'indexer:replay',
+    DLQ_LIST: 'dlq:list',
+    DLQ_READ: 'dlq:read',
+    DLQ_REPLAY: 'dlq:replay',
+    DLQ_DELETE: 'dlq:delete',
+    DLQ_CONSUMER_RESUME: 'dlq:consumer:resume',
+    AUDIT_READ: 'audit:read',
+    AUDIT_WRITE: 'audit:write',
+  },
 }));
 
 // ── Mock downstream deps ───────────────────────────────────────────────────────
@@ -96,7 +145,7 @@ function authed(req: request.Test): request.Test {
   return req.set('Authorization', `Bearer ${ADMIN_KEY}`);
 }
 
-function gql(body: Record<string, unknown>) {
+function gql(body: Record<string, unknown> | Array<Record<string, unknown>>) {
   return authed(request(app).post('/api/graphql').send(body));
 }
 
@@ -161,6 +210,93 @@ describe('GraphQL gateway', () => {
     });
   });
 
+  it('rejects overly deep queries before resolver work', async () => {
+    const deepQuery = `
+      query {
+        stream(id: "stream-001") {
+          ... on Stream {
+            ... on Stream {
+              ... on Stream {
+                ... on Stream {
+                  ... on Stream {
+                    ... on Stream {
+                      id
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const res = await gql({ query: deepQuery });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].extensions.code).toBe('QUERY_TOO_DEEP');
+    expect(mockGetById).not.toHaveBeenCalled();
+  });
+
+  it('rejects high-complexity aliased queries', async () => {
+    const query = `
+      query {
+        a1: stream(id: "stream-001") { id }
+        a2: stream(id: "stream-001") { senderAddress }
+        a3: stream(id: "stream-001") { recipientAddress }
+        a4: stream(id: "stream-001") { amount }
+        a5: stream(id: "stream-001") { streamedAmount }
+        a6: stream(id: "stream-001") { remainingAmount }
+        a7: stream(id: "stream-001") { ratePerSecond }
+        a8: stream(id: "stream-001") { status }
+        a9: stream(id: "stream-001") { contractId }
+        a10: stream(id: "stream-001") { transactionHash }
+      }
+    `;
+
+    const res = await gql({ query });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].extensions.code).toBe('QUERY_TOO_COMPLEX');
+  });
+
+  it('rejects batched requests', async () => {
+    const res = await gql([
+      { query: '{ stream(id: "stream-001") { id } }' },
+      { query: '{ stream(id: "stream-001") { status } }' },
+    ] as any);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({
+      success: false,
+      error: { code: 'VALIDATION_ERROR' },
+    });
+  });
+
+  it('rejects introspection queries for non-trusted clients', async () => {
+    const res = await gql({ query: '{ __schema { queryType { name } } }' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].extensions.code).toBe('INTROSPECTION_FORBIDDEN');
+  });
+
+  it('masks internal resolver errors', async () => {
+    mockGetById.mockRejectedValue(
+      new Error('postgresql://user:pass@db.example.com:5432/app failed')
+    );
+
+    const res = await gql({ query: '{ stream(id: "stream-001") { id } }' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toBe('An unexpected error occurred');
+    expect(JSON.stringify(res.body.errors)).not.toContain('postgresql://');
+    expect(JSON.stringify(res.body.errors)).not.toContain('db.example.com');
+  });
+
   // ── Stream query ─────────────────────────────────────────────────────────
 
   it('resolves a single stream by ID', async () => {
@@ -192,8 +328,10 @@ describe('GraphQL gateway', () => {
   // ── Streams list query ───────────────────────────────────────────────────
 
   it('resolves paginated stream list', async () => {
+    // `total` is only populated when includeTotal: true is requested (the
+    // schema documents this contract on the StreamConnection.total field).
     const res = await gql({
-      query: `{ streams(limit: 10) { streams { id status } hasMore total } }`,
+      query: `{ streams(limit: 10, includeTotal: true) { streams { id status } hasMore total } }`,
     });
 
     expect(res.status).toBe(200);
@@ -281,7 +419,9 @@ describe('GraphQL gateway', () => {
   });
 
   it('sanitises internal error messages', async () => {
-    mockGetById.mockRejectedValue(new Error('Internal detail: postgresql://user:pass@host:5432/db'));
+    mockGetById.mockRejectedValue(
+      new Error('Internal detail: postgresql://user:pass@host:5432/db')
+    );
 
     const res = await gql({
       query: `{ stream(id: "stream-001") { id } }`,

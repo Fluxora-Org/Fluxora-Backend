@@ -26,6 +26,7 @@ import {
   type StellarRpcService,
 } from '../services/stellar-rpc.js';
 import { logger } from '../lib/logger.js';
+import { rpcDegradationTransitionsTotal, rpcDegradedModeGauge } from '../metrics/rpcMetrics.js';
 
 export const STALE_WARNING = '199 fluxora-backend "Stellar RPC unavailable - data may be stale"';
 
@@ -60,8 +61,16 @@ export function createRpcDegradationMiddleware(
       const { circuitState, degraded } = snapshot;
 
       res.setHeader('X-Degradation-State', circuitState);
+      // Expose the current degradation posture as a metric so dashboards can
+      // alert on sustained degradation without polling the health endpoint.
+      rpcDegradedModeGauge.set(degraded ? 1 : 0);
 
       if (circuitState !== lastLoggedState) {
+        // Only count real transitions: the first observed state is the baseline,
+        // not an entry/exit event.
+        if (lastLoggedState !== undefined) {
+          rpcDegradationTransitionsTotal.inc({ from: lastLoggedState, to: circuitState });
+        }
         logger.warn('RPC degradation state changed', undefined, {
           event: 'rpc_degradation_transition',
           previousState: lastLoggedState ?? 'INIT',

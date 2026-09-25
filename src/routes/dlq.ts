@@ -1,3 +1,4 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Dead-Letter Queue (DLQ) Inspection API — Admin Only
  *
@@ -32,14 +33,17 @@
 import { Router, type Request, type Response } from 'express';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { asyncHandler, validationError } from '../middleware/errorHandler.js';
-import { info } from '../utils/logger.js';
+import { info } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { dlqRepository } from '../db/repositories/dlqRepository.js';
+import { OffsetPaginationSchema, DEFAULT_PAGE_LIMIT } from '../validation/paginationSchema.js';
 
 /** Shape of a dead-letter entry */
 export interface DlqEntry {
   id: string;
+  /** Tenant that owns the failed delivery. Legacy rows may omit this value. */
+  tenantId?: string;
   topic: string;
   payload: unknown;
   error: string;
@@ -78,32 +82,23 @@ dlqRouter.get(
   '/',
   requirePermission(Permission.DLQ_LIST),
   asyncHandler(async (req: Request, res: Response) => {
-    const limitParam  = req.query.limit;
-    const offsetParam = req.query.offset;
     const topicFilter = req.query.topic;
+    const tenantFilter = req.query.tenantId;
     const requestId   = req.correlationId;
 
-    let limit = 50;
-    if (limitParam !== undefined) {
-      const parsed = Number.parseInt(String(limitParam), 10);
-      if (Number.isNaN(parsed) || parsed < 1 || parsed > 100) {
-        throw validationError('limit must be an integer between 1 and 100');
-      }
-      limit = parsed;
+    const parsed = OffsetPaginationSchema.safeParse(req.query);
+    if (!parsed.success) {
+      const firstIssue = parsed.error.issues[0];
+      throw validationError(firstIssue?.message ?? 'Invalid pagination parameters');
     }
 
-    let offset = 0;
-    if (offsetParam !== undefined) {
-      const parsed = Number.parseInt(String(offsetParam), 10);
-      if (Number.isNaN(parsed) || parsed < 0) {
-        throw validationError('offset must be a non-negative integer');
-      }
-      offset = parsed;
-    }
+    const limit  = parsed.data.limit  ?? DEFAULT_PAGE_LIMIT;
+    const offset = parsed.data.offset ?? 0;
 
     const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
+    const tenantId = typeof tenantFilter === 'string' && tenantFilter.trim() !== '' ? tenantFilter.trim() : undefined;
     const [{ entries, total }, suspensions] = await Promise.all([
-      dlqRepository.findAll({ limit, offset, topic }),
+      dlqRepository.findAll({ limit, offset, ...(topic ? { topic } : {}), ...(tenantId ? { tenantId } : {}) }),
       dlqRepository.listSuspendedConsumers(),
     ]);
 
@@ -266,13 +261,17 @@ dlqRouter.delete(
   requirePermission(Permission.DLQ_DELETE),
   asyncHandler(async (req: Request, res: Response) => {
     const topicFilter = req.query.topic;
+    const tenantFilter = req.query.tenantId;
     const requestId = req.correlationId;
 
     const topic = typeof topicFilter === 'string' && topicFilter.trim() !== '' ? topicFilter.trim() : undefined;
-    const purged = await dlqRepository.deleteAll(topic);
+    const tenantId = typeof tenantFilter === 'string' && tenantFilter.trim() !== '' ? tenantFilter.trim() : undefined;
+    const purged = tenantId
+      ? await dlqRepository.deleteAll(topic, tenantId)
+      : await dlqRepository.deleteAll(topic);
 
     info('DLQ entries purged', { count: purged, topicFilter, requestId });
-    recordAuditEvent('DLQ_PURGED', 'dlq', 'bulk', requestId, { purgedCount: purged, topicFilter });
+    recordAuditEvent('DLQ_PURGED', 'dlq', 'bulk', requestId, { purgedCount: purged, topicFilter, tenantId });
 
     res.json(successResponse({ message: 'DLQ entries purged', purged, topicFilter: topicFilter ?? 'all' }, requestId));
   }),
