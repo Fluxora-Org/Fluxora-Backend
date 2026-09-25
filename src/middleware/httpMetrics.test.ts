@@ -60,6 +60,12 @@ describe('resolveRoute', () => {
     const label = resolveRoute(req);
     expect(label).toBe(UNMATCHED_ROUTE);
     expect(label).not.toMatch(/abc-uuid|\/42/);
+  });
+
+  it('collapses only a single trailing slash, keeping internal empty segments', () => {
+    const req = {
+      baseUrl: '',
+      route: undefined,
       originalUrl: '/multiple///'
     } as unknown as Request;
     // After collapse of a single trailing slash, remaining empties are kept
