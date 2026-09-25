@@ -43,13 +43,25 @@ export function changedTypeScriptFiles(base = baseRef()) {
   if (process.env.LINT_FILES) {
     return process.env.LINT_FILES.split('\n').filter((f) => f.endsWith('.ts'));
   }
+  let diffBase = base;
+  const baseCheck = spawnSync('git', ['rev-parse', '--verify', diffBase], {
+    cwd: pathname('.'),
+    encoding: 'utf8',
+  });
+  // GitHub's pull_request checkout is a synthetic merge commit and may use a
+  // shallow clone without origin/<base> available. Its first parent is the
+  // checked-out base commit, so use that parent instead of failing the lint
+  // job before ESLint can run.
+  if (baseCheck.status !== 0 && process.env.CI && process.env.GITHUB_EVENT_NAME === 'pull_request') {
+    diffBase = 'HEAD^1';
+  }
   const diff = spawnSync(
     'git',
-    ['diff', '--name-only', '--diff-filter=ACMR', `${base}...HEAD`],
+    ['diff', '--name-only', '--diff-filter=ACMR', `${diffBase}...HEAD`],
     { cwd: pathname('.'), encoding: 'utf8' },
   );
   if (diff.status !== 0) {
-    throw new Error(`Unable to determine changed files against ${base}: ${diff.stderr.trim()}`);
+    throw new Error(`Unable to determine changed files against ${diffBase}: ${diff.stderr.trim()}`);
   }
   return diff.stdout
     .split('\n')
