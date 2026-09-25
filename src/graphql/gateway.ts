@@ -62,11 +62,61 @@ const MAX_STREAM_PAGE_SIZE = 100;
 /** Maximum page size for audit-log pagination. */
 const MAX_AUDIT_PAGE_SIZE = 100;
 
-/** Maximum GraphQL query nesting depth before rejecting the request. */
+/**
+ * Maximum GraphQL query nesting depth before rejecting the request.
+ *
+ * Depth alone does not bound repeated work: aliasing one expensive field many
+ * times keeps this metric constant, which is why complexity additionally
+ * charges for alias repetition (see {@link ALIAS_COMPLEXITY_COST}).
+ */
 const MAX_QUERY_DEPTH = 3;
 
-/** Maximum GraphQL field complexity before rejecting the request. */
-const MAX_QUERY_COMPLEXITY = 15;
+/**
+ * Maximum GraphQL field complexity before rejecting the request.
+ *
+ * The score is the number of field selections in the document, plus
+ * `ALIAS_COMPLEXITY_COST` for every *aliased* use of a field beyond its first
+ * (see {@link ALIAS_COMPLEXITY_COST}). A query that requests every field at
+ * most once — aliased or not — therefore stays within this budget with up to
+ * 15 selections, unchanged from when complexity was a pure selection count.
+ */
+export const MAX_QUERY_COMPLEXITY = 15;
+
+/**
+ * Complexity surcharge for alias repetition.
+ *
+ * Depth-based and count-based limits are blind to aliases: `a: streams(...)`,
+ * `b: streams(...)`, … keeps the depth constant and reads as “one field per
+ * selection set”, yet every alias forces the executor to run the (possibly
+ * expensive) resolver again, so executed work grows linearly with the number
+ * of aliases while neither measured metric moves.
+ *
+ * To close that gap, the complexity scorer charges `ALIAS_COMPLEXITY_COST` for
+ * each aliased occurrence of a field beyond the field's first occurrence
+ * anywhere in the document. The first use of a field still costs 1 per
+ * selection, so existing queries that request each field once — with or
+ * without an alias — stay inside the documented budget.
+ *
+ * Example with cost 2 and `MAX_QUERY_COMPLEXITY = 15`: aliasing
+ * `streams { streams { id } }` (3 selections per alias) reaches the limit at
+ * the 3rd alias — 3×3 selections + 2×2 surcharge = 13 for two aliases, 21 for
+ * three — and is refused with QUERY_TOO_COMPLEX.
+ */
+export const ALIAS_COMPLEXITY_COST = 2;
+
+/**
+ * Maximum number of aliases a single field may carry in one document.
+ *
+ * Derived from the complexity budget: the first alias is free and every
+ * further alias costs {@link ALIAS_COMPLEXITY_COST}, so a query whose aliased
+ * field has a trivial selection set can carry at most
+ * `(MAX_QUERY_COMPLEXITY − 1) / ALIAS_COMPLEXITY_COST` aliases before the
+ * complexity check refuses it.
+ */
+export const MAX_ALIAS_REPEATS = Math.max(
+  1,
+  Math.floor((MAX_QUERY_COMPLEXITY - 1) / ALIAS_COMPLEXITY_COST)
+);
 
 // ── Persisted-query helpers ───────────────────────────────────────────────────
 
@@ -125,7 +175,7 @@ function visitSelectionSet(
   }
 }
 
-function computeQueryDepth(document: DocumentNode): number {
+export function computeQueryDepth(document: DocumentNode): number {
   const fragments = getQueryFragments(document);
   let maxDepth = 0;
 
@@ -171,18 +221,47 @@ function computeQueryDepth(document: DocumentNode): number {
   return maxDepth + 1;
 }
 
-function computeQueryComplexity(document: DocumentNode): number {
+/**
+ * Compute the complexity score for a parsed GraphQL document.
+ *
+ * The score is:
+ *
+ *   1 per field selection
+ * + ALIAS_COMPLEXITY_COST per aliased occurrence of a field beyond that
+ *   field's first occurrence across the whole document
+ *
+ * The repetition surcharge is charged for the same *field name*, regardless of
+ * which operation, alias, or fragment it appears under — exactly the work the
+ * executor must repeat. Unaliased repeat selections of the same field are
+ * treated like any other first-time field (cost 1) because the executor
+ * merges them into one response key; aliased repeats cannot be merged, which
+ * is why they carry the surcharge instead.
+ */
+export function computeQueryComplexity(document: DocumentNode): number {
   const fragments = getQueryFragments(document);
   let complexity = 0;
+  const aliasedFieldUses = new Map<string, number>();
+
+  const chargeField = (selection: SelectionNode): void => {
+    if (selection.kind !== 'Field') return;
+    complexity += 1;
+
+    const alias = selection.alias?.value;
+    if (alias === undefined) return;
+
+    const previousUses = aliasedFieldUses.get(selection.name.value) ?? 0;
+    aliasedFieldUses.set(selection.name.value, previousUses + 1);
+    if (previousUses >= 1) {
+      complexity += ALIAS_COMPLEXITY_COST;
+    }
+  };
 
   for (const definition of document.definitions) {
     if (definition.kind !== 'OperationDefinition' || !definition.selectionSet) {
       continue;
     }
 
-    visitSelectionSet(definition.selectionSet, fragments, () => {
-      complexity += 1;
-    });
+    visitSelectionSet(definition.selectionSet, fragments, chargeField);
   }
 
   return complexity;
