@@ -1,8 +1,17 @@
 /**
- * Property-based tests for streamRepository.findWithCursor (PostgreSQL-backed).
+ * Property-based tests for streamRepository (PostgreSQL-backed).
  *
- * This test suite uses fast-check to generate randomized datasets and query parameters,
- * validating pagination invariants (gaps/duplicates, completeness, order stability).
+ * Uses fast-check to generate randomized datasets and validates the pagination
+ * ordering guarantee documented on `streamRepository.findWithCursor` /
+ * `streamRepository.find` in src/db/repositories/streamRepository.ts:
+ *
+ *   • the keyset path orders by the unique, total key `id` ASC, so no row that
+ *     existed at the start of a traversal is repeated or skipped;
+ *   • the offset path orders by `created_at DESC, id DESC`, so datasets with
+ *     duplicate `created_at` sort values still paginate without gaps or
+ *     duplicates;
+ *   • concurrent inserts during a traversal never duplicate or drop a
+ *     pre-existing row.
  *
  * All PG pool interactions are mocked — no live database is required.
  */
@@ -12,6 +21,45 @@ import fc from 'fast-check';
 // ── Mock pool query implementation ───────────────────────────────────────────
 let currentDataset: Record<string, any>[] = [];
 
+interface OrderKey {
+  column: string;
+  direction: 'ASC' | 'DESC';
+}
+
+/** Compare two column values the way PostgreSQL orders them (text + timestamptz). */
+function compareValues(a: unknown, b: unknown): number {
+  if (a instanceof Date || b instanceof Date) {
+    const ta = a instanceof Date ? a.getTime() : new Date(String(a)).getTime();
+    const tb = b instanceof Date ? b.getTime() : new Date(String(b)).getTime();
+    return ta === tb ? 0 : ta < tb ? -1 : 1;
+  }
+  const sa = String(a);
+  const sb = String(b);
+  return sa === sb ? 0 : sa < sb ? -1 : 1;
+}
+
+/** Parse the ORDER BY clause emitted by StreamQueryBuilder (single or composite key). */
+function parseOrderKeys(sql: string): OrderKey[] {
+  const match = sql.match(/ORDER BY\s+(.+?)(?:\s+LIMIT|\s+OFFSET|$)/i);
+  if (!match || !match[1]) return [{ column: 'id', direction: 'ASC' }];
+  return match[1].split(',').map((clause) => {
+    const [column, direction] = clause.trim().split(/\s+/);
+    return {
+      column: column!,
+      direction: (direction?.toUpperCase() === 'DESC' ? 'DESC' : 'ASC') as 'ASC' | 'DESC',
+    };
+  });
+}
+
+/**
+ * Minimal in-memory stand-in for PostgreSQL.
+ *
+ * It honours the parts of the generated SQL that the pagination guarantee
+ * depends on: WHERE predicates, multi-column ORDER BY with direction, and
+ * parameterised LIMIT/OFFSET.  Keeping the mock faithful means the property
+ * tests exercise the real cursor/offset ordering contracts rather than a
+ * simplified "sort by id" shortcut.
+ */
 const mockQuery = vi.fn(async (pool: unknown, sql: string, queryParams: unknown[]) => {
   const isCount = sql.toUpperCase().includes('COUNT(*)');
 
@@ -49,10 +97,23 @@ const mockQuery = vi.fn(async (pool: unknown, sql: string, queryParams: unknown[
     return { rows: [{ count: String(filtered.length) }] };
   }
 
-  // Cursor pagination orders by id ASC
-  filtered.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  // Apply the emitted ORDER BY (id ASC for keyset, created_at DESC, id DESC for offset).
+  const orderKeys = parseOrderKeys(sql);
+  filtered.sort((a, b) => {
+    for (const { column, direction } of orderKeys) {
+      const cmp = compareValues(a[column], b[column]);
+      if (cmp !== 0) return direction === 'DESC' ? -cmp : cmp;
+    }
+    return 0;
+  });
 
-  // Handle LIMIT $N parameter (which corresponds to limit + 1 in findWithCursor)
+  // OFFSET $N (offset pagination only).
+  const offsetMatch = sql.match(/OFFSET\s+\$(\d+)/i);
+  if (offsetMatch && offsetMatch[1]) {
+    filtered = filtered.slice(Number(queryParams[parseInt(offsetMatch[1], 10) - 1]));
+  }
+
+  // LIMIT $N (the cursor path asks for limit + 1 rows to detect `hasMore`).
   const limitMatch = sql.match(/LIMIT\s+\$(\d+)/i);
   if (limitMatch && limitMatch[1]) {
     const limitParamIdx = parseInt(limitMatch[1]!, 10);
@@ -149,6 +210,27 @@ const streamRecordArb = fc.record({
   created_at: fc.date(),
   updated_at: fc.date(),
 });
+
+/** Build a complete stream row fixture used by the ordering-guarantee tests. */
+function makeStreamRow(id: string, createdAt: Date) {
+  return {
+    id,
+    sender_address: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7',
+    recipient_address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
+    amount: '1000',
+    streamed_amount: '0',
+    remaining_amount: '1000',
+    rate_per_second: '10',
+    start_time: 1700000000,
+    end_time: 0,
+    status: 'active',
+    contract_id: 'api-created',
+    transaction_hash: 'a'.repeat(64),
+    event_index: 0,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+}
 
 describe('streamRepository.findWithCursor - Property-Based Tests', () => {
   beforeEach(() => {
@@ -290,5 +372,139 @@ describe('streamRepository.findWithCursor - Property-Based Tests', () => {
     expect(result.hasMore).toBe(false);
     expect(result.total).toBe(1);
     expect(result.streams[0]!.id).toBe('stream-single');
+  });
+
+  // ── Ordering-guarantee contracts ────────────────────────────────────────────
+
+  it('orders cursor pages by `id` ASC with an exclusive afterId bound', async () => {
+    const shared = new Date('2026-06-26T12:00:00.000Z');
+    currentDataset = [
+      makeStreamRow('stream-b', shared),
+      makeStreamRow('stream-a', shared),
+      makeStreamRow('stream-c', shared),
+    ];
+
+    const firstPage = await streamRepository.findWithCursor({}, 2);
+    expect(firstPage.streams.map((s) => s.id)).toEqual(['stream-a', 'stream-b']);
+
+    await streamRepository.findWithCursor({}, 2, 'stream-b');
+
+    const dataCalls = mockQuery.mock.calls.filter(
+      ([, sql]) => !String(sql).includes('COUNT(*)'),
+    );
+    const firstSql = String(dataCalls[0]![1]);
+    const nextSql = String(dataCalls[1]![1]);
+
+    // The ordering key is `id` — the streams primary key (TEXT NOT NULL,
+    // unique) — so the order is total and page windows cannot overlap or gap.
+    expect(firstSql).toMatch(/ORDER BY\s+id\s+ASC/i);
+    // afterId is an exclusive lower bound: the previous page's last row is
+    // never re-emitted, and a unique key means nothing is skipped either.
+    expect(nextSql).toMatch(/\bid\s*>\s*\$\d+/);
+    expect(nextSql).not.toMatch(/\bid\s*>=\s*\$\d+/);
+  });
+
+  it('never repeats or skips duplicate sort values across offset pages', async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(streamRecordArb, { minLength: 0, maxLength: 80 }),
+        fc.integer({ min: 1, max: 20 }),
+        async (rawStreams, pageSize) => {
+          const shared = new Date('2026-06-26T12:00:00.000Z');
+          // Force a large share of duplicate `created_at` ordering values.
+          const streams = rawStreams.map((s, idx) => ({
+            ...s,
+            id: `offset-${idx}-${s.id.slice(7)}`,
+            created_at: idx % 3 === 0 ? shared : s.created_at,
+            updated_at: idx % 3 === 0 ? shared : s.created_at,
+          }));
+          currentDataset = streams;
+
+          // Expected total order: created_at DESC, then the id tiebreaker DESC.
+          const expectedIds = [...streams]
+            .sort((a, b) => {
+              const byDate = b.created_at.getTime() - a.created_at.getTime();
+              if (byDate !== 0) return byDate;
+              return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+            })
+            .map((s) => s.id);
+
+          const collected: string[] = [];
+          let offset = 0;
+          for (let guard = 0; guard < streams.length + 5; guard++) {
+            const page = await streamRepository.find({}, { limit: pageSize, offset });
+            collected.push(...page.streams.map((s) => s.id));
+            if (!page.hasMore) break;
+            expect(page.streams.length).toBeGreaterThan(0);
+            offset += page.streams.length;
+          }
+
+          // Every row once, in the documented order — no repeats, no omissions.
+          expect(collected).toEqual(expectedIds);
+          expect(new Set(collected).size).toBe(collected.length);
+        },
+      ),
+      { seed: 4242, numRuns: 50 },
+    );
+  });
+
+  it('returns every pre-existing row exactly once when rows are inserted mid-traversal', async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(streamRecordArb, { minLength: 1, maxLength: 60 }),
+        fc.integer({ min: 1, max: 15 }),
+        fc.array(streamRecordArb, { minLength: 1, maxLength: 20 }),
+        async (rawExisting, limit, rawInserted) => {
+          // Half the table shares one `created_at`, so the traversal runs over
+          // rows with duplicate non-unique sort values as well.
+          const shared = new Date('2026-06-26T12:00:00.000Z');
+          const existing = rawExisting.map((s, idx) => ({
+            ...s,
+            id: `existing-${idx}-${s.id.slice(7)}`,
+            created_at: idx % 2 === 0 ? shared : s.created_at,
+            updated_at: idx % 2 === 0 ? shared : s.created_at,
+          }));
+          const inserted = rawInserted.map((s, idx) => ({
+            ...s,
+            id: `inserted-${idx}-${s.id.slice(7)}`,
+            created_at: idx % 2 === 0 ? shared : s.created_at,
+            updated_at: idx % 2 === 0 ? shared : s.created_at,
+          }));
+          currentDataset = [...existing];
+
+          const existingIds = new Set(existing.map((s) => s.id));
+          const fetched: string[] = [];
+          let afterId: string | undefined;
+          let insertedOnce = false;
+
+          for (let guard = 0; guard < existing.length + inserted.length + 5; guard++) {
+            const page = await streamRepository.findWithCursor({}, limit, afterId);
+            fetched.push(...page.streams.map((s) => s.id));
+
+            // A concurrent writer commits new rows once the first page is in flight.
+            if (!insertedOnce && page.streams.length > 0) {
+              currentDataset = [...currentDataset, ...inserted];
+              insertedOnce = true;
+            }
+
+            if (!page.hasMore) break;
+            expect(page.streams.length).toBeGreaterThan(0);
+            afterId = page.streams[page.streams.length - 1]!.id;
+          }
+
+          // No duplicates anywhere in the traversal...
+          expect(new Set(fetched).size).toBe(fetched.length);
+          // ...and every row that existed at the start is returned exactly once.
+          for (const id of existingIds) {
+            expect(fetched.filter((fetchedId) => fetchedId === id)).toHaveLength(1);
+          }
+          // Ordering stays strictly ascending on the unique ordering key.
+          for (let i = 1; i < fetched.length; i++) {
+            expect(fetched[i - 1]! < fetched[i]!).toBe(true);
+          }
+        },
+      ),
+      { seed: 1337, numRuns: 50 },
+    );
   });
 });
