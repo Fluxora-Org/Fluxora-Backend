@@ -693,7 +693,6 @@ export class IndexerService {
 
       let offset = cursor.last_committed_offset;
       let batchIndex = 0;
-      let lastBatchRowCount = 0;
 
       // 5. Per-batch loop — each iteration uses a fresh connection.
       while (offset < totalRows) {
@@ -784,7 +783,6 @@ export class IndexerService {
         const newOffset = offset + batchResult.rowsFetched;
         offset = newOffset;
         batchIndex++;
-        lastBatchRowCount = batchResult.rowsFetched;
 
         // Update in-memory progress.
         replayState.updateProgress(batchResult.rowsFetched, newOffset);
@@ -968,7 +966,7 @@ export class IndexerService {
     cursorId: string,
     request: ReplayRequest,
     offset: number,
-    batchIndex: number,
+    _batchIndex: number,
   ): Promise<{ rowsFetched: number; aborted: boolean }> {
     const client = await this.pool.connect();
     try {

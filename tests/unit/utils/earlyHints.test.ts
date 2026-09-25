@@ -143,29 +143,26 @@ describe('isEarlyHintsConfigEnabled', () => {
   });
 });
 
-describe('sendEarlyHints client support & degradation', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
+const flushAsync = () => new Promise((resolve) => setImmediate(resolve));
 
+describe('sendEarlyHints client support & degradation', () => {
   afterEach(() => {
-    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
-  it('skips early hints when client does NOT advertise support via request header', () => {
+  it('skips early hints when client does NOT advertise support via request header', async () => {
     const req = {
       headers: { accept: 'application/json' },
     } as unknown as Request;
     const res = createMockResponse(false, req);
 
     sendEarlyHints(res as unknown as Response, BASE_CONFIG, req);
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).not.toHaveBeenCalled();
   });
 
-  it('skips early hints when res.req exists but client does not advertise support', () => {
+  it('skips early hints when res.req exists but client does not advertise support', async () => {
     const req = {
       headers: { accept: 'application/json' },
     } as unknown as Request;
@@ -173,12 +170,12 @@ describe('sendEarlyHints client support & degradation', () => {
 
     // Call without explicit req param; it should fall back to res.req
     sendEarlyHints(res as unknown as Response, BASE_CONFIG);
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).not.toHaveBeenCalled();
   });
 
-  it('sends early hints when client advertises support via Early-Hints: 1', () => {
+  it('sends early hints when client advertises support via Early-Hints: 1', async () => {
     const req = {
       headers: { 'early-hints': '1' },
       header: (name: string) => (name.toLowerCase() === 'early-hints' ? '1' : undefined),
@@ -186,7 +183,7 @@ describe('sendEarlyHints client support & degradation', () => {
     const res = createMockResponse(false, req);
 
     sendEarlyHints(res as unknown as Response, BASE_CONFIG, req);
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).toHaveBeenCalledTimes(1);
     expect(res.writeProcessing).toHaveBeenCalledWith(
@@ -195,7 +192,7 @@ describe('sendEarlyHints client support & degradation', () => {
     );
   });
 
-  it('respects clientSupportsHints: false override even when request header is present', () => {
+  it('respects clientSupportsHints: false override even when request header is present', async () => {
     const req = {
       headers: { 'early-hints': '1' },
     } as unknown as Request;
@@ -206,12 +203,12 @@ describe('sendEarlyHints client support & degradation', () => {
       { ...BASE_CONFIG, clientSupportsHints: false },
       req
     );
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).not.toHaveBeenCalled();
   });
 
-  it('respects clientSupportsHints: true override even when request header is absent', () => {
+  it('respects clientSupportsHints: true override even when request header is absent', async () => {
     const req = {
       headers: {},
     } as unknown as Request;
@@ -222,12 +219,12 @@ describe('sendEarlyHints client support & degradation', () => {
       { ...BASE_CONFIG, clientSupportsHints: true },
       req
     );
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).toHaveBeenCalledTimes(1);
   });
 
-  it('skips early hints when enabled: false in config override', () => {
+  it('skips early hints when enabled: false in config override', async () => {
     const req = {
       headers: { 'early-hints': '1' },
     } as unknown as Request;
@@ -238,12 +235,12 @@ describe('sendEarlyHints client support & degradation', () => {
       { ...BASE_CONFIG, enabled: false },
       req
     );
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).not.toHaveBeenCalled();
   });
 
-  it('safely handles intermediary error if writeProcessing throws (resilient degradation)', () => {
+  it('safely handles intermediary error if writeProcessing throws (resilient degradation)', async () => {
     const req = {
       headers: { 'early-hints': '1' },
     } as unknown as Request;
@@ -252,38 +249,31 @@ describe('sendEarlyHints client support & degradation', () => {
       throw new Error('Broken intermediary socket connection');
     });
 
-    expect(() => {
-      sendEarlyHints(res as unknown as Response, BASE_CONFIG, req);
-      vi.runAllTimers();
-    }).not.toThrow();
+    sendEarlyHints(res as unknown as Response, BASE_CONFIG, req);
+    await expect(flushAsync()).resolves.toBeUndefined();
 
     expect(res.writeProcessing).toHaveBeenCalledTimes(1);
   });
 
-  it('skips early hints if headers are already sent', () => {
+  it('skips early hints if headers are already sent', async () => {
     const req = {
       headers: { 'early-hints': '1' },
     } as unknown as Request;
     const res = createMockResponse(true, req);
 
     sendEarlyHints(res as unknown as Response, BASE_CONFIG, req);
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).not.toHaveBeenCalled();
   });
 });
 
 describe('sendEarlyHintsWithBoth client support & degradation', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-
   afterEach(() => {
-    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
-  it('skips early hints when client does NOT advertise support', () => {
+  it('skips early hints when client does NOT advertise support', async () => {
     const req = {
       headers: { host: 'example.com' },
     } as unknown as Request;
@@ -298,12 +288,12 @@ describe('sendEarlyHintsWithBoth client support & degradation', () => {
       undefined,
       req
     );
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).not.toHaveBeenCalled();
   });
 
-  it('sends early hints when client advertises support', () => {
+  it('sends early hints when client advertises support', async () => {
     const req = {
       headers: { 'early-hints': '1' },
     } as unknown as Request;
@@ -318,12 +308,12 @@ describe('sendEarlyHintsWithBoth client support & degradation', () => {
       undefined,
       req
     );
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).toHaveBeenCalledTimes(2);
   });
 
-  it('skips early hints when options.enabled is false', () => {
+  it('skips early hints when options.enabled is false', async () => {
     const req = {
       headers: { 'early-hints': '1' },
     } as unknown as Request;
@@ -339,7 +329,7 @@ describe('sendEarlyHintsWithBoth client support & degradation', () => {
       req,
       { enabled: false }
     );
-    vi.runAllTimers();
+    await flushAsync();
 
     expect(res.writeProcessing).not.toHaveBeenCalled();
   });

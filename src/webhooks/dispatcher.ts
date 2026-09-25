@@ -45,7 +45,6 @@ interface WebhookHttpResponse {
   headers: Headers;
 }
 
-type LookupCallback = (error: Error | null, address: string, family: number) => void;
 
 type FetchRedirectOptions = Omit<RequestInit, 'redirect'>;
 
@@ -118,7 +117,7 @@ async function followFetchRedirects(
 const lookupWebhookTarget: https.RequestOptions['lookup'] = (
   hostname: string,
   options: dns.LookupOptions,
-  callback: (err: NodeJS.ErrnoException | null, address: any, family?: number) => void,
+  callback: (err: NodeJS.ErrnoException | null, address: string, family?: number) => void,
 ): void => {
   const family = typeof options === 'number' ? options : (typeof options === 'object' && options !== null ? options.family : undefined);
   dns.lookup(hostname, { family, all: false }, (error, address, resolvedFamily) => {

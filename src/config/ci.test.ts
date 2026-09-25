@@ -47,7 +47,7 @@ test('lint job has no shell fallback that masks a missing ESLint configuration',
 });
 
 test('informational jobs are marked', () => {
-  for (const [j, b] of Object.entries(jobs)) {
+  for (const [_j, b] of Object.entries(jobs)) {
     if (/^\s*continue-on-error:\s*true\s*$/m.test(b)) {
       expect(b).toMatch(/informational/i);
     }

@@ -39,7 +39,6 @@ import { requestBodyTooLargeTotal } from '../metrics/requestProtectionMetrics.js
  * @internal
  */
 function normalizedPath(req: Request): string {
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
   const routePath = (req as unknown as { route?: { path?: string } }).route?.path;
   return typeof routePath === 'string' ? routePath : req.path;
 }

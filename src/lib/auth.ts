@@ -78,7 +78,7 @@ export function verifyToken(token: string): UserPayload {
     if (jwtSecretPrevious) {
       try {
         return jwt.verify(token, jwtSecretPrevious, verifyOptions) as unknown as UserPayload;
-      } catch (prevError) {
+      } catch {
         // Fall through to throw the original error
       }
     }
