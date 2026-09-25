@@ -28,6 +28,7 @@
  */
 
 import type { StreamRecord } from '../db/types.js';
+import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
 import { serializeToDecimalString } from './decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -132,7 +133,11 @@ export function toStreamJsonLd(record: StreamRecord): StreamJsonLd {
     ratePerSecond: serializeToDecimalString(record.rate_per_second, 'ratePerSecond'),
     startTime: record.start_time,
     endTime: record.end_time,
-    status: record.status,
+    status: deriveStreamStatusFromSchedule({
+      startTime: record.start_time,
+      endTime: record.end_time,
+      status: record.status as ApiStreamStatus,
+    }).status,
     contractId: record.contract_id,
     transactionHash: record.transaction_hash,
   };

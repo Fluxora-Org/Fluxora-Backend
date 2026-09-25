@@ -82,6 +82,158 @@
  * @module routes/streams
  */
 import { Router } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import crypto from 'crypto';
+import { loadConfig } from '../config/env.js';
+import {
+  compareDecimalStringToZero,
+  validateDecimalString,
+  validateAmountFields,
+} from '../serialization/decimal.js';
+import { ApiError } from '../errors.js';
+import {
+  ApiErrorCode,
+  notFound,
+  validationError,
+  serviceUnavailable,
+  asyncHandler,
+  tooManyRequests,
+  forbidden,
+} from '../middleware/errorHandler.js';
+import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
+import { canonicalizeBody } from '../middleware/idempotency.js';
+import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
+import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
+import { successResponse, idempotentReplayResponse } from '../utils/response.js';
+import { sendEarlyHints } from '../utils/earlyHints.js';
+import { streamRepository, StatusConflictError } from '../db/repositories/streamRepository.js';
+import { PoolExhaustedError } from '../db/pool.js';
+import {
+  issueWriteFencePin,
+  shouldForcePrimaryFromHeaders,
+  WRITE_FENCE_HEADER,
+} from '../db/writeFencePin.js';
+import {
+  CreateStreamSchema,
+  parseBody,
+  formatZodIssues,
+} from '../validation/schemas.js';
+import { PaginationSchema } from '../validation/paginationSchema.js';
+import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
+import {
+  assertValidApiTransition,
+  isApiStreamStatus,
+  isTerminalStatus,
+  API_STREAM_STATUSES,
+  deriveStreamStatusFromSchedule,
+  type ApiStreamStatus,
+} from '../streams/status.js';
+import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
+import { isValidStreamStatus } from '../metrics/businessMetrics.js';
+import { verifyWsToken } from '../middleware/tokenAuth.js';
+import { recordServerTimingPhase } from '../middleware/serverTiming.js';
+import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
+import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
+import { getClientIp } from '../ws/connectionLimiter.js';
+import {
+  eventMatchesStreamId,
+  SSE_STREAM_UPDATE_EVENT,
+  SSE_CLOSE_EVENT,
+  SSE_CLOSE_REASONS,
+  subscribeToSseStream,
+  registerSseShutdownCallback,
+  type LiveSseStreamUpdateEvent,
+} from '../streams/sseEmitter.js';
+import {
+  resolveSseConnectionLimits,
+  tryAcquireSseConnection,
+} from '../streams/sseConnectionLimiter.js';
+import {
+  resolveLongPollConnectionLimits,
+  tryAcquireLongPollConnection,
+} from '../streams/longPoll.js';
+import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
+import {
+  RedisIdempotencyStore,
+  NoOpIdempotencyStore,
+  InMemoryIdempotencyStore,
+  type IdempotencyStore,
+  ENVELOPE_VERSION,
+} from '../redis/idempotencyStore.js';
+import { toStreamJsonLd } from '../serialization/jsonld.js';
+export const streamsRouter = Router();
+
+/**
+ * Validate and sanitise the Last-Event-ID header value.
+ *
+ * Security: rejects control characters (CR/LF/NUL), whitespace-only values,
+ * and values exceeding 200 characters. The allowed character set is printable
+ * ASCII 0x21–0x7E which excludes space (0x20) and all control characters.
+ *
+ * Returns the trimmed, validated value or throws a validationError.
+ * Returns `undefined` when the header is absent (no replay requested).
+ *
+ * Exported for unit testing — the HTTP parser strips control characters from
+ * headers in transit, so integration tests cannot cover CR/LF/NUL paths.
+ */
+export function parseLastEventIdHeader(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string') {
+    throw validationError('Last-Event-ID must be a string');
+  }
+  // Validate the raw value BEFORE trimming so control characters in the value
+  // (CR, LF, NUL, etc.) are caught — trim() would strip trailing CR/LF.
+  if (raw.trim() === '') {
+    throw validationError('Last-Event-ID must not be empty or whitespace-only');
+  }
+  if (!/^[\x21-\x7E]+$/.test(raw)) {
+    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length > 200) {
+    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
+  }
+  return trimmed;
+}
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/** Public-facing stream shape (camelCase, decimal strings). */
+export interface Stream {
+  id: string;
+  sender: string;
+  recipient: string;
+  depositAmount: string;
+  streamedAmount: string;
+  remainingAmount: string;
+  ratePerSecond: string;
+  startTime: number;
+  endTime: number;
+  status: string;
+}
+
+type StreamsCursor = { v: 1; lastId: string; scope?: string };
+type DependencyState = 'healthy' | 'unavailable';
+
+type NormalizedCreateInput = {
+  sender: string;
+  recipient: string;
+  depositAmount: string;
+  ratePerSecond: string;
+  startTime: number;
+  endTime: number;
+};
+
+const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
+const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
+const NO_STORE_STREAM_HEADERS = 'private, no-store';
+const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
+
+// ── Dependency state (injectable for tests) ───────────────────────────────────
+
+const streamListingDependency = { state: 'healthy' as DependencyState };
+const idempotencyDependency = { state: 'healthy' as DependencyState };
 import type { Stream } from '../serialization/stream.js';
 import { registerReadRoutes } from './streams/read.js';
 import { registerWriteRoutes } from './streams/write.js';
@@ -155,6 +307,11 @@ export function setIdempotencyStore(
 // ── DB → API mapper ───────────────────────────────────────────────────────────
 
 function toApiStream(record: StreamRecord): Stream {
+  const status = deriveStreamStatusFromSchedule({
+    startTime: record.start_time,
+    endTime: record.end_time,
+    status: record.status,
+  }).status;
   return {
     id: record.id,
     sender: record.sender_address,
@@ -165,7 +322,7 @@ function toApiStream(record: StreamRecord): Stream {
     ratePerSecond: record.rate_per_second,
     startTime: record.start_time,
     endTime: record.end_time,
-    status: record.status,
+    status,
   };
 }
 
@@ -361,28 +518,7 @@ function wrapDbError(err: unknown): never {
   throw err;
 }
 
-// ── API status state machine ──────────────────────────────────────────────────
-
-type ApiStreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
-
-const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
-  active: ['paused', 'completed', 'cancelled'],
-  paused: ['active', 'cancelled'],
-  completed: [],
-  cancelled: [],
-};
-
-function assertValidApiTransition(
-  from: ApiStreamStatus,
-  to: ApiStreamStatus,
-): { ok: true } | { ok: false; message: string } {
-  const allowed = API_TRANSITIONS[from] ?? [];
-  if (allowed.includes(to)) return { ok: true };
-  if (from === to) return { ok: false, message: `Stream is already ${from}` };
-  if (from === 'completed') return { ok: false, message: 'Stream is already completed and cannot be transitioned' };
-  if (from === 'cancelled') return { ok: false, message: 'Stream is already cancelled and cannot be transitioned' };
-  return { ok: false, message: `Cannot transition stream from '${from}' to '${to}'` };
-}
+// ── API status state machine (shared: ../streams/status.js) ─────────────
 
 // ── Test helpers (no-op in production) ───────────────────────────────────────
 
@@ -546,7 +682,11 @@ streamsRouter.get(
 
     // Cache only when every stream on the page is in a terminal state.
     // An empty page is treated as all-terminal (nothing mutable present).
-    const allTerminal = pageStreams.every((s) => isTerminalStatus(s.status as ApiStreamStatus));
+    const allTerminal = pageStreams.every((s) => isTerminalStatus(deriveStreamStatusFromSchedule({
+      startTime: s.startTime,
+      endTime: s.endTime,
+      status: s.status as ApiStreamStatus,
+    }).status));
     res.set(
       'Cache-Control',
       allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
@@ -707,7 +847,11 @@ streamsRouter.get(
     setStreamResourceHeaders(res, record!);
     res.set(
       'Cache-Control',
-      isTerminalStatus(stream.status as ApiStreamStatus)
+      isTerminalStatus(deriveStreamStatusFromSchedule({
+        startTime: stream.startTime,
+        endTime: stream.endTime,
+        status: stream.status as ApiStreamStatus,
+      }).status)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
@@ -779,7 +923,11 @@ streamsRouter.get(
     setStreamResourceHeaders(res, record);
     res.set(
       'Cache-Control',
-      isTerminalStatus(record.status as ApiStreamStatus)
+      isTerminalStatus(deriveStreamStatusFromSchedule({
+        startTime: record.start_time,
+        endTime: record.end_time,
+        status: record.status,
+      }).status)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
@@ -1030,9 +1178,8 @@ streamsRouter.patch(
       throw notFound('Stream', '');
     }
 
-    const validStatuses: ApiStreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
-    if (typeof newStatus !== 'string' || !validStatuses.includes(newStatus as ApiStreamStatus)) {
-      throw validationError('status must be one of: active, paused, completed, cancelled');
+    if (!isApiStreamStatus(newStatus)) {
+      throw validationError(`status must be one of: ${API_STREAM_STATUSES.join(', ')}`);
     }
 
     let record;

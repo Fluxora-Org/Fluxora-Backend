@@ -58,3 +58,46 @@ export interface RouteBudget {
   path: string;
   config: RouteRateLimitConfig;
 }
+
+// ---------------------------------------------------------------------------
+// Rate-limit response headers — single declared contract
+// ---------------------------------------------------------------------------
+
+/**
+ * Single declared contract for the rate-limit response headers.
+ *
+ * Every rate-limit header the service emits is keyed from this mapping (see
+ * `setRateLimitHeaders` in `src/middleware/rateLimiter.ts`), and the
+ * client-facing Zod schema (`src/validation/rateLimitHeaders.ts`) derives its
+ * header names from it, so the emitted headers cannot drift from the
+ * declared type.
+ *
+ * `retryAfter` (`Retry-After`, RFC 6585) is only emitted on HTTP 429; the
+ * remaining headers are emitted on every rate-limited response.
+ *
+ * Note: `X-RateLimit-Store` is an observability-only header emitted
+ * separately and is intentionally not part of the client contract.
+ */
+export const RATE_LIMIT_HEADERS = {
+  limit: 'X-RateLimit-Limit',
+  remaining: 'X-RateLimit-Remaining',
+  reset: 'X-RateLimit-Reset',
+  retryAfter: 'Retry-After',
+} as const;
+
+/** Declared rate-limit header fields (keys of {@link RATE_LIMIT_HEADERS}). */
+export type RateLimitHeaderField = keyof typeof RATE_LIMIT_HEADERS;
+
+/** Declared wire header names as emitted by the service. */
+export type RateLimitHeaderName = (typeof RATE_LIMIT_HEADERS)[RateLimitHeaderField];
+
+/**
+ * Declared semantic values carried by the rate-limit response headers.
+ * `retryAfter` is present only when the request was rejected with 429.
+ */
+export interface RateLimitHeaderValues {
+  limit: number;
+  remaining: number;
+  reset: number;
+  retryAfter?: number;
+}

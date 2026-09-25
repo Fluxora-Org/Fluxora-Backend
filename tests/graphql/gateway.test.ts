@@ -26,7 +26,7 @@ const gqlMocks = vi.hoisted(() => {
     remaining_amount: '500.0000000',
     rate_per_second: '1.0000000',
     start_time: 1700000000,
-    end_time: 1700100000,
+    end_time: Math.floor(Date.now() / 1000) + 3600,
     status: 'active',
     contract_id: 'CCONTRACT123',
     transaction_hash: '0xdeadbeef',
