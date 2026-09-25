@@ -73,6 +73,10 @@ Secret values are never included in validation messages.
 | `RPC_CB_WINDOW_MS`                | integer ms                                     | `30000`                                                                                                  |
 | `RPC_CB_RESET_TIMEOUT_MS`         | integer ms                                     | `60000`                                                                                                  |
 | `RPC_TIMEOUT_MS`                  | integer ms                                     | `5000`                                                                                                   |
+| `RPC_FALLBACK_CACHE_TTL_SECONDS`  | integer seconds, minimum 1                     | `300`                                                                                                    |
+| `RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA` | number, minimum 0                         | `0` (disabled)                                                                                            |
+| `RPC_HEALTH_CHECK_INTERVAL_MS`    | integer ms, minimum 0                          | `0` (disabled)                                                                                            |
+| `RPC_HEALTH_CHECK_FAILURE_THRESHOLD` | integer, minimum 1                         | `3`                                                                                                      |
 | `RATE_LIMIT_ENABLED`              | boolean                                        | `true`                                                                                                   |
 | `RATE_LIMIT_IP_WINDOW_MS`         | integer ms                                     | route default                                                                                            |
 | `RATE_LIMIT_IP_MAX`               | integer                                        | route default                                                                                            |

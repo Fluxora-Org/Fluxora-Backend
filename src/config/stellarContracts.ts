@@ -1,7 +1,8 @@
-import type { StellarNetwork } from './stellar.js';
+import type { StellarNetwork, ContractAddresses } from './stellar.js';
+import { logger } from '../lib/logger.js';
 
 export type PinnedStellarNetwork = Extract<StellarNetwork, 'testnet' | 'mainnet'>;
-export type PinnedStellarAddressKind = 'contract' | 'token';
+export type PinnedStellarAddressKind = 'contract' | 'token' | 'streaming';
 
 const STELLAR_CONTRACT_VERSION_BYTE = 2 << 3;
 const STELLAR_STRKEY_LENGTH = 56;
@@ -15,10 +16,12 @@ export const STELLAR_CONTRACT_ALLOWLIST: Record<
 > = {
   testnet: {
     contract: ['CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC'],
+    streaming: ['CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC'],
     token: ['CBFFW3D5R2P3BQOS4P2AKFRHHBEVU234RWPK7QGR4LZQIFJGG5EFTAK6'],
   },
   mainnet: {
     contract: ['CBXYBENCWPCNLZXXBAMSUO2MLVXH7EFBWLB5JZPWA4MCSOSLLRWX5OUA'],
+    streaming: ['CBXYBENCWPCNLZXXBAMSUO2MLVXH7EFBWLB5JZPWA4MCSOSLLRWX5OUA'],
     token: ['CCKKLNWH3DU7UCY4FU7E6YDRQKJ2JNOG27UPSCQ3FQ6U4X3QQGJKHTZ5'],
   },
 } as const;
@@ -91,11 +94,122 @@ export function getPinnedAddressNetwork(
   kind: PinnedStellarAddressKind,
   address: string
 ): PinnedStellarNetwork | null {
+  const allowlistKind = kind === 'streaming' ? 'contract' : kind;
   for (const network of Object.keys(STELLAR_CONTRACT_ALLOWLIST) as PinnedStellarNetwork[]) {
-    if (STELLAR_CONTRACT_ALLOWLIST[network][kind].includes(address)) {
+    if (STELLAR_CONTRACT_ALLOWLIST[network][allowlistKind].includes(address)) {
       return network;
     }
   }
 
   return null;
+}
+
+export function getAddressPinnedNetwork(address: string): PinnedStellarNetwork | null {
+  for (const network of Object.keys(STELLAR_CONTRACT_ALLOWLIST) as PinnedStellarNetwork[]) {
+    for (const kind of Object.keys(
+      STELLAR_CONTRACT_ALLOWLIST[network]
+    ) as PinnedStellarAddressKind[]) {
+      if (STELLAR_CONTRACT_ALLOWLIST[network][kind].includes(address)) {
+        return network;
+      }
+    }
+  }
+
+  return null;
+}
+
+export function assertNetworkMatchesContracts(
+  network: StellarNetwork,
+  addresses: ContractAddresses
+): void {
+  if (network === 'local') {
+    for (const [name, address] of Object.entries(addresses)) {
+      if (address && !isValidStellarContractAddress(address)) {
+        throw new Error(
+          `Contract address mismatch: "${name}" (${address}) must be a valid Stellar contract StrKey`
+        );
+      }
+    }
+    return;
+  }
+
+  for (const [name, address] of Object.entries(addresses)) {
+    if (!address) continue;
+
+    if (!isValidStellarContractAddress(address)) {
+      throw new Error(
+        `Contract address mismatch: "${name}" (${address}) must be a valid Stellar contract StrKey`
+      );
+    }
+
+    const kind: PinnedStellarAddressKind =
+      name === 'token' ? 'token' : name === 'streaming' ? 'streaming' : 'contract';
+    const pinnedNetwork = getPinnedAddressNetwork(kind, address);
+
+    if (pinnedNetwork !== network) {
+      if (pinnedNetwork !== null) {
+        throw new Error(
+          `Contract address mismatch: "${name}" (${address}) is pinned for ${pinnedNetwork} but configured network is ${network}`
+        );
+      } else {
+        const anyPinnedNetwork = getAddressPinnedNetwork(address);
+        if (anyPinnedNetwork !== null) {
+          throw new Error(
+            `Contract address mismatch: "${name}" (${address}) is pinned for ${anyPinnedNetwork} but configured network is ${network}`
+          );
+        }
+        throw new Error(
+          `Contract address mismatch: "${name}" (${address}) is not in the known-good ${network} ${kind} address allowlist`
+        );
+      }
+    }
+  }
+}
+
+export function logActiveStellarConfig(config: {
+  network: StellarNetwork;
+  contractAddresses: ContractAddresses;
+}): void {
+  logger.info('stellar:network_config', undefined, {
+    network: config.network,
+    contractAddresses: config.contractAddresses,
+    addresses: config.contractAddresses,
+  });
+/**
+ * Validate the pinned contract allowlist and network passphrases (issue #1437).
+ *
+ * These tables are static module data, but if an entry were ever edited into
+ * an invalid StrKey the mismatch would only surface when a request tried to
+ * verify or resolve an address. Validate them at startup instead. Overrides
+ * are injectable for tests.
+ */
+export function validateStellarContractsConfig(
+  allowlist: Record<
+    PinnedStellarNetwork,
+    Record<PinnedStellarAddressKind, readonly string[]>
+  > = STELLAR_CONTRACT_ALLOWLIST,
+  passphrases: Record<StellarNetwork, string> = STELLAR_NETWORK_PASSPHRASES,
+): string[] {
+  const issues: string[] = [];
+
+  for (const network of Object.keys(allowlist) as PinnedStellarNetwork[]) {
+    for (const kind of ['contract', 'token'] as PinnedStellarAddressKind[]) {
+      const entries = allowlist[network][kind];
+      entries.forEach((address, index) => {
+        if (!isValidStellarContractAddress(address)) {
+          issues.push(
+            `STELLAR_CONTRACT_ALLOWLIST.${network}.${kind}[${index}] must be a valid Stellar contract StrKey (got "${address}")`,
+          );
+        }
+      });
+    }
+  }
+
+  for (const network of Object.keys(passphrases) as StellarNetwork[]) {
+    if (typeof passphrases[network] !== 'string' || passphrases[network].trim() === '') {
+      issues.push(`STELLAR_NETWORK_PASSPHRASES.${network} must be a non-empty string`);
+    }
+  }
+
+  return issues;
 }

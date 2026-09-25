@@ -1,9 +1,20 @@
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Streams API routes — PostgreSQL-backed.
  *
- * All list/get/create/cancel operations delegate to streamRepository.
- * The in-memory store has been removed; state lives in the `streams` table.
+ * This module only assembles the router. The work is split by concern:
+ *
+ *   routes/streams/read.ts      list, NDJSON export, HEAD, GET, JSON-LD
+ *   routes/streams/write.ts     create (idempotent), cancel, status transition
+ *   routes/streams/sse.ts       Server-Sent Events
+ *   routes/streams/longPoll.ts  long-poll fallback
+ *   routes/streams/realtime.ts  auth/limits/teardown/replay shared by SSE + long-poll
+ *   routes/streams/guards.ts    request validation, authorization, error mapping
+ *   routes/streams/state.ts     dependency health + idempotency store wiring
+ *
+ *   db/repositories/streamApiQueries.ts  query construction (filters, create rows)
+ *   serialization/stream.ts              response shaping (Stream, list pages, update envelopes)
+ *   utils/opaqueCursor.ts                cursor codec, shared with other paginated routes
+ *   utils/conditionalGet.ts              ETag / If-None-Match, shared with other resource routes
  *
  * Decimal-string invariant
  * ------------------------
@@ -223,15 +234,32 @@ const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 
 const streamListingDependency = { state: 'healthy' as DependencyState };
 const idempotencyDependency = { state: 'healthy' as DependencyState };
+import type { Stream } from '../serialization/stream.js';
+import { registerReadRoutes } from './streams/read.js';
+import { registerWriteRoutes } from './streams/write.js';
+import { registerSseRoutes } from './streams/sse.js';
+import { registerLongPollRoutes } from './streams/longPoll.js';
 
-// Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
-// by wireIdempotencyStore() in app.ts with a RedisIdempotencyStore when Redis
-// is available (REDIS_ENABLED=true).
-let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>>> =
-  new InMemoryIdempotencyStore();
+export type { Stream } from '../serialization/stream.js';
+export {
+  enforceStreamScope,
+  fingerprintInput,
+  getFeatureFlagRequesterId,
+  parseLastEventIdHeader,
+} from './streams/guards.js';
+export {
+  resetStreamIdempotencyStore,
+  setIdempotencyDependencyState,
+  setIdempotencyStore,
+  setStreamListingDependencyState,
+} from './streams/state.js';
 
-// TTL for idempotency entries — overridden in tests and set from config at startup
-let idempotencyTtlSeconds = 86400;
+export const streamsRouter = Router();
+
+registerReadRoutes(streamsRouter);
+registerWriteRoutes(streamsRouter);
+registerSseRoutes(streamsRouter);
+registerLongPollRoutes(streamsRouter);
 
 /**
  * Legacy shim — audit.test.ts and streams.test.ts reference this array.
@@ -241,6 +269,7 @@ let idempotencyTtlSeconds = 86400;
  */
 export const streams: Stream[] = [];
 
+/** Legacy no-op kept for existing test imports. */
 export function setStreamListingDependencyState(state: DependencyState): void {
   streamListingDependency.state = state;
 }
@@ -1555,6 +1584,15 @@ streamsRouter.get(
  * Holds the HTTP connection open (bounded by a timeout) until a new event for the stream
  * arrives or the timeout elapses. Returns the same event envelope shape used by the
  * WebSocket hub.
+ *
+ * Timeout Semantics:
+ * - When the hold duration elapses without an event, the response includes:
+ *   - status: 'timeout' field to distinguish from errors
+ *   - retryAfterSeconds: configured retry hint for clients
+ *   - Retry-After HTTP header with the same retry hint
+ * - This allows clients to distinguish idle timeouts from errors and implement backoff
+ * - Hold duration is configurable via LONG_POLL_MAX_CONNECTION_DURATION_MS (default: 30s)
+ * - Retry hint is configurable via LONG_POLL_RETRY_AFTER_SECONDS (default: 15s)
  */
 streamsRouter.get(
   '/:id/poll',
@@ -1864,7 +1902,13 @@ streamsRouter.get(
     pollTimer = setTimeout(() => {
       if (cleanedUp || res.destroyed || res.writableEnded) return;
       cleanup('timeout_elapsed');
-      res.json(successResponse(null, requestId));
+      // Distinguish timeout from error by including a status field and Retry-After header
+      res.setHeader('Retry-After', String(longPollLimits.retryAfterSeconds));
+      res.json(successResponse({ 
+        data: null, 
+        status: 'timeout',
+        retryAfterSeconds: longPollLimits.retryAfterSeconds 
+      }, requestId));
     }, timeoutMs);
 
     pollTimer.unref?.();

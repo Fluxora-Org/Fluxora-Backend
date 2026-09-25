@@ -4,10 +4,10 @@ import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from '.
 import {
   getPinnedAddressNetwork,
   isValidStellarContractAddress,
-  STELLAR_CONTRACT_ALLOWLIST,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
   STELLAR_NETWORK_PASSPHRASES,
   type PinnedStellarAddressKind,
-  type PinnedStellarNetwork,
 } from './stellarContracts.js';
 import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
@@ -15,7 +15,10 @@ export {
   STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
   isValidStellarContractAddress,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
 } from './stellarContracts.js';
+export { resolveNetwork } from './stellar.js';
 
 type NodeEnv = 'development' | 'staging' | 'production' | 'test';
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -134,6 +137,21 @@ function optionalString(name: string) {
   );
 }
 
+function operationDeadlinesEnv() {
+  return z.preprocess(
+    (value) => {
+      if (value === undefined || value === '') return {};
+      if (typeof value !== 'string') return value;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    },
+    z.record(z.string(), z.number().int().min(1, 'RPC operation deadlines must be at least 1ms')),
+  );
+}
+
 function requiredStellarContractAddress(name: string) {
   return z
     .string()
@@ -154,7 +172,7 @@ function validatePinnedAddress(
   ctx: z.RefinementCtx,
   network: StellarNetwork,
   kind: PinnedStellarAddressKind,
-  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS' | 'CONTRACT_ADDRESS_STREAMING' | string,
   address: string
 ): void {
   if (network === 'local') return;
@@ -232,7 +250,12 @@ export const EnvSchema = z
     STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
     HORIZON_URL: optionalUrlString('HORIZON_URL'),
     HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
-    CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
+    CONTRACT_ADDRESS_STREAMING: z
+      .preprocess((value) => (value === '' ? undefined : value), z.string().trim().optional())
+      .refine(
+        (val) => val === undefined || isValidStellarContractAddress(val),
+        'CONTRACT_ADDRESS_STREAMING must be a valid Stellar contract StrKey'
+      ),
     STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
     STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(LIMITS.STELLAR_RPC_TIMEOUT),
     STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(
@@ -246,7 +269,7 @@ export const EnvSchema = z
      * Format: JSON object mapping operation names to timeouts in ms.
      * Example: '{"getLatestLedger":2000,"accountExists":8000}'
      */
-    STELLAR_RPC_OPERATION_DEADLINES: z.string().optional(),
+    STELLAR_RPC_OPERATION_DEADLINES: operationDeadlinesEnv(),
 
     JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
     JWT_SECRET_PREVIOUS: z.preprocess(
@@ -359,6 +382,7 @@ export const EnvSchema = z
     ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
     WS_AUTH_REQUIRED: booleanEnv().default(false),
     WS_ALLOWED_ORIGINS: optionalString('WS_ALLOWED_ORIGINS'),
+    WS_MAX_CONNECTIONS_PER_IP: integerEnv('WS_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
     WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
     WS_RECONNECT_WINDOW_MS: integerEnv('WS_RECONNECT_WINDOW_MS', 1, 86_400_000).default(60_000),
     SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
@@ -428,6 +452,10 @@ export const EnvSchema = z
       LIMITS.RPC_CB_RESET_TIMEOUT_MS
     ),
     RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
+    RPC_FALLBACK_CACHE_TTL_SECONDS: integerEnv('RPC_FALLBACK_CACHE_TTL_SECONDS', 1).default(300),
+    RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA: z.preprocess(parseNumber, z.number().min(0).default(0)),
+    RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
+    RPC_HEALTH_CHECK_FAILURE_THRESHOLD: integerEnv('RPC_HEALTH_CHECK_FAILURE_THRESHOLD', 1).default(3),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
     RATE_LIMIT_ENABLED: booleanEnv().default(true),
@@ -531,6 +559,15 @@ export const EnvSchema = z
       'STELLAR_TOKEN_ADDRESS',
       env.STELLAR_TOKEN_ADDRESS
     );
+    if (env.CONTRACT_ADDRESS_STREAMING) {
+      validatePinnedAddress(
+        ctx,
+        stellarNetwork,
+        'streaming',
+        'CONTRACT_ADDRESS_STREAMING',
+        env.CONTRACT_ADDRESS_STREAMING
+      );
+    }
 
     const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
     if (hasApiKeys && env.API_KEY_PEPPER === undefined) {
@@ -602,6 +639,18 @@ export interface Config {
 
   stellarNetwork: StellarNetwork;
   stellarRpcUrl: string;
+  stellarRpcTimeout: number;
+  stellarRpcMaxRetries: number;
+  stellarRpcRetryDelay: number;
+  stellarRpcOperationDeadlines: Record<string, number>;
+  rpcCircuitBreakerFailureThreshold: number;
+  rpcCircuitBreakerWindowMs: number;
+  rpcCircuitBreakerResetTimeoutMs: number;
+  rpcTimeoutMs: number;
+  rpcFallbackCacheTtlSeconds: number;
+  rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcHealthCheckIntervalMs: number;
+  rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
@@ -662,6 +711,9 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
+  wsAuthRequired: boolean;
+  wsMaxConnectionsPerIp: number;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -794,8 +846,9 @@ function resolveNetwork(env: ParsedEnv): StellarNetwork {
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
+  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? env.STELLAR_CONTRACT_ADDRESS;
   return {
-    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    streaming,
     contract: env.STELLAR_CONTRACT_ADDRESS,
     token: env.STELLAR_TOKEN_ADDRESS,
   };
@@ -805,6 +858,9 @@ function toConfig(env: ParsedEnv): Config {
   const stellarNetwork = resolveNetwork(env);
   const networkDefaults = STELLAR_NETWORKS[stellarNetwork];
   const isProduction = env.NODE_ENV === 'production';
+  const contractAddresses = resolveContractAddresses(stellarNetwork, env);
+
+  assertNetworkMatchesContracts(stellarNetwork, contractAddresses);
 
   return {
     port: env.PORT,
@@ -831,6 +887,18 @@ function toConfig(env: ParsedEnv): Config {
 
     stellarNetwork,
     stellarRpcUrl: env.STELLAR_RPC_URL,
+    stellarRpcTimeout: env.STELLAR_RPC_TIMEOUT,
+    stellarRpcMaxRetries: env.STELLAR_RPC_MAX_RETRIES,
+    stellarRpcRetryDelay: env.STELLAR_RPC_RETRY_DELAY,
+    stellarRpcOperationDeadlines: env.STELLAR_RPC_OPERATION_DEADLINES,
+    rpcCircuitBreakerFailureThreshold: env.RPC_CB_FAILURE_THRESHOLD,
+    rpcCircuitBreakerWindowMs: env.RPC_CB_WINDOW_MS,
+    rpcCircuitBreakerResetTimeoutMs: env.RPC_CB_RESET_TIMEOUT_MS,
+    rpcTimeoutMs: env.RPC_TIMEOUT_MS,
+    rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
+    rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
+    rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
@@ -899,6 +967,8 @@ function toConfig(env: ParsedEnv): Config {
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    wsAuthRequired: env.WS_AUTH_REQUIRED,
+    wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
@@ -966,6 +1036,12 @@ export function initializeConfig(): Config {
   }
 
   configInstance = loadConfig();
+  if (process.env.NODE_ENV !== 'test') {
+    logActiveStellarConfig({
+      network: configInstance.stellarNetwork,
+      contractAddresses: configInstance.contractAddresses,
+    });
+  }
   return configInstance;
 }
 

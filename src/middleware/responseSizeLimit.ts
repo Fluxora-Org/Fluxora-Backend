@@ -35,7 +35,7 @@ import { Counter } from 'prom-client';
 import { registry } from '../metrics.js';
 import { ApiErrorCode } from '../errors.js';
 import { errorResponse } from '../utils/response.js';
-import { warn } from '../utils/logger.js';
+import { warn } from '../lib/logger.js';
 
 /** Default cap for any buffered response body: 1 MiB. */
 export const DEFAULT_RESPONSE_LIMIT_BYTES = 1024 * 1024;

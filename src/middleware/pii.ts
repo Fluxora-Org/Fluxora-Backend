@@ -7,7 +7,7 @@
  */
 
 import type { Request, Response, NextFunction } from 'express';
-import { logger } from '../logging/logger.js';
+import { logger } from '../lib/logger.js';
 import { redactKeysInString, sanitize } from '../pii/sanitizer.js';
 
 /**

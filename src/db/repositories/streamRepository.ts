@@ -41,7 +41,7 @@ import {
   STREAM_INVARIANTS,
   StreamStatus,
 } from '../types.js';
-import { info, debug } from '../../utils/logger.js';
+import { info, debug } from '../../lib/logger.js';
 import { dbQueryDurationSeconds } from '../../metrics/dbMetrics.js';
 import { enrichActiveSpanWithStream } from '../../tracing/hooks.js';
 import { getConfig } from '../../config/env.js';

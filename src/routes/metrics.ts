@@ -4,7 +4,7 @@ import { registry } from '../metrics.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { syncWebhookMetrics } from '../metrics/businessMetrics.js';
 import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
-import { warn } from '../utils/logger.js';
+import { warn } from '../lib/logger.js';
 
 export const metricsRouter = express.Router();
 

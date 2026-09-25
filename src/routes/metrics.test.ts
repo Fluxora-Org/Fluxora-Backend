@@ -4,7 +4,7 @@ import express from 'express';
 import { metricsRouter } from './metrics.js';
 import { registry } from '../metrics.js';
 import { generateToken } from '../lib/auth.js';
-import * as logger from '../utils/logger.js';
+import * as logger from '../lib/logger.js';
 
 describe('src/routes/metrics.ts (dedicated module test)', () => {
   const TEST_ADMIN_KEY = 'fluxora-metrics-test-admin-key-999';

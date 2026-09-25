@@ -10,7 +10,7 @@
  */
 import jwt, { type SignOptions } from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
-import { warn } from '../utils/logger.js';
+import { warn } from './logger.js';
 
 export interface UserPayload {
   address: string;

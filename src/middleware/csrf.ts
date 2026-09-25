@@ -3,7 +3,7 @@ import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { errorResponse } from '../utils/response.js';
 import { ApiErrorCode } from './errorHandler.js';
 import { getApiKeyFromRequest } from '../lib/apiKey.js';
-import { warn } from '../utils/logger.js';
+import { warn } from '../lib/logger.js';
 
 /** Cookie name used to deliver the double-submit CSRF token to browser clients. */
 export const CSRF_COOKIE_NAME = 'fluxora_csrf';

@@ -248,8 +248,8 @@ export interface StreamEventRecord {
   eventId: string;
   /** Ledger sequence number */
   ledger: number;
-  /** Ledger hash for reorg detection */
-  ledgerHash: string;
+  /** Ledger hash for reorg detection; NULL for legacy rows written before the column existed */
+  ledgerHash: string | null;
   /** Soroban contract ID */
   contractId: string;
   /** Event topic (e.g. "stream.created") */

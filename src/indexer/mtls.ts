@@ -45,7 +45,7 @@ export function mtlsValidationMiddleware(req: Request, res: Response, next: Next
         'INDEXER_MTLS_FAILURE',
         'indexer_worker',
         req.ip || 'unknown_ip',
-        (req as any).id ?? (req as any).correlationId,
+        req.id ?? req.correlationId,
         { reason: 'non_tls_connection_mtls_required' },
       );
       indexerMtlsValidationFailuresTotal.inc({ reason: 'non_tls_mtls_required' });
@@ -53,7 +53,7 @@ export function mtlsValidationMiddleware(req: Request, res: Response, next: Next
         error: {
           code: 'FORBIDDEN',
           message: 'mTLS is required but connection is not TLS',
-          requestId: (req as any).id ?? (req as any).correlationId,
+          requestId: req.id ?? req.correlationId,
         },
       });
       return;
@@ -111,7 +111,7 @@ export function mtlsValidationMiddleware(req: Request, res: Response, next: Next
     'INDEXER_MTLS_FAILURE',
     'indexer_worker',
     req.ip || 'unknown_ip',
-    (req as any).id ?? (req as any).correlationId,
+    req.id ?? req.correlationId,
     meta
   );
 
@@ -121,7 +121,7 @@ export function mtlsValidationMiddleware(req: Request, res: Response, next: Next
       code: isCertMissing ? 'UNAUTHORIZED' : 'FORBIDDEN',
       message: 'mTLS client-certificate validation failed',
       details: authError || 'Certificate missing or invalid',
-      requestId: (req as any).id ?? (req as any).correlationId,
+      requestId: req.id ?? req.correlationId,
     }
   });
 }

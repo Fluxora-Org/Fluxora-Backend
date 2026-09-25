@@ -14,7 +14,7 @@
  */
 
 import type { Request, Response, NextFunction } from 'express';
-import { logger } from '../logging/logger.js';
+import { logger } from '../lib/logger.js';
 
 export function requestLoggerMiddleware(req: Request, res: Response, next: NextFunction): void {
   const { correlationId } = req;

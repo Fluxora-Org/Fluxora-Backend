@@ -31,7 +31,11 @@ import {
   captureStartupEnvSnapshot,
   refreshHotConfig,
   getConfig,
+  logActiveStellarConfig,
+  assertNetworkMatchesContracts,
+  loadConfig,
 } from './config/env.js';
+import { validateStartupConfig } from './config/startupValidation.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { prepareReloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
@@ -54,18 +58,45 @@ if (process.env.NODE_ENV !== 'test') {
   // active threshold for this environment is always visible at startup.
   logActiveLogLevel({ logLevel: cfg.logLevel, nodeEnv: cfg.nodeEnv });
 
+  // Log active Stellar network and configured contract addresses at startup.
+  logActiveStellarConfig({
+    network: cfg.stellarNetwork,
+    contractAddresses: cfg.contractAddresses,
+  });
+
+  // Assert configured network matches contract addresses.
+  assertNetworkMatchesContracts(cfg.stellarNetwork, cfg.contractAddresses);
+
   /**
    * Startup initialization sequence:
    * 1. Capture startup env snapshot for restart-only-key detection.
-   * 2. Start the OpenTelemetry SDK and activate the logs bridge.
-   * 3. Run tiered startup dependency probes.
-   * 4. Validate admin state file writability (graceful degradation on failure).
-   * 5. Start the HTTP server and begin accepting requests.
-   * 6. Resume any incomplete indexer replays from the database checkpoint.
+   * 2. Validate all configuration modules (issue #1437).
+   * 3. Start the OpenTelemetry SDK and activate the logs bridge.
+   * 4. Run tiered startup dependency probes.
+   * 5. Validate admin state file writability (graceful degradation on failure).
+   * 6. Start the HTTP server and begin accepting requests.
+   * 7. Resume any incomplete indexer replays from the database checkpoint.
    */
   captureStartupEnvSnapshot();
 
   (async () => {
+    // ── Startup configuration validation (issue #1437) ───────────────────
+    // Fail immediately — before dependency probes, socket binding, or any
+    // request handling — when any configuration module is invalid. Throwing
+    // here lands in the .catch() below which logs startup:fatal and exits(1).
+    validateStartupConfig();
+
+    const cfg = loadConfig();
+
+    // Apply and record the effective log level before anything else logs, so the
+    // active threshold for this environment is always visible at startup.
+    logActiveLogLevel({ logLevel: cfg.logLevel, nodeEnv: cfg.nodeEnv });
+
+    // ── OpenTelemetry SDK & Logs Bridge ───────────────────────────────────
+    // Must be called before the first request is served so that
+    // auto-instrumentation patches are active from the start.
+    // startTracing() is a no-op when OTEL_SDK_DISABLED=true or already running.
+    // initLogsBridge() is a no-op when tracingOtelEnabled=false.
     startTracing();
     initLogsBridge({ enabled: cfg.tracingOtelEnabled });
 

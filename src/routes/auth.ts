@@ -3,7 +3,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { generateToken } from '../lib/auth.js';
 import { validationError, unauthorized, asyncHandler } from '../middleware/errorHandler.js';
-import { info } from '../utils/logger.js';
+import { info } from '../lib/logger.js';
 import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { revoke } from '../redis/jwtRevocationStore.js';

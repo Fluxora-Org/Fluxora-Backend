@@ -152,19 +152,9 @@ export function isProductionEnvironment(env: NodeJS.ProcessEnv | undefined): boo
  * with administrative/timing scopes, and holders of the configured ADMIN_API_KEY
  * or SERVER_TIMING_SECRET.
  */
-interface AuthenticatedRequestLike {
-  user?: {
-    role?: unknown;
-    permissions?: unknown;
-  };
-  keyScopes?: unknown;
-}
-
 export function isAuthorizedTimingCaller(req: Request): boolean {
-  const authReq = req as unknown as AuthenticatedRequestLike;
-
   // 1. Check req.user if populated by JWT auth middleware
-  const user = authReq.user;
+  const user = req.user;
   if (user) {
     if (user.role === 'admin' || user.role === 'operator' || user.role === 'data-protection-officer') {
       return true;
@@ -178,7 +168,7 @@ export function isAuthorizedTimingCaller(req: Request): boolean {
   }
 
   // 2. Check req.keyScopes if populated by API key auth middleware
-  const keyScopes = authReq.keyScopes;
+  const keyScopes = req.keyScopes;
   if (Array.isArray(keyScopes)) {
     if (
       keyScopes.includes('admin') ||
