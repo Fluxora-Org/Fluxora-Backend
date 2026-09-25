@@ -5,6 +5,7 @@ import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { syncWebhookMetrics } from '../metrics/businessMetrics.js';
 import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
 import { warn } from '../lib/logger.js';
+import { errorResponse } from '../utils/response.js';
 
 export const metricsRouter = express.Router();
 
@@ -38,7 +39,7 @@ export const metricsRouter = express.Router();
  *   or per-user data (e.g. user IDs, wallet addresses, emails, raw tokens) is ever
  *   emitted in metric labels.
  */
-metricsRouter.get('/', requireAdminAuth, async (_req: Request, res: Response) => {
+metricsRouter.get('/', requireAdminAuth, async (req: Request, res: Response) => {
    try {
      // Sync webhook metrics from store
      syncWebhookMetrics(webhookDeliveryStore);
@@ -50,6 +51,6 @@ metricsRouter.get('/', requireAdminAuth, async (_req: Request, res: Response) =>
      warn('Failed to generate metrics', {
        error: err instanceof Error ? err.message : String(err),
      });
-     res.status(500).send('Failed to generate metrics');
+    res.status(500).json(errorResponse('INTERNAL_ERROR', 'Failed to generate metrics', undefined, req.correlationId));
    }
  });

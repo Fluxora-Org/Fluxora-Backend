@@ -234,7 +234,7 @@ adminRouter.post('/indexer/stall/clear', (req, res) => {
     res.json({ message: 'Indexer stall flag cleared successfully.' });
   } catch (err) {
     if (err instanceof ActiveStallError) {
-      res.status(409).json({ error: err.message });
+      res.status(409).json(errorResponse('CONFLICT', err.message, undefined, req.correlationId));
       return;
     }
     throw err;

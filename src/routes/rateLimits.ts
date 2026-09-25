@@ -9,6 +9,7 @@ import {
   setRuntimeRateLimitConfig,
 } from '../config/rateLimits.js';
 import type { RateLimitConfig } from '../types/rateLimit.js';
+import { errorResponse } from '../utils/response.js';
 
 /** Validates a partial RateLimitConfig patch object. Returns an error string or null. */
 function validateConfigPatch(obj: unknown): string | null {
@@ -49,11 +50,11 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
   rateLimitsRouter.get('/', async (req: Request, res: Response) => {
     const { identifier, identifierType } = limiter.extractClientIdentifier(req);
     if (req.query.path !== undefined && typeof req.query.path !== 'string') {
-      res.status(400).json({ error: 'Query parameter "path" must be a string.' });
+      res.status(400).json(errorResponse('VALIDATION_ERROR', 'Query parameter "path" must be a string.', undefined, req.correlationId));
       return;
     }
     if (req.query.method !== undefined && typeof req.query.method !== 'string') {
-      res.status(400).json({ error: 'Query parameter "method" must be a string.' });
+      res.status(400).json(errorResponse('VALIDATION_ERROR', 'Query parameter "method" must be a string.', undefined, req.correlationId));
       return;
     }
 
@@ -107,7 +108,7 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
     const { ip, apiKey, admin } = req.body ?? {};
 
     if (ip === undefined && apiKey === undefined && admin === undefined) {
-      res.status(400).json({ error: 'Body must include at least one of: ip, apiKey, admin.' });
+      res.status(400).json(errorResponse('VALIDATION_ERROR', 'Body must include at least one of: ip, apiKey, admin.', undefined, req.correlationId));
       return;
     }
 
@@ -115,7 +116,7 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
       if (val !== undefined) {
         const err = validateConfigPatch(val);
         if (err) {
-          res.status(400).json({ error: `Invalid config for '${key}': ${err}` });
+          res.status(400).json(errorResponse('VALIDATION_ERROR', `Invalid config for '${key}': ${err}`, undefined, req.correlationId));
           return;
         }
       }
@@ -132,7 +133,7 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
       admin:  admin  ? { ...base.admin,  ...(admin  as Partial<RateLimitConfig>) } : base.admin,
     };
     if (!merged.ip.enabled && !merged.apiKey.enabled && !merged.admin.enabled) {
-      res.status(409).json({ error: 'Cannot disable all rate-limit tiers simultaneously.' });
+      res.status(409).json(errorResponse('CONFLICT', 'Cannot disable all rate-limit tiers simultaneously.', undefined, req.correlationId));
       return;
     }
 

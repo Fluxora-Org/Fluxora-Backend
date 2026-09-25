@@ -1,6 +1,8 @@
 import type { Request, Response, NextFunction } from 'express';
 import type { AuthAttemptStore } from '../redis/authAttemptStore.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
+import { ApiErrorCode } from '../errors.js';
+import { errorResponse } from '../utils/response.js';
 
 let authAttemptStore: AuthAttemptStore | null = null;
 
@@ -25,10 +27,7 @@ export async function authLockoutMiddleware(
       const ipLockout = await authAttemptStore.isLockedOut(ip);
       if (ipLockout > 0) {
         res.setHeader('Retry-After', String(ipLockout));
-        res.status(429).json({
-          success: false,
-          message: 'Too many failed attempts, try again later',
-        });
+        res.status(429).json(errorResponse(ApiErrorCode.TOO_MANY_REQUESTS, 'Too many failed attempts, try again later', undefined, req.correlationId));
         return;
       }
     }
@@ -37,10 +36,7 @@ export async function authLockoutMiddleware(
       const addrLockout = await authAttemptStore.isLockedOut(address);
       if (addrLockout > 0) {
         res.setHeader('Retry-After', String(addrLockout));
-        res.status(429).json({
-          success: false,
-          message: 'Too many failed attempts, try again later',
-        });
+        res.status(429).json(errorResponse(ApiErrorCode.TOO_MANY_REQUESTS, 'Too many failed attempts, try again later', undefined, req.correlationId));
         return;
       }
     }

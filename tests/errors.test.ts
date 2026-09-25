@@ -1,7 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { ApiError, serviceUnavailable, unauthorized, ApiErrorCode } from '../src/errors.js';
+import { ApiError, serviceUnavailable, unauthorized, ApiErrorCode, isApiErrorCode } from '../src/errors.js';
+import { errorResponse } from '../src/utils/response.js';
 
 describe('src/errors.ts', () => {
+  it('recognizes every published error code', () => {
+    for (const code of Object.values(ApiErrorCode)) {
+      const response = errorResponse(code, 'test');
+      expect(isApiErrorCode(response.error.code)).toBe(true);
+      expect(response.error.code).toBe(code);
+    }
+  });
+
   describe('ApiError', () => {
     it('constructs with all fields', () => {
       const err = new ApiError(400, 'TEST_CODE', 'test message', { key: 'value' }, true);

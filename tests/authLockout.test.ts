@@ -212,7 +212,10 @@ describe('Auth lockout', () => {
       .send({ idToken: 'invalid-token', address: 'GTEST' })
       .expect(429);
 
-    expect(response.body.message).toBe('Too many failed attempts, try again later');
+    expect(response.body.error).toMatchObject({
+      code: 'TOO_MANY_REQUESTS',
+      message: 'Too many failed attempts, try again later',
+    });
     expect(response.headers['retry-after']).toBeDefined();
   });
 

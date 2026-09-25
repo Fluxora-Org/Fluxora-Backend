@@ -38,7 +38,7 @@ import {
   validationError,
   tooManyRequests,
 } from '../middleware/errorHandler.js';
-import { successResponse } from '../utils/response.js';
+import { successResponse, errorResponse } from '../utils/response.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { recordAuditEventToDb, recordErasureAuditLog, writeAuditEntryToClient } from '../lib/auditLog.js';
 import { hashStringSHA256 } from '../lib/security.js';
@@ -100,12 +100,7 @@ function rejectUnsupportedMethods(allowedMethods: string[]) {
   return (req: Request, res: Response): void => {
     const allow = allowedMethods.join(', ');
     res.setHeader('Allow', allow);
-    res.status(405).json({
-      error: {
-        code: 'METHOD_NOT_ALLOWED',
-        message: `${req.method} is not allowed on this resource`,
-      },
-    });
+    res.status(405).json(errorResponse('METHOD_NOT_ALLOWED', `${req.method} is not allowed on this resource`, undefined, req.correlationId));
   };
 }
 
@@ -431,12 +426,7 @@ privacyRouter.delete(
       recipientAddress.trim().length === 0 ||
       recipientAddress.length > 256
     ) {
-      res.status(400).json({
-        error: {
-          code: 'INVALID_ADDRESS',
-          message: 'recipientAddress must be a non-empty string of at most 256 characters.',
-        },
-      });
+      res.status(400).json(errorResponse('INVALID_ADDRESS', 'recipientAddress must be a non-empty string of at most 256 characters.', undefined, correlationId));
       return;
     }
 
@@ -554,12 +544,7 @@ privacyRouter.delete(
         // ignore nested failure
       }
 
-      res.status(500).json({
-        error: {
-          code: 'ERASURE_FAILED',
-          message: 'An internal error occurred while processing the erasure request.',
-        },
-      });
+      res.status(500).json(errorResponse('ERASURE_FAILED', 'An internal error occurred while processing the erasure request.', undefined, correlationId));
     }
   },
 );

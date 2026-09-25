@@ -58,7 +58,7 @@ webhooksRouter.post(
     // 1. Shared Preflight (size, depth, encoding, valid json)
     const preflight = checkWebhookPreflight(rawBody, contentType);
     if (!preflight.ok) {
-      res.status(preflight.status).json({ error: preflight.code, message: preflight.message });
+      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message, undefined, req.correlationId));
       return;
     }
 
@@ -81,9 +81,7 @@ webhooksRouter.post(
     const verification = verifyWebhookSignature(verifyInput);
 
     if (!verification.ok) {
-      res
-        .status(verification.status)
-        .json({ error: verification.code, message: verification.message });
+      res.status(verification.status).json(errorResponse(verification.code, verification.message, undefined, req.correlationId));
       return;
     }
 
@@ -91,7 +89,7 @@ webhooksRouter.post(
 
     const isNew = await inboundWebhookDedupCache.add('webhook', deliveryId);
     if (!isNew) {
-      res.status(409).json({ error: 'duplicate_delivery', message: 'Duplicate delivery id' });
+      res.status(409).json(errorResponse('duplicate_delivery', 'Duplicate delivery id', undefined, req.correlationId));
       return;
     }
 

@@ -4,7 +4,7 @@ import { SerializationLogger, error as logError } from '../lib/logger.js';
 import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
-import { ApiError, ApiErrorCode } from '../errors.js';
+import { ApiError, ApiErrorCode, toApiErrorCode } from '../errors.js';
 import { getActiveTraceSpanIds } from '../tracing/hooks.js';
 
 export {
@@ -81,13 +81,10 @@ export function errorHandler(
 
     if (err.expose) {
       res.status(err.statusCode).json(
-        errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
+        errorResponse(toApiErrorCode(err.code), err.message, err.details, requestId)
       );
     } else {
-      res.status(err.statusCode).json({
-        success: false,
-        message: 'Internal server error',
-      });
+      res.status(err.statusCode).json(errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId));
     }
     return;
   }
@@ -139,10 +136,7 @@ export function errorHandler(
     ...traceSpanIds,
   });
 
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-  });
+  res.status(500).json(errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId));
 }
 
 /** Async handler wrapper */

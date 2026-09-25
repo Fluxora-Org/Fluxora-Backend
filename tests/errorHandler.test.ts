@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { ApiError } from '../src/errors.js';
-import { ApiErrorCode, errorHandler } from '../src/middleware/errorHandler.js';
+import { ApiError, ApiErrorCode, isApiErrorCode } from '../src/errors.js';
+import { errorHandler } from '../src/middleware/errorHandler.js';
 import { QueryTimeoutError } from '../src/db/pool.js';
 import { DecimalSerializationError } from '../src/serialization/decimal.js';
 
@@ -64,7 +64,7 @@ describe('errorHandler middleware', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.success).toBe(false);
-    expect(res.body.message).toBe('Internal server error');
+    expect(res.body.error).toEqual({ code: ApiErrorCode.INTERNAL_ERROR, message: 'Internal server error' });
     expect(res.body).not.toHaveProperty('error.details');
     expect(res.body).not.toHaveProperty('stack');
   });
@@ -75,8 +75,7 @@ describe('errorHandler middleware', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.success).toBe(false);
-    expect(res.body.message).toBe('Internal server error');
-    expect(res.body).not.toHaveProperty('error');
+    expect(res.body.error).toEqual({ code: ApiErrorCode.INTERNAL_ERROR, message: 'Internal server error' });
     expect(res.body).not.toHaveProperty('stack');
     expect(JSON.stringify(res.body)).not.toContain('Unexpected');
     expect(JSON.stringify(res.body)).not.toContain('/internal/private/path');
@@ -95,6 +94,7 @@ describe('errorHandler middleware', () => {
     expect(res.status).toBe(status);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe(code);
+    expect(isApiErrorCode(res.body.error.code)).toBe(true);
     expect(JSON.stringify(res.body)).not.toContain('stack');
     expect(JSON.stringify(res.body)).not.toContain('/internal/private/path');
     expect(JSON.stringify(res.body)).not.toContain('secret-value');

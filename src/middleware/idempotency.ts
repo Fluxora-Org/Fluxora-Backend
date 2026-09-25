@@ -66,10 +66,7 @@ export function createIdempotencyMiddleware(
           idempotencyKeyLength: idempotencyKey.length,
           incomingHash,
         });
-        return res.status(409).json({
-          error: 'idempotency_conflict',
-          message: 'A request with this idempotency key is already in progress.',
-        });
+        return res.status(409).json(errorResponse('IDEMPOTENCY_CONFLICT', 'A request with this idempotency key is already in progress.', undefined, req.correlationId));
       }
 
       if (existing) {
@@ -80,11 +77,7 @@ export function createIdempotencyMiddleware(
             storedHash: existing.requestFingerprint,
           });
 
-          return res.status(409).json({
-            error: 'idempotency_conflict',
-            stored_hash: existing.requestFingerprint,
-            incoming_hash: incomingHash,
-          });
+          return res.status(409).json(errorResponse('IDEMPOTENCY_CONFLICT', 'The idempotency key was already used with a different request.', { storedHash: existing.requestFingerprint, incomingHash }, req.correlationId));
         }
 
         logger.info('Replaying idempotent response', req.correlationId as string, { 
@@ -110,10 +103,7 @@ export function createIdempotencyMiddleware(
           idempotencyKeyLength: idempotencyKey.length,
           incomingHash,
         });
-        return res.status(409).json({
-          error: 'idempotency_conflict',
-          message: 'A request with this idempotency key is already in progress.',
-        });
+        return res.status(409).json(errorResponse('IDEMPOTENCY_CONFLICT', 'A request with this idempotency key is already in progress.', undefined, req.correlationId));
       }
 
       // Intercept res.json to cache the successful response

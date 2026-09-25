@@ -27,6 +27,7 @@ import {
 } from '../services/stellar-rpc.js';
 import { logger } from '../lib/logger.js';
 import { rpcDegradationTransitionsTotal, rpcDegradedModeGauge } from '../metrics/rpcMetrics.js';
+import { errorResponse } from '../utils/response.js';
 
 export const STALE_WARNING = '199 fluxora-backend "Stellar RPC unavailable - data may be stale"';
 
@@ -98,17 +99,11 @@ export function createRpcDegradationMiddleware(
         circuitState,
       });
 
-      res.status(503).json({
-        error: {
-          code: 'SERVICE_UNAVAILABLE',
-          message: DEGRADED_WRITE_MESSAGE,
-          degradation: {
-            circuitState,
-            failureCount: snapshot.failureCount,
-            openedAt: snapshot.openedAt,
-          },
-        },
-      });
+      res.status(503).json(errorResponse('SERVICE_UNAVAILABLE', DEGRADED_WRITE_MESSAGE, {
+        circuitState,
+        failureCount: snapshot.failureCount,
+        openedAt: snapshot.openedAt,
+      }, req.correlationId));
     });
   };
 }
