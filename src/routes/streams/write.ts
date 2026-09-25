@@ -66,7 +66,7 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
 
   const input = parseCreateStreamBody(req.body, requestId);
   const requestFingerprint = fingerprintInput(input);
-  const tenantId = (req as any).keyId || req.user?.address || input.sender || 'anonymous';
+  const tenantId = req.keyId || req.user?.address || input.sender || 'anonymous';
   const idempotencyStore = getIdempotencyStore();
   const existingResponse = await idempotencyStore.get(idempotencyKey, tenantId);
 

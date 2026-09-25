@@ -65,7 +65,7 @@ function getSpec(): Record<string, unknown> {
 
     if (spec.tags) {
       spec.tags = spec.tags.filter(
-        (t: any) => !['admin', 'indexer', 'webhooks'].includes(t.name)
+        (t: { name: string }) => !['admin', 'indexer', 'webhooks'].includes(t.name)
       );
     }
 

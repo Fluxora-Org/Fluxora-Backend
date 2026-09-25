@@ -170,7 +170,7 @@ export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler
       }
       
       next();
-    } catch (err) {
+    } catch {
       next(
         unauthorized(`Invalid ${options.role} bearer token`, {
           role: options.role,

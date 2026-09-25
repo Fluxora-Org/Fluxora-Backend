@@ -109,6 +109,6 @@ export function refreshBackgroundJobStaleness(nowSeconds = Date.now() / 1000): v
   }
 }
 
-(backgroundJobStale as any).collect = async () => {
+(backgroundJobStale as unknown as { collect?: () => void | Promise<void> }).collect = async () => {
   refreshBackgroundJobStaleness();
 };
