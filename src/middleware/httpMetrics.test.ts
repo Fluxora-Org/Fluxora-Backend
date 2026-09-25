@@ -60,12 +60,6 @@ describe('resolveRoute', () => {
     const label = resolveRoute(req);
     expect(label).toBe(UNMATCHED_ROUTE);
     expect(label).not.toMatch(/abc-uuid|\/42/);
-      originalUrl: '/multiple///'
-    } as unknown as Request;
-    // After collapse of a single trailing slash, remaining empties are kept
-    // by normalizeRouteLabel join; high-cardinality policy does not alter
-    // static vocabulary segments.
-    expect(resolveRoute(req)).toBe('/multiple//');
   });
 
   it('bounds series count across many distinct unmatched URLs', () => {
