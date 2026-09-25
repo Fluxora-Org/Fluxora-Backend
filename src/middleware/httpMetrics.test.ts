@@ -10,7 +10,7 @@ function fakeReq(partial: {
 }): Request {
   return {
     baseUrl: partial.baseUrl ?? '',
-    route: partial.route as any,
+    route: partial.route as Request['route'],
     originalUrl: partial.originalUrl ?? '',
   } as unknown as Request;
 }
@@ -60,12 +60,14 @@ describe('resolveRoute', () => {
     const label = resolveRoute(req);
     expect(label).toBe(UNMATCHED_ROUTE);
     expect(label).not.toMatch(/abc-uuid|\/42/);
-      originalUrl: '/multiple///'
-    } as unknown as Request;
-    // After collapse of a single trailing slash, remaining empties are kept
-    // by normalizeRouteLabel join; high-cardinality policy does not alter
-    // static vocabulary segments.
-    expect(resolveRoute(req)).toBe('/multiple//');
+
+    // Slash-heavy unmatched URLs share the same fixed label; empty segments
+    // are never joined into new series, keeping cardinality bounded.
+    const slashHeavy = fakeReq({
+      route: undefined,
+      originalUrl: '/multiple///',
+    });
+    expect(resolveRoute(slashHeavy)).toBe(UNMATCHED_ROUTE);
   });
 
   it('bounds series count across many distinct unmatched URLs', () => {
@@ -95,29 +97,16 @@ describe('resolveRoute', () => {
     expect([...series][0]).toBe('/api/users/:userId/items/:itemId');
   });
 
-  it('buckets UUID path parameters on unmatched routes', () => {
-    const req = {
-      baseUrl: '',
-      route: undefined,
-      originalUrl: '/api/streams/550e8400-e29b-41d4-a716-446655440000'
-    } as unknown as Request;
-    expect(resolveRoute(req)).toBe('/api/streams/:id');
-  });
-
-  it('buckets Stellar addresses on unmatched routes', () => {
-    const address = 'GCSX22222222222222222222222222222222222222222222222222UV';
-    const req = {
-      baseUrl: '',
-      route: undefined,
-      originalUrl: `/api/accounts/${address}`
-    } as unknown as Request;
-    expect(resolveRoute(req)).toBe('/api/accounts/:address');
-  });
+  // NOTE: two older tests asserted that unmatched routes fall back to
+  // normalizeRouteLabel('/api/streams/:id', '/api/accounts/:address'). That
+  // fallback contract was retired when unmatched requests were collapsed to
+  // the single UNMATCHED_ROUTE label (see the tests above); asserting both
+  // contracts simultaneously is impossible, so those cases were removed.
 
   it('preserves Express route templates with :param placeholders', () => {
     const req = {
       baseUrl: '/api',
-      route: { path: '/streams/:id' } as any,
+      route: { path: '/streams/:id' } as Request['route'],
       originalUrl: '/api/streams/550e8400-e29b-41d4-a716-446655440000'
     } as unknown as Request;
     expect(resolveRoute(req)).toBe('/api/streams/:id');

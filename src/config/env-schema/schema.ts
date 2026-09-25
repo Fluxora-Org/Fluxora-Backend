@@ -44,7 +44,7 @@ function validatePinnedAddress(
   ctx: z.RefinementCtx,
   network: StellarNetwork,
   kind: PinnedStellarAddressKind,
-  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS' | 'CONTRACT_ADDRESS_STREAMING' | (string & {}),
   address: string
 ): void {
   if (network === 'local') return;
@@ -115,6 +115,15 @@ export const EnvSchema = z
       'STELLAR_TOKEN_ADDRESS',
       env.STELLAR_TOKEN_ADDRESS
     );
+    if (env.CONTRACT_ADDRESS_STREAMING) {
+      validatePinnedAddress(
+        ctx,
+        stellarNetwork,
+        'streaming',
+        'CONTRACT_ADDRESS_STREAMING',
+        env.CONTRACT_ADDRESS_STREAMING
+      );
+    }
 
     const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
     if (hasApiKeys && env.API_KEY_PEPPER === undefined) {

@@ -25,6 +25,8 @@ export const serverEnvSchema = {
   WS_AUTH_REQUIRED: booleanEnv().default(false),
   /** Comma-separated allowed origins for WebSocket connections. */
   WS_ALLOWED_ORIGINS: optionalString('WS_ALLOWED_ORIGINS'),
+  /** Max concurrent WebSocket connections per client IP. @default 10 */
+  WS_MAX_CONNECTIONS_PER_IP: integerEnv('WS_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
   /** Max WebSocket reconnect attempts per client window. @default 20 */
   WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
   /** Sliding window for WS reconnect limiting, in ms. @default 60000 */

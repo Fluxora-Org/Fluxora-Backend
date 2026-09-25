@@ -10,7 +10,13 @@
  * `env-hot-reload.ts`. `env.ts` re-exports the public surface unchanged.
  */
 import { z } from 'zod';
-import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
+import {
+  type StellarNetwork,
+  STELLAR_NETWORKS,
+  type ContractAddresses,
+  resolveNetwork as resolveStellarNetwork,
+} from './stellar.js';
+import { assertNetworkMatchesContracts, logActiveStellarConfig } from './stellarContracts.js';
 import { EnvSchema, type ParsedEnv } from './env-schema/schema.js';
 import type { NodeEnv, LogLevel } from './env-schema/types.js';
 import { SECRET_ENV_NAMES } from './env-schema/parsers.js';
@@ -47,8 +53,32 @@ export interface Config {
   redisSentinelName?: string | undefined;
   redisClusterNodes?: string | undefined;
 
+  /** TCP connect timeout for each Redis client, in ms. */
+  redisConnectTimeoutMs: number;
+  /** Command retries per request before a Redis call fails. */
+  redisMaxRetriesPerRequest: number;
+  /** Base delay of the Redis reconnect backoff, in ms. */
+  redisRetryBaseDelayMs: number;
+  /** Ceiling of the Redis reconnect backoff, in ms. */
+  redisRetryMaxDelayMs: number;
+  /** Reconnect attempts before ioredis stops retrying. */
+  redisRetryMaxAttempts: number;
+
+
   stellarNetwork: StellarNetwork;
   stellarRpcUrl: string;
+  stellarRpcTimeout: number;
+  stellarRpcMaxRetries: number;
+  stellarRpcRetryDelay: number;
+  stellarRpcOperationDeadlines: Record<string, number>;
+  rpcCircuitBreakerFailureThreshold: number;
+  rpcCircuitBreakerWindowMs: number;
+  rpcCircuitBreakerResetTimeoutMs: number;
+  rpcTimeoutMs: number;
+  rpcFallbackCacheTtlSeconds: number;
+  rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcHealthCheckIntervalMs: number;
+  rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
@@ -95,6 +125,11 @@ export interface Config {
   webhookPollIntervalMs: number;
   webhookBatchSize: number;
   webhookRetryRps: number;
+  webhookRetryBurst: number;
+  webhookCircuitBreakerThreshold: number;
+  webhookCircuitBreakerResetMs: number;
+  webhookBatchMaxBackoffMs: number;
+  webhookMaxResponseBytes: number;
   webhookAllowedHosts?: string[] | undefined;
 
   enableStreamValidation: boolean;
@@ -104,6 +139,9 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
+  wsAuthRequired: boolean;
+  wsMaxConnectionsPerIp: number;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -238,12 +276,13 @@ export function parseEnv(env: NodeJS.ProcessEnv): ParsedEnv {
 }
 
 function resolveNetwork(env: ParsedEnv): StellarNetwork {
-  return env.STELLAR_NETWORK ?? (env.NODE_ENV === 'production' ? 'mainnet' : 'testnet');
+  return resolveStellarNetwork(env);
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
+  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? env.STELLAR_CONTRACT_ADDRESS;
   return {
-    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    streaming,
     contract: env.STELLAR_CONTRACT_ADDRESS,
     token: env.STELLAR_TOKEN_ADDRESS,
   };
@@ -253,6 +292,9 @@ function toConfig(env: ParsedEnv): Config {
   const stellarNetwork = resolveNetwork(env);
   const networkDefaults = STELLAR_NETWORKS[stellarNetwork];
   const isProduction = env.NODE_ENV === 'production';
+  const contractAddresses = resolveContractAddresses(stellarNetwork, env);
+
+  assertNetworkMatchesContracts(stellarNetwork, contractAddresses);
 
   return {
     port: env.PORT,
@@ -276,9 +318,26 @@ function toConfig(env: ParsedEnv): Config {
     redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
     redisSentinelName: env.REDIS_SENTINEL_NAME,
     redisClusterNodes: env.REDIS_CLUSTER_NODES,
+    redisConnectTimeoutMs: env.REDIS_CONNECT_TIMEOUT_MS,
+    redisMaxRetriesPerRequest: env.REDIS_MAX_RETRIES_PER_REQUEST,
+    redisRetryBaseDelayMs: env.REDIS_RETRY_BASE_DELAY_MS,
+    redisRetryMaxDelayMs: env.REDIS_RETRY_MAX_DELAY_MS,
+    redisRetryMaxAttempts: env.REDIS_RETRY_MAX_ATTEMPTS,
 
     stellarNetwork,
     stellarRpcUrl: env.STELLAR_RPC_URL,
+    stellarRpcTimeout: env.STELLAR_RPC_TIMEOUT,
+    stellarRpcMaxRetries: env.STELLAR_RPC_MAX_RETRIES,
+    stellarRpcRetryDelay: env.STELLAR_RPC_RETRY_DELAY,
+    stellarRpcOperationDeadlines: env.STELLAR_RPC_OPERATION_DEADLINES,
+    rpcCircuitBreakerFailureThreshold: env.RPC_CB_FAILURE_THRESHOLD,
+    rpcCircuitBreakerWindowMs: env.RPC_CB_WINDOW_MS,
+    rpcCircuitBreakerResetTimeoutMs: env.RPC_CB_RESET_TIMEOUT_MS,
+    rpcTimeoutMs: env.RPC_TIMEOUT_MS,
+    rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
+    rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
+    rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
@@ -329,8 +388,15 @@ function toConfig(env: ParsedEnv): Config {
     webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
     webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
     webhookRetryRps: env.WEBHOOK_RETRY_RPS,
+    webhookRetryBurst: env.WEBHOOK_RETRY_BURST,
+    webhookCircuitBreakerThreshold: env.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD,
+    webhookCircuitBreakerResetMs: env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS,
+    webhookBatchMaxBackoffMs: env.WEBHOOK_BATCH_MAX_BACKOFF_MS,
+    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
     webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
-      ? env.WEBHOOK_ALLOWED_HOSTS.split(',').map(h => h.trim()).filter(h => h.length > 0)
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',')
+          .map((h) => h.trim())
+          .filter((h) => h.length > 0)
       : undefined,
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
@@ -340,6 +406,9 @@ function toConfig(env: ParsedEnv): Config {
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
+    wsAuthRequired: env.WS_AUTH_REQUIRED,
+    wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
@@ -401,6 +470,12 @@ export function initializeConfig(): Config {
   }
 
   configInstance = loadConfig();
+  if (process.env.NODE_ENV !== 'test') {
+    logActiveStellarConfig({
+      network: configInstance.stellarNetwork,
+      contractAddresses: configInstance.contractAddresses,
+    });
+  }
   return configInstance;
 }
 

@@ -3,7 +3,7 @@
 # Environment Variable Reference
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
-issue #1519). 136 variables across 11 subsystems.
+issue #1519). 152 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
 (required, or optional with a runtime fallback).
@@ -26,7 +26,8 @@ issue #1519). 136 variables across 11 subsystems.
 | `DB_IDLE_TIMEOUT` | Idle client release timeout in ms. @default 30000 | `30000` |
 | `DB_POOL_MAX` | Maximum primary-pool connections. @default 10 | `10` |
 | `DB_POOL_MIN` | Minimum primary-pool connections. @default 2 | `2` |
-| `REPLICA_QUEUE_LIMIT` | Max requests allowed to queue on the replica pool before fast-failing. | `25` |
+| `POOL_QUEUE_LIMIT` | Max requests allowed to queue on the primary pool before fast-failing with 503. @default 50 | `50` |
+| `REPLICA_QUEUE_LIMIT` | Max requests allowed to queue on the replica pool before fast-failing. @default 25 | `25` |
 | `REPLICA_STATEMENT_TIMEOUT_MS` | Replica statement timeout in ms. Defaults to STATEMENT_TIMEOUT_MS when absent. 0 = disabled. | — |
 | `SLOW_QUERY_THRESHOLD_MS` | Queries slower than this are logged as slow. @default 1000 | `1000` |
 | `STATEMENT_TIMEOUT_MS` | statement_timeout for primary connections in ms; 0 disables. @default 5000 | `5000` |
@@ -36,8 +37,13 @@ issue #1519). 136 variables across 11 subsystems.
 | Variable | Purpose | Default |
 |---|---|---|
 | `REDIS_CLUSTER_NODES` | Comma-separated list of cluster nodes: host:port,host:port | — |
+| `REDIS_CONNECT_TIMEOUT_MS` | TCP connect timeout for each Redis client, in ms. @default 5000 | `5000` |
 | `REDIS_ENABLED` | Master switch for Redis-backed features; false falls back to in-memory. @default true | `true` |
+| `REDIS_MAX_RETRIES_PER_REQUEST` | Command retries per request before a Redis call fails. @default 3 | `3` |
 | `REDIS_MODE` | Client topology: `standalone` (single endpoint), `sentinel` (HA via monitors), or `cluster` (sharded). @default 'standalone' | `standalone` |
+| `REDIS_RETRY_BASE_DELAY_MS` | Base delay of the Redis reconnect backoff, in ms. @default 50 | `50` |
+| `REDIS_RETRY_MAX_ATTEMPTS` | Reconnect attempts before ioredis stops retrying. @default 10 | `10` |
+| `REDIS_RETRY_MAX_DELAY_MS` | Ceiling of the Redis reconnect backoff, in ms. @default 2000 | `2000` |
 | `REDIS_SENTINEL_HOSTS` | Comma-separated list of sentinel nodes: host:port,host:port | — |
 | `REDIS_SENTINEL_NAME` | Sentinel master name (required when REDIS_MODE=sentinel) | — |
 | `REDIS_URL` | Redis connection string for cache, pub/sub, and queue backends. @default 'redis://localhost:6379' | `redis://localhost:6379` |
@@ -46,7 +52,7 @@ issue #1519). 136 variables across 11 subsystems.
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `CONTRACT_ADDRESS_STREAMING` | Streaming contract address override used by stream consumers. | — |
+| `CONTRACT_ADDRESS_STREAMING` | Optional dedicated streaming contract address. Falls back to STELLAR_CONTRACT_ADDRESS when unset. Must be a valid StrKey and is checked against the pinned allowlist when a network is resolved. | — |
 | `HORIZON_NETWORK_PASSPHRASE` | Horizon network passphrase; must match the resolved network's passphrase when set. | — |
 | `HORIZON_URL` | Horizon API base URL. When unset, falls back to the network default (STELLAR_NETWORKS[network].horizonUrl). | — |
 | `STELLAR_CONTRACT_ADDRESS` | Streaming contract address (Stellar contract StrKey, allowlisted when not local). | — |
@@ -105,6 +111,7 @@ issue #1519). 136 variables across 11 subsystems.
 | `FLUXORA_WEBHOOK_SECRET` | Fluxora-platform inbound webhook HMAC secret. | — |
 | `FLUXORA_WEBHOOK_SECRET_PREVIOUS` | Previous Fluxora-platform webhook secret during rotation. | — |
 | `WEBHOOK_ALLOWED_HOSTS` | Comma-separated SSRF allowlist of webhook hostnames. | — |
+| `WEBHOOK_BATCH_MAX_BACKOFF_MS` | Cap of the exponential backoff between batch retries, in ms. @default 60000 | `60000` |
 | `WEBHOOK_BATCH_SIZE` | Webhooks dispatched per outbox poll batch. @default 10 | `10` |
 | `WEBHOOK_CIRCUIT_BREAKER_RESET_MS` | Delay before a tripped circuit breaker half-opens, in ms. @default 300000 | `300000` |
 | `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD` | Consecutive failures before the circuit breaker opens; 0 disables. @default 0 | `0` |
@@ -145,6 +152,7 @@ issue #1519). 136 variables across 11 subsystems.
 | `WORKER_ENABLED` | Run background queue workers inside this process. @default false | `false` |
 | `WS_ALLOWED_ORIGINS` | Comma-separated allowed origins for WebSocket connections. | — |
 | `WS_AUTH_REQUIRED` | Require Origin allowlist checks on WebSocket upgrades. @default false | `false` |
+| `WS_MAX_CONNECTIONS_PER_IP` | Max concurrent WebSocket connections per client IP. @default 10 | `10` |
 | `WS_RECONNECT_LIMIT` | Max WebSocket reconnect attempts per client window. @default 20 | `20` |
 | `WS_RECONNECT_WINDOW_MS` | Sliding window for WS reconnect limiting, in ms. @default 60000 | `60000` |
 
@@ -177,6 +185,10 @@ issue #1519). 136 variables across 11 subsystems.
 | `RATE_LIMIT_IP_MAX` | Max requests per IP per window. @default 100 | — |
 | `RATE_LIMIT_IP_WINDOW_MS` | Sliding window for per-IP limits, in ms. @default 60000 | — |
 | `RATE_LIMIT_TRUST_PROXY` | Honor X-Forwarded-For from reverse proxies. @default true | `true` |
+| `RATE_LIMIT_TRUSTED_PROXIES` | Comma-separated list of trusted proxies for rate-limit keying. | — |
+| `TRUSTED_PROXIES` | Comma-separated list of trusted proxy IPs/CIDRs (global fallback). | — |
+| `TRUSTED_PROXY_COUNT` | Number of trusted proxies in front of the service (0 = direct). @default 0 | `0` |
+| `WS_TRUSTED_PROXIES` | Comma-separated list of trusted proxies for WebSocket client-IP resolution. | — |
 
 ## Infrastructure & Ops
 
@@ -191,6 +203,10 @@ issue #1519). 136 variables across 11 subsystems.
 | `RPC_CB_FAILURE_THRESHOLD` | Failed RPC calls within the window before the circuit opens. @default 5 | `5` |
 | `RPC_CB_RESET_TIMEOUT_MS` | Time before an open RPC circuit half-opens, in ms. @default 60000 | `60000` |
 | `RPC_CB_WINDOW_MS` | Sliding window for RPC failure counting, in ms. @default 30000 | `30000` |
+| `RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA` | Beta parameter for the fallback cache's early-expiry probabilistic refresh. @default 0 | — |
+| `RPC_FALLBACK_CACHE_TTL_SECONDS` | TTL of the RPC fallback cache in seconds. @default 300 | `300` |
+| `RPC_HEALTH_CHECK_FAILURE_THRESHOLD` | Consecutive RPC health-check failures before a target is marked unhealthy. @default 3 | `3` |
+| `RPC_HEALTH_CHECK_INTERVAL_MS` | Interval between proactive RPC health checks in ms; 0 disables. @default 0 | `0` |
 | `RPC_TIMEOUT_MS` | Per-attempt RPC timeout in ms. @default 5000 | `5000` |
 | `S3_BACKUP_BUCKET` | S3 bucket holding database backups. @default unset (backups disabled) | — |
 | `S3_BACKUP_PREFIX` | Key prefix under which backups are written in S3_BACKUP_BUCKET. | — |

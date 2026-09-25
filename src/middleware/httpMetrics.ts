@@ -11,6 +11,7 @@ export const UNMATCHED_ROUTE = 'unmatched';
  * Uses `baseUrl + route.path` (the pattern, e.g. `/users/:id`) so path
  * parameters never appear as distinct series. Unmatched requests share one
  * fixed label to keep cardinality bounded.
+ */
 import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /**

@@ -6,17 +6,31 @@
  * Every field is documented with its purpose and default; the composed schema
  * (`src/config/env.ts`) is unchanged in effect.
  */
-import { integerEnv, optionalString } from './parsers.js';
+import { z } from 'zod';
+import { integerEnv, optionalString, parseNumber } from './parsers.js';
+import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from '../connectionLimits.js';
 
 export const infrastructureEnvSchema = {
   /** Failed RPC calls within the window before the circuit opens. @default 5 */
-  RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(5),
+  RPC_CB_FAILURE_THRESHOLD: integerEnv('RPC_CB_FAILURE_THRESHOLD', 1).default(
+    LIMITS.RPC_CB_FAILURE_THRESHOLD
+  ),
   /** Sliding window for RPC failure counting, in ms. @default 30000 */
-  RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(30000),
+  RPC_CB_WINDOW_MS: integerEnv('RPC_CB_WINDOW_MS', 1).default(LIMITS.RPC_CB_WINDOW_MS),
   /** Time before an open RPC circuit half-opens, in ms. @default 60000 */
-  RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(60000),
+  RPC_CB_RESET_TIMEOUT_MS: integerEnv('RPC_CB_RESET_TIMEOUT_MS', 1).default(
+    LIMITS.RPC_CB_RESET_TIMEOUT_MS
+  ),
   /** Per-attempt RPC timeout in ms. @default 5000 */
-  RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(5000),
+  RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
+  /** TTL of the RPC fallback cache in seconds. @default 300 */
+  RPC_FALLBACK_CACHE_TTL_SECONDS: integerEnv('RPC_FALLBACK_CACHE_TTL_SECONDS', 1).default(300),
+  /** Beta parameter for the fallback cache's early-expiry probabilistic refresh. @default 0 */
+  RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA: z.preprocess(parseNumber, z.number().min(0).default(0)),
+  /** Interval between proactive RPC health checks in ms; 0 disables. @default 0 */
+  RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
+  /** Consecutive RPC health-check failures before a target is marked unhealthy. @default 3 */
+  RPC_HEALTH_CHECK_FAILURE_THRESHOLD: integerEnv('RPC_HEALTH_CHECK_FAILURE_THRESHOLD', 1).default(3),
   /** Retention window for idempotency keys in seconds (max 7 days). @default 86400 */
   IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 

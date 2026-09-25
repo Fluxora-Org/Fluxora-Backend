@@ -5,9 +5,17 @@
  * their behavior is intentionally unchanged. See `src/config/env-schema/` for
  * the per-subsystem fragments and `env.ts` for the composition.
  */
-import { z, type ZodBoolean, type ZodOptional, type ZodPipe, type ZodPreprocess, type ZodString } from 'zod';
+import {
+  z,
+  type ZodBoolean,
+  type ZodNumber,
+  type ZodOptional,
+  type ZodPipe,
+  type ZodPreprocess,
+  type ZodRecord,
+  type ZodString,
+} from 'zod';
 import { isValidStellarContractAddress } from '../stellarContracts.js';
-
 /**
  * Names of environment variables whose values must never appear in validation
  * error messages. `issueMessage()` (env-config.ts) redacts quoted strings from
@@ -94,7 +102,7 @@ export function urlString(name: string): ZodString {
 }
 
 /** Optional, valid absolute URL; empty strings are treated as unset. */
-export function optionalUrlString(name: string): ZodOptional<ZodString> {
+export function optionalUrlString(name: string): ZodPreprocess<ZodOptional<ZodString>> {
   return z.preprocess(
     (value) => (value === '' ? undefined : value),
     z
@@ -131,15 +139,34 @@ export function integerEnv(
 }
 
 /** Boolean accepting `true/1/false/0` (case-insensitive). */
-export function booleanEnv(): ZodBoolean {
+export function booleanEnv(): ZodPreprocess<ZodBoolean> {
   return z.preprocess(parseBoolean, z.boolean());
 }
 
 /** Optional non-empty string; empty strings are treated as unset. */
-export function optionalString(name: string): ZodOptional<ZodString> {
+export function optionalString(name: string): ZodPreprocess<ZodOptional<ZodString>> {
   return z.preprocess(
     (value) => (value === '' ? undefined : value),
     z.string().min(1, `${name} cannot be empty`).optional()
+  );
+}
+
+/**
+ * Parse a JSON object of per-operation timeout overrides (operation name → ms).
+ * Empty input becomes an empty record so config consumers see a stable shape.
+ */
+export function operationDeadlinesEnv(): ZodPreprocess<ZodRecord<ZodString, ZodNumber>> {
+  return z.preprocess(
+    (value) => {
+      if (value === undefined || value === '') return {};
+      if (typeof value !== 'string') return value;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    },
+    z.record(z.string(), z.number().int().min(1, 'RPC operation deadlines must be at least 1ms'))
   );
 }
 

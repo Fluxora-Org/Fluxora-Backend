@@ -22,6 +22,8 @@ export const webhooksEnvSchema = {
   WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
   /** Webhooks dispatched per outbox poll batch. @default 10 */
   WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
+  /** Cap of the exponential backoff between batch retries, in ms. @default 60000 */
+  WEBHOOK_BATCH_MAX_BACKOFF_MS: integerEnv('WEBHOOK_BATCH_MAX_BACKOFF_MS', 1).default(60_000),
   /** Steady-state retry dispatch rate, webhooks/second. @default 10 */
   WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
   /** Extra tokens allowed above the steady retry rate in a burst. @default 0 */

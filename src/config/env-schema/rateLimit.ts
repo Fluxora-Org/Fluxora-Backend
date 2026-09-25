@@ -25,4 +25,12 @@ export const rateLimitEnvSchema = {
   RATE_LIMIT_TRUST_PROXY: booleanEnv().default(true),
   /** Comma-separated IPs exempt from rate limiting. */
   RATE_LIMIT_ALLOWLIST_IPS: optionalString('RATE_LIMIT_ALLOWLIST_IPS'),
+  /** Number of trusted proxies in front of the service (0 = direct). @default 0 */
+  TRUSTED_PROXY_COUNT: integerEnv('TRUSTED_PROXY_COUNT', 0, 100).default(0),
+  /** Comma-separated list of trusted proxy IPs/CIDRs (global fallback). */
+  TRUSTED_PROXIES: optionalString('TRUSTED_PROXIES'),
+  /** Comma-separated list of trusted proxies for WebSocket client-IP resolution. */
+  WS_TRUSTED_PROXIES: optionalString('WS_TRUSTED_PROXIES'),
+  /** Comma-separated list of trusted proxies for rate-limit keying. */
+  RATE_LIMIT_TRUSTED_PROXIES: optionalString('RATE_LIMIT_TRUSTED_PROXIES'),
 };
