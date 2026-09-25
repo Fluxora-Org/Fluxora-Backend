@@ -110,7 +110,14 @@ import {
 } from '../validation/schemas.js';
 import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
-import { isTerminalStatus } from '../streams/status.js';
+import {
+  assertValidApiTransition,
+  isApiStreamStatus,
+  isTerminalStatus,
+  API_STREAM_STATUSES,
+  deriveStreamStatusFromSchedule,
+  type ApiStreamStatus,
+} from '../streams/status.js';
 import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { isValidStreamStatus } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
@@ -271,6 +278,11 @@ export function setIdempotencyStore(
 // ── DB → API mapper ───────────────────────────────────────────────────────────
 
 function toApiStream(record: StreamRecord): Stream {
+  const status = deriveStreamStatusFromSchedule({
+    startTime: record.start_time,
+    endTime: record.end_time,
+    status: record.status,
+  }).status;
   return {
     id: record.id,
     sender: record.sender_address,
@@ -281,7 +293,7 @@ function toApiStream(record: StreamRecord): Stream {
     ratePerSecond: record.rate_per_second,
     startTime: record.start_time,
     endTime: record.end_time,
-    status: record.status,
+    status,
   };
 }
 
@@ -477,28 +489,7 @@ function wrapDbError(err: unknown): never {
   throw err;
 }
 
-// ── API status state machine ──────────────────────────────────────────────────
-
-type ApiStreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
-
-const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
-  active: ['paused', 'completed', 'cancelled'],
-  paused: ['active', 'cancelled'],
-  completed: [],
-  cancelled: [],
-};
-
-function assertValidApiTransition(
-  from: ApiStreamStatus,
-  to: ApiStreamStatus,
-): { ok: true } | { ok: false; message: string } {
-  const allowed = API_TRANSITIONS[from] ?? [];
-  if (allowed.includes(to)) return { ok: true };
-  if (from === to) return { ok: false, message: `Stream is already ${from}` };
-  if (from === 'completed') return { ok: false, message: 'Stream is already completed and cannot be transitioned' };
-  if (from === 'cancelled') return { ok: false, message: 'Stream is already cancelled and cannot be transitioned' };
-  return { ok: false, message: `Cannot transition stream from '${from}' to '${to}'` };
-}
+// ── API status state machine (shared: ../streams/status.js) ─────────────
 
 // ── Test helpers (no-op in production) ───────────────────────────────────────
 
@@ -662,7 +653,11 @@ streamsRouter.get(
 
     // Cache only when every stream on the page is in a terminal state.
     // An empty page is treated as all-terminal (nothing mutable present).
-    const allTerminal = pageStreams.every((s) => isTerminalStatus(s.status as ApiStreamStatus));
+    const allTerminal = pageStreams.every((s) => isTerminalStatus(deriveStreamStatusFromSchedule({
+      startTime: s.startTime,
+      endTime: s.endTime,
+      status: s.status as ApiStreamStatus,
+    }).status));
     res.set(
       'Cache-Control',
       allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
@@ -823,7 +818,11 @@ streamsRouter.get(
     setStreamResourceHeaders(res, record!);
     res.set(
       'Cache-Control',
-      isTerminalStatus(stream.status as ApiStreamStatus)
+      isTerminalStatus(deriveStreamStatusFromSchedule({
+        startTime: stream.startTime,
+        endTime: stream.endTime,
+        status: stream.status as ApiStreamStatus,
+      }).status)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
@@ -895,7 +894,11 @@ streamsRouter.get(
     setStreamResourceHeaders(res, record);
     res.set(
       'Cache-Control',
-      isTerminalStatus(record.status as ApiStreamStatus)
+      isTerminalStatus(deriveStreamStatusFromSchedule({
+        startTime: record.start_time,
+        endTime: record.end_time,
+        status: record.status,
+      }).status)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
@@ -1146,9 +1149,8 @@ streamsRouter.patch(
       throw notFound('Stream', '');
     }
 
-    const validStatuses: ApiStreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
-    if (typeof newStatus !== 'string' || !validStatuses.includes(newStatus as ApiStreamStatus)) {
-      throw validationError('status must be one of: active, paused, completed, cancelled');
+    if (!isApiStreamStatus(newStatus)) {
+      throw validationError(`status must be one of: ${API_STREAM_STATUSES.join(', ')}`);
     }
 
     let record;

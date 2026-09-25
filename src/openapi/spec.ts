@@ -10,6 +10,7 @@ import {
   extendZodWithOpenApi,
 } from '@asteasolutions/zod-to-openapi';
 import { ApiKeyCreatedSchema as _ApiKeyCreatedBase } from '../lib/apiKey.js';
+import { API_STREAM_STATUSES } from '../streams/status.js';
 
 extendZodWithOpenApi(z);
 
@@ -64,7 +65,7 @@ const StellarAddress = registry.register(
 
 const StreamStatus = registry.register(
   'StreamStatus',
-  z.enum(['active', 'paused', 'completed', 'cancelled']).openapi({ example: 'active' })
+  z.enum(API_STREAM_STATUSES).openapi({ example: 'active' })
 );
 
 const StreamObject = registry.register(
