@@ -48,14 +48,22 @@ export interface RpcFallbackCacheSetOptions {
 
 export interface RpcFallbackCache {
   get<T>(operation: string, cacheParts?: readonly string[]): Promise<T | null>;
-  set<T>(operation: string, value: T, ttlSeconds: number, cacheParts?: readonly string[]): Promise<void>;
-  getEntry?<T>(operation: string, cacheParts?: readonly string[]): Promise<RpcFallbackCacheEntry<T> | null>;
+  set<T>(
+    operation: string,
+    value: T,
+    ttlSeconds: number,
+    cacheParts?: readonly string[]
+  ): Promise<void>;
+  getEntry?<T>(
+    operation: string,
+    cacheParts?: readonly string[]
+  ): Promise<RpcFallbackCacheEntry<T> | null>;
   setEntry?<T>(
     operation: string,
     value: T,
     ttlSeconds: number,
     cacheParts?: readonly string[],
-    options?: RpcFallbackCacheSetOptions,
+    options?: RpcFallbackCacheSetOptions
   ): Promise<void>;
 }
 
@@ -77,20 +85,27 @@ function encodeCacheKeyPart(part: string): string {
 /**
  * Builds a collision-resistant cache key.
  *
- * We keep the SAFE_OPERATION allow-list check, but we additionally hash each
- * cache-part (and also the operation name) before concatenation.
+ * @security
+ * - Every component (the operation name and each cache part) is validated
+ *   against the `SAFE_OPERATION` allow-list and then SHA-256 hashed before
+ *   concatenation. Raw, potentially attacker-influenced strings (account
+ *   addresses, horizon URLs, cursor tokens) never appear verbatim in the key,
+ *   so delimiter-forging across tuple boundaries is impossible.
+ * - Two distinct `(operation, cacheParts[])` tuples therefore map to distinct
+ *   keys with overwhelming probability (second-preimage resistance of
+ *   SHA-256), rather than relying on delimiter-joined raw strings.
+ * - The key is versioned (`v2`) so the format can evolve without colliding
+ *   with keys written by older code.
  *
- * Why: delimiter-joined raw strings can be made to collide via different
- * (operation, parts[]) tuples.
- *
- * Key format stays stable for SAFE operations by including explicit versions.
+ * @throws {Error} if `operation` or any `cachePart` contains characters
+ *   outside the `SAFE_OPERATION` allow-list.
  */
-function buildCacheKey(operation: string, cacheParts: readonly string[] = []): string {
+export function buildCacheKey(operation: string, cacheParts: readonly string[] = []): string {
   if (!SAFE_OPERATION.test(operation)) {
     throw new Error('RPC fallback cache operation contains unsafe characters');
   }
 
-  const encodedOperation = encodeCacheKeyPart(operation);
+  const encodedOperation = hashCachePart(operation);
   const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
   // Key format versioning:
@@ -99,23 +114,43 @@ function buildCacheKey(operation: string, cacheParts: readonly string[] = []): s
   return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
 }
 
-
+/**
+ * Test-only variant of {@link buildCacheKey} that skips the `SAFE_OPERATION`
+ * allow-list.
+ *
+ * It exists so unit tests can construct genuinely near-colliding inputs (for
+ * example delimiter-forging tuples that a naive delimiter-join strategy would
+ * collapse into one key) and assert that the hashing strategy still maps them
+ * to distinct keys.
+ *
+ * DO NOT call this from production code paths.
+ */
+export function buildUnsafeCacheKeyForTest(
+  operation: string,
+  cacheParts: readonly string[] = []
+): string {
+  const encodedOperation = hashCachePart(operation);
+  const encodedParts = cacheParts.map(hashCachePart);
+  return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
+}
 
 function isCacheEnvelope<T>(value: unknown): value is RpcFallbackCacheEnvelope<T> {
-  return typeof value === 'object'
-    && value !== null
-    && (value as { version?: unknown }).version === RPC_FALLBACK_CACHE_ENVELOPE_VERSION
-    && 'value' in value
-    && typeof (value as { writtenAt?: unknown }).writtenAt === 'number'
-    && typeof (value as { expiresAt?: unknown }).expiresAt === 'number'
-    && typeof (value as { ttlSeconds?: unknown }).ttlSeconds === 'number'
-    && typeof (value as { refreshDurationMs?: unknown }).refreshDurationMs === 'number';
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { version?: unknown }).version === RPC_FALLBACK_CACHE_ENVELOPE_VERSION &&
+    'value' in value &&
+    typeof (value as { writtenAt?: unknown }).writtenAt === 'number' &&
+    typeof (value as { expiresAt?: unknown }).expiresAt === 'number' &&
+    typeof (value as { ttlSeconds?: unknown }).ttlSeconds === 'number' &&
+    typeof (value as { refreshDurationMs?: unknown }).refreshDurationMs === 'number'
+  );
 }
 
 function createCacheEnvelope<T>(
   value: T,
   ttlSeconds: number,
-  options: RpcFallbackCacheSetOptions = {},
+  options: RpcFallbackCacheSetOptions = {}
 ): RpcFallbackCacheEnvelope<T> {
   const writtenAt = options.nowMs ?? Date.now();
   return {
@@ -232,7 +267,7 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
 
   async getEntry<T>(
     operation: string,
-    cacheParts: readonly string[] = [],
+    cacheParts: readonly string[] = []
   ): Promise<RpcFallbackCacheEntry<T> | null> {
     const key = buildCacheKey(operation, cacheParts);
 
@@ -264,7 +299,7 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
     operation: string,
     value: T,
     ttlSeconds: number,
-    cacheParts: readonly string[] = [],
+    cacheParts: readonly string[] = []
   ): Promise<void> {
     return this.setEntry(operation, value, ttlSeconds, cacheParts);
   }
@@ -274,7 +309,7 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
     value: T,
     ttlSeconds: number,
     cacheParts: readonly string[] = [],
-    options: RpcFallbackCacheSetOptions = {},
+    options: RpcFallbackCacheSetOptions = {}
   ): Promise<void> {
     const key = buildCacheKey(operation, cacheParts);
 
@@ -288,7 +323,9 @@ export class RedisRpcFallbackCache implements RpcFallbackCache {
     }
 
     try {
-      await this.client.set(key, JSON.stringify(createCacheEnvelope(value, ttlSeconds, options)), { ex: ttlSeconds });
+      await this.client.set(key, JSON.stringify(createCacheEnvelope(value, ttlSeconds, options)), {
+        ex: ttlSeconds,
+      });
     } catch (err) {
       logger.warn('Stellar RPC fallback cache write failed', undefined, {
         event: 'rpc_fallback_cache_write_failed',
@@ -335,7 +372,7 @@ export class InMemoryRpcFallbackCache implements RpcFallbackCache {
 
   async getEntry<T>(
     operation: string,
-    cacheParts: readonly string[] = [],
+    cacheParts: readonly string[] = []
   ): Promise<RpcFallbackCacheEntry<T> | null> {
     const key = buildCacheKey(operation, cacheParts);
     const entry = this.entries.get(key);
@@ -353,7 +390,7 @@ export class InMemoryRpcFallbackCache implements RpcFallbackCache {
     operation: string,
     value: T,
     ttlSeconds: number,
-    cacheParts: readonly string[] = [],
+    cacheParts: readonly string[] = []
   ): Promise<void> {
     return this.setEntry(operation, value, ttlSeconds, cacheParts);
   }
@@ -363,7 +400,7 @@ export class InMemoryRpcFallbackCache implements RpcFallbackCache {
     value: T,
     ttlSeconds: number,
     cacheParts: readonly string[] = [],
-    options: RpcFallbackCacheSetOptions = {},
+    options: RpcFallbackCacheSetOptions = {}
   ): Promise<void> {
     const key = buildCacheKey(operation, cacheParts);
     const envelope = createCacheEnvelope(value, ttlSeconds, options);
