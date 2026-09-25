@@ -45,6 +45,7 @@ import { hashStringSHA256 } from '../lib/security.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
 import { requireJsonContentType } from '../middleware/contentType.js';
+import { isValidStellarAccountAddress } from '../validation/stellarAddress.js';
 
 export const privacyRouter = Router();
 
@@ -429,12 +430,13 @@ privacyRouter.delete(
     if (
       typeof recipientAddress !== 'string' ||
       recipientAddress.trim().length === 0 ||
-      recipientAddress.length > 256
+      recipientAddress.length > 256 ||
+      !isValidStellarAccountAddress(recipientAddress.trim())
     ) {
       res.status(400).json({
         error: {
           code: 'INVALID_ADDRESS',
-          message: 'recipientAddress must be a non-empty string of at most 256 characters.',
+          message: 'recipientAddress must be a valid Stellar account address.',
         },
       });
       return;
