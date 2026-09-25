@@ -15,6 +15,7 @@
     "start": "node dist/src/index.js",
     "migrate": "tsx src/db/migrate.ts",
     "check:migrations": "node scripts/check-migration-names.mjs",
+    "check:blue-green-migrations": "node scripts/check-blue-green-migration-compatibility.mjs",
     "seed": "ts-node scripts/seed-test-data.ts",
     "benchmark": "ts-node scripts/benchmark.ts",
     "verify": "ts-node scripts/verify-setup.ts",
