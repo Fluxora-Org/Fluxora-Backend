@@ -47,6 +47,14 @@ import {
   recordConfigReloadFailure,
   recordConfigReloadSuccess,
 } from './metrics.js';
+import {
+  markDependenciesReady,
+  markPoolReady,
+  markRedisReady,
+  markIndexerReady,
+  markReady,
+  markShuttingDown,
+} from './startup/readiness.js';
 
 let server: ReturnType<typeof app.listen> | undefined;
 
@@ -177,6 +185,9 @@ if (process.env.NODE_ENV !== 'test') {
       budgetMs: cfg.startupProbeBudgetMs,
     });
 
+    // Mark startup dependency probes as complete.
+    markDependenciesReady();
+
     void checkAdminStatePersistence();
 
     server = app.listen(cfg.port, () => {
@@ -185,11 +196,35 @@ if (process.env.NODE_ENV !== 'test') {
         env: cfg.nodeEnv,
       });
 
-      indexerService.resumeIncompleteReplay().catch((err) => {
-        logger.error('indexer:resume_failed', undefined, {
-          error: err instanceof Error ? err.message : String(err),
+      // Indexer startup runs asynchronously after server is listening.
+      // Mark each stage ready as it completes, then mark the service fully ready.
+      indexerService.resumeIncompleteReplay()
+        .then(() => {
+          // Mark pool ready after the app initializes (which happens during require).
+          markPoolReady();
+          // Mark Redis ready after app initialization.
+          markRedisReady();
+          // Mark indexer ready after replay completes.
+          markIndexerReady();
+          // Finally, mark the entire service ready to accept traffic.
+          markReady();
+
+          logger.info('startup:complete', undefined, {
+            phase: 'READY',
+            message: 'All dependencies ready; accepting traffic',
+          });
+        })
+        .catch((err) => {
+          logger.error('indexer:resume_failed', undefined, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Even if indexer resume fails, mark as ready so service doesn't block indefinitely.
+          // The indexer health check will report degraded status.
+          markPoolReady();
+          markRedisReady();
+          markIndexerReady();
+          markReady();
         });
-      });
     });
 
     process.on('SIGTERM', () => void gracefulShutdown(server!, 'SIGTERM'));
