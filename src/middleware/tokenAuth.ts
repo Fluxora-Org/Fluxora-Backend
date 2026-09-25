@@ -15,6 +15,7 @@
  * access properly.
  */
 import type { IncomingMessage } from 'http';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
 
 import { logger } from '../lib/logger.js';
@@ -22,6 +23,7 @@ import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
+import { unauthorized } from './errorHandler.js';
 
 // ── WebSocket JWT auth ────────────────────────────────────────────────────────
 
