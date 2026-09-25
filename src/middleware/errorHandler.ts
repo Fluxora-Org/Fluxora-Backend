@@ -50,6 +50,13 @@ export function errorHandler(
   }
 
   if (err instanceof QueryTimeoutError) {
+    logError('Query timeout handled', {
+      errorName: err.name,
+      errorMessage: err.message,
+      stack: err.stack,
+      requestId,
+      ...traceSpanIds,
+    });
     res.status(504).json(
       errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
     );
@@ -61,7 +68,7 @@ export function errorHandler(
     res.status(400).json(
       errorResponse(
         ApiErrorCode.DECIMAL_ERROR,
-        err.message,
+        'Invalid decimal value',
         { decimalErrorCode: err.code, field: err.field },
         requestId
       )
@@ -86,6 +93,13 @@ export function errorHandler(
   }
 
   if ((err as { type?: string }).type === 'entity.too.large') {
+    logError('Request body exceeded configured size limit', {
+      errorName: err.name,
+      errorMessage: err.message,
+      stack: err.stack,
+      requestId,
+      ...traceSpanIds,
+    });
     res.status(413).json(
       errorResponse(
         ApiErrorCode.PAYLOAD_TOO_LARGE,
@@ -99,6 +113,13 @@ export function errorHandler(
 
   // express.json() throws SyntaxError on malformed bodies — surface as 400.
   if (err instanceof SyntaxError && (err as SyntaxError & { status?: number }).status === 400) {
+    logError('Malformed JSON request body', {
+      errorName: err.name,
+      errorMessage: err.message,
+      stack: err.stack,
+      requestId,
+      ...traceSpanIds,
+    });
     res.status(400).json(
       errorResponse(
         ApiErrorCode.VALIDATION_ERROR,
