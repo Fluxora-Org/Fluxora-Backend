@@ -36,6 +36,12 @@ node scripts/check-performance-budget.mjs --fixture-regression
 
 `k6 run k6/main.js` writes `k6/results/performance-budget-summary.json` via `handleSummary` so results stay comparable across releases (same endpoint ids and percentile columns).
 
+The manually dispatched [Load tests workflow](../.github/workflows/load-tests.yml)
+runs the selected profile against a deployed environment, fails when a threshold
+is exceeded or an endpoint produces no percentile data, and retains the raw
+metrics plus both summaries as a 90-day GitHub Actions artifact. Set the
+`K6_API_KEY` repository secret when the target requires bearer authentication.
+
 ## Updating the budget
 
 1. Re-measure production p95/p99 for each hot route.

@@ -6,6 +6,7 @@ import {
   errorRate,
   streamsCreateLatency,
   JSON_HEADERS,
+  AUTH_HEADERS,
   makeStreamPayload,
 } from '../helpers.js';
 
@@ -39,6 +40,7 @@ export default function streamsCreateScenario() {
     headers: {
       'Content-Type': 'application/json',
       'Idempotency-Key': idempotencyKey,
+      ...AUTH_HEADERS,
     },
     tags: { endpoint: 'streams_create' },
   });
@@ -65,7 +67,7 @@ export default function streamsCreateScenario() {
 
   // --- Missing Idempotency-Key → 400 ---
   const noKeyRes = http.post(`${BASE_URL}/api/streams`, payload, {
-    ...JSON_HEADERS,
+    headers: { ...JSON_HEADERS.headers, ...AUTH_HEADERS },
     tags: { endpoint: 'streams_create' },
   });
   const noKeyOk = check(noKeyRes, {
@@ -79,6 +81,7 @@ export default function streamsCreateScenario() {
     headers: {
       'Content-Type': 'application/json',
       'Idempotency-Key': `${idempotencyKey}-empty`,
+      ...AUTH_HEADERS,
     },
     tags: { endpoint: 'streams_create' },
   });

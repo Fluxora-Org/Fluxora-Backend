@@ -17,6 +17,13 @@ export const JSON_HEADERS = {
   headers: { 'Content-Type': 'application/json' },
 };
 
+// Optional bearer authentication keeps the same scenarios usable against
+// public local instances and protected staging deployments.
+const API_KEY = __ENV.K6_API_KEY || '';
+export const AUTH_HEADERS = API_KEY
+  ? { Authorization: `Bearer ${API_KEY}` }
+  : {};
+
 /**
  * Run common response checks and record to the error rate metric.
  *
