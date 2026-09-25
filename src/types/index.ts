@@ -10,7 +10,7 @@ export interface ContractEvent {
   block_height: number;
   transaction_hash: string;
   ingested_at?: Date | null;
-  created_at?: Date;
+  created_at?: Date | null;
 }
 
 /**

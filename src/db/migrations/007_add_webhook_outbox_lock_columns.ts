@@ -15,6 +15,8 @@
  * @module db/migrations/007_add_webhook_outbox_lock_columns
  */
 
+export const IN_FLIGHT_INDEX_NAME = 'idx_webhook_outbox_in_flight';
+
 export const up = `
 -- Add status column (TEXT for extensibility)
 ALTER TABLE webhook_outbox

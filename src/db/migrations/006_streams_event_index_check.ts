@@ -11,9 +11,6 @@
  */
 
 export const up = `
--- Backfill any rows that may violate the constraint (should be none in practice).
-UPDATE streams SET event_index = 0 WHERE event_index < 0;
-
 ALTER TABLE streams
   ADD CONSTRAINT chk_streams_event_index_non_negative
   CHECK (event_index >= 0);

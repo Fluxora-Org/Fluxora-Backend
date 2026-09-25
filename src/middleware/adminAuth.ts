@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 import { verifyToken } from '../lib/auth.js';
+import { warn } from '../lib/logger.js';
 import crypto from 'crypto';
 
 /**
@@ -47,6 +48,12 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
 
   if (!adminKey) {
     recordOutcome('failure');
+    warn('Admin authorization refused — ADMIN_API_KEY is not configured', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+    });
     res.status(503).json({
       error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
     });
@@ -56,12 +63,25 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   const header = req.headers.authorization;
   if (!header) {
     recordOutcome('failure');
+    warn('Admin authorization refused — missing Authorization header', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+    });
     res.status(401).json({ error: 'Missing Authorization header.' });
     return;
   }
 
   if (header.length > MAX_AUTHORIZATION_HEADER_LENGTH) {
     recordOutcome('failure');
+    warn('Admin authorization refused — Authorization header too large', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+      headerLength: header.length,
+    });
     res.status(401).json({ error: 'Authorization header too large.' });
     return;
   }
@@ -69,6 +89,12 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   const parts = header.split(' ');
   if (parts.length !== 2 || parts[0] !== 'Bearer') {
     recordOutcome('failure');
+    warn('Admin authorization refused — invalid Authorization header scheme', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+    });
     res.status(401).json({ error: 'Authorization header must use Bearer scheme.' });
     return;
   }
@@ -76,13 +102,19 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   const token = parts[1];
   if (!token) {
     recordOutcome('failure');
+    warn('Admin authorization refused — missing Bearer token', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+    });
     res.status(401).json({ error: 'Bearer token is missing.' });
     return;
   }
 
   // Constant-time-ish comparison to reduce timing side-channels.
   if (token.length === adminKey.length && timingSafeEqual(token, adminKey)) {
-    (req as any).user = { role: 'admin' };
+    req.user = { address: '', role: 'admin' };
     recordOutcome('success');
     next();
     return;
@@ -93,7 +125,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
     const payload = verifyToken(token);
     const role = payload?.role;
     if (role === 'admin' || role === 'data-protection-officer') {
-      (req as any).user = payload;
+      req.user = payload;
       recordOutcome('success');
       next();
       return;
@@ -103,6 +135,12 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   }
 
   recordOutcome('failure');
+  warn('Admin authorization refused — invalid admin credentials', {
+    correlationId: req.correlationId ?? req.id,
+    path: req.originalUrl || req.path,
+    method: req.method,
+    ip: req.ip,
+  });
   res.status(403).json({ error: 'Invalid admin credentials.' });
   return;
 }

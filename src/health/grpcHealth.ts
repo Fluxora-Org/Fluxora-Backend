@@ -3,10 +3,13 @@
  * (`grpc-health-probe`, kubelet's built-in gRPC liveness/readiness probes).
  *
  * Reuses `HealthCheckManager` — the same dependency-check logic backing the
- * HTTP `/health/ready` route (src/routes/health.ts) — so the two surfaces
- * can never drift: `Check`/`Watch` map `healthy`/`degraded` to `SERVING`
- * and `unhealthy` to `NOT_SERVING`, exactly like `/health/ready`'s 200/503
- * split.
+ * HTTP `/health/ready` route (src/routes/health.ts) — and, more importantly,
+ * the *same readiness decision*: both surfaces call
+ * `checkInstanceReadiness()` from ./readiness.ts, which is the single source
+ * of truth for "should this instance receive traffic". `Check`/`Watch` map
+ * its `ready` flag to `SERVING`/`NOT_SERVING`, exactly like `/health/ready`'s
+ * 200/503 split, so an orchestrator watching gRPC and a load balancer
+ * watching HTTP can never disagree about the same instance.
  *
  * The standard proto (see ./health.proto for the human-readable reference)
  * is parsed from an in-memory string rather than read from disk: the
@@ -19,7 +22,8 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import protobuf from 'protobufjs';
 import { getConfig } from '../config/env.js';
-import type { HealthCheckManager, HealthStatus } from '../config/health.js';
+import type { HealthCheckManager } from '../config/health.js';
+import { checkInstanceReadiness } from './readiness.js';
 import { logger } from '../lib/logger.js';
 
 // Keep in sync with ./health.proto — the canonical, unmodified grpc.health.v1 spec.
@@ -72,24 +76,25 @@ function loadHealthServiceDefinition(): grpc.ServiceDefinition {
 
 const HEALTH_SERVICE_DEFINITION = loadHealthServiceDefinition();
 
-/** healthy/degraded still serve traffic (matches /health/ready's 200 for both). */
-function mapStatus(status: HealthStatus): HealthCheckResponse['status'] {
-  return status === 'unhealthy' ? 'NOT_SERVING' : 'SERVING';
-}
-
 /**
  * Resolve the current status via the real dependency checks (`checkAll()`,
  * not the cached `getLastReport()`) so `Check`/`Watch` reflect live state,
- * same as `/health/ready`. Never throws: any internal failure fails closed
- * to NOT_SERVING, since gRPC health-probe clients only understand the
- * ServingStatus enum, not gRPC error codes.
+ * same as `/health/ready`. The verdict comes from the shared readiness
+ * assessment, so gRPC reports `NOT_SERVING` for every case where
+ * `/health/ready` would return 503 (unhealthy, degraded during startup, or
+ * degraded past the grace period) and `SERVING` in every case where it would
+ * return 200.
+ *
+ * Never throws: any internal failure fails closed to NOT_SERVING, since gRPC
+ * health-probe clients only understand the ServingStatus enum, not gRPC error
+ * codes.
  */
 async function resolveServingStatus(
   healthManager: HealthCheckManager,
 ): Promise<HealthCheckResponse['status']> {
   try {
-    const report = await healthManager.checkAll();
-    return mapStatus(report.status);
+    const { assessment } = await checkInstanceReadiness(healthManager);
+    return assessment.ready ? 'SERVING' : 'NOT_SERVING';
   } catch (err) {
     logger.error('grpc_health_check_failed', undefined, {
       event: 'grpc_health_check_failed',

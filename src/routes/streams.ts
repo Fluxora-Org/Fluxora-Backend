@@ -1,9 +1,20 @@
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Streams API routes — PostgreSQL-backed.
  *
- * All list/get/create/cancel operations delegate to streamRepository.
- * The in-memory store has been removed; state lives in the `streams` table.
+ * This module only assembles the router. The work is split by concern:
+ *
+ *   routes/streams/read.ts      list, NDJSON export, HEAD, GET, JSON-LD
+ *   routes/streams/write.ts     create (idempotent), cancel, status transition
+ *   routes/streams/sse.ts       Server-Sent Events
+ *   routes/streams/longPoll.ts  long-poll fallback
+ *   routes/streams/realtime.ts  auth/limits/teardown/replay shared by SSE + long-poll
+ *   routes/streams/guards.ts    request validation, authorization, error mapping
+ *   routes/streams/state.ts     dependency health + idempotency store wiring
+ *
+ *   db/repositories/streamApiQueries.ts  query construction (filters, create rows)
+ *   serialization/stream.ts              response shaping (Stream, list pages, update envelopes)
+ *   utils/opaqueCursor.ts                cursor codec, shared with other paginated routes
+ *   utils/conditionalGet.ts              ETag / If-None-Match, shared with other resource routes
  *
  * Decimal-string invariant
  * ------------------------
@@ -71,160 +82,32 @@
  * @module routes/streams
  */
 import { Router } from 'express';
-import type { NextFunction, Request, Response } from 'express';
-import crypto from 'crypto';
-import { loadConfig } from '../config/env.js';
-import {
-  compareDecimalStringToZero,
-  validateDecimalString,
-  validateAmountFields,
-} from '../serialization/decimal.js';
-import { ApiError } from '../errors.js';
-import {
-  ApiErrorCode,
-  notFound,
-  validationError,
-  serviceUnavailable,
-  asyncHandler,
-  tooManyRequests,
-  forbidden,
-} from '../middleware/errorHandler.js';
-import { requireIdempotencyKey, parseIdempotencyKeyHeader } from '../middleware/requestProtection.js';
-import { canonicalizeBody } from '../middleware/idempotency.js';
-import { SerializationLogger, info, debug, warn } from '../utils/logger.js';
-import { recordAuditEvent } from '../lib/auditLog.js';
-import { authenticate, requireAuth, authenticateApiKey, requireScope } from '../middleware/auth.js';
-import { successResponse, idempotentReplayResponse } from '../utils/response.js';
-import { sendEarlyHints } from '../utils/earlyHints.js';
-import { streamRepository, StatusConflictError } from '../db/repositories/streamRepository.js';
-import { PoolExhaustedError } from '../db/pool.js';
-import {
-  issueWriteFencePin,
-  shouldForcePrimaryFromHeaders,
-  WRITE_FENCE_HEADER,
-} from '../db/writeFencePin.js';
-import {
-  CreateStreamSchema,
-  parseBody,
-  formatZodIssues,
-} from '../validation/schemas.js';
-import { PaginationSchema } from '../validation/paginationSchema.js';
-import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
-import { isTerminalStatus } from '../streams/status.js';
-import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
-import { isValidStreamStatus } from '../metrics/businessMetrics.js';
-import { verifyWsToken } from '../middleware/tokenAuth.js';
-import { recordServerTimingPhase } from '../middleware/serverTiming.js';
-import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
-import { STALE_CURSOR_ERROR_CODE, StaleCursorError } from '../indexer/store.js';
-import { getClientIp } from '../ws/connectionLimiter.js';
-import {
-  eventMatchesStreamId,
-  SSE_STREAM_UPDATE_EVENT,
-  SSE_CLOSE_EVENT,
-  SSE_CLOSE_REASONS,
-  subscribeToSseStream,
-  registerSseShutdownCallback,
-  type LiveSseStreamUpdateEvent,
-} from '../streams/sseEmitter.js';
-import {
-  resolveSseConnectionLimits,
-  tryAcquireSseConnection,
-} from '../streams/sseConnectionLimiter.js';
-import {
-  resolveLongPollConnectionLimits,
-  tryAcquireLongPollConnection,
-} from '../streams/longPoll.js';
-import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
-import {
-  RedisIdempotencyStore,
-  NoOpIdempotencyStore,
-  InMemoryIdempotencyStore,
-  type IdempotencyStore,
-  ENVELOPE_VERSION,
-} from '../redis/idempotencyStore.js';
-import { toStreamJsonLd } from '../serialization/jsonld.js';
+import type { Stream } from '../serialization/stream.js';
+import { registerReadRoutes } from './streams/read.js';
+import { registerWriteRoutes } from './streams/write.js';
+import { registerSseRoutes } from './streams/sse.js';
+import { registerLongPollRoutes } from './streams/longPoll.js';
+
+export type { Stream } from '../serialization/stream.js';
+export {
+  enforceStreamScope,
+  fingerprintInput,
+  getFeatureFlagRequesterId,
+  parseLastEventIdHeader,
+} from './streams/guards.js';
+export {
+  resetStreamIdempotencyStore,
+  setIdempotencyDependencyState,
+  setIdempotencyStore,
+  setStreamListingDependencyState,
+} from './streams/state.js';
+
 export const streamsRouter = Router();
 
-/**
- * Validate and sanitise the Last-Event-ID header value.
- *
- * Security: rejects control characters (CR/LF/NUL), whitespace-only values,
- * and values exceeding 200 characters. The allowed character set is printable
- * ASCII 0x21–0x7E which excludes space (0x20) and all control characters.
- *
- * Returns the trimmed, validated value or throws a validationError.
- * Returns `undefined` when the header is absent (no replay requested).
- *
- * Exported for unit testing — the HTTP parser strips control characters from
- * headers in transit, so integration tests cannot cover CR/LF/NUL paths.
- */
-export function parseLastEventIdHeader(raw: unknown): string | undefined {
-  if (raw === undefined) return undefined;
-  if (typeof raw !== 'string') {
-    throw validationError('Last-Event-ID must be a string');
-  }
-  // Validate the raw value BEFORE trimming so control characters in the value
-  // (CR, LF, NUL, etc.) are caught — trim() would strip trailing CR/LF.
-  if (raw.trim() === '') {
-    throw validationError('Last-Event-ID must not be empty or whitespace-only');
-  }
-  if (!/^[\x21-\x7E]+$/.test(raw)) {
-    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
-  }
-  const trimmed = raw.trim();
-  if (trimmed.length > 200) {
-    throw validationError('Last-Event-ID contains invalid characters or exceeds the 200-character limit');
-  }
-  return trimmed;
-}
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-/** Public-facing stream shape (camelCase, decimal strings). */
-export interface Stream {
-  id: string;
-  sender: string;
-  recipient: string;
-  depositAmount: string;
-  streamedAmount: string;
-  remainingAmount: string;
-  ratePerSecond: string;
-  startTime: number;
-  endTime: number;
-  status: string;
-}
-
-type StreamsCursor = { v: 1; lastId: string; scope?: string };
-type DependencyState = 'healthy' | 'unavailable';
-
-type NormalizedCreateInput = {
-  sender: string;
-  recipient: string;
-  depositAmount: string;
-  ratePerSecond: string;
-  startTime: number;
-  endTime: number;
-};
-
-const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
-const CACHEABLE_STREAM_HEADERS = 'public, max-age=300, stale-while-revalidate=60';
-const NO_STORE_STREAM_HEADERS = 'private, no-store';
-const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
-
-// ── Dependency state (injectable for tests) ───────────────────────────────────
-
-const streamListingDependency = { state: 'healthy' as DependencyState };
-const idempotencyDependency = { state: 'healthy' as DependencyState };
-
-// Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
-// by wireIdempotencyStore() in app.ts with a RedisIdempotencyStore when Redis
-// is available (REDIS_ENABLED=true).
-let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>>> =
-  new InMemoryIdempotencyStore();
-
-// TTL for idempotency entries — overridden in tests and set from config at startup
-let idempotencyTtlSeconds = 86400;
+registerReadRoutes(streamsRouter);
+registerWriteRoutes(streamsRouter);
+registerSseRoutes(streamsRouter);
+registerLongPollRoutes(streamsRouter);
 
 /**
  * Legacy shim — audit.test.ts and streams.test.ts reference this array.
@@ -234,6 +117,7 @@ let idempotencyTtlSeconds = 86400;
  */
 export const streams: Stream[] = [];
 
+/** Legacy no-op kept for existing test imports. */
 export function setStreamListingDependencyState(state: DependencyState): void {
   streamListingDependency.state = state;
 }
@@ -1068,6 +952,7 @@ streamsRouter.delete(
   requireAuth,
   authenticateApiKey,
   requireScope('streams:write'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.correlationId;
@@ -1084,6 +969,14 @@ streamsRouter.delete(
     }
 
     if (!record) throw notFound('Stream', id);
+
+    // Tenant ownership check: an authenticated, scoped caller can only cancel
+    // their own streams. req.callerAddress is set by enforceStreamScope when
+    // the JWT payload contains an address (non-operator role).
+    if (req.callerAddress && record!.sender_address !== req.callerAddress) {
+      // Return 404 to avoid leaking the existence of another tenant's resource.
+      throw notFound('Stream', id);
+    }
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
     if (!guard.ok) {
@@ -1544,6 +1437,15 @@ streamsRouter.get(
  * Holds the HTTP connection open (bounded by a timeout) until a new event for the stream
  * arrives or the timeout elapses. Returns the same event envelope shape used by the
  * WebSocket hub.
+ *
+ * Timeout Semantics:
+ * - When the hold duration elapses without an event, the response includes:
+ *   - status: 'timeout' field to distinguish from errors
+ *   - retryAfterSeconds: configured retry hint for clients
+ *   - Retry-After HTTP header with the same retry hint
+ * - This allows clients to distinguish idle timeouts from errors and implement backoff
+ * - Hold duration is configurable via LONG_POLL_MAX_CONNECTION_DURATION_MS (default: 30s)
+ * - Retry hint is configurable via LONG_POLL_RETRY_AFTER_SECONDS (default: 15s)
  */
 streamsRouter.get(
   '/:id/poll',
@@ -1853,7 +1755,13 @@ streamsRouter.get(
     pollTimer = setTimeout(() => {
       if (cleanedUp || res.destroyed || res.writableEnded) return;
       cleanup('timeout_elapsed');
-      res.json(successResponse(null, requestId));
+      // Distinguish timeout from error by including a status field and Retry-After header
+      res.setHeader('Retry-After', String(longPollLimits.retryAfterSeconds));
+      res.json(successResponse({ 
+        data: null, 
+        status: 'timeout',
+        retryAfterSeconds: longPollLimits.retryAfterSeconds 
+      }, requestId));
     }, timeoutMs);
 
     pollTimer.unref?.();

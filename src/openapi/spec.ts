@@ -564,7 +564,9 @@ registry.registerPath({
     query: z.object({
       limit: z.string().optional().openapi({
         example: '20',
-        description: 'Page size (1–100, default 20).',
+        description:
+          'Page size (1–100, default 20). ' +
+          'A request above the maximum is rejected with 400 VALIDATION_ERROR.',
       }),
       cursor: z
         .string()
@@ -2178,6 +2180,68 @@ registry.registerPath({
   },
 });
 
+registry.registerPath({
+  method: 'post',
+  path: '/internal/indexer/events/replay',
+  summary: 'Trigger historical DB backfill',
+  tags: ['indexer'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: z.object({
+            contract_id: z.string().min(1).openapi({
+              description: 'Contract identifier to replay events for.',
+              example: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+            }),
+            ledger: z.number().int().nonnegative().openapi({
+              description: 'Ledger number to replay.',
+              example: 512345,
+            }),
+            from_block: z.number().int().nonnegative().optional().openapi({
+              description: 'Optional lower bound block height (inclusive).',
+              example: 0,
+            }),
+            to_block: z.number().int().nonnegative().optional().openapi({
+              description: 'Optional upper bound block height (inclusive). Must be >= from_block.',
+              example: 100,
+            }),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    '202': {
+      description: 'Replay accepted and running asynchronously.',
+      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+    },
+    '400': errorResponses['400'],
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+    '409': errorResponses['409'],
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/internal/indexer/status',
+  summary: 'Get current replay progress',
+  tags: ['indexer'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    '200': {
+      description: 'Replay progress snapshot.',
+      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+    },
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+    '500': errorResponses['500'],
+  },
+});
+
 // ── Webhooks ──────────────────────────────────────────────────────────────────
 
 registry.registerPath({
@@ -2285,7 +2349,10 @@ registry.registerPath({
   method: 'get',
   path: '/metrics',
   summary: 'Prometheus metrics',
+  description:
+    'Returns Prometheus-format metrics for scraping. Protected by Bearer token authorization using ADMIN_API_KEY or an authorized JWT token with admin/data-protection-officer role. Unauthorised requests are refused and logged.',
   tags: ['observability'],
+  security: [{ bearerAuth: [] }],
   responses: {
     '200': {
       description: 'Prometheus text format',
@@ -2298,6 +2365,15 @@ registry.registerPath({
             'http_requests_total{method="GET",path="/health"} 42\n',
         },
       },
+    },
+    '401': {
+      description: 'Unauthorized — missing or invalid Bearer authorization scheme/token',
+    },
+    '403': {
+      description: 'Forbidden — invalid admin credentials or insufficient role',
+    },
+    '503': {
+      description: 'Service Unavailable — admin API / ADMIN_API_KEY is not configured',
     },
   },
 });

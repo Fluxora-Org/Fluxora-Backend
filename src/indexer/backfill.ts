@@ -75,9 +75,12 @@ export class OrderedBackfillScheduler {
     };
   }
 
-  async run(fromLedger: number, toLedger: number): Promise<BackfillResult> {
+  async run(fromLedger: number, toLedger: number, liveCursor: number): Promise<BackfillResult> {
     if (!Number.isInteger(fromLedger) || !Number.isInteger(toLedger) || fromLedger > toLedger) {
       throw new RangeError(`Invalid ledger range [${fromLedger}, ${toLedger}]`);
+    }
+    if (toLedger > liveCursor) {
+      throw new RangeError(`Backfill cannot advance past live cursor (${liveCursor})`);
     }
 
     const batches = this.buildBatches(fromLedger, toLedger);

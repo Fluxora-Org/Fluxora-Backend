@@ -41,7 +41,7 @@ import {
   STREAM_INVARIANTS,
   StreamStatus,
 } from '../types.js';
-import { info, debug } from '../../utils/logger.js';
+import { info, debug } from '../../lib/logger.js';
 import { dbQueryDurationSeconds } from '../../metrics/dbMetrics.js';
 import { enrichActiveSpanWithStream } from '../../tracing/hooks.js';
 import { getConfig } from '../../config/env.js';
@@ -56,6 +56,8 @@ import {
   streamSelectColumns,
   senderAddressFilterCondition,
   recipientAddressFilterCondition,
+  StreamQueryBuilder,
+  MAX_STREAM_LIMIT,
 } from '../queries/streams.js';
 
 
@@ -71,7 +73,7 @@ const REPO = 'streamRepository';
  * Both `findWithCursor` (cursor pagination) and `find` (offset pagination)
  * honour this constant so the two paths are always in agreement.
  */
-export const MAX_PAGE_SIZE = 100;
+export const MAX_PAGE_SIZE = MAX_STREAM_LIMIT;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -146,6 +148,117 @@ async function timed<T>(operation: string, fn: () => Promise<T>): Promise<T> {
   } finally {
     end();
   }
+}
+
+/**
+ * Per-tenant query helper.  Every tenant-scoped read through the repository
+ * layer must go through this before any other find/getById path.  Returns
+ * rows scoped by `sender_address = tenantId`; it is the structural isolation
+ * boundary for the streams table (which has no `tenant_id` column).
+ */
+export async function findForTenant(
+  tenantId: string,
+  filter: StreamFilter,
+  pagination: PaginationOptions,
+): Promise<PaginatedStreams> {
+  return streamRepository.find(
+    {
+      ...filter,
+      sender_address: tenantId,
+    },
+    pagination,
+  );
+}
+
+/**
+ * Per-tenant cursor list.  Equivalent to `findWithCursor` plus the
+ * tenant constraint.
+ */
+export async function findForTenantWithCursor(
+  tenantId: string,
+  filter: StreamFilter,
+  limit: number,
+  afterId?: string,
+  includeTotal?: boolean,
+  options?: { forcePrimary?: boolean },
+): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
+  return streamRepository.findWithCursor(
+    {
+      ...filter,
+      sender_address: tenantId,
+    },
+    limit,
+    afterId,
+    includeTotal,
+    { forcePrimary: options?.forcePrimary },
+  );
+}
+
+/**
+ * Per-tenant retrieval.  Returns the row only if the caller's tenant owns it.
+ * Ownership is established by `sender_address` matching the tenantId, which
+ * is the authenticated principal (Stellar public key) of the requesting tenant.
+ * This is the structural check that normal tenant-scoped lookups must use.
+ */
+export async function getForTenant(
+  tenantId: string,
+  id: string,
+): Promise<StreamRecord | undefined> {
+  const record = await streamRepository.getById(id);
+  if (!record) return undefined;
+  if (record.sender_address !== tenantId) {
+    // Foreign tenants return no row: 404 keeps the existence of other
+    // tenants' resources hidden.
+    return undefined;
+  }
+  return record;
+}
+
+/**
+ * Per-tenant existence check.  Returns true only when the authenticated
+ * tenant owns the row (sender_address matches tenantId).
+ */
+export async function existsForTenant(
+  tenantId: string,
+  id: string,
+): Promise<boolean> {
+  const record = await streamRepository.getById(id);
+  if (!record) return false;
+  return record.sender_address === tenantId;
+}
+
+/**
+ * Count streams for a tenant.
+ *
+ * Since the streams table does not have a `tenant_id` column, the tenant
+ * is identified by `sender_address` matching the tenantId (the authenticated
+ * principal).  Applies any additional filter predicates on top of the
+ * sender constraint.
+ */
+export async function countForTenant(
+  tenantId: string,
+  filter: StreamFilter,
+): Promise<number> {
+  const result = await streamRepository.find(
+    { ...filter, sender_address: tenantId },
+    { limit: 1, offset: 0 },
+  );
+  return result.total;
+}
+
+/** Count streams for a tenant.
+ *
+ * NOTE: the streams table has no tenant column, so a strict per-tenant
+ * count is not structurally possible.  This is retained as the
+ * privileged-administration entry point and is deliberately NOT exposed
+ * through the tenant-scoped wrapper.
+ */
+export async function countByTenant(
+  _tenantId: string,
+  _filter: StreamFilter,
+): Promise<number> {
+  // Foreign-tenant reads are deliberately refused at the route layer.
+  throw new Error('cross-tenant count is not permitted');
 }
 
 export const streamRepository = {
@@ -385,7 +498,8 @@ export const streamRepository = {
     options?: { forcePrimary?: boolean },
   ): Promise<{ streams: StreamRecord[]; hasMore: boolean; total?: number }> {
     return timed('findWithCursor', async () => {
-      const effectiveLimit = Math.min(Math.max(limit, 1), MAX_PAGE_SIZE);
+      const builder = new StreamQueryBuilder(limit);
+      const effectiveLimit = builder.effectiveLimit;
       if (effectiveLimit !== limit) {
         debug('findWithCursor: limit clamped', { requested: limit, effective: effectiveLimit });
       }
@@ -430,7 +544,15 @@ export const streamRepository = {
       if (keySet.previous) cursorParams.push(keySet.previous);
 
       const cursorSort = allowlistedSqlIdentifier('id', STREAM_CURSOR_SORT_FIELDS, 'stream cursor sort field');
-      const dataSql = `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${whereCursor} ORDER BY ${cursorSort} ASC LIMIT $${limitParamIndex}`;
+      const dataSql = builder.buildCursorQuery({
+        columns: streamSelectColumns(keyIndex, previousKeyIndex),
+        keyIndex,
+        previousKeyIndex,
+        whereClause: whereCursor,
+        sortField: cursorSort,
+        sortDirection: 'ASC',
+        limitParamIndex,
+      });
       const [dataResult, countResult] = await Promise.all([
         query<Record<string, unknown>>(pool, dataSql, cursorParams),
         includeTotal
@@ -489,7 +611,8 @@ export const streamRepository = {
    */
   async find(filter: StreamFilter, pagination: PaginationOptions): Promise<PaginatedStreams> {
     return timed('find', async () => {
-      const effectiveLimit = Math.min(Math.max(pagination.limit, 1), MAX_PAGE_SIZE);
+      const builder = new StreamQueryBuilder(pagination.limit);
+      const effectiveLimit = builder.effectiveLimit;
       if (effectiveLimit !== pagination.limit) {
         debug('find: limit clamped', { requested: pagination.limit, effective: effectiveLimit });
       }
@@ -532,11 +655,22 @@ export const streamRepository = {
       if (keySet.previous) params.push(keySet.previous);
 
       const offsetSort = allowlistedSqlIdentifier('created_at', STREAM_OFFSET_SORT_FIELDS, 'stream offset sort field');
+      const limitParamIndex = params.length + 1;
+      const offsetParamIndex = params.length + 2;
+      const dataSql = builder.buildOffsetQuery({
+        columns: streamSelectColumns(keyIndex, previousKeyIndex),
+        keyIndex,
+        previousKeyIndex,
+        whereClause: where,
+        sortClause: offsetSort,
+        limitParamIndex,
+        offsetParamIndex,
+      });
       const [countResult, dataResult] = await Promise.all([
         query<{ count: string }>(pool, `SELECT COUNT(*) AS count FROM streams ${where}`, countParams),
         query<Record<string, unknown>>(
           pool,
-          `SELECT ${streamSelectColumns(keyIndex, previousKeyIndex)} FROM streams ${where} ORDER BY ${offsetSort} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          dataSql,
           [...params, effectiveLimit, pagination.offset],
         ),
       ]);

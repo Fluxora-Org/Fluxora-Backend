@@ -27,6 +27,9 @@ export interface FeatureFlagDefinition {
   percentage: number;
   description?: string;
   minMigration?: string;
+  default: boolean;
+  owner: string;
+  removalDate: string;
 }
 
 type FlagMap = Map<string, FeatureFlagDefinition>;
@@ -93,7 +96,36 @@ function parseFlagEntry(item: unknown): FeatureFlagDefinition | undefined {
 
   if (name.length === 0 || percentage === undefined) return undefined;
 
-  const definition: FeatureFlagDefinition = { name, percentage };
+  const owner = entry['owner'];
+  if (typeof owner !== 'string' || owner.trim().length === 0) {
+    throw new Error(`[featureFlags] Flag "${name}" is missing an owner`);
+  }
+
+  const defaultState = entry['default'];
+  if (typeof defaultState !== 'boolean') {
+    throw new Error(`[featureFlags] Flag "${name}" is missing a default`);
+  }
+
+  const removalDate = entry['removalDate'];
+  if (typeof removalDate !== 'string' || removalDate.trim().length === 0) {
+    throw new Error(`[featureFlags] Flag "${name}" is missing a removalDate`);
+  }
+
+  const removalTime = new Date(removalDate).getTime();
+  if (Number.isNaN(removalTime)) {
+    throw new Error(`[featureFlags] Flag "${name}" has an invalid removalDate`);
+  }
+  if (Date.now() > removalTime) {
+    throw new Error(`[featureFlags] Flag "${name}" is past its removal date of ${removalDate}`);
+  }
+
+  const definition: FeatureFlagDefinition = { 
+    name, 
+    percentage,
+    default: defaultState,
+    owner: owner.trim(),
+    removalDate: removalDate.trim()
+  };
   if (typeof entry['description'] === 'string') {
     definition.description = entry['description'];
   }

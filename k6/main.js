@@ -43,7 +43,7 @@
  *   - Stellar RPC dependency simulation
  */
 
-import { THRESHOLDS, PROFILES } from './config.js';
+import { THRESHOLDS, PROFILES, PERFORMANCE_BUDGET } from './config.js';
 import healthScenario from './scenarios/health.js';
 import streamsListScenario from './scenarios/streams-list.js';
 import streamsGetScenario from './scenarios/streams-get.js';
@@ -110,4 +110,68 @@ export function streams_get() {
 
 export function streams_create() {
   streamsCreateScenario();
+}
+
+// ---------------------------------------------------------------------------
+// Comparable cross-release summary (performance budget gate)
+// ---------------------------------------------------------------------------
+function metricPercents(data, name) {
+  const m = data.metrics[name];
+  if (!m || !m.values) return { p95: null, p99: null };
+  return {
+    p95: m.values['p(95)'] ?? null,
+    p99: m.values['p(99)'] ?? null,
+  };
+}
+
+/**
+ * Emit a stable JSON summary so release-to-release latency can be compared
+ * by endpoint id. Also used by scripts/check-performance-budget.mjs.
+ */
+export function handleSummary(data) {
+  const rows = PERFORMANCE_BUDGET.endpoints.map((endpoint) => {
+    const tagged = metricPercents(
+      data,
+      `http_req_duration{endpoint:${endpoint.id}}`,
+    );
+    const trend = metricPercents(data, endpoint.trendMetric);
+    const p95 = tagged.p95 ?? trend.p95;
+    const p99 = tagged.p99 ?? trend.p99;
+    const budgetP95 = endpoint.budgets.p95 ?? null;
+    const budgetP99 = endpoint.budgets.p99 ?? null;
+    const p95Ok = budgetP95 == null || p95 == null || p95 <= budgetP95;
+    const p99Ok = budgetP99 == null || p99 == null || p99 <= budgetP99;
+    return {
+      endpoint: endpoint.id,
+      method: endpoint.method,
+      path: endpoint.path,
+      p95_ms: p95,
+      p99_ms: p99,
+      budget_p95_ms: budgetP95,
+      budget_p99_ms: budgetP99,
+      passed: p95Ok && p99Ok,
+    };
+  });
+
+  const summary = {
+    version: PERFORMANCE_BUDGET.version,
+    unit: PERFORMANCE_BUDGET.unit,
+    profile: (__ENV.PROFILE || 'smoke').toLowerCase(),
+    generatedAt: new Date().toISOString(),
+    endpoints: rows,
+  };
+
+  const lines = rows
+    .map(
+      (r) =>
+        `${r.endpoint}: p95=${r.p95_ms ?? 'n/a'} (budget ${r.budget_p95_ms ?? '-'}) ` +
+        `p99=${r.p99_ms ?? 'n/a'} (budget ${r.budget_p99_ms ?? '-'}) ` +
+        `${r.passed ? 'PASS' : 'FAIL'}`,
+    )
+    .join('\n');
+
+  return {
+    'k6/results/performance-budget-summary.json': JSON.stringify(summary, null, 2) + '\n',
+    stdout: `\n=== Performance budget summary ===\n${lines}\n`,
+  };
 }

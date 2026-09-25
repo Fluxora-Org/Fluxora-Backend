@@ -103,18 +103,22 @@ vi.mock('../src/tracing/hooks.js', () => ({
   enrichActiveSpanWithStream: vi.fn(),
 }));
 
-vi.mock('../src/db/queries/streams.js', () => ({
-  encryptAddressValue: vi.fn((col: number) => `$${col}`),
-  streamSelectColumns: vi.fn(() => '*'),
-  senderAddressFilterCondition: vi.fn((f: number) => `sender_address = $${f}`),
-  recipientAddressFilterCondition: vi.fn((f: number) => `recipient_address = $${f}`),
-}));
+vi.mock('../src/db/queries/streams.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/db/queries/streams.js')>();
+  return {
+    ...actual,
+    encryptAddressValue: vi.fn((col: number) => `$${col}`),
+    streamSelectColumns: vi.fn(() => '*'),
+    senderAddressFilterCondition: vi.fn((f: number) => `sender_address = $${f}`),
+    recipientAddressFilterCondition: vi.fn((f: number) => `recipient_address = $${f}`),
+  };
+});
 
 vi.mock('../src/metrics/dbMetrics.js', () => ({
   dbQueryDurationSeconds: { startTimer: vi.fn(() => vi.fn()) },
 }));
 
-vi.mock('../src/utils/logger.js', () => ({
+vi.mock('../src/lib/logger.js', () => ({
   info: vi.fn(),
   debug: vi.fn(),
   warn: vi.fn(),

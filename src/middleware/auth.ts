@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyToken } from '../lib/auth.js';
 import { ApiErrorCode } from './errorHandler.js';
-import { warn, info, debug } from '../utils/logger.js';
+import { warn, info, debug } from '../lib/logger.js';
 import { z } from 'zod';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
 import { authJwtVerifyDurationSeconds } from '../metrics/businessMetrics.js';
@@ -28,6 +28,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
     if (!record) {
       warn('API key authentication failed — key not found', { requestId });
       res.status(401).json({
+        success: false,
         error: {
           code: ApiErrorCode.UNAUTHORIZED,
           message: 'Invalid API key',
@@ -40,6 +41,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
     if (!record.active) {
       warn('API key authentication failed — key is revoked', { keyId: record.id, requestId });
       res.status(401).json({
+        success: false,
         error: {
           code: ApiErrorCode.UNAUTHORIZED,
           message: 'API key has been revoked',
@@ -49,8 +51,8 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
       return;
     }
 
-    (req as any).keyScopes = record.scopes;
-    (req as any).keyId = record.id;
+    req.keyScopes = record.scopes;
+    req.keyId = record.id;
     
     info('API key authenticated', { keyId: record.id, requestId });
     return next();
@@ -60,6 +62,7 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
       requestId 
     });
     res.status(401).json({
+      success: false,
       error: {
         code: ApiErrorCode.UNAUTHORIZED,
         message: 'Authentication failed',
@@ -154,6 +157,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
       if (revoked) {
         warn('JWT rejected — token revoked', { jti, requestId });
         res.status(401).json({
+          success: false,
           error: {
             code: ApiErrorCode.UNAUTHORIZED,
             message: 'token_revoked',
@@ -171,6 +175,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
   } catch (error) {
     warn('JWT authentication failed', { error: error instanceof Error ? error.message : String(error), requestId });
     res.status(401).json({
+      success: false,
       error: {
         code: ApiErrorCode.UNAUTHORIZED,
         message: 'Invalid or expired authentication token',
@@ -186,6 +191,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   if (!req.user) {
     warn('Anonymous access denied to protected route', { path: req.path, requestId });
     res.status(401).json({
+      success: false,
       error: {
         code: ApiErrorCode.UNAUTHORIZED,
         message: 'Authentication required to access this resource',
@@ -203,6 +209,7 @@ export function requirePermission(permission: Permission) {
     if (!req.user) {
       warn('Permission check failed: no authenticated user', { path: req.path, requestId });
       res.status(401).json({
+        success: false,
         error: {
           code: ApiErrorCode.UNAUTHORIZED,
           message: 'Authentication required to access this resource',
@@ -215,6 +222,7 @@ export function requirePermission(permission: Permission) {
     if (!Array.isArray(permissions)) {
       warn('Permission check failed: non-array permissions on principal', { path: req.path, requestId });
       res.status(403).json({
+        success: false,
         error: {
           code: ApiErrorCode.FORBIDDEN,
           message: 'Insufficient permissions to access this resource',
@@ -226,6 +234,7 @@ export function requirePermission(permission: Permission) {
     if (!permissions.includes(permission)) {
       warn('Insufficient permissions', { required: permission, have: permissions, path: req.path, requestId });
       res.status(403).json({
+        success: false,
         error: {
           code: ApiErrorCode.FORBIDDEN,
           message: 'Insufficient permissions to access this resource',
@@ -241,11 +250,12 @@ export function requirePermission(permission: Permission) {
 export function requireScope(...requiredScopes: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const requestId = req.id ?? req.correlationId;
-    const isApiKeyAuth = (req as any).keyId !== undefined;
+    const isApiKeyAuth = req.keyId !== undefined;
     const isJwtAuth = req.user !== undefined;
     if (!isApiKeyAuth && !isJwtAuth) {
       warn('Scope check failed: no authenticated principal', { path: req.path, requestId });
       res.status(401).json({
+        success: false,
         error: {
           code: ApiErrorCode.UNAUTHORIZED,
           message: 'Authentication required to access this resource',
@@ -256,13 +266,14 @@ export function requireScope(...requiredScopes: string[]) {
     }
     let scopes: string[] = [];
     if (isApiKeyAuth) {
-      scopes = (req as any).keyScopes ?? [];
+      scopes = req.keyScopes ?? [];
     } else if (isJwtAuth) {
       scopes = (req.user as any).permissions ?? [];
     }
     if (!Array.isArray(scopes) || scopes.length === 0) {
       warn('Scope check failed: no scopes found on principal', { path: req.path, requestId });
       res.status(403).json({
+        success: false,
         error: {
           code: ApiErrorCode.FORBIDDEN,
           message: 'Principal does not have required scopes',
@@ -275,6 +286,7 @@ export function requireScope(...requiredScopes: string[]) {
     if (!hasRequiredScope) {
       warn('Insufficient scopes', { required: requiredScopes, have: scopes, path: req.path, requestId });
       res.status(403).json({
+        success: false,
         error: {
           code: ApiErrorCode.FORBIDDEN,
           message: `Insufficient scopes. Required: ${requiredScopes.join(' or ')}`,

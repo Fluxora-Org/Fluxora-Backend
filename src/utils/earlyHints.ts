@@ -23,7 +23,7 @@
  */
 
 import type { Response } from 'express';
-import { debug, warn } from './logger.js';
+import { debug, warn } from '../lib/logger.js';
 
 /**
  * Configuration for Early Hints generation.

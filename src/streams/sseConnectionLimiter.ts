@@ -1,4 +1,9 @@
-import { sseActiveConnectionsGauge, sseConnectionsRejectedTotal, isValidRejectionReason } from '../metrics/businessMetrics.js';
+import {
+  sseActiveConnectionsGauge,
+  sseConnectionsRejectedTotal,
+  isValidRejectionReason,
+  type SseConnectionRejectionReason,
+} from '../metrics/businessMetrics.js';
 
 export const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP = 10;
 export const DEFAULT_SSE_MAX_GLOBAL_CONNECTIONS = 1000;
@@ -10,10 +15,8 @@ const MAX_SSE_CONNECTION_LIMIT = 100_000;
 const MAX_SSE_CONNECTION_DURATION_MS = 86400_000;
 const MAX_SSE_RETRY_AFTER_SECONDS = 86400;
 
-export type SseConnectionRejectionReason =
-  | 'per_ip_limit'
-  | 'per_key_limit'
-  | 'global_limit';
+// Re-export the canonical type so route handlers and tests can import from one place.
+export type { SseConnectionRejectionReason } from '../metrics/businessMetrics.js';
 
 export interface SseConnectionLimits {
   maxConnectionsPerIp: number;
@@ -52,7 +55,7 @@ export type SseConnectionAttempt =
 const activeConnectionsByIp = new Map<string, number>();
 let activeConnections = 0;
 const activeConnectionsByApiKey = new Map<string, number>();
-const activeTimers = new Set<ReturnType<typeof setTimeout>>();
+const activeTimers = new Set<NodeJS.Timeout>();
 
 function normalizeApiKey(apiKey: string | undefined): string | undefined {
   if (apiKey === undefined) return undefined;
@@ -66,7 +69,7 @@ function normalizeIp(ip: string): string {
 }
 
 function readBoundedPositiveInteger(
-  env: Record<string, string | undefined>,
+  env: NodeJS.ProcessEnv,
   name: string,
   fallback: number,
   min: number,
@@ -93,7 +96,7 @@ function readBoundedPositiveInteger(
  * budgets.
  */
 export function resolveSseConnectionLimits(
-  env: Record<string, string | undefined> = process.env,
+  env: NodeJS.ProcessEnv = process.env,
 ): SseConnectionLimits {
   return {
     maxConnectionsPerIp: readBoundedPositiveInteger(
@@ -170,7 +173,9 @@ export function tryAcquireSseConnection(
   if (normalizedKey !== undefined) {
     const activeForKey = activeConnectionsByApiKey.get(normalizedKey) ?? 0;
     if (activeForKey >= limits.maxConnectionsPerApiKey) {
-      sseConnectionsRejectedTotal.inc({ reason: 'per_key_limit' });
+      if (isValidRejectionReason('per_key_limit')) {
+        sseConnectionsRejectedTotal.inc({ reason: 'per_key_limit' });
+      }
       return {
         ok: false,
         reason: 'per_key_limit',
@@ -207,7 +212,7 @@ export function tryAcquireSseConnection(
   sseActiveConnectionsGauge.set(activeConnections);
 
   let released = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+let timer: NodeJS.Timeout | undefined;
   const acceptedAt = Date.now();
 
   const connection: AcceptedSseConnection = {

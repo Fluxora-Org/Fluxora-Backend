@@ -24,6 +24,12 @@ export const indexerReplayDurationSeconds = histogram('indexer_replay_duration_s
 export const indexerReplayIntegrityGapsTotal = counter('indexer_replay_integrity_gaps_total');
 export const indexerReplayIntegrityDuplicatesTotal = counter('indexer_replay_integrity_duplicates_total');
 
+/**
+ * Number of times the indexer failed to acquire or renew the leader lease.
+ * Threshold: > 0 for more than 5 minutes (indicates Redis outage or persistent network partition).
+ */
+export const indexerLeaderElectionFailuresTotal = counter('indexer_leader_election_failures_total', ['reason']);
+
 export function deRegisterIndexerMetrics(): void {
   for (const name of [
     'indexer_replay_batches_committed_total',

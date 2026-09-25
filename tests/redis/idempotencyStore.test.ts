@@ -25,7 +25,7 @@ import {
   ENVELOPE_VERSION,
   type IdempotentEntry,
 } from '../../src/redis/idempotencyStore.js';
-import { logger } from '../../src/logging/logger.js';
+import { logger } from '../../src/lib/logger.js';
 import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

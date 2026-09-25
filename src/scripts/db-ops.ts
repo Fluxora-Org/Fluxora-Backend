@@ -37,6 +37,79 @@ export interface DbOperationResult {
   error?: string
 }
 
+/**
+ * Safety controls for operations that can change or remove database data.
+ *
+ * `confirm` and `confirmTargetEnvironment` are accepted as aliases so callers
+ * can use the concise flag or the more explicit target-confirmation name. A
+ * live operation requires one of them; production additionally requires
+ * `acknowledgeProduction` (or its `confirmProduction` alias).
+ */
+export interface DestructiveOperationOptions {
+  /** Print the planned change without executing it. */
+  dryRun?: boolean
+  /** The environment being changed, for example `staging` or `production`. */
+  targetEnvironment?: string
+  /** Explicit confirmation that the operation should proceed. */
+  confirm?: boolean
+  /** Explicit confirmation that the printed target environment is correct. */
+  confirmTargetEnvironment?: boolean
+  /** Additional acknowledgement required when the target is production. */
+  acknowledgeProduction?: boolean
+  /** Alias for acknowledgeProduction, consistent with restore request APIs. */
+  confirmProduction?: boolean
+}
+
+export interface DropOldPartitionsResult {
+  success?: boolean
+  droppedPartitions: string[]
+  message: string
+  targetEnvironment?: string
+}
+
+function printDestructiveTarget(
+  operation: string,
+  targetEnvironment: string | undefined,
+  databaseUrl: string,
+  dryRun: boolean,
+): void {
+  const mode = dryRun ? 'DRY-RUN' : 'CONFIRM'
+  console.warn(
+    `[${mode}] ${operation} target environment: ${targetEnvironment || 'unspecified'}`,
+  )
+  console.warn(`[${mode}] ${operation} database: ${redactDatabaseUrl(databaseUrl)}`)
+}
+
+/**
+ * Print the target and reject a live operation unless the caller explicitly
+ * confirms both the operation and the environment it will affect.
+ */
+function checkDestructiveConfirmation(
+  operation: string,
+  options: DestructiveOperationOptions,
+  databaseUrl: string,
+): string | undefined {
+  const dryRun = options.dryRun === true
+  const targetEnvironment = options.targetEnvironment?.trim()
+  printDestructiveTarget(operation, targetEnvironment, databaseUrl, dryRun)
+
+  if (dryRun) return undefined
+  if (options.confirm !== true && options.confirmTargetEnvironment !== true) {
+    return `${operation} requires confirm: true before proceeding.`
+  }
+  if (!targetEnvironment) {
+    return `${operation} requires an explicit targetEnvironment for a live operation.`
+  }
+  if (
+    targetEnvironment.toLowerCase() === 'production' &&
+    options.acknowledgeProduction !== true &&
+    options.confirmProduction !== true
+  ) {
+    return `Production ${operation} requires acknowledgeProduction: true.`
+  }
+  return undefined
+}
+
 // ── S3 options ────────────────────────────────────────────────────────────────
 
 /**
@@ -357,6 +430,7 @@ export async function restoreDatabase(
   databaseUrl: string,
   inputPath: string,
   s3Source?: S3Target,
+  options: DestructiveOperationOptions = {},
 ): Promise<DbOperationResult> {
   const normalizedDatabaseUrl = databaseUrl.trim()
   const normalizedInputPath = inputPath.trim()
@@ -387,6 +461,28 @@ export async function restoreDatabase(
     if (!keyCheck.valid) {
       return { success: false, message: keyCheck.reason! }
     }
+  }
+
+  const confirmationError = checkDestructiveConfirmation(
+    'restoreDatabase',
+    options,
+    normalizedDatabaseUrl,
+  )
+  if (confirmationError) {
+    logger.warn('restoreDatabase refused', undefined, { reason: confirmationError })
+    return { success: false, message: confirmationError }
+  }
+
+  if (options.dryRun) {
+    const source = s3Source
+      ? `s3://${s3Source.bucket}/${s3Source.key}`
+      : normalizedInputPath
+    const message = `[DRY RUN] Would restore ${source} into the ${options.targetEnvironment || 'unspecified'} environment with pg_restore --clean.`
+    logger.info('restoreDatabase dry run completed', undefined, {
+      targetEnvironment: options.targetEnvironment,
+      source,
+    })
+    return { success: true, message }
   }
 
   try {
@@ -518,13 +614,31 @@ export async function dropOldPartitions(
   pool: import('pg').Pool,
   parentTable: string,
   olderThanDays: number,
-  dryRun = true
-): Promise<{ success?: boolean; droppedPartitions: string[]; message: string }> {
+  options: boolean | DestructiveOperationOptions = { dryRun: true },
+): Promise<DropOldPartitionsResult> {
+  const normalizedOptions: DestructiveOperationOptions =
+    typeof options === 'boolean' ? { dryRun: options } : options
+  const dryRun = normalizedOptions.dryRun !== false
   if (!parentTable || parentTable.trim() === '') {
     return { droppedPartitions: [], message: 'parentTable is required but was not provided.' }
   }
   if (!Number.isFinite(olderThanDays) || olderThanDays < 0) {
     return { droppedPartitions: [], message: 'olderThanDays must be a non-negative number.' }
+  }
+
+  const confirmationError = checkDestructiveConfirmation(
+    'dropOldPartitions',
+    normalizedOptions,
+    '[database supplied by pool]',
+  )
+  if (confirmationError) {
+    logger.warn('dropOldPartitions refused', undefined, { reason: confirmationError })
+    return {
+      success: false,
+      droppedPartitions: [],
+      message: confirmationError,
+      targetEnvironment: normalizedOptions.targetEnvironment,
+    }
   }
 
   const query = `
@@ -592,20 +706,32 @@ export async function dropOldPartitions(
   }
   
   if (dryRun) {
-    const message = `[DRY RUN] Would drop ${droppedPartitions.length} old partitions for ${parentTable}`
-    logger.info('dropOldPartitions completed', undefined, { parentTable, dryRun, count: droppedPartitions.length })
+    const message = `[DRY RUN] Would drop ${droppedPartitions.length} old partitions for ${parentTable} in the ${normalizedOptions.targetEnvironment || 'unspecified'} environment.`
+    logger.info('dropOldPartitions completed', undefined, {
+      parentTable,
+      targetEnvironment: normalizedOptions.targetEnvironment,
+      dryRun,
+      count: droppedPartitions.length,
+    })
     return {
       success: true,
       droppedPartitions,
-      message
+      message,
+      targetEnvironment: normalizedOptions.targetEnvironment,
     };
   }
   
-  const message = `Dropped ${droppedPartitions.length} old partitions for ${parentTable}`
-  logger.info('dropOldPartitions completed', undefined, { parentTable, dryRun, count: droppedPartitions.length })
+  const message = `Dropped ${droppedPartitions.length} old partitions for ${parentTable} in the ${normalizedOptions.targetEnvironment || 'unspecified'} environment.`
+  logger.info('dropOldPartitions completed', undefined, {
+    parentTable,
+    targetEnvironment: normalizedOptions.targetEnvironment,
+    dryRun,
+    count: droppedPartitions.length,
+  })
   return {
     success: true,
     droppedPartitions,
-    message
+    message,
+    targetEnvironment: normalizedOptions.targetEnvironment,
   };
 }

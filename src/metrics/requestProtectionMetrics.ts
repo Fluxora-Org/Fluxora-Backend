@@ -22,6 +22,7 @@
 
 import { Counter, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
+import { assertCollectorLabels } from './cardinality.js';
 
 /**
  * Counter incremented once for every HTTP 413 rejection produced by
@@ -32,6 +33,9 @@ import { registry } from '../metrics.js';
  * // arrive within a 5-minute window on any single route.
  * increase(fluxora_request_body_too_large_total[5m]) > 50
  */
+assertCollectorLabels(['path']);
+assertCollectorLabels(['consumer_hash']);
+
 export const requestBodyTooLargeTotal =
   (registry.getSingleMetric('fluxora_request_body_too_large_total') as Counter<'path'>) ||
   new Counter({

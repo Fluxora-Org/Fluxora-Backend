@@ -1,6 +1,23 @@
 import { Counter } from 'prom-client';
 import { registry } from '../metrics.js';
 
+/**
+ * Counter for observed entry into and exit from RPC degradation mode.
+ *
+ * Incremented by `rpcDegradationMiddleware` each time the circuit-breaker
+ * state it observes changes between requests. `from` is the previous state
+ * and `to` the new one, so `{from="CLOSED",to="OPEN"}` counts entries into
+ * degradation and `{from="OPEN",to="CLOSED"}` counts automatic recoveries.
+ */
+export const rpcDegradationTransitionsTotal =
+  (registry.getSingleMetric('rpc_degradation_transitions_total') as Counter<'from' | 'to'>) ||
+  new Counter({
+    name: 'rpc_degradation_transitions_total',
+    help: 'Total Stellar RPC degradation-mode transitions observed by the HTTP degradation middleware',
+    labelNames: ['from', 'to'] as const,
+    registers: [registry],
+  });
+
 export const rpcCircuitOpenFallbackHitsTotal =
   (registry.getSingleMetric('rpc_circuit_open_fallback_hits_total') as Counter<'operation'>) ||
   new Counter({
@@ -49,6 +66,21 @@ export const rpcFallbackCacheEarlyRefreshesTotal =
 import { Gauge } from 'prom-client';
 
 /**
+ * Gauge (0 or 1) exposing whether the backend is currently serving in RPC
+ * degradation mode: 1 = degraded (circuit breaker not CLOSED), 0 = healthy.
+ *
+ * Set by `rpcDegradationMiddleware` on every request so dashboards and alerts
+ * can detect sustained degradation without polling the health endpoint.
+ */
+export const rpcDegradedModeGauge =
+  (registry.getSingleMetric('rpc_degraded_mode') as Gauge) ||
+  new Gauge({
+    name: 'rpc_degraded_mode',
+    help: 'Whether the backend is in Stellar RPC degradation mode (1 = degraded, 0 = healthy)',
+    registers: [registry],
+  });
+
+/**
  * Gauge (0 or 1) reflecting the most recent provider health-check outcome.
  * 1 = healthy, 0 = unhealthy (consecutive health-check failures exceeded the
  * threshold). Lets dashboards/alerts surface provider degradation independent of
@@ -87,6 +119,8 @@ export const fluxora_rpc_cache_corrupt_total =
   });
 
 export function deRegisterRpcMetrics(): void {
+  registry.removeSingleMetric('rpc_degradation_transitions_total');
+  registry.removeSingleMetric('rpc_degraded_mode');
   registry.removeSingleMetric('rpc_circuit_open_fallback_hits_total');
   registry.removeSingleMetric('rpc_circuit_open_fallback_misses_total');
   registry.removeSingleMetric('rpc_fallback_cache_hits_total');

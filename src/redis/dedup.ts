@@ -9,7 +9,7 @@
 
 import type { RedisClient } from './client.js';
 import { dedupRedisErrorsTotal, dedupRedisFallbackTotal } from '../metrics.js';
-import { logger } from '../logging/logger.js';
+import { logger } from '../lib/logger.js';
 
 export const DEDUP_KEY_PREFIX = 'fluxora:dedup:';
 

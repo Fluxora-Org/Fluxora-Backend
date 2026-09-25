@@ -114,12 +114,40 @@ describe('grpcHealth', () => {
       await expect(checkOnce(client)).resolves.toBe('SERVING');
     });
 
-    it('returns SERVING when a dependency is degraded (still serving traffic)', async () => {
+    it('returns NOT_SERVING when a dependency is degraded during startup (matches /health/ready 503)', async () => {
       const manager = new HealthCheckManager();
       manager.registerChecker(makeChecker('db', async () => ({ latency: 1500, degraded: true })));
       await startServerWithManager(manager);
 
+      await expect(checkOnce(client)).resolves.toBe('NOT_SERVING');
+    });
+
+    it('returns SERVING when a dependency is degraded in steady state, within the grace period', async () => {
+      const manager = new HealthCheckManager();
+      manager.registerChecker(makeChecker('db', async () => ({ latency: 1500, degraded: true })));
+      // Past the startup window, but the degradation itself is fresh.
+      Object.defineProperty(manager, 'startTime', { value: Date.now() - 40_000 });
+      await startServerWithManager(manager);
+
       await expect(checkOnce(client)).resolves.toBe('SERVING');
+    });
+
+    it('returns NOT_SERVING when a dependency stays degraded past the grace period', async () => {
+      const manager = new HealthCheckManager();
+      manager.registerChecker(makeChecker('db', async () => ({ latency: 1500, degraded: true })));
+      Object.defineProperty(manager, 'startTime', { value: Date.now() - 80_000 });
+      await startServerWithManager(manager);
+
+      // Establish degradedSince via a first check...
+      await expect(checkOnce(client)).resolves.toBe('SERVING');
+
+      // ...then simulate the degradation having persisted past the grace period.
+      const lastResults = (manager as unknown as {
+        lastResults: Map<string, { degradedSince?: string }>;
+      }).lastResults;
+      lastResults.get('db')!.degradedSince = new Date(Date.now() - 35_000).toISOString();
+
+      await expect(checkOnce(client)).resolves.toBe('NOT_SERVING');
     });
 
     it('returns NOT_SERVING when a dependency is unhealthy', async () => {

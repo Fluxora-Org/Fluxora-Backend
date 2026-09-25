@@ -220,8 +220,9 @@ describe('Distributed Tracing Hooks', () => {
         throw new Error('Hook error');
       };
 
-      // Spy on console.error to verify error is logged
-      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      // #1518: hook failures are reported through structured logging on
+      // stderr rather than a raw console.error call.
+      const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
       const tracer = new Tracer({
         enabled: true,
@@ -233,8 +234,11 @@ describe('Distributed Tracing Hooks', () => {
         tracer.startSpan({ traceId: 'trace-123' });
       }).not.toThrow();
 
-      expect(consoleError).toHaveBeenCalled();
-      consoleError.mockRestore();
+      expect(stderrWrite).toHaveBeenCalled();
+      const record = JSON.parse(String(stderrWrite.mock.calls[0][0]));
+      expect(record.level).toBe('error');
+      expect(record.message).toContain('Hook error');
+      stderrWrite.mockRestore();
     });
   });
 
