@@ -1,17 +1,10 @@
 import type { Request, Response, NextFunction } from 'express';
 import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
 import { sanitizeMetricLabels } from '../pii/secretPatterns.js';
+import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /** Single label for requests that never matched an Express route. */
 export const UNMATCHED_ROUTE = 'unmatched';
-
-/**
- * Resolve the Prometheus `route` label from the matched Express route template.
- *
- * Uses `baseUrl + route.path` (the pattern, e.g. `/users/:id`) so path
- * parameters never appear as distinct series. Unmatched requests share one
- * fixed label to keep cardinality bounded.
-import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /**
  * Normalise the matched route so cardinality stays bounded.
@@ -21,6 +14,10 @@ import { normalizeRouteLabel } from '../metrics/cardinality.js';
  * buckets UUIDs, numeric ids, Stellar addresses, and other high-cardinality
  * segments so path parameters cannot grow the Prometheus series set without
  * limit.
+ *
+ * Uses `baseUrl + route.path` (the pattern, e.g. `/users/:id`) so path
+ * parameters never appear as distinct series. Unmatched requests share one
+ * fixed label to keep cardinality bounded.
  *
  * @see docs/observability/metric-cardinality.md
  */
