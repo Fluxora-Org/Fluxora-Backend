@@ -42,7 +42,7 @@ export const webhooksRouter = express.Router();
  * POST /internal/webhooks/receive
  *
  * Verifies an incoming Fluxora webhook delivery against the shared secret.
- * Deduplicates using `inboundWebhookDedupCache` (24h TTL, max 10,000 entries per instance).
+ * Deduplicates using `inboundWebhookDedupCache` (DEDUP_WINDOW_SECONDS window, default 24h; see src/redis/dedup.ts).
  * Returns a flat envelope (not the standard successResponse / errorResponse
  * shape) so callers can rely on stable HTTP status codes and the
  * `error` string match the documented `WebhookVerificationCode` values.

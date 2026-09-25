@@ -457,6 +457,8 @@ export const EnvSchema = z
     RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
     RPC_HEALTH_CHECK_FAILURE_THRESHOLD: integerEnv('RPC_HEALTH_CHECK_FAILURE_THRESHOLD', 1).default(3),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
+    /** Seconds a (streamId, eventId) pair is remembered for duplicate suppression. */
+    DEDUP_WINDOW_SECONDS: integerEnv('DEDUP_WINDOW_SECONDS', 1, 86400 * 7).default(86400),
 
     RATE_LIMIT_ENABLED: booleanEnv().default(true),
     RATE_LIMIT_IP_WINDOW_MS: integerEnv('RATE_LIMIT_IP_WINDOW_MS', 1).optional(),
@@ -632,6 +634,8 @@ export interface Config {
 
   redisUrl: string;
   redisEnabled: boolean;
+  /** Duplicate-suppression window for stream events and inbound webhooks (DEDUP_WINDOW_SECONDS). */
+  dedupWindowSeconds: number;
   redisMode: 'standalone' | 'sentinel' | 'cluster';
   redisSentinelHosts?: string | undefined;
   redisSentinelName?: string | undefined;
@@ -880,6 +884,7 @@ function toConfig(env: ParsedEnv): Config {
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
+    dedupWindowSeconds: env.DEDUP_WINDOW_SECONDS,
     redisMode: env.REDIS_MODE,
     redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
     redisSentinelName: env.REDIS_SENTINEL_NAME,

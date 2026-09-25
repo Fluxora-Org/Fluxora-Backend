@@ -389,3 +389,183 @@ describe('HybridDedupCache Redis-outage replay false-negative', () => {
         expect(duplicate).toBe(false);
     });
 });
+// ── Issue #1433: deduplication window and store-unavailable behaviour ────────
+
+const WINDOW_SECONDS = 60;
+const WINDOW_MS = WINDOW_SECONDS * 1000;
+
+/** Redis client double whose setNx/exists honour the PX expiry, like real Redis. */
+function windowedRedisClient(): RedisClient {
+    const expiresAt = new Map<string, number>();
+    const live = (key: string): boolean => {
+        const deadline = expiresAt.get(key);
+        if (deadline === undefined) return false;
+        if (Date.now() < deadline) return true;
+        expiresAt.delete(key);
+        return false;
+    };
+    return mockRedisClient({
+        exists: vi.fn(async (key: string) => live(key)),
+        setNx: vi.fn(async (key: string, _value: string, pxMs: number) => {
+            if (live(key)) return false;
+            expiresAt.set(key, Date.now() + pxMs);
+            return true;
+        }),
+    });
+}
+
+function brokenStore(): DedupCache {
+    return {
+        has: vi.fn().mockRejectedValue(new Error('Redis down')),
+        add: vi.fn().mockRejectedValue(new Error('Redis down')),
+        clear: vi.fn(),
+        close: vi.fn(),
+    };
+}
+
+/** Submits the same event `times` times and returns how many were accepted as new. */
+async function acceptedCount(cache: DedupCache, times: number): Promise<number> {
+    let accepted = 0;
+    for (let i = 0; i < times; i++) {
+        if (await cache.add('stream-1', 'evt-1')) accepted++;
+    }
+    return accepted;
+}
+
+const backends: Array<[string, () => DedupCache]> = [
+    ['InMemoryDedupCache', () => new InMemoryDedupCache(WINDOW_SECONDS)],
+    ['RedisDedupCache', () => new RedisDedupCache(windowedRedisClient(), WINDOW_SECONDS)],
+    [
+        'HybridDedupCache (Redis healthy)',
+        () =>
+            new HybridDedupCache(
+                new RedisDedupCache(windowedRedisClient(), WINDOW_SECONDS),
+                new InMemoryDedupCache(WINDOW_SECONDS),
+                true,
+            ),
+    ],
+    [
+        'HybridDedupCache (Redis unavailable)',
+        () => new HybridDedupCache(brokenStore(), new InMemoryDedupCache(WINDOW_SECONDS), true),
+    ],
+];
+
+describe.each(backends)('%s – deduplication window', (_name, makeCache) => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+        __resetDedupForTest();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('processes an event exactly once when duplicates arrive inside the window', async () => {
+        const cache = makeCache();
+
+        expect(await acceptedCount(cache, 1)).toBe(1);
+        vi.advanceTimersByTime(WINDOW_MS - 1);
+        expect(await acceptedCount(cache, 3)).toBe(0);
+        await expect(cache.has('stream-1', 'evt-1')).resolves.toBe(true);
+    });
+
+    it('processes the event again once the window has elapsed, then suppresses it again', async () => {
+        const cache = makeCache();
+
+        expect(await acceptedCount(cache, 1)).toBe(1);
+        vi.advanceTimersByTime(WINDOW_MS);
+        await expect(cache.has('stream-1', 'evt-1')).resolves.toBe(false);
+        expect(await acceptedCount(cache, 3)).toBe(1);
+    });
+
+    it('measures the window from the first add, not from later duplicates', async () => {
+        const cache = makeCache();
+
+        await cache.add('stream-1', 'evt-1');
+        vi.advanceTimersByTime(WINDOW_MS / 2);
+        expect(await cache.add('stream-1', 'evt-1')).toBe(false);
+        vi.advanceTimersByTime(WINDOW_MS / 2);
+        expect(await cache.add('stream-1', 'evt-1')).toBe(true);
+    });
+});
+
+describe('RedisDedupCache – window configuration', () => {
+    it('defaults the Redis TTL to 24h', async () => {
+        const client = mockRedisClient();
+        await new RedisDedupCache(client).add('s', 'e');
+        expect(client.setNx).toHaveBeenCalledWith(expect.any(String), '1', 86400 * 1000);
+    });
+});
+
+describe('HybridDedupCache – store unavailable (fail-open to in-memory)', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+        __resetDedupForTest();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    async function fallbackCount(): Promise<number> {
+        const metric = await dedupRedisFallbackTotal.get();
+        return metric.values.reduce((sum, v) => sum + v.value, 0);
+    }
+
+    it('never rejects an event because the store is unavailable', async () => {
+        const hybrid = new HybridDedupCache(brokenStore(), new InMemoryDedupCache(WINDOW_SECONDS), true);
+
+        await expect(hybrid.add('stream-1', 'evt-1')).resolves.toBe(true);
+        await expect(hybrid.has('stream-1', 'evt-1')).resolves.toBe(true);
+    });
+
+    it('records every fallback on dedup_redis_fallback_total', async () => {
+        const hybrid = new HybridDedupCache(brokenStore(), new InMemoryDedupCache(WINDOW_SECONDS), true);
+        const before = await fallbackCount();
+
+        await hybrid.add('stream-1', 'evt-1');
+        await hybrid.add('stream-1', 'evt-2');
+        await hybrid.has('stream-1', 'evt-1');
+
+        expect((await fallbackCount()) - before).toBe(3);
+    });
+
+    it('keeps suppressing an event seen before Redis went down', async () => {
+        const primary = brokenStore();
+        const redisHealthy = new RedisDedupCache(windowedRedisClient(), WINDOW_SECONDS);
+        (primary.add as ReturnType<typeof vi.fn>).mockImplementationOnce((s: string, e: string) =>
+            redisHealthy.add(s, e),
+        );
+        const hybrid = new HybridDedupCache(primary, new InMemoryDedupCache(WINDOW_SECONDS), true);
+
+        expect(await hybrid.add('stream-1', 'evt-1')).toBe(true);
+        // Redis is now down for every later call.
+        expect(await hybrid.add('stream-1', 'evt-1')).toBe(false);
+    });
+
+    it('does not suppress a duplicate reaching a different process during an outage (documented)', async () => {
+        const processA = new HybridDedupCache(brokenStore(), new InMemoryDedupCache(WINDOW_SECONDS), true);
+        const processB = new HybridDedupCache(brokenStore(), new InMemoryDedupCache(WINDOW_SECONDS), true);
+
+        expect(await processA.add('stream-1', 'evt-1')).toBe(true);
+        expect(await processB.add('stream-1', 'evt-1')).toBe(true);
+    });
+
+    it('suppresses via Redis again once it recovers, for keys written before the outage', async () => {
+        const client = windowedRedisClient();
+        const before = new HybridDedupCache(
+            new RedisDedupCache(client, WINDOW_SECONDS),
+            new InMemoryDedupCache(WINDOW_SECONDS),
+            true,
+        );
+        await before.add('stream-1', 'evt-1');
+
+        // A fresh process (empty in-memory cache) after Redis recovers.
+        const after = new HybridDedupCache(
+            new RedisDedupCache(client, WINDOW_SECONDS),
+            new InMemoryDedupCache(WINDOW_SECONDS),
+            true,
+        );
+        expect(await after.add('stream-1', 'evt-1')).toBe(false);
+    });
+});
