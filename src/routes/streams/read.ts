@@ -110,7 +110,7 @@ async function listStreamsHandler(req: Request, res: Response): Promise<void> {
     if (sender) queryParams.sender = sender;
     if (recipient) queryParams.recipient = recipient;
     if (includeTotal) queryParams.include_total = 'true';
-    sendEarlyHints(res, { baseUrl: '/api/streams', hasMore: true, nextCursor: body.next_cursor, queryParams });
+    sendEarlyHints(res, { baseUrl: '/api/streams', hasMore: true, nextCursor: body.next_cursor, queryParams }, req);
   }
 
   if (isFlagEnabled(STREAMS_ENHANCED_RESPONSE_FLAG, getFeatureFlagRequesterId(req))) {
