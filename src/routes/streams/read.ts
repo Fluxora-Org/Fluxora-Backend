@@ -41,7 +41,7 @@ import {
 } from './guards.js';
 import { isStreamListingHealthy } from './state.js';
 
-const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
+export const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 const MAX_EXPORT_PAGES = 1000;
 const JSON_LD_CONTEXT_LINK =
   '<https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"';

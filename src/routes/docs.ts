@@ -71,7 +71,7 @@ function getSpec(): Record<string, unknown> {
 
     cachedSpec = spec;
   }
-  return cachedSpec;
+  return cachedSpec!;
 }
 
 /** GET /openapi.json — raw OpenAPI 3.1 document */
