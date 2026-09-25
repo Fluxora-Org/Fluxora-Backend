@@ -122,6 +122,7 @@ jobs:
           tests/db/streams.compositeIndexes.test.ts
           tests/db/logicalReplication.test.ts
           tests/db/contractEvents.partitionPruning.test.ts
+          tests/db/rowMapping.schema.test.ts
 
       # Required gate: failing tests block the pipeline.
       - name: Run tests

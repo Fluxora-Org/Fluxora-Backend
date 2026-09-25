@@ -10,10 +10,10 @@ export const STALE_CURSOR_ERROR_CODE = 'STALE_CURSOR';
  * Map a raw `contract_events` row into a {@link StreamEventRecord} (issue #1316).
  *
  * Strict row-mapping contract, enforced through the shared `rowReader`:
- * - Every NOT NULL column must be present and non-NULL; an absent column is
- *   treated exactly like NULL (a forgotten SELECT is a bug, not a NULL).
+ * - Every mapped column must be present; an omitted SELECT column is a bug.
  * - `ledger_hash` is nullable — legacy rows written before the column was
- *   added must stay readable — but a wrong-typed value is still rejected.
+ *   added must stay readable — so explicit NULL is accepted, but a
+ *   wrong-typed value is still rejected.
  * - `timestamptz` columns (`happened_at`, `ingested_at`) are normalized to
  *   ISO-8601 strings; epoch numbers and unparsed JSON strings are rejected.
  * - `payload` must be a JSON object (not an array, scalar, or string).
