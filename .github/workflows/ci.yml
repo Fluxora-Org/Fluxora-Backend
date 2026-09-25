@@ -112,6 +112,14 @@ jobs:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
         run: pnpm run migrate
 
+      # Assert src/db/types.ts still matches the schema the migrations just
+      # produced. A renamed or retyped mapped column fails here until the
+      # declared interface is updated.
+      - name: Assert DB types match the live schema
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+        run: pnpm run check:db-types
+
       - name: Run live database integration suites
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
