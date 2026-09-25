@@ -21,6 +21,7 @@ import {
   StellarAddressValidator,
   STELLAR_ACCOUNT_CACHE_PREFIX,
 } from '../../src/validation/stellarAddressValidator.js';
+import { logger } from '../../src/lib/logger.js';
 import {
   classifyStellarAddress,
   isValidStellarAccountAddress,
@@ -279,12 +280,13 @@ describe('StellarAddressValidator', () => {
 
   it('fails-open and logs a warning when circuit breaker is OPEN', async () => {
     const rpc = makeRpc({ [SENDER]: new CircuitOpenError(), [RECIPIENT]: new CircuitOpenError() });
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const v = new StellarAddressValidator(rpc, redis, TTL, 'testnet');
     const result = await v.validate(SENDER, RECIPIENT);
     expect(result.valid).toBe(true);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Circuit breaker OPEN'),
+      expect.any(String),
       expect.any(Object)
     );
     warnSpy.mockRestore();
@@ -293,11 +295,15 @@ describe('StellarAddressValidator', () => {
   it('fails-open and logs a warning on generic RPC error', async () => {
     const rpcErr = new RpcProviderError('connection refused', 'NETWORK');
     const rpc = makeRpc({ [SENDER]: rpcErr, [RECIPIENT]: rpcErr });
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const v = new StellarAddressValidator(rpc, redis, TTL, 'testnet');
     const result = await v.validate(SENDER, RECIPIENT);
     expect(result.valid).toBe(true);
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('RPC error'), expect.any(Object));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('RPC error'),
+      expect.any(String),
+      expect.any(Object)
+    );
     warnSpy.mockRestore();
   });
 
@@ -307,7 +313,7 @@ describe('StellarAddressValidator', () => {
       [SENDER]: new CircuitOpenError(),
       [RECIPIENT]: true,
     });
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const v = new StellarAddressValidator(rpc, redis, TTL, 'testnet');
     const result = await v.validate(SENDER, RECIPIENT);
     // null (fail-open) + true → both pass → valid
@@ -321,7 +327,7 @@ describe('StellarAddressValidator', () => {
       [SENDER]: new CircuitOpenError(),
       [RECIPIENT]: false,
     });
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const v = new StellarAddressValidator(rpc, redis, TTL, 'testnet');
     const result = await v.validate(SENDER, RECIPIENT);
     expect(result.valid).toBe(false);
@@ -425,4 +431,5 @@ describe('Network-aware contract at representative API boundaries', () => {
     expect(isValidStellarAccountAddress(CASE_VARIANT_ADDRESS)).toBe(false);
   });
 });
+
 
