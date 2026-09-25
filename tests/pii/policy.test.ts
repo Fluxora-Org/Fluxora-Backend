@@ -28,7 +28,28 @@ describe('PII policy definitions', () => {
     });
 
     it('covers all expected stream fields', () => {
-      const expected = ['id', 'sender', 'recipient', 'depositAmount', 'ratePerSecond', 'startTime', 'status'];
+      const expected = [
+        'id',
+        'sender_address',
+        'recipient_address',
+        'amount',
+        'streamed_amount',
+        'remaining_amount',
+        'rate_per_second',
+        'start_time',
+        'end_time',
+        'status',
+        'contract_id',
+        'transaction_hash',
+        'event_index',
+        'created_at',
+        'updated_at',
+        'sender',
+        'recipient',
+        'depositAmount',
+        'ratePerSecond',
+        'startTime',
+      ];
       expect(Object.keys(STREAM_FIELD_POLICIES).sort()).toEqual(expected.sort());
     });
 
