@@ -29,3 +29,20 @@ export const indexerReplayIntegrityDuplicatesTotal = counter('indexer_replay_int
  * Threshold: > 0 for more than 5 minutes (indicates Redis outage or persistent network partition).
  */
 export const indexerLeaderElectionFailuresTotal = counter('indexer_leader_election_failures_total', ['reason']);
+
+export function deRegisterIndexerMetrics(): void {
+  for (const name of [
+    'indexer_replay_batches_committed_total',
+    'indexer_replay_rows_committed_total',
+    'indexer_replay_rows_per_second',
+    'indexer_replay_duration_seconds',
+    'indexer_mtls_validation_failures_total',
+    'indexer_replay_integrity_gaps_total',
+    'indexer_replay_integrity_duplicates_total',
+    'indexer_replay_active_workers',
+    'indexer_replay_retries_total',
+    'indexer_replay_checkpoint_sequence',
+  ]) {
+    registry.removeSingleMetric(name);
+  }
+}

@@ -1,10 +1,34 @@
 /**
- * Rate-limit store implementations.
+ * Rate-limit store implementations backing `src/middleware/rateLimiter.ts`.
  *
  * Three implementations of the `RateLimitStore` interface:
- *   - `InMemoryStore`: In-process counter map, used as fallback when Redis is unavailable.
- *   - `SlidingWindowStore`: Redis sorted-set pipeline implementation for cluster-wide limits.
- *   - `HybridStore`: Wraps a primary and fallback store; delegates to fallback on primary errors.
+ *   - `InMemoryStore`: process-local sliding-window counter map. Used as the
+ *     fallback when Redis is unavailable, and as the sole backend when
+ *     `REDIS_ENABLED=false`.
+ *   - `SlidingWindowStore`: Redis sorted-set pipeline implementation for
+ *     cluster-wide limits.
+ *   - `HybridStore`: Wraps a primary and fallback store; delegates to fallback
+ *     on primary errors.
+ *
+ * ## Shared contract
+ *
+ * All three stores implement the same sliding-window semantics and the same
+ * key scope:
+ *
+ * - **Key scope** — `key` is the fully-qualified storage key supplied by the
+ *   caller (the middleware builds `{principalType}:{identifier}:{route}`).
+ *   Stores never broaden or merge keys; two distinct callers always get two
+ *   distinct counters. `SlidingWindowStore` additionally sanitises the key
+ *   before embedding it in a Redis key (`fluxora:rl:{sanitisedKey}`).
+ * - **Expiry/lifetime** — a request counted by the store is only counted while
+ *   it is inside `windowMs`. Both implementations prune anything older than
+ *   `windowMs`, so entries cannot outlive the window they were recorded in.
+ * - **Sliding, not fixed** — the window slides with each request. Unlike a
+ *   fixed window, the stores cannot admit up to twice the configured limit
+ *   across a window boundary.
+ * - **Unavailable** — see `SlidingWindowStore` and `HybridStore`. A failed or
+ *   closed Redis store throws; `HybridStore` catches that and delegates to its
+ *   (always-available) in-memory fallback so requests keep being limited.
  */
 
 import type { RateLimitStore } from '../types/rateLimit.js';
@@ -33,26 +57,75 @@ function randomHex(bytes: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// InMemoryStore (Task 2.1)
+// InMemoryStore
 // ---------------------------------------------------------------------------
+
+/**
+ * One sliding-window bucket: the ascending timestamps of requests that are
+ * still inside the window, plus the window length used to prune them.
+ */
+interface SlidingBucket {
+    /** Ascending request timestamps (ms) within the current window. */
+    timestamps: number[];
+    /** Window duration (ms). Re-stamped on every access. */
+    windowMs: number;
+}
 
 /**
  * In-memory implementation of `RateLimitStore`.
  *
- * Extracted from the counter logic in `src/middleware/rateLimiter.ts`.
- * Used as the fallback backend when Redis is unavailable.
+ * Contract:
+ * - **Key scope**: keys are stored verbatim (process-local, never used as a
+ *   Redis key), so no sanitisation is performed here.
+ * - **Window**: a genuine **sliding window**. Each `increment` records the
+ *   request timestamp; every read prunes timestamps that have left the window.
+ *   This is deliberate: the previous fixed-window implementation admitted up to
+ *   twice the configured rate across a window boundary (a burst at the end of
+ *   one window plus a burst at the start of the next).
+ * - **Expiry / boundedness**: timestamps are pruned once they are older than
+ *   `windowMs`, a fully-elapsed bucket is dropped on access, and a periodic
+ *   sweep evicts buckets whose window has passed. An entry therefore never
+ *   outlives `windowMs` of inactivity.
+ * - **Unavailable**: never — this is the fallback used when Redis is down and
+ *   the sole backend when `REDIS_ENABLED=false`. `close()` releases all state.
  */
 export class InMemoryStore implements RateLimitStore {
-    private readonly counters = new Map<string, { count: number; resetAt: number }>();
+    private readonly buckets = new Map<string, SlidingBucket>();
 
-    private getOrInit(key: string, windowMs: number): { count: number; resetAt: number } {
-        const now = Date.now();
-        let entry = this.counters.get(key);
-        if (!entry || now >= entry.resetAt) {
-            entry = { count: 0, resetAt: now + windowMs };
-            this.counters.set(key, entry);
+    /**
+     * Operations performed since the last full sweep. Expired buckets are
+     * evicted periodically rather than on every call so a store with many live
+     * keys does not pay an O(n) scan per request.
+     */
+    private operationsSinceSweep = 0;
+
+    private static readonly SWEEP_INTERVAL = 256;
+
+    /** Drop timestamps that have left the bucket's window. */
+    private prune(bucket: SlidingBucket, now: number): void {
+        const cutoff = now - bucket.windowMs;
+        let firstAlive = 0;
+        while (firstAlive < bucket.timestamps.length && bucket.timestamps[firstAlive] <= cutoff) {
+            firstAlive++;
         }
-        return entry;
+        if (firstAlive > 0) {
+            bucket.timestamps.splice(0, firstAlive);
+        }
+    }
+
+    /**
+     * Evict every bucket whose window has fully elapsed. Runs at most once per
+     * `SWEEP_INTERVAL` operations to keep the per-request cost amortised.
+     */
+    private maybeSweep(now: number): void {
+        if (++this.operationsSinceSweep < InMemoryStore.SWEEP_INTERVAL) return;
+        this.operationsSinceSweep = 0;
+        for (const [key, bucket] of this.buckets) {
+            this.prune(bucket, now);
+            if (bucket.timestamps.length === 0) {
+                this.buckets.delete(key);
+            }
+        }
     }
 
     async increment(
@@ -60,9 +133,20 @@ export class InMemoryStore implements RateLimitStore {
         windowMs: number,
         _limit: number,
     ): Promise<{ count: number; resetAt: number }> {
-        const entry = this.getOrInit(key, windowMs);
-        entry.count += 1;
-        return { count: entry.count, resetAt: entry.resetAt };
+        const now = Date.now();
+        this.maybeSweep(now);
+
+        const bucket = this.buckets.get(key);
+        if (bucket) {
+            bucket.windowMs = windowMs;
+            this.prune(bucket, now);
+        }
+
+        const timestamps = bucket && bucket.timestamps.length > 0 ? bucket.timestamps : [];
+        timestamps.push(now);
+        this.buckets.set(key, { timestamps, windowMs });
+
+        return { count: timestamps.length, resetAt: timestamps[0] + windowMs };
     }
 
     async getCount(
@@ -70,20 +154,33 @@ export class InMemoryStore implements RateLimitStore {
         windowMs: number,
     ): Promise<{ count: number; resetAt: number }> {
         const now = Date.now();
-        const entry = this.counters.get(key);
-        if (!entry || now >= entry.resetAt) {
+        this.maybeSweep(now);
+
+        const bucket = this.buckets.get(key);
+        if (!bucket) {
             return { count: 0, resetAt: now + windowMs };
         }
-        return { count: entry.count, resetAt: entry.resetAt };
+
+        bucket.windowMs = windowMs;
+        this.prune(bucket, now);
+        if (bucket.timestamps.length === 0) {
+            // The window has fully elapsed — drop the entry so it cannot
+            // outlive its documented lifetime.
+            this.buckets.delete(key);
+            return { count: 0, resetAt: now + windowMs };
+        }
+
+        return { count: bucket.timestamps.length, resetAt: bucket.timestamps[0] + windowMs };
     }
 
     async close(): Promise<void> {
-        // No-op — nothing to clean up for an in-memory store.
+        this.buckets.clear();
+        this.operationsSinceSweep = 0;
     }
 }
 
 // ---------------------------------------------------------------------------
-// SlidingWindowStore (Task 2.3)
+// SlidingWindowStore
 // ---------------------------------------------------------------------------
 
 const KEY_PREFIX = 'fluxora:rl:';
@@ -91,8 +188,24 @@ const KEY_PREFIX = 'fluxora:rl:';
 /**
  * Redis sliding-window implementation of `RateLimitStore`.
  *
- * Uses a sorted-set pipeline (ZADD NX + ZREMRANGEBYSCORE + ZCARD + PEXPIRE)
- * executed in a single `multi()` round-trip per `increment` call.
+ * Contract:
+ * - **Key scope**: one Redis sorted set per caller key, named
+ *   `fluxora:rl:{sanitiseIdentifier(key)}`. Sanitisation replaces characters
+ *   outside `[A-Za-z0-9._-]` with `_` and truncates to 256 chars, so the Redis
+ *   key (prefix + 256) stays bounded regardless of caller input and can never
+ *   collide across namespaces. Distinct caller keys always map to distinct
+ *   Redis keys.
+ * - **Window / expiry**: a genuine **sliding window**, not a fixed one. Every
+ *   member carries the request timestamp as its score; `increment` removes
+ *   members whose score is `<= now - windowMs` (`ZREMRANGEBYSCORE`) before
+ *   counting, so only requests inside the trailing window count. A burst at the
+ *   end of one window plus a burst at the start of the next cannot exceed the
+ *   configured limit. `PEXPIRE {windowMs}` is refreshed on every increment, so
+ *   the Redis key — and every member in it — expires one window after the last
+ *   recorded request and cannot outlive its lifetime.
+ * - **Unavailable**: throws if the pipeline returns no result, if any pipelined
+ *   command fails, or after `close()`. Errors propagate to `HybridStore`, which
+ *   falls back to an in-memory sliding window (`InMemoryStore`).
  *
  * Key format: `fluxora:rl:{sanitisedKey}`
  * Member format: `{timestampMs}-{6-char random hex}`
@@ -176,7 +289,7 @@ export class SlidingWindowStore implements RateLimitStore {
 }
 
 // ---------------------------------------------------------------------------
-// HybridStore (Task 2.5)
+// HybridStore
 // ---------------------------------------------------------------------------
 
 /**
@@ -185,8 +298,16 @@ export class SlidingWindowStore implements RateLimitStore {
  * Delegates to `primary` (typically `SlidingWindowStore`) and falls back to
  * `fallback` (typically `InMemoryStore`) on any error from the primary.
  *
- * The `usingFallback` property is set to `true` the first time the primary
- * fails, allowing callers to detect degraded operation.
+ * Contract:
+ * - **Unavailable behaviour**: if the primary throws for any reason — Redis
+ *   connection loss, a partial pipeline failure, or a closed store — the error
+ *   is reported through `onError`, `usingFallback` is set permanently to `true`,
+ *   and the request is answered by the fallback store. Requests are therefore
+ *   always limited, even during a Redis outage; the fallback enforces the same
+ *   sliding-window semantics per process.
+ * - `usingFallback` is sticky: once the primary has failed, callers can report
+ *   degraded operation (`GET /api/rate-limits` returns `degraded: true`) even
+ *   after Redis recovers.
  */
 export class HybridStore implements RateLimitStore {
     usingFallback = false;

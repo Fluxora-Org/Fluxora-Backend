@@ -18,7 +18,7 @@ vi.mock('../src/db/repositories/streamRepository.js', () => ({
     updateStream: vi.fn(),
   },
 }));
-vi.mock('../src/utils/logger.js', () => ({
+vi.mock('../src/lib/logger.js', () => ({
   info: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),

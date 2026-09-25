@@ -3,15 +3,15 @@ import type { BanStore, BanCheckResult } from '../redis/banStore.js';
 import { createBanStore } from '../redis/banStore.js';
 import type { RedisClient } from '../redis/client.js';
 import { getClientIp } from '../lib/ipExtraction.js';
-import { Gauge } from 'prom-client';
+import { Counter, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
 export { getClientIp };
 
 // In-memory state (non-ban state)
 const connectionCounts = new Map<string, number>();
-const rejectionHistory = new Map<string, number[]>(); // IP -> timestamps of rejections
-const reconnectHistory = new Map<string, number[]>(); // IP -> timestamps of upgrade attempts
+const rejectionHistory = new Map<string, number[]>(); // client key -> timestamps of rejections
+const reconnectHistory = new Map<string, number[]>(); // client key -> timestamps of upgrade attempts
 
 // Graceful shutdown state
 let shuttingDown = false;
@@ -26,7 +26,14 @@ const activeConnectionsGauge = new Gauge({
 
 const maxConnectionsGauge = new Gauge({
   name: 'websocket_connections_max',
-  help: 'Maximum allowed WebSocket connections per IP',
+  help: 'Maximum allowed WebSocket connections per authenticated identity or IP fallback',
+  registers: [registry],
+});
+
+const connectionRejectionsCounter = new Counter({
+  name: 'websocket_connection_rejections_total',
+  help: 'WebSocket connection attempts rejected by the limiter',
+  labelNames: ['reason'] as const,
   registers: [registry],
 });
 
@@ -108,7 +115,14 @@ export function getBanStore(): BanStore {
  * // On successful upgrade, mark cleaned=true to prevent double-cleanup
  * ```
  */
-export async function checkAndReserve(ip: string): Promise<{ allowed: boolean; code?: number; reason?: string }> {
+function resolveConnectionKey(ip: string, clientIdentity?: string): string {
+  return clientIdentity?.trim() ? `identity:${clientIdentity.trim()}` : `ip:${ip}`;
+}
+
+export async function checkAndReserve(
+  ip: string,
+  clientIdentity?: string
+): Promise<{ allowed: boolean; code?: number; reason?: string }> {
   // Reject new connections during graceful shutdown
   if (shuttingDown) {
     return { allowed: false, code: 4029, reason: 'Server shutting down' };
@@ -118,25 +132,28 @@ export async function checkAndReserve(ip: string): Promise<{ allowed: boolean; c
   const maxConnections = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
   const reconnectLimit = parseInt(process.env.WS_RECONNECT_LIMIT || '20', 10);
   const reconnectWindowMs = parseInt(process.env.WS_RECONNECT_WINDOW_MS || '60000', 10);
+  const key = resolveConnectionKey(ip, clientIdentity);
 
-  const attempts = (reconnectHistory.get(ip) || []).filter((timestamp) => now - timestamp < reconnectWindowMs);
+  const attempts = (reconnectHistory.get(key) || []).filter(
+    (timestamp) => now - timestamp < reconnectWindowMs
+  );
   if (attempts.length >= reconnectLimit) {
-    reconnectHistory.set(ip, attempts);
-    recordRejection(ip, now);
+    reconnectHistory.set(key, attempts);
+    recordRejection(key, ip, now, 'Reconnect rate exceeded');
     return { allowed: false, code: 4029, reason: 'Reconnect rate exceeded' };
   }
   attempts.push(now);
-  reconnectHistory.set(ip, attempts);
+  reconnectHistory.set(key, attempts);
 
   // 1. Check connection limit FIRST (synchronously) to avoid TOCTOU
-  const currentCount = connectionCounts.get(ip) || 0;
+  const currentCount = connectionCounts.get(key) || 0;
   if (currentCount >= maxConnections) {
-    recordRejection(ip, now);
+    recordRejection(key, ip, now, 'Too many connections');
     return { allowed: false, code: 4029, reason: 'Too many connections' };
   }
 
   // Atomically reserve the connection slot before any async operations
-  connectionCounts.set(ip, currentCount + 1);
+  connectionCounts.set(key, currentCount + 1);
   activeConnections++;
   updateActiveConnectionsMetric();
 
@@ -144,7 +161,8 @@ export async function checkAndReserve(ip: string): Promise<{ allowed: boolean; c
   try {
     const banResult: BanCheckResult = await banStore.isBanned(ip);
     if (banResult.banned) {
-      untrackConnection(ip); // rollback reservation
+      untrackConnection(ip, clientIdentity); // rollback reservation
+      connectionRejectionsCounter.inc({ reason: 'IP banned due to abuse' });
       return { allowed: false, code: 4029, reason: 'IP banned due to abuse' };
     }
   } catch {
@@ -159,16 +177,19 @@ export async function checkAndReserve(ip: string): Promise<{ allowed: boolean; c
  * Records a rejection and checks if the IP should be banned for abuse.
  * Now delegates ban creation to the configured BanStore (Redis + local).
  */
-function recordRejection(ip: string, now: number): void {
+function recordRejection(key: string, ip: string, now: number, reason: string): void {
   const abuseThreshold = parseInt(process.env.WS_ABUSE_THRESHOLD || '5', 10);
   const banTtl = parseInt(process.env.WS_BAN_TTL_S || '3600', 10);
   const abuseWindowMs = 60_000; // 1 minute sliding window for abuse detection
 
-  let rejections = rejectionHistory.get(ip) || [];
+  connectionRejectionsCounter.inc({ reason });
+  logger.warn('ws_connection_rejected', undefined, { event: 'ws_connection_rejected', reason, ip });
+
+  let rejections = rejectionHistory.get(key) || [];
   // Sliding window: only keep rejections within the last abuseWindowMs
   rejections = rejections.filter((t) => now - t < abuseWindowMs);
   rejections.push(now);
-  rejectionHistory.set(ip, rejections);
+  rejectionHistory.set(key, rejections);
 
   if (rejections.length > abuseThreshold) {
     // Delegate to banStore (Redis-backed with TTL + local cache)
@@ -179,7 +200,7 @@ function recordRejection(ip: string, now: number): void {
       });
     });
 
-    rejectionHistory.delete(ip);
+    rejectionHistory.delete(key);
     // Note: actual audit log emitted inside BanStore implementations
   }
 }
@@ -187,8 +208,9 @@ function recordRejection(ip: string, now: number): void {
 /**
  * Tracks a new active connection for an IP.
  */
-export function trackConnection(ip: string): void {
-  connectionCounts.set(ip, (connectionCounts.get(ip) || 0) + 1);
+export function trackConnection(ip: string, clientIdentity?: string): void {
+  const key = resolveConnectionKey(ip, clientIdentity);
+  connectionCounts.set(key, (connectionCounts.get(key) || 0) + 1);
 }
 
 /**
@@ -204,12 +226,13 @@ export function trackConnection(ip: string): void {
  *
  * INVARIANT: counter never goes negative (min 0).
  */
-export function untrackConnection(ip: string): void {
-  const current = connectionCounts.get(ip) || 0;
+export function untrackConnection(ip: string, clientIdentity?: string): void {
+  const key = resolveConnectionKey(ip, clientIdentity);
+  const current = connectionCounts.get(key) || 0;
   if (current <= 1) {
-    connectionCounts.delete(ip);
+    connectionCounts.delete(key);
   } else {
-    connectionCounts.set(ip, current - 1);
+    connectionCounts.set(key, current - 1);
   }
 
   // Decrement global active connections
@@ -263,7 +286,8 @@ export async function gracefulDrain(
   if (wss && wss.clients) {
     const closePayload = JSON.stringify({ reason: 'Server restarting' });
     for (const client of wss.clients) {
-      if (client.readyState === 1) { // WebSocket.OPEN
+      if (client.readyState === 1) {
+        // WebSocket.OPEN
         try {
           client.close(1001, closePayload);
         } catch (err) {
@@ -278,13 +302,17 @@ export async function gracefulDrain(
   // Wait for connections to close or grace period to expire
   const startTime = Date.now();
   while (activeConnections > 0 && Date.now() - startTime < gracePeriodMs) {
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   if (activeConnections > 0) {
-    logger.warn(`Grace period expired with ${activeConnections} connections still active`, undefined, {
-      remainingConnections: activeConnections,
-    });
+    logger.warn(
+      `Grace period expired with ${activeConnections} connections still active`,
+      undefined,
+      {
+        remainingConnections: activeConnections,
+      }
+    );
   } else {
     logger.info('All connections drained gracefully');
   }

@@ -1,3 +1,33 @@
+# Which authentication helper to use (#1579)
+
+**`src/middleware/auth.ts` is the authoritative authentication entry point.**
+Every new HTTP handler takes its guards from it:
+
+| Caller | Guard chain |
+|---|---|
+| User / service JWT | `authenticate` → `requireAuth` or `requirePermission(Permission.X)` |
+| API key (`X-API-Key`) | `authenticateApiKey` → `requireScope('scope')` |
+
+`authenticate` alone lets anonymous requests through; it must always be
+followed by `requireAuth` or `requirePermission`. `requirePermission` without
+`authenticate` in front of it rejects everyone (this was the bug on
+`POST /api/auth/revoke`, fixed in #1579).
+
+The other modules exist for narrower jobs. Use them only for exactly that job:
+
+| Module | What it is for | Do not use it for |
+|---|---|---|
+| `src/lib/auth.ts` | `generateToken` / `verifyToken` primitives | Guarding a handler: `verifyToken` skips revocation and payload validation |
+| `src/middleware/adminAuth.ts` | `requireAdminAuth`: operator gate (`ADMIN_API_KEY` or admin/DPO JWT) for `/api/admin`, `/metrics`, `/internal/webhooks`, rate-limit config, privacy erasure | Tenant or user routes: its JWT fallback does not check revocation |
+| `src/middleware/tokenAuth.ts` | `verifyWsToken`: WebSocket upgrades, and the extra `?token=` check on the SSE / long-poll stream routes (which run `authenticateApiKey` + `requireScope` first) | The sole guard on any HTTP route: it checks the signature only |
+| `src/services/oidcProvider.ts` | `verifyIdToken`: OIDC ID-token exchange in `POST /api/auth/session` | Authenticating API requests |
+
+`createBearerTokenAuth` (a static shared-token check in `tokenAuth.ts`) was
+removed in #1579: no route used it and it compared tokens with `!==` rather
+than in constant time. `tests/security/auth-entrypoint.test.ts` fails if a
+route file calls `verifyToken`/`jsonwebtoken` directly or uses
+`requireAuth`/`requirePermission` without `authenticate`.
+
 # Authentication & Authorization (RBAC)
 
 This document describes the fine-grained permission model introduced to replace simple `role` checks.

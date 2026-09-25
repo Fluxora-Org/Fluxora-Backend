@@ -14,14 +14,15 @@ import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
 import * as overrideService from '../../src/services/tenantRateLimitOverride.service.js';
 
 function mockRequest(props: Partial<Request> = {}): Request & { ip?: string } {
+  const remoteAddress = props.ip ?? (props.socket as any)?.remoteAddress ?? '10.0.0.1';
   return {
     headers: {},
-    socket: { remoteAddress: '10.0.0.1' } as any,
+    socket: { remoteAddress } as any,
     // Use a path that does not match any ROUTE_BUDGETS so the env-driven
     // limits in this test apply directly.
     path: '/__rate-limit-test__',
     method: 'GET',
-    ip: '10.0.0.1',
+    ip: remoteAddress,
     ...props,
   } as Request & { ip?: string };
 }

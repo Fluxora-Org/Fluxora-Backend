@@ -51,7 +51,7 @@ export function validateOverrideMethod(raw: unknown): string | null {
  * @returns `true` if authentication is present or credentials exist.
  */
 function isAuthenticatedRequest(req: Request): boolean {
-  const hasUser = Boolean(req.user || (req as any).keyId || (req as any).keyScopes);
+  const hasUser = Boolean(req.user || req.keyId || req.keyScopes);
   const hasCredentialHeader = Boolean(req.headers.authorization || req.headers['x-api-key']);
   return hasUser || hasCredentialHeader;
 }
@@ -67,8 +67,8 @@ function getAuditUserId(req: Request): string {
     const u = req.user as { address?: string; sub?: string; role?: string };
     return u.address || u.sub || u.role || 'authenticated_user';
   }
-  if ((req as any).keyId) {
-    return `key:${(req as any).keyId}`;
+  if (req.keyId) {
+    return `key:${req.keyId}`;
   }
   return 'credential_header_present';
 }

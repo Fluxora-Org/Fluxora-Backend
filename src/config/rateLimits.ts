@@ -89,6 +89,8 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
   apiKey: RateLimitConfig;
   admin: RateLimitConfig;
   trustProxy: boolean;
+  trustedProxyCount: number;
+  trustedProxies: Set<string>;
   allowlistIps: Set<string>;
 } {
   const enabled = env.RATE_LIMIT_ENABLED !== 'false';
@@ -125,6 +127,26 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
       };
 
   const trustProxy = env.RATE_LIMIT_TRUST_PROXY !== 'false';
+  const trustedProxyCount =
+    parseInt(
+      env.TRUSTED_PROXY_COUNT ??
+        env.TRUST_PROXY_HOPS ??
+        env.RATE_LIMIT_TRUSTED_PROXY_COUNT ??
+        '',
+      10
+    ) || 0;
+
+  const trustedProxies = new Set<string>();
+  const proxiesEnv =
+    env.TRUSTED_PROXIES ??
+    env.WS_TRUSTED_PROXIES ??
+    env.RATE_LIMIT_TRUSTED_PROXIES ??
+    '';
+  if (proxiesEnv) {
+    for (const entry of proxiesEnv.split(',').map((s) => s.trim()).filter(Boolean)) {
+      trustedProxies.add(entry);
+    }
+  }
 
   // Parse allowlist IPs for health probes
   const allowlistIps = new Set<string>();
@@ -135,7 +157,7 @@ export function getRateLimitConfig(env: Record<string, string | undefined>): {
     }
   }
 
-  return { ip, apiKey, admin, trustProxy, allowlistIps };
+  return { ip, apiKey, admin, trustProxy, trustedProxyCount, trustedProxies, allowlistIps };
 }
 
 /**
@@ -276,4 +298,72 @@ export function getWebhookRateLimitConfig(
     parseInt(env.WEBHOOK_RETRY_BURST ?? '', 10) || DEFAULT_WEBHOOK_RATE_LIMIT.burst;
 
   return { limit, windowMs, burst };
+}
+
+// ─── Startup validation (issue #1437) ───────────────────────────────────────
+
+interface IntegerRange {
+  min: number;
+  max?: number;
+  /** Human-readable explanation appended to out-of-range errors. */
+  maxReason?: string;
+}
+
+const RATE_LIMIT_INTEGER_ENVS: Readonly<Record<string, IntegerRange>> = {
+  RATE_LIMIT_IP_WINDOW_MS: {
+    min: 1,
+    max: MAX_WINDOW_MS,
+    maxReason: `the sliding-window store uses PEXPIRE windowMs, so larger windows would pin Redis keys (MAX_WINDOW_MS)`,
+  },
+  RATE_LIMIT_IP_MAX: { min: 1 },
+  RATE_LIMIT_APIKEY_WINDOW_MS: {
+    min: 1,
+    max: MAX_WINDOW_MS,
+    maxReason: `the sliding-window store uses PEXPIRE windowMs, so larger windows would pin Redis keys (MAX_WINDOW_MS)`,
+  },
+  RATE_LIMIT_APIKEY_MAX: { min: 1 },
+  RATE_LIMIT_ADMIN_WINDOW_MS: {
+    min: 1,
+    max: MAX_WINDOW_MS,
+    maxReason: `the sliding-window store uses PEXPIRE windowMs, so larger windows would pin Redis keys (MAX_WINDOW_MS)`,
+  },
+  RATE_LIMIT_ADMIN_MAX: { min: 1 },
+  WEBHOOK_RETRY_RPS: { min: 1 },
+  WEBHOOK_RETRY_BURST: { min: 0 },
+};
+
+/**
+ * Validate the env-driven rate-limit configuration (issue #1437).
+ *
+ * `getRateLimitConfig()` silently falls back to defaults for non-numeric or
+ * out-of-range values (`parseInt(...) || DEFAULT`), which means a typo like
+ * `RATE_LIMIT_IP_WINDOW_MS=90000000000` would previously surface only as
+ * misbehaving rate limiting during request handling. Reject such values at
+ * startup instead. Values absent or empty are valid (defaults apply).
+ */
+export function validateRateLimitsConfig(
+  env: Record<string, string | undefined>,
+): string[] {
+  const issues: string[] = [];
+
+  for (const [name, range] of Object.entries(RATE_LIMIT_INTEGER_ENVS)) {
+    const raw = env[name];
+    if (raw === undefined || raw.trim() === '') continue;
+
+    if (!/^-?\d+$/.test(raw.trim())) {
+      issues.push(`${name} must be an integer (got "${raw}")`);
+      continue;
+    }
+
+    const value = Number.parseInt(raw, 10);
+    if (value < range.min) {
+      issues.push(`${name} must be at least ${range.min} (got "${raw}")`);
+    } else if (range.max !== undefined && value > range.max) {
+      issues.push(
+        `${name} must be at most ${range.max}${range.maxReason ? ` — ${range.maxReason}` : ''} (got "${raw}")`,
+      );
+    }
+  }
+
+  return issues;
 }

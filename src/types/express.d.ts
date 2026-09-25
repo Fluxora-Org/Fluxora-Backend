@@ -28,8 +28,17 @@ declare global {
        * `undefined` — middleware has not yet run (e.g. very early in the stack).
        */
       isCanary?: boolean;
-      /** Attached by authenticateApiKey middleware; the api_keys.id (cuid2). */
+      /**
+       * Attached by authenticateApiKey middleware; the api_keys.id (cuid2).
+       * Present only when a valid API key was presented on the request.
+       */
       keyId?: string;
+      /**
+       * Attached by authenticateApiKey middleware; the list of permission
+       * scopes granted to the API key identified by `keyId`.
+       * Present only when a valid API key was presented on the request.
+       */
+      keyScopes?: string[];
       /** Attached by authLockoutMiddleware; the AuthAttemptStore instance for recording auth failures. */
       authAttemptStore?: import('../redis/authAttemptStore.js').AuthAttemptStore;
     }

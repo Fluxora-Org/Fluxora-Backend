@@ -3,7 +3,7 @@
 // ── Ingest service (contract event ingestion from chain worker) ───────────────
 
 import { ApiError, ApiErrorCode, conflictError, serviceUnavailable, validationError } from '../middleware/errorHandler.js';
-import { debug, error, info, warn } from '../utils/logger.js';
+import { debug, error, info, warn } from '../lib/logger.js';
 import { ContractEventStore, InMemoryContractEventStore } from './store.js';
 import {
   ContractEventRecord,

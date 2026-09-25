@@ -74,7 +74,7 @@ vi.mock('../../src/metrics/dbMetrics.js', () => ({
   dbQueryDurationSeconds: { startTimer: vi.fn(() => vi.fn()) },
 }));
 
-vi.mock('../../src/utils/logger.js', () => ({
+vi.mock('../../src/lib/logger.js', () => ({
   info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn(),
 }));
 

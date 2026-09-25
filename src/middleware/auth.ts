@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyToken } from '../lib/auth.js';
 import { ApiErrorCode } from './errorHandler.js';
-import { warn, info, debug } from '../utils/logger.js';
+import { warn, info, debug } from '../lib/logger.js';
 import { z } from 'zod';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
 import { authJwtVerifyDurationSeconds } from '../metrics/businessMetrics.js';
@@ -51,8 +51,8 @@ export async function authenticateApiKey(req: Request, res: Response, next: Next
       return;
     }
 
-    (req as any).keyScopes = record.scopes;
-    (req as any).keyId = record.id;
+    req.keyScopes = record.scopes;
+    req.keyId = record.id;
     
     info('API key authenticated', { keyId: record.id, requestId });
     return next();
@@ -250,7 +250,7 @@ export function requirePermission(permission: Permission) {
 export function requireScope(...requiredScopes: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const requestId = req.id ?? req.correlationId;
-    const isApiKeyAuth = (req as any).keyId !== undefined;
+    const isApiKeyAuth = req.keyId !== undefined;
     const isJwtAuth = req.user !== undefined;
     if (!isApiKeyAuth && !isJwtAuth) {
       warn('Scope check failed: no authenticated principal', { path: req.path, requestId });
@@ -266,7 +266,7 @@ export function requireScope(...requiredScopes: string[]) {
     }
     let scopes: string[] = [];
     if (isApiKeyAuth) {
-      scopes = (req as any).keyScopes ?? [];
+      scopes = req.keyScopes ?? [];
     } else if (isJwtAuth) {
       scopes = (req.user as any).permissions ?? [];
     }

@@ -79,6 +79,7 @@ FROM expected
 WHERE actual.ledger IS NULL
 ORDER BY expected.ledger
 `;
+
 const DUPLICATE_QUERY = `SELECT event_id, ledger, COUNT(*)::int AS occurrence_count
   FROM contract_events
   WHERE contract_id = $1 AND ledger BETWEEN $2 AND $3
@@ -125,7 +126,8 @@ async function runIntegrityChunk(
       toLedger,
       contractId,
     ]);
-    const dupResult = await pool.query<{
+const dupResult = await pool.query<
+      {
         event_id: string;
         ledger: number;
         occurrence_count: number;
@@ -179,7 +181,7 @@ export async function checkReplayIntegrity(
       event: 'replay_integrity_large_range',
       contractId,
       originalRange,
-      reason: `Range exceeds $MAX_INTEGRITY_RANGE ledgers, processing in chunks`,
+      reason: `Range exceeds ${MAX_INTEGRITY_RANGE} ledgers, processing in chunks`,
     });
   }
 
@@ -189,8 +191,7 @@ export async function checkReplayIntegrity(
       min_ledger: number | null;
       max_ledger: number | null;
     }>(RANGE_QUERY, [contractId, effectiveFrom, effectiveTo]);
-
-    const minLedger = rangeRes.rows[0]?.min_ledger ?? null;
+const minLedger = rangeRes.rows[0]?.min_ledger ?? null;
     const maxLedger = rangeRes.rows[0]?.max_ledger ?? null;
 
     if (minLedger === null || maxLedger === null) {
@@ -218,7 +219,7 @@ export async function checkReplayIntegrity(
       MAX_CONCURRENT_CHECKS,
       async (start) => {
         const end = Math.min(start + INTEGRITY_CHUNK_SIZE - 1, maxLedger);
-        let lastError: string = 'unknown';
+let lastError: string | undefined = 'unknown';
         for (let attempt = 0; attempt < INTEGRITY_RETRY_BUDGET; attempt++) {
           const r = await runIntegrityChunk(pool, contractId, start, end);
           if (!r.error) {
@@ -236,7 +237,9 @@ export async function checkReplayIntegrity(
     // Combine results.
     const gaps: number[] = [];
     const duplicates: ReplayIntegrityCheckResult['duplicates'] = [];
-    const firstError = chunkResults.find((r) => r.error != null)?.error;
+const firstError = chunkResults.find(
+      (r) => r.error != null,
+    )?.error;
     for (const chunk of chunkResults) {
       if (chunk.error) continue;
       gaps.push(...chunk.gaps);
@@ -304,7 +307,7 @@ export async function checkReplayIntegrity(
             : `${gaps.length} gaps (first 20: ${gaps.slice(0, 20).join(', ')})`,
         duplicates:
           duplicates.length <= 10
-            ? duplicates.map((d) => `${d.eventId}@${d.ledger}`)
+            ? duplicates.map((d) => `${d.count}x ${d.eventId}@${d.ledger}`)
             : `${duplicates.length} duplicates`,
       });
     }

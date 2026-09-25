@@ -10,7 +10,7 @@
 import { runner } from 'node-pg-migrate';
 import fs from 'fs';
 import pg from 'pg';
-import { info, error as logError } from '../utils/logger.js';
+import { info, error as logError } from '../lib/logger.js';
 import path from 'path';
 
 

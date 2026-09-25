@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The project tsconfig targets ES2020 without DOM lib; `HeadersInit` comes from
+// the Fetch API type surface, so alias the narrow shape used by these stubs.
+type HeadersInit = Record<string, string>;
 import { WebhookDispatcher } from '../../src/webhooks/service.js';
 import type { EnhancedRetryPolicy } from '../../src/webhooks/retry.js';
 import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';

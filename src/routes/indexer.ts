@@ -31,7 +31,7 @@ import {
   defaultIndexerEventStore,
   indexerIngestionService,
 } from '../indexer/ingestion.js';
-import { indexerService } from '../indexer/service.js';
+import { indexerService, replayLock, replayState } from '../indexer/service.js';
 import { IndexerDependencyState } from '../indexer/types.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { successResponse, errorResponse } from '../utils/response.js';
@@ -202,6 +202,14 @@ indexerRouter.post(
       return;
     }
 
+    // Guard against concurrent control operations
+    if (replayLock.isHeld() || indexerService.getReplayProgress().isReplaying) {
+      res.status(409).json(
+        errorResponse('CONFLICT', 'Replay operation already in progress', undefined, requestId),
+      );
+      return;
+    }
+
     const lockProvider = getReindexLock();
     let lock: Lock | undefined;
 
@@ -279,6 +287,8 @@ indexerRouter.get(
 
 // ── Test helpers (consumed by tests only) ────────────────────────────────────
 
+export { replayLock, replayState };
+
 export function setIndexerIngestAuthToken(token: string): void {
   indexerWorkerToken = token;
 }
@@ -298,6 +308,8 @@ export function resetIndexerState(): void {
   indexerIngestionService.setStore(defaultIndexerEventStore);
   indexerIngestionService.resetRuntimeState();
   indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+  replayLock.release();
+  replayState.endReplay();
 }
 
 export function getIndexerHealth() {

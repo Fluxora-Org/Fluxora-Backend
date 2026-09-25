@@ -589,7 +589,7 @@ vi.mock('../../src/db/replicaPool.js', () => ({
   setReplicaPool: vi.fn(),
 }));
 
-vi.mock('../../src/utils/logger.js', () => ({
+vi.mock('../../src/lib/logger.js', () => ({
   info: vi.fn(),
   debug: vi.fn(),
   warn: vi.fn(),

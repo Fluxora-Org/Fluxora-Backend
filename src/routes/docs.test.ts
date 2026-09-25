@@ -9,10 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { docsRouter, resetSpecCache, FLAG_GATED_PATHS } from './docs.js';
-import {
-  reloadFlags,
-  clearFlagsReloadListeners,
-} from '../config/featureFlags.js';
+import { reloadFlags } from '../config/featureFlags.js';
 import { GRAPHQL_GATEWAY_FLAG } from '../graphql/gateway.js';
 
 /** Build the test app fresh each test so router state is clean. */
@@ -26,8 +23,6 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
   let app: express.Express;
 
   beforeEach(() => {
-    // Re-register the invalidation listener that may have been cleared by
-    // a prior test. This mirrors what happens at module load in production.
     resetSpecCache();
     app = makeApp();
   });

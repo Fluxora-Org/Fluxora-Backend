@@ -1,6 +1,8 @@
 # Database Pool Metrics
 
-Fluxora Backend exposes three Prometheus Gauges for every named `pg.Pool` instance. Operators can use these to detect pool exhaustion before it causes request timeouts.
+Fluxora Backend exposes five Prometheus Gauges for every named `pg.Pool` instance. Two of them are
+saturation ratios that move **before** the pool is exhausted, so operators get lead time instead of
+a post-mortem.
 
 ## Metrics
 
@@ -9,6 +11,8 @@ Fluxora Backend exposes three Prometheus Gauges for every named `pg.Pool` instan
 | `db_pool_active` | Gauge | `pool` | Connections currently checked out (in use) |
 | `db_pool_idle` | Gauge | `pool` | Connections sitting idle in the pool |
 | `db_pool_waiting` | Gauge | `pool` | Client requests queued waiting for a connection |
+| `db_pool_saturation_ratio` | Gauge | `pool` | Checked-out connections ÷ configured `max` (0..1) |
+| `db_pool_queue_saturation_ratio` | Gauge | `pool` | Queued requests ÷ configured `queueLimit` (0..1) |
 
 The `pool` label identifies the pool instance. The default singleton uses `pool="default"`. A read-replica pool would use `pool="read-replica"`.
 
@@ -20,13 +24,39 @@ The `pool` label identifies the pool instance. The default singleton uses `pool=
 - `acquire` — a connection was checked out to a client
 - `remove` — a connection was closed (idle timeout or error)
 
-Each event triggers a snapshot of `pool.totalCount`, `pool.idleCount`, and `pool.waitingCount`.
+Each event triggers a snapshot of `pool.totalCount`, `pool.idleCount`, `pool.waitingCount`, plus the pool's
+configured `options.max` (capacity) and `queueLimit`.
 
 ```
-active = totalCount - idleCount   (clamped to 0)
-idle   = idleCount
-waiting = waitingCount
+active                 = totalCount - idleCount      (clamped to 0)
+idle                   = idleCount
+waiting                = waitingCount
+saturation_ratio       = active  / capacity           (clamped to 0..1)
+queue_saturation_ratio = waiting / queueLimit         (clamped to 0..1)
 ```
+
+`syncPoolGauges()` only publishes a ratio when the denominator is a known positive number, so a pool
+without an explicit `max` / `queueLimit` is never reported as a misleading `0`.
+
+`query()` in `src/db/pool.ts` also re-syncs the gauges on the pool-exhausted fast-fail path (when
+`waitingCount >= queueLimit`) immediately before it throws `PoolExhaustedError`. That is the exact moment
+`db_pool_queue_saturation_ratio` reaches `1`, so the failure path is reflected in the published metrics
+rather than only in the logs.
+
+## Saturation: why not just `db_pool_waiting`?
+
+`db_pool_waiting` stays at `0` until the pool is **already** exhausted — by then requests are queueing or
+being refused, so an alert on it has no lead time. The ratio gauges are the actionable signals:
+
+| Metric | Meaning | Warn | Page |
+|---|---|---|---|
+| `db_pool_saturation_ratio` | Fraction of configured capacity in use | `>= 0.80` | `>= 0.95` |
+| `db_pool_queue_saturation_ratio` | Fraction of the wait queue in use | `>= 0.50` | `>= 0.90` |
+
+With `max = 10`, `db_pool_saturation_ratio = 0.80` means eight connections are checked out and two are
+still idle: there is headroom, but the trend is clear enough to scale the pool or shed load before
+anything queues. `db_pool_queue_saturation_ratio` climbs from `0` as soon as requests begin to queue and
+reaches `1` at the point `query()` fast-fails.
 
 ## Configuring the pool name
 
@@ -78,6 +108,16 @@ db_pool_idle{pool="read-replica"} 4
 # TYPE db_pool_waiting gauge
 db_pool_waiting{pool="default"} 0
 db_pool_waiting{pool="read-replica"} 0
+
+# HELP db_pool_saturation_ratio Fraction of configured pg.Pool capacity in use (active / max); alert at 0.8, page at 0.95
+# TYPE db_pool_saturation_ratio gauge
+db_pool_saturation_ratio{pool="default"} 0.3
+db_pool_saturation_ratio{pool="read-replica"} 0.2
+
+# HELP db_pool_queue_saturation_ratio Fraction of the pg.Pool wait queue in use (waiting / queueLimit); alert at 0.5, page at 0.9
+# TYPE db_pool_queue_saturation_ratio gauge
+db_pool_queue_saturation_ratio{pool="default"} 0
+db_pool_queue_saturation_ratio{pool="read-replica"} 0
 ```
 
 ## Alerting rules
@@ -86,7 +126,33 @@ db_pool_waiting{pool="read-replica"} 0
 groups:
   - name: database_pool
     rules:
-      # Alert when the waiting queue is non-zero for more than 30 seconds
+      # Lead-time signal: the pool is filling up before anything queues.
+      - alert: DbPoolSaturationWarning
+        expr: db_pool_saturation_ratio >= 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pool {{ $labels.pool }} is {{ $value }} saturated"
+
+      - alert: DbPoolSaturationCritical
+        expr: db_pool_saturation_ratio >= 0.95
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pool {{ $labels.pool }} is {{ $value }} saturated — exhaustion imminent"
+
+      # Failure-path signal: the wait queue is filling and requests are being refused.
+      - alert: DbPoolQueueSaturation
+        expr: db_pool_queue_saturation_ratio >= 0.9
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pool {{ $labels.pool }} wait queue is {{ $value }} full"
+
+      # Belt-and-braces: something is already queuing.
       - alert: DbPoolQueueBuildup
         expr: db_pool_waiting > 0
         for: 30s
@@ -94,15 +160,6 @@ groups:
           severity: warning
         annotations:
           summary: "Pool {{ $labels.pool }} has {{ $value }} waiting requests"
-
-      # Alert when active connections reach 90% of pool max
-      - alert: DbPoolNearExhaustion
-        expr: db_pool_active / (db_pool_active + db_pool_idle) > 0.9
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Pool {{ $labels.pool }} utilisation above 90%"
 ```
 
 ## Query-failure metrics (actionable failure paths)
@@ -155,8 +212,11 @@ Every failed `query()` call — pool exhaustion fast-fail, `statement_timeout` (
 # Active connections by pool
 db_pool_active
 
-# Pool utilisation ratio (0–1)
-db_pool_active / (db_pool_active + db_pool_idle)
+# Pool saturation (0–1) — uses the configured max, not the current connection count
+db_pool_saturation_ratio
+
+# Wait-queue saturation (0–1)
+db_pool_queue_saturation_ratio
 
 # Waiting queue depth
 db_pool_waiting
