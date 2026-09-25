@@ -10,53 +10,44 @@ in `tests/security/streamRepository.sqli.test.ts` and use payloads from
 When running in CI against a real Postgres instance, ensure the test DB is
 isolated and reset between runs.
 
-## Dependency audit (pnpm)
+## Dependency Audit (pnpm)
 
-The repository enforces dependency security through automated vulnerability scanning in CI.
+The repository enforces continuous security auditing of all dependencies. Findings at **moderate severity or above** fail the build unless covered by an explicit, time-bound exception.
 
-### Policy Overview
+### Audit Enforcement
 
-- **Audit Level**: Moderate and above (moderate, high, critical)
-- **Enforcement**: Builds fail on unexcepted vulnerabilities
-- **Exceptions**: Managed via `.audit-exceptions.json` with mandatory expiry dates
-- **Tool**: `scripts/audit-security.mjs` validates both vulnerabilities and exceptions
-
-### Quick Reference
+The `security` job in CI runs:
 
 ```bash
-# Run full audit with exception validation
-node scripts/audit-security.mjs
-
-# Check only for expired exceptions
-node scripts/audit-security.mjs --check-expired
-
-# List all active exceptions
-node scripts/audit-security.mjs --list-exceptions
+pnpm run audit:check
 ```
+
+This script (`scripts/audit-security.mjs`):
+1. Executes `pnpm audit --audit-level=moderate --json`
+2. Parses moderate/high/critical findings
+3. Validates findings against `.audit-exceptions.json`
+4. Checks exception expiry dates
+5. **Fails the build** if any finding lacks a valid exception or if any exception has expired
 
 ### Remediation Windows
 
-| Severity | Time to Remediate |
-|----------|------------------|
-| Critical | 7 days           |
-| High     | 14 days          |
-| Moderate | 30 days          |
-| Low      | 90 days (advisory) |
+| Severity | Maximum Window | Approval Required |
+|----------|---------------|-------------------|
+| Critical | 7 days | Engineering lead |
+| High | 14 days | Team lead |
+| Moderate | 30 days | Peer review |
 
 ### Exception Process
 
-When a vulnerability cannot be immediately remediated:
+Exceptions are recorded in `.audit-exceptions.json` with:
+- Package name
+- Detailed justification (with issue tracker reference)
+- Severity level
+- Expiry date (must align with remediation windows)
+- Approver email
+- Creation date
 
-1. Assess exploitability and impact
-2. Document exception in `.audit-exceptions.json`
-3. Set expiry date (within policy limits)
-4. Get approval from security team (high/critical) or tech lead (moderate/low)
-5. Link tracking issue in `ticketUrl` field
-6. Submit PR with exception for review
-
-Expired exceptions cause build failures, forcing re-evaluation.
-
-**Full policy**: See [docs/security/dependency-audit-policy.md](./security/dependency-audit-policy.md) for complete details on the exception process, remediation windows, and governance.
+See `docs/security/dependency-audit-policy.md` for the complete exception process, validation requirements, and policy details.
 
 ## mTLS Client Certificate Validation
 

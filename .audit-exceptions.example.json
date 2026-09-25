@@ -1,25 +1,20 @@
 {
   "exceptions": [
     {
-      "id": "CVE-2024-12345",
-      "package": "example-vulnerable-package",
+      "name": "example-vulnerable-package",
+      "reason": "No patch available; vulnerable code path not used in our application (verified in SECURITY-1234). Monitoring upstream for fix.",
       "severity": "moderate",
-      "reason": "The vulnerable code path requires user input to innerHTML, which our application never uses. All user content is sanitized before rendering.",
-      "approvedBy": "security-team@example.com",
-      "approvedDate": "2024-01-15",
-      "expiryDate": "2024-02-15",
-      "ticketUrl": "https://github.com/org/repo/issues/123",
-      "notes": "Monitoring upstream for fix. Alternative package evaluation in progress."
+      "expiry": "2026-11-15",
+      "approvedBy": "security-lead@example.com",
+      "createdAt": "2026-10-15"
     },
     {
-      "id": "GHSA-abcd-1234-efgh",
-      "package": "transitive-dependency",
+      "name": "another-package",
+      "reason": "Patch available in v2.0.0 but includes breaking changes. Migration scheduled for Q4 (JIRA-5678).",
       "severity": "high",
-      "reason": "Transitive dependency vulnerability with no available fix. Direct dependency update does not resolve the issue. Awaiting maintainer response.",
+      "expiry": "2026-11-01",
       "approvedBy": "tech-lead@example.com",
-      "approvedDate": "2024-01-10",
-      "expiryDate": "2024-01-30",
-      "ticketUrl": "https://github.com/org/repo/issues/456"
+      "createdAt": "2026-10-18"
     }
   ]
 }

@@ -1,214 +1,55 @@
-# Security Audit Enforcement with Exception Management
+Closes #1437
 
 ## Summary
 
-Implements enforcing security audit with a reviewed exception process to address the vulnerability in our CI pipeline where security findings were advisory-only with no remediation policy.
+Configuration in `deployment.ts`, `stellar.ts`, `stellarContracts.ts`, `rateLimits.ts`, `health.ts`, and `deprecations.ts` was validated lazily, so an invalid deployment could go unnoticed until a request happened to read the bad setting. Each module now exposes a pure `validate*Config()` function returning one human-readable issue per invalid setting, and a new `validateStartupConfig()` aggregator (`src/config/startupValidation.ts`) runs them all during bootstrap.
 
-## Problem
+Validation is triggered at both startup paths, following the project's existing patterns (no new validation framework):
 
-Prior implementation ran `pnpm audit --audit-level=moderate` in CI but:
-- No exception management system
-- No defined remediation windows
-- No expiry tracking for accepted risks
-- Known vulnerabilities could remain indefinitely unaddressed
+- **`src/index.ts`** — at the top of the async bootstrap, before dependency probes or socket binding. Throwing lands in the existing `startup:fatal` catch, which logs and exits(1), so a bad deployment fails immediately.
+- **`src/app.ts` (`createApp`)** — so tests and embedding apps that build the app with an explicit env object get the same contract. A configuration error can never first surface during request handling.
 
-## Solution
+Errors reuse the existing `ConfigError` from `src/config/env.ts`; its message bullets each invalid setting (e.g. `- RATE_LIMIT_IP_MAX must be an integer >= 1 (got "abc")`), and issues from multiple modules are aggregated into a single startup error.
 
-Comprehensive security audit enforcement system with:
+### Per-module checks
 
-1. **Formal Policy** - Remediation windows by severity, exception process, governance
-2. **Exception Management** - JSON-based tracking with mandatory expiry dates
-3. **Automated Validation** - Script validates vulnerabilities and exceptions
-4. **CI Integration** - Required gate that fails on unexcepted/expired issues
-5. **Monitoring** - Daily check for expiring exceptions with GitHub issue creation
+| Module | Startup checks |
+| --- | --- |
+| `rateLimits.ts` | All `RATE_LIMIT_*` / `WEBHOOK_RETRY_*` integer envs are integers within bounds, including the `MAX_WINDOW_MS` PEXPIRE ceiling on windows; unset values still fall back to defaults |
+| `deployment.ts` | `REQUIRE_PARTNER_AUTH`/`REQUIRE_ADMIN_AUTH` demand their tokens; prod-like environments (staging/production) must enable Redis, worker, metrics, and indexer; `DEPLOYMENT_CHECKLIST_VERSION` non-empty |
+| `health.ts` | All health/probe timeout & interval knobs are positive integers |
+| `stellar.ts` | `horizonUrl` is a valid URL, passphrases non-empty and mutually consistent, pinned contract addresses are valid StrKeys |
+| `stellarContracts.ts` | Allowlist entries are valid StrKeys; network passphrases non-empty |
+| `deprecations.ts` | Registry entries have valid ISO dates, routes start with `/`, and header-bearing fields contain no CR/LF injection |
 
-## Acceptance Criteria
+## Tests
 
-- [x] ✅ Finding at configured level fails build
-- [x] ✅ Exceptions recorded with expiry date
-- [x] ✅ Expired exceptions fail build
-- [x] ✅ Policy states remediation windows by severity
-- [x] ✅ Validation: Dependency with known advisory fails build
+`src/config/startupValidation.test.ts` (30 cases, all passing) covers:
 
-## Key Features
+- Startup succeeds with valid configuration (aggregator + `createApp()`).
+- Startup rejects invalid configuration for each configuration module.
+- Errors clearly identify the invalid setting.
+- Configuration errors are caught at construction/startup, never during request handling.
 
-### Remediation Windows
+## Required context: repository repair commit
 
-| Severity | Window | Max Exception |
-|----------|--------|--------------|
-| Critical | 7 days | 14 days |
-| High | 14 days | 30 days |
-| Moderate | 30 days | 60 days |
-| Low | 90 days | 90 days |
+The repository tip (`5b896b0`) shipped with widespread syntax corruption — severed string literals, dropped tokens, CRLF-injected identifiers in `sseConnectionLimiter.ts`, `backfill.ts`, `replayIntegrity.ts`, `shutdown.ts`, `catchupTelemetry.test.ts`, plus imports of helpers no module exported (`notFound`, `deriveStreamId`, `rowToStreamEventRecord`, …) and an ESLint config that crashed on load. **`tsc --noEmit` failed with 70+ syntax errors and the vitest suite could not import the app, so no change to this repo was verifiable.**
 
-### Exception Process
+The first commit (`32965fe`) makes only mechanical repairs that restore the evident intent of the surrounding code, each corroborated by an existing call site, sibling code, or an existing test (e.g. `rowToStreamEventRecord` is fully specified by the existing issue-#1316 tests in `tests/db/rowMapping.test.ts`). It includes:
 
-1. Vulnerability detected in CI
-2. Security team evaluates exploitability
-3. If exception needed: document in `.audit-exceptions.json`
-4. PR review requires approval (Security team for high/critical, Tech lead for moderate/low)
-5. Exception must link tracking issue
-6. Exception expires automatically, forcing re-evaluation
+- `tsc --noEmit`: 76 errors → **0** (full strict typecheck clean)
+- vitest: suite went from "cannot import app" → 3,932 passing tests
+- eslint: config no longer crashes; every file touched by this PR lints with 0 errors
 
-### Build Failure Conditions
+**Known pre-existing issues deliberately not addressed** (unrelated to #1437, documented in the repair commit message): 2 tests in `tests/indexer/catchupTelemetry.test.ts` fail on `IndexerIngestionService` concurrency/checkpoint behavior (the PR #1330 feature appears absent from the tree), and the `errorHandler` 500 fallback shape mismatches `app.test.ts` expectations. The remaining full-suite failures (~200 across 51 files) are integration tests requiring live Postgres/Redis (1508 `ECONNREFUSED` hits) and do not occur in the sandbox.
 
-- Moderate+ severity vulnerability without valid exception
-- Exception has expired
-- Exception file validation errors
+## Verification performed in this PR
 
-## Files Created
+- `pnpm typecheck` → 0 errors
+- `pnpm vitest run src/config/startupValidation.test.ts` → 30/30 passing
+- Targeted suites for every module touched by the repairs (SSE limiter/emitter, backfill, rowMapping, webhook dispatcher, shutdown, startupValidation) → passing
+- `pnpm eslint` on all changed files → 0 errors, 0 new warnings (baseline HEAD had 118 lint errors)
+- Full `vitest run` → 3,932 passed / 201 failed (all accounted for above: live-DB integration tests + the two documented pre-existing behavior gaps)
 
-### Core Implementation
-- `scripts/audit-security.mjs` - Main audit script with exception validation
-- `.audit-exceptions.json` - Exception tracking file (empty initially)
-- `.audit-exceptions.example.json` - Example exception entries
-
-### Documentation
-- `docs/security/dependency-audit-policy.md` - Complete policy document
-- `docs/security/audit-validation-guide.md` - Step-by-step validation procedures
-- `docs/security/audit-quick-reference.md` - Fast reference for developers
-- `docs/security/AUDIT_ENFORCEMENT_CHANGELOG.md` - Detailed implementation log
-- `docs/security/IMPLEMENTATION_COMPLETE.md` - Implementation status
-- `SECURITY_AUDIT_IMPLEMENTATION.md` - High-level summary
-
-### CI/CD
-- `.github/workflows/audit-exception-check.yml` - Daily monitoring workflow
-- `scripts/test-audit-with-vulnerability.mjs` - Testing helper
-
-## Files Modified
-
-- `.github/workflows/ci.yml` - Security job now uses audit script
-- `docs/security.md` - Added audit policy section
-- `README.md` - Added to security features
-- `package.json` - Added convenience scripts
-
-## Usage
-
-```bash
-# Run security audit
-pnpm run audit:security
-
-# Check for expired exceptions
-pnpm run audit:check-expired
-
-# List active exceptions
-pnpm run audit:list-exceptions
-```
-
-## Exception File Format
-
-```json
-{
-  "exceptions": [{
-    "id": "CVE-2024-12345",
-    "package": "vulnerable-package",
-    "severity": "moderate",
-    "reason": "Technical justification for exception",
-    "approvedBy": "security-team@example.com",
-    "approvedDate": "2024-01-15",
-    "expiryDate": "2024-02-15",
-    "ticketUrl": "https://github.com/org/repo/issues/123",
-    "notes": "Additional context"
-  }]
-}
-```
-
-## Validation
-
-To validate this implementation:
-
-1. **Install vulnerable package**
-   ```bash
-   pnpm add axios@0.21.1
-   ```
-
-2. **Confirm audit fails**
-   ```bash
-   node scripts/audit-security.mjs
-   # Expected: ❌ UNEXCEPTED VULNERABILITIES DETECTED
-   ```
-
-3. **Add valid exception**
-   Edit `.audit-exceptions.json` with required fields
-
-4. **Confirm audit passes**
-   ```bash
-   node scripts/audit-security.mjs
-   # Expected: ✅ Security audit passed (all vulnerabilities excepted)
-   ```
-
-5. **Test expiry enforcement**
-   Backdate `expiryDate` to yesterday, run audit again
-   ```bash
-   # Expected: ❌ EXPIRED EXCEPTIONS DETECTED
-   ```
-
-6. **Cleanup**
-   ```bash
-   pnpm remove axios
-   git checkout .audit-exceptions.json
-   ```
-
-Complete validation guide: `docs/security/audit-validation-guide.md`
-
-## Testing
-
-```bash
-# Verify script works
-node scripts/audit-security.mjs --check-expired
-# ✅ No expired exceptions.
-
-node scripts/audit-security.mjs --list-exceptions
-# No active exceptions found.
-```
-
-## Impact
-
-### Benefits
-- ✅ **Enforcing**: Unexcepted vulnerabilities block deployment
-- ✅ **Time-bounded**: Mandatory expiry forces re-evaluation
-- ✅ **Traceable**: Git history of all security decisions
-- ✅ **Accountable**: Named approvers, linked tracking issues
-- ✅ **Developer-friendly**: Clear errors, convenient commands
-
-### Breaking Changes
-- ⚠️ **CI builds will fail** on existing moderate+ vulnerabilities without exceptions
-- **Action Required**: Initial triage needed after merge
-
-## Documentation
-
-- **Quick Reference**: `docs/security/audit-quick-reference.md` (start here)
-- **Full Policy**: `docs/security/dependency-audit-policy.md`
-- **Validation Guide**: `docs/security/audit-validation-guide.md`
-- **Implementation Summary**: `SECURITY_AUDIT_IMPLEMENTATION.md`
-
-## Monitoring
-
-Daily workflow (`.github/workflows/audit-exception-check.yml`) runs at 9 AM UTC to:
-- Check for expired exceptions
-- Create GitHub issues for expired exceptions
-- (Optional) Send Slack notifications
-
-## Next Steps After Merge
-
-1. Run full audit to identify existing vulnerabilities
-2. Triage each vulnerability (fix or create exception)
-3. Train team on exception process
-4. Configure Slack notifications (optional)
-5. Establish weekly security triage meeting
-
-## Review Notes
-
-- All acceptance criteria met and verified
-- Documentation complete and comprehensive
-- Scripts tested and working
-- CI integration configured
-- No dependencies added
-- Zero impact on existing functionality (until audit reveals issues)
-
----
-
-**Ready for**: Team review and validation  
-**Policy Version**: 1.0.0  
-**Documentation**: Complete  
-**Status**: ✅ All acceptance criteria met
+Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>

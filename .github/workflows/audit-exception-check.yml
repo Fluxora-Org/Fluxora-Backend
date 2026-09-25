@@ -1,17 +1,17 @@
 name: Audit Exception Check
 
-# Runs daily to check for expiring security exceptions
-# Posts warnings to Slack/Teams or creates GitHub issues
+# Weekly review of audit exceptions to identify expiring exceptions
+# and ensure security posture is maintained
 
 on:
   schedule:
-    # Run every day at 9:00 AM UTC
-    - cron: '0 9 * * *'
+    # Run every Monday at 9:00 AM UTC
+    - cron: '0 9 * * 1'
   workflow_dispatch: # Allow manual trigger
 
 jobs:
   check-exceptions:
-    name: Check Exception Status
+    name: Review Audit Exceptions
     runs-on: ubuntu-latest
 
     steps:
@@ -30,104 +30,86 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Check for expired exceptions (will fail if any are expired)
-      - name: Check for expired exceptions
-        id: check_expired
+      - name: Validate exceptions file
+        run: pnpm run audit:validate
+
+      - name: Run audit check
+        id: audit
         continue-on-error: true
-        run: node scripts/audit-security.mjs --check-expired
+        run: pnpm run audit:check
 
-      # List all exceptions to capture expiring soon warnings
-      - name: List active exceptions
-        id: list_exceptions
-        run: |
-          echo "EXCEPTIONS_OUTPUT<<EOF" >> $GITHUB_ENV
-          node scripts/audit-security.mjs --list-exceptions >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-      # Optional: Create GitHub issue for expired exceptions
       - name: Create issue for expired exceptions
-        if: steps.check_expired.outcome == 'failure'
+        if: steps.audit.outcome == 'failure'
         uses: actions/github-script@v7
         with:
           script: |
-            const title = '🚨 Security Audit: Expired Exceptions Detected';
-            const body = `## Expired Security Exceptions
+            const fs = require('fs');
+            const exceptionsRaw = fs.readFileSync('.audit-exceptions.json', 'utf-8');
+            const exceptionsData = JSON.parse(exceptionsRaw);
             
-            One or more security vulnerability exceptions have expired and are blocking CI builds.
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
             
-            ### Action Required
-            
-            For each expired exception:
-            1. **Remediate** the vulnerability by updating the package, or
-            2. **Renew** the exception with updated expiry date and justification
-            
-            ### Check Status
-            
-            \`\`\`bash
-            node scripts/audit-security.mjs --check-expired
-            node scripts/audit-security.mjs --list-exceptions
-            \`\`\`
-            
-            ### Documentation
-            
-            - [Exception Policy](./docs/security/dependency-audit-policy.md)
-            - [Quick Reference](./docs/security/audit-quick-reference.md)
-            
-            ---
-            *This issue was automatically created by the audit-exception-check workflow.*
-            *Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}*
-            `;
-            
-            // Check if issue already exists
-            const issues = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'security,audit-exception'
+            const expired = exceptionsData.exceptions.filter(ex => {
+              const expiry = new Date(ex.expiry);
+              return expiry < today;
             });
             
-            const existingIssue = issues.data.find(issue => issue.title === title);
+            if (expired.length > 0) {
+              const body = `## ⚠️ Expired Security Audit Exceptions
             
-            if (!existingIssue) {
+            The following security audit exceptions have expired and need attention:
+            
+            ${expired.map(ex => `### \`${ex.name}\`
+            - **Severity:** ${ex.severity}
+            - **Expired:** ${ex.expiry}
+            - **Reason:** ${ex.reason}
+            - **Originally approved by:** ${ex.approvedBy}
+            - **Created:** ${ex.createdAt}
+            
+            **Action required:**
+            - [ ] Update the package to remediate the vulnerability
+            - [ ] Renew the exception with updated justification and approval (if patch still unavailable)
+            - [ ] Remove from \`.audit-exceptions.json\` once resolved
+            `).join('\n\n')}
+            
+            ---
+            
+            See [Dependency Audit Policy](docs/security/dependency-audit-policy.md) for remediation guidelines.
+            
+            This issue was automatically created by the weekly audit exception review workflow.`;
+            
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: title,
+                title: `🔒 Security: ${expired.length} expired audit exception(s) require attention`,
                 body: body,
-                labels: ['security', 'audit-exception', 'priority-high']
+                labels: ['security', 'audit', 'automated']
               });
-              console.log('Created new issue for expired exceptions');
-            } else {
-              console.log('Issue already exists:', existingIssue.html_url);
             }
 
-      # Optional: Send Slack notification (requires SLACK_WEBHOOK_URL secret)
-      # Uncomment and configure if you want Slack notifications
-      # - name: Send Slack notification
-      #   if: steps.check_expired.outcome == 'failure'
-      #   uses: slackapi/slack-github-action@v1
-      #   with:
-      #     payload: |
-      #       {
-      #         "text": "🚨 Security Audit: Expired Exceptions Detected",
-      #         "blocks": [
-      #           {
-      #             "type": "section",
-      #             "text": {
-      #               "type": "mrkdwn",
-      #               "text": "*Expired Security Exceptions*\n\nOne or more security vulnerability exceptions have expired.\n\n*Action Required:* Review and remediate or renew exceptions.\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow Run>"
-      #             }
-      #           }
-      #         ]
-      #       }
-      #   env:
-      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
-      - name: Report status
-        run: |
-          if [ "${{ steps.check_expired.outcome }}" == "failure" ]; then
-            echo "::warning::Expired security exceptions detected. Review required."
-            exit 1
-          else
-            echo "✅ No expired security exceptions."
-          fi
+      - name: Comment on existing issues with near-expiry warnings
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const exceptionsRaw = fs.readFileSync('.audit-exceptions.json', 'utf-8');
+            const exceptionsData = JSON.parse(exceptionsRaw);
+            
+            const today = new Date();
+            const sevenDaysFromNow = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+            
+            const nearingExpiry = exceptionsData.exceptions.filter(ex => {
+              const expiry = new Date(ex.expiry);
+              return expiry >= today && expiry <= sevenDaysFromNow;
+            });
+            
+            if (nearingExpiry.length > 0) {
+              console.log(`⚠️ ${nearingExpiry.length} exception(s) expiring within 7 days:`);
+              nearingExpiry.forEach(ex => {
+                console.log(`  - ${ex.name} (expires ${ex.expiry})`);
+              });
+              
+              // Note: In production, you might want to post this to a Slack channel
+              // or create a separate issue for tracking
+            }

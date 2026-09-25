@@ -2,211 +2,139 @@
 
 ## Overview
 
-All npm dependencies are automatically audited for known security vulnerabilities during CI builds. This policy defines the enforcement rules, remediation windows, and exception process.
+All dependencies are continuously audited for known security vulnerabilities. Findings at or above the configured severity threshold **fail the build** unless an explicit, time-bound exception is recorded.
 
-## Enforcement Rules
+## Severity Thresholds
 
-### Audit Levels
+The audit enforces at **moderate** severity and above:
+- **Critical**: Immediate remediation required
+- **High**: Remediation required
+- **Moderate**: Remediation required
 
-The security audit enforces the following severity levels:
+Advisories below moderate (low/info) do not block the build but should be reviewed during dependency updates.
 
-- **Critical**: Immediate action required
-- **High**: Must be addressed within remediation window
-- **Moderate**: Must be addressed within remediation window
-- **Low**: Advisory only, does not fail builds
+## Remediation Windows by Severity
 
-### Build Failure Conditions
+| Severity | Maximum Remediation Window | Notes |
+|----------|---------------------------|-------|
+| **Critical** | 7 days | Must be addressed immediately; exceptions require engineering lead approval |
+| **High** | 14 days | Urgent remediation; exceptions require team lead approval |
+| **Moderate** | 30 days | Standard remediation window; exceptions require peer review |
 
-A CI build will **fail** if any of the following conditions are met:
-
-1. A vulnerability at `moderate` severity or above is detected
-2. An exception exists but has **expired**
-3. An exception references a vulnerability that no longer exists (stale exception)
-
-### Bypass Prevention
-
-- The audit job is a **required gate** in CI
-- No shell fallback or advisory-only mode is permitted
-- All exceptions must be reviewed and approved before merge
-
-## Remediation Windows
-
-Security vulnerabilities must be remediated within the following timeframes from initial detection:
-
-| Severity | Remediation Window | Notes |
-|----------|-------------------|-------|
-| **Critical** | 7 days | Immediate priority; consider hotfix deployment |
-| **High** | 14 days | High priority; plan into current sprint |
-| **Moderate** | 30 days | Standard priority; plan into upcoming sprint |
-| **Low** | 90 days (advisory) | Low priority; address during maintenance |
+These windows begin from the date the vulnerability is first detected in CI or local audit runs.
 
 ## Exception Process
 
-### When to Request an Exception
+### When to File an Exception
 
-Exceptions should only be requested when:
+Exceptions are appropriate when:
+1. **No patch is available** and a workaround or mitigation is in place
+2. **The vulnerable code path is not reachable** in our application (must be verified)
+3. **Breaking changes** in the fix require coordinated migration across services
+4. **False positive** confirmed by manual analysis
 
-1. **No fix available**: The vulnerability has no published fix from the maintainer
-2. **Non-exploitable**: The vulnerable code path is not used by our application
-3. **Transitive dependency**: Vulnerability is in a sub-dependency and updating the direct dependency doesn't resolve it
-4. **Breaking change**: The fix requires a major version upgrade with breaking changes requiring significant refactoring
+Exceptions are **not** appropriate for:
+- Convenience or to defer work
+- Vulnerabilities with available patches
+- Issues that can be resolved by updating dependencies
 
-### Exception File Format
+### Recording an Exception
 
-Exceptions are recorded in `.audit-exceptions.json` at the repository root:
+Exceptions are stored in `.audit-exceptions.json` at the repository root:
 
 ```json
 {
   "exceptions": [
     {
-      "id": "CVE-2024-12345",
-      "package": "example-package",
+      "name": "package-name",
+      "reason": "No patch available; vulnerable code path unreachable (see JIRA-1234)",
       "severity": "moderate",
-      "reason": "Vulnerable code path not used in our implementation",
-      "approvedBy": "security-team@example.com",
-      "approvedDate": "2024-01-15",
-      "expiryDate": "2024-02-15",
-      "ticketUrl": "https://github.com/org/repo/issues/123",
-      "notes": "The XSS vulnerability requires user input to innerHTML, which we never do."
+      "expiry": "2026-11-15",
+      "approvedBy": "alice@example.com",
+      "createdAt": "2026-10-15"
     }
   ]
 }
 ```
 
-### Exception Fields
+**Required fields:**
+- `name`: Exact package name from `pnpm audit` output
+- `reason`: Detailed justification referencing issue tracker or documentation
+- `severity`: `critical`, `high`, or `moderate`
+- `expiry`: ISO date (YYYY-MM-DD) when the exception expires; must align with remediation windows above
+- `approvedBy`: Email of the approver (engineering lead for critical, team lead for high, peer for moderate)
+- `createdAt`: ISO date when the exception was created
 
-- **id** (required): CVE identifier or advisory ID (e.g., `CVE-2024-12345` or `GHSA-xxxx-yyyy-zzzz`)
-- **package** (required): Name of the affected package
-- **severity** (required): One of `critical`, `high`, `moderate`, `low`
-- **reason** (required): Justification for the exception (must be substantive)
-- **approvedBy** (required): Email or identifier of approver (security team member)
-- **approvedDate** (required): ISO 8601 date when exception was approved
-- **expiryDate** (required): ISO 8601 date when exception expires (must follow remediation window)
-- **ticketUrl** (optional): Link to tracking issue or remediation plan
-- **notes** (optional): Additional context or technical details
+### Exception Expiry
 
-### Maximum Exception Duration
+When an exception expires:
+1. The build **fails** immediately
+2. The team must either:
+   - **Remediate** the vulnerability by updating or replacing the dependency
+   - **Renew** the exception with updated justification and a new expiry date (subject to approval)
 
-Exception expiry dates are constrained by severity:
+Renewal requires demonstrating that:
+- The original reason still applies (e.g., patch still unavailable)
+- Mitigations remain effective
+- The risk is actively monitored
 
-- **Critical**: Maximum 14 days
-- **High**: Maximum 30 days
-- **Moderate**: Maximum 60 days
-- **Low**: Maximum 90 days
+## Validation in CI
 
-### Exception Workflow
-
-1. **Detection**: CI audit identifies a vulnerability
-2. **Assessment**: Security team evaluates exploitability and impact
-3. **Decision**:
-   - If remediable immediately → fix and deploy
-   - If requires exception → proceed to step 4
-4. **Documentation**: Create exception entry in `.audit-exceptions.json`
-5. **Review**: Exception must be approved in PR review by:
-   - Security team member (for high/critical)
-   - Tech lead or senior engineer (for moderate/low)
-6. **Tracking**: Create GitHub issue linked in `ticketUrl` to track remediation
-7. **Merge**: PR with exception can be merged after approval
-8. **Monitoring**: CI will fail when exception expires, forcing re-evaluation
-
-### Exception Renewal
-
-When an exception is approaching expiry:
-
-1. Re-assess the vulnerability status
-2. Check if a fix has become available
-3. If still no fix available:
-   - Update the `expiryDate` (within maximum duration constraints)
-   - Update `notes` with current status
-   - Requires new approval
-
-## Audit Tooling
-
-### Audit Script
-
-The `scripts/audit-security.mjs` script performs the audit and exception validation:
+The `security` job in `.github/workflows/ci.yml` runs:
 
 ```bash
-# Run audit with exception handling
-node scripts/audit-security.mjs
-
-# Check for expired exceptions only
-node scripts/audit-security.mjs --check-expired
-
-# List all active exceptions
-node scripts/audit-security.mjs --list-exceptions
+pnpm run audit:check
 ```
 
-### CI Integration
+This script:
+1. Runs `pnpm audit --audit-level=moderate --json`
+2. Parses the output for moderate/high/critical findings
+3. Cross-references findings against `.audit-exceptions.json`
+4. Checks exception expiry dates
+5. **Fails with exit code 1** if:
+   - Any finding lacks a valid exception
+   - Any exception has expired
+   - The exceptions file is malformed
 
-The security job in `.github/workflows/ci.yml` runs the audit script:
+## Local Development
 
-```yaml
-- name: Run security audit
-  run: node scripts/audit-security.mjs
-```
-
-### Pre-commit Hook (Optional)
-
-Teams may optionally install a pre-commit hook to catch vulnerabilities early:
+Developers can run the audit check locally:
 
 ```bash
-# .git/hooks/pre-commit
-#!/bin/bash
-node scripts/audit-security.mjs --check-expired
+pnpm run audit:check
 ```
 
-## Responsibilities
+To review all current advisories without blocking:
 
-### Development Team
+```bash
+pnpm audit --audit-level=moderate
+```
 
-- Monitor for new vulnerabilities in dependencies
-- Propose updates to address vulnerabilities
-- Document exception requests with technical justification
-- Track remediation work via GitHub issues
+To update the lockfile and resolve advisories:
 
-### Security Team
+```bash
+pnpm update --recursive --latest
+pnpm audit --audit-level=moderate
+```
 
-- Review and approve exception requests
-- Audit exception renewal requests
-- Monitor industry advisories for emerging threats
-- Periodically review exception policy effectiveness
+## Monitoring and Review
 
-### Tech Lead / Engineering Manager
+- **Weekly**: Automated scan reviews exceptions nearing expiry (alerts in Slack)
+- **Monthly**: Security team reviews all active exceptions
+- **Quarterly**: Full dependency audit and exception policy review
 
-- Prioritize remediation work within sprint planning
-- Ensure remediation windows are met
-- Escalate blocked or expired exceptions
-- Approve moderate/low exception requests
+## Exception File Schema
 
-## Reporting
+The `.audit-exceptions.json` file must be valid JSON. A template is provided in `.audit-exceptions.example.json`.
 
-### Weekly Report
+To validate your exceptions file:
 
-Every Monday, the security team receives an automated report containing:
+```bash
+node scripts/audit-security.mjs --validate
+```
 
-- Active exceptions approaching expiry (within 7 days)
-- New vulnerabilities detected in the previous week
-- Overdue remediation items
+## References
 
-### Monthly Metrics
-
-The following metrics are tracked monthly:
-
-- Total vulnerabilities detected by severity
-- Mean time to remediation by severity
-- Exception utilization rate (% of vulnerabilities requiring exception)
-- Exception expiry compliance (% of exceptions renewed before expiry)
-
-## Policy Review
-
-This policy is reviewed quarterly by the security team and updated as needed based on:
-
-- Industry best practices evolution
-- Tool capability changes (pnpm audit features)
-- Internal incident retrospectives
-- Exception pattern analysis
-
-**Last reviewed**: 2024-01-15  
-**Next review due**: 2024-04-15  
-**Policy version**: 1.0.0
+- [pnpm audit documentation](https://pnpm.io/cli/audit)
+- [National Vulnerability Database (NVD)](https://nvd.nist.gov/)
+- Internal JIRA board for security tracking: `SECURITY-*` issues

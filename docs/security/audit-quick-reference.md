@@ -1,217 +1,184 @@
-# Security Audit Quick Reference
+# Dependency Audit Quick Reference
 
-Fast reference for common security audit tasks.
-
-## Daily Commands
+## Common Commands
 
 ```bash
-# Check for vulnerabilities
-pnpm run audit:security
+# Run enforcing audit check (as used in CI)
+pnpm run audit:check
 
-# List current exceptions
-pnpm run audit:list-exceptions
+# Validate exceptions file format
+pnpm run audit:validate
 
-# Check for expired exceptions only
-pnpm run audit:check-expired
+# View all advisories (non-blocking)
+pnpm audit
+
+# View moderate+ advisories
+pnpm audit --audit-level=moderate
+
+# Update dependencies and re-audit
+pnpm update --recursive --latest
+pnpm run audit:check
 ```
 
-## When You See a Vulnerability
+## Remediation Workflows
 
-### Option 1: Immediate Fix (Preferred)
+### Resolving a Vulnerability
 
-```bash
-# Update the vulnerable package
-pnpm update <package-name>
+1. **Check for updates:**
+   ```bash
+   pnpm outdated
+   pnpm update <package-name>
+   ```
 
-# Or update all dependencies
-pnpm update
+2. **If no update available, check transitive deps:**
+   ```bash
+   pnpm why <package-name>
+   # Update the root dependency instead
+   ```
 
-# Run audit to confirm
-pnpm run audit:security
-```
+3. **Verify resolution:**
+   ```bash
+   pnpm run audit:check
+   ```
 
-### Option 2: Request Exception
+### Adding an Exception
 
-If immediate fix is not possible, follow the exception process.
+1. **Verify no patch is available** or confirm mitigation is in place
 
-## Exception Request Template
+2. **Edit `.audit-exceptions.json`:**
+   ```json
+   {
+     "exceptions": [
+       {
+         "name": "package-name",
+         "reason": "Detailed justification with JIRA-1234 reference",
+         "severity": "moderate",
+         "expiry": "2026-11-15",
+         "approvedBy": "lead@example.com",
+         "createdAt": "2026-10-15"
+       }
+     ]
+   }
+   ```
 
-Create/edit `.audit-exceptions.json`:
+3. **Validate the exception:**
+   ```bash
+   pnpm run audit:validate
+   ```
+
+4. **Get approval** (per severity requirements in policy)
+
+5. **Commit and push:**
+   ```bash
+   git add .audit-exceptions.json
+   git commit -m "security: add exception for package-name (JIRA-1234)"
+   ```
+
+### Renewing an Expired Exception
+
+1. **Review the original justification** - does it still apply?
+
+2. **Update the expiry date** in `.audit-exceptions.json`:
+   ```json
+   {
+     "expiry": "2026-12-15",
+     "createdAt": "2026-11-15"
+   }
+   ```
+
+3. **Update the reason** with renewal justification:
+   ```json
+   {
+     "reason": "Renewed: no patch available upstream; monitoring github.com/org/pkg/issues/123"
+   }
+   ```
+
+4. **Get renewed approval** and commit
+
+## Exception Templates
+
+### No Patch Available
 
 ```json
 {
-  "exceptions": [
-    {
-      "id": "CVE-YYYY-XXXXX",
-      "package": "package-name",
-      "severity": "moderate",
-      "reason": "Brief technical explanation of why exception is needed",
-      "approvedBy": "your-email@example.com",
-      "approvedDate": "YYYY-MM-DD",
-      "expiryDate": "YYYY-MM-DD",
-      "ticketUrl": "https://github.com/org/repo/issues/NNN",
-      "notes": "Additional context or remediation plan"
-    }
-  ]
+  "name": "vulnerable-package",
+  "reason": "No patch available from upstream. Vulnerable code path not exercised (verified in code review JIRA-1234). Monitoring github.com/org/pkg/issues/567.",
+  "severity": "moderate",
+  "expiry": "2026-11-30",
+  "approvedBy": "security-lead@example.com",
+  "createdAt": "2026-10-15"
 }
 ```
 
-## Exception Expiry Limits
-
-| Severity | Max Exception Duration |
-|----------|----------------------|
-| Critical | 14 days              |
-| High     | 30 days              |
-| Moderate | 60 days              |
-| Low      | 90 days              |
-
-## Approval Requirements
-
-| Severity | Approver Required |
-|----------|------------------|
-| Critical | Security Team    |
-| High     | Security Team    |
-| Moderate | Tech Lead        |
-| Low      | Tech Lead        |
-
-## Common Scenarios
-
-### Scenario: No Fix Available
+### Breaking Changes Required
 
 ```json
 {
-  "reason": "No patch available from maintainer. Upstream issue tracked at [URL]. Alternative package evaluation in progress."
+  "name": "legacy-dep",
+  "reason": "Patch requires v2.x migration with breaking changes. Migration planned for Q4 2026 (PROJ-789). Workaround: input sanitization in src/middleware/sanitize.ts",
+  "severity": "high",
+  "expiry": "2026-12-01",
+  "approvedBy": "tech-lead@example.com",
+  "createdAt": "2026-10-20"
 }
 ```
 
-### Scenario: Vulnerable Code Path Not Used
+### Unreachable Code Path
 
 ```json
 {
-  "reason": "The XSS vulnerability requires direct innerHTML assignment with user input, which our application never performs. All user content is sanitized via DOMPurify before rendering."
+  "name": "indirect-dep",
+  "reason": "Vulnerability in unused feature flag path. Verified via code coverage: feature disabled in production config. Tracking upstream fix in SECURITY-456.",
+  "severity": "moderate",
+  "expiry": "2026-11-20",
+  "approvedBy": "peer@example.com",
+  "createdAt": "2026-10-18"
 }
 ```
 
-### Scenario: Transitive Dependency
+## Severity Guidelines
 
-```json
-{
-  "reason": "Transitive dependency of 'parent-package'. Vulnerability exists in 'child-package' v1.2.3. Parent package maintainer notified; awaiting update."
-}
-```
+| Severity | Max Window | Required Approval | Example |
+|----------|-----------|-------------------|---------|
+| Critical | 7 days | Engineering Lead | RCE, Auth bypass |
+| High | 14 days | Team Lead | SQL injection, XSS |
+| Moderate | 30 days | Peer Review | DoS, Info disclosure |
 
-### Scenario: Breaking Change Required
+## CI Failure Resolution
 
-```json
-{
-  "reason": "Fix requires upgrading to major version 5.x which has breaking API changes. Migration estimated at 3 sprints. Planned for Q2 2024."
-}
-```
+When CI fails on the security job:
 
-## Finding CVE/Advisory IDs
+1. **Check the error output** - which vulnerabilities are unexcepted?
 
-```bash
-# Run pnpm audit to see advisory details
-pnpm audit --json | jq '.advisories'
+2. **Run locally:**
+   ```bash
+   pnpm install
+   pnpm run audit:check
+   ```
 
-# Look for:
-# - "cves": ["CVE-2024-12345"]
-# - "github_advisory_id": "GHSA-xxxx-yyyy-zzzz"
-```
+3. **Choose a path:**
+   - **Remediate:** Update the package
+   - **Exception:** Add to `.audit-exceptions.json` with approval
 
-## Reviewing Exceptions in PRs
+4. **Re-run CI** by pushing the fix
 
-When reviewing a PR with exceptions:
+## Monitoring
 
-1. **Verify technical justification** - Is the reason substantive?
-2. **Check expiry date** - Within policy limits for severity?
-3. **Confirm tracking issue** - Is there a linked GitHub issue?
-4. **Assess remediation plan** - What's the path to fixing this?
-5. **Review approval authority** - Is approver authorized for this severity?
+- **Expiry warnings:** Exceptions within 7 days of expiry show warnings in output
+- **Weekly scans:** Automated review of active exceptions
+- **Slack alerts:** Notifications for critical/high findings
 
-## Exception Renewal
+## Files Reference
 
-When an exception is expiring:
+| File | Purpose |
+|------|---------|
+| `.audit-exceptions.json` | Active exceptions |
+| `.audit-exceptions.example.json` | Template and examples |
+| `scripts/audit-security.mjs` | Enforcement script |
+| `docs/security/dependency-audit-policy.md` | Full policy |
 
-```bash
-# Check current status
-pnpm run audit:list-exceptions
+## Getting Help
 
-# Update the exception
-# 1. Edit .audit-exceptions.json
-# 2. Update expiryDate (within max duration)
-# 3. Update notes with current status
-# 4. Get new approval in PR review
-```
-
-## CI Failures
-
-### "Expired exceptions detected"
-
-**Action**: Remove the exception and fix the vulnerability, or renew the exception.
-
-```bash
-# Check which exceptions expired
-node scripts/audit-security.mjs --check-expired
-
-# Fix the vulnerability
-pnpm update <package-name>
-
-# Or renew the exception (update expiryDate in .audit-exceptions.json)
-```
-
-### "Unexcepted vulnerabilities detected"
-
-**Action**: Either fix immediately or request an exception.
-
-```bash
-# See vulnerability details
-pnpm run audit:security
-
-# Try updating first
-pnpm update <package-name>
-
-# If update doesn't work, request exception
-```
-
-### "Stale exceptions detected"
-
-**Warning (not failure)**: An exception exists for a vulnerability that's no longer present.
-
-**Action**: Remove the stale exception from `.audit-exceptions.json`.
-
-## Emergency Overrides
-
-❌ **There are no emergency overrides.**
-
-The security job is a required gate. If you need to merge urgently:
-
-1. Add a valid exception with short expiry (7 days minimum)
-2. Get proper approval in PR review
-3. Create tracking issue with high priority
-4. Plan immediate remediation
-
-## Scripts Location
-
-- Audit script: `scripts/audit-security.mjs`
-- Test script: `scripts/test-audit-with-vulnerability.mjs`
-- Exception file: `.audit-exceptions.json`
-- Example: `.audit-exceptions.example.json`
-
-## Documentation
-
-- **Full Policy**: [dependency-audit-policy.md](./dependency-audit-policy.md)
-- **Validation Guide**: [audit-validation-guide.md](./audit-validation-guide.md)
-- **General Security**: [../security.md](../security.md)
-
-## Support
-
-Questions about security audit?
-
-- **Slack**: #security-team
-- **Email**: security@example.com
-- **Docs**: `docs/security/`
-
----
-
-**Remember**: Security vulnerabilities are not negotiable. Every exception must have a remediation plan and expiry date.
+- Policy questions: See `docs/security/dependency-audit-policy.md`
+- Technical issues: Open issue with `security` label
+- Approval needed: Ping in `#security` Slack channel
