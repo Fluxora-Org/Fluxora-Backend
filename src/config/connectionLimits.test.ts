@@ -8,6 +8,7 @@
  * re-defaulted in code without updating the document.
  */
 
+import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
 import { EnvSchema } from './env.js';
@@ -18,7 +19,7 @@ import {
   type ConnectionLimitKey,
 } from './connectionLimits.js';
 
-const doc = readFileSync(new URL('../../docs/connection-limits.md', import.meta.url), 'utf8');
+const doc = readFileSync(path.resolve(__dirname, '../../docs/connection-limits.md'), 'utf8');
 
 /**
  * The minimum environment `EnvSchema` needs to parse. Every other value is left
