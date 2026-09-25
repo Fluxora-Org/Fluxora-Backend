@@ -176,9 +176,25 @@ the slow connection and increments `droppedMessages`. When
 connection, increments both `droppedMessages` and `terminatedConnections`, and
 removes the connection from subscriptions.
 
-The hub does not queue unbounded per-client messages. Recovery is handled by
-future broadcasts after the client's socket drains, or by reconnecting and using
-the replay API backed by the event store.
+The hub retains outbound messages per connection only while the socket is
+backpressured. `WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION` (default 128) limits the
+message count, and `WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION` (default 1 MiB)
+limits the UTF-8 byte size of their combined serialized payloads. If adding a
+message would exceed either cap, the hub drops the newest message and preserves
+the messages already queued. A message larger than the byte cap is dropped
+without entering the queue. Recovery is handled by future broadcasts after the
+client's socket drains, or by reconnecting and using the replay API backed by
+the event store.
+
+## Inbound Message Size
+
+`WS_MAX_INBOUND_MESSAGE_BYTES` (default 4,096) limits each incoming WebSocket
+message payload in **bytes**, measured as UTF-8 payload bytes rather than
+JavaScript string characters. The same value configures the `ws` transport's
+`maxPayload`, which rejects oversized messages before delivering them to the
+application (close code 1009), and the application-level validator repeats the
+byte check before parsing as defense in depth. Fragmented messages are limited
+by their combined message payload size.
 
 Tests can lower thresholds with:
 
@@ -288,8 +304,8 @@ await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
 
 ### Security notes (partition handling)
 
-- No per-client unbounded queuing: the hub never queues messages for slow
-  clients beyond a single broadcast cycle.
+- Queued messages are bounded per connection by both a message-count cap and
+  a combined UTF-8 byte cap; overflow drops the newest message.
 - Terminated connections have their subscriptions fully cleaned up:
   `streamSubscriptions`, `recipientSubscriptions`, and per-client batch
   accumulators are all purged.
@@ -300,7 +316,9 @@ await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
 ## Security Notes
 
 - Only JSON text frames are accepted; binary frames are rejected.
-- Inbound client messages are capped by `MAX_MESSAGE_BYTES`.
+- Inbound client messages are capped in UTF-8 bytes by
+  `WS_MAX_INBOUND_MESSAGE_BYTES` at the WebSocket transport and application
+  validation layers.
 - Inbound client messages are rate-limited per connection.
 - Optional WebSocket JWT authentication can reject unauthenticated upgrades.
 - When `WS_ALLOWED_ORIGINS` is configured, browser upgrades require an exact
@@ -446,8 +464,9 @@ The flag is also accepted inside a nested `filter` object:
 
 - `events` is always in insertion order (in-order delivery guarantee).
 - `correlationId` is omitted from an entry when not present on the source event.
-- Each frame is bounded by `MAX_MESSAGE_BYTES` (4 096 bytes). If the full batch
-  would exceed that limit, the largest safe prefix (by event count) is sent.
+- Each batch frame is bounded by `MAX_MESSAGE_BYTES` (4 096 bytes), independently
+  of the inbound client-message byte limit. If the full batch would exceed that
+  limit, the largest safe prefix (by event count) is sent.
 
 ### Configuration
 
@@ -508,9 +527,10 @@ rate(fluxora_ws_batch_events_coalesced_total[5m])
   Neither field is client-controlled in a way that allows key collision.
 - Pending timers are cancelled immediately on client disconnect and on
   `hub.close()` — no frames are ever sent to a closed socket.
-- Each outbound frame is checked against `MAX_MESSAGE_BYTES` before delivery.
-  Oversized frames are truncated to the largest event prefix that fits, rather
-  than silently dropped.
+- Each `stream_update_batch` frame is checked against `MAX_MESSAGE_BYTES` before
+  delivery. Oversized batches are truncated to the largest event prefix that
+  fits; other outbound envelopes are bounded by the per-connection queued-byte
+  cap when they enter the outbound queue.
 
 ### Broadcast Resilience
 

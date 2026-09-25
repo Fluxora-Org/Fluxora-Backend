@@ -191,6 +191,8 @@ function validatePinnedAddress(
   });
 }
 
+export const DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES = 4_096;
+
 export const EnvSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'staging', 'production', 'test']).default('development'),
@@ -383,6 +385,24 @@ export const EnvSchema = z
     WS_AUTH_REQUIRED: booleanEnv().default(false),
     WS_ALLOWED_ORIGINS: optionalString('WS_ALLOWED_ORIGINS'),
     WS_MAX_CONNECTIONS_PER_IP: integerEnv('WS_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+    WS_MAX_SUBSCRIPTIONS_PER_CONNECTION: integerEnv(
+      'WS_MAX_SUBSCRIPTIONS_PER_CONNECTION',
+      1,
+      100_000,
+    ).default(32),
+    WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION: integerEnv(
+      'WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION',
+      1,
+      100_000,
+    ).default(128),
+    WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION: integerEnv(
+      'WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION',
+      1,
+      64 * 1024 * 1024,
+    ).default(1024 * 1024),
+    WS_MAX_INBOUND_MESSAGE_BYTES: integerEnv('WS_MAX_INBOUND_MESSAGE_BYTES', 1, 16 * 1024 * 1024).default(
+      DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES,
+    ),
     WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
     WS_RECONNECT_WINDOW_MS: integerEnv('WS_RECONNECT_WINDOW_MS', 1, 86_400_000).default(60_000),
     SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
@@ -714,6 +734,10 @@ export interface Config {
   /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
   wsAuthRequired: boolean;
   wsMaxConnectionsPerIp: number;
+  wsMaxSubscriptionsPerConnection: number;
+  wsMaxOutboundQueuePerConnection: number;
+  wsMaxOutboundQueueBytesPerConnection: number;
+  wsMaxInboundMessageBytes: number;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -969,6 +993,10 @@ function toConfig(env: ParsedEnv): Config {
     adminApiToken: env.ADMIN_API_TOKEN,
     wsAuthRequired: env.WS_AUTH_REQUIRED,
     wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
+    wsMaxSubscriptionsPerConnection: env.WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    wsMaxOutboundQueuePerConnection: env.WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION,
+    wsMaxOutboundQueueBytesPerConnection: env.WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION,
+    wsMaxInboundMessageBytes: env.WS_MAX_INBOUND_MESSAGE_BYTES,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
@@ -1043,6 +1071,10 @@ export function initializeConfig(): Config {
     });
   }
   return configInstance;
+}
+
+export function getWsMaxInboundMessageBytes(): number {
+  return initializeConfig().wsMaxInboundMessageBytes;
 }
 
 export function resetConfig(): void {

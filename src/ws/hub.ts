@@ -40,6 +40,7 @@ import { EventEmitter } from 'node:events';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage, IncomingHttpHeaders } from 'http';
 import type { Server } from 'http';
+import { getConfig, initializeConfig } from '../config/env.js';
 import type { DedupCache as IDedupCache } from '../redis/dedup.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
@@ -69,9 +70,13 @@ import {
   recordWsBroadcastBatchFlushLatency,
   DEFAULT_WS_BACKPRESSURE_INTERVAL_MS,
   DEFAULT_WS_SLOW_CLIENT_BYTES,
+  setWsResourceLimitMetrics,
   wsBatchFlushTotal,
   wsBatchEventsCoalescedTotal,
   wsBatchSizeExceededTotal,
+  wsInboundMessageSizeLimitViolationsTotal,
+  wsOutboundQueueLimitViolationsTotal,
+  wsSubscriptionLimitViolationsTotal,
 } from '../metrics/wsBackpressure.js';
 import { updateWsHealthMetrics } from '../metrics/wsHealth.js';
 
@@ -80,6 +85,9 @@ import { updateWsHealthMetrics } from '../metrics/wsHealth.js';
 export const MAX_MESSAGE_BYTES = 4_096;
 export const RATE_LIMIT_MAX = 30;
 export const RATE_LIMIT_WINDOW_MS = 10_000;
+export const DEFAULT_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION = 32;
+export const DEFAULT_WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION = 128;
+export const DEFAULT_WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION = 1024 * 1024;
 
 export const BACKPRESSURE_DROP_BYTES = 1 * 1024 * 1024;
 export const BACKPRESSURE_TERMINATE_BYTES = 4 * 1024 * 1024;
@@ -329,6 +337,14 @@ export interface StreamHubOptions {
   closeFrameTimeoutMs?: number;
   /** Configurable heartbeat interval in ms. Default 30000. */
   healthProbeIntervalMs?: number;
+  /** Maximum number of subscriptions a single connection may hold. */
+  maxSubscriptionsPerConnection?: number;
+  /** Maximum number of queued outbound messages a single connection may retain. */
+  maxOutboundQueuePerConnection?: number;
+  /** Maximum retained outbound queue bytes for a single connection. */
+  maxOutboundQueueBytesPerConnection?: number;
+  /** Maximum inbound WebSocket message payload size in bytes. */
+  maxInboundMessageBytes?: number;
   /** Number of consecutive missed pongs before termination. Default 2. */
   healthProbeMaxMissed?: number;
   /**
@@ -356,6 +372,11 @@ export class StreamHub extends EventEmitter {
   private readonly wsAuthRequired: boolean;
   private readonly jwtSecret: string | undefined;
   private readonly allowedOrigins: ReadonlySet<string> | undefined;
+  private readonly maxSubscriptionsPerConnection: number;
+  private readonly maxOutboundQueuePerConnection: number;
+  private readonly maxOutboundQueueBytesPerConnection: number;
+  private readonly maxInboundMessageBytes: number;
+  private readonly outboundQueues = new Map<WebSocket, string[]>();
   private eventStore: ContractEventStore | undefined;
   private readonly backpressureCollectorInterval: NodeJS.Timeout | undefined;
   private readonly backpressureSlowThresholdBytes: number;
@@ -418,9 +439,38 @@ export class StreamHub extends EventEmitter {
       this.ownsDedup = true;
     }
 
+    const runtimeConfig = (() => {
+      try {
+        return getConfig();
+      } catch {
+        return initializeConfig();
+      }
+    })();
+
     this.wsAuthRequired = options?.wsAuthRequired ?? process.env.WS_AUTH_REQUIRED === 'true';
 
     this.jwtSecret = options?.jwtSecret ?? process.env.JWT_SECRET;
+    this.maxSubscriptionsPerConnection =
+      options?.maxSubscriptionsPerConnection ??
+      runtimeConfig.wsMaxSubscriptionsPerConnection ??
+      DEFAULT_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION;
+    this.maxOutboundQueuePerConnection =
+      options?.maxOutboundQueuePerConnection ??
+      runtimeConfig.wsMaxOutboundQueuePerConnection ??
+      DEFAULT_WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION;
+    this.maxOutboundQueueBytesPerConnection =
+      options?.maxOutboundQueueBytesPerConnection ??
+      runtimeConfig.wsMaxOutboundQueueBytesPerConnection ??
+      DEFAULT_WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION;
+    this.maxInboundMessageBytes =
+      options?.maxInboundMessageBytes ??
+      runtimeConfig.wsMaxInboundMessageBytes;
+    setWsResourceLimitMetrics({
+      maxSubscriptionsPerConnection: this.maxSubscriptionsPerConnection,
+      maxOutboundQueuePerConnection: this.maxOutboundQueuePerConnection,
+      maxOutboundQueueBytesPerConnection: this.maxOutboundQueueBytesPerConnection,
+      maxInboundMessageBytes: this.maxInboundMessageBytes,
+    });
 
     const configuredOrigins =
       options?.allowedOrigins ??
@@ -466,7 +516,7 @@ export class StreamHub extends EventEmitter {
         : BACKPRESSURE_DROP_BYTES;
 
     // Use noServer mode so we fully control the upgrade handshake.
-    this.wss = new WebSocketServer({ noServer: true });
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: this.maxInboundMessageBytes });
 
     // Start the backpressure collector AFTER WebSocketServer setup so the
     // initial collection can see any clients that already connected while
@@ -670,8 +720,9 @@ export class StreamHub extends EventEmitter {
         state.metrics.bytesReceived += byteLength;
       }
 
-      if (byteLength > MAX_MESSAGE_BYTES) {
-        this.sendError(ws, 'PAYLOAD_TOO_LARGE', `Message exceeds ${MAX_MESSAGE_BYTES} bytes`);
+      if (byteLength > this.maxInboundMessageBytes) {
+        wsInboundMessageSizeLimitViolationsTotal.inc();
+        this.sendError(ws, 'PAYLOAD_TOO_LARGE', `Message exceeds ${this.maxInboundMessageBytes} bytes`);
         return;
       }
 
@@ -735,6 +786,7 @@ export class StreamHub extends EventEmitter {
 
     // Remove the per-client gauge time series so it doesn't accumulate.
     removeWsClientBackpressureGauge(state.id);
+    this.outboundQueues.delete(ws);
 
     const durationMs = Date.now() - state.connectedAt;
     logger.info('WebSocket disconnected', state.correlationId, {
@@ -768,7 +820,7 @@ export class StreamHub extends EventEmitter {
   // ── Message handling ───────────────────────────────────────────────────────
 
   async handleMessage(ws: WebSocket, raw: string): Promise<void> {
-    const result = validateWebSocketMessage(raw);
+    const result = validateWebSocketMessage(raw, undefined, this.maxInboundMessageBytes);
     if (!result.ok) {
       this.sendError(ws, result.code, result.message);
       return;
@@ -798,6 +850,15 @@ export class StreamHub extends EventEmitter {
 
     const key = this.subscriptionKey(filter);
     if (state.subscriptionFilters.has(key)) return;
+    if (state.subscriptionFilters.size >= this.maxSubscriptionsPerConnection) {
+      wsSubscriptionLimitViolationsTotal.inc();
+      this.sendError(
+        ws,
+        'SUBSCRIPTION_LIMIT_EXCEEDED',
+        `Connection is limited to ${this.maxSubscriptionsPerConnection} subscriptions`,
+      );
+      return;
+    }
 
     state.subscriptionFilters.set(key, filter);
     this.addSubscriptionToIndexes(ws, filter);
@@ -1166,36 +1227,9 @@ export class StreamHub extends EventEmitter {
       })),
     });
 
-    // Backpressure check — same thresholds as the non-batched path.
-    const buffered = ws.bufferedAmount;
-    if (buffered > this.terminateBytes) {
-      this.metrics.terminatedConnections++;
-      this.metrics.droppedMessages += safeEvents.length;
-      try {
-        ws.terminate();
-      } catch {
-        /* ignore */
-      }
-      this.onDisconnect(ws);
-      return;
-    }
-    if (buffered > this.dropBytes) {
+    if (!this.queueOutboundMessage(ws, message)) {
       this.metrics.droppedMessages += safeEvents.length;
       return;
-    }
-
-    try {
-      ws.send(message);
-    } catch {
-      this.metrics.droppedMessages += safeEvents.length;
-      return;
-    }
-    this.metrics.sentMessages++;
-
-    const state = this.clients.get(ws);
-    if (state) {
-      state.metrics.messagesSent += 1;
-      state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
     }
 
     // Update Prometheus batch counters.
@@ -1254,21 +1288,11 @@ export class StreamHub extends EventEmitter {
         continue;
       }
 
-      try {
-        ws.send(message);
-      } catch {
-        // If send throws (e.g. a race with concurrent terminate), skip this
-        // client without counting it as sent or crashing the broadcast.
+      if (!this.queueOutboundMessage(ws, message)) {
+        this.metrics.droppedMessages++;
         continue;
       }
-      this.metrics.sentMessages++;
       sent++;
-
-      const state = this.clients.get(ws);
-      if (state) {
-        state.metrics.messagesSent += 1;
-        state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
-      }
     }
 
     // Record a span event for observability (fire-and-forget, no correlationId context here).
@@ -1293,6 +1317,76 @@ export class StreamHub extends EventEmitter {
     tracer.endSpan(span, 'ok');
 
     return sent;
+  }
+
+  private queueOutboundMessage(ws: WebSocket, message: string): boolean {
+    if (ws.readyState !== WebSocket.OPEN) return false;
+
+    const queue = this.outboundQueues.get(ws) ?? [];
+    const queuedBytes = queue.reduce((total, queuedMessage) => total + Buffer.byteLength(queuedMessage, 'utf8'), 0);
+    const messageBytes = Buffer.byteLength(message, 'utf8');
+    if (
+      queue.length >= this.maxOutboundQueuePerConnection ||
+      queuedBytes + messageBytes > this.maxOutboundQueueBytesPerConnection
+    ) {
+      wsOutboundQueueLimitViolationsTotal.inc();
+      return false;
+    }
+
+    queue.push(message);
+    this.outboundQueues.set(ws, queue);
+    this.flushOutboundQueue(ws);
+    return true;
+  }
+
+  private flushOutboundQueue(ws: WebSocket): void {
+    const queue = this.outboundQueues.get(ws);
+    if (!queue || queue.length === 0) return;
+
+    while (queue.length > 0) {
+      if (ws.readyState !== WebSocket.OPEN) {
+        this.outboundQueues.delete(ws);
+        return;
+      }
+
+      const buffered = ws.bufferedAmount;
+      if (buffered > this.terminateBytes) {
+        this.metrics.terminatedConnections++;
+        this.metrics.droppedMessages += queue.length;
+        try {
+          ws.terminate();
+        } catch {
+          /* ignore */
+        }
+        this.onDisconnect(ws);
+        return;
+      }
+
+      if (buffered > this.dropBytes) {
+        return;
+      }
+
+      const next = queue.shift();
+      if (next === undefined) break;
+
+      try {
+        ws.send(next);
+      } catch {
+        this.metrics.droppedMessages++;
+        return;
+      }
+
+      this.metrics.sentMessages++;
+      const state = this.clients.get(ws);
+      if (state) {
+        state.metrics.messagesSent += 1;
+        state.metrics.bytesSent += Buffer.byteLength(next, 'utf8');
+      }
+    }
+
+    if (queue.length === 0) {
+      this.outboundQueues.delete(ws);
+    }
   }
 
   private emitBackpressure(
@@ -1395,7 +1489,7 @@ export class StreamHub extends EventEmitter {
   }
 
   private sendError(ws: WebSocket, code: string, message: string): void {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', code, message }));
+    this.queueOutboundMessage(ws, JSON.stringify({ type: 'error', code, message }));
   }
 
   get clientCount(): number {
@@ -1510,14 +1604,7 @@ export class StreamHub extends EventEmitter {
           happenedAt: event.happenedAt,
         });
 
-        ws.send(message);
-
-        const state = this.clients.get(ws);
-        if (state) {
-          state.metrics.messagesSent += 1;
-          state.metrics.bytesSent += Buffer.byteLength(message, 'utf8');
-        }
-        this.metrics.sentMessages++;
+        this.queueOutboundMessage(ws, message);
       }
 
       cursor = result.nextCursor;
@@ -1525,7 +1612,7 @@ export class StreamHub extends EventEmitter {
 
     // Signal end of replay stream
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'stream_replay_complete', cursor: cursor ?? null }));
+      this.queueOutboundMessage(ws, JSON.stringify({ type: 'stream_replay_complete', cursor: cursor ?? null }));
     }
   }
 
@@ -1575,6 +1662,9 @@ export class StreamHub extends EventEmitter {
       clearTimeout(acc.timer);
     }
     this.batchAccumulators.clear();
+    for (const ws of this.outboundQueues.keys()) {
+      this.outboundQueues.delete(ws);
+    }
     if (this.ownsDedup) await this.dedup.close();
     this.wss.close(cb);
   }
