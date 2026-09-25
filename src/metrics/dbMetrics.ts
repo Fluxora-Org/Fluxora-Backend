@@ -59,6 +59,16 @@ export const dbPoolExhaustedTotal =
     registers: [registry],
   });
 
+/** Counter of rejected write-fence pins, partitioned by a bounded reason. */
+export const dbWriteFenceRejectedTotal =
+  (registry.getSingleMetric('fluxora_db_write_fence_rejected_total') as Counter<'reason'>) ||
+  new Counter({
+    name: 'fluxora_db_write_fence_rejected_total',
+    help: 'Total number of invalid, expired, or unverifiable write-fence pins',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
 /** Bounded set of DB query failure classes recorded by dbQueryErrorsTotal. */
 export const DB_ERROR_TYPES = ['pool_exhausted', 'query_timeout', 'duplicate_entry', 'other'] as const;
 
@@ -105,6 +115,7 @@ export function deRegisterDbMetrics(): void {
   registry.removeSingleMetric('fluxora_db_pool_idle_connections');
   registry.removeSingleMetric('fluxora_db_pool_waiting_requests');
   registry.removeSingleMetric('fluxora_db_pool_exhausted_total');
+  registry.removeSingleMetric('fluxora_db_write_fence_rejected_total');
   registry.removeSingleMetric('fluxora_db_query_errors_total');
   registry.removeSingleMetric('fluxora_db_replication_lag_seconds');
 }

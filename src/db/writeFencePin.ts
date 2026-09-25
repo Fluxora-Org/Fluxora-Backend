@@ -65,6 +65,8 @@
  */
 
 import crypto from 'crypto';
+import { dbWriteFenceRejectedTotal } from '../metrics/dbMetrics.js';
+import { logger } from '../lib/logger.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -92,6 +94,20 @@ export const CLOCK_SKEW_TOLERANCE_MS = 2_000;
 
 /** Protocol version embedded at the start of every pin. */
 const PIN_VERSION = 'v1' as const;
+
+type WriteFenceRejectReason =
+  | 'missing'
+  | 'malformed'
+  | 'expired'
+  | 'disabled'
+  | 'secret_unavailable'
+  | 'signature_mismatch';
+
+function rejectWriteFence(reason: WriteFenceRejectReason): false {
+  dbWriteFenceRejectedTotal.inc({ reason });
+  logger.warn('Write-fence pin rejected', undefined, { event: 'write_fence_rejected', reason });
+  return false;
+}
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -198,38 +214,38 @@ export function verifyWriteFencePin(
   pinHeader: string | string[] | undefined,
 ): boolean {
   // Guard against absent / multi-value headers.
-  if (!pinHeader) return false;
+  if (!pinHeader) return rejectWriteFence('missing');
   const raw = Array.isArray(pinHeader) ? pinHeader[0] : pinHeader;
-  if (typeof raw !== 'string' || raw.trim() === '') return false;
+  if (typeof raw !== 'string' || raw.trim() === '') return rejectWriteFence('malformed');
 
   // Decode base64url → "v1.<ts_ms>.<sig>"
   let decoded: string;
   try {
     decoded = Buffer.from(raw.trim(), 'base64url').toString('utf8');
   } catch {
-    return false;
+    return rejectWriteFence('malformed');
   }
 
   // Parse components
   const parts = decoded.split('.');
-  if (parts.length !== 3) return false;
+  if (parts.length !== 3) return rejectWriteFence('malformed');
 
   const [version, tsMs, receivedSig] = parts;
 
-  if (version !== PIN_VERSION) return false;
-  if (!tsMs || !/^\d{10,}$/.test(tsMs)) return false; // must be ≥10 digits (ms epoch)
-  if (!receivedSig || receivedSig.length === 0) return false;
+  if (version !== PIN_VERSION) return rejectWriteFence('malformed');
+  if (!tsMs || !/^\d{10,}$/.test(tsMs)) return rejectWriteFence('malformed'); // must be ≥10 digits (ms epoch)
+  if (!receivedSig || receivedSig.length === 0) return rejectWriteFence('malformed');
 
   // Validate timestamp (TTL check before HMAC to short-circuit early)
   const ttlSeconds = readTtlSeconds();
-  if (ttlSeconds === 0) return false; // pinning explicitly disabled
+  if (ttlSeconds === 0) return rejectWriteFence('disabled'); // pinning explicitly disabled
 
   const issuedAt = parseInt(tsMs, 10);
   const ageMs = Date.now() - issuedAt;
   // One-sided skew leeway: allow a pin that looks slightly "in the future"
   // (issuer clock ahead of verifier). Do not loosen the TTL upper bound.
   if (ageMs < -CLOCK_SKEW_TOLERANCE_MS || ageMs > ttlSeconds * 1000) {
-    return false;
+    return rejectWriteFence('expired');
   }
 
   // Derive expected signature
@@ -237,7 +253,7 @@ export function verifyWriteFencePin(
   try {
     key = deriveSigningKey();
   } catch {
-    return false;
+    return rejectWriteFence('secret_unavailable');
   }
 
   const expectedSig = hmac(key, `${PIN_VERSION}:${tsMs}`);
@@ -247,12 +263,12 @@ export function verifyWriteFencePin(
   const expectedBuf = Buffer.from(expectedSig, 'hex');
   const receivedBuf = Buffer.from(receivedSig, 'hex');
 
-  if (expectedBuf.length !== receivedBuf.length) return false;
+  if (expectedBuf.length !== receivedBuf.length) return rejectWriteFence('signature_mismatch');
 
   try {
     return crypto.timingSafeEqual(expectedBuf, receivedBuf);
   } catch {
-    return false;
+    return rejectWriteFence('signature_mismatch');
   }
 }
 
