@@ -64,14 +64,15 @@ function getSpec(): Record<string, unknown> {
     }
 
     if (spec.tags) {
-      spec.tags = spec.tags.filter(
-        (t: any) => !['admin', 'indexer', 'webhooks'].includes(t.name)
+      const tags = spec.tags as Array<{ name?: string }>;
+      spec.tags = tags.filter(
+        (tag) => !['admin', 'indexer', 'webhooks'].includes(tag.name ?? '')
       );
     }
 
     cachedSpec = spec;
   }
-  return cachedSpec;
+  return cachedSpec ?? {};
 }
 
 /** GET /openapi.json — raw OpenAPI 3.1 document */

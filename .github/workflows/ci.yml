@@ -34,10 +34,18 @@ jobs:
   lint:
     name: Lint (changed files)
     runs-on: ubuntu-latest
+    env:
+      # The PR base commit is available even when checkout creates only the
+      # synthetic pull-request merge ref.
+      LINT_BASE: ${{ github.event.pull_request.base.sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # The changed-files linter needs the PR base ref (origin/main),
+          # not only the shallow merge checkout created for pull requests.
+          fetch-depth: 0
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -71,10 +79,11 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pgisready
+          --health-cmd "pg_isready --host=127.0.0.1 --username=test_user --dbname=indexer_test"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-start-period 30s
+          --health-retries 20
 
     steps:
       - name: Checkout code

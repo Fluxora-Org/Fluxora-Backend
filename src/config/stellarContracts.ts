@@ -175,6 +175,8 @@ export function logActiveStellarConfig(config: {
     contractAddresses: config.contractAddresses,
     addresses: config.contractAddresses,
   });
+}
+
 /**
  * Validate the pinned contract allowlist and network passphrases (issue #1437).
  *

@@ -25,13 +25,14 @@ const pathname = (p) => new URL(p, ROOT).pathname;
 /**
  * Base revision to diff against. For PRs we diff against the merged base
  * branch so the change set is exactly what this PR introduces. Locally the
- * documented rollout default is the shared `origin/main`.
+ * documented rollout default is the fork's `origin/main`.
  */
 export function baseRef() {
-  if (process.env.CI && process.env.GITHUB_EVENT_NAME === 'pull_request' && process.env.GITHUB_BASE_REF) {
-    return `origin/${process.env.GITHUB_BASE_REF}`;
+  if (process.env.CI && process.env.GITHUB_EVENT_NAME === 'pull_request') {
+    return process.env.GITHUB_BASE_SHA || process.env.LINT_BASE ||
+      (process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : 'origin/main');
   }
-  return process.env.LINT_BASE || 'upstream/main';
+  return process.env.LINT_BASE || 'origin/main';
 }
 
 /**
@@ -40,7 +41,7 @@ export function baseRef() {
  * honoured for testing and ad-hoc single-file runs.
  */
 export function changedTypeScriptFiles(base = baseRef()) {
-  if (process.env.LINT_FILES) {
+  if (process.env.LINT_FILES !== undefined) {
     return process.env.LINT_FILES.split('\n').filter((f) => f.endsWith('.ts'));
   }
   const diff = spawnSync(

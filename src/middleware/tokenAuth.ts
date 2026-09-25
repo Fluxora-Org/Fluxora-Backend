@@ -15,7 +15,10 @@
  * access properly.
  */
 import type { IncomingMessage } from 'http';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import jwt from 'jsonwebtoken';
+
+import { unauthorized } from '../errors.js';
 
 import { logger } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
@@ -168,7 +171,7 @@ export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler
       }
       
       next();
-    } catch (err) {
+    } catch {
       next(
         unauthorized(`Invalid ${options.role} bearer token`, {
           role: options.role,

@@ -2,7 +2,7 @@
 import pg from 'pg';
 import { db } from '../db/client.js';
 import { config } from '../config.js';
-import { ReplayCursor, ReplayProgress, ReplayRequest } from '../types.js';
+import { ReplayCursor, ReplayProgress, ReplayRequest } from '../types/index.js';
 import { logger } from '../lib/logger.js';
 import {
   indexerReplayBatchesCommittedTotal,

@@ -23,7 +23,7 @@ import { streamsCreatedTotal, isValidStreamStatus } from '../../metrics/business
 import { toApiStream } from '../../serialization/stream.js';
 import type { ApiStreamStatus } from '../../streams/status.js';
 import { successResponse, idempotentReplayResponse } from '../../utils/response.js';
-import { SerializationLogger, debug, info, warn } from '../../utils/logger.js';
+import { SerializationLogger, debug, info, warn } from '../../lib/logger.js';
 import {
   API_STREAM_STATUS_VALUES,
   assertApiTransition,
@@ -51,6 +51,7 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const requestId = req.correlationId;
   const correlationId = req.correlationId;
   const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
+  const tenantId = req.callerAddress ?? req.user?.address ?? 'anonymous';
 
   if (!isIdempotencyHealthy()) {
     warn('Idempotency dependency unavailable', {
@@ -67,7 +68,16 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const input = parseCreateStreamBody(req.body, requestId);
   const requestFingerprint = fingerprintInput(input);
   const idempotencyStore = getIdempotencyStore();
-  const existingResponse = await idempotencyStore.get(idempotencyKey);
+  const existingResponse = await idempotencyStore.get(idempotencyKey, tenantId);
+
+  if (existingResponse === 'in_progress') {
+    throw new ApiError(
+      409,
+      ApiErrorCode.CONFLICT,
+      'An identical request is already being processed',
+      { hint: 'Retry after the in-flight request completes' },
+    );
+  }
 
   if (existingResponse) {
     if (existingResponse.requestFingerprint !== requestFingerprint) {
@@ -104,6 +114,7 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const responseEnvelope = successResponse(stream, requestId);
   await idempotencyStore.set(
     idempotencyKey,
+    tenantId,
     { version: ENVELOPE_VERSION, requestFingerprint, statusCode: 201, body: responseEnvelope },
     getIdempotencyTtlSeconds(),
   );

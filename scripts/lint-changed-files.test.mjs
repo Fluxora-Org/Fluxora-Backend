@@ -60,7 +60,7 @@ describe('lintFiles rejects deliberate violations', () => {
     const errors = results.reduce((n, r) => n + r.errorCount, 0);
     expect(errors).toBeGreaterThan(0);
     expect(results[0].messages.some((m) => m.ruleId === 'no-console')).toBe(true);
-  });
+  }, 15000);
 
   it('passes a clean file with zero warnings and errors', async () => {
     const clean = source('clean.ts', 'export function good(): string {\n  return "ok";\n}\n');

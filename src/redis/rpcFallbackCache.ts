@@ -33,8 +33,6 @@ const SAFE_OPERATION = /^[A-Za-z0-9._-]+$/;
  * intentionally looser than SAFE_OPERATION (it allows ':') so operation
  * names stay human-readable/greppable in Redis.
  */
-const SAFE_OPERATION_NAME = /^[A-Za-z0-9._:-]+$/;
-
 const RPC_FALLBACK_CACHE_ENVELOPE_VERSION = 1;
 
 /**
@@ -115,6 +113,7 @@ export function buildRpcFallbackCacheKey(operation: string, cacheParts: readonly
     throw new Error('RPC fallback cache operation contains unsafe characters');
   }
 
+  const encodedOperation = `${operation.length}:${operation}`;
   const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
   return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;
@@ -327,7 +326,7 @@ export class NoOpRpcFallbackCache implements RpcFallbackCache {
     return null;
   }
 
-  async set<T>(): Promise<void> {
+  async set<T>(_value: T, _ttlSeconds: number, _cacheParts?: readonly string[]): Promise<void> {
     return;
   }
 
@@ -335,7 +334,12 @@ export class NoOpRpcFallbackCache implements RpcFallbackCache {
     return null;
   }
 
-  async setEntry<T>(): Promise<void> {
+  async setEntry<T>(
+    _value: T,
+    _ttlSeconds: number,
+    _cacheParts?: readonly string[],
+    _options?: RpcFallbackCacheSetOptions,
+  ): Promise<void> {
     return;
   }
 }
