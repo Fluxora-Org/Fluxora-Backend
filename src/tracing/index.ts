@@ -1,4 +1,3 @@
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * OpenTelemetry SDK bootstrap for Fluxora Backend.
  *
@@ -25,7 +24,7 @@ import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { ExpressInstrumentation } from '@opentelemetry/instrumentation-express';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
 import { IORedisInstrumentation } from '@opentelemetry/instrumentation-ioredis';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -79,7 +78,7 @@ export function startTracing(): boolean {
     });
 
     sdk = new NodeSDK({
-      resource: new Resource({
+      resource: resourceFromAttributes({
         [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'fluxora-backend',
         [ATTR_SERVICE_VERSION]: process.env.npm_package_version ?? '0.0.0',
       }),

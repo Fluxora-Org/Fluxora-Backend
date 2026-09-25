@@ -7,8 +7,8 @@ import { RedisWebhookCircuitBreakerStore } from '../../src/redis/webhookCircuitB
 interface MockClient {
   queries: Array<{ sql: string; params: unknown[] | undefined }>;
   rows: unknown[];
-  query: ReturnType<typeof vi.fn>;
-  release: ReturnType<typeof vi.fn>;
+  query: any;
+  release: any;
 }
 
 const policy: EnhancedRetryPolicy = {
@@ -51,7 +51,7 @@ function createDispatcher(
     batchSize: 5,
     policy,
     pool: {
-      connect: vi.fn(async () => client),
+      connect: vi.fn(async () => client) as any,
     },
     circuitBreakerStore: breaker,
   });
@@ -254,7 +254,7 @@ describe('WebhookDispatcher outbox polling', () => {
       if (sql.includes('UPDATE webhook_outbox SET processed = true')) {
         throw new Error('Simulated crash during DB acknowledgement');
       }
-      return originalQuery(sql, params);
+      return (originalQuery as any)(sql, params);
     });
 
     let fetchHeaders: RequestInit['headers'] | undefined;
@@ -574,7 +574,7 @@ describe('WebhookDispatcher outbox polling', () => {
         batchSize: 5,
         policy: poisonPolicy,
         pool: {
-          connect: vi.fn(async () => client),
+          connect: vi.fn(async () => client) as any,
         },
         circuitBreakerStore: breaker,
       });

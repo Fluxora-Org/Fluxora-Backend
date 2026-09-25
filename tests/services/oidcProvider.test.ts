@@ -46,6 +46,7 @@ const mockClient: RedisClient = {
   exists: vi.fn(),
   close: vi.fn(),
   del: vi.fn(),
+  incr: vi.fn(),
   multi: vi.fn() as any,
   zcount: vi.fn(),
 };

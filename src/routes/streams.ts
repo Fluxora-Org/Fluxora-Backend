@@ -140,6 +140,7 @@ import {
   type IdempotencyStore,
   ENVELOPE_VERSION,
 } from '../redis/idempotencyStore.js';
+import { isTerminalStatus } from '../streams/status.js';
 import { toStreamJsonLd } from '../serialization/jsonld.js';
 export const streamsRouter = Router();
 
@@ -957,8 +958,17 @@ streamsRouter.post(
       throw error;
     }
 
+    const tenantId = req.keyId || req.user?.address || 'anonymous';
     const requestFingerprint = fingerprintInput(normalizedInput);
-    const existingResponse = await idempotencyStore.get(idempotencyKey);
+    const existingResponse = await idempotencyStore.get(idempotencyKey, tenantId);
+
+    if (existingResponse === 'in_progress') {
+      throw new ApiError(
+        409,
+        ApiErrorCode.CONFLICT,
+        'A request with this idempotency key is already in progress.',
+      );
+    }
 
     if (existingResponse) {
       if (existingResponse.requestFingerprint !== requestFingerprint) {
@@ -1021,6 +1031,7 @@ streamsRouter.post(
     const responseEnvelope = successResponse(stream, requestId);
     await idempotencyStore.set(
       idempotencyKey,
+      tenantId,
       { version: ENVELOPE_VERSION, requestFingerprint, statusCode: 201, body: responseEnvelope },
       idempotencyTtlSeconds,
     );

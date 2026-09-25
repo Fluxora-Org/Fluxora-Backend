@@ -93,5 +93,25 @@
     "vitest": "^3.2.6",
     "ws": "^8.20.0"
   },
-  "packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531"
+  "packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531",
+  "pnpm": {
+    "overrides": {
+      "glob@>=11.0.0 <11.1.0": ">=11.1.0",
+      "@opentelemetry/sdk-node@<0.217.0": ">=0.217.0",
+      "@opentelemetry/resources": ">=2.11.0",
+      "@opentelemetry/exporter-trace-otlp-http": ">=0.222.0",
+      "@opentelemetry/exporter-prometheus@<0.217.0": ">=0.217.0",
+      "@opentelemetry/propagator-jaeger@<2.9.0": ">=2.9.0",
+      "@opentelemetry/core@<2.8.0": ">=2.8.0",
+      "body-parser@<1.20.6": ">=1.20.6",
+      "brace-expansion@2": "^2.1.4",
+      "brace-expansion@>=3.0.0": ">=5.0.9",
+      "nanoid": ">=3.3.18",
+      "postcss": ">=8.5.23",
+      "qs": ">=6.16.0",
+      "vitest@>=2.1.0 <4.1.11": "^4.1.11",
+      "@vitest/mocker@>=2.1.0 <4.1.11": "^4.1.11",
+      "@vitest/coverage-v8": "^4.1.11"
+    }
+  }
 }

@@ -180,6 +180,7 @@ describe('connectionLimiter (Redis-backed bans)', () => {
         async setNx() { return false; },
         async del() { throw new Error('Redis down'); },
         async exists() { return false; },
+        async incr() { throw new Error('Redis down'); },
         async close() {},
         multi() { return { zadd() {return this;}, zremrangebyscore(){return this;}, zcard(){return this;}, pexpire(){return this;}, async exec() {return [];} } as any; },
         async zcount() { return 0; }

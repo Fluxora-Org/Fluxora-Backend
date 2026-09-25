@@ -58,6 +58,7 @@ export const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9:_-]+$/;
  * Default decompressed payload limit: 256 KiB
  */
 export const DEFAULT_RAW_LIMIT_BYTES = 256 * 1024;
+export const BODY_LIMIT_BYTES = DEFAULT_RAW_LIMIT_BYTES;
 export const DEFAULT_DECOMPRESSED_LIMIT_BYTES = 256 * 1024;
 
 export interface RouteLimit {

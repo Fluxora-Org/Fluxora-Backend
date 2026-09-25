@@ -115,6 +115,7 @@ export function buildRpcFallbackCacheKey(operation: string, cacheParts: readonly
     throw new Error('RPC fallback cache operation contains unsafe characters');
   }
 
+  const encodedOperation = encodeCacheKeyPart(operation);
   const encodedParts = cacheParts.map(encodeCacheKeyPart);
 
   return `${RPC_FALLBACK_CACHE_PREFIX}v${RPC_FALLBACK_CACHE_KEY_VERSION}::op:${encodedOperation}::parts:${encodedParts.join(',')}`;

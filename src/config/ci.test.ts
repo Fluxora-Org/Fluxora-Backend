@@ -1,13 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { test, expect } from 'vitest';
 
-const wf = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+import path from 'node:path';
 
-function parseJobs(workflow) {
+const wf = readFileSync(path.resolve(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
+
+function parseJobs(workflow: string): Record<string, string> {
   const jobsSection = workflow.slice(workflow.indexOf('\njobs:') + 1);
   const lines = jobsSection.split('\n');
-  const jobs = {};
-  let current = null;
+  const jobs: Record<string, string[]> = {};
+  let current: string | null = null;
   for (const line of lines) {
     const header = /^ {2}([\w-]+):\s*$/.exec(line);
     const doesNotBelong = /^ {4,}/.test(line) || line.trim() === '';

@@ -16,8 +16,14 @@
  */
 
 import process from 'node:process';
+import util from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { ESLint } from 'eslint';
+
+// Polyfill util.styleText for Node runtimes < 20.12 (used by ESLint's stylish formatter)
+if (typeof util.styleText !== 'function') {
+  util.styleText = (_format, text) => text;
+}
 
 const ROOT = new URL('../', import.meta.url);
 const pathname = (p) => new URL(p, ROOT).pathname;

@@ -36,7 +36,7 @@ import { graphql, parse, type DocumentNode, type GraphQLError, Kind } from 'grap
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, authenticateApiKey, requireAuth, requireScope } from '../middleware/auth.js';
+import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { errorResponse } from '../utils/response.js';
@@ -483,7 +483,7 @@ graphqlGatewayRouter.post(
       let document: DocumentNode;
       try {
         document = parse(source);
-      } catch (parseError) {
+      } catch {
         res
           .status(400)
           .json(

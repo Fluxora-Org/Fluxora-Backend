@@ -11,7 +11,12 @@ describe('Idempotency Middleware', () => {
   beforeEach(() => {
     store = new InMemoryIdempotencyStore();
     app = express();
-    app.use(express.json({ limit: '1mb' })); app.use((req, res, next) => { req.keyId = req.headers['x-tenant-id'] || 'anonymous'; next(); });
+    app.use(express.json({ limit: '1mb' }));
+    app.use((req, _res, next) => {
+      const header = req.headers['x-tenant-id'];
+      req.keyId = (Array.isArray(header) ? header[0] : header) || 'anonymous';
+      next();
+    });
     app.use(createIdempotencyMiddleware(store));
 
     app.post('/test', (req, res) => {
@@ -30,9 +35,13 @@ describe('Idempotency Middleware', () => {
     expect(response.headers['idempotency-replayed']).toBe('false');
     expect(response.body.data).toEqual(body);
 
-    const cached = await store.get('', 'anonymous');
+    const cached = await store.get('test-key-1', 'anonymous');
     expect(cached).not.toBeNull();
-    expect(cached?.requestFingerprint).toBeDefined();
+    if (cached && cached !== 'in_progress') {
+      expect(cached.requestFingerprint).toBeDefined();
+    } else {
+      expect.fail('expected cached entry');
+    }
   });
 
   it('should return a replayed response on matching body', async () => {
