@@ -21,6 +21,13 @@ import { forwardToOtel } from '../tracing/logsBridge.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+/**
+ * Fields that every structured log record must retain for log consumers.
+ * Optional correlation and metadata fields may be added without changing
+ * this compatibility contract.
+ */
+export const LOGGER_CORE_FIELDS = ['timestamp', 'level', 'message'] as const;
+
 export interface LogRecord {
   timestamp: string;
   level: LogLevel;
@@ -230,4 +237,3 @@ export const logger = {
 };
 
 export type Logger = typeof logger;
-
