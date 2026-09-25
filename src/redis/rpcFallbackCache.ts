@@ -326,7 +326,7 @@ export class NoOpRpcFallbackCache implements RpcFallbackCache {
     return null;
   }
 
-  async set<T>(_value: T, _ttlSeconds: number, _cacheParts?: readonly string[]): Promise<void> {
+  async set<T>(_operation: string, _value: T, _ttlSeconds: number, _cacheParts?: readonly string[]): Promise<void> {
     return;
   }
 
@@ -335,6 +335,7 @@ export class NoOpRpcFallbackCache implements RpcFallbackCache {
   }
 
   async setEntry<T>(
+    _operation: string,
     _value: T,
     _ttlSeconds: number,
     _cacheParts?: readonly string[],

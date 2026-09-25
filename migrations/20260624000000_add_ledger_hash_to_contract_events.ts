@@ -23,14 +23,12 @@ export const shorthands: ColumnDefinitions | undefined = undefined;
 
 /** Add ledger_hash (TEXT, nullable) to contract_events. */
 export async function up(pgm: MigrationBuilder): Promise<void> {
-  pgm.addColumn('contract_events', {
-    // Hash of the Stellar ledger header for reorg detection.
-    // Nullable so pre-existing rows without a hash remain valid.
-    ledger_hash: { type: 'text', notNull: false },
-  });
+  // The initial-schema migration already creates this column on fresh
+  // databases, so the forward migration must be safe when both run in order.
+  pgm.sql('ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS ledger_hash TEXT');
 }
 
 /** Remove the ledger_hash column — reverses the up() migration. */
 export async function down(pgm: MigrationBuilder): Promise<void> {
-  pgm.dropColumn('contract_events', 'ledger_hash');
+  pgm.sql('ALTER TABLE contract_events DROP COLUMN IF EXISTS ledger_hash');
 }

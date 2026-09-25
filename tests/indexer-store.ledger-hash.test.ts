@@ -2,8 +2,8 @@
  * Migration round-trip regression test for ledger_hash on contract_events.
  *
  * Tests verified here:
- *  1. The forward migration (20260624000000) up()/down() calls the correct
- *     pgm methods with the correct column definition.
+ *  1. The forward migration (20260624000000) uses idempotent SQL for the
+ *     nullable ledger_hash column.
  *  2. The streams-table migration (1774715131962) includes ledger_hash in
  *     the contract_events createTable call.
  *  3. The initial-schema migration (1000000000000) includes ledger_hash in
@@ -16,7 +16,7 @@
  * and removes the ledger_hash column definition.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import type { ContractEventRecord } from '../src/indexer/types.js';
 import { PostgresContractEventStore } from '../src/indexer/store.js';
 
@@ -57,31 +57,24 @@ function makeRecord(overrides: Partial<ContractEventRecord> = {}): ContractEvent
 // ---------------------------------------------------------------------------
 
 describe('20260624000000_add_ledger_hash_to_contract_events — migration shape', () => {
-  it('up() calls addColumn on contract_events with ledger_hash TEXT nullable', async () => {
+  it('up() uses an idempotent SQL add for a nullable ledger_hash column', async () => {
     const { pgm, calls } = makePgmSpy();
     const { up } = await import('../migrations/20260624000000_add_ledger_hash_to_contract_events.js');
     await up(pgm);
 
-    const addCall = calls.find((c) => c.method === 'addColumn');
-    expect(addCall).toBeDefined();
-    expect(addCall!.args[0]).toBe('contract_events');
-    const colDef = addCall!.args[1] as Record<string, unknown>;
-    expect(colDef).toHaveProperty('ledger_hash');
-    const ledgerHashDef = colDef['ledger_hash'] as { type: string; notNull: boolean | undefined };
-    expect(ledgerHashDef.type).toBe('text');
-    // notNull must be falsy (nullable) so legacy rows survive
-    expect(ledgerHashDef.notNull).toBeFalsy();
+    const sqlCall = calls.find((c) => c.method === 'sql');
+    expect(sqlCall).toBeDefined();
+    expect(sqlCall!.args[0]).toContain('ADD COLUMN IF NOT EXISTS ledger_hash TEXT');
   });
 
-  it('down() calls dropColumn on contract_events for ledger_hash', async () => {
+  it('down() uses an idempotent SQL drop for ledger_hash', async () => {
     const { pgm, calls } = makePgmSpy();
     const { down } = await import('../migrations/20260624000000_add_ledger_hash_to_contract_events.js');
     await down(pgm);
 
-    const dropCall = calls.find((c) => c.method === 'dropColumn');
-    expect(dropCall).toBeDefined();
-    expect(dropCall!.args[0]).toBe('contract_events');
-    expect(dropCall!.args[1]).toBe('ledger_hash');
+    const sqlCall = calls.find((c) => c.method === 'sql');
+    expect(sqlCall).toBeDefined();
+    expect(sqlCall!.args[0]).toContain('DROP COLUMN IF EXISTS ledger_hash');
   });
 });
 
