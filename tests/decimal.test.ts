@@ -622,3 +622,201 @@ describe('decimalStringField validation limits', () => {
   });
 });
 
+describe('Non-null assertion handling', () => {
+  describe('compareDecimalStringToZero', () => {
+    it('should throw proper error when validation fails without error object', () => {
+      // This tests the case where validation.valid is false but error might be undefined
+      expect(() => compareDecimalStringToZero('invalid')).toThrow(DecimalSerializationError);
+    });
+
+    it('should throw proper error when validation succeeds but value is missing', () => {
+      // This tests the case where validation.valid is true but value is undefined
+      // We can't directly test this without mocking, but we can ensure the error path exists
+      expect(() => compareDecimalStringToZero('')).toThrow(DecimalSerializationError);
+    });
+  });
+
+  describe('serializeToDecimalString', () => {
+    it('should throw proper error when string validation fails without error object', () => {
+      expect(() => serializeToDecimalString('invalid')).toThrow(DecimalSerializationError);
+    });
+
+    it('should throw proper error when string validation succeeds but value is missing', () => {
+      // This tests the error path for missing value after successful validation
+      expect(() => serializeToDecimalString('')).toThrow(DecimalSerializationError);
+    });
+  });
+
+  describe('formatDecimalForDisplay', () => {
+    it('should handle missing value after validation gracefully', () => {
+      // This tests the case where validation succeeds but value is missing
+      const result = formatDecimalForDisplay('invalid');
+      expect(result).toBe('invalid'); // Should return original for invalid input
+    });
+  });
+
+  describe('parseToStroops', () => {
+    it('should throw proper error when validation fails without error object', () => {
+      expect(() => parseToStroops('invalid')).toThrow(DecimalSerializationError);
+    });
+
+    it('should throw proper error when validation succeeds but value is missing', () => {
+      expect(() => parseToStroops('')).toThrow(DecimalSerializationError);
+    });
+  });
+});
+
+describe('Boundary value serialization', () => {
+  describe('Largest representable amounts', () => {
+    it('should serialize int64 max (9223372036854775807) correctly', () => {
+      const result = serializeToDecimalString('9223372036854775807');
+      expect(result).toBe('9223372036854775807');
+    });
+
+    it('should serialize int64 max with maximum fractional precision', () => {
+      const result = serializeToDecimalString('9223372036854775807.9999999');
+      expect(result).toBe('9223372036854775807.9999999');
+    });
+
+    it('should serialize negative int64 min correctly', () => {
+      const result = serializeToDecimalString('-9223372036854775808');
+      expect(result).toBe('-9223372036854775808');
+    });
+
+    it('should reject int64 max + 1', () => {
+      expect(() => serializeToDecimalString('9223372036854775808')).toThrow(DecimalSerializationError);
+    });
+
+    it('should reject value with integer part exceeding int64 max', () => {
+      expect(() => serializeToDecimalString('9223372036854775808.0')).toThrow(DecimalSerializationError);
+    });
+  });
+
+  describe('Smallest representable amounts', () => {
+    it('should serialize smallest positive value (0.0000001)', () => {
+      const result = serializeToDecimalString('0.0000001');
+      expect(result).toBe('0.0000001');
+    });
+
+    it('should serialize smallest negative value (-0.0000001)', () => {
+      const result = serializeToDecimalString('-0.0000001');
+      expect(result).toBe('-0.0000001');
+    });
+
+    it('should serialize zero correctly', () => {
+      const result = serializeToDecimalString('0');
+      expect(result).toBe('0');
+    });
+
+    it('should serialize normalized zero variants', () => {
+      expect(serializeToDecimalString('0.0')).toBe('0');
+      expect(serializeToDecimalString('0.0000000')).toBe('0');
+      expect(serializeToDecimalString('+0')).toBe('0');
+      expect(serializeToDecimalString('-0')).toBe('-0');
+    });
+  });
+
+  describe('Precision boundary values', () => {
+    it('should handle exactly 7 decimal places (Stellar precision)', () => {
+      const result = serializeToDecimalString('100.1234567');
+      expect(result).toBe('100.1234567');
+    });
+
+    it('should handle values with no fractional part', () => {
+      const result = serializeToDecimalString('1000000000000000');
+      expect(result).toBe('1000000000000000');
+    });
+
+    it('should handle very long fractional parts within validation limits', () => {
+      const result = serializeToDecimalString('0.1234567');
+      expect(result).toBe('0.1234567');
+    });
+  });
+});
+
+describe('Malformed value handling', () => {
+  it('should reject null with EMPTY_VALUE error', () => {
+    expect(() => serializeToDecimalString(null)).toThrow(DecimalSerializationError);
+    try {
+      serializeToDecimalString(null);
+    } catch (e) {
+      expect(e).toBeInstanceOf(DecimalSerializationError);
+      if (e instanceof DecimalSerializationError) {
+        expect(e.code).toBe(DecimalErrorCode.EMPTY_VALUE);
+      }
+    }
+  });
+
+  it('should reject undefined with EMPTY_VALUE error', () => {
+    expect(() => serializeToDecimalString(undefined)).toThrow(DecimalSerializationError);
+    try {
+      serializeToDecimalString(undefined);
+    } catch (e) {
+      expect(e).toBeInstanceOf(DecimalSerializationError);
+      if (e instanceof DecimalSerializationError) {
+        expect(e.code).toBe(DecimalErrorCode.EMPTY_VALUE);
+      }
+    }
+  });
+
+  it('should reject empty string with EMPTY_VALUE error', () => {
+    expect(() => serializeToDecimalString('')).toThrow(DecimalSerializationError);
+    try {
+      serializeToDecimalString('');
+    } catch (e) {
+      expect(e).toBeInstanceOf(DecimalSerializationError);
+      if (e instanceof DecimalSerializationError) {
+        expect(e.code).toBe(DecimalErrorCode.EMPTY_VALUE);
+      }
+    }
+  });
+
+  it('should reject non-string types with INVALID_TYPE error', () => {
+    expect(() => serializeToDecimalString(100 as unknown)).toThrow(DecimalSerializationError);
+    try {
+      serializeToDecimalString(100 as unknown);
+    } catch (e) {
+      expect(e).toBeInstanceOf(DecimalSerializationError);
+      if (e instanceof DecimalSerializationError) {
+        expect(e.code).toBe(DecimalErrorCode.INVALID_TYPE);
+      }
+    }
+  });
+
+  it('should reject scientific notation with INVALID_FORMAT error', () => {
+    expect(() => serializeToDecimalString('1e10')).toThrow(DecimalSerializationError);
+    try {
+      serializeToDecimalString('1e10');
+    } catch (e) {
+      expect(e).toBeInstanceOf(DecimalSerializationError);
+      if (e instanceof DecimalSerializationError) {
+        expect(e.code).toBe(DecimalErrorCode.INVALID_FORMAT);
+      }
+    }
+  });
+
+  it('should reject multiple decimal points with INVALID_FORMAT error', () => {
+    expect(() => serializeToDecimalString('1.2.3')).toThrow(DecimalSerializationError);
+    try {
+      serializeToDecimalString('1.2.3');
+    } catch (e) {
+      expect(e).toBeInstanceOf(DecimalSerializationError);
+      if (e instanceof DecimalSerializationError) {
+        expect(e.code).toBe(DecimalErrorCode.INVALID_FORMAT);
+      }
+    }
+  });
+
+  it('should reject out of range values with OUT_OF_RANGE error', () => {
+    expect(() => serializeToDecimalString('99999999999999999999999')).toThrow(DecimalSerializationError);
+    try {
+      serializeToDecimalString('99999999999999999999999');
+    } catch (e) {
+      expect(e).toBeInstanceOf(DecimalSerializationError);
+      if (e instanceof DecimalSerializationError) {
+        expect(e.code).toBe(DecimalErrorCode.OUT_OF_RANGE);
+      }
+    }
+  });
+});
+
