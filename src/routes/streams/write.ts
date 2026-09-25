@@ -66,10 +66,18 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
 
   const input = parseCreateStreamBody(req.body, requestId);
   const requestFingerprint = fingerprintInput(input);
+  const tenantId = (req as any).keyId || req.user?.address || input.sender || 'anonymous';
   const idempotencyStore = getIdempotencyStore();
-  const existingResponse = await idempotencyStore.get(idempotencyKey);
+  const existingResponse = await idempotencyStore.get(idempotencyKey, tenantId);
 
   if (existingResponse) {
+    if (existingResponse === 'in_progress') {
+      throw new ApiError(
+        409,
+        ApiErrorCode.CONFLICT,
+        'Request is currently being processed',
+      );
+    }
     if (existingResponse.requestFingerprint !== requestFingerprint) {
       warn('Idempotency-Key reused with different payload', {
         requestId,
@@ -104,6 +112,7 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const responseEnvelope = successResponse(stream, requestId);
   await idempotencyStore.set(
     idempotencyKey,
+    tenantId,
     { version: ENVELOPE_VERSION, requestFingerprint, statusCode: 201, body: responseEnvelope },
     getIdempotencyTtlSeconds(),
   );

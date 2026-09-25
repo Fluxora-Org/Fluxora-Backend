@@ -26,7 +26,7 @@ import type { ApiCreateStreamInput } from '../../db/repositories/streamApiQuerie
 import { CreateStreamSchema, parseBody, formatZodIssues } from '../../validation/schemas.js';
 import type { ApiStreamStatus } from '../../streams/status.js';
 
-const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'];
+const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 
 export const API_STREAM_STATUS_VALUES: readonly ApiStreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
 
