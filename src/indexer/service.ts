@@ -34,6 +34,7 @@ export { ReplayBudgetExceededError, IndexerNotLeaderError, ReplayForcedStopError
 export { replayLock, replayState, requestStopReplay, _resetStopReplay } from './replayRuntimeState.js';
 export { rowToReplayCursor, rowToContractEvent } from './replayRowMappers.js';
 export { ReplayCursorRepository } from './replayCursorRepository.js';
+export { _resetRolledBackLedgers } from './ingestion.js';
 
 /** Seconds elapsed since a `process.hrtime.bigint()` start mark. */
 function elapsedSecondsSince(startedAt: bigint): number {
