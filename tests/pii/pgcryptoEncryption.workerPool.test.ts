@@ -156,6 +156,27 @@ describe('WorkerPool', () => {
     expect(fallback).toHaveBeenCalledOnce();
     expect((result as { current: string }).current).toBe('fallback-hash');
   });
+
+  it('rejects with PoolQueueFullError when max queue size is reached', async () => {
+    const workerUrl = resolveWorkerUrl(pathToFileURL(__filename), '../../src/pii/pgcryptoWorker');
+    pool = new WorkerPool(workerUrl, { maxWorkers: 1, maxQueueSize: 1 });
+
+    // Enqueue task 1 (occupies the single worker)
+    const p1 = pool.exec({ type: 'hash', taskId: 0, address, keys });
+    
+    // Wait briefly so the worker processes and becomes busy
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Enqueue task 2 (enters the queue, which has max size 1)
+    const p2 = pool.exec({ type: 'hash', taskId: 1, address, keys });
+
+    // Enqueue task 3 (should be rejected since queue is full)
+    const p3 = pool.exec({ type: 'hash', taskId: 2, address, keys });
+
+    await expect(p3).rejects.toThrow('WorkerPool queue is full (backpressure applied)');
+    
+    await Promise.all([p1, p2]);
+  });
 });
 
 // ── batchComputeAddressHashes ──────────────────────────────────────────────

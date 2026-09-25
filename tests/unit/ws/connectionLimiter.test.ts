@@ -1,14 +1,14 @@
 import { IncomingMessage } from 'node:http';
 import { Socket } from 'node:net';
-import { 
-  getClientIp, 
-  checkAndReserve, 
-  trackConnection, 
-  untrackConnection, 
+import {
+  getClientIp,
+  checkAndReserve,
+  trackConnection,
+  untrackConnection,
   _resetLimiter,
   setBanStore,
   getBanStore,
-  wireRedisBanStore
+  wireRedisBanStore,
 } from '../../../src/ws/connectionLimiter.js';
 import { InMemoryBanStore, createBanStore } from '../../../src/redis/banStore.js';
 import type { RedisClient } from '../../../src/redis/client.js';
@@ -20,7 +20,7 @@ describe('connectionLimiter (Redis-backed bans)', () => {
     vi.resetModules();
     process.env = { ...originalEnv };
     _resetLimiter();
-    
+
     process.env.WS_MAX_CONNECTIONS_PER_IP = '2';
     process.env.WS_ABUSE_THRESHOLD = '2';
     process.env.WS_BAN_TTL_S = '60';
@@ -60,9 +60,9 @@ describe('connectionLimiter (Redis-backed bans)', () => {
       expect(getClientIp(req)).toBe('8.8.8.8');
     });
 
-    it('handles multiple IPs in X-Forwarded-For', () => {
+    it('handles multiple IPs in X-Forwarded-For by ignoring spoofed client entries beyond trusted proxy', () => {
       const req = mockRequest('127.0.0.1', '1.2.3.4, 5.6.7.8');
-      expect(getClientIp(req)).toBe('1.2.3.4');
+      expect(getClientIp(req)).toBe('5.6.7.8');
     });
   });
 
@@ -73,11 +73,28 @@ describe('connectionLimiter (Redis-backed bans)', () => {
       // Limit is 2. checkAndReserve atomically increments.
       expect((await checkAndReserve(ip)).allowed).toBe(true); // count: 0 -> 1
       expect((await checkAndReserve(ip)).allowed).toBe(true); // count: 1 -> 2
-      
+
       const result = await checkAndReserve(ip); // count: 2 (already at limit)
       expect(result.allowed).toBe(false);
       expect(result.code).toBe(4029);
       expect(result.reason).toBe('Too many connections');
+    });
+
+    it('limits authenticated clients independently when they share an IP', async () => {
+      process.env.WS_MAX_CONNECTIONS_PER_IP = '1';
+
+      expect((await checkAndReserve(ip, 'user-1')).allowed).toBe(true);
+      expect((await checkAndReserve(ip, 'user-2')).allowed).toBe(true);
+
+      const result = await checkAndReserve(ip, 'user-1');
+      expect(result).toMatchObject({
+        allowed: false,
+        code: 4029,
+        reason: 'Too many connections',
+      });
+
+      untrackConnection(ip, 'user-1');
+      untrackConnection(ip, 'user-2');
     });
 
     it('works correctly with IPv6 addresses', async () => {
@@ -107,7 +124,7 @@ describe('connectionLimiter (Redis-backed bans)', () => {
       await checkAndReserve(ip); // count: 1 -> 2 (at limit)
 
       // Rejection 1 (count = 2, at limit)
-      await checkAndReserve(ip); 
+      await checkAndReserve(ip);
       // Rejection 2
       await checkAndReserve(ip);
       // Rejection 3 -> Triggers ban (3 > threshold of 2)
@@ -124,29 +141,29 @@ describe('connectionLimiter (Redis-backed bans)', () => {
     });
 
     it('ban expires after TTL (local InMemoryBanStore)', async () => {
-        vi.useFakeTimers();
-        await checkAndReserve(ip); // count: 0 -> 1
-        await checkAndReserve(ip); // count: 1 -> 2 (at limit)
-        
-        // Trigger rejections and ban (3 rejections > threshold of 2)
-        await checkAndReserve(ip); // rejection 1
-        await checkAndReserve(ip); // rejection 2
-        await checkAndReserve(ip); // rejection 3 -> ban triggered
-        
-        // Clear count and try - ban should be active
-        untrackConnection(ip);
-        untrackConnection(ip);
-        expect((await checkAndReserve(ip)).reason).toBe('IP banned due to abuse');
-        
-        // Fast forward 61 seconds
-        vi.advanceTimersByTime(61000);
-        
-        // Ban should be expired now, and we should get 'Too many connections' because we're back at limit
-        untrackConnection(ip); // clear any count changes
-        const result = await checkAndReserve(ip);
-        expect(result.allowed).toBe(true); // Ban expired
-        
-        vi.useRealTimers();
+      vi.useFakeTimers();
+      await checkAndReserve(ip); // count: 0 -> 1
+      await checkAndReserve(ip); // count: 1 -> 2 (at limit)
+
+      // Trigger rejections and ban (3 rejections > threshold of 2)
+      await checkAndReserve(ip); // rejection 1
+      await checkAndReserve(ip); // rejection 2
+      await checkAndReserve(ip); // rejection 3 -> ban triggered
+
+      // Clear count and try - ban should be active
+      untrackConnection(ip);
+      untrackConnection(ip);
+      expect((await checkAndReserve(ip)).reason).toBe('IP banned due to abuse');
+
+      // Fast forward 61 seconds
+      vi.advanceTimersByTime(61000);
+
+      // Ban should be expired now, and we should get 'Too many connections' because we're back at limit
+      untrackConnection(ip); // clear any count changes
+      const result = await checkAndReserve(ip);
+      expect(result.allowed).toBe(true); // Ban expired
+
+      vi.useRealTimers();
     });
 
     it('supports explicit InMemoryBanStore injection', async () => {
@@ -162,7 +179,7 @@ describe('connectionLimiter (Redis-backed bans)', () => {
       // Clear count and verify ban is in store
       untrackConnection(ip);
       untrackConnection(ip);
-      
+
       const result = await checkAndReserve(ip);
       expect(result.allowed).toBe(false);
       expect(result.reason).toBe('IP banned due to abuse');
@@ -175,15 +192,47 @@ describe('connectionLimiter (Redis-backed bans)', () => {
     it('Redis outage falls back to local enforcement (fail-safe)', async () => {
       // Create a fake Redis client that always throws
       const fakeRedis: RedisClient = {
-        async get() { throw new Error('Redis down'); },
-        async set() { throw new Error('Redis down'); },
-        async setNx() { return false; },
-        async del() { throw new Error('Redis down'); },
-        async exists() { return false; },
-        async incr() { throw new Error('Redis down'); },
+        async get() {
+          throw new Error('Redis down');
+        },
+        async set() {
+          throw new Error('Redis down');
+        },
+        async setNx() {
+          return false;
+        },
+        async del() {
+          throw new Error('Redis down');
+        },
+        async exists() {
+          return false;
+        },
+        async incr() {
+          throw new Error('Redis down');
+        },
         async close() {},
-        multi() { return { zadd() {return this;}, zremrangebyscore(){return this;}, zcard(){return this;}, pexpire(){return this;}, async exec() {return [];} } as any; },
-        async zcount() { return 0; }
+        multi() {
+          return {
+            zadd() {
+              return this;
+            },
+            zremrangebyscore() {
+              return this;
+            },
+            zcard() {
+              return this;
+            },
+            pexpire() {
+              return this;
+            },
+            async exec() {
+              return [];
+            },
+          } as any;
+        },
+        async zcount() {
+          return 0;
+        },
       };
 
       const store = createBanStore(fakeRedis);
@@ -200,7 +249,7 @@ describe('connectionLimiter (Redis-backed bans)', () => {
       // Clear count and verify ban works despite Redis outage
       untrackConnection(ip);
       untrackConnection(ip);
-      
+
       const result = await checkAndReserve(ip);
       expect(result.allowed).toBe(false);
       expect(result.reason).toBe('IP banned due to abuse');

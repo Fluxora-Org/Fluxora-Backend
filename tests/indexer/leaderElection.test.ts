@@ -7,6 +7,7 @@ import {
   getIndexerLeaderElection,
   _resetIndexerLeaderElection,
 } from '../../src/indexer/leaderElection.js';
+import { indexerLeaderElectionFailuresTotal } from '../../src/metrics/indexerMetrics.js';
 
 describe('NoOpLeaderElection', () => {
   it('always reports leadership and never rejects', async () => {
@@ -29,6 +30,39 @@ describe('RedisIndexerLeaderElection', () => {
   afterEach(() => {
     vi.useRealTimers();
     redis.reset();
+  });
+
+  it('asserts the collector reflects failure states and counters are not reset by a leader handover', async () => {
+    // Increment a metric as if we did some work
+    const { indexerReplayBatchesCommittedTotal } = await import('../../src/metrics/indexerMetrics.js');
+    indexerReplayBatchesCommittedTotal.inc({ contract_id: 'test' }, 5);
+    
+    const before = (await indexerReplayBatchesCommittedTotal.get()).values
+      .find((v) => v.labels?.contract_id === 'test')?.value ?? 0;
+    
+    const beforeFailure = (await indexerLeaderElectionFailuresTotal.get()).values
+      .find((v) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
+
+    const leaseMs = 9000;
+    let now = 1_000_000;
+    const clockNowMs = () => now;
+    
+    const a = new RedisIndexerLeaderElection(redis as any, { instanceId: 'a', leaseMs, clockNowMs });
+    
+    await a.tryAcquire();
+    now += leaseMs; // forward jump
+    await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
+    expect(a.isLeader()).toBe(false);
+
+    const afterFailure = (await indexerLeaderElectionFailuresTotal.get()).values
+      .find((v) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
+    expect(afterFailure - beforeFailure).toBe(1);
+
+    const after = (await indexerReplayBatchesCommittedTotal.get()).values
+      .find((v) => v.labels?.contract_id === 'test')?.value ?? 0;
+    
+    // Assert the counter wasn't reset
+    expect(after).toBe(before);
   });
 
   it('acquires the lease when the key is absent', async () => {

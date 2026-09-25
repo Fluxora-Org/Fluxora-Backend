@@ -28,7 +28,7 @@
  */
 
 import type { RedisClient } from './client.js';
-import { logger as defaultLogger } from '../logging/logger.js';
+import { logger as defaultLogger } from '../lib/logger.js';
 import { correlationStore } from '../tracing/middleware.js';
 
 export const IDEMPOTENCY_KEY_PREFIX = 'fluxora:idempotency:';

@@ -61,7 +61,7 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
 
       // 2. Mutate feature flags configuration in env and execute runtime reload
       process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-        { name: 'experimental_new_endpoint', percentage: 100 },
+        { name: 'experimental_new_endpoint', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01' },
       ]);
       const newFlags = reloadFlags();
       expect(newFlags.has('experimental_new_endpoint')).toBe(true);

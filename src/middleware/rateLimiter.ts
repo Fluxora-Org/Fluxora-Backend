@@ -1,7 +1,17 @@
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import type { Request, Response, NextFunction } from 'express';
-import type { RateLimitConfig, RateLimitStatus, RateLimitStore, RouteRateLimitConfig } from '../types/rateLimit.js';
+import type {
+  RateLimitConfig,
+  RateLimitStatus,
+  RateLimitStore,
+  RouteRateLimitConfig,
+} from '../types/rateLimit.js';
+import {
+  RATE_LIMIT_HEADERS,
+  type RateLimitHeaderField,
+  type RateLimitHeaderValues,
+} from '../types/rateLimit.js';
 import { getRateLimitConfig, getRouteRateLimitConfig } from '../config/rateLimits.js';
 import { InMemoryStore, SlidingWindowStore, HybridStore } from '../redis/rateLimitStore.js';
 import { createRedisClient } from '../redis/client.js';
@@ -32,6 +42,33 @@ function getRemainingRequests(count: number, max: number): number {
 
 function secondsUntil(resetAt: number): number {
   return Math.max(0, Math.ceil((resetAt - Date.now()) / 1000));
+}
+
+/**
+ * Emit the rate-limit response headers declared in `RATE_LIMIT_HEADERS`
+ * (`src/types/rateLimit.ts`) onto a response.
+ *
+ * This is the only place rate-limit quota headers are produced: header names
+ * come from the declared mapping and values from the declared
+ * `RateLimitHeaderValues`, so the emitted headers cannot drift from the
+ * type callers implement against. Every declared field must have a value
+ * renderer here; adding a field without one is a compile error.
+ *
+ * `retryAfter` is only emitted when provided (HTTP 429 responses).
+ */
+export function setRateLimitHeaders(res: Response, values: RateLimitHeaderValues): void {
+  const renderers: Record<RateLimitHeaderField, (value: RateLimitHeaderValues[RateLimitHeaderField]) => string> = {
+    limit: (v) => String(v),
+    remaining: (v) => String(v),
+    reset: (v) => String(v),
+    retryAfter: (v) => (v === undefined ? '' : String(v)),
+  };
+
+  for (const field of Object.keys(RATE_LIMIT_HEADERS) as RateLimitHeaderField[]) {
+    const value = values[field];
+    if (value === undefined) continue; // optional declared field (Retry-After on non-429)
+    res.setHeader(RATE_LIMIT_HEADERS[field], renderers[field](value));
+  }
 }
 
 /**
@@ -452,10 +489,13 @@ export function createRateLimiter(
 
     if (count > effectiveLimit) {
       const retryAfter = secondsUntil(resetAt);
-      res.setHeader('Retry-After', String(retryAfter));
-      res.setHeader('X-RateLimit-Limit', String(effectiveLimit));
-      res.setHeader('X-RateLimit-Remaining', '0');
-      res.setHeader('X-RateLimit-Reset', String(resetAtSeconds));
+      // Headers emitted from the declared RATE_LIMIT_HEADERS contract.
+      setRateLimitHeaders(res, {
+        limit: effectiveLimit,
+        remaining: 0,
+        reset: resetAtSeconds,
+        retryAfter,
+      });
 
       // Observability
       logger.warn('Rate limit exceeded', undefined, {
@@ -474,9 +514,12 @@ export function createRateLimiter(
       return;
     }
 
-    res.setHeader('X-RateLimit-Limit', String(effectiveLimit));
-    res.setHeader('X-RateLimit-Remaining', String(getRemainingRequests(count, effectiveLimit)));
-    res.setHeader('X-RateLimit-Reset', String(resetAtSeconds));
+    // Headers emitted from the declared RATE_LIMIT_HEADERS contract.
+    setRateLimitHeaders(res, {
+      limit: effectiveLimit,
+      remaining: getRemainingRequests(count, effectiveLimit),
+      reset: resetAtSeconds,
+    });
 
     next();
   }

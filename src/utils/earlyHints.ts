@@ -24,7 +24,7 @@
 
 import type { IncomingMessage } from 'node:http';
 import type { Request, Response } from 'express';
-import { debug, warn } from './logger.js';
+import { debug, warn } from '../lib/logger.js';
 import { getConfig } from '../config/env.js';
 
 /**

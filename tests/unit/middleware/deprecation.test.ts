@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
 import { createDeprecationMiddleware, deprecate } from '../../../src/middleware/deprecation.js';
-import { logger } from '../../../src/logging/logger.js';
+import { logger } from '../../../src/lib/logger.js';
 
 function mockRequest(path: string, method = 'GET'): Request {
   return {

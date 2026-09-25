@@ -68,20 +68,58 @@ Fluxora can return a W3C-compatible `Server-Timing` response header for the stre
 
 - Middleware creates a request-scoped registry attached to `res.locals` when `SERVER_TIMING_ENABLED=true`.
 - Streams route handlers record named phases by pushing sanitized values into the registry. Current streams responses include `db` and `serialize`; paths that make Stellar RPC calls may also record `stellar_rpc`.
-- The final header is emitted once per response and contains only phase names and durations.
 - Responses without recorded phases omit the header, even when the feature is enabled.
+- The header is gated by environment and caller to prevent information disclosure and timing-oracle attacks.
+
+### Environment & Caller Gating
+
+To protect backend architecture topology and prevent timing-oracle attacks in production:
+
+1. **Production Configuration (`NODE_ENV=production`)**:
+   - **Absent by default**: Detailed stage timings are absent for public, unauthenticated, and unauthorized callers, regardless of `SERVER_TIMING_ENABLED`.
+   - **Authorized & Opt-in Only**: Timing headers are ONLY emitted if the caller is **both** authorized **and** has explicitly opted in.
+   - **Component Name Masking**: Timing names emitted in production are automatically masked to architecture-neutral, abstract tier names (e.g., `data`, `render`, `upstream`, `lookup`, `job`, `security`) or a generic `process` label. Internal component names (such as `db`, `postgres`, `serialize`, `stellar_rpc`) are never revealed to callers.
+
+2. **Development / Test Configuration (`NODE_ENV !== 'production'`)**:
+   - When `SERVER_TIMING_ENABLED=true`, detailed stage timings (e.g., `db`, `serialize`, `stellar_rpc`) are emitted directly to facilitate local debugging and browser DevTools profiling.
+   - Component name masking can optionally be forced via `SERVER_TIMING_MASK_COMPONENTS=true` or middleware options.
+
+### Authorization Requirements (Production)
+
+A caller is authorized to receive timing metrics in production if any of the following criteria are met:
+- JWT identity carrying an `admin`, `operator`, or `data-protection-officer` role, or an administrative permission (`admin:pause`, `admin:reindex`, `timing:read`).
+- API key (`X-API-Key`) containing `admin`, `operator`, or `timing` scopes.
+- Shared secret match via `Authorization: Bearer <ADMIN_API_KEY>` or dedicated `X-Server-Timing-Key: <SERVER_TIMING_SECRET>`.
+
+### Opt-In Signals
+
+Authorized callers must explicitly opt in to timing emission via any of the following mechanisms:
+- Request Header: `X-Server-Timing: 1` (or `true`, `enabled`)
+- Request Header: `Server-Timing: 1` (or `true`, `enabled`)
+- Request Header: `Prefer: server-timing`
+- Query Parameter: `?timing=1` (or `?timing=true`, `?server-timing=1`)
 
 ### Security guarantees
 
 - The header contains no hostnames, query strings, URLs, or PII.
 - Phase names are restricted to a safe token format and durations are rounded to milliseconds.
+- Internal component names are masked in production so no infrastructure details or component layers are disclosed.
 - The feature is disabled by default and adds negligible overhead when `SERVER_TIMING_ENABLED` is unset or false.
 
-### Example
+### Examples
 
+**Development environment (`NODE_ENV=development`):**
 ```http
 Server-Timing: db;dur=12.5, serialize;dur=3.75
 ```
+
+**Production environment (`NODE_ENV=production`, authorized and opt-in caller):**
+```http
+Server-Timing: data;dur=12.5, render;dur=3.75
+```
+
+**Production environment (unauthorized or default request):**
+*(Header is omitted entirely)*
 
 ### Prometheus Counter
 
@@ -94,9 +132,34 @@ Counter name: `fluxora_db_slow_queries_total`
 Label: `table_hint` — the extracted table name (or `unknown`).  
 Scraped at: `GET /metrics`
 
-## Prometheus scrape configuration
+> Slow queries are counted on the **failure path too**: a query that hangs and is then canceled by `statement_timeout` still increments `fluxora_db_slow_queries_total`, so the counter keeps rising during an incident instead of flatlining.
 
-`GET /metrics` is protected by the same `ADMIN_API_KEY` Bearer token used by other admin routes. Prometheus scrape jobs must supply the token via the `Authorization` header.
+Every failed query is also recorded by `fluxora_db_query_errors_total{error_type}`, where `error_type` is a bounded enum (`pool_exhausted`, `query_timeout`, `duplicate_entry`, `other`). Alert when the failure rate is non-zero:
+
+```promql
+# warning — any query failing for 5 minutes
+rate(fluxora_db_query_errors_total[5m]) > 0
+```
+
+## Prometheus scrape configuration
+## Prometheus scrape configuration & Access Rules
+
+`GET /metrics` exposes internal operational metrics (traffic volumes, error rates, tenant counts, and component latencies) and is strictly protected from public access.
+
+### Authorization & Access Control
+- **Static Bearer Token**: `GET /metrics` requires a valid Bearer token matching the `ADMIN_API_KEY` environment variable (`Authorization: Bearer <ADMIN_API_KEY>`).
+- **JWT Authorization**: Requests carrying a signed JWT with the `admin` or `data-protection-officer` role are also authorized.
+- **Fail-Closed**: When `ADMIN_API_KEY` is not configured, the service fails closed and refuses all requests with `503 Service Unavailable`.
+- **Refusal & Logging**: Unauthenticated or unauthorized requests are refused immediately (401, 403, or 503) and logged as structured security warnings containing the request path, method, and client IP. No token or secret material is ever logged.
+
+### Network Interface & Internal Boundary
+In production deployments, the metrics endpoint must not be exposed to the public internet:
+- **Internal Interface Binding**: Ingress controllers, API gateways, or reverse proxies (such as Nginx, Traefik, or AWS ALB) must block external routing to `/metrics`.
+- **Private Scraping VPC**: Prometheus scrape jobs should access `/metrics` over internal VPC networks, private subnets, or dedicated management interfaces.
+
+### Cardinality & Privacy Guarantees
+- **No Per-User PII**: Metric labels are bounded to low-cardinality enum values (e.g. `method`, `route`, `status_code`, `outcome`, `status`, `reason`).
+- **No High-Cardinality User Identifiers**: Per-user identifiers, Stellar wallet addresses (`G...`), email addresses, user IDs, or API keys are strictly forbidden from metric label dimensions to prevent cardinality explosion and PII leakage in observability systems.
 
 ### Environment variable
 
@@ -118,12 +181,12 @@ scrape_configs:
 
 ### Response codes
 
-| Status | Cause |
-|--------|-------|
-| `200` | Valid token — metrics payload returned |
-| `401` | Missing or malformed `Authorization` header |
-| `403` | Token present but incorrect |
-| `503` | `ADMIN_API_KEY` not configured on the server |
+| Status | Cause | Logging |
+|--------|-------|---------|
+| `200` | Valid `ADMIN_API_KEY` or admin JWT token — metrics payload returned | Standard request log |
+| `401` | Missing or malformed `Authorization` header | Warning logged with path, method, client IP |
+| `403` | Token present but incorrect, or insufficient JWT role | Warning logged with path, method, client IP |
+| `503` | `ADMIN_API_KEY` not configured on the server | Warning logged with path, method, client IP |
 
 ## Runtime Performance Metrics
 
@@ -229,6 +292,7 @@ The per-client gauges below expose `ws.bufferedAmount` directly so operators can
 | `fluxora_ws_backpressure_buffered_bytes` | Gauge | `connection_id` (UUID v4) | Current `ws.bufferedAmount` per connected `/ws/streams` client, in bytes. Sampled every 5s by the hub's collector and rounded to non-negative integers. |
 | `fluxora_ws_max_buffered_bytes` | Gauge | — | Maximum `ws.bufferedAmount` observed across all live clients at the most recent sample. Useful for dashboards: spikes here precede drops. |
 | `fluxora_ws_slow_clients` | Gauge | — | Count of live clients whose `bufferedAmount` exceeds the slow threshold (default 1 MiB). |
+| `fluxora_ws_connection_health_total` | Gauge | `status` (closed set: `healthy`, `stalled`, `unhealthy`) | Live connections by health status. `stalled` counts `OPEN` connections whose outbound queue is saturated above `healthProbeStallBytes` (default 1 MiB) — an open-but-not-draining connection is reported as stalled, never healthy. Cardinality is fixed at 3. |
 | `fluxora_ws_broadcast_batch_flush_seconds` | Histogram | — | Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush. Bounded O(1) cardinality (zero labels). |
 
 ### Micro-Batch Broadcast Flush Latency
@@ -265,6 +329,7 @@ The aggregated `fluxora_ws_max_buffered_bytes` and `fluxora_ws_slow_clients` car
 |------------------|---------|-------------|
 | `backpressureCollector.intervalMs` | `5000` | Poll interval. Set to `0` to disable the periodic collector entirely (gauge updates still happen during broadcast / send activity). |
 | `backpressureCollector.slowThresholdBytes` | `1048576` (1 MiB) | Threshold above which a client is counted in `fluxora_ws_slow_clients`. |
+| `healthProbeStallBytes` | `1048576` (1 MiB) | Outbound `bufferedAmount` above which an `OPEN` connection is counted in `fluxora_ws_connection_health_total{status="stalled"}` instead of `healthy`. Defaults to `BACKPRESSURE_DROP_BYTES`. |
 
 ### PromQL examples
 
@@ -286,11 +351,18 @@ Alert: more than 5 slow clients sustained over 5 minutes:
 fluxora_ws_slow_clients > 5
 ```
 
+Alert: any open connection stalled beyond a heartbeat interval (2 minutes):
+
+```promql
+fluxora_ws_connection_health_total{status="stalled"} > 0
+```
+
 ### Thresholding strategy
 
 - **`fluxora_ws_slow_clients > 0` for > 2 min**: investigate the highest entries of `topk(5, fluxora_ws_backpressure_buffered_bytes)` and look for one or two clients with `correlation_id` entries repeated in the structured `ws_backpressure` warning logs.
 - **`max(fluxora_ws_backpressure_buffered_bytes) > 4 MiB`** (terminate threshold): one or more clients are about to be force-closed by the hub. Operators can proactively identify the offending connection via `topk(1, fluxora_ws_backpressure_buffered_bytes)`.
 - **`fluxora_ws_max_buffered_bytes` rising without `fluxora_ws_slow_clients` rising**: one client is filling up but stays below the slow threshold — still worth checking `topk(1, ...)` to confirm it's not unbounded.
+- **`fluxora_ws_connection_health_total{status="stalled"} > 0` for > 2 min**: at least one `OPEN` connection is not draining its outbound queue (network partition or wedged consumer). Cross-reference `topk(5, fluxora_ws_backpressure_buffered_bytes)` to identify the peer before the hub escalates to drop/terminate.
 
 ### Affected source files
 
@@ -637,3 +709,9 @@ Hot-config refresh emits the following Prometheus series (no secret labels):
 | `fluxora_config_reload_generation` | Gauge | — | Last successfully applied generation |
 
 See also [env-reload-behavior.md](./env-reload-behavior.md).
+
+## Metric label cardinality
+
+See [metric-cardinality.md](./observability/metric-cardinality.md) for the
+policy that bounds Prometheus label values (no stream IDs, path parameters,
+or tenants as labels). Enforcement: `src/metrics/cardinality.ts`.

@@ -21,7 +21,7 @@ import {
 import type { RedisClient } from '../../src/redis/client.js';
 import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
 import { dedupRedisErrorsTotal, dedupRedisFallbackTotal, registry } from '../../src/metrics.js';
-import { logger } from '../../src/logging/logger.js';
+import { logger } from '../../src/lib/logger.js';
 
 const mockRedisClient = (overrides: Partial<RedisClient> = {}): RedisClient => ({
     get: vi.fn().mockResolvedValue(null),

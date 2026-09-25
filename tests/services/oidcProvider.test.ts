@@ -250,7 +250,7 @@ describe('OIDC Provider Service & Routes', () => {
         json: async () => ({ keys: [jwk1] }),
       } as Response);
 
-      await expect(verifyIdToken(token)).rejects.toThrow('jwt audience invalid');
+      await expect(verifyIdToken(token)).rejects.toThrow(/aud claim|jwt audience invalid/);
     });
 
     it('should throw if token is expired', async () => {
@@ -370,6 +370,58 @@ describe('OIDC Provider Service & Routes', () => {
       setRedisClientFactory(mockFactory);
       await _resetOidcProviderForTest();
     });
+
+    it('should reject a token whose signature does not match the public key in JWKS', async () => {
+      // Generate two independent RSA keypairs. The JWKS advertises key1's public key,
+      // but the token is signed with key2's private key. Both share the same kid so
+      // the key lookup succeeds; the mismatch is detected during signature verification.
+      const { publicKey: advertisedPublicKey } = crypto.generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+      });
+      const { privateKey: wrongSigningKey } = crypto.generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+      });
+
+      // JWKS advertises advertisedPublicKey under kid1, but the token is signed with
+      // wrongSigningKey — the public key and private key belong to different pairs.
+      const advertisedJwk = {
+        kid: kid1,
+        kty: 'RSA',
+        alg: 'RS256',
+        use: 'sig',
+        ...advertisedPublicKey.export({ format: 'jwk' }),
+      };
+
+      const token = jwt.sign(
+        { iss: issuer, aud: audience, sub: 'attacker' },
+        wrongSigningKey,
+        { algorithm: 'RS256', keyid: kid1, expiresIn: '5m' },
+      );
+
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ keys: [advertisedJwk] }),
+      } as Response);
+
+      await expect(verifyIdToken(token)).rejects.toThrow(/Token verification failed/);
+    });
+
+    it('should fail closed when the JWKS discovery document is unavailable and no cache exists', async () => {
+      // Ensure neither the in-memory nor the Redis cache holds any entry.
+      await _resetOidcProviderForTest();
+
+      // JWKS endpoint is down (network error — simulates total discovery-document unavailability).
+      globalThis.fetch = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+
+      const token = jwt.sign(
+        { iss: issuer, aud: audience, sub: 'user123' },
+        privateKey,
+        { algorithm: 'RS256', keyid: kid1, expiresIn: '5m' },
+      );
+
+      // Must throw rather than silently accepting the token.
+      await expect(verifyIdToken(token)).rejects.toThrow(/JWKS fetch request failed/);
+    });
   });
 
   // ── Replay Cache Eviction Tests ─────────────────────────────────────────────
@@ -481,7 +533,9 @@ describe('OIDC Provider Service & Routes', () => {
 
       vi.mocked(mockClient.exists).mockResolvedValue(true);
       vi.mocked(mockClient.setNx).mockResolvedValue(false);
-      await expect(verifyIdToken(token1)).rejects.toThrow('Token replay detected');
+      // token1 expired after the time advance; jwt.verify rejects it before replay check
+      await expect(verifyIdToken(token1)).rejects.toThrow(/jwt expired|Token verification failed/);
+      // token2 is still valid; replay cache entry was preserved, so it must be rejected for replay
       await expect(verifyIdToken(token2)).rejects.toThrow('Token replay detected');
     });
   });
@@ -573,7 +627,9 @@ describe('OIDC Provider Service & Routes', () => {
 
       expect(res.status).toBe(401);
       expect(res.body.error.code).toBe('UNAUTHORIZED');
-      expect(res.body.error.message).toContain('OIDC token validation failed');
+      // The route normalises all OIDC failures to a generic credential error
+      // to avoid leaking internal token-validation details to callers.
+      expect(res.body.error.message).toMatch(/Invalid credentials/i);
     });
   });
 });

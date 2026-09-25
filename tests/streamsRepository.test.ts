@@ -38,18 +38,22 @@ vi.mock('../src/tracing/hooks.js', () => ({
   enrichActiveSpanWithStream: vi.fn(),
 }));
 
-vi.mock('../src/db/queries/streams.js', () => ({
-  encryptAddressValue: vi.fn((col: number) => `$${col}`),
-  streamSelectColumns: vi.fn(() => '*'),
-  senderAddressFilterCondition: vi.fn((f: number) => `sender_address = $${f}`),
-  recipientAddressFilterCondition: vi.fn((f: number) => `recipient_address = $${f}`),
-}));
+vi.mock('../src/db/queries/streams.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/db/queries/streams.js')>();
+  return {
+    ...actual,
+    encryptAddressValue: vi.fn((col: number) => `$${col}`),
+    streamSelectColumns: vi.fn(() => '*'),
+    senderAddressFilterCondition: vi.fn((f: number) => `sender_address = $${f}`),
+    recipientAddressFilterCondition: vi.fn((f: number) => `recipient_address = $${f}`),
+  };
+});
 
 vi.mock('../src/metrics/dbMetrics.js', () => ({
   dbQueryDurationSeconds: { startTimer: vi.fn(() => vi.fn()) },
 }));
 
-vi.mock('../src/utils/logger.js', () => ({
+vi.mock('../src/lib/logger.js', () => ({
   info: vi.fn(),
   debug: vi.fn(),
   warn: vi.fn(),
@@ -57,6 +61,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { streamRepository, MAX_PAGE_SIZE, StatusConflictError } from '../src/db/repositories/streamRepository.js';
+import { UnboundedStreamQueryError } from '../src/db/queries/streams.js';
 import type { CreateStreamInput, UpdateStreamInput } from '../src/db/types.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -734,4 +739,37 @@ describe('streamRepository', () => {
       });
     });
   });
+
+  describe('Unbounded query refusal (defense-in-depth)', () => {
+    it('findWithCursor refuses query with undefined limit', async () => {
+      await expect(streamRepository.findWithCursor({}, undefined as any)).rejects.toThrow(
+        UnboundedStreamQueryError,
+      );
+    });
+
+    it('findWithCursor refuses query with limit <= 0', async () => {
+      await expect(streamRepository.findWithCursor({}, 0)).rejects.toThrow(
+        UnboundedStreamQueryError,
+      );
+      await expect(streamRepository.findWithCursor({}, -5)).rejects.toThrow(
+        UnboundedStreamQueryError,
+      );
+    });
+
+    it('find refuses query with undefined pagination.limit', async () => {
+      await expect(
+        streamRepository.find({}, { limit: undefined as any, offset: 0 }),
+      ).rejects.toThrow(UnboundedStreamQueryError);
+    });
+
+    it('find refuses query with pagination.limit <= 0', async () => {
+      await expect(
+        streamRepository.find({}, { limit: 0, offset: 0 }),
+      ).rejects.toThrow(UnboundedStreamQueryError);
+      await expect(
+        streamRepository.find({}, { limit: -10, offset: 0 }),
+      ).rejects.toThrow(UnboundedStreamQueryError);
+    });
+  });
 });
+

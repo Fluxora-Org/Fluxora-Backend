@@ -145,7 +145,17 @@ To prevent stale or half-open connections (e.g., dropped by NAT timeouts or flak
 - **Pong Response**: Clients are expected to respond with a `pong` frame. Most standard WebSocket client libraries (such as the native browser API) do this automatically.
 - **Termination Threshold**: If a client misses consecutive `pong` responses (default is 2 missed pongs, configurable via `healthProbeMaxMissed`), the server proactively terminates the connection (`ws.terminate()`) and fully cleans up its subscription state.
 
-The aggregate health of all WebSocket connections is exposed via the Prometheus gauge `fluxora_ws_connection_health_total`, labeled by `status="healthy"` or `status="unhealthy"`.
+The aggregate health of all WebSocket connections is exposed via the Prometheus gauge `fluxora_ws_connection_health_total`, labeled by `status`:
+
+| `status` | Meaning |
+| -------- | ------- |
+| `healthy` | Socket is `OPEN` and its outbound queue is draining below the stall threshold. |
+| `stalled` | Socket is `OPEN` but its outbound `bufferedAmount` exceeds `healthProbeStallBytes` (default `BACKPRESSURE_DROP_BYTES`, 1 MiB). Frames are buffering faster than the peer drains them — the connection is **not** healthy even though it is open. |
+| `unhealthy` | The client missed `healthProbeMaxMissed` consecutive pongs and is being terminated. |
+
+The `status` label is a closed set of three values, so its cardinality is fixed at 3 regardless of connection churn; no per-connection identifier is used as a label.
+
+> **Alert threshold:** page when `fluxora_ws_connection_health_total{status="stalled"} > 0` for **2 minutes**. A stall sustained beyond a heartbeat interval means a peer stopped draining its outbound queue; the hub will start dropping frames once the backpressure drop threshold is crossed.
 
 ## Backpressure Policy
 

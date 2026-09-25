@@ -22,6 +22,7 @@
  */
 
 import { z } from 'zod';
+import { API_STREAM_STATUSES } from '../streams/status.js';
 
 export const DEFAULT_PAGE_LIMIT = 20;
 export const MAX_PAGE_LIMIT     = 100;
@@ -33,7 +34,7 @@ export const MIN_PAGE_LIMIT     = 1;
  * constraint so that unknown strings are rejected at the schema boundary
  * before they reach the repository or database layer.
  */
-export const STREAM_STATUS_VALUES = ['active', 'paused', 'completed', 'cancelled'] as const;
+export const STREAM_STATUS_VALUES = API_STREAM_STATUSES;
 export type StreamStatusValue = (typeof STREAM_STATUS_VALUES)[number];
 
 export const PaginationSchema = z.object({

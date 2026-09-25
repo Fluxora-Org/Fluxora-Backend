@@ -602,7 +602,7 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   if (typeof opts.ledger === 'number') {
     const [{ webhookDeliveriesSuppressedTotal }, { isLedgerRolledBack }] = await Promise.all([
       import('../metrics/businessMetrics.js'),
-      import('../indexer/service.js'),
+      import('../indexer/ingestion.js'),
     ]);
     if (isLedgerRolledBack(opts.ledger)) {
       // Increment suppressed counter with outcome label

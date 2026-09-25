@@ -40,6 +40,7 @@ import {
   rpcProviderHealthCheckFailuresTotal,
 } from '../metrics/rpcMetrics.js';
 import { withJitteredRetry } from '../lib/retry.js';
+import { getConfig } from '../config/env.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -768,28 +769,26 @@ let _service: StellarRpcService | null = null;
 
 export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpcService {
   if (!_service) {
+    const config = getConfig();
     const client = getClient ?? (() => {
       throw new RpcProviderError('No Stellar RPC client configured', 'PROVIDER');
     });
     const redisFallbackCache = createConfiguredRpcFallbackCache();
-    const operationDeadlines = parseOperationDeadlines(
-      process.env.STELLAR_RPC_OPERATION_DEADLINES,
-    );
     _service = new StellarRpcService(client, {
-      failureThreshold: parseInt(process.env.RPC_CB_FAILURE_THRESHOLD ?? '5', 10),
-      windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
-      resetTimeoutMs: parseInt(process.env.RPC_CB_RESET_TIMEOUT_MS ?? '60000', 10),
-      timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
-      maxRetries: parseInt(process.env.STELLAR_RPC_MAX_RETRIES ?? '3', 10),
-      retryDelayMs: parseInt(process.env.STELLAR_RPC_RETRY_DELAY ?? '1000', 10),
-      operationDeadlines,
-      fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
-      fallbackCacheEarlyExpiryBeta: parseFloat(process.env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA ?? '0'),
+      failureThreshold: config.rpcCircuitBreakerFailureThreshold,
+      windowMs: config.rpcCircuitBreakerWindowMs,
+      resetTimeoutMs: config.rpcCircuitBreakerResetTimeoutMs,
+      timeoutMs: config.rpcTimeoutMs,
+      maxRetries: config.stellarRpcMaxRetries,
+      retryDelayMs: config.stellarRpcRetryDelay,
+      operationDeadlines: config.stellarRpcOperationDeadlines,
+      fallbackCacheTtlSeconds: config.rpcFallbackCacheTtlSeconds,
+      fallbackCacheEarlyExpiryBeta: config.rpcFallbackCacheEarlyExpiryBeta,
       fallbackCache: redisFallbackCache,
-      healthCheckIntervalMs: parseInt(process.env.RPC_HEALTH_CHECK_INTERVAL_MS ?? '0', 10),
-      healthCheckFailureThreshold: parseInt(process.env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD ?? '3', 10),
+      healthCheckIntervalMs: config.rpcHealthCheckIntervalMs,
+      healthCheckFailureThreshold: config.rpcHealthCheckFailureThreshold,
     });
-    const intervalMs = parseInt(process.env.RPC_HEALTH_CHECK_INTERVAL_MS ?? '0', 10);
+    const intervalMs = config.rpcHealthCheckIntervalMs;
     if (intervalMs > 0) {
       _service.startHealthCheck(intervalMs);
     }
@@ -802,7 +801,8 @@ export function setStellarRpcService(svc: StellarRpcService | null): void {
 }
 
 function createConfiguredRpcFallbackCache(): RpcFallbackCache {
-  if (process.env.REDIS_ENABLED === 'false') {
+  const config = getConfig();
+  if (!config.redisEnabled) {
     return new NoOpRpcFallbackCache();
   }
 
@@ -810,7 +810,7 @@ function createConfiguredRpcFallbackCache(): RpcFallbackCache {
   const getCache = async (): Promise<RpcFallbackCache> => {
     if (!cachePromise) {
       cachePromise = createRedisClient({
-        url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+        url: config.redisUrl,
         enabled: true,
       })
         .then((client) => new RedisRpcFallbackCache(client))

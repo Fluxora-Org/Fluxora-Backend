@@ -7,11 +7,21 @@ import { _resetLimiter } from '../../src/ws/connectionLimiter.js';
 
 const SECRET = 'websocket-admission-test-secret';
 
-function connect(port: number, options: { origin?: string; token?: string } = {}): Promise<WebSocket> {
+function connect(
+  port: number,
+  options: { origin?: string; token?: string } = {}
+): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/streams`, {
       ...(options.origin ? { headers: { Origin: options.origin } } : {}),
-      ...(options.token ? { headers: { ...(options.origin ? { Origin: options.origin } : {}), Authorization: `Bearer ${options.token}` } } : {}),
+      ...(options.token
+        ? {
+            headers: {
+              ...(options.origin ? { Origin: options.origin } : {}),
+              Authorization: `Bearer ${options.token}`,
+            },
+          }
+        : {}),
     });
     ws.once('open', () => resolve(ws));
     ws.once('error', reject);
@@ -44,9 +54,13 @@ describe('WebSocket upgrade admission', () => {
     await expect(connect(port, { origin: 'https://app.example' })).rejects.toBeTruthy();
 
     const expired = jwt.sign({ sub: 'user-1' }, SECRET, { expiresIn: -1 });
-    await expect(connect(port, { origin: 'https://app.example', token: expired })).rejects.toBeTruthy();
+    await expect(
+      connect(port, { origin: 'https://app.example', token: expired })
+    ).rejects.toBeTruthy();
     const valid = jwt.sign({ sub: 'user-1' }, SECRET, { expiresIn: '5m' });
-    await expect(connect(port, { origin: 'https://evil.example', token: valid })).rejects.toBeTruthy();
+    await expect(
+      connect(port, { origin: 'https://evil.example', token: valid })
+    ).rejects.toBeTruthy();
     expect(hub.clientCount).toBe(0);
   });
 
@@ -57,11 +71,29 @@ describe('WebSocket upgrade admission', () => {
     ws.close();
   });
 
+  it('limits by authenticated identity rather than shared IP when both clients are valid', async () => {
+    process.env.WS_MAX_CONNECTIONS_PER_IP = '1';
+    _resetLimiter();
+
+    const first = jwt.sign({ sub: 'user-1' }, SECRET, { expiresIn: '5m' });
+    const second = jwt.sign({ sub: 'user-2' }, SECRET, { expiresIn: '5m' });
+
+    const ws1 = await connect(port, { origin: 'https://app.example', token: first });
+    const ws2 = await connect(port, { origin: 'https://app.example', token: second });
+
+    expect(ws1.readyState).toBe(WebSocket.OPEN);
+    expect(ws2.readyState).toBe(WebSocket.OPEN);
+    expect(hub.clientCount).toBe(2);
+
+    ws1.close();
+    ws2.close();
+  });
+
   // ── Scope matrix — exact, missing, malformed, expired, cross-tenant (#1266) ──
 
   it('rejects a malformed (non-JWT) token before upgrade', async () => {
     await expect(
-      connect(port, { origin: 'https://app.example', token: 'not-a-jwt-at-all' }),
+      connect(port, { origin: 'https://app.example', token: 'not-a-jwt-at-all' })
     ).rejects.toBeTruthy();
     expect(hub.clientCount).toBe(0);
   });
@@ -69,7 +101,7 @@ describe('WebSocket upgrade admission', () => {
   it('rejects a token signed with a different (cross-tenant) secret before upgrade', async () => {
     const crossTenant = jwt.sign({ sub: 'user-1' }, 'another-tenant-secret', { expiresIn: '5m' });
     await expect(
-      connect(port, { origin: 'https://app.example', token: crossTenant }),
+      connect(port, { origin: 'https://app.example', token: crossTenant })
     ).rejects.toBeTruthy();
     expect(hub.clientCount).toBe(0);
   });
@@ -77,7 +109,7 @@ describe('WebSocket upgrade admission', () => {
   it('rejects an expired token even when the payload is otherwise valid', async () => {
     const expired = jwt.sign({ sub: 'user-1' }, SECRET, { expiresIn: -60 });
     await expect(
-      connect(port, { origin: 'https://app.example', token: expired }),
+      connect(port, { origin: 'https://app.example', token: expired })
     ).rejects.toBeTruthy();
     expect(hub.clientCount).toBe(0);
   });

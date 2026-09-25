@@ -6,8 +6,8 @@
  * in this module mutates or removes existing records.
  *
  * Three write paths:
- *  1. `recordAuditEvent`          – in-memory only; never throws; used by
- *                                   non-transactional callers (admin routes, etc.)
+ *  1. `recordAuditEvent`          – in-memory only; throws if the audit store
+ *                                   cannot accept the entry.
  *  2. `buildAuditEntry` +
  *     `writeAuditEntryToDb`       – used inside DB transactions so the audit
  *                                   row is committed or rolled back atomically
@@ -22,16 +22,31 @@
  * - Public clients and authenticated partners have no access to this log.
  *
  * Failure modes
- * - `recordAuditEvent` never throws; a failed write is logged to stderr.
+ * - Audit writes fail closed. A caller receives the store error and must not
+ *   report the action as successfully audited when the write did not happen.
  * - `writeAuditEntryToDb` throws on DB error so the caller's transaction
  *   rolls back atomically.
+ * - No entry is appended to the in-memory read mirror until its durable DB
+ *   write succeeds. We intentionally do not buffer in process memory: such a
+ *   buffer would be lost if the process exits while the store is unavailable.
  */
 
 import { logger } from './logger.js';
 import { getPool, query } from '../db/pool.js';
 import { redactKeysInString, sanitize } from '../pii/sanitizer.js';
 
-export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'STREAM_BROADCAST' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE' | 'ADMIN_BULK_ACTION' | 'INDEXER_MTLS_FAILURE' | 'PURGE_INITIATED' | 'PURGE_SKIPPED_LEGAL_HOLD' | 'PII_ERASURE_REQUESTED' | 'GDPR_ERASURE' | 'BACKUP_RESTORE_QUEUED' | 'BACKUP_RESTORE_STARTED' | 'BACKUP_RESTORE_COMPLETED' | 'BACKUP_RESTORE_FAILED' | 'REPLAY_INTEGRITY_ISSUE' | 'MTLS_VALIDATION_FAILED' | 'DLQ_RETENTION_PURGED' | 'AUDIT_EXPORTED';
+export type AuditAction = 'STREAM_CREATED' | 'STREAM_CANCELLED' | 'STREAM_STATUS_UPDATED' | 'STREAM_BROADCAST' | 'DLQ_LISTED' | 'DLQ_REPLAYED' | 'DLQ_PURGED' | 'DLQ_CONSUMER_SUSPENDED' | 'DLQ_CONSUMER_RESUMED' | 'PAUSE_FLAGS_UPDATED' | 'REINDEX_TRIGGERED' | 'API_KEY_CREATED' | 'API_KEY_ROTATED' | 'API_KEY_REVOKED' | 'INDEXER_STALL_CLEARED' | 'ADMIN_WS_DISCONNECT' | 'WS_AUTH_FAILURE' | 'ADMIN_BULK_ACTION' | 'INDEXER_MTLS_FAILURE' | 'PURGE_INITIATED' | 'PURGE_SKIPPED_LEGAL_HOLD' | 'PII_ERASURE_REQUESTED' | 'GDPR_ERASURE' | 'BACKUP_RESTORE_QUEUED' | 'BACKUP_RESTORE_STARTED' | 'BACKUP_RESTORE_COMPLETED' | 'BACKUP_RESTORE_FAILED' | 'REPLAY_INTEGRITY_ISSUE' | 'MTLS_VALIDATION_FAILED' | 'DLQ_RETENTION_PURGED' | 'AUDIT_EXPORTED' |
+  /**
+   * Emitted whenever an administrator explicitly invokes adminCrossTenant()
+   * to access a resource across tenant boundaries.  This event is the
+   * structural audit trail required by GitHub issue #1557.
+   *
+   * Required meta fields:
+   *   action   – the named cross-tenant action (e.g. "admin.listAllStreams")
+   *   tenantId – the authenticated admin's own tenant identity
+   *   principal – the admin's stable identity string
+   */
+  'ADMIN_CROSS_TENANT_ACCESS';
 
 /**
  * Minimal prepare/run shape used by {@link writeAuditEntryToDb}.
@@ -81,8 +96,11 @@ function appendAuditEntry(entry: AuditEntry): void {
 // ── In-memory path (non-transactional) ───────────────────────────────────────
 
 /**
- * Append an audit entry to the in-memory log. Never throws.
- * Use this for non-transactional callers (admin routes, etc.).
+ * Append an audit entry to the in-memory log.
+ *
+ * This is a read mirror, not a durability mechanism. Callers must handle a
+ * thrown error as an unsuccessful audit write; swallowing it would silently
+ * lose a security-relevant record.
  */
 export function recordAuditEvent(
   action: AuditAction,
@@ -91,26 +109,16 @@ export function recordAuditEvent(
   correlationId?: string,
   meta?: Record<string, unknown>
 ): void {
-  try {
-    const entry: AuditEntry = {
-      seq: ++seq,
-      timestamp: new Date().toISOString(),
-      action,
-      resourceType: redactKeysInString(resourceType),
-      resourceId: redactKeysInString(resourceId),
-      ...(correlationId !== undefined ? { correlationId } : {}),
-      ...(meta !== undefined ? { meta: sanitize(meta) } : {}),
-    };
-    appendAuditEntry(entry);
-  } catch (err) {
-    // Audit must never block the primary operation.
-    logger.error('Failed to record audit event', undefined, {
-      action,
-      resourceType,
-      resourceId,
-      err: String(err),
-    });
-  }
+  const entry: AuditEntry = {
+    seq: ++seq,
+    timestamp: new Date().toISOString(),
+    action,
+    resourceType: redactKeysInString(resourceType),
+    resourceId: redactKeysInString(resourceId),
+    ...(correlationId !== undefined ? { correlationId } : {}),
+    ...(meta !== undefined ? { meta: sanitize(meta) } : {}),
+  };
+  appendAuditEntry(entry);
 }
 
 // ── Transactional path (DB-backed) ───────────────────────────────────────────

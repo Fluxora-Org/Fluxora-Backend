@@ -1,9 +1,20 @@
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Streams API routes — PostgreSQL-backed.
  *
- * All list/get/create/cancel operations delegate to streamRepository.
- * The in-memory store has been removed; state lives in the `streams` table.
+ * This module only assembles the router. The work is split by concern:
+ *
+ *   routes/streams/read.ts      list, NDJSON export, HEAD, GET, JSON-LD
+ *   routes/streams/write.ts     create (idempotent), cancel, status transition
+ *   routes/streams/sse.ts       Server-Sent Events
+ *   routes/streams/longPoll.ts  long-poll fallback
+ *   routes/streams/realtime.ts  auth/limits/teardown/replay shared by SSE + long-poll
+ *   routes/streams/guards.ts    request validation, authorization, error mapping
+ *   routes/streams/state.ts     dependency health + idempotency store wiring
+ *
+ *   db/repositories/streamApiQueries.ts  query construction (filters, create rows)
+ *   serialization/stream.ts              response shaping (Stream, list pages, update envelopes)
+ *   utils/opaqueCursor.ts                cursor codec, shared with other paginated routes
+ *   utils/conditionalGet.ts              ETag / If-None-Match, shared with other resource routes
  *
  * Decimal-string invariant
  * ------------------------
@@ -110,7 +121,15 @@ import {
 } from '../validation/schemas.js';
 import { PaginationSchema } from '../validation/paginationSchema.js';
 import type { StreamStatus, StreamFilter, StreamRecord } from '../db/types.js';
-import { streamsCreatedTotal } from '../metrics/businessMetrics.js';
+import {
+  assertValidApiTransition,
+  isApiStreamStatus,
+  isTerminalStatus,
+  API_STREAM_STATUSES,
+  deriveStreamStatusFromSchedule,
+  type ApiStreamStatus,
+} from '../streams/status.js';
+import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 import { isValidStreamStatus } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { recordServerTimingPhase } from '../middleware/serverTiming.js';
@@ -214,15 +233,32 @@ const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 
 const streamListingDependency = { state: 'healthy' as DependencyState };
 const idempotencyDependency = { state: 'healthy' as DependencyState };
+import type { Stream } from '../serialization/stream.js';
+import { registerReadRoutes } from './streams/read.js';
+import { registerWriteRoutes } from './streams/write.js';
+import { registerSseRoutes } from './streams/sse.js';
+import { registerLongPollRoutes } from './streams/longPoll.js';
 
-// Idempotency store — starts as InMemoryIdempotencyStore; replaced at startup
-// by wireIdempotencyStore() in app.ts with a RedisIdempotencyStore when Redis
-// is available (REDIS_ENABLED=true).
-let idempotencyStore: IdempotencyStore<ReturnType<typeof successResponse<Stream>>> =
-  new InMemoryIdempotencyStore();
+export type { Stream } from '../serialization/stream.js';
+export {
+  enforceStreamScope,
+  fingerprintInput,
+  getFeatureFlagRequesterId,
+  parseLastEventIdHeader,
+} from './streams/guards.js';
+export {
+  resetStreamIdempotencyStore,
+  setIdempotencyDependencyState,
+  setIdempotencyStore,
+  setStreamListingDependencyState,
+} from './streams/state.js';
 
-// TTL for idempotency entries — overridden in tests and set from config at startup
-let idempotencyTtlSeconds = 86400;
+export const streamsRouter = Router();
+
+registerReadRoutes(streamsRouter);
+registerWriteRoutes(streamsRouter);
+registerSseRoutes(streamsRouter);
+registerLongPollRoutes(streamsRouter);
 
 /**
  * Legacy shim — audit.test.ts and streams.test.ts reference this array.
@@ -232,6 +268,7 @@ let idempotencyTtlSeconds = 86400;
  */
 export const streams: Stream[] = [];
 
+/** Legacy no-op kept for existing test imports. */
 export function setStreamListingDependencyState(state: DependencyState): void {
   streamListingDependency.state = state;
 }
@@ -269,6 +306,11 @@ export function setIdempotencyStore(
 // ── DB → API mapper ───────────────────────────────────────────────────────────
 
 function toApiStream(record: StreamRecord): Stream {
+  const status = deriveStreamStatusFromSchedule({
+    startTime: record.start_time,
+    endTime: record.end_time,
+    status: record.status,
+  }).status;
   return {
     id: record.id,
     sender: record.sender_address,
@@ -279,7 +321,7 @@ function toApiStream(record: StreamRecord): Stream {
     ratePerSecond: record.rate_per_second,
     startTime: record.start_time,
     endTime: record.end_time,
-    status: record.status,
+    status,
   };
 }
 
@@ -475,28 +517,7 @@ function wrapDbError(err: unknown): never {
   throw err;
 }
 
-// ── API status state machine ──────────────────────────────────────────────────
-
-type ApiStreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
-
-const API_TRANSITIONS: Record<ApiStreamStatus, ApiStreamStatus[]> = {
-  active: ['paused', 'completed', 'cancelled'],
-  paused: ['active', 'cancelled'],
-  completed: [],
-  cancelled: [],
-};
-
-function assertValidApiTransition(
-  from: ApiStreamStatus,
-  to: ApiStreamStatus,
-): { ok: true } | { ok: false; message: string } {
-  const allowed = API_TRANSITIONS[from] ?? [];
-  if (allowed.includes(to)) return { ok: true };
-  if (from === to) return { ok: false, message: `Stream is already ${from}` };
-  if (from === 'completed') return { ok: false, message: 'Stream is already completed and cannot be transitioned' };
-  if (from === 'cancelled') return { ok: false, message: 'Stream is already cancelled and cannot be transitioned' };
-  return { ok: false, message: `Cannot transition stream from '${from}' to '${to}'` };
-}
+// ── API status state machine (shared: ../streams/status.js) ─────────────
 
 // ── Test helpers (no-op in production) ───────────────────────────────────────
 
@@ -664,7 +685,11 @@ streamsRouter.get(
 
     // Cache only when every stream on the page is in a terminal state.
     // An empty page is treated as all-terminal (nothing mutable present).
-    const allTerminal = pageStreams.every((s) => isTerminalStatus(s.status as ApiStreamStatus));
+    const allTerminal = pageStreams.every((s) => isTerminalStatus(deriveStreamStatusFromSchedule({
+      startTime: s.startTime,
+      endTime: s.endTime,
+      status: s.status as ApiStreamStatus,
+    }).status));
     res.set(
       'Cache-Control',
       allTerminal ? CACHEABLE_STREAM_HEADERS : NO_STORE_STREAM_HEADERS,
@@ -825,7 +850,11 @@ streamsRouter.get(
     setStreamResourceHeaders(res, record!);
     res.set(
       'Cache-Control',
-      isTerminalStatus(stream.status as ApiStreamStatus)
+      isTerminalStatus(deriveStreamStatusFromSchedule({
+        startTime: stream.startTime,
+        endTime: stream.endTime,
+        status: stream.status as ApiStreamStatus,
+      }).status)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
@@ -897,7 +926,11 @@ streamsRouter.get(
     setStreamResourceHeaders(res, record);
     res.set(
       'Cache-Control',
-      isTerminalStatus(record.status as ApiStreamStatus)
+      isTerminalStatus(deriveStreamStatusFromSchedule({
+        startTime: record.start_time,
+        endTime: record.end_time,
+        status: record.status,
+      }).status)
         ? CACHEABLE_STREAM_HEADERS
         : NO_STORE_STREAM_HEADERS,
     );
@@ -1080,6 +1113,7 @@ streamsRouter.delete(
   requireAuth,
   authenticateApiKey,
   requireScope('streams:write'),
+  enforceStreamScope,
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params['id'];
     const requestId = req.correlationId;
@@ -1096,6 +1130,14 @@ streamsRouter.delete(
     }
 
     if (!record) throw notFound('Stream', id);
+
+    // Tenant ownership check: an authenticated, scoped caller can only cancel
+    // their own streams. req.callerAddress is set by enforceStreamScope when
+    // the JWT payload contains an address (non-operator role).
+    if (req.callerAddress && record!.sender_address !== req.callerAddress) {
+      // Return 404 to avoid leaking the existence of another tenant's resource.
+      throw notFound('Stream', id);
+    }
 
     const guard = assertValidApiTransition(record!.status as ApiStreamStatus, 'cancelled');
     if (!guard.ok) {
@@ -1149,9 +1191,8 @@ streamsRouter.patch(
       throw notFound('Stream', '');
     }
 
-    const validStatuses: ApiStreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
-    if (typeof newStatus !== 'string' || !validStatuses.includes(newStatus as ApiStreamStatus)) {
-      throw validationError('status must be one of: active, paused, completed, cancelled');
+    if (!isApiStreamStatus(newStatus)) {
+      throw validationError(`status must be one of: ${API_STREAM_STATUSES.join(', ')}`);
     }
 
     let record;
@@ -1556,6 +1597,15 @@ streamsRouter.get(
  * Holds the HTTP connection open (bounded by a timeout) until a new event for the stream
  * arrives or the timeout elapses. Returns the same event envelope shape used by the
  * WebSocket hub.
+ *
+ * Timeout Semantics:
+ * - When the hold duration elapses without an event, the response includes:
+ *   - status: 'timeout' field to distinguish from errors
+ *   - retryAfterSeconds: configured retry hint for clients
+ *   - Retry-After HTTP header with the same retry hint
+ * - This allows clients to distinguish idle timeouts from errors and implement backoff
+ * - Hold duration is configurable via LONG_POLL_MAX_CONNECTION_DURATION_MS (default: 30s)
+ * - Retry hint is configurable via LONG_POLL_RETRY_AFTER_SECONDS (default: 15s)
  */
 streamsRouter.get(
   '/:id/poll',
@@ -1865,7 +1915,13 @@ streamsRouter.get(
     pollTimer = setTimeout(() => {
       if (cleanedUp || res.destroyed || res.writableEnded) return;
       cleanup('timeout_elapsed');
-      res.json(successResponse(null, requestId));
+      // Distinguish timeout from error by including a status field and Retry-After header
+      res.setHeader('Retry-After', String(longPollLimits.retryAfterSeconds));
+      res.json(successResponse({ 
+        data: null, 
+        status: 'timeout',
+        retryAfterSeconds: longPollLimits.retryAfterSeconds 
+      }, requestId));
     }, timeoutMs);
 
     pollTimer.unref?.();
