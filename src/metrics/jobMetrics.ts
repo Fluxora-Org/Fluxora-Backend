@@ -109,6 +109,6 @@ export function refreshBackgroundJobStaleness(nowSeconds = Date.now() / 1000): v
   }
 }
 
-backgroundJobStale.collect = async () => {
+(backgroundJobStale as any).collect = async () => {
   refreshBackgroundJobStaleness();
 };
