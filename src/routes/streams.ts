@@ -129,8 +129,7 @@ import {
   deriveStreamStatusFromSchedule,
   type ApiStreamStatus,
 } from '../streams/status.js';
-import { streamsCreatedTotal, sseConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
-import { isValidStreamStatus } from '../metrics/businessMetrics.js';
+import { streamsCreatedTotal, isValidStreamStatus } from '../metrics/businessMetrics.js';
 import { verifyWsToken } from '../middleware/tokenAuth.js';
 import { recordServerTimingPhase } from '../middleware/serverTiming.js';
 import { getStreamHub, type StreamUpdateEvent } from '../ws/hub.js';
