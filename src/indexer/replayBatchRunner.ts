@@ -1,6 +1,6 @@
 // Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import pg, { PoolClient } from 'pg';
-import { ContractEvent, ReplayRequest } from '../types.js';
+import { ContractEvent, ReplayRequest } from '../types/index.js';
 import { ReplayForcedStopError } from './replayErrors.js';
 import {
   isReplayStopRequested,
@@ -124,7 +124,7 @@ export class ReplayBatchRunner {
     cursorId: string,
     request: ReplayRequest,
     offset: number,
-    batchIndex: number,
+    _batchIndex: number,
   ): Promise<{ rowsFetched: number; aborted: boolean }> {
     const client = await this.pool.connect();
     try {
