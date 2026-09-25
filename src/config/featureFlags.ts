@@ -239,10 +239,33 @@ export function prepareReloadFlags(
   };
 }
 
+/** Callbacks fired after every successful reloadFlags(). */
+const reloadListeners: Array<() => void> = [];
+
+/**
+ * Register a callback to run after each successful flag reload. Used by
+ * `src/routes/docs.ts` to invalidate its OpenAPI spec cache when the set of
+ * enabled feature flags changes (#1477).
+ */
+export function onFlagsReloaded(cb: () => void): void {
+  reloadListeners.push(cb);
+}
+
+/** Test-only: clear all registered listeners. */
+export function clearFlagsReloadListeners(): void {
+  reloadListeners.length = 0;
+}
+
+function notifyFlagsReloaded(): void {
+  for (const cb of reloadListeners) cb();
+}
+
 export function reloadFlags(
   latestMigration?: string | null,
 ): ReadonlyMap<string, FeatureFlagDefinition> {
-  return prepareReloadFlags(latestMigration)();
+  const next = prepareReloadFlags(latestMigration)();
+  notifyFlagsReloaded();
+  return next;
 }
 
 /**
