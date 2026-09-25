@@ -60,8 +60,13 @@ describe('resolveRoute', () => {
     const label = resolveRoute(req);
     expect(label).toBe(UNMATCHED_ROUTE);
     expect(label).not.toMatch(/abc-uuid|\/42/);
+  });
+
+  it('preserves repeated path separators except for a single trailing slash', () => {
+    const req = fakeReq({
+      route: { path: '/multiple///' },
       originalUrl: '/multiple///'
-    } as unknown as Request;
+    });
     // After collapse of a single trailing slash, remaining empties are kept
     // by normalizeRouteLabel join; high-cardinality policy does not alter
     // static vocabulary segments.
