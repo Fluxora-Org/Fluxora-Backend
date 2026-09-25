@@ -18,7 +18,7 @@ import {
   webhookDeliveryDurationSeconds,
   safeObserveDuration,
 } from '../metrics/businessMetrics.js';
-import type { WebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
+import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
 import { loadConfig } from '../config/env.js';
 import {
