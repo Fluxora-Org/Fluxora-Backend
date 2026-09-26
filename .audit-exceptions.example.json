@@ -1,0 +1,20 @@
+{
+  "exceptions": [
+    {
+      "name": "example-vulnerable-package",
+      "reason": "No patch available; vulnerable code path not used in our application (verified in SECURITY-1234). Monitoring upstream for fix.",
+      "severity": "moderate",
+      "expiry": "2026-11-15",
+      "approvedBy": "security-lead@example.com",
+      "createdAt": "2026-10-15"
+    },
+    {
+      "name": "another-package",
+      "reason": "Patch available in v2.0.0 but includes breaking changes. Migration scheduled for Q4 (JIRA-5678).",
+      "severity": "high",
+      "expiry": "2026-11-01",
+      "approvedBy": "tech-lead@example.com",
+      "createdAt": "2026-10-18"
+    }
+  ]
+}

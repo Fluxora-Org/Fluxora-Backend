@@ -10,11 +10,44 @@ in `tests/security/streamRepository.sqli.test.ts` and use payloads from
 When running in CI against a real Postgres instance, ensure the test DB is
 isolated and reset between runs.
 
-## Dependency audit (pnpm)
+## Dependency Audit (pnpm)
 
-The repository's CI will run `pnpm audit --audit-level=high --json` and
-fail the build on any high/critical advisories unless an explicit
-exception is recorded in `.pnpm-audit-exceptions` (see CI docs).
+The repository enforces continuous security auditing of all dependencies. Findings at **moderate severity or above** fail the build unless covered by an explicit, time-bound exception.
+
+### Audit Enforcement
+
+The `security` job in CI runs:
+
+```bash
+pnpm run audit:check
+```
+
+This script (`scripts/audit-security.mjs`):
+1. Executes `pnpm audit --audit-level=moderate --json`
+2. Parses moderate/high/critical findings
+3. Validates findings against `.audit-exceptions.json`
+4. Checks exception expiry dates
+5. **Fails the build** if any finding lacks a valid exception or if any exception has expired
+
+### Remediation Windows
+
+| Severity | Maximum Window | Approval Required |
+|----------|---------------|-------------------|
+| Critical | 7 days | Engineering lead |
+| High | 14 days | Team lead |
+| Moderate | 30 days | Peer review |
+
+### Exception Process
+
+Exceptions are recorded in `.audit-exceptions.json` with:
+- Package name
+- Detailed justification (with issue tracker reference)
+- Severity level
+- Expiry date (must align with remediation windows)
+- Approver email
+- Creation date
+
+See `docs/security/dependency-audit-policy.md` for the complete exception process, validation requirements, and policy details.
 
 ## mTLS Client Certificate Validation
 

@@ -40,6 +40,9 @@
     "check:performance-budget": "node scripts/check-performance-budget.mjs"
     "generate:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts",
     "check:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts --check"
+    "check:performance-budget": "node scripts/check-performance-budget.mjs",
+    "audit:check": "node scripts/audit-security.mjs",
+    "audit:validate": "node scripts/audit-security.mjs --validate"
   },
   "keywords": [
     "indexer",

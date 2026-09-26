@@ -236,6 +236,26 @@ The test suite includes:
 4. **Transaction Safety**: Automatic rollback on errors
 5. **Webhook Delivery Logging**: Outbound webhook dispatch logs use the shared structured logger and include only stable identifiers (`deliveryId`, `eventType`, `attemptNumber`) plus `statusCode` when available. Webhook secrets, raw payloads, signatures, and endpoint URLs are excluded from log metadata.
 
+### Dependency Audit Enforcement
+
+All dependencies are continuously audited for security vulnerabilities. Findings at **moderate severity or above** fail the build unless covered by an explicit, time-bound exception.
+
+**Remediation windows:**
+- Critical: 7 days (engineering lead approval required)
+- High: 14 days (team lead approval required)
+- Moderate: 30 days (peer review required)
+
+Run audit checks locally:
+```bash
+# Run enforcing audit check (as used in CI)
+pnpm run audit:check
+
+# Validate exceptions file format
+pnpm run audit:validate
+```
+
+See [docs/security/dependency-audit-policy.md](docs/security/dependency-audit-policy.md) for the complete exception process and remediation guidelines.
+
 ### Webhook Delivery Logging
 
 The class-based `WebhookDispatcher` imports the shared structured logger from `src/lib/logger.ts` and uses the same `(message, correlationId?, meta?)` signature as other services. Dispatch outcomes log only safe delivery metadata:

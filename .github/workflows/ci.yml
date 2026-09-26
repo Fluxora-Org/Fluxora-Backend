@@ -254,9 +254,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Validate exceptions file format first
+      - name: Validate audit exceptions
+        run: pnpm run audit:validate
+
       # Required gate: audit failures block the pipeline.
-      - name: Run security audit
-        run: pnpm audit --audit-level=moderate
+      # Findings at moderate+ severity fail the build unless covered by a valid,
+      # non-expired exception. See docs/security/dependency-audit-policy.md.
+      - name: Run enforcing security audit
+        run: pnpm run audit:check
 
   docker:
     name: Docker Build

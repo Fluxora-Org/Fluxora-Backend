@@ -1,0 +1,115 @@
+name: Audit Exception Check
+
+# Weekly review of audit exceptions to identify expiring exceptions
+# and ensure security posture is maintained
+
+on:
+  schedule:
+    # Run every Monday at 9:00 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  check-exceptions:
+    name: Review Audit Exceptions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate exceptions file
+        run: pnpm run audit:validate
+
+      - name: Run audit check
+        id: audit
+        continue-on-error: true
+        run: pnpm run audit:check
+
+      - name: Create issue for expired exceptions
+        if: steps.audit.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const exceptionsRaw = fs.readFileSync('.audit-exceptions.json', 'utf-8');
+            const exceptionsData = JSON.parse(exceptionsRaw);
+            
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            
+            const expired = exceptionsData.exceptions.filter(ex => {
+              const expiry = new Date(ex.expiry);
+              return expiry < today;
+            });
+            
+            if (expired.length > 0) {
+              const body = `## ⚠️ Expired Security Audit Exceptions
+            
+            The following security audit exceptions have expired and need attention:
+            
+            ${expired.map(ex => `### \`${ex.name}\`
+            - **Severity:** ${ex.severity}
+            - **Expired:** ${ex.expiry}
+            - **Reason:** ${ex.reason}
+            - **Originally approved by:** ${ex.approvedBy}
+            - **Created:** ${ex.createdAt}
+            
+            **Action required:**
+            - [ ] Update the package to remediate the vulnerability
+            - [ ] Renew the exception with updated justification and approval (if patch still unavailable)
+            - [ ] Remove from \`.audit-exceptions.json\` once resolved
+            `).join('\n\n')}
+            
+            ---
+            
+            See [Dependency Audit Policy](docs/security/dependency-audit-policy.md) for remediation guidelines.
+            
+            This issue was automatically created by the weekly audit exception review workflow.`;
+            
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🔒 Security: ${expired.length} expired audit exception(s) require attention`,
+                body: body,
+                labels: ['security', 'audit', 'automated']
+              });
+            }
+
+      - name: Comment on existing issues with near-expiry warnings
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const exceptionsRaw = fs.readFileSync('.audit-exceptions.json', 'utf-8');
+            const exceptionsData = JSON.parse(exceptionsRaw);
+            
+            const today = new Date();
+            const sevenDaysFromNow = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+            
+            const nearingExpiry = exceptionsData.exceptions.filter(ex => {
+              const expiry = new Date(ex.expiry);
+              return expiry >= today && expiry <= sevenDaysFromNow;
+            });
+            
+            if (nearingExpiry.length > 0) {
+              console.log(`⚠️ ${nearingExpiry.length} exception(s) expiring within 7 days:`);
+              nearingExpiry.forEach(ex => {
+                console.log(`  - ${ex.name} (expires ${ex.expiry})`);
+              });
+              
+              // Note: In production, you might want to post this to a Slack channel
+              // or create a separate issue for tracking
+            }
