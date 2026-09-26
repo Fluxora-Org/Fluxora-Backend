@@ -43,6 +43,12 @@ let _healthCheckDone = false;
 let _lastLagCheckTime = 0;
 let _lastLagValue: number | null = null;
 const LAG_CHECK_INTERVAL_MS = 30000; // 30 seconds
+/**
+ * Maximum replication lag (seconds) before reads are routed to the primary.
+ * Configurable via REPLICA_MAX_LAG_SECONDS (default 30 s).
+ * Set to 0 to disable lag-based fallback entirely.
+ */
+const LAG_MAX_SECONDS = envInt('REPLICA_MAX_LAG_SECONDS', 30);
 
 /**
  * Extract hostname from a connection string for safe logging.
@@ -270,7 +276,22 @@ export async function getReadPool(options: GetReadPoolOptions = {}): Promise<pg.
 
   // Fast path: already resolved.
   if (_healthCheckDone) {
-    return _replicaHealthy && _replicaPool ? _replicaPool : getPool();
+    if (!_replicaHealthy || !_replicaPool) return getPool();
+
+    // Enforce lag-based fallback: if the replica is lagging beyond the
+    // configured threshold, route this read to the primary instead.
+    if (LAG_MAX_SECONDS > 0) {
+      const lag = await checkReplicationLag();
+      if (lag !== null && lag > LAG_MAX_SECONDS) {
+        logger.warn('Replica lag exceeds threshold — routing read to primary', undefined, {
+          lagSeconds: lag,
+          thresholdSeconds: LAG_MAX_SECONDS,
+        });
+        return getPool();
+      }
+    }
+
+    return _replicaPool;
   }
 
   const cfg = resolveReplicaPoolConfig();
