@@ -305,6 +305,23 @@ describe('method-restriction scoping for /api/privacy/erasure', () => {
     expect(res.status).toBe(401);
   });
 
+  it('rejects invalid subject identifiers after authentication and before database work', async () => {
+    const res = await request(app)
+      .delete('/api/privacy/erasure/not-a-stellar-address')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_ADDRESS');
+  });
+
+  it('rejects an authenticated request with invalid credentials before subject processing', async () => {
+    const res = await request(app)
+      .delete('/api/privacy/erasure/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7')
+      .set('Authorization', 'Bearer not-the-admin-key');
+
+    expect(res.status).toBe(403);
+  });
+
   it.each(['post', 'put', 'patch'] as const)(
     '%s /erasure/:recipientAddress is NOT exempted and returns 405 with Allow: DELETE',
     async (method) => {
