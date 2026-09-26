@@ -11,7 +11,12 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import { webhookService } from '../webhooks/service.js';
 import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
-import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
+import {
+  getWebhookCircuitBreakerStore,
+  describeWebhookCircuitBreaker,
+  type CircuitBreakerPolicy,
+} from '../redis/webhookCircuitBreakerStore.js';
+import { resolveWebhookRetryPolicy } from '../webhooks/delivery-support.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { logger } from '../lib/logger.js';
@@ -32,6 +37,21 @@ export function getInboundWebhookDedupCache(): DedupCache {
 }
 
 export const webhooksRouter = express.Router();
+
+/**
+ * Effective circuit-breaker thresholds for reporting.
+ *
+ * Observability must never fail because configuration is incomplete, so a
+ * config error falls back to the store defaults (threshold `0` = disabled,
+ * reset `300000` ms) that `describeWebhookCircuitBreaker` applies itself.
+ */
+function circuitBreakerPolicyForStatus(): CircuitBreakerPolicy {
+  try {
+    return resolveWebhookRetryPolicy();
+  } catch {
+    return {};
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // PUBLIC endpoint — no admin token required; verified by HMAC signature only.
@@ -515,8 +535,14 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
 });
 
 /**
- * GET /api/webhooks/circuit-breakers
- * Look up Redis-backed circuit breaker state for a consumer endpoint.
+ * GET /internal/webhooks/circuit-breakers?endpointUrl=…
+ *
+ * Reports the circuit breaker state of a single receiver (consumer URL) and,
+ * crucially, *why* deliveries to it are paused and when they resume.
+ *
+ * The thresholds reported (`threshold`, `resetMs`) are the effective ones, read
+ * from `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD` / `WEBHOOK_CIRCUIT_BREAKER_RESET_MS`;
+ * they are the same numbers documented in `docs/webhooks.md`.
  */
 webhooksRouter.get('/circuit-breakers', async (req, res) => {
   const endpointUrl = typeof req.query.endpointUrl === 'string' ? req.query.endpointUrl : undefined;
@@ -538,28 +564,36 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
     return;
   }
 
-  const state = await getWebhookCircuitBreakerStore().getState(endpointUrl);
-  if (!state) {
-    res.json({ total: 0, states: [] });
-    return;
-  }
+  const now = Date.now();
+  const record = await getWebhookCircuitBreakerStore().getState(endpointUrl);
+  const status = describeWebhookCircuitBreaker(record, circuitBreakerPolicyForStatus(), now);
 
   res.json({
     total: 1,
     states: [
       {
         endpointUrl,
-        state: state.state,
-        failureCount: state.consecutiveFailures,
-        lastFailureTime: null,
-        nextAttemptTime: state.resetAt > 0 ? new Date(state.resetAt).toISOString() : null,
+        state: status.state,
+        /** True while deliveries to this receiver are blocked. */
+        paused: status.paused,
+        /** Why delivery is paused — see docs/webhooks.md "Pause reasons". */
+        reason: status.reason,
+        consecutiveFailures: status.consecutiveFailures,
+        failureCount: status.consecutiveFailures,
+        threshold: status.threshold,
+        resetMs: status.resetMs,
+        lastFailureTime: status.lastFailureAt !== null ? new Date(status.lastFailureAt).toISOString() : null,
+        /** When the next probe may be claimed, or null when nothing is blocked. */
+        resumeAt: status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
+        nextAttemptTime: status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
       },
     ],
+    observedAt: new Date(now).toISOString(),
   });
 });
 
 /**
- * POST /api/webhooks/circuit-breakers/:endpointUrl/reset
+ * POST /internal/webhooks/circuit-breakers/:endpointUrl/reset
  * Reset circuit breaker for an endpoint
  */
 webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => {
@@ -583,10 +617,28 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => 
   await getWebhookCircuitBreakerStore().recordSuccess(decodedUrl, {});
   logger.info('Circuit breaker reset requested', undefined, { endpointUrl: decodedUrl });
 
+  const status = describeWebhookCircuitBreaker(
+    await getWebhookCircuitBreakerStore().getState(decodedUrl),
+    circuitBreakerPolicyForStatus(),
+    Date.now(),
+  );
+
   res.json({
     ok: true,
     message: 'Circuit breaker reset requested',
     endpointUrl: decodedUrl,
+    states: [
+      {
+        endpointUrl: decodedUrl,
+        state: status.state,
+        paused: status.paused,
+        reason: status.reason,
+        consecutiveFailures: status.consecutiveFailures,
+        threshold: status.threshold,
+        resetMs: status.resetMs,
+        resumeAt: null,
+      },
+    ],
   });
 });
 

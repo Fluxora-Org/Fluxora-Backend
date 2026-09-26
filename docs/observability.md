@@ -512,10 +512,18 @@ accurate during a Redis outage.
 
 ```
 closed ──(threshold reached)──▸ open
- open  ──(reset period elapsed)──▸ half-open
+  open  ──(reset period elapsed)──▸ half-open
 half-open ──(probe succeeds)──▸ closed
 half-open ──(probe fails)──▸ open
 ```
+
+Thresholds: the circuit opens on the `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD`-th consecutive
+retryable failure (default `0` = disabled) and stays open for
+`WEBHOOK_CIRCUIT_BREAKER_RESET_MS` (default `300000`) before one half-open probe is admitted.
+The full transition table, and the per-receiver state exposed by
+`GET /internal/webhooks/circuit-breakers?endpointUrl=…` (including the machine-readable
+`reason` a receiver's deliveries are paused and the `resumeAt` timestamp), are documented in
+[`docs/webhooks.md`](webhooks.md#circuit-breaker-resilience).
 
 ### PromQL examples
 
