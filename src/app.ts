@@ -71,6 +71,7 @@ import { webhookDispatcher } from './webhooks/service.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 import { responseSizeLimitMiddleware } from './middleware/responseSizeLimit.js';
+import { readinessGuardMiddleware } from './middleware/readinessGuard.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -497,6 +498,10 @@ export function createApp(options: AppOptions = {}): Express {
 
   // Blue/green slot header — must run before any response can be sent.
   app.use(deploymentSlotMiddleware);
+
+  // Readiness guard — reject all requests until startup is complete.
+  // Must run before all other middleware so it intercepts every incoming request.
+  app.use(readinessGuardMiddleware());
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   // Correlation ID must run before express.json() so req.correlationId is available
