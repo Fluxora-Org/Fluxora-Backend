@@ -3,6 +3,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { generateToken } from '../lib/auth.js';
 import { validationError, unauthorized, asyncHandler } from '../middleware/errorHandler.js';
+import { successResponse } from '../utils/response.js';
 import { info } from '../lib/logger.js';
 import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
@@ -82,7 +83,10 @@ authRouter.post(
     const requestId = req.correlationId;
 
     if (!result.success) {
-      throw validationError('Invalid session request', result.error.format());
+      throw validationError(
+        'Stellar address is required when idToken is not provided',
+        result.error.format()
+      );
     }
 
     const { address, role, idToken } = result.data;
