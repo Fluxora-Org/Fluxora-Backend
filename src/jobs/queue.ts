@@ -14,6 +14,10 @@ import {
 } from '../metrics/jobMetrics.js';
 import { getCorrelationId, correlationStore } from '../tracing/middleware.js';
 import { traceSpan } from '../tracing/hooks.js';
+import {
+  DEFAULT_WEBHOOK_SECRET_ID,
+  webhookSecretRepository,
+} from '../db/repositories/webhookSecretRepository.js';
 
 // ── Retry / expiry defaults ───────────────────────────────────────────────────
 //
@@ -47,6 +51,7 @@ export const DEFAULT_RETRY_BACKOFF = true;
 export const DEFAULT_EXPIRE_SECONDS = 900; // 15 minutes
 
 export const BACKGROUND_JOB_INTERVAL_SECONDS = 24 * 60 * 60;
+export const WEBHOOK_SECRET_CLEANUP_INTERVAL_SECONDS = 15 * 60;
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
@@ -629,6 +634,26 @@ export function startBackgroundJobs(pool: Pool): void {
     }
   );
 
+  queue.register(
+    'webhook-secret-cleanup',
+    async () => {
+      const cleared = await webhookSecretRepository.clearExpiredPreviousSecret(
+        DEFAULT_WEBHOOK_SECRET_ID,
+      );
+      if (cleared) {
+        logger.info('Expired webhook secret removed');
+      }
+    },
+    {
+      retryLimit: DEFAULT_RETRY_LIMIT,
+      retryDelay: DEFAULT_RETRY_DELAY,
+      retryBackoff: DEFAULT_RETRY_BACKOFF,
+      expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+      deadLetter: DEAD_LETTER_QUEUE,
+      expectedIntervalSeconds: WEBHOOK_SECRET_CLEANUP_INTERVAL_SECONDS,
+    }
+  );
+
   queue.register(DEAD_LETTER_QUEUE, async (ctx) => {
     // pg-boss delivers the original job's metadata as ctx.data when routing
     // to a dead-letter queue.  We use the DlqJobPayload interface to make
@@ -751,6 +776,16 @@ export function startBackgroundJobs(pool: Pool): void {
     });
 
   queue
+    .schedule('webhook-secret-cleanup', '*/15 * * * *', undefined, {
+      retryLimit: DEFAULT_RETRY_LIMIT,
+      retryDelay: DEFAULT_RETRY_DELAY,
+      retryBackoff: DEFAULT_RETRY_BACKOFF,
+    })
+    .catch((err: Error) => {
+      logger.error('Failed to schedule webhook secret cleanup', undefined, { error: err.message });
+    });
+
+  queue
     .send(
       'partition-maintenance',
       {},
@@ -800,6 +835,24 @@ export function startBackgroundJobs(pool: Pool): void {
     )
     .catch((err: Error) => {
       logger.error('Failed to enqueue startup dead-letter purge', undefined, {
+        error: err.message,
+      });
+    });
+
+  queue
+    .send(
+      'webhook-secret-cleanup',
+      {},
+      {
+        retryLimit: DEFAULT_RETRY_LIMIT,
+        retryDelay: DEFAULT_RETRY_DELAY,
+        retryBackoff: DEFAULT_RETRY_BACKOFF,
+        expireInSeconds: DEFAULT_EXPIRE_SECONDS,
+        deadLetter: DEAD_LETTER_QUEUE,
+      }
+    )
+    .catch((err: Error) => {
+      logger.error('Failed to enqueue startup webhook secret cleanup', undefined, {
         error: err.message,
       });
     });

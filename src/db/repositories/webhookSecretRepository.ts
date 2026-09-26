@@ -17,6 +17,7 @@
  */
 
 import { getPool, query } from '../pool.js';
+import { DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS } from '../../webhooks/signature.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -26,7 +27,12 @@ import { getPool, query } from '../pool.js';
  * `previousSecretRotatedAt` and `previousSecretExpiresAt` are stored as Unix
  * timestamps (seconds) so the verification path can compute the grace window
  * without any date parsing.
+ * The `id` used for the single global webhook signing secret. The table
+ * supports per-tenant ids, but the shared-secret `/receive` verification
+ * path (src/routes/webhooks.ts) only ever consults this one row.
  */
+export const DEFAULT_WEBHOOK_SECRET_ID = 'default';
+
 export interface WebhookSecretState {
   /** Stable identifier for this secret entry (e.g. tenant or 'default'). */
   id: string;
@@ -161,7 +167,8 @@ export const webhookSecretRepository = {
     id: string,
     input: RotateSecretInput,
   ): Promise<WebhookSecretState> {
-    const graceWindowSeconds = input.graceWindowSeconds ?? 86_400;
+    const graceWindowSeconds =
+      input.graceWindowSeconds ?? DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS;
     const rotatedAt = input.rotatedAt ?? Math.floor(Date.now() / 1000);
     const expiresAt = rotatedAt + graceWindowSeconds;
 

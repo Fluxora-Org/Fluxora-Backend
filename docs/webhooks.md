@@ -225,7 +225,8 @@ Webhook consumers verify incoming requests by recomputing the HMAC-SHA256 signat
 When a webhook consumer rotates its signing secret via the admin API, there is a transition period during which some producers may still be signing with the old secret. To avoid spurious verification failures, the verification path supports a **bounded dual-secret grace window**:
 
 - During the grace window, **both** the previous and current secret are accepted.
-- After the grace window expires, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
+- The overlap is configurable with `graceWindowSeconds`; it is active from the rotation timestamp up to, but not including, the expiry timestamp.
+- At and after expiry, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
 - The rotation timestamp and grace-window expiry are **persisted** in the `webhook_secrets` table (not held in memory), so a process restart cannot silently extend or shrink the window.
 - The default grace window is `DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS` (86 400 seconds / 24 hours).
 
