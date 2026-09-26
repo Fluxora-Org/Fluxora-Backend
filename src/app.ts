@@ -8,6 +8,7 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
+import { protectRouter, PUBLIC_ROUTE_PATHS } from './routes/protect.js';
 import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders, sanitizeResponses, responseSanitizer } from './middleware/pii.js';
@@ -557,17 +558,28 @@ export function createApp(options: AppOptions = {}): Express {
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
+  // Public routes are explicitly declared in `routes/protect.ts`.
   app.use('/api/streams', csrfMiddleware, streamsRouter);
-  app.use('/api/admin', adminRouter);
-  app.use('/internal/indexer', indexerRouter);
-  app.use('/internal/webhooks', webhooksRouter);
-  app.use('/api/audit', auditRouter);
-  app.use('/api/privacy', privacyRouter);
-  app.use('/admin/dlq', dlqRouter);
-  app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
+
+  // Protected routers: wrap with `protectRouter` so `authenticate` runs
+  // structurally before any handler in the group.
+  app.use('/api/admin', protectRouter(adminRouter));
+  app.use('/internal/indexer', protectRouter(indexerRouter));
+  app.use('/internal/webhooks', protectRouter(webhooksRouter));
+  app.use('/api/audit', protectRouter(auditRouter));
+  app.use('/api/privacy', protectRouter(privacyRouter));
+  app.use('/admin/dlq', protectRouter(dlqRouter));
+  app.use('/api/rate-limits', protectRouter(createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) })));
 
   // Experimental GraphQL federation gateway — feature-flagged off by default.
   app.use('/api/graphql', graphqlGatewayRouter);
+
+  // --- Temporary mis-registration (for validation) ---
+  // Intentionally register a protected router without `protectRouter` so
+  // the structural auth registration test fails until the mount is fixed.
+  // Remove this before landing the change; kept here so CI will fail when
+  // a route is added without a decision.
+  app.use('/internal/unwrapped', indexerRouter);
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(
