@@ -51,7 +51,6 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const requestId = req.correlationId;
   const correlationId = req.correlationId;
   const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
-  const tenantId = req.callerAddress ?? req.user?.address ?? 'anonymous';
 
   if (!isIdempotencyHealthy()) {
     warn('Idempotency dependency unavailable', {

@@ -557,16 +557,6 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const persistedQuery = extensions as { version?: unknown; sha256Hash?: unknown };
-        const { version, sha256Hash } = persistedQuery;
-
-        if (version !== 1) {
-          res
-            .status(400)
-            .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
-          return;
-        }
-
         const persistedQuery = (extensions as Record<string, unknown>).persistedQuery;
         if (persistedQuery !== undefined) {
           if (typeof persistedQuery !== 'object' || persistedQuery === null || Array.isArray(persistedQuery)) {
@@ -651,9 +641,6 @@ graphqlGatewayRouter.post(
       try {
         document = parse(source);
       } catch {
-        res.status(400).json(
-          errorResponse('GRAPHQL_PARSE_ERROR', 'GraphQL query could not be parsed.', undefined, requestId),
-        );
         res
           .status(400)
           .json(
