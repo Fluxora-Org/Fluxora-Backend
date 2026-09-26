@@ -42,6 +42,16 @@ describe('performance budget', () => {
     expect(results[0].reason).toMatch(/p99 .+ > budget/);
   });
 
+  it('fails when a covered endpoint has no percentile data', () => {
+    const budget = loadBudget();
+    const summary = buildPassingFixture(budget);
+    summary.endpoints[0].p99_ms = null;
+
+    const { passed, results } = evaluateSummary(budget, summary);
+    expect(passed).toBe(false);
+    expect(results[0].reason).toContain('p99 is missing from summary');
+  });
+
   it('CLI --fixture-regression exits non-zero', () => {
     const logs = [];
     const errors = [];

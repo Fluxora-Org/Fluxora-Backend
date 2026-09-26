@@ -1,7 +1,7 @@
 import http from 'k6/http';
 import { sleep } from 'k6';
 import { BASE_URL } from '../config.js';
-import { checkResponse, healthLatency } from '../helpers.js';
+import { checkResponse, healthLatency, AUTH_HEADERS } from '../helpers.js';
 
 /**
  * Exercises GET /health.
@@ -13,6 +13,7 @@ import { checkResponse, healthLatency } from '../helpers.js';
  */
 export default function healthScenario() {
   const res = http.get(`${BASE_URL}/health`, {
+    headers: AUTH_HEADERS,
     tags: { endpoint: 'health' },
   });
 

@@ -1,7 +1,12 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { BASE_URL } from '../config.js';
-import { checkResponse, errorRate, streamsListLatency } from '../helpers.js';
+import {
+  checkResponse,
+  errorRate,
+  streamsListLatency,
+  AUTH_HEADERS,
+} from '../helpers.js';
 
 // Valid Stellar addresses used as filter values (must match helpers.js senders/recipients).
 const FILTER_SENDER    = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
@@ -30,6 +35,7 @@ const FILTER_RECIPIENT = 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OG
 export default function streamsListScenario() {
   // --- Baseline: list all streams ---
   const res = http.get(`${BASE_URL}/api/streams`, {
+    headers: AUTH_HEADERS,
     tags: { endpoint: 'streams_list' },
   });
   const passed = checkResponse(res, 200, 'GET /api/streams');
@@ -56,6 +62,7 @@ export default function streamsListScenario() {
 
   // --- Filter by status=active ---
   const statusRes = http.get(`${BASE_URL}/api/streams?status=active`, {
+    headers: AUTH_HEADERS,
     tags: { endpoint: 'streams_list' },
   });
   const statusOk = check(statusRes, {
@@ -70,7 +77,7 @@ export default function streamsListScenario() {
   // --- Filter by sender ---
   const senderRes = http.get(
     `${BASE_URL}/api/streams?sender=${encodeURIComponent(FILTER_SENDER)}`,
-    { tags: { endpoint: 'streams_list' } },
+    { headers: AUTH_HEADERS, tags: { endpoint: 'streams_list' } },
   );
   const senderOk = check(senderRes, {
     'GET /api/streams?sender — status 200': (r) => r.status === 200,
@@ -84,7 +91,7 @@ export default function streamsListScenario() {
   // --- Filter by recipient ---
   const recipientRes = http.get(
     `${BASE_URL}/api/streams?recipient=${encodeURIComponent(FILTER_RECIPIENT)}`,
-    { tags: { endpoint: 'streams_list' } },
+    { headers: AUTH_HEADERS, tags: { endpoint: 'streams_list' } },
   );
   const recipientOk = check(recipientRes, {
     'GET /api/streams?recipient — status 200': (r) => r.status === 200,
@@ -94,6 +101,7 @@ export default function streamsListScenario() {
 
   // --- Pagination: limit=5 ---
   const pageRes = http.get(`${BASE_URL}/api/streams?limit=5`, {
+    headers: AUTH_HEADERS,
     tags: { endpoint: 'streams_list' },
   });
   const pageOk = check(pageRes, {
@@ -107,6 +115,7 @@ export default function streamsListScenario() {
 
   // --- Invalid status → 400 ---
   const badStatusRes = http.get(`${BASE_URL}/api/streams?status=pending`, {
+    headers: AUTH_HEADERS,
     tags: { endpoint: 'streams_list' },
   });
   const badStatusOk = check(badStatusRes, {
