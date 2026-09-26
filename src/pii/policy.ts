@@ -1,22 +1,27 @@
 /**
  * PII policy definitions for the Fluxora backend.
  *
- * This module is the single source of truth for data classification,
- * retention periods, and field-level sensitivity across the service.
- * All other modules that handle potentially sensitive data must
- * reference these definitions rather than hard-coding their own rules.
+ * This module holds the field-level classification policy and the trust
+ * boundaries. The **retention** schedule lives in `src/pii/retention.ts` and is
+ * re-exported here, because the retention commitments and the purge job that
+ * enforces them have to be derived from a single list — see the module docs of
+ * `src/pii/retention.ts` and `docs/retention-schedule.md`.
  */
 
-export enum DataClassification {
-  /** Freely shareable (health status, API version, docs links). */
-  PUBLIC = 'PUBLIC',
-  /** Operational data visible to authenticated partners and operators. */
-  INTERNAL = 'INTERNAL',
-  /** Pseudonymous identifiers that could be correlated to real identities. */
-  SENSITIVE = 'SENSITIVE',
-  /** Credentials, tokens, or direct PII — never persisted in logs. */
-  RESTRICTED = 'RESTRICTED',
-}
+import { DataClassification } from './classification.js';
+import { publishedRetentionRules, type RetentionRule } from './retention.js';
+
+export { DataClassification };
+export { LEGAL_HOLD_EXEMPT_TABLES, LEGAL_HOLD_POLICY, RETENTION_MANIFEST } from './retention.js';
+export type {
+  DataRetentionRule,
+  PublishedRetentionRule,
+  PurgeAction,
+  PurgeableRetentionRule,
+  RetentionEnforcement,
+  RetentionRule,
+} from './retention.js';
+export { PURGEABLE_RETENTION_SCHEDULE } from './retention.js';
 
 export interface FieldPolicy {
   classification: DataClassification;
@@ -24,51 +29,6 @@ export interface FieldPolicy {
   redactInLogs: boolean;
   /** Human-readable rationale for the classification. */
   rationale: string;
-}
-
-export interface RetentionRule {
-  /** Category label shown in the privacy endpoint. */
-  category: string;
-  /** Maximum number of days data in this category is retained. null = indefinite (chain-derived). */
-  retentionDays: number | null;
-  /** Where the data lives (memory, database, external chain). */
-  storageLayer: string;
-  /** Justification for the retention window. */
-  rationale: string;
-}
-
-/**
- * Extension of `RetentionRule` for categories that can be actively purged
- * by the scheduled retention-purge job.
- *
- * The extra fields tell the job:
- *  - which database table to target (`table`)
- *  - which column records the row's age (`ageColumn`) — the job compares
- *    this against `NOW() - INTERVAL '<retentionDays> days'`
- *  - how to purge rows whose retention window has expired (`purgeAction`):
- *      `delete`  — hard-delete the row entirely (use for ephemeral metadata).
- *      `redact`  — overwrite PII columns with a placeholder and set
- *                  `purged_at` (use when the row must stay for audit integrity
- *                   but its sensitive fields must not persist).
- */
-export interface PurgeableRetentionRule extends RetentionRule {
-  /**
-   * The fully-qualified table name the purge job will operate on.
-   * Must reference a table that has a `legal_hold` boolean column.
-   */
-  table: string;
-  /**
-   * Column used to determine the age of a row for the retention cut-off
-   * calculation. Typically `created_at`.
-   */
-  ageColumn: string;
-  /**
-   * Purge strategy:
-   *  - `delete`  — remove rows past their retention window.
-   *  - `redact`  — blank PII fields and stamp `purged_at`; the row shell
-   *                remains for referential integrity.
-   */
-  purgeAction: 'delete' | 'redact';
 }
 
 export type StreamFieldPolicyKey =
@@ -324,92 +284,21 @@ export const REQUEST_FIELD_POLICIES: Record<string, FieldPolicy> = {
   },
 };
 
-/** Retention schedule exposed via the privacy endpoint. */
-export const RETENTION_SCHEDULE: RetentionRule[] = [
-  {
-    category: 'Stream records (chain-derived)',
-    retentionDays: null,
-    storageLayer: 'in-memory (future: PostgreSQL)',
-    rationale:
-      'Mirrors immutable on-chain state. Retained as long as the contract exists; deletion would create inconsistency with Horizon.',
-  },
-  {
-    category: 'Stream address PII',
-    retentionDays: 365,
-    storageLayer: 'PostgreSQL — streams',
-    rationale:
-      'Sender and recipient addresses are sensitive pseudonymous identifiers. After 365 days these fields are redacted in place unless the stream is under legal hold.',
-  },
-  {
-    category: 'HTTP request metadata',
-    retentionDays: 0,
-    storageLayer: 'ephemeral (process memory)',
-    rationale:
-      'IP addresses and headers are used only for the lifetime of the request and are not written to any persistent store.',
-  },
-  {
-    category: 'Application logs',
-    retentionDays: 30,
-    storageLayer: 'stdout / log aggregator',
-    rationale:
-      'Structured logs are retained for operational diagnostics. PII fields are redacted before emission.',
-  },
-  {
-    category: 'Authentication tokens',
-    retentionDays: 0,
-    storageLayer: 'ephemeral (process memory)',
-    rationale: 'Tokens are validated in-flight and never persisted or logged.',
-  },
-];
-
 /**
- * Subset of the retention schedule that the automated purge job can
- * enforce.  Each entry extends `RetentionRule` with the database
- * coordinates and purge strategy needed to actually delete or redact
- * expired rows.
+ * Retention schedule exposed via the privacy endpoint.
  *
- * Rules are evaluated in order during each purge run.  Add a new entry
- * here whenever a table gains a `created_at` column and reaches a finite
- * retention commitment.
+ * A projection of `RETENTION_MANIFEST` in `src/pii/retention.ts` — every class
+ * of persisted data the service has, each with its period, the mechanism that
+ * enforces it, and whether a legal hold can override it. The projection keeps
+ * the historical `category` / `retentionDays` / `storageLayer` / `rationale`
+ * field names and adds the enforcement metadata, so existing consumers of
+ * `/api/privacy/retention` and `/api/privacy/policy` keep working.
  *
- * Legal-hold exemption applies globally: any row in the target table
- * with `legal_hold = TRUE` is skipped by the purge job and a
- * `PURGE_SKIPPED_LEGAL_HOLD` audit event is written instead.
+ * The human-readable rendering of the same list, including the legal-hold
+ * rules and the exemptions, is `docs/retention-schedule.md`; CI keeps the two
+ * in step via `scripts/check-retention-schedule.ts`.
  */
-export const PURGEABLE_RETENTION_SCHEDULE: PurgeableRetentionRule[] = [
-  {
-    category: 'Audit logs',
-    retentionDays: 365,
-    storageLayer: 'PostgreSQL — audit_logs',
-    rationale:
-      'Audit records are kept for one year for regulatory compliance (SOC-2, GDPR Art. 5(1)(e)).' +
-      ' After 365 days the row is hard-deleted; no PII is stored in the audit log itself.',
-    table: 'audit_logs',
-    ageColumn: 'timestamp',
-    purgeAction: 'delete',
-  },
-  {
-    category: 'Stream address PII',
-    retentionDays: 365,
-    storageLayer: 'PostgreSQL — streams',
-    rationale:
-      'Sender and recipient addresses are sensitive pseudonymous identifiers. After 365 days these fields are redacted in place unless the stream is under legal hold.',
-    table: 'streams',
-    ageColumn: 'created_at',
-    purgeAction: 'redact',
-  },
-  {
-    category: 'Webhook outbox (processed)',
-    retentionDays: 90,
-    storageLayer: 'PostgreSQL — webhook_outbox',
-    rationale:
-      'Processed outbox rows are retained for 90 days for debugging and replay investigation,' +
-      ' then purged to prevent unbounded table growth.',
-    table: 'webhook_outbox',
-    ageColumn: 'created_at',
-    purgeAction: 'delete',
-  },
-];
+export const RETENTION_SCHEDULE: RetentionRule[] = publishedRetentionRules();
 
 /**
  * Trust boundary definitions describing what each actor class

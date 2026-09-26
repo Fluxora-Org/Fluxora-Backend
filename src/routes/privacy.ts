@@ -19,6 +19,7 @@ import {
   STREAM_FIELD_POLICIES,
   REQUEST_FIELD_POLICIES,
   RETENTION_SCHEDULE,
+  LEGAL_HOLD_POLICY,
   TRUST_BOUNDARIES,
   DataClassification,
 } from '../pii/policy.js';
@@ -236,15 +237,24 @@ privacyRouter.all('/policy', rejectUnsupportedMethods(['GET', 'HEAD']));
 /**
  * GET /api/privacy/retention
  *
- * Lightweight view of just the retention schedule for quick
- * compliance checks.
+ * The complete data-retention schedule for the service: every class of
+ * persisted data, the period committed to for it, the mechanism that enforces
+ * that period, and whether a legal hold can override it.
+ *
+ * This is the machine-readable half of `docs/retention-schedule.md`; both are
+ * generated from the same manifest (`RETENTION_MANIFEST` in
+ * `src/pii/retention.ts`) and `scripts/check-retention-schedule.ts` fails CI
+ * when they diverge. It is the endpoint a subject-access or erasure request
+ * should be answered from.
  */
 privacyRouter.get('/retention', (_req: Request, res: Response) => {
   res.json({
     retentionSchedule: RETENTION_SCHEDULE,
+    legalHold: LEGAL_HOLD_POLICY,
     _links: {
       self: '/api/privacy/retention',
       fullPolicy: '/api/privacy/policy',
+      document: 'docs/retention-schedule.md',
     },
   });
 });

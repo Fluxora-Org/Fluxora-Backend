@@ -182,6 +182,15 @@ jobs:
 
       - name: Check deprecation sunset policy
         run: pnpm run check:deprecations
+
+      # Required gate: the published retention schedule (docs/retention-schedule.md),
+      # the code manifest, the migrations and the purge jobs must agree. A new
+      # table with no stated retention period, a changed window that was not
+      # re-published, or a purge rule pointing at the wrong column all fail here.
+      # See scripts/check-retention-schedule.ts and docs/retention-schedule.md.
+      - name: Check data retention schedule
+        run: pnpm run check:retention
+
       # Required gate: the API changelog must record every externally visible
       # change, grouped by API version, with breaking changes marked. Adding or
       # removing an endpoint without a changelog entry fails the build.
