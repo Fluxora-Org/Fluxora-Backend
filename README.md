@@ -13,9 +13,30 @@ High-performance contract event indexer with optimized batch processing and Post
 
 ## 📋 Requirements
 
-- Node.js 18+
+- Node.js **20.20.2** (exact, pinned; see [Node.js version](#nodejs-version))
 - PostgreSQL 12+
 - pnpm 9.15.9 (required)
+
+## Node.js version
+
+The service runs on exactly one Node.js version everywhere: **20.20.2**. The
+same version is used locally, in CI and in the Docker image.
+
+| Where | How it names the version |
+| --- | --- |
+| `.nvmrc` | `20.20.2` (source of truth; `nvm use` / `fnm use` read it) |
+| `package.json` | `"engines": { "node": "20.20.2" }` |
+| `Dockerfile` | `ARG NODE_VERSION=20.20.2` (both stages use `node:${NODE_VERSION}-alpine`) |
+| `.github/workflows/*.yml` | `actions/setup-node` with `node-version-file: '.nvmrc'` |
+
+CI runs `node scripts/check-node-version.mjs` (also `pnpm run check:node-version`)
+and fails when any of these disagree, or when a workflow or compose file names
+some other Node.js version.
+
+**Upgrading Node.js** is one reviewed pull request that changes `.nvmrc`,
+`package.json` `engines.node`, the Dockerfile `ARG NODE_VERSION`, and the
+version stated in this README. Run `pnpm run check:node-version` to confirm
+nothing was missed.
 
 ## 🛠️ Installation
 

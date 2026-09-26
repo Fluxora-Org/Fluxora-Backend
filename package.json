@@ -15,6 +15,7 @@
     "start": "node dist/src/index.js",
     "migrate": "tsx src/db/migrate.ts",
     "check:migrations": "node scripts/check-migration-names.mjs",
+    "check:node-version": "node scripts/check-node-version.mjs",
     "seed": "ts-node scripts/seed-test-data.ts",
     "benchmark": "ts-node scripts/benchmark.ts",
     "verify": "ts-node scripts/verify-setup.ts",
@@ -40,6 +41,9 @@
   ],
   "author": "",
   "license": "MIT",
+  "engines": {
+    "node": "20.20.2"
+  },
   "dependencies": {
     "@asteasolutions/zod-to-openapi": "8.5.0",
     "@aws-sdk/client-s3": "^3.1114.0",

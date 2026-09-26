@@ -7,6 +7,25 @@ on:
     branches: [ main, develop ]
 
 jobs:
+  node-version:
+    name: Node.js Version Pin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      # Fails when .nvmrc, package.json "engines.node", the Dockerfile and the
+      # workflows do not all name the same Node.js version. See
+      # scripts/check-node-version.mjs.
+      - name: Check Node.js version pin
+        run: node scripts/check-node-version.mjs
+
   typecheck:
     name: TypeScript Typecheck
     runs-on: ubuntu-latest
@@ -21,7 +40,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -53,7 +72,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -109,7 +128,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -184,7 +203,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
