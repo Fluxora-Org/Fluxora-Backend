@@ -132,10 +132,7 @@ authRouter.post(
       await store.resetAttempts(targetAddress);
     }
 
-    res.json({
-      token,
-      user: { address: targetAddress, role: targetRole },
-    });
+    res.json(successResponse({ token, user: { address: targetAddress, role: targetRole } }, requestId));
   })
 );
 
@@ -226,11 +223,10 @@ authRouter.post(
       requestId,
     });
 
-    res.json({
-      success: true,
+    res.json(successResponse({
       jti,
       revoked: revocation.revoked,
       ttl: revocation.ttlSeconds,
-    });
+    }, requestId));
   })
 );

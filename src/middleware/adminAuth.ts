@@ -4,6 +4,7 @@ import { verifyToken } from '../lib/auth.js';
 import { warn } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import crypto from 'crypto';
+import { errorResponse } from '../utils/response.js';
 
 /**
  * Maximum allowed length for the `Authorization` header value, in bytes.

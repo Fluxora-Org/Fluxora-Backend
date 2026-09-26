@@ -9,6 +9,7 @@ import {
   setRuntimeRateLimitConfig,
 } from '../config/rateLimits.js';
 import type { RateLimitConfig } from '../types/rateLimit.js';
+import { successResponse, errorResponse } from '../utils/response.js';
 
 /** Validates a partial RateLimitConfig patch object. Returns an error string or null. */
 function validateConfigPatch(obj: unknown): string | null {
@@ -83,15 +84,16 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
    * GET /api/rate-limits/config
    * Returns the active runtime rate-limit configuration (admin only).
    */
-  rateLimitsRouter.get('/config', requireAdminAuth, (_req: Request, res: Response) => {
+  rateLimitsRouter.get('/config', requireAdminAuth, (req: Request, res: Response) => {
+    const requestId = req.correlationId;
     const runtime = getRuntimeRateLimitConfig();
     const defaults = opts?.defaults;
-    res.json({
+    res.json(successResponse({
       ip:     runtime?.ip     ?? defaults?.ip,
       apiKey: runtime?.apiKey ?? defaults?.apiKey,
       admin:  runtime?.admin  ?? defaults?.admin,
       source: runtime ? 'runtime' : 'default',
-    });
+    }, requestId));
   });
 
   /**
@@ -104,10 +106,16 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
    * Returns 409 if the resulting config would disable all tiers simultaneously.
    */
   rateLimitsRouter.put('/config', requireAdminAuth, (req: Request, res: Response) => {
+    const requestId = req.correlationId;
     const { ip, apiKey, admin } = req.body ?? {};
 
     if (ip === undefined && apiKey === undefined && admin === undefined) {
-      res.status(400).json({ error: 'Body must include at least one of: ip, apiKey, admin.' });
+      res.status(400).json(errorResponse(
+        'VALIDATION_ERROR',
+        'Body must include at least one of: ip, apiKey, admin.',
+        undefined,
+        requestId,
+      ));
       return;
     }
 
@@ -115,7 +123,12 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
       if (val !== undefined) {
         const err = validateConfigPatch(val);
         if (err) {
-          res.status(400).json({ error: `Invalid config for '${key}': ${err}` });
+          res.status(400).json(errorResponse(
+            'VALIDATION_ERROR',
+            `Invalid config for '${key}': ${err}`,
+            undefined,
+            requestId,
+          ));
           return;
         }
       }
@@ -132,12 +145,17 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
       admin:  admin  ? { ...base.admin,  ...(admin  as Partial<RateLimitConfig>) } : base.admin,
     };
     if (!merged.ip.enabled && !merged.apiKey.enabled && !merged.admin.enabled) {
-      res.status(409).json({ error: 'Cannot disable all rate-limit tiers simultaneously.' });
+      res.status(409).json(errorResponse(
+        'CONFLICT',
+        'Cannot disable all rate-limit tiers simultaneously.',
+        undefined,
+        requestId,
+      ));
       return;
     }
 
     const updated = setRuntimeRateLimitConfig({ ip, apiKey, admin });
-    res.json({ message: 'Rate-limit config updated.', config: updated });
+    res.json(successResponse({ message: 'Rate-limit config updated.', config: updated }, requestId));
   });
 
   return rateLimitsRouter;

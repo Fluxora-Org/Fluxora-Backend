@@ -228,13 +228,16 @@ adminRouter.post('/reindex', async (req, res) => {
  * lag is still violating the freshness threshold.
  */
 adminRouter.post('/indexer/stall/clear', (req, res) => {
+  const requestId = req.correlationId;
   try {
     clearIndexerStall();
-    recordAuditEvent('INDEXER_STALL_CLEARED', 'indexer', 'system', req.correlationId);
-    res.json({ message: 'Indexer stall flag cleared successfully.' });
+    recordAuditEvent('INDEXER_STALL_CLEARED', 'indexer', 'system', requestId);
+    res.json(successResponse({ message: 'Indexer stall flag cleared successfully.' }, requestId));
   } catch (err) {
     if (err instanceof ActiveStallError) {
-      res.status(409).json({ error: err.message });
+      res.status(409).json(
+        errorResponse('ACTIVE_STALL', err.message, undefined, requestId)
+      );
       return;
     }
     throw err;

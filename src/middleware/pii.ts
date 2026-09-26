@@ -132,10 +132,9 @@ export function safeErrorHandler(
     stack: process.env.NODE_ENV === 'production' ? undefined : redactKeysInString(err.stack || ''),
   });
 
-  res.status(500).json({
-    error: 'Internal server error',
-    message: 'An unexpected error occurred. No sensitive data has been included in this response.',
-  });
+  res.status(500).json(
+    errorResponse('INTERNAL_ERROR', 'An unexpected error occurred. No sensitive data has been included in this response.')
+  );
 }
 
 /**
