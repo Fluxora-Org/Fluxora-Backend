@@ -161,7 +161,7 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
 async function wireStreamEventDedupCache(config: Config): Promise<void> {
   if (!config.redisEnabled) {
     logger.info('Redis disabled — stream event dedup will use in-memory cache');
-    setDedupCache(new InMemoryDedupCache());
+    setDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
     return;
   }
 
@@ -175,8 +175,8 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
       clusterNodes: config.redisClusterNodes,
     });
 
-    const primary = new RedisDedupCache(redisClient);
-    const fallback = new InMemoryDedupCache();
+    const primary = new RedisDedupCache(redisClient, config.dedupWindowSeconds);
+    const fallback = new InMemoryDedupCache(config.dedupWindowSeconds);
     const hybrid = new HybridDedupCache(primary, fallback, true);
 
     setDedupCache(hybrid);
@@ -194,14 +194,14 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       },
     );
-    setDedupCache(new InMemoryDedupCache());
+    setDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
   }
 }
 
 async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
   if (!config.redisEnabled) {
     logger.info('Redis disabled — inbound webhook dedup will use in-memory cache');
-    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    setInboundWebhookDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
     return;
   }
 
@@ -215,8 +215,8 @@ async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
       clusterNodes: config.redisClusterNodes,
     });
 
-    const primary = new RedisDedupCache(redisClient);
-    const fallback = new InMemoryDedupCache();
+    const primary = new RedisDedupCache(redisClient, config.dedupWindowSeconds);
+    const fallback = new InMemoryDedupCache(config.dedupWindowSeconds);
     const hybrid = new HybridDedupCache(primary, fallback, true);
 
     setInboundWebhookDedupCache(hybrid);
@@ -234,7 +234,7 @@ async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       },
     );
-    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    setInboundWebhookDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
   }
 }
 
