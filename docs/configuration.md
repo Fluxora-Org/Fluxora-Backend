@@ -32,6 +32,8 @@ Secret values are never included in validation messages.
 | `STELLAR_RPC_TIMEOUT`             | integer ms                                     | `10000`                                                                                                  |
 | `STELLAR_RPC_MAX_RETRIES`         | integer                                        | `3`                                                                                                      |
 | `STELLAR_RPC_RETRY_DELAY`         | integer ms                                     | `1000`                                                                                                   |
+| `STELLAR_CONTRACT_REACHABILITY_CHECK` | boolean | `true` outside `NODE_ENV=test`; set `false` to skip the startup contract-existence probe |
+| `STELLAR_CONTRACT_REACHABILITY_STRICT` | boolean | `false` (failures are logged prominently); `true` aborts startup on a malformed, wrong-network, or unreachable contract |
 | `JWT_EXPIRES_IN`                  | string                                         | `24h`                                                                                                    |
 | `API_KEYS`                        | comma-separated string                         | Empty, except `test-api-key` in tests                                                                    |
 | `API_KEY_PEPPER`                  | string, min 32 chars                           | unset — required at runtime to mint/validate API keys (see [auth.md](./auth.md#api-keys)). Never logged. |
