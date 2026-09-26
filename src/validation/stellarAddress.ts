@@ -37,7 +37,6 @@
 import type { StellarNetwork } from '../config/stellar.js';
 
 // SEP-23 StrKey constants shared by every Stellar address type.
-export const STELLAR_ACCOUNT_CACHE_PREFIX = 'fluxora:stellar:account:';
 
 export const STELLAR_STRKEY_LENGTH = 56;
 export const STELLAR_STRKEY_DECODED_LENGTH = 35;
@@ -45,7 +44,7 @@ export const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
 export const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 /** Cache key prefix for validated Stellar account existence results in Redis. */
-export const STELLAR_ACCOUNT_CACHE_PREFIX = 'stellar:account:';
+export const STELLAR_ACCOUNT_CACHE_PREFIX = 'fluxora:stellar:account:';
 
 /** Version bytes (the first decoded byte) for the well-known StrKey kinds. */
 export const STELLAR_STRKEY_VERSION = {

@@ -67,7 +67,7 @@ describe('resolveRoute', () => {
       baseUrl: '',
       route: undefined,
       originalUrl: '/multiple///'
-    });
+    };
     // After collapse of a single trailing slash, remaining empties are kept
     // by normalizeRouteLabel join; high-cardinality policy does not alter
     // static vocabulary segments.

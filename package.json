@@ -39,10 +39,9 @@
     "check:sdk:ts": "node scripts/generate-sdk-ts.mjs --check",
     "check:sdk:version": "node scripts/check-sdk-version-sync.mjs",
     "check:sdk": "pnpm check:sdk:python && pnpm check:sdk:ts && pnpm check:sdk:version",
-    "check:performance-budget": "node scripts/check-performance-budget.mjs"
-    "generate:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts",
-    "check:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts --check"
     "check:performance-budget": "node scripts/check-performance-budget.mjs",
+    "generate:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts",
+    "check:sdk:fixtures": "tsx scripts/generate-sdk-fixtures.ts --check",
     "audit:check": "node scripts/audit-security.mjs",
     "audit:validate": "node scripts/audit-security.mjs --validate"
   },
@@ -98,7 +97,6 @@
     "@typescript-eslint/eslint-plugin": "^8.59.0",
     "@typescript-eslint/parser": "^8.59.0",
     "@vitest/coverage-v8": "^4.1.11",
-    "@vitest/coverage-v8": "^3.2.6",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "aws-sdk-client-mock": "^4.1.0",
@@ -111,8 +109,6 @@
     "typescript": "^5.9.3",
     "vite": "^6.4.3",
     "vitest": "^4.1.11",
-    "ws": "^8.20.0"
-    "vitest": "^3.2.6",
     "ws": "^8.20.0",
     "yaml": "2.9.0"
   },

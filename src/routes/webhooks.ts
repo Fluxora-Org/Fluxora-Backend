@@ -362,7 +362,7 @@ webhooksRouter.get('/outbox', (req, res) => {
   const total = items.length;
   const page = items.slice(offset, offset + limit);
 
-  res.json({
+  res.json(successResponse({
     total,
     limit,
     offset,
@@ -578,7 +578,7 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
       },
     ],
     observedAt: new Date(now).toISOString(),
-  });
+  }, requestId));
 });
 
 /**
