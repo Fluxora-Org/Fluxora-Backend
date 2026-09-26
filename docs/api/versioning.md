@@ -75,3 +75,13 @@ When Fluxora introduces a `v2` of the API, the following strategy will be employ
 2. **Default Phase:** The default behavior for requests missing the header will eventually be changed to `v2` after ample communication.
 3. **Deprecation Phase:** `v1` will be marked as deprecated but will continue to function for clients explicitly passing `Accept-Version: v1`.
 4. **Sunset Phase:** `v1` will be removed, and requests for it will result in an `unsupported_version` error.
+
+## Client SDKs
+
+The generated TypeScript (`@fluxora/sdk`) and Python (`fluxora-sdk`) clients are
+versioned in lockstep with the API: their version is copied from `openapi.yaml`
+`info.version`, and `scripts/check-sdk-version-sync.mjs` fails CI if the two ever
+drift. Publication of both SDKs is automated from a `v*` tagged release.
+
+See [SDK Versioning & Publication](../sdk-publishing.md) for the versioning
+policy, the release runbook, and where to obtain each SDK.

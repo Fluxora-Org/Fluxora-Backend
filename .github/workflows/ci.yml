@@ -142,6 +142,12 @@ jobs:
       - name: SDK drift check (TypeScript)
         run: node scripts/generate-sdk-ts.mjs --check
 
+      # The generated SDK version must equal `openapi.yaml` info.version, so a
+      # breaking API change can never ship an SDK that still advertises the old
+      # version. See docs/sdk-publishing.md.
+      - name: SDK version sync check
+        run: node scripts/check-sdk-version-sync.mjs
+
       - name: Check migration naming policy
         run: pnpm run check:migrations
 
