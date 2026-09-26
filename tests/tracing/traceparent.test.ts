@@ -17,6 +17,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import express, { type Request, type Response, type NextFunction } from 'express';
+
+import { stubOutboundWebhookTransport } from '../helpers/webhookTransport.js';
 import {
   parseTraceparent,
   buildTraceparent,
@@ -369,12 +371,10 @@ describe('WebhookDispatcher — outbound traceparent header', () => {
   it('attaches traceparent header when active trace context exists', async () => {
     const { WebhookDispatcher } = await import('../../src/webhooks/dispatcher.js');
 
-    const capturedHeaders: Record<string, string> = {};
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-      const headers = init?.headers as Record<string, string> | undefined;
-      if (headers) Object.assign(capturedHeaders, headers);
-      return new Response(null, { status: 200 });
-    });
+    // The dispatcher sends through `node:https` (so it can pin the resolved IP
+    // and defeat DNS rebinding), not `fetch` — stubbing `global.fetch` left this
+    // test opening a real socket and never observing a header.
+    const transport = stubOutboundWebhookTransport();
 
     const mockStore = {
       checkAndClaimAttempt: vi.fn().mockResolvedValue({ allowed: true, state: 'CLOSED' }),
@@ -407,22 +407,17 @@ describe('WebhookDispatcher — outbound traceparent header', () => {
       })
     );
 
-    expect(capturedHeaders['traceparent']).toBe(
+    expect(transport.last().headers['traceparent']).toBe(
       `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`
     );
 
-    fetchSpy.mockRestore();
+    transport.restore();
   });
 
   it('does not attach traceparent header when no trace context exists', async () => {
     const { WebhookDispatcher } = await import('../../src/webhooks/dispatcher.js');
 
-    const capturedHeaders: Record<string, string> = {};
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-      const headers = init?.headers as Record<string, string> | undefined;
-      if (headers) Object.assign(capturedHeaders, headers);
-      return new Response(null, { status: 200 });
-    });
+    const transport = stubOutboundWebhookTransport();
 
     const mockStore = {
       checkAndClaimAttempt: vi.fn().mockResolvedValue({ allowed: true, state: 'CLOSED' }),
@@ -446,9 +441,13 @@ describe('WebhookDispatcher — outbound traceparent header', () => {
       attemptNumber: 1,
     });
 
-    expect(capturedHeaders['traceparent']).toBeUndefined();
+    // A transport-level assertion is what makes this meaningful: previously
+    // the stub was on `fetch`, which the dispatcher never calls, so the
+    // captured headers stayed empty and this test passed vacuously.
+    expect(transport.deliveries).toHaveLength(1);
+    expect(transport.last().headers['traceparent']).toBeUndefined();
 
-    fetchSpy.mockRestore();
+    transport.restore();
   });
 });
 

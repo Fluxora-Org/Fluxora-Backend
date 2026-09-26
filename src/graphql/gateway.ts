@@ -34,9 +34,7 @@
 import { Router, type Request, type Response } from 'express';
 import {
   graphql,
-  GraphQLError,
   parse,
-  GraphQLError,
   type DocumentNode,
   type GraphQLError,
   type SelectionNode,
@@ -45,8 +43,7 @@ import {
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import type { StreamFilter, StreamStatus } from '../db/types.js';
 import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
@@ -557,16 +554,6 @@ graphqlGatewayRouter.post(
           return;
         }
 
-        const persistedQuery = extensions as { version?: unknown; sha256Hash?: unknown };
-        const { version, sha256Hash } = persistedQuery;
-
-        if (version !== 1) {
-          res
-            .status(400)
-            .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
-          return;
-        }
-
         const persistedQuery = (extensions as Record<string, unknown>).persistedQuery;
         if (persistedQuery !== undefined) {
           if (typeof persistedQuery !== 'object' || persistedQuery === null || Array.isArray(persistedQuery)) {
@@ -654,16 +641,6 @@ graphqlGatewayRouter.post(
         res.status(400).json(
           errorResponse('GRAPHQL_PARSE_ERROR', 'GraphQL query could not be parsed.', undefined, requestId),
         );
-        res
-          .status(400)
-          .json(
-            errorResponse(
-              'GRAPHQL_PARSE_ERROR',
-              'GraphQL query could not be parsed.',
-              undefined,
-              requestId
-            )
-          );
         return;
       }
 

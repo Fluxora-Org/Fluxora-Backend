@@ -142,6 +142,14 @@ export interface Config {
   /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
   wsAuthRequired: boolean;
   wsMaxConnectionsPerIp: number;
+  /** Max subscription filters a single WebSocket connection may hold. */
+  wsMaxSubscriptionsPerConnection: number;
+  /** Max messages queued for a slow WebSocket client before backpressure kicks in. */
+  wsMaxOutboundQueuePerConnection: number;
+  /** Max bytes queued for a slow WebSocket client. */
+  wsMaxOutboundQueueBytesPerConnection: number;
+  /** Max size of a single inbound WebSocket frame, in bytes. */
+  wsMaxInboundMessageBytes: number;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -409,6 +417,10 @@ function toConfig(env: ParsedEnv): Config {
     /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
     wsAuthRequired: env.WS_AUTH_REQUIRED,
     wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
+    wsMaxSubscriptionsPerConnection: env.WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    wsMaxOutboundQueuePerConnection: env.WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION,
+    wsMaxOutboundQueueBytesPerConnection: env.WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION,
+    wsMaxInboundMessageBytes: env.WS_MAX_INBOUND_MESSAGE_BYTES,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,

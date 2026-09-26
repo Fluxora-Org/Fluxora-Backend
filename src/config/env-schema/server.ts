@@ -7,6 +7,14 @@
  */
 import { booleanEnv, integerEnv, optionalString } from './parsers.js';
 
+/**
+ * Default ceiling on a single inbound WebSocket frame, in bytes.
+ *
+ * Exported so the WebSocket message handler can size its parser without
+ * reaching into the parsed config (which is only available after startup).
+ */
+export const DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES = 4_096;
+
 export const serverEnvSchema = {
   /** Validate stream queries against allowlisted columns. @default true */
   ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
@@ -27,6 +35,30 @@ export const serverEnvSchema = {
   WS_ALLOWED_ORIGINS: optionalString('WS_ALLOWED_ORIGINS'),
   /** Max concurrent WebSocket connections per client IP. @default 10 */
   WS_MAX_CONNECTIONS_PER_IP: integerEnv('WS_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+  /** Max subscription filters a single WebSocket connection may hold. @default 32 */
+  WS_MAX_SUBSCRIPTIONS_PER_CONNECTION: integerEnv(
+    'WS_MAX_SUBSCRIPTIONS_PER_CONNECTION',
+    1,
+    100_000,
+  ).default(32),
+  /** Max messages queued for a slow WebSocket client before backpressure. @default 128 */
+  WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION: integerEnv(
+    'WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION',
+    1,
+    100_000,
+  ).default(128),
+  /** Max bytes queued for a slow WebSocket client. @default 1048576 */
+  WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION: integerEnv(
+    'WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION',
+    1,
+    64 * 1024 * 1024,
+  ).default(1024 * 1024),
+  /** Max size of a single inbound WebSocket frame, in bytes. @default 4096 */
+  WS_MAX_INBOUND_MESSAGE_BYTES: integerEnv(
+    'WS_MAX_INBOUND_MESSAGE_BYTES',
+    1,
+    16 * 1024 * 1024,
+  ).default(DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES),
   /** Max WebSocket reconnect attempts per client window. @default 20 */
   WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
   /** Sliding window for WS reconnect limiting, in ms. @default 60000 */
