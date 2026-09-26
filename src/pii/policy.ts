@@ -71,7 +71,15 @@ export interface PurgeableRetentionRule extends RetentionRule {
   purgeAction: 'delete' | 'redact';
 }
 
-export const STREAM_FIELD_POLICIES: Record<keyof import('../db/types.js').StreamRecord, FieldPolicy> = {
+export type StreamFieldPolicyKey =
+  | keyof import('../db/types.js').StreamRecord
+  | 'sender'
+  | 'recipient'
+  | 'depositAmount'
+  | 'ratePerSecond'
+  | 'startTime';
+
+export const STREAM_FIELD_POLICIES: Record<StreamFieldPolicyKey, FieldPolicy> = {
   id: {
     classification: DataClassification.INTERNAL,
     redactInLogs: false,
@@ -146,7 +154,32 @@ export const STREAM_FIELD_POLICIES: Record<keyof import('../db/types.js').Stream
     classification: DataClassification.INTERNAL,
     redactInLogs: false,
     rationale: 'Internal timestamp.',
-  }
+  },
+  sender: {
+    classification: DataClassification.SENSITIVE,
+    redactInLogs: true,
+    rationale: 'Stellar public key — pseudonymous but correlatable.',
+  },
+  recipient: {
+    classification: DataClassification.SENSITIVE,
+    redactInLogs: true,
+    rationale: 'Stellar public key — pseudonymous but correlatable.',
+  },
+  depositAmount: {
+    classification: DataClassification.INTERNAL,
+    redactInLogs: false,
+    rationale: 'On-chain amount; publicly observable via Horizon.',
+  },
+  ratePerSecond: {
+    classification: DataClassification.INTERNAL,
+    redactInLogs: false,
+    rationale: 'Derived from on-chain contract state.',
+  },
+  startTime: {
+    classification: DataClassification.PUBLIC,
+    redactInLogs: false,
+    rationale: 'Unix timestamp; publicly observable.',
+  },
 };
 
 /**

@@ -35,6 +35,7 @@ import { Router, type Request, type Response } from 'express';
 import {
   graphql,
   parse,
+  GraphQLError,
   type DocumentNode,
   type GraphQLError,
   type SelectionNode,
@@ -400,7 +401,7 @@ function createRootValue(req: Request) {
      */
     async streams(args: {
       limit?: number;
-      status?: string;
+      status?: ApiStreamStatus;
       contractId?: string;
       afterId?: string;
       includeTotal?: boolean;

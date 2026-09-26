@@ -3,7 +3,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { changedTypeScriptFiles, lintFiles } from './lint-changed-files.mjs';
+import { baseRef, changedTypeScriptFiles, lintFiles, refExists } from './lint-changed-files.mjs';
 
 const ROOT = new URL('../', import.meta.url).pathname;
 const SCRIPT = new URL('./lint-changed-files.mjs', import.meta.url).pathname;
@@ -20,6 +20,10 @@ beforeEach(() => {
 afterEach(() => {
   fs.rmSync(scratch, { recursive: true, force: true });
   delete process.env.LINT_FILES;
+  delete process.env.LINT_BASE;
+  delete process.env.CI;
+  delete process.env.GITHUB_EVENT_NAME;
+  delete process.env.GITHUB_BASE_REF;
 });
 
 function source(name, content) {
@@ -54,6 +58,8 @@ describe('changed-files lint scoping', () => {
 });
 
 describe('lintFiles rejects deliberate violations', () => {
+  const TIMEOUT = 60000;
+
   it('flags a no-console violation as an error', async () => {
     const dirty = source('dirty.ts', 'export function bad(): void {\n  console.log("boom");\n}\n');
     const { results } = await lintFiles([dirty]);
@@ -67,7 +73,7 @@ describe('lintFiles rejects deliberate violations', () => {
     const { results } = await lintFiles([clean]);
     const total = results.reduce((n, r) => n + r.errorCount + r.warningCount, 0);
     expect(total).toBe(0);
-  });
+  }, TIMEOUT);
 });
 
 describe('CLI exit codes are deterministic', () => {
@@ -91,3 +97,37 @@ describe('CLI exit codes are deterministic', () => {
     expect(res.stdout).toMatch(/no changed TypeScript files/);
   }, CLI_TIMEOUT);
 });
+
+describe('baseRef resolution', () => {
+  it('prefers LINT_BASE env override', () => {
+    process.env.LINT_BASE = 'custom-base';
+    expect(baseRef()).toBe('custom-base');
+  });
+
+  it('uses origin/GITHUB_BASE_REF in CI pull requests', () => {
+    process.env.CI = 'true';
+    process.env.GITHUB_EVENT_NAME = 'pull_request';
+    process.env.GITHUB_BASE_REF = 'develop';
+    expect(baseRef()).toBe('origin/develop');
+  });
+
+  it('falls back to origin/main or main when not in a PR', () => {
+    delete process.env.CI;
+    delete process.env.GITHUB_EVENT_NAME;
+    delete process.env.GITHUB_BASE_REF;
+    delete process.env.LINT_BASE;
+    const ref = baseRef();
+    expect(['origin/main', 'main']).toContain(ref);
+  });
+});
+
+describe('refExists helper', () => {
+  it('returns true for HEAD', () => {
+    expect(refExists('HEAD')).toBe(true);
+  });
+
+  it('returns false for nonexistent-ref-xyz', () => {
+    expect(refExists('nonexistent-ref-xyz-12345')).toBe(false);
+  });
+});
+

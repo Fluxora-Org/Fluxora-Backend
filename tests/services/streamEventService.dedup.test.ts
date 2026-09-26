@@ -121,6 +121,18 @@ class TestFailableRedisClient implements RedisClient {
     return this.store.has(key);
   }
 
+  async incr(key: string): Promise<number> {
+    this.totalOperationAttempts++;
+    if (!this.isAvailable) {
+      this.totalFailuresEncountered++;
+      throw new Error("Redis outage (simulated incr failure)");
+    }
+    const current = parseInt(this.store.get(key) ?? '0', 10);
+    const next = isNaN(current) ? 1 : current + 1;
+    this.store.set(key, String(next));
+    return next;
+  }
+
   async close(): Promise<void> {
     this.store.clear();
   }

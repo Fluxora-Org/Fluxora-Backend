@@ -16,11 +16,29 @@
  */
 
 import process from 'node:process';
+import util from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { ESLint } from 'eslint';
 
+// Polyfill util.styleText for Node runtimes < 20.12 (used by ESLint's stylish formatter)
+if (typeof util.styleText !== 'function') {
+  util.styleText = (_format, text) => text;
+}
+
 const ROOT = new URL('../', import.meta.url);
 const pathname = (p) => new URL(p, ROOT).pathname;
+
+/**
+ * Verify whether a git reference resolves to a valid commit object.
+ */
+export function refExists(ref) {
+  const check = spawnSync(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
+    { cwd: pathname('.'), encoding: 'utf8' },
+  );
+  return check.status === 0;
+}
 
 /**
  * Base revision to diff against. For PRs we diff against the merged base

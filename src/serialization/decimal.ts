@@ -501,7 +501,7 @@ export function serializeAmountFields<T extends Record<string, unknown>>(
  */
 export function validateAmountFields<T extends Record<string, unknown>>(
   obj: T,
-  fieldNames: (keyof T)[]
+  fieldNames: readonly (keyof T)[]
 ): { valid: boolean; errors: DecimalSerializationError[] } {
   const errors: DecimalSerializationError[] = [];
   

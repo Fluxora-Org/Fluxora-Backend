@@ -378,6 +378,7 @@ export const EnvSchema = z
 
     ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
     ENABLE_RATE_LIMIT: booleanEnv().optional(),
+    EARLY_HINTS_ENABLED: booleanEnv().default(true),
     REQUIRE_PARTNER_AUTH: booleanEnv().default(false),
     PARTNER_API_TOKEN: optionalString('PARTNER_API_TOKEN'),
     REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
@@ -730,6 +731,7 @@ export interface Config {
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
+  earlyHintsEnabled: boolean;
   idempotencyTtlSeconds: number;
   requirePartnerAuth: boolean;
   partnerApiToken?: string | undefined;
@@ -991,6 +993,7 @@ function toConfig(env: ParsedEnv): Config {
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
+    earlyHintsEnabled: env.EARLY_HINTS_ENABLED,
     idempotencyTtlSeconds: env.IDEMPOTENCY_TTL_SECONDS,
     requirePartnerAuth: env.REQUIRE_PARTNER_AUTH,
     partnerApiToken: env.PARTNER_API_TOKEN,

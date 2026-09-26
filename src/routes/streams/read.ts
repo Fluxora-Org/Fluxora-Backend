@@ -41,7 +41,7 @@ import {
 } from './guards.js';
 import { isStreamListingHealthy } from './state.js';
 
-const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
+export const STREAMS_ENHANCED_RESPONSE_FLAG = 'streams_enhanced_response';
 const MAX_EXPORT_PAGES = 1000;
 const JSON_LD_CONTEXT_LINK =
   '<https://fluxora.dev/ns/v1>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"';
@@ -110,7 +110,7 @@ async function listStreamsHandler(req: Request, res: Response): Promise<void> {
     if (sender) queryParams.sender = sender;
     if (recipient) queryParams.recipient = recipient;
     if (includeTotal) queryParams.include_total = 'true';
-    sendEarlyHints(res, { baseUrl: '/api/streams', hasMore: true, nextCursor: body.next_cursor, queryParams });
+    sendEarlyHints(res, { baseUrl: '/api/streams', hasMore: true, nextCursor: body.next_cursor, queryParams }, req);
   }
 
   if (isFlagEnabled(STREAMS_ENHANCED_RESPONSE_FLAG, getFeatureFlagRequesterId(req))) {

@@ -45,7 +45,6 @@ interface WebhookHttpResponse {
   headers: Headers;
 }
 
-type LookupCallback = (error: Error | null, address: string, family: number) => void;
 
 type FetchRedirectOptions = Omit<RequestInit, 'redirect'>;
 
@@ -115,12 +114,12 @@ async function followFetchRedirects(
  * Returning the address prevents the HTTP client from performing a second DNS
  * lookup that could receive a rebinding answer.
  */
-function lookupWebhookTarget(
+const lookupWebhookTarget: https.RequestOptions['lookup'] = (
   hostname: string,
-  options: number | dns.LookupOneOptions,
-  callback: LookupCallback,
-): void {
-  const family = typeof options === 'number' ? options : options.family;
+  options: dns.LookupOptions,
+  callback: (err: NodeJS.ErrnoException | null, address: string, family?: number) => void,
+): void => {
+  const family = typeof options === 'number' ? options : (typeof options === 'object' && options !== null ? options.family : undefined);
   dns.lookup(hostname, { family, all: false }, (error, address, resolvedFamily) => {
     if (error) {
       callback(error, address, resolvedFamily);
@@ -133,14 +132,14 @@ function lookupWebhookTarget(
     } catch (validationError) {
       callback(
         validationError instanceof Error
-          ? validationError
+          ? (validationError as NodeJS.ErrnoException)
           : new WebhookTargetValidationError('Resolved webhook address was rejected'),
         address,
         resolvedFamily,
       );
     }
   });
-}
+};
 
 /**
  * Enhanced webhook dispatcher with durable delivery and proper error handling

@@ -76,12 +76,13 @@ export function errorHandler(
     return;
   }
 
-  if (err instanceof ApiError) {
-    logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId, ...traceSpanIds });
+  if (err instanceof ApiError || (err && typeof (err as ApiError).statusCode === 'number')) {
+    const apiErr = err as ApiError;
+    logError(`API error: ${apiErr.message}`, { code: apiErr.code, statusCode: apiErr.statusCode, details: apiErr.details, requestId, ...traceSpanIds });
 
-    if (err.expose) {
-      res.status(err.statusCode).json(
-        errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
+    if (apiErr.expose) {
+      res.status(apiErr.statusCode).json(
+        errorResponse(apiErr.code ?? ApiErrorCode.INTERNAL_ERROR, apiErr.message, apiErr.details, requestId)
       );
     } else {
       res.status(err.statusCode).json(

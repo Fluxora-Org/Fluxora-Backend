@@ -29,6 +29,7 @@ const mockRedisClient = (overrides: Partial<RedisClient> = {}): RedisClient => (
     setNx: vi.fn().mockResolvedValue(true),
     del: vi.fn().mockResolvedValue(undefined),
     exists: vi.fn().mockResolvedValue(false),
+    incr: vi.fn().mockResolvedValue(1),
     close: vi.fn().mockResolvedValue(undefined),
     multi: vi.fn(),
     zcount: vi.fn().mockResolvedValue(0),

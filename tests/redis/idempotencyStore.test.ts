@@ -40,6 +40,10 @@ function makeEntry(overrides: Partial<IdempotentEntry> = {}): IdempotentEntry {
   };
 }
 
+function asEntry<T>(val: IdempotentEntry<T> | 'in_progress' | null | undefined): IdempotentEntry<T> | null {
+  return typeof val === 'object' && val !== null ? val : null;
+}
+
 // ── RedisIdempotencyStore ─────────────────────────────────────────────────────
 
 describe('RedisIdempotencyStore', () => {
@@ -58,15 +62,15 @@ describe('RedisIdempotencyStore', () => {
 
   it('returns the stored entry on cache hit', async () => {
     const entry = makeEntry();
-    await store.set('', 'tenant-a', 'tenant-a', entry, 3600);
+    await store.set('key-1', 'tenant-a', entry, 3600);
     const result = await store.get('key-1', 'tenant-a');
     expect(result).toEqual(entry);
   });
 
   it('preserves status code and body exactly through serialisation round-trip', async () => {
     const entry = makeEntry({ statusCode: 201, body: { data: { id: 'stream-xyz' }, meta: { requestId: 'r1' } } });
-    await store.set('', 'tenant-a', entry, 60);
-    const result = await store.get('', 'tenant-a');
+    await store.set('key-1', 'tenant-a', entry, 60);
+    const result = asEntry(await store.get('key-1', 'tenant-a'));
     expect(result?.statusCode).toBe(201);
     expect(result?.body).toEqual(entry.body);
     expect(result?.requestFingerprint).toBe(entry.requestFingerprint);
@@ -74,9 +78,9 @@ describe('RedisIdempotencyStore', () => {
 
   it('stores under the namespaced key (fluxora:idempotency: prefix)', async () => {
     const entry = makeEntry();
-    await store.set('', 'tenant-a', entry, 100);
+    await store.set('my-key', 'tenant-a', entry, 100);
     // Access the fake's internal string store via get() to confirm the prefix
-    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}my-key`);
+    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}tenant-a:my-key`);
     expect(raw).not.toBeNull();
     const parsed = JSON.parse(raw!);
     expect(parsed).toMatchObject(entry);
@@ -86,9 +90,9 @@ describe('RedisIdempotencyStore', () => {
   it('forwards the TTL to the Redis client', async () => {
     const setSpy = vi.spyOn(fake, 'set');
     const entry = makeEntry();
-    await store.set('', 'tenant-a', entry, 7200);
+    await store.set('key-ttl', 'tenant-a', entry, 7200);
     expect(setSpy).toHaveBeenCalledWith(
-      `${IDEMPOTENCY_KEY_PREFIX}key-ttl`,
+      `${IDEMPOTENCY_KEY_PREFIX}tenant-a:key-ttl`,
       expect.any(String),
       { ex: 7200 },
     );
@@ -97,10 +101,10 @@ describe('RedisIdempotencyStore', () => {
   it('different keys are independent', async () => {
     const e1 = makeEntry({ requestFingerprint: 'fp-1' });
     const e2 = makeEntry({ requestFingerprint: 'fp-2' });
-    await store.set('', 'tenant-a', e1, 60);
-    await store.set('', 'tenant-a', e2, 60);
-    expect((await store.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-1');
-    expect((await store.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-2');
+    await store.set('key-a', 'tenant-a', e1, 60);
+    await store.set('key-b', 'tenant-a', e2, 60);
+    expect(asEntry(await store.get('key-a', 'tenant-a'))?.requestFingerprint).toBe('fp-1');
+    expect(asEntry(await store.get('key-b', 'tenant-a'))?.requestFingerprint).toBe('fp-2');
   });
 
   // ── Graceful degradation ──────────────────────────────────────────────────
@@ -108,7 +112,7 @@ describe('RedisIdempotencyStore', () => {
   it('returns null and logs a warning when Redis get throws', async () => {
     fake.throwOnNext('get');
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
-    const result = await store.get('', 'tenant-a');
+    const result = await store.get('k', 'tenant-a');
     expect(result).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Idempotency store'),
@@ -125,7 +129,7 @@ describe('RedisIdempotencyStore', () => {
     fake.throwOnNext('set');
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     // Should not throw
-    await expect(store.set('', 'tenant-a', makeEntry(), 60)).resolves.toBeUndefined();
+    await expect(store.set('k', 'tenant-a', makeEntry(), 60)).resolves.toBeUndefined();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Idempotency store'),
       expect.objectContaining({
@@ -140,8 +144,8 @@ describe('RedisIdempotencyStore', () => {
   it('subsequent get after a failed set returns null (no partial state)', async () => {
     fake.throwOnNext('set');
     vi.spyOn(logger, 'warn').mockImplementation(() => {});
-    await store.set('', 'tenant-a', makeEntry(), 60);
-    const result = await store.get('', 'tenant-a');
+    await store.set('k', 'tenant-a', makeEntry(), 60);
+    const result = await store.get('k', 'tenant-a');
     expect(result).toBeNull();
     vi.restoreAllMocks();
   });
@@ -150,12 +154,12 @@ describe('RedisIdempotencyStore', () => {
     // First set fails
     fake.throwOnNext('set');
     vi.spyOn(logger, 'warn').mockImplementation(() => {});
-    await store.set('', 'tenant-a', makeEntry({ requestFingerprint: 'fp-fail' }), 60);
+    await store.set('k', 'tenant-a', makeEntry({ requestFingerprint: 'fp-fail' }), 60);
 
     // Second set succeeds
     const entry2 = makeEntry({ requestFingerprint: 'fp-ok' });
-    await store.set('', 'tenant-a', entry2, 60);
-    const result = await store.get('', 'tenant-a');
+    await store.set('k', 'tenant-a', entry2, 60);
+    const result = asEntry(await store.get('k', 'tenant-a'));
     expect(result?.requestFingerprint).toBe('fp-ok');
     vi.restoreAllMocks();
   });
@@ -345,12 +349,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
   });
 
   async function seedRaw(key: string, value: unknown) {
-    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}${key}`, JSON.stringify(value), { ex: 3600 });
+    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}tenant-a:${key}`, JSON.stringify(value), { ex: 3600 });
   }
 
   it('returns null and warns on version mismatch (old version)', async () => {
     await seedRaw('k', { ...makeEntry(), version: 0 });
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: expect.stringContaining('version mismatch') }),
@@ -359,7 +363,7 @@ describe('RedisIdempotencyStore — envelope validation', () => {
 
   it('returns null and warns on future version', async () => {
     await seedRaw('k', { ...makeEntry(), version: ENVELOPE_VERSION + 1 });
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: expect.stringContaining('version mismatch') }),
@@ -369,7 +373,7 @@ describe('RedisIdempotencyStore — envelope validation', () => {
   it('returns null and warns when version field is missing', async () => {
     const { version: _v, ...noVersion } = makeEntry();
     await seedRaw('k', noVersion);
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: 'missing version field' }),
@@ -379,7 +383,7 @@ describe('RedisIdempotencyStore — envelope validation', () => {
   it('returns null and warns when requestFingerprint is missing', async () => {
     const { requestFingerprint: _fp, ...noFp } = makeEntry();
     await seedRaw('k', noFp);
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: 'missing or invalid requestFingerprint' }),
@@ -389,7 +393,7 @@ describe('RedisIdempotencyStore — envelope validation', () => {
   it('returns null and warns when statusCode is missing', async () => {
     const { statusCode: _sc, ...noSc } = makeEntry();
     await seedRaw('k', noSc);
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: 'missing or invalid statusCode' }),
@@ -399,7 +403,7 @@ describe('RedisIdempotencyStore — envelope validation', () => {
   it('returns null and warns when body is missing', async () => {
     const { body: _b, ...noBody } = makeEntry();
     await seedRaw('k', noBody);
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: 'missing body' }),
@@ -407,8 +411,8 @@ describe('RedisIdempotencyStore — envelope validation', () => {
   });
 
   it('returns null and warns on malformed (non-object) JSON', async () => {
-    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}k`, '"just a string"', { ex: 3600 });
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}tenant-a:k`, '"just a string"', { ex: 3600 });
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: 'envelope is not an object' }),
@@ -416,8 +420,8 @@ describe('RedisIdempotencyStore — envelope validation', () => {
   });
 
   it('returns null and warns on invalid JSON bytes', async () => {
-    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}k`, '{bad json}', { ex: 3600 });
-    expect(await store.get('', 'tenant-a')).toBeNull();
+    await fake.set(`${IDEMPOTENCY_KEY_PREFIX}tenant-a:k`, '{bad json}', { ex: 3600 });
+    expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
       expect.objectContaining({ reason: 'invalid JSON' }),
@@ -426,22 +430,22 @@ describe('RedisIdempotencyStore — envelope validation', () => {
 
   it('stamps ENVELOPE_VERSION on every set()', async () => {
     const entry = makeEntry();
-    await store.set('', 'tenant-a', entry, 60);
-    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}k`);
+    await store.set('k', 'tenant-a', entry, 60);
+    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}tenant-a:k`);
     expect(JSON.parse(raw!).version).toBe(ENVELOPE_VERSION);
   });
 
   it('overwrites caller-supplied version with ENVELOPE_VERSION on set()', async () => {
     const entry = makeEntry({ version: 99 } as Partial<IdempotentEntry>);
-    await store.set('', 'tenant-a', entry, 60);
-    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}k`);
+    await store.set('k', 'tenant-a', entry, 60);
+    const raw = await fake.get(`${IDEMPOTENCY_KEY_PREFIX}tenant-a:k`);
     expect(JSON.parse(raw!).version).toBe(ENVELOPE_VERSION);
   });
 
   it('returns the entry when the stored envelope is fully valid', async () => {
     const entry = makeEntry();
-    await store.set('', 'tenant-a', entry, 60);
-    const result = await store.get('', 'tenant-a');
+    await store.set('k', 'tenant-a', entry, 60);
+    const result = asEntry(await store.get('k', 'tenant-a'));
     expect(result).not.toBeNull();
     expect(result?.requestFingerprint).toBe(entry.requestFingerprint);
     expect(result?.statusCode).toBe(entry.statusCode);
@@ -477,9 +481,9 @@ describe('RedisIdempotencyStore — cross-instance replay', () => {
 
   it('instance B replays a 201 written by instance A (same key + same body)', async () => {
     const entry = makeEntry({ statusCode: 201 });
-    await instanceA.set('', 'tenant-a', entry, 86400);
+    await instanceA.set('idem-key', 'tenant-a', entry, 86400);
 
-    const replayed = await instanceB.get('', 'tenant-a');
+    const replayed = asEntry(await instanceB.get('idem-key', 'tenant-a'));
     expect(replayed).not.toBeNull();
     expect(replayed?.statusCode).toBe(201);
     expect(replayed?.requestFingerprint).toBe(entry.requestFingerprint);
@@ -488,28 +492,28 @@ describe('RedisIdempotencyStore — cross-instance replay', () => {
 
   it('instance B detects a conflict (same key, different fingerprint) written by instance A', async () => {
     const entryA = makeEntry({ requestFingerprint: 'fp-from-instance-a' });
-    await instanceA.set('', 'tenant-a', entryA, 86400);
+    await instanceA.set('conflict-key', 'tenant-a', entryA, 86400);
 
-    const retrieved = await instanceB.get('', 'tenant-a');
+    const retrieved = asEntry(await instanceB.get('conflict-key', 'tenant-a'));
     // The route handler (not the store) enforces the 409 — the store just
     // returns the stored entry so the caller can compare fingerprints.
     expect(retrieved?.requestFingerprint).toBe('fp-from-instance-a');
   });
 
   it('instance A and B store to isolated keys', async () => {
-    await instanceA.set('', 'tenant-a', makeEntry({ requestFingerprint: 'fp-a' }), 60);
-    await instanceB.set('', 'tenant-a', makeEntry({ requestFingerprint: 'fp-b' }), 60);
+    await instanceA.set('key-a', 'tenant-a', makeEntry({ requestFingerprint: 'fp-a' }), 60);
+    await instanceB.set('key-b', 'tenant-a', makeEntry({ requestFingerprint: 'fp-b' }), 60);
 
-    expect((await instanceA.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-b');
-    expect((await instanceB.get('', 'tenant-a'))?.requestFingerprint).toBe('fp-a');
+    expect(asEntry(await instanceA.get('key-b', 'tenant-a'))?.requestFingerprint).toBe('fp-b');
+    expect(asEntry(await instanceB.get('key-a', 'tenant-a'))?.requestFingerprint).toBe('fp-a');
   });
 
   it('TTL is forwarded correctly from config-derived value', async () => {
     const setSpy = vi.spyOn(sharedFake, 'set');
     const configTtl = 86400; // matches IDEMPOTENCY_TTL_SECONDS default
-    await instanceA.set('', 'tenant-a', makeEntry(), configTtl);
+    await instanceA.set('key-ttl', 'tenant-a', makeEntry(), configTtl);
     expect(setSpy).toHaveBeenCalledWith(
-      `${IDEMPOTENCY_KEY_PREFIX}key-ttl`,
+      `${IDEMPOTENCY_KEY_PREFIX}tenant-a:key-ttl`,
       expect.any(String),
       { ex: configTtl },
     );

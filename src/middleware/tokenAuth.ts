@@ -25,6 +25,7 @@ import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
+import { unauthorized } from './errorHandler.js';
 
 // ── WebSocket JWT auth ────────────────────────────────────────────────────────
 

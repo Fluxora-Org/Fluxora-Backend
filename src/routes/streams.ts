@@ -6,6 +6,7 @@ import { registerSseRoutes } from './streams/sse.js';
 import { registerLongPollRoutes } from './streams/longPoll.js';
 
 export type { Stream } from '../serialization/stream.js';
+export { STREAMS_ENHANCED_RESPONSE_FLAG } from './streams/read.js';
 export {
   enforceStreamScope,
   fingerprintInput,

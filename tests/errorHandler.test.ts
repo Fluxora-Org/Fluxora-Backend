@@ -4,7 +4,7 @@ import request from 'supertest';
 import { ApiError } from '../src/errors.js';
 import { ApiErrorCode, errorHandler } from '../src/middleware/errorHandler.js';
 import { QueryTimeoutError } from '../src/db/pool.js';
-import { DecimalSerializationError } from '../src/serialization/decimal.js';
+import { DecimalSerializationError, DecimalErrorCode } from '../src/serialization/decimal.js';
 
 function buildApp() {
   const app = express();
@@ -25,7 +25,7 @@ function buildApp() {
   });
 
   app.get('/decimal', () => {
-    throw new DecimalSerializationError('INVALID_FORMAT', 'invalid decimal from /internal/db', 'amount', 'secret-value');
+    throw new DecimalSerializationError(DecimalErrorCode.INVALID_FORMAT, 'invalid decimal from /internal/db', 'amount', 'secret-value');
   });
 
   app.get('/too-large', () => {

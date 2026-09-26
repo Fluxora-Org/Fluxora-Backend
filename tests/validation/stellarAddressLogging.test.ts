@@ -9,7 +9,7 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { StellarAddressValidator } from '../../src/validation/stellarAddressValidator.js';
 import { logger } from '../../src/lib/logger.js';
@@ -36,9 +36,9 @@ function makeRpc(responses: Record<string, boolean | Error>): StellarRpcService 
 }
 
 /** Read the current value of one labelled series of the failure counter. */
-function metricCount(reason: string): number {
-  const snapshot = stellarAddressValidationFailuresTotal.get();
-  const match = snapshot.values.find((value) => value.labels.reason === reason);
+async function metricCount(reason: string): Promise<number> {
+  const snapshot = await stellarAddressValidationFailuresTotal.get();
+  const match = snapshot.values.find((value: any) => value.labels.reason === reason);
   return match?.value ?? 0;
 }
 
@@ -53,7 +53,7 @@ describe('StellarAddressValidator observability', () => {
 
   it('contains no console call', () => {
     const source = readFileSync(
-      fileURLToPath(new URL('../../src/validation/stellarAddressValidator.ts', import.meta.url)),
+      path.resolve(__dirname, '../../src/validation/stellarAddressValidator.ts'),
       'utf8'
     );
     expect(source).not.toMatch(/console\./);
@@ -110,10 +110,10 @@ describe('StellarAddressValidator observability', () => {
     const rpc = makeRpc({ [VALID_SENDER]: true, [WRONG_NETWORK_ACCOUNT]: false });
     const validator = new StellarAddressValidator(rpc, null, 300, 'testnet');
 
-    expect(metricCount('wrong-network')).toBe(0);
+    expect(await metricCount('wrong-network')).toBe(0);
     await validator.validate(VALID_SENDER, WRONG_NETWORK_ACCOUNT);
     await validator.validate(VALID_SENDER, WRONG_NETWORK_ACCOUNT);
-    expect(metricCount('wrong-network')).toBe(2);
+    expect(await metricCount('wrong-network')).toBe(2);
   });
 
   it('counts RPC fail-open as rpc-unavailable and keeps the request passing', async () => {
@@ -129,7 +129,7 @@ describe('StellarAddressValidator observability', () => {
       expect(result.valid).toBe(true);
     });
 
-    expect(metricCount('rpc-unavailable')).toBe(2);
+    expect(await metricCount('rpc-unavailable')).toBe(2);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Circuit breaker OPEN'),
       'corr-rpc-1',

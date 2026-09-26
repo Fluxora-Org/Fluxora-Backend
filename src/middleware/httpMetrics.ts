@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
 import { sanitizeMetricLabels } from '../pii/secretPatterns.js';
+import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /** Single label for requests that never matched an Express route. */
 export const UNMATCHED_ROUTE = 'unmatched';

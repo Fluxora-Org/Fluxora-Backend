@@ -43,7 +43,7 @@ interface MockResponse {
 }
 
 function mockHttpsRequests(...responses: MockResponse[]) {
-  return vi.spyOn(https, 'request').mockImplementation(((_url, options, callback) => {
+  return vi.spyOn(https, 'request').mockImplementation(((_url: any, options: any, callback: any) => {
     const request = new EventEmitter() as EventEmitter & { end(body: string): void };
     request.end = () => {
       const response = responses.shift();
@@ -69,7 +69,7 @@ function mockHttpsRequests(...responses: MockResponse[]) {
 afterEach(() => vi.restoreAllMocks());
 
 beforeEach(() => {
-  vi.spyOn(dns, 'lookup').mockImplementation(((_hostname, _options, callback) => {
+  vi.spyOn(dns, 'lookup').mockImplementation(((_hostname: any, _options: any, callback: any) => {
     callback(null, '8.8.8.8', 4);
     return undefined as never;
   }) as never);
@@ -176,7 +176,7 @@ describe('webhook SSRF guard (#1268)', () => {
 
   it('blocks DNS rebinding when connect-time lookup changes from public to private', async () => {
     vi.spyOn(dns.promises, 'lookup').mockResolvedValue({ address: '8.8.8.8', family: 4 });
-    vi.spyOn(dns, 'lookup').mockImplementation(((_hostname, _options, callback) => {
+    vi.spyOn(dns, 'lookup').mockImplementation(((_hostname: any, _options: any, callback: any) => {
       callback(null, '127.0.0.1', 4);
       return undefined as never;
     }) as never);

@@ -9,7 +9,7 @@ import { registry } from '../../src/metrics.js';
 describe('mTLS Validation Failure Audit', () => {
   let req: Partial<Request>;
   let res: Partial<Response>;
-  let next: ReturnType<typeof vi.fn>;
+  let next: any;
   let statusMock: ReturnType<typeof vi.fn>;
   let jsonMock: ReturnType<typeof vi.fn>;
 
