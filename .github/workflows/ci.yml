@@ -177,6 +177,10 @@ jobs:
       - name: SDK fixtures drift check
         run: pnpm run check:sdk:fixtures
 
+      # Drift check: fail CI if OpenAPI spec drifts from shared Zod types
+      - name: OpenAPI types drift check
+        run: pnpm run check:types-openapi
+
       - name: Check migration naming policy
         run: pnpm run check:migrations
 
