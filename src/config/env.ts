@@ -488,6 +488,14 @@ export const EnvSchema = z
     RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
     RPC_FALLBACK_CACHE_TTL_SECONDS: integerEnv('RPC_FALLBACK_CACHE_TTL_SECONDS', 1).default(300),
     RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA: z.preprocess(parseNumber, z.number().min(0).default(0)),
+    /**
+     * Maximum age, in milliseconds, that a last-known-good fallback entry may
+     * be served at while the RPC circuit is OPEN. Enforced independently of
+     * the Redis TTL above so staleness policy is explicit and testable, not
+     * an incidental side effect of cache eviction. Defaults to the TTL's
+     * equivalent in ms so behavior is unchanged unless explicitly configured.
+     */
+    RPC_FALLBACK_CACHE_MAX_AGE_MS: integerEnv('RPC_FALLBACK_CACHE_MAX_AGE_MS', 1).default(300_000),
     RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
     RPC_HEALTH_CHECK_FAILURE_THRESHOLD: integerEnv('RPC_HEALTH_CHECK_FAILURE_THRESHOLD', 1).default(3),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
@@ -687,6 +695,7 @@ export interface Config {
   rpcTimeoutMs: number;
   rpcFallbackCacheTtlSeconds: number;
   rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcFallbackCacheMaxAgeMs: number;
   rpcHealthCheckIntervalMs: number;
   rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
@@ -941,6 +950,7 @@ function toConfig(env: ParsedEnv): Config {
     rpcTimeoutMs: env.RPC_TIMEOUT_MS,
     rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
     rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcFallbackCacheMaxAgeMs: env.RPC_FALLBACK_CACHE_MAX_AGE_MS,
     rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
     rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
