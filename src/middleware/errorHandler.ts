@@ -6,6 +6,7 @@ import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
 import { ApiError, ApiErrorCode, toApiErrorCode } from '../errors.js';
 import { getActiveTraceSpanIds } from '../tracing/hooks.js';
+import { RpcFallbackExhaustedError } from '../services/stellar-rpc.js';
 
 export {
   ApiError,
@@ -59,6 +60,25 @@ export function errorHandler(
     });
     res.status(504).json(
       errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
+    );
+    return;
+  }
+
+  if (err instanceof RpcFallbackExhaustedError) {
+    logError('Stellar RPC fallback cache exhausted', {
+      operation: err.operation,
+      ageMs: err.ageMs,
+      maxAgeMs: err.maxAgeMs,
+      requestId,
+      ...traceSpanIds,
+    });
+    res.status(503).json(
+      errorResponse(
+        ApiErrorCode.SERVICE_UNAVAILABLE,
+        'Stellar RPC is unavailable and the last-known-good data is too stale to serve',
+        { operation: err.operation, ageMs: err.ageMs, maxAgeMs: err.maxAgeMs },
+        requestId,
+      ),
     );
     return;
   }
