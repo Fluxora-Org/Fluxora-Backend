@@ -834,6 +834,20 @@ components:
           description: Opaque request identifier for log correlation
           example: 550e8400-e29b-41d4-a716-446655440000
 
+    SuccessResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data: {}
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
     RootResponse:
       type: object
       required:

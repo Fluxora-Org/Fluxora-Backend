@@ -4,7 +4,7 @@ Fluxora uses response headers and published documentation to give API consumers 
 
 ## Timeline
 
-1. Announce the deprecation in release notes, the changelog, and this policy.
+1. Announce the deprecation in release notes, the [API changelog](./changelog.md#deprecations), and this policy.
 2. Add the route to `src/config/deprecations.ts` with an ISO-8601 UTC sunset date and migration link.
 3. Serve the deprecated route for at least 90 days, or one major release cycle, whichever is longer.
 4. Keep the route behavior-compatible during the deprecation window except for urgent security fixes.

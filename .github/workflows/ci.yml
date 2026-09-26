@@ -180,6 +180,11 @@ jobs:
 
       - name: Check deprecation sunset policy
         run: pnpm run check:deprecations
+      # Required gate: the API changelog must record every externally visible
+      # change, grouped by API version, with breaking changes marked. Adding or
+      # removing an endpoint without a changelog entry fails the build.
+      - name: Check API changelog
+        run: pnpm run check:api-changelog
 
       # The database suites are guarded by DATABASE_URL so local/offline test
       # runs remain lightweight. In CI, give them a real PostgreSQL schema and

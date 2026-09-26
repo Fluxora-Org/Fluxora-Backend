@@ -2,6 +2,8 @@
 
 Fluxora uses header-based API versioning to ensure backward compatibility for our integrators while allowing the platform to evolve. We prioritize header-based negotiation over URI-based versioning (e.g., `/v1/streams`) to keep our endpoint URLs clean, stable, and focused on resources.
 
+The authoritative record of what changed in each API version — including breaking changes and deprecations — is the [API changelog](./changelog.md). It is validated in CI against `openapi.yaml`, so it never drifts from the served surface.
+
 ## The `Accept-Version` Header
 
 All API requests may specify their desired API version using the `Accept-Version` header.
