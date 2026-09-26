@@ -17,6 +17,7 @@
     "check:migrations": "node scripts/check-migration-names.mjs",
     "check:node-version": "node scripts/check-node-version.mjs",
     "check:blue-green-migrations": "node scripts/check-blue-green-migration-compatibility.mjs",
+    "check:deprecations": "tsx scripts/check-deprecation-sunset.ts",
     "seed": "ts-node scripts/seed-test-data.ts",
     "benchmark": "ts-node scripts/benchmark.ts",
     "verify": "ts-node scripts/verify-setup.ts",

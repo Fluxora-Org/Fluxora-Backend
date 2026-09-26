@@ -178,6 +178,9 @@ jobs:
       - name: Check migration naming policy
         run: pnpm run check:migrations
 
+      - name: Check deprecation sunset policy
+        run: pnpm run check:deprecations
+
       # The database suites are guarded by DATABASE_URL so local/offline test
       # runs remain lightweight. In CI, give them a real PostgreSQL schema and
       # run the complete live-DB manifest explicitly so a future skip cannot
