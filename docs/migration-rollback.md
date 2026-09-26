@@ -1,5 +1,9 @@
 # Migration Rollback Procedure
 
+> Forward-application atomicity, the non-transactional manifest, and re-run
+> safety after a partial failure are defined in
+> [`docs/migration-atomicity.md`](./migration-atomicity.md).
+
 The migration files under `src/db/migrations` expose an `up` and `down` path.
 They are feature-level migration contracts and are tested directly; the
 application startup runner remains the timestamped migration set under

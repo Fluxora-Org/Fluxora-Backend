@@ -1,0 +1,16 @@
+{
+  "nonTransactional": [
+    {
+      "name": "1000000000001_add_contract_events_replay_indexes",
+      "reason": "PostgreSQL forbids CREATE/DROP INDEX CONCURRENTLY inside a transaction block; every replay index is guarded with IF [NOT] EXISTS so a failed concurrent build can be replayed safely."
+    },
+    {
+      "name": "20260622000000_streams_composite_pagination_indexes",
+      "reason": "Cursor/offset pagination indexes are built CONCURRENTLY to avoid blocking writes; each create/drop is guarded with IF [NOT] EXISTS so a mid-build failure leaves a re-runnable state."
+    },
+    {
+      "name": "20260624000000_streams_created_at_id_tiebreaker_index",
+      "reason": "The (created_at DESC, id DESC) tiebreaker index is built CONCURRENTLY; IF NOT EXISTS makes a partial failure safe to re-run."
+    }
+  ]
+}
