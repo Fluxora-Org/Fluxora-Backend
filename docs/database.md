@@ -20,6 +20,26 @@ return result.rows.map(rowToReplayCursor);
 
 Full convention: [`src/db/repositories/README.md`](../src/db/repositories/README.md).
 
+## Schema/Type Consistency Check
+
+`src/db/types.ts` declares the shapes the application believes PostgreSQL holds. Because nothing in a normal build compares those declarations against the database, a migration that renames or retypes a column can leave the types asserting something untrue, and the mismatch only surfaces later as a value of the wrong shape.
+
+`scripts/check-db-schema-types.mjs` closes that gap. With a migrated `DATABASE_URL` it:
+
+- reads the declared interfaces (and their type aliases) from `src/db/types.ts`,
+- maps each declared property onto its column (camelCase properties become snake_case columns),
+- introspects the mapped tables (`streams`, `api_keys`, `contract_events`) through `information_schema.columns`, and
+- **fails** (exit code 1) when a declared column is missing — a rename or drop — or when its SQL type family disagrees with the declared type — a retype.
+
+Columns that exist in the schema but are not part of the declared domain shape (for example `streams.sender_address_hash` or `streams.legal_hold`) are reported as non-fatal drift, as is a declared non-null property backed by a nullable column.
+
+```bash
+# after `pnpm run migrate` against the test database
+DATABASE_URL=postgresql://test_user:test_password@localhost:5432/indexer_test pnpm run check:db-types
+```
+
+Without `DATABASE_URL` the check is skipped, matching the other live-database suites. CI runs it in the `test` job immediately after applying migrations, so renaming a mapped column in a migration fails the pipeline until `src/db/types.ts` is updated. Intentional representation differences — a timestamp column exposed as an ISO-8601 `string`, or a JSON-serialized `text` column exposed as `string[]` — are recorded with a reason in `SCHEMA_TYPE_CONTRACT` inside the script.
+
 ## Configuration
 
 | Variable | Default | Description |
