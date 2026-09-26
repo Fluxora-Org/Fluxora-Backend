@@ -3,7 +3,7 @@
 # Environment Variable Reference
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
-issue #1519). 152 variables across 11 subsystems.
+issue #1519). 154 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
 (required, or optional with a runtime fallback).
@@ -56,6 +56,8 @@ issue #1519). 152 variables across 11 subsystems.
 | `HORIZON_NETWORK_PASSPHRASE` | Horizon network passphrase; must match the resolved network's passphrase when set. | — |
 | `HORIZON_URL` | Horizon API base URL. When unset, falls back to the network default (STELLAR_NETWORKS[network].horizonUrl). | — |
 | `STELLAR_CONTRACT_ADDRESS` | Streaming contract address (Stellar contract StrKey, allowlisted when not local). | — |
+| `STELLAR_CONTRACT_REACHABILITY_CHECK` | Master switch for the startup contract-reachability probe (issue #1438). Defaults to true outside NODE_ENV=test. | — |
+| `STELLAR_CONTRACT_REACHABILITY_STRICT` | When true, a malformed, wrong-network, unreachable, or non-existent contract aborts startup; when false (default) it is logged at error level and startup continues. | — |
 | `STELLAR_NETWORK` | Target Stellar network. Defaults to `mainnet` when NODE_ENV=production, otherwise `testnet`. `local` skips pinned-address checks for development. | — |
 | `STELLAR_RPC_MAX_RETRIES` | Retries per failed RPC call. @default 3 | `3` |
 | `STELLAR_RPC_OPERATION_DEADLINES` | Per-operation timeout overrides for Stellar RPC calls. Format: JSON object mapping operation names to timeouts in ms. Example: '{"getLatestLedger":2000,"accountExists":8000}' | — |

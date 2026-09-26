@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { isValidStellarContractAddress } from '../stellarContracts.js';
 import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from '../connectionLimits.js';
 import {
+  booleanEnv,
   integerEnv,
   operationDeadlinesEnv,
   optionalString,
@@ -64,4 +65,8 @@ export const stellarEnvSchema = {
    * Example: '{"getLatestLedger":2000,"accountExists":8000}'
    */
   STELLAR_RPC_OPERATION_DEADLINES: operationDeadlinesEnv(),
+  /** Master switch for the startup contract-reachability probe (issue #1438). Defaults to true outside NODE_ENV=test. */
+  STELLAR_CONTRACT_REACHABILITY_CHECK: booleanEnv().optional(),
+  /** When true, a malformed, wrong-network, unreachable, or non-existent contract aborts startup; when false (default) it is logged at error level and startup continues. */
+  STELLAR_CONTRACT_REACHABILITY_STRICT: booleanEnv().optional(),
 };
