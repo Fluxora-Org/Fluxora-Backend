@@ -19,6 +19,8 @@
  * @module serialization/decimal
  */
 
+import { SerializationLogger } from '../lib/logger.js';
+
 /**
  * Regular expression for validating decimal string format.
  * Allows: optional sign, digits, optional decimal point with digits
@@ -41,6 +43,10 @@ export const MAX_DECIMAL_INTEGER_PART = 9_223_372_036_854_775_807n;
 /**
  * Normalize a validated decimal string by stripping trailing fractional zeros.
  * The input must already match DECIMAL_STRING_PATTERN.
+ *
+ * Precision behaviour: This function performs no rounding. It only removes
+ * trailing zeros from the fractional part to produce the canonical string
+ * representation. The mathematical value remains unchanged.
  *
  * @example
  * normalizeDecimalString("100.50")      // "100.5"
@@ -75,8 +81,24 @@ export function normalizeDecimalString(value: string): string {
  */
 export function compareDecimalStringToZero(value: string): -1 | 0 | 1 {
   const validated = validateDecimalString(value);
-  if (!validated.valid || !validated.value) {
-    throw validated.error!;
+  if (!validated.valid) {
+    if (validated.error) {
+      throw validated.error;
+    }
+    throw new DecimalSerializationError(
+      DecimalErrorCode.INVALID_FORMAT,
+      'Validation failed with unknown error',
+      undefined,
+      value
+    );
+  }
+  if (!validated.value) {
+    throw new DecimalSerializationError(
+      DecimalErrorCode.EMPTY_VALUE,
+      'Validation succeeded but value is missing',
+      undefined,
+      value
+    );
   }
 
   const normalized = validated.value;
@@ -140,7 +162,8 @@ export interface ValidationResult {
  * @example
  * const result = validateDecimalString(100);
  * if (!result.valid) {
- *   console.error(result.error.code);
+ *   // Use structured logging for error tracking
+ *   SerializationLogger.validationFailed('amount', 100, result.error?.code ?? 'UNKNOWN');
  * }
  */
 export function validateDecimalString(value: unknown, fieldName?: string): ValidationResult {
@@ -225,6 +248,13 @@ export function validateDecimalString(value: unknown, fieldName?: string): Valid
 /**
  * Serialize a numeric value to a decimal string
  * 
+ * Precision behaviour: For floating point numbers, this function uses the
+ * JavaScript Number.toString() method which may produce scientific notation
+ * for very small/large numbers. Such values are rejected with PRECISION_LOSS
+ * error to prevent ambiguous representations. Integer values are converted
+ * directly to string with no precision loss. String values are validated and
+ * normalized but not rounded.
+ * 
  * @param value - The value to serialize (number, string, or BigInt)
  * @param fieldName - Optional field name for error context
  * @returns The decimal string representation
@@ -249,9 +279,25 @@ export function serializeToDecimalString(value: unknown, fieldName?: string): st
   if (typeof value === 'string') {
     const result = validateDecimalString(value, fieldName);
     if (!result.valid) {
-      throw result.error;
+      if (result.error) {
+        throw result.error;
+      }
+      throw new DecimalSerializationError(
+        DecimalErrorCode.INVALID_FORMAT,
+        'Validation failed with unknown error',
+        fieldName,
+        value
+      );
     }
-    return result.value!; // validateDecimalString already normalizes
+    if (!result.value) {
+      throw new DecimalSerializationError(
+        DecimalErrorCode.EMPTY_VALUE,
+        'Validation succeeded but value is missing',
+        fieldName,
+        value
+      );
+    }
+    return result.value; // validateDecimalString already normalizes
   }
 
   // Handle numbers
@@ -304,6 +350,12 @@ export function serializeToDecimalString(value: unknown, fieldName?: string): st
 /**
  * Deserialize a decimal string to a number (use with caution)
  * 
+ * Precision behaviour: This function converts the decimal string to a JavaScript
+ * Number, which may lose precision for values outside the safe integer range
+ * (-2^53+1 to 2^53-1) or for high-precision fractional values. The function
+ * validates that the result is finite but does not guarantee precision preservation.
+ * For values requiring exact precision, use string-based operations or BigInt.
+ * 
  * @param value - The decimal string to deserialize
  * @param fieldName - Optional field name for error context
  * @returns The numeric representation
@@ -348,6 +400,12 @@ export function tryDeserializeToNumber(value: unknown, fieldName?: string): numb
 /**
  * Format a decimal string for display (adds thousands separators)
  * 
+ * Precision behaviour: When the `decimals` parameter is specified, the fractional
+ * part is padded with zeros to reach the requested precision (truncation, not rounding).
+ * For example, formatDecimalForDisplay("100.5", 4) returns "100.5000". When the
+ * fractional part has more digits than requested, it is truncated (no rounding).
+ * The integer part is never modified.
+ * 
  * @param value - The decimal string to format
  * @param decimals - Number of decimal places to show
  * @returns Formatted string
@@ -363,7 +421,11 @@ export function formatDecimalForDisplay(value: string, decimals: number = 7): st
     return value; // Return original if invalid
   }
 
-  const [intPart, decPart] = validated.value!.split('.');
+  if (!validated.value) {
+    return value; // Return original if value is missing
+  }
+
+  const [intPart, decPart] = validated.value.split('.');
   if (intPart === undefined) return value;
   const sign = intPart.startsWith('-') ? '-' : '';
   const absIntPart = intPart.replace(/^[+-]/, '');
@@ -468,14 +530,36 @@ export function validateAmountFields<T extends Record<string, unknown>>(
 /**
  * Parse a decimal string to a BigInt representing stroops (7-decimal precision)
  * 
+ * Precision behaviour: This function requires the input to have at most 7 decimal
+ * places (Stellar's precision). If the fractional part has fewer than 7 digits,
+ * it is padded with zeros to reach exactly 7 places (no rounding). For example,
+ * "1.5" becomes 15000000 stroops. Values with more than 7 decimal places are
+ * rejected with PRECISION_EXCEEDED error to prevent silent precision loss.
+ * 
  * @param value - The decimal string to parse
  * @returns BigInt value in stroops
  * @throws DecimalSerializationError if the string has more than 7 decimals
  */
 export function parseToStroops(value: string): bigint {
   const validated = validateDecimalString(value);
-  if (!validated.valid || !validated.value) {
-    throw validated.error!;
+  if (!validated.valid) {
+    if (validated.error) {
+      throw validated.error;
+    }
+    throw new DecimalSerializationError(
+      DecimalErrorCode.INVALID_FORMAT,
+      'Validation failed with unknown error',
+      undefined,
+      value
+    );
+  }
+  if (!validated.value) {
+    throw new DecimalSerializationError(
+      DecimalErrorCode.EMPTY_VALUE,
+      'Validation succeeded but value is missing',
+      undefined,
+      value
+    );
   }
 
   const parts = validated.value.split('.');
@@ -503,6 +587,11 @@ export function parseToStroops(value: string): bigint {
 
 /**
  * Format stroops (BigInt) back to a decimal string with 7-decimal precision
+ * 
+ * Precision behaviour: This function converts the exact stroop value to a decimal
+ * string with up to 7 decimal places. Trailing zeros in the fractional part are
+ * removed to produce the canonical representation. For example, 15000000 stroops
+ * becomes "1.5" (not "1.5000000"). The conversion is exact with no rounding.
  * 
  * @param stroops - The BigInt value in stroops
  * @returns Standard decimal string
