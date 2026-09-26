@@ -1100,9 +1100,24 @@ export const openApiFixtures = {
                 "payload": {
                   "streamId": "stream-abc123"
                 },
-                "failureReason": "RPC timeout",
-                "attempts": 3,
-                "firstFailedAt": "2026-01-01T00:00:00.000Z"
+                "error": "RPC timeout",
+                "attempts": 2,
+                "firstFailedAt": "2026-01-01T00:00:00.000Z",
+                "lastFailedAt": "2026-01-01T00:05:00.000Z",
+                "failureHistory": [
+                  {
+                    "error": "RPC timeout",
+                    "attempt": 1,
+                    "failedAt": "2026-01-01T00:00:00.000Z",
+                    "source": "enqueue"
+                  },
+                  {
+                    "error": "signature mismatch",
+                    "attempt": 2,
+                    "failedAt": "2026-01-01T00:05:00.000Z",
+                    "source": "replay"
+                  }
+                ]
               }
             ],
             "total": 1,
@@ -1165,10 +1180,42 @@ export const openApiFixtures = {
               "payload": {
                 "streamId": "stream-abc123"
               },
-              "failureReason": "RPC timeout",
-              "attempts": 3,
-              "firstFailedAt": "2026-01-01T00:00:00.000Z"
+              "error": "RPC timeout",
+              "attempts": 2,
+              "firstFailedAt": "2026-01-01T00:00:00.000Z",
+              "lastFailedAt": "2026-01-01T00:05:00.000Z",
+              "failureHistory": [
+                {
+                  "error": "RPC timeout",
+                  "attempt": 1,
+                  "failedAt": "2026-01-01T00:00:00.000Z",
+                  "source": "enqueue"
+                },
+                {
+                  "error": "signature mismatch",
+                  "attempt": 2,
+                  "failedAt": "2026-01-01T00:05:00.000Z",
+                  "source": "replay"
+                }
+              ]
             },
+            "failureHistory": [
+              {
+                "error": "RPC timeout",
+                "attempt": 1,
+                "failedAt": "2026-01-01T00:00:00.000Z",
+                "source": "enqueue"
+              },
+              {
+                "error": "signature mismatch",
+                "attempt": 2,
+                "failedAt": "2026-01-01T00:05:00.000Z",
+                "source": "replay"
+              }
+            ],
+            "failureCount": 2,
+            "firstFailure": "RPC timeout",
+            "latestFailure": "signature mismatch",
             "consumerSuspended": false,
             "consecutiveFailures": 0
           },
@@ -1273,10 +1320,30 @@ export const openApiFixtures = {
           "data": {
             "message": "DLQ entry replayed",
             "id": "dlq_001",
-            "topic": "stream.created"
+            "topic": "stream.created",
+            "failureHistory": [
+              {
+                "error": "RPC timeout",
+                "attempt": 1,
+                "failedAt": "2026-01-01T00:00:00.000Z",
+                "source": "enqueue"
+              }
+            ]
           },
           "meta": {
             "timestamp": "2026-01-01T00:00:00.000Z",
+            "requestId": "req_abc123"
+          }
+        }
+      }
+    },
+    "POST /admin/dlq/{id}/retry → 400": {
+      "application/json": {
+        "default": {
+          "success": false,
+          "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Request validation failed",
             "requestId": "req_abc123"
           }
         }

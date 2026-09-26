@@ -1567,6 +1567,9 @@ registry.registerPath({
   method: 'get',
   path: '/admin/dlq',
   summary: 'List dead-letter queue entries',
+  description:
+    'Lists dead-lettered deliveries. Each entry carries `error` (the first recorded failure cause, ' +
+    'never overwritten) and `failureHistory` (every recorded failure, oldest first).',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   request: {
@@ -1590,9 +1593,24 @@ registry.registerPath({
                   id: 'dlq_001',
                   topic: 'stream.created',
                   payload: { streamId: 'stream-abc123' },
-                  failureReason: 'RPC timeout',
-                  attempts: 3,
+                  error: 'RPC timeout',
+                  attempts: 2,
                   firstFailedAt: '2026-01-01T00:00:00.000Z',
+                  lastFailedAt: '2026-01-01T00:05:00.000Z',
+                  failureHistory: [
+                    {
+                      error: 'RPC timeout',
+                      attempt: 1,
+                      failedAt: '2026-01-01T00:00:00.000Z',
+                      source: 'enqueue',
+                    },
+                    {
+                      error: 'signature mismatch',
+                      attempt: 2,
+                      failedAt: '2026-01-01T00:05:00.000Z',
+                      source: 'replay',
+                    },
+                  ],
                 },
               ],
               total: 1,
@@ -1616,6 +1634,9 @@ registry.registerPath({
   method: 'get',
   path: '/admin/dlq/{id}',
   summary: 'Get DLQ entry',
+  description:
+    'Fetches one dead-lettered delivery, including its full `failureHistory` and its first/last ' +
+    'recorded causes. The history is append-only: a later attempt never replaces an earlier cause.',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   request: { params: z.object({ id: z.string() }) },
@@ -1632,10 +1653,42 @@ registry.registerPath({
                 id: 'dlq_001',
                 topic: 'stream.created',
                 payload: { streamId: 'stream-abc123' },
-                failureReason: 'RPC timeout',
-                attempts: 3,
+                error: 'RPC timeout',
+                attempts: 2,
                 firstFailedAt: '2026-01-01T00:00:00.000Z',
+                lastFailedAt: '2026-01-01T00:05:00.000Z',
+                failureHistory: [
+                  {
+                    error: 'RPC timeout',
+                    attempt: 1,
+                    failedAt: '2026-01-01T00:00:00.000Z',
+                    source: 'enqueue',
+                  },
+                  {
+                    error: 'signature mismatch',
+                    attempt: 2,
+                    failedAt: '2026-01-01T00:05:00.000Z',
+                    source: 'replay',
+                  },
+                ],
               },
+              failureHistory: [
+                {
+                  error: 'RPC timeout',
+                  attempt: 1,
+                  failedAt: '2026-01-01T00:00:00.000Z',
+                  source: 'enqueue',
+                },
+                {
+                  error: 'signature mismatch',
+                  attempt: 2,
+                  failedAt: '2026-01-01T00:05:00.000Z',
+                  source: 'replay',
+                },
+              ],
+              failureCount: 2,
+              firstFailure: 'RPC timeout',
+              latestFailure: 'signature mismatch',
               consumerSuspended: false,
               consecutiveFailures: 0,
             },
@@ -1681,9 +1734,27 @@ registry.registerPath({
   method: 'post',
   path: '/admin/dlq/{id}/retry',
   summary: 'Retry DLQ entry',
+  description:
+    'Replays a dead-lettered entry. The response echoes the entry’s `failureHistory` as stored ' +
+    'after the call. When a retry is known to have failed, the reported cause is appended to that ' +
+    'history — the original cause recorded in `entry.error` is never replaced.',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
-  request: { params: z.object({ id: z.string() }) },
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: false,
+      content: {
+        'application/json': {
+          schema: z.object({
+            failed: z.boolean().optional().openapi({ example: false }),
+            error: z.string().optional().openapi({ example: 'signature mismatch' }),
+          }),
+          example: { failed: true, error: 'signature mismatch' },
+        },
+      },
+    },
+  },
   responses: {
     '200': {
       description: 'Retry queued',
@@ -1692,12 +1763,25 @@ registry.registerPath({
           schema: z.record(z.string(), z.unknown()),
           example: {
             success: true,
-            data: { message: 'DLQ entry replayed', id: 'dlq_001', topic: 'stream.created' },
+            data: {
+              message: 'DLQ entry replayed',
+              id: 'dlq_001',
+              topic: 'stream.created',
+              failureHistory: [
+                {
+                  error: 'RPC timeout',
+                  attempt: 1,
+                  failedAt: '2026-01-01T00:00:00.000Z',
+                  source: 'enqueue',
+                },
+              ],
+            },
             meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
           },
         },
       },
     },
+    '400': errorResponses['400'],
     '401': errorResponses['401'],
     '403': errorResponses['403'],
     '404': errorResponses['404'],

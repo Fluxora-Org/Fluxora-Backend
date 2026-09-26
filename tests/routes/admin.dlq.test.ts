@@ -7,6 +7,8 @@
  *  - GET /admin/dlq/:id: entry + consumerSuspended field, 404
  *  - POST /admin/dlq/:id/replay: success, 404, 409 when suspended
  *  - POST /admin/dlq/:id/replay with failed=true: increments failures, suspends at threshold
+ *  - Failure history: the first cause is retained, later attempt failures are
+ *    appended, and the full history is served by GET /admin/dlq/:id
  *  - POST /admin/dlq/consumers/:topic/resume: clears suspension, 401/403, idempotent
  *  - DELETE /admin/dlq/:id: 200, 404
  *  - DELETE /admin/dlq: bulk purge
@@ -31,6 +33,7 @@ const mockRepo = vi.hoisted(() => ({
   recordReplaySuccess:     vi.fn(),
   resumeConsumer:          vi.fn(),
   replayEntry:             vi.fn(),
+  recordFailure:           vi.fn(),
 }));
 
 vi.mock('../../src/db/repositories/dlqRepository.js', () => ({
@@ -57,11 +60,19 @@ vi.mock('../../src/webhooks/retry.js', () => ({
 vi.mock('../../src/openapi/spec.js', () => ({ openApiDocument: {} }));
 
 import { app } from '../../src/app.js';
+import type { DlqFailureAttempt } from '../../src/routes/dlq.js';
 import { generateToken } from '../../src/lib/auth.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { _resetAuditLog, getAuditEntries } from '../../src/lib/auditLog.js';
 
 // ── Shared fixtures ───────────────────────────────────────────────────────────
+
+const FIRST_FAILURE = {
+  error: 'connection timeout',
+  attempt: 1,
+  failedAt: '2026-01-01T00:00:00.000Z',
+  source: 'enqueue',
+};
 
 const ENTRY = {
   id: 'dlq-001',
@@ -73,6 +84,7 @@ const ENTRY = {
   lastFailedAt:  '2026-01-02T00:00:00.000Z',
   correlationId: 'corr-1',
   status: 'dead' as const,
+  failureHistory: [FIRST_FAILURE],
 };
 
 const SUSPENSION_NONE = null;
@@ -119,6 +131,14 @@ beforeEach(() => {
   mockRepo.recordReplayFailure.mockResolvedValue(SUSPENSION_HEALTHY);
   mockRepo.resumeConsumer.mockResolvedValue(null);
   mockRepo.insert.mockResolvedValue(undefined);
+  mockRepo.replayEntry.mockResolvedValue(true);
+  mockRepo.recordFailure.mockImplementation(
+    async (_id: string, failure: DlqFailureAttempt) => ({
+      ...ENTRY,
+      attempts: (ENTRY.failureHistory?.length ?? 0) + 1,
+      failureHistory: [...(ENTRY.failureHistory ?? []), failure],
+    }),
+  );
 });
 
 afterEach(() => {
@@ -474,5 +494,147 @@ describe('DELETE /admin/dlq', () => {
 
     expect(res.status).toBe(200);
     expect(mockRepo.deleteAll).toHaveBeenCalledWith('stream.created');
+  });
+});
+
+// ── Failure history ───────────────────────────────────────────────────────────
+
+/**
+ * A dead-lettered item is only actionable if it records why it failed, so the
+ * causes of every attempt must survive — including the first one.
+ *
+ * These tests drive the real route against a stateful stand-in for the
+ * repository that mirrors the append-only SQL contract: `recordFailure()`
+ * appends to `failureHistory`, increments `attempts`, and never touches
+ * `error`.
+ */
+describe('DLQ failure history', () => {
+  /** Install the stateful repository stand-in and return the mutable entry. */
+  function useStatefulRepo() {
+    const state = {
+      ...ENTRY,
+      attempts: 1,
+      failureHistory: [FIRST_FAILURE],
+    };
+
+    mockRepo.findById.mockImplementation(async (id: string) => (id === state.id ? { ...state } : undefined));
+    mockRepo.findAll.mockImplementation(async () => ({ entries: [{ ...state }], total: 1 }));
+    mockRepo.replayEntry.mockResolvedValue(true);
+    mockRepo.recordReplayFailure.mockResolvedValue({ ...SUSPENSION_HEALTHY, consecutiveFailures: 1 });
+    mockRepo.recordFailure.mockImplementation(async (_id: string, failure: DlqFailureAttempt) => {
+      state.attempts = Math.max(0, state.attempts) + 1;
+      state.failureHistory = [...state.failureHistory, { ...failure, attempt: state.attempts }];
+      return { ...state };
+    });
+
+    return state;
+  }
+
+  const replay = (body: Record<string, unknown>) =>
+    request(app)
+      .post('/admin/dlq/dlq-001/replay')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .send(body);
+
+  const read = () =>
+    request(app)
+      .get('/admin/dlq/dlq-001')
+      .set('Authorization', `Bearer ${operatorToken}`);
+
+  it('retains every cause when an item is failed repeatedly with different errors', async () => {
+    useStatefulRepo();
+
+    const laterCauses = ['TLS handshake timeout', 'upstream returned 503', 'signature mismatch'];
+    for (const cause of laterCauses) {
+      await replay({ failed: true, error: cause }).expect(200);
+    }
+
+    const res = await read().expect(200);
+    const history = res.body.data.entry.failureHistory as Array<{ error: string; attempt: number; failedAt: string }>;
+
+    // Every cause is retained, oldest first — the first one included.
+    expect(history.map((f) => f.error)).toEqual(['connection timeout', ...laterCauses]);
+    // The first cause is still the entry's own error: it was never replaced.
+    expect(res.body.data.entry.error).toBe('connection timeout');
+    expect(res.body.data.firstFailure).toBe('connection timeout');
+    expect(res.body.data.latestFailure).toBe('signature mismatch');
+    expect(res.body.data.failureCount).toBe(4);
+    // Attempt count and a timestamp per attempt are recorded.
+    expect(history.map((f) => f.attempt)).toEqual([1, 2, 3, 4]);
+    for (const failure of history) {
+      expect(failure.failedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    }
+  });
+
+  it('appends a placeholder cause when a failed replay reports no reason', async () => {
+    useStatefulRepo();
+
+    const res = await replay({ failed: true }).expect(200);
+
+    expect(res.body.data.failureHistory).toHaveLength(2);
+    expect(res.body.data.failureHistory[1].error).toMatch(/reason not reported/);
+    expect(res.body.data.failureHistory[1].source).toBe('replay');
+  });
+
+  it('records only the reported cause, not the whole request body', async () => {
+    useStatefulRepo();
+
+    await replay({ failed: true, error: '  connection reset by peer  ' }).expect(200);
+
+    expect(mockRepo.recordFailure).toHaveBeenCalledWith(
+      'dlq-001',
+      expect.objectContaining({ error: 'connection reset by peer', source: 'replay' }),
+    );
+  });
+
+  it('rejects a non-string reported cause without changing any state', async () => {
+    useStatefulRepo();
+
+    const res = await replay({ failed: true, error: { nested: 'object' } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect(mockRepo.replayEntry).not.toHaveBeenCalled();
+    expect(mockRepo.recordFailure).not.toHaveBeenCalled();
+  });
+
+  it('bounds the length of a reported cause', async () => {
+    useStatefulRepo();
+
+    await replay({ failed: true, error: 'x'.repeat(5_000) }).expect(200);
+
+    const recorded = mockRepo.recordFailure.mock.calls[0]![1] as DlqFailureAttempt;
+    expect(recorded.error).toHaveLength(2_000);
+  });
+
+  it('does not record a cause for a successful replay', async () => {
+    useStatefulRepo();
+
+    await replay({}).expect(200);
+
+    expect(mockRepo.recordFailure).not.toHaveBeenCalled();
+    expect(mockRepo.recordReplaySuccess).toHaveBeenCalledWith('stream.created');
+  });
+
+  it('exposes the history on the list endpoint too', async () => {
+    useStatefulRepo();
+
+    await replay({ failed: true, error: 'deadline exceeded' }).expect(200);
+    const res = await request(app)
+      .get('/admin/dlq')
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+
+    const history = res.body.data.entries[0].failureHistory as Array<{ error: string }>;
+    expect(history.map((f) => f.error)).toEqual(['connection timeout', 'deadline exceeded']);
+  });
+
+  it('still reports the first cause for an entry stored without a history', async () => {
+    mockRepo.findById.mockResolvedValue({ ...ENTRY, failureHistory: undefined });
+
+    const res = await read().expect(200);
+
+    expect(res.body.data.failureHistory).toEqual([]);
+    expect(res.body.data.firstFailure).toBe('connection timeout');
   });
 });

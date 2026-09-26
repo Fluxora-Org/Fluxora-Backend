@@ -641,6 +641,16 @@ graphqlGatewayRouter.post(
         res.status(400).json(
           errorResponse('GRAPHQL_PARSE_ERROR', 'GraphQL query could not be parsed.', undefined, requestId),
         );
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'GRAPHQL_PARSE_ERROR',
+              'GraphQL query could not be parsed.',
+              undefined,
+              requestId
+            )
+          );
         return;
       }
 

@@ -586,7 +586,6 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
  * Reset circuit breaker for an endpoint
  */
 webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => {
-  const requestId = req.correlationId;
   const { endpointUrl } = req.params;
 
   // URL decode the endpoint URL

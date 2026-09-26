@@ -63,11 +63,16 @@ describe('resolveRoute', () => {
   });
 
   it('collapses only a single trailing slash, keeping internal empty segments', () => {
-    const req = {
+    const req = fakeReq({
       baseUrl: '',
       route: undefined,
       originalUrl: '/multiple///'
     };
+      // A matched route is required for the label to be derived at all: an
+      // unmatched request is labelled UNMATCHED_ROUTE (see above).
+      route: { path: '/multiple///' },
+      originalUrl: '/multiple///',
+    });
     // After collapse of a single trailing slash, remaining empties are kept
     // by normalizeRouteLabel join; high-cardinality policy does not alter
     // static vocabulary segments.
@@ -105,7 +110,7 @@ describe('resolveRoute', () => {
     const req = {
       baseUrl: '/api',
       route: { path: '/streams/:id' },
-      originalUrl: '/api/streams/550e8400-e29b-41d4-a716-446655440000'
+      originalUrl: '/api/streams/550e8400-e29b-41d4-a716-446655440000',
     } as unknown as Request;
     expect(resolveRoute(req)).toBe('/api/streams/:id');
   });
