@@ -109,10 +109,10 @@ export function rowToContractEvent(row: Record<string, unknown>): ContractEvent 
     block_height:     r.requireInt('block_height', { min: 0, max: BIGINT_SAFE_MAX }),
     transaction_hash: r.requireString('transaction_hash'),
     ...(row['ingested_at'] !== undefined
-      ? { ingested_at: r.optionalDate('ingested_at') ?? undefined }
+      ? { ingested_at: r.optionalDate('ingested_at') }
       : {}),
     ...(row['created_at'] !== undefined
-      ? { created_at: r.optionalDate('created_at') ?? undefined }
+      ? { created_at: r.optionalDate('created_at') }
       : {}),
   };
 }
