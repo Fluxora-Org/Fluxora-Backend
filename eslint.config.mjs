@@ -4,6 +4,22 @@ import prettierConfig from 'eslint-config-prettier';
 
 export default [
   {
+    // Environment reads are centralized under src/config so startup
+    // validation remains the single policy boundary.
+    files: ['src/**/*.ts'],
+    ignores: ['src/config/**', '**/*.test.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "MemberExpression[object.type='MemberExpression'][object.object.name='process'][object.property.name='env']",
+          message: 'Read environment values through src/config/runtime-env.ts.',
+        },
+      ],
+    },
+  },
+  {
     files: ['**/*.ts'],
     ignores: ['dist/**', 'node_modules/**', 'coverage/**'],
     languageOptions: {

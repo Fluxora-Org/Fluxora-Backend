@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import {
   sseActiveConnectionsGauge,
   sseConnectionsRejectedTotal,
@@ -92,11 +93,11 @@ function readBoundedPositiveInteger(
  * intentionally request-time rather than module-load-time so tests and runtime
  * configuration reloads do not require reconstructing the router singleton. The
  * bounded fallback parser mirrors the EnvSchema ranges so an invalid late
- * process.env mutation cannot accidentally create unbounded listener/socket
+ * getRuntimeEnv() mutation cannot accidentally create unbounded listener/socket
  * budgets.
  */
 export function resolveSseConnectionLimits(
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = getRuntimeEnv(),
 ): SseConnectionLimits {
   return {
     maxConnectionsPerIp: readBoundedPositiveInteger(

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { errorResponse } from '../utils/response.js';
 
 type CorsRequest = {
@@ -45,7 +46,7 @@ function parseAllowedOrigins(raw: string | undefined): Set<string> {
 }
 
 function isProduction(): boolean {
-  return process.env.NODE_ENV === 'production';
+  return getRuntimeEnv().NODE_ENV === 'production';
 }
 
 function clearCorsPermissionHeaders(res: CorsResponse): void {
@@ -94,7 +95,7 @@ export function corsAllowlistMiddleware(req: CorsRequest, res: CorsResponse, nex
     return;
   }
 
-  const allowedOrigins = parseAllowedOrigins(process.env.CORS_ALLOWED_ORIGINS);
+  const allowedOrigins = parseAllowedOrigins(getRuntimeEnv().CORS_ALLOWED_ORIGINS);
   const allowAnyOrigin = !isProduction() && (allowedOrigins.size === 0 || allowedOrigins.has('*'));
   const isAllowed = allowAnyOrigin || isOriginAllowed(origin, allowedOrigins);
 

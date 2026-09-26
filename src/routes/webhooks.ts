@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Enhanced webhook delivery and management routes
  * Includes outbox, dead-letter queue, and circuit breaker endpoints
@@ -86,11 +87,11 @@ webhooksRouter.post(
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
-    if (process.env.FLUXORA_WEBHOOK_SECRET !== undefined) {
-      verifyInput.secret = process.env.FLUXORA_WEBHOOK_SECRET;
+    if (getRuntimeEnv().FLUXORA_WEBHOOK_SECRET !== undefined) {
+      verifyInput.secret = getRuntimeEnv().FLUXORA_WEBHOOK_SECRET;
     }
-    if (process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
-      verifyInput.secretPrevious = process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS;
+    if (getRuntimeEnv().FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
+      verifyInput.secretPrevious = getRuntimeEnv().FLUXORA_WEBHOOK_SECRET_PREVIOUS;
     }
     const deliveryHeader = headers['x-fluxora-delivery-id'];
     if (deliveryHeader !== undefined) verifyInput.deliveryId = deliveryHeader;

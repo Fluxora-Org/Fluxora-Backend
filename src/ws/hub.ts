@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * WebSocket Hub — stream update broadcast channel (#49).
  *
@@ -163,7 +164,7 @@ const BATCH_MAX_SIZE_MAX = 500;
  * Default: 50 ms.
  */
 export const WS_BATCH_FLUSH_MS: number = (() => {
-  const raw = parseInt(process.env['WS_BATCH_FLUSH_MS'] ?? '', 10);
+  const raw = parseInt(getRuntimeEnv()['WS_BATCH_FLUSH_MS'] ?? '', 10);
   if (!Number.isFinite(raw)) return 50;
   return Math.max(BATCH_FLUSH_MS_MIN, Math.min(BATCH_FLUSH_MS_MAX, raw));
 })();
@@ -177,7 +178,7 @@ export const WS_BATCH_FLUSH_MS: number = (() => {
  * Default: 25.
  */
 export const WS_BATCH_MAX_SIZE: number = (() => {
-  const raw = parseInt(process.env['WS_BATCH_MAX_SIZE'] ?? '', 10);
+  const raw = parseInt(getRuntimeEnv()['WS_BATCH_MAX_SIZE'] ?? '', 10);
   if (!Number.isFinite(raw)) return 25;
   return Math.max(BATCH_MAX_SIZE_MIN, Math.min(BATCH_MAX_SIZE_MAX, raw));
 })();
@@ -447,9 +448,9 @@ export class StreamHub extends EventEmitter {
       }
     })();
 
-    this.wsAuthRequired = options?.wsAuthRequired ?? process.env.WS_AUTH_REQUIRED === 'true';
+    this.wsAuthRequired = options?.wsAuthRequired ?? getRuntimeEnv().WS_AUTH_REQUIRED === 'true';
 
-    this.jwtSecret = options?.jwtSecret ?? process.env.JWT_SECRET;
+    this.jwtSecret = options?.jwtSecret ?? getRuntimeEnv().JWT_SECRET;
     this.maxSubscriptionsPerConnection =
       options?.maxSubscriptionsPerConnection ??
       runtimeConfig.wsMaxSubscriptionsPerConnection ??
@@ -474,7 +475,7 @@ export class StreamHub extends EventEmitter {
 
     const configuredOrigins =
       options?.allowedOrigins ??
-      process.env.WS_ALLOWED_ORIGINS?.split(',').map((origin) => origin.trim());
+      getRuntimeEnv().WS_ALLOWED_ORIGINS?.split(',').map((origin) => origin.trim());
     this.allowedOrigins =
       configuredOrigins && configuredOrigins.length > 0
         ? new Set(configuredOrigins.filter((origin) => origin.length > 0))
@@ -490,7 +491,7 @@ export class StreamHub extends EventEmitter {
 
     // ── Micro-batching ────────────────────────────────────────────────────
     // Options take precedence over env vars so tests can tune without
-    // touching process.env.  Both values are clamped to sane bounds.
+    // touching getRuntimeEnv().  Both values are clamped to sane bounds.
     this.batchFlushMs =
       options?.batching?.flushMs !== undefined
         ? Math.max(5, Math.min(5_000, options.batching.flushMs))

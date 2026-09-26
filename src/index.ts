@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from './config/runtime-env.js';
 /**
  * Fluxora Backend — process entry point.
  *
@@ -59,7 +60,7 @@ import {
 
 let server: ReturnType<typeof app.listen> | undefined;
 
-if (process.env.NODE_ENV !== 'test') {
+if (getRuntimeEnv().NODE_ENV !== 'test') {
   // app.ts calls initializeConfig() at module load, so getConfig() is safe here.
   const cfg = getConfig();
 
@@ -277,7 +278,7 @@ if (process.env.NODE_ENV !== 'test') {
       },
       prepareFeatureFlags: () => prepareReloadFlags(),
       prepareLogLevel: (level) => () => {
-        process.env.LOG_LEVEL = level;
+        getRuntimeEnv().LOG_LEVEL = level;
         setLogLevel(level);
       },
       onSuccess: (result) => {

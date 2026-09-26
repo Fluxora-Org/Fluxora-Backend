@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Aggregated system diagnostics service.
  *
@@ -112,11 +113,11 @@ export interface DiagnosticsServiceDependencies {
  */
 function defaultPingRedis(): Promise<number | null> {
   // If Redis is explicitly disabled, skip the ping check.
-  if (process.env.REDIS_ENABLED === 'false') {
+  if (getRuntimeEnv().REDIS_ENABLED === 'false') {
     return Promise.resolve(null);
   }
 
-  const url = process.env.REDIS_URL ?? 'redis://localhost:6379';
+  const url = getRuntimeEnv().REDIS_URL ?? 'redis://localhost:6379';
   const connectTimeout = 5_000;
 
   // Dynamically import ioredis and create a temporary connection for the PING.
