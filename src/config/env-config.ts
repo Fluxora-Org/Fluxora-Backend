@@ -141,6 +141,8 @@ export interface Config {
   adminApiToken?: string | undefined;
   /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
   wsAuthRequired: boolean;
+  /** Origins allowed to perform browser WebSocket upgrades (WS_ALLOWED_ORIGINS). */
+  wsAllowedOrigins?: string[] | undefined;
   wsMaxConnectionsPerIp: number;
   /** Max subscription filters a single WebSocket connection may hold. */
   wsMaxSubscriptionsPerConnection: number;
@@ -150,6 +152,10 @@ export interface Config {
   wsMaxOutboundQueueBytesPerConnection: number;
   /** Max size of a single inbound WebSocket frame, in bytes. */
   wsMaxInboundMessageBytes: number;
+  /** WebSocket micro-batch flush window in ms, clamped by the schema. */
+  wsBatchFlushMs: number;
+  /** Max events coalesced into one WebSocket batch frame, clamped by the schema. */
+  wsBatchMaxSize: number;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -247,6 +253,20 @@ export class EnvironmentError extends ConfigError {
     super(Array.isArray(message) ? message : [message]);
     this.name = 'EnvironmentError';
   }
+}
+
+/**
+ * Split a comma-separated env var into trimmed, non-empty entries.
+ * Returns `undefined` when the variable is unset so consumers can tell
+ * "not configured" apart from "configured with an empty list".
+ */
+function splitCommaSeparated(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return entries.length > 0 ? entries : undefined;
 }
 
 function formatPath(issue: z.ZodIssue): string {
@@ -416,11 +436,14 @@ function toConfig(env: ParsedEnv): Config {
     adminApiToken: env.ADMIN_API_TOKEN,
     /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
     wsAuthRequired: env.WS_AUTH_REQUIRED,
+    wsAllowedOrigins: splitCommaSeparated(env.WS_ALLOWED_ORIGINS),
     wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
     wsMaxSubscriptionsPerConnection: env.WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
     wsMaxOutboundQueuePerConnection: env.WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION,
     wsMaxOutboundQueueBytesPerConnection: env.WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION,
     wsMaxInboundMessageBytes: env.WS_MAX_INBOUND_MESSAGE_BYTES,
+    wsBatchFlushMs: env.WS_BATCH_FLUSH_MS,
+    wsBatchMaxSize: env.WS_BATCH_MAX_SIZE,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,

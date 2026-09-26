@@ -8,6 +8,32 @@
 
 Fluxora exposes real-time treasury stream updates on `/ws/streams` using standard WebSockets.
 
+## Module layout
+
+The hub is split into focused modules under `src/ws/`, each owning one concern.
+`src/ws/hub.ts` wires them together and re-exports the public surface, so
+`import { StreamHub, WS_CLOSE_REASONS } from '../ws/hub.js'` keeps working:
+
+| Module | Owns |
+|--------|------|
+| `hub.ts` | Server wiring, broadcast entry point, shutdown, observability surface |
+| `upgradeHandler.ts` | Origin allowlist, JWT auth, atomic per-IP connection limiting |
+| `connectionLifecycle.ts` | Accept/close handling and per-connection cleanup |
+| `connectionRegistry.ts` | Connected sockets, client state, subscription indexes |
+| `subscriptionRouter.ts` | Filter authorization and fanout targeting |
+| `fanout.ts` | Broadcast dispatch, fanout chunking, broadcast tracing span |
+| `backpressure.ts` | Outbound queue, drop/terminate thresholds, counters |
+| `batching.ts` | Opt-in `stream_update_batch` micro-batching |
+| `replay.ts` | Cursor replay from the event store |
+| `healthProbe.ts` | Liveness and stall probes |
+| `hubConfig.ts` | Constants and configuration resolved from the validated env schema |
+| `hubTypes.ts` | Shared type declarations |
+
+Every tunable is declared in the validated environment schema
+(`src/config/env-schema/`) and surfaced through `Config`, so the hub no longer
+reads `process.env` itself and its defaults cannot drift from
+`docs/env-reference.md`.
+
 ## Connection Handshake
 
 During the initial upgrade handshake, clients can optionally filter stream updates by specifying query parameters in the connection URL:
@@ -475,8 +501,10 @@ The flag is also accepted inside a nested `filter` object:
 | `WS_BATCH_FLUSH_MS` |    50   |   5 | 5 000 | Flush-window duration in milliseconds.                |
 | `WS_BATCH_MAX_SIZE` |    25   |   1 |   500 | Max events per batch before triggering an early flush.|
 
-Both values are clamped to their respective bounds at startup; out-of-range
-values fall back to the clamped boundary rather than crashing.
+Both values are declared in the validated environment schema
+(`src/config/env-schema/server.ts`) and clamped to their respective bounds at
+startup; out-of-range values fall back to the clamped boundary rather than
+crashing, and an unparseable value falls back to the default.
 
 ### Flush triggers
 

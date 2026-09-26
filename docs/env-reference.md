@@ -3,7 +3,7 @@
 # Environment Variable Reference
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
-issue #1519). 154 variables across 11 subsystems.
+issue #1519). 161 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
 (required, or optional with a runtime fallback).
@@ -154,7 +154,13 @@ issue #1519). 154 variables across 11 subsystems.
 | `WORKER_ENABLED` | Run background queue workers inside this process. @default false | `false` |
 | `WS_ALLOWED_ORIGINS` | Comma-separated allowed origins for WebSocket connections. | — |
 | `WS_AUTH_REQUIRED` | Require Origin allowlist checks on WebSocket upgrades. @default false | `false` |
+| `WS_BATCH_FLUSH_MS` | WebSocket micro-batch flush window in ms; clamped to 5–5000. @default 50 | `50` |
+| `WS_BATCH_MAX_SIZE` | Max events coalesced into one `stream_update_batch` frame; clamped to 1–500. @default 25 | `25` |
 | `WS_MAX_CONNECTIONS_PER_IP` | Max concurrent WebSocket connections per client IP. @default 10 | `10` |
+| `WS_MAX_INBOUND_MESSAGE_BYTES` | Max size of a single inbound WebSocket frame, in bytes. @default 4096 | `4096` |
+| `WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION` | Max bytes queued for a slow WebSocket client. @default 1048576 | `1048576` |
+| `WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION` | Max messages queued for a slow WebSocket client before backpressure. @default 128 | `128` |
+| `WS_MAX_SUBSCRIPTIONS_PER_CONNECTION` | Max subscription filters a single WebSocket connection may hold. @default 32 | `32` |
 | `WS_RECONNECT_LIMIT` | Max WebSocket reconnect attempts per client window. @default 20 | `20` |
 | `WS_RECONNECT_WINDOW_MS` | Sliding window for WS reconnect limiting, in ms. @default 60000 | `60000` |
 
@@ -206,6 +212,7 @@ issue #1519). 154 variables across 11 subsystems.
 | `RPC_CB_RESET_TIMEOUT_MS` | Time before an open RPC circuit half-opens, in ms. @default 60000 | `60000` |
 | `RPC_CB_WINDOW_MS` | Sliding window for RPC failure counting, in ms. @default 30000 | `30000` |
 | `RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA` | Beta parameter for the fallback cache's early-expiry probabilistic refresh. @default 0 | — |
+| `RPC_FALLBACK_CACHE_MAX_AGE_MS` | Maximum age, in ms, that a last-known-good fallback entry may be served at while the RPC circuit is OPEN. Enforced independently of the TTL above so staleness policy is explicit and testable; entries older than this are refused rather than served. @default 300000 | `300000` |
 | `RPC_FALLBACK_CACHE_TTL_SECONDS` | TTL of the RPC fallback cache in seconds. @default 300 | `300` |
 | `RPC_HEALTH_CHECK_FAILURE_THRESHOLD` | Consecutive RPC health-check failures before a target is marked unhealthy. @default 3 | `3` |
 | `RPC_HEALTH_CHECK_INTERVAL_MS` | Interval between proactive RPC health checks in ms; 0 disables. @default 0 | `0` |
