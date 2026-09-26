@@ -15,6 +15,7 @@
     "start": "node dist/src/index.js",
     "migrate": "tsx src/db/migrate.ts",
     "check:migrations": "node scripts/check-migration-names.mjs",
+    "check:migration-atomicity": "node scripts/check-migration-atomicity.mjs",
     "check:node-version": "node scripts/check-node-version.mjs",
     "check:blue-green-migrations": "node scripts/check-blue-green-migration-compatibility.mjs",
     "check:deprecations": "tsx scripts/check-deprecation-sunset.ts",
