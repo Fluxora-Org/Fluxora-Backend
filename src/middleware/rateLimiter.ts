@@ -18,6 +18,7 @@ import { createRedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 import { rateLimitRejectedTotal, rateLimitRedisErrorsTotal } from '../metrics.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
+import { errorResponse } from '../utils/response.js';
 import { getOverride } from '../services/tenantRateLimitOverride.service.js';
 import type { RateLimitOverride } from '../services/tenantRateLimitOverride.service.js';
 
@@ -224,30 +225,18 @@ function buildErrorBody(
   route?: string,
   method?: string,
 ) {
-  const body: {
-    error: {
-      code: string;
-      message: string;
-      retryAfter: number;
-      limit: number;
-      window: string;
-      identifier: string;
-      route?: string;
-      method?: string;
-    };
-  } = {
-    error: {
-      code: 'RATE_LIMIT_EXCEEDED',
-      message: `Too many requests. Retry after ${retryAfterSeconds} seconds.`,
+  return errorResponse(
+    'RATE_LIMIT_EXCEEDED',
+    `Too many requests. Retry after ${retryAfterSeconds} seconds.`,
+    {
       retryAfter: retryAfterSeconds,
       limit,
       window: windowMs === 60_000 ? 'minute' : 'unknown',
       identifier: identifierType === 'ip' ? identifier : maskApiKey(identifier),
+      ...(route ? { route } : {}),
+      ...(method ? { method } : {}),
     },
-  };
-  if (route) body.error.route = route;
-  if (method) body.error.method = method;
-  return body;
+  );
 }
 
 // ---------------------------------------------------------------------------

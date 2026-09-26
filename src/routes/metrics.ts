@@ -5,6 +5,7 @@ import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { syncWebhookMetrics } from '../metrics/businessMetrics.js';
 import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
 import { warn } from '../lib/logger.js';
+import { errorResponse } from '../utils/response.js';
 
 export const metricsRouter = express.Router();
 

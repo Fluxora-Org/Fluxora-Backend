@@ -101,9 +101,7 @@ webhooksRouter.post(
     const verification = verifyWebhookSignature(verifyInput);
 
     if (!verification.ok) {
-      res
-        .status(verification.status)
-        .json({ error: verification.code, message: verification.message });
+      res.status(verification.status).json(errorResponse(verification.code, verification.message, undefined, req.correlationId));
       return;
     }
 

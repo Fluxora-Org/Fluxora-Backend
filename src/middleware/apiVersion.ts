@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
+import { errorResponse } from '../utils/response.js';
 
 /** Canonical request header name used for versioning. */
 export const ACCEPT_VERSION_HEADER = 'accept-version';
@@ -59,10 +60,7 @@ export function apiVersionMiddleware(req: Request, res: Response, next: NextFunc
   const resolved = !requested ? DEFAULT_API_VERSION : normalizeVersion(requested);
 
   if (!resolved || !SUPPORTED_VERSIONS.includes(resolved)) {
-    res.status(400).json({
-      error: 'unsupported_version',
-      supported: SUPPORTED_VERSIONS,
-    });
+    res.status(400).json(errorResponse('UNSUPPORTED_VERSION', 'Requested API version is not supported.', { supported: SUPPORTED_VERSIONS }, req.correlationId));
     return;
   }
 

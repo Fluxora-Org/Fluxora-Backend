@@ -50,11 +50,11 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
   rateLimitsRouter.get('/', async (req: Request, res: Response) => {
     const { identifier, identifierType } = limiter.extractClientIdentifier(req);
     if (req.query.path !== undefined && typeof req.query.path !== 'string') {
-      res.status(400).json({ error: 'Query parameter "path" must be a string.' });
+      res.status(400).json(errorResponse('VALIDATION_ERROR', 'Query parameter "path" must be a string.', undefined, req.correlationId));
       return;
     }
     if (req.query.method !== undefined && typeof req.query.method !== 'string') {
-      res.status(400).json({ error: 'Query parameter "method" must be a string.' });
+      res.status(400).json(errorResponse('VALIDATION_ERROR', 'Query parameter "method" must be a string.', undefined, req.correlationId));
       return;
     }
 

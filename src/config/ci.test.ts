@@ -21,7 +21,7 @@ function parseJobs(workflow: string): Record<string, string> {
       jobs[current].push(line);
     }
   }
-  return Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.join('\n')]));
+  return Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.join('\n')])) as Record<string, string>;
 }
 
 const jobs = parseJobs(wf);

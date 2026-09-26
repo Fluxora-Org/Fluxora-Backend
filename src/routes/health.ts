@@ -25,14 +25,13 @@ healthRouter.get('/', (req: Request, res: Response) => {
   // Return 503 during graceful shutdown.  The body uses a flat shape so
   // operators reading `/health` always see `status` at the top level.
   if (isShuttingDown()) {
-    res.status(503).json({
+    res.status(503).json(errorResponse('SERVICE_SHUTTING_DOWN', 'Service is shutting down', {
       status: 'shutting_down',
       service: 'fluxora-backend',
       network: req.app.locals.config?.stellarNetwork ?? 'unknown',
       contractAddresses: (req.app.locals.config as Config | undefined)?.contractAddresses ?? {},
       timestamp: new Date().toISOString(),
-      message: 'Service is shutting down',
-    });
+    }));
     return;
   }
 
@@ -122,11 +121,11 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
         })),
       });
       // 503 for unhealthy or unacceptably degraded
-      res.status(503).json({
+      res.status(503).json(errorResponse('HEALTH_CHECK_ERROR', reason ?? 'Service is not ready', {
         status,
         version: report.version,
         dependencies,
-      });
+      }));
       return;
     }
 
@@ -191,7 +190,11 @@ healthRouter.get('/deployment', async (req: Request, res: Response) => {
     const indexerHealth = assessIndexerHealth();
     const report = buildDeploymentChecklistReport({ config, dependencyHealth, indexerHealth });
     const statusCode = report.status === 'fail' ? 503 : 200;
-    res.status(statusCode).json({ report });
+    if (statusCode === 503) {
+      res.status(statusCode).json(errorResponse('HEALTH_CHECK_ERROR', 'Service readiness check failed', { report }));
+    } else {
+      res.status(statusCode).json({ report });
+    }
   } catch (err) {
     logger?.error('Failed to generate deployment report', req.correlationId, {
       error: err instanceof Error ? err.message : String(err),

@@ -5,7 +5,7 @@
  *   { success: true, data: T, meta: ResponseMeta }
  *
  * All error responses are wrapped in:
- *   { success: false, error: { code: string, message: string, details?: unknown, requestId?: string } }
+ *   { success: false, error: { code: ApiErrorCode, message: string, details?: unknown, requestId?: string } }
  *
  * This contract is stable — clients and auditors may rely on it.
  */
@@ -25,8 +25,10 @@ export interface SuccessEnvelope<T> {
     meta: ResponseMeta;
 }
 
+import { toApiErrorCode, type ApiErrorCode } from '../errors.js';
+
 export interface ErrorDetail {
-    code: string;
+    code: ApiErrorCode;
     message: string;
     details?: unknown;
     requestId?: string;
@@ -82,7 +84,7 @@ export function errorResponse(
     return {
         success: false,
         error: {
-            code,
+            code: toApiErrorCode(code),
             message,
             ...(details !== undefined ? { details } : {}),
             ...(requestId !== undefined ? { requestId } : {}),

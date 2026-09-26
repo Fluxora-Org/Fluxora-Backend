@@ -148,7 +148,7 @@ export function responseSanitizer(req: Request, res: Response, next: NextFunctio
       body = sanitize(body);
     } catch (e) {
       logger.error('failed to sanitize response body', req.correlationId as string, { error: e });
-      return res.status(500).send('Internal server error');
+      return res.status(500).json(errorResponse('INTERNAL_ERROR', 'Internal server error', undefined, req.correlationId));
     }
     return originalJson.call(this, body);
   };

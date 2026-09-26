@@ -4,7 +4,7 @@ import { SerializationLogger, error as logError } from '../lib/logger.js';
 import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
-import { ApiError, ApiErrorCode } from '../errors.js';
+import { ApiError, ApiErrorCode, toApiErrorCode } from '../errors.js';
 import { getActiveTraceSpanIds } from '../tracing/hooks.js';
 
 export {

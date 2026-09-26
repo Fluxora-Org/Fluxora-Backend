@@ -62,9 +62,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
       method: req.method,
       ip: req.ip,
     });
-    res.status(503).json({
-      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
-    });
+    res.status(503).json(errorResponse(ApiErrorCode.CONFIGURATION_ERROR, 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.', undefined, req.correlationId ?? req.id));
     return;
   }
 
@@ -83,7 +81,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
       method: req.method,
       ip: req.ip,
     });
-    res.status(401).json({ error: 'Missing Authorization header.' });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Missing Authorization header.', undefined, req.correlationId ?? req.id));
     return;
   }
 
@@ -103,7 +101,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
       ip: req.ip,
       headerLength: header.length,
     });
-    res.status(401).json({ error: 'Authorization header too large.' });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Authorization header too large.', undefined, req.correlationId ?? req.id));
     return;
   }
 
@@ -122,7 +120,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
       method: req.method,
       ip: req.ip,
     });
-    res.status(401).json({ error: 'Authorization header must use Bearer scheme.' });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Authorization header must use Bearer scheme.', undefined, req.correlationId ?? req.id));
     return;
   }
 
@@ -141,7 +139,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
       method: req.method,
       ip: req.ip,
     });
-    res.status(401).json({ error: 'Bearer token is missing.' });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Bearer token is missing.', undefined, req.correlationId ?? req.id));
     return;
   }
 
@@ -180,7 +178,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
     method: req.method,
     ip: req.ip,
   });
-  res.status(403).json({ error: 'Invalid admin credentials.' });
+  res.status(403).json(errorResponse(ApiErrorCode.FORBIDDEN, 'Invalid admin credentials.', undefined, req.correlationId ?? req.id));
   return;
 }
 

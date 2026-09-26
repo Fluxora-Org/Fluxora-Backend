@@ -1356,6 +1356,60 @@ components:
                 - SERVICE_UNAVAILABLE
                 - INTERNAL_ERROR
                 - DECIMAL_ERROR
+                - UNSUPPORTED_MEDIA_TYPE
+                - GATEWAY_TIMEOUT
+                - NOT_ACCEPTABLE
+                - PERSISTED_QUERY_INVALID
+                - PERSISTED_QUERY_UNSUPPORTED_VERSION
+                - PERSISTED_QUERY_INVALID_HASH
+                - PERSISTED_QUERY_HASH_MISMATCH
+                - PERSISTED_QUERY_NOT_FOUND
+                - GRAPHQL_PARSE_ERROR
+                - FEATURE_FLAG_DISABLED
+                - CONFIGURATION_ERROR
+                - RESTORE_ERROR
+                - PERSISTENCE_ERROR
+                - API_KEY_ERROR
+                - DIAGNOSTICS_ERROR
+                - SERVICE_SHUTTING_DOWN
+                - HEALTH_CHECK_ERROR
+                - CONSUMER_SUSPENDED
+                - ENTRY_ALREADY_REPLAYED
+                - INVALID_REQUEST
+                - QUEUE_ERROR
+                - INVALID_DELIVERY_ID
+                - DELIVERY_NOT_FOUND
+                - INVALID_PAGINATION
+                - INVALID_OUTBOX_FILTER
+                - INVALID_RETRY_REQUEST
+                - DLQ_ITEM_NOT_FOUND
+                - DLQ_PROCESS_ERROR
+                - DLQ_RETRY_ERROR
+                - INVALID_ENDPOINT_URL
+                - OUTBOX_PROCESSING_ERROR
+                - INVALID_CLEANUP_REQUEST
+                - CLEANUP_ERROR
+                - CORS_ORIGIN_DENIED
+                - RATE_LIMIT_EXCEEDED
+                - INVALID_ADDRESS
+                - ERASURE_FAILED
+                - INTERNAL_CALLER_ADDRESS_MISSING
+                - unsupported_media_type
+                - payload_too_large
+                - invalid_encoding
+                - payload_too_deep
+                - invalid_json
+                - missing_secret
+                - missing_delivery_id
+                - missing_timestamp
+                - missing_signature
+                - invalid_timestamp
+                - timestamp_outside_tolerance
+                - previous_secret_expired
+                - signature_mismatch
+                - duplicate_delivery
+                - UNSUPPORTED_VERSION
+                - IDEMPOTENCY_CONFLICT
               example: VALIDATION_ERROR
             message:
               type: string

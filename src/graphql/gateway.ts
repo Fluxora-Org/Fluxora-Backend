@@ -34,6 +34,7 @@
 import { Router, type Request, type Response } from 'express';
 import {
   graphql,
+  GraphQLError,
   parse,
   GraphQLError,
   type DocumentNode,

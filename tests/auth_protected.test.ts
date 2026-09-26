@@ -308,6 +308,8 @@ describe('Auth Protected Routes', () => {
       expect(res.body.error.message).toBeDefined();
       expect(typeof res.body.error.message).toBe('string');
     });
+  });
+
   describe('JWT Token Verification Strictness', () => {
     it('should reject tokens with wrong algorithm (e.g. HS512 instead of HS256)', async () => {
       const { jwtSecret } = getConfig();
