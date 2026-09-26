@@ -31,7 +31,7 @@ import { successResponse } from '../../utils/response.js';
 import { sendEarlyHints } from '../../utils/earlyHints.js';
 import { parseCursorParam } from '../../utils/opaqueCursor.js';
 import { respondNotModified, setValidatorHeaders } from '../../utils/conditionalGet.js';
-import { debug, info, warn } from '../../utils/logger.js';
+import { debug, info, warn } from '../../lib/logger.js';
 import {
   assertCallerMayList,
   enforceStreamScope,

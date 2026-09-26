@@ -12,7 +12,7 @@
  * @module utils/opaqueCursor
  */
 import { validationError } from '../middleware/errorHandler.js';
-import { warn } from './logger.js';
+import { warn } from '../lib/logger.js';
 
 export type OpaqueCursor = { v: 1; lastId: string; scope?: string };
 

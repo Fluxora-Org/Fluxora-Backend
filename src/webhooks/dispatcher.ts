@@ -16,7 +16,7 @@ import { getConfig } from '../config/env.js';
 import dns from 'node:dns';
 import http from 'node:http';
 import https from 'node:https';
-import type { IncomingMessage } from 'node:http';
+import type { IncomingMessage, RequestOptions } from 'node:http';
 
 export interface WebhookDispatchOptions {
   url: string;
@@ -433,10 +433,10 @@ export class WebhookDispatcher {
   ): Promise<WebhookHttpResponse> {
     const parsedUrl = new URL(url);
     return new Promise((resolve, reject) => {
-      const options = {
+      const options: RequestOptions = {
         method: requestOptions.method,
         headers: requestOptions.headers,
-        lookup: lookupWebhookTarget,
+        lookup: lookupWebhookTarget as RequestOptions['lookup'],
         signal: requestOptions.signal,
       };
       const handleResponse = (response: IncomingMessage) => {

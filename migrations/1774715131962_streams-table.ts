@@ -63,11 +63,11 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
       notNull: true,
       default: pgm.func('current_timestamp'),
     },
-  });
+  }, { ifNotExists: true });
 
-  pgm.createIndex('contract_events', 'contract_id');
-  pgm.createIndex('contract_events', 'tx_hash');
-  pgm.createIndex('contract_events', 'happened_at');
+  pgm.createIndex('contract_events', 'contract_id', { ifNotExists: true });
+  pgm.createIndex('contract_events', 'tx_hash', { ifNotExists: true });
+  pgm.createIndex('contract_events', 'happened_at', { ifNotExists: true });
 }
 
 export async function down(pgm: MigrationBuilder): Promise<void> {

@@ -335,7 +335,6 @@ describe('StellarAddressValidator', () => {
     vi.restoreAllMocks();
   });
 });
-
 // ── The single contract applied at every API boundary ────────────────────────
 //
 // The same shared validator must reject mixed-network / malformed input at the
@@ -431,5 +430,3 @@ describe('Network-aware contract at representative API boundaries', () => {
     expect(isValidStellarAccountAddress(CASE_VARIANT_ADDRESS)).toBe(false);
   });
 });
-
-

@@ -36,15 +36,16 @@ import {
   graphql,
   parse,
   type DocumentNode,
+  type GraphQLError,
   type SelectionNode,
   type SelectionSetNode,
 } from 'graphql';
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
-import { authenticate, authenticateApiKey, requireScope, requireAuth } from '../middleware/auth.js';
+import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
+import type { StreamFilter, StreamStatus } from '../db/types.js';
 import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
 import { getAuditEntries } from '../lib/auditLog.js';
 import { errorResponse } from '../utils/response.js';
@@ -308,12 +309,12 @@ function createRootValue(req: Request) {
       assertCallerScope(req, 'streams:read');
       const limit = Math.min(Math.max(args.limit ?? 20, 1), MAX_STREAM_PAGE_SIZE);
       const includeTotal = args.includeTotal === true;
-      const filter: Record<string, unknown> = {};
-      if (args.status) filter.status = args.status;
+      const filter: StreamFilter = {};
+      if (args.status) filter.status = args.status as StreamStatus;
       if (args.contractId) filter.contract_id = args.contractId;
 
       const result = await streamRepository.findWithCursor(
-        filter as any,
+        filter,
         limit,
         args.afterId,
         includeTotal
@@ -410,7 +411,6 @@ graphqlGatewayRouter.post(
   requireScope('streams:read', 'streams:write', 'audit:read'),
   async (req, res) => {
   const requestId = res.req?.id ?? req.correlationId;
-  const start = Date.now();
 
     try {
       if (!isGraphQLGatewayEnabled(req)) {
@@ -519,7 +519,7 @@ graphqlGatewayRouter.post(
       let document: DocumentNode;
       try {
         document = parse(source);
-      } catch (parseError) {
+      } catch {
         res.status(400).json(
           errorResponse('GRAPHQL_PARSE_ERROR', 'GraphQL query could not be parsed.', undefined, requestId),
         );
