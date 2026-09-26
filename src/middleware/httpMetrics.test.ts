@@ -62,6 +62,18 @@ describe('resolveRoute', () => {
     expect(label).not.toMatch(/abc-uuid|\/42/);
   });
 
+  it('collapses only a single trailing slash, keeping internal empty segments', () => {
+    const req = {
+      baseUrl: '',
+      route: undefined,
+      originalUrl: '/multiple///'
+    } as unknown as Request;
+    // After collapse of a single trailing slash, remaining empties are kept
+    // by normalizeRouteLabel join; high-cardinality policy does not alter
+    // static vocabulary segments.
+    expect(resolveRoute(req)).toBe('/multiple//');
+  });
+
   it('bounds series count across many distinct unmatched URLs', () => {
     const series = new Set<string>();
     for (let i = 0; i < 200; i++) {
