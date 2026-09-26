@@ -36,6 +36,7 @@ import { IndexerDependencyState } from '../indexer/types.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { ReplayRequestSchema, parseBody, formatZodIssues } from '../validation/schemas.js';
+import { ReplayProgress } from '../types/index.js';
 import { logger } from '../lib/logger.js';
 import { mtlsValidationMiddleware } from '../indexer/mtls.js';
 import { getReindexLock } from '../state/adminState.js';
@@ -274,7 +275,7 @@ indexerRouter.get(
     try {
       // Use the DB-backed extended snapshot so persisted replay checkpoints
       // survive restarts (falls back to the in-memory snapshot on read error).
-      const progress = await indexerService.getReplayProgressExtended();
+      const progress: ReplayProgress = await indexerService.getReplayProgressExtended();
       res.status(200).json(successResponse(progress, requestId));
     } catch (err: unknown) {
       logger.error('Failed to get indexer status', correlationId, {

@@ -19,6 +19,7 @@
     "check:blue-green-migrations": "node scripts/check-blue-green-migration-compatibility.mjs",
     "check:deprecations": "tsx scripts/check-deprecation-sunset.ts",
     "check:db-types": "node scripts/check-db-schema-types.mjs",
+    "check:types-openapi": "tsx scripts/check-types-openapi.ts",
     "check:api-changelog": "node scripts/check-api-changelog.mjs",
     "update:api-changelog": "node scripts/check-api-changelog.mjs --update-release",
     "seed": "ts-node scripts/seed-test-data.ts",

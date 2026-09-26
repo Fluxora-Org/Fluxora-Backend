@@ -1083,6 +1083,8 @@ function toConfig(env: ParsedEnv): Config {
     dlqRetentionDays: env.DLQ_RETENTION_DAYS,
     dlqPurgeBatchSize: env.DLQ_PURGE_BATCH_SIZE,
   };
+}
+
 export function getWsMaxInboundMessageBytes(): number {
   return getConfig().wsMaxInboundMessageBytes;
 }
