@@ -1,16 +1,30 @@
-import { z } from 'zod';
-import { warn } from '../lib/logger.js';
-import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
-import {
-  getPinnedAddressNetwork,
-  isValidStellarContractAddress,
-  assertNetworkMatchesContracts,
-  logActiveStellarConfig,
-  STELLAR_NETWORK_PASSPHRASES,
-  type PinnedStellarAddressKind,
-} from './stellarContracts.js';
-import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
+/**
+ * Environment configuration — public entry point.
+ *
+ * This module is the single import surface for the rest of the codebase
+ * (`import { loadConfig, Config } from './config/env.js'`). The schema itself
+ * is split into per-subsystem modules (issue #1519):
+ *
+ * - `env-schema/`        — per-subsystem zod fragments (core, database, redis,
+ *                           stellar, auth, http, webhooks, server, indexer,
+ *                           rateLimit, infrastructure) composed in
+ *                           `env-schema/schema.ts`
+ * - `env-config.ts`       — `Config` interface, error types, env → config
+ *                           mapping, and load/initialize/reset singletons
+ * - `env-hot-reload.ts`   — SIGHUP hot-reload machinery (HotConfig)
+ *
+ * The composed schema is unchanged in effect: it accepts and rejects exactly
+ * the same inputs as the original single-file definition, verified by
+ * `tests/config/env.schema-split.test.ts`.
+ */
+import { parseEnv } from './env-config.js';
+
+export { EnvSchema } from './env-schema/schema.js';
+export type { ParsedEnv } from './env-schema/schema.js';
+export type { NodeEnv, LogLevel } from './env-schema/types.js';
+
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
+export { resolveNetwork } from './stellar.js';
 export {
   STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
@@ -18,7 +32,6 @@ export {
   assertNetworkMatchesContracts,
   logActiveStellarConfig,
 } from './stellarContracts.js';
-export { resolveNetwork } from './stellar.js';
 
 type NodeEnv = 'development' | 'staging' | 'production' | 'test';
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';

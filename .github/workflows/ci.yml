@@ -59,6 +59,8 @@ jobs:
       LINT_BASE: ${{ github.event.pull_request.base.sha }}
 
     steps:
+      # fetch-depth: 0 is required by scripts/lint-changed-files.mjs, which
+      # diffs the changed file set against origin/<base branch>.
       - name: Checkout code
         uses: actions/checkout@v4
         with:
