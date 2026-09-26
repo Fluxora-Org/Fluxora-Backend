@@ -128,6 +128,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # Real Redis for the AdminStateLock integration suite
+      # (tests/state/adminStateLock.concurrentReindex.test.ts). The suite is
+      # gated on REDIS_INTEGRATION=true and asserts distributed-lock
+      # contention and lease-based crash recovery against a live server.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -157,6 +171,9 @@ jobs:
       # version. See docs/sdk-publishing.md.
       - name: SDK version sync check
         run: node scripts/check-sdk-version-sync.mjs
+      # Fixtures must match OpenAPI examples (same source as example contract tests)
+      - name: SDK fixtures drift check
+        run: pnpm run check:sdk:fixtures
 
       - name: Check migration naming policy
         run: pnpm run check:migrations

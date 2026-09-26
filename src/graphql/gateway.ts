@@ -44,6 +44,7 @@ import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
 import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import type { StreamFilter, StreamStatus } from '../db/types.js';
 import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
@@ -550,6 +551,14 @@ graphqlGatewayRouter.post(
 
       if (extensions !== undefined && extensions !== null) {
         if (typeof extensions !== 'object' || Array.isArray(extensions)) {
+          res.status(400).json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
+          return;
+        }
+
+        const persistedQuery = extensions as { version?: unknown; sha256Hash?: unknown };
+        const { version, sha256Hash } = persistedQuery;
+
+        if (version !== 1) {
           res
             .status(400)
             .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
@@ -622,12 +631,20 @@ graphqlGatewayRouter.post(
       }
 
       if (!source || typeof source !== 'string') {
-        res.status(400).json(
-          errorResponse('VALIDATION_ERROR', 'GraphQL request must include a "query" string field.', undefined, requestId),
-        );
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'VALIDATION_ERROR',
+              'GraphQL request must include a "query" string field.',
+              undefined,
+              requestId
+            )
+          );
         return;
       }
 
+      // ── Static query enforcement ───────────────────────────────────────────
       let document: DocumentNode;
       try {
         document = parse(source);
@@ -635,6 +652,16 @@ graphqlGatewayRouter.post(
         res.status(400).json(
           errorResponse('GRAPHQL_PARSE_ERROR', 'GraphQL query could not be parsed.', undefined, requestId),
         );
+        res
+          .status(400)
+          .json(
+            errorResponse(
+              'GRAPHQL_PARSE_ERROR',
+              'GraphQL query could not be parsed.',
+              undefined,
+              requestId
+            )
+          );
         return;
       }
 
@@ -653,26 +680,17 @@ graphqlGatewayRouter.post(
         return;
       }
 
-      if (!source || typeof source !== 'string') {
-      res
-        .status(400)
-        .json(
-          errorResponse(
-            'VALIDATION_ERROR',
-            'GraphQL request must include a "query" string field.',
-            undefined,
-            requestId
-          )
+      const queryComplexity = computeQueryComplexity(document);
+      if (queryComplexity > MAX_QUERY_COMPLEXITY) {
+        rejectGraphQLError(
+          res,
+          'QUERY_TOO_COMPLEX',
+          `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`
         );
         return;
       }
 
-      const queryComplexity = computeQueryComplexity(document);
-      if (queryComplexity > MAX_QUERY_COMPLEXITY) {
-        rejectGraphQLError(res, 'QUERY_TOO_COMPLEX', `Query exceeds the maximum complexity of ${MAX_QUERY_COMPLEXITY}.`);
-        return;
-      }
-
+      // ── Execute query ──────────────────────────────────────────────────────
       const rootValue = createRootValue(req);
       const context = { req, res, requestId };
 
@@ -685,6 +703,7 @@ graphqlGatewayRouter.post(
         operationName: operationName ?? undefined,
       });
 
+      // ── Sanitise errors ────────────────────────────────────────────────────
       if (result.errors && result.errors.length > 0) {
         result.errors = result.errors.map((err) => {
           if ((err as { originalError?: unknown }).originalError instanceof GraphQLScopeDeniedError) {
@@ -717,7 +736,7 @@ graphqlGatewayRouter.post(
         ],
       });
     }
-  },
+  }
 );
 
 // ── Error sanitisation ─────────────────────────────────────────────────────────

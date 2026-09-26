@@ -144,7 +144,7 @@ const WebSocketSubscriptionFilter = registry.register(
     })
 );
 
-const WebSocketSubscribeMessage = registry.register(
+registry.register(
   'WebSocketSubscribeMessage',
   z
     .object({
@@ -180,7 +180,7 @@ const WebSocketSubscribeMessage = registry.register(
     })
 );
 
-const WebSocketUnsubscribeMessage = registry.register(
+registry.register(
   'WebSocketUnsubscribeMessage',
   z
     .object({
@@ -260,73 +260,80 @@ function successSchema<T extends z.ZodTypeAny>(dataSchema: T) {
   return z.object({ success: z.literal(true), data: dataSchema, meta: ResponseMeta });
 }
 
-/** Wraps a successSchema in a full 200-response object with common headers. */
-function successResponse200<T extends z.ZodTypeAny>(dataSchema: T, description = 'Success') {
+/** Wraps a successSchema in a full response object with an example. */
+function successResponse<T extends z.ZodTypeAny>(
+  dataSchema: T,
+  example: unknown,
+  description = 'Success'
+) {
   return {
     description,
     headers: commonResponseHeaders,
-    content: { 'application/json': { schema: successSchema(dataSchema) } },
-  };
+    content: {
+      'application/json': {
+        schema: successSchema(dataSchema),
+        example,
+      },
+    },
+  } as const;
+}
+
+/** Builds an ErrorEnvelope response with a validated example. */
+function errorResponseWithExample(description: string, code: string, message: string) {
+  return {
+    description,
+    headers: commonResponseHeaders,
+    content: {
+      'application/json': {
+        schema: ErrorEnvelope,
+        example: {
+          success: false,
+          error: { code, message, requestId: 'req_abc123' },
+        },
+      },
+    },
+  } as const;
 }
 
 const errorResponses = {
-  '400': {
-    description: 'Validation error',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '401': {
-    description: 'Unauthorized',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '403': {
-    description: 'Forbidden',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '404': {
-    description: 'Not found',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '406': {
-    description:
-      'Not acceptable — the `Accept` header cannot be satisfied. ' +
-      'This API only produces `application/json` (plus `application/*+json` vendor types).',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '408': {
-    description: 'Request timeout',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '409': {
-    description: 'Conflict',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '422': {
-    description: 'Unprocessable entity',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '429': {
-    description: 'Too many requests',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '500': {
-    description: 'Internal server error',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
-  '503': {
-    description: 'Service unavailable',
-    headers: commonResponseHeaders,
-    content: { 'application/json': { schema: ErrorEnvelope } },
-  },
+  '400': errorResponseWithExample(
+    'Validation error',
+    'VALIDATION_ERROR',
+    'Request validation failed'
+  ),
+  '401': errorResponseWithExample(
+    'Unauthorized',
+    'UNAUTHORIZED',
+    'Authentication required to access this resource'
+  ),
+  '403': errorResponseWithExample(
+    'Forbidden',
+    'FORBIDDEN',
+    'Insufficient permissions to access this resource'
+  ),
+  '404': errorResponseWithExample('Not found', 'NOT_FOUND', 'Resource not found'),
+  '408': errorResponseWithExample('Request timeout', 'REQUEST_TIMEOUT', 'Request timed out'),
+  '409': errorResponseWithExample('Conflict', 'CONFLICT', 'Resource conflict'),
+  '422': errorResponseWithExample(
+    'Unprocessable entity',
+    'UNPROCESSABLE_ENTITY',
+    'Request could not be processed'
+  ),
+  '429': errorResponseWithExample(
+    'Too many requests',
+    'TOO_MANY_REQUESTS',
+    'Too many requests — retry after the Retry-After header'
+  ),
+  '500': errorResponseWithExample(
+    'Internal server error',
+    'INTERNAL_ERROR',
+    'An unexpected error occurred'
+  ),
+  '503': errorResponseWithExample(
+    'Service unavailable',
+    'SERVICE_UNAVAILABLE',
+    'Service temporarily unavailable'
+  ),
 } as const;
 
 // ── GET / ─────────────────────────────────────────────────────────────────────
@@ -337,16 +344,19 @@ registry.registerPath({
   summary: 'API info',
   tags: ['meta'],
   responses: {
-    '200': {
-      description: 'API metadata',
-      content: {
-        'application/json': {
-          schema: successSchema(
-            z.object({ name: z.string(), version: z.string(), docs: z.string() })
-          ),
+    '200': successResponse(
+      z.object({ name: z.string(), version: z.string(), docs: z.string() }),
+      {
+        success: true,
+        data: {
+          name: 'Fluxora Backend',
+          version: '0.1.0',
+          docs: '/docs',
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'API metadata'
+    ),
   },
 });
 
@@ -396,12 +406,29 @@ registry.registerPath({
             version: z.string(),
             dependencies: z.record(z.string(), z.string()),
           }),
+          example: {
+            status: 'healthy',
+            version: '0.1.0',
+            dependencies: { database: 'healthy', redis: 'healthy' },
+          },
         },
       },
     },
     '503': {
       description: 'One or more dependencies unhealthy',
-      content: { 'application/json': { schema: ErrorEnvelope } },
+      content: {
+        'application/json': {
+          schema: ErrorEnvelope,
+          example: {
+            success: false,
+            error: {
+              code: 'SERVICE_UNAVAILABLE',
+              message: 'One or more dependencies are unhealthy',
+              requestId: 'req_abc123',
+            },
+          },
+        },
+      },
     },
   },
 });
@@ -412,14 +439,22 @@ registry.registerPath({
   summary: 'Detailed health report',
   tags: ['health'],
   responses: {
-    '200': {
-      description: 'Full health report',
-      content: {
-        'application/json': {
-          schema: successSchema(z.object({ report: z.record(z.string(), z.unknown()) })),
+    '200': successResponse(
+      z.object({ report: z.record(z.string(), z.unknown()) }),
+      {
+        success: true,
+        data: {
+          report: {
+            status: 'healthy',
+            version: '0.1.0',
+            uptimeSeconds: 12345,
+            dependencies: { database: 'healthy', redis: 'healthy' },
+          },
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'Full health report'
+    ),
     '500': errorResponses['500'],
   },
 });
@@ -493,7 +528,7 @@ const StreamListPage = registry.register(
       description: 'True when additional pages exist. Fetch them by passing `next_cursor`.',
       example: true,
     }),
-    next_cursor: StreamCursorToken.nullable().openapi({
+    next_cursor: z.union([StreamCursorToken, z.null()]).openapi({
       description:
         'Cursor to pass as `cursor` on the next request. ' +
         'Null on the last page (has_more=false).',
@@ -507,23 +542,6 @@ const StreamListPage = registry.register(
 );
 
 /** 400 body specific to invalid/expired cursor. */
-const InvalidCursorError = z
-  .object({
-    success: z.literal(false),
-    error: z.object({
-      code: z.literal('VALIDATION_ERROR').openapi({ example: 'VALIDATION_ERROR' }),
-      message: z.string().openapi({
-        example: 'cursor must be a valid opaque pagination token',
-      }),
-    }),
-  })
-  .openapi({
-    description:
-      'Returned when the `cursor` parameter is present but cannot be decoded ' +
-      '(bad base64url, wrong JSON shape, missing version tag, or empty lastId). ' +
-      'The client must discard the cursor and restart pagination from the first page ' +
-      'by omitting the `cursor` parameter.',
-  });
 
 registry.registerPath({
   method: 'get',
@@ -603,6 +621,11 @@ registry.registerPath({
                       startTime: 1700000000,
                       endTime: 0,
                       status: 'active',
+                      contractId: 'api-created',
+                      transactionHash: '0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b',
+                      eventIndex: 0,
+                      createdAt: '2026-01-01T00:00:00.000Z',
+                      updatedAt: '2026-01-01T00:00:00.000Z',
                     },
                   ],
                   has_more: true,
@@ -631,6 +654,11 @@ registry.registerPath({
                       startTime: 1700001000,
                       endTime: 0,
                       status: 'active',
+                      contractId: 'api-created',
+                      transactionHash: '1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c',
+                      eventIndex: 1,
+                      createdAt: '2026-01-01T00:01:00.000Z',
+                      updatedAt: '2026-01-01T00:01:00.000Z',
                     },
                   ],
                   has_more: true,
@@ -659,6 +687,11 @@ registry.registerPath({
                       startTime: 1700002000,
                       endTime: 1800000000,
                       status: 'completed',
+                      contractId: 'api-created',
+                      transactionHash: '2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d',
+                      eventIndex: 2,
+                      createdAt: '2026-01-01T00:02:00.000Z',
+                      updatedAt: '2026-01-01T00:03:00.000Z',
                     },
                   ],
                   has_more: false,
@@ -738,7 +771,32 @@ registry.registerPath({
     '200': {
       description: 'Stream record',
       content: {
-        'application/json': { schema: successSchema(z.object({ stream: StreamObject })) },
+        'application/json': {
+          schema: successSchema(z.object({ stream: StreamObject })),
+          example: {
+            success: true,
+            data: {
+              stream: {
+                id: 'stream-abc123',
+                sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+                recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+                depositAmount: '1000000.0000000',
+                streamedAmount: '0.0000000',
+                remainingAmount: '1000000.0000000',
+                ratePerSecond: '0.0000116',
+                startTime: 1700000000,
+                endTime: 0,
+                status: 'active',
+                contractId: 'api-created',
+                transactionHash: '0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b',
+                eventIndex: 0,
+                createdAt: '2026-01-01T00:00:00.000Z',
+                updatedAt: '2026-01-01T00:00:00.000Z',
+              },
+            },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
       },
     },
     '304': {
@@ -819,10 +877,31 @@ registry.registerPath({
     },
   },
   responses: {
-    '201': {
-      description: 'Stream created',
-      content: { 'application/json': { schema: successSchema(StreamObject) } },
-    },
+    '201': successResponse(
+      StreamObject,
+      {
+        success: true,
+        data: {
+          id: 'stream-abc123',
+          sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+          recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+          depositAmount: '1000000.0000000',
+          streamedAmount: '0.0000000',
+          remainingAmount: '1000000.0000000',
+          ratePerSecond: '0.0000116',
+          startTime: 1700000000,
+          endTime: 0,
+          status: 'active',
+          contractId: 'api-created',
+          transactionHash: '0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b',
+          eventIndex: 0,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+      },
+      'Stream created'
+    ),
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '409': errorResponses['409'],
@@ -839,14 +918,15 @@ registry.registerPath({
   security: [{ bearerAuth: [] }],
   request: { params: z.object({ id: z.string().openapi({ example: 'stream-abc123' }) }) },
   responses: {
-    '200': {
-      description: 'Stream cancelled',
-      content: {
-        'application/json': {
-          schema: successSchema(z.object({ message: z.string(), id: z.string() })),
-        },
+    '200': successResponse(
+      z.object({ message: z.string(), id: z.string() }),
+      {
+        success: true,
+        data: { message: 'Stream cancelled', id: 'stream-abc123' },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'Stream cancelled'
+    ),
     '401': errorResponses['401'],
     '404': errorResponses['404'],
     '409': errorResponses['409'],
@@ -873,10 +953,31 @@ registry.registerPath({
     },
   },
   responses: {
-    '200': {
-      description: 'Updated stream',
-      content: { 'application/json': { schema: successSchema(StreamObject) } },
-    },
+    '200': successResponse(
+      StreamObject,
+      {
+        success: true,
+        data: {
+          id: 'stream-abc123',
+          sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+          recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+          depositAmount: '1000000.0000000',
+          streamedAmount: '0.0000000',
+          remainingAmount: '1000000.0000000',
+          ratePerSecond: '0.0000116',
+          startTime: 1700000000,
+          endTime: 0,
+          status: 'paused',
+          contractId: 'api-created',
+          transactionHash: '0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b',
+          eventIndex: 0,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+      },
+      'Updated stream'
+    ),
     '400': errorResponses['400'],
     '404': errorResponses['404'],
     '409': errorResponses['409'],
@@ -937,19 +1038,31 @@ registry.registerPath({
   tags: ['audit'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': {
-      description: 'Audit entries',
-      content: {
-        'application/json': {
-          schema: successSchema(
-            z.object({
-              entries: z.array(z.record(z.string(), z.unknown())),
-              total: z.number().int(),
-            })
-          ),
+    '200': successResponse(
+      z.object({
+        entries: z.array(z.record(z.string(), z.unknown())),
+        total: z.number().int(),
+      }),
+      {
+        success: true,
+        data: {
+          entries: [
+            {
+              seq: 1,
+              timestamp: '2026-01-01T00:00:00.000Z',
+              action: 'stream.create',
+              resourceType: 'stream',
+              resourceId: 'stream-abc123',
+              correlationId: 'req_abc123',
+              meta: null,
+            },
+          ],
+          total: 1,
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'Audit entries'
+    ),
     '401': errorResponses['401'],
     '403': errorResponses['403'],
     '406': errorResponses['406'],
@@ -1028,7 +1141,36 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Full PII policy including trustBoundaries array',
-      content: { 'application/json': { schema: PrivacyPolicyResponseSchema } },
+      content: {
+        'application/json': {
+          schema: PrivacyPolicyResponseSchema,
+          example: {
+            service: 'fluxora-backend',
+            version: '0.1.0',
+            piiPolicy: {
+              summary:
+                'Fluxora stores only chain-derived pseudonymous data (Stellar public keys and on-chain amounts).',
+              dataClassifications: [
+                { level: 'PUBLIC', description: 'Stellar public keys and amounts' },
+              ],
+              fieldPolicies: {
+                streamFields: {},
+                requestFields: {},
+              },
+              retentionSchedule: [],
+              trustBoundaries: [
+                {
+                  actor: 'Anonymous client',
+                  description: 'Unauthenticated public internet request.',
+                  allowed: ['Read public stream list and individual stream details'],
+                  denied: ['Create or mutate stream records (future: requires auth)'],
+                },
+              ],
+            },
+            _links: { self: '/api/privacy/policy' },
+          },
+        },
+      },
     },
     '406': errorResponses['406'],
   },
@@ -1042,7 +1184,18 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Retention schedule',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            retentionSchedule: [
+              { dataClass: 'STREAM_METADATA', retentionDays: 365 },
+              { dataClass: 'AUDIT_LOG', retentionDays: 90 },
+            ],
+            _links: { self: '/api/privacy/retention', fullPolicy: '/api/privacy/policy' },
+          },
+        },
+      },
     },
     '406': errorResponses['406'],
   },
@@ -1056,15 +1209,15 @@ registry.registerPath({
   summary: 'Read pause flags (no auth)',
   tags: ['admin'],
   responses: {
-    '200': {
-      description: 'Pause flags',
-      content: {
-        'application/json': {
-          schema: successSchema(z.object({ pauseFlags: z.record(z.string(), z.boolean()) })),
-        },
+    '200': successResponse(
+      z.object({ pauseFlags: z.record(z.string(), z.boolean()) }),
+      {
+        success: true,
+        data: { pauseFlags: { streamCreation: false, ingestion: false } },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
-    '406': errorResponses['406'],
+      'Pause flags'
+    ),
   },
 });
 
@@ -1075,19 +1228,21 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': {
-      description: 'Admin status',
-      content: {
-        'application/json': {
-          schema: successSchema(
-            z.object({
-              pauseFlags: z.record(z.string(), z.boolean()),
-              reindex: z.record(z.string(), z.unknown()),
-            })
-          ),
+    '200': successResponse(
+      z.object({
+        pauseFlags: z.record(z.string(), z.boolean()),
+        reindex: z.record(z.string(), z.unknown()),
+      }),
+      {
+        success: true,
+        data: {
+          pauseFlags: { streamCreation: false, ingestion: false },
+          reindex: { status: 'idle', lastCompletedAt: null },
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'Admin status'
+    ),
     '401': errorResponses['401'],
     '406': errorResponses['406'],
   },
@@ -1100,10 +1255,15 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': {
-      description: 'Pause flags',
-      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.boolean())) } },
-    },
+    '200': successResponse(
+      z.record(z.string(), z.boolean()),
+      {
+        success: true,
+        data: { streamCreation: false, ingestion: false },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+      },
+      'Pause flags'
+    ),
     '401': errorResponses['401'],
     '406': errorResponses['406'],
   },
@@ -1130,16 +1290,18 @@ registry.registerPath({
     },
   },
   responses: {
-    '200': {
-      description: 'Updated pause flags',
-      content: {
-        'application/json': {
-          schema: successSchema(
-            z.object({ message: z.string(), pauseFlags: z.record(z.string(), z.boolean()) })
-          ),
+    '200': successResponse(
+      z.object({ message: z.string(), pauseFlags: z.record(z.string(), z.boolean()) }),
+      {
+        success: true,
+        data: {
+          message: 'Pause flags updated.',
+          pauseFlags: { streamCreation: true, ingestion: false },
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'Updated pause flags'
+    ),
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '503': errorResponses['503'],
@@ -1154,10 +1316,15 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': {
-      description: 'Reindex state',
-      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
-    },
+    '200': successResponse(
+      z.record(z.string(), z.unknown()),
+      {
+        success: true,
+        data: { status: 'idle', lastCompletedAt: null, progress: null },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+      },
+      'Reindex state'
+    ),
     '401': errorResponses['401'],
     '406': errorResponses['406'],
   },
@@ -1170,16 +1337,18 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '202': {
-      description: 'Reindex started',
-      content: {
-        'application/json': {
-          schema: successSchema(
-            z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) })
-          ),
+    '202': successResponse(
+      z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) }),
+      {
+        success: true,
+        data: {
+          message: 'Reindex started.',
+          reindex: { status: 'running', startedAt: '2026-01-01T00:00:00.000Z', progress: 0 },
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'Reindex started'
+    ),
     '401': errorResponses['401'],
     '409': errorResponses['409'],
     '406': errorResponses['406'],
@@ -1204,20 +1373,23 @@ registry.registerPath({
     },
   },
   responses: {
-    '200': {
-      description: 'WebSocket subscribers disconnected',
-      content: {
-        'application/json': {
-          schema: successSchema(
-            z.object({
-              message: z.string(),
-              stream_id: z.string(),
-              disconnectedCount: z.number().int(),
-            })
-          ),
+    '200': successResponse(
+      z.object({
+        message: z.string(),
+        stream_id: z.string(),
+        disconnectedCount: z.number().int(),
+      }),
+      {
+        success: true,
+        data: {
+          message: 'WebSocket subscribers disconnected.',
+          stream_id: 'stream-abc123',
+          disconnectedCount: 3,
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'WebSocket subscribers disconnected'
+    ),
     '400': errorResponses['400'],
     '401': errorResponses['401'],
     '503': errorResponses['503'],
@@ -1232,14 +1404,26 @@ registry.registerPath({
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
   responses: {
-    '200': {
-      description: 'API key list',
-      content: {
-        'application/json': {
-          schema: successSchema(z.object({ apiKeys: z.array(z.record(z.string(), z.unknown())) })),
+    '200': successResponse(
+      z.object({ apiKeys: z.array(z.record(z.string(), z.unknown())) }),
+      {
+        success: true,
+        data: {
+          apiKeys: [
+            {
+              id: 'ck1abc123',
+              name: 'my-service',
+              prefix: 'flx_a1b2',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              lastUsedAt: null,
+              revokedAt: null,
+            },
+          ],
         },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
-    },
+      'API key list'
+    ),
     '401': errorResponses['401'],
     '406': errorResponses['406'],
   },
@@ -1264,7 +1448,18 @@ registry.registerPath({
   responses: {
     '201': {
       description: 'API key created (raw key returned once)',
-      content: { 'application/json': { schema: ApiKeyCreatedSchema } },
+      content: {
+        'application/json': {
+          schema: ApiKeyCreatedSchema,
+          example: {
+            id: 'ck1abc123',
+            name: 'my-service',
+            key: 'flx_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6',
+            prefix: 'flx_a1b2',
+            createdAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
+      },
     },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
@@ -1282,7 +1477,18 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'New raw key returned once',
-      content: { 'application/json': { schema: ApiKeyCreatedSchema } },
+      content: {
+        'application/json': {
+          schema: ApiKeyCreatedSchema,
+          example: {
+            id: 'ck1abc123',
+            name: 'my-service',
+            key: 'flx_newrotatedkey000000000000000000',
+            prefix: 'flx_new',
+            createdAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
+      },
     },
     '401': errorResponses['401'],
     '404': errorResponses['404'],
@@ -1334,6 +1540,18 @@ registry.registerPath({
             data: z.array(DeprecatedRouteEntry),
             meta: z.object({ timestamp: z.string() }),
           }),
+          example: {
+            success: true,
+            data: [
+              {
+                route: '/api/rate-limits/config',
+                sunsetDate: '2026-09-30T00:00:00.000Z',
+                link: '/docs/api/deprecation-policy.md#current-deprecations',
+                daysUntilSunset: 93,
+              },
+            ],
+            meta: { timestamp: '2026-01-01T00:00:00.000Z' },
+          },
         },
       },
     },
@@ -1361,7 +1579,32 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'DLQ entries',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            success: true,
+            data: {
+              entries: [
+                {
+                  id: 'dlq_001',
+                  topic: 'stream.created',
+                  payload: { streamId: 'stream-abc123' },
+                  failureReason: 'RPC timeout',
+                  attempts: 3,
+                  firstFailedAt: '2026-01-01T00:00:00.000Z',
+                },
+              ],
+              total: 1,
+              limit: 50,
+              offset: 0,
+              has_more: false,
+              suspendedTopics: [],
+            },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
+      },
     },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
@@ -1379,7 +1622,27 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'DLQ entry',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            success: true,
+            data: {
+              entry: {
+                id: 'dlq_001',
+                topic: 'stream.created',
+                payload: { streamId: 'stream-abc123' },
+                failureReason: 'RPC timeout',
+                attempts: 3,
+                firstFailedAt: '2026-01-01T00:00:00.000Z',
+              },
+              consumerSuspended: false,
+              consecutiveFailures: 0,
+            },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
+      },
     },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
@@ -1397,7 +1660,16 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Entry deleted',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            success: true,
+            data: { message: 'DLQ entry removed', id: 'dlq_001' },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
+      },
     },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
@@ -1415,7 +1687,16 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Retry queued',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            success: true,
+            data: { message: 'DLQ entry replayed', id: 'dlq_001', topic: 'stream.created' },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
+      },
     },
     '401': errorResponses['401'],
     '403': errorResponses['403'],
@@ -1433,7 +1714,17 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Rate-limit status',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            limit: 100,
+            remaining: 95,
+            resetAt: '2026-01-01T00:01:00.000Z',
+            windowMs: 60000,
+          },
+        },
+      },
     },
     '406': errorResponses['406'],
   },
@@ -1448,7 +1739,17 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Rate-limit config',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            ip: { windowMs: 60000, max: 100, enabled: true },
+            apiKey: { windowMs: 60000, max: 200, enabled: true },
+            admin: { windowMs: 60000, max: 50, enabled: true },
+            source: 'default',
+          },
+        },
+      },
     },
     '401': errorResponses['401'],
     '406': errorResponses['406'],
@@ -1497,7 +1798,19 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Updated config',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            message: 'Rate-limit config updated.',
+            config: {
+              ip: { windowMs: 60000, max: 200, enabled: true },
+              apiKey: { windowMs: 60000, max: 200, enabled: true },
+              admin: { windowMs: 60000, max: 50, enabled: true },
+            },
+          },
+        },
+      },
     },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
@@ -1742,10 +2055,11 @@ registry.registerPath({
         },
       },
     },
-    '413': {
-      description: 'Payload too large',
-      content: { 'application/json': { schema: ErrorEnvelope } },
-    },
+    '413': errorResponseWithExample(
+      'Payload too large',
+      'PAYLOAD_TOO_LARGE',
+      'Request payload exceeds the maximum allowed size'
+    ),
     '429': errorResponses['429'],
     '503': errorResponses['503'],
   },
@@ -1788,7 +2102,35 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Offset-paginated event list ordered by `ledger` ASC, `eventId` ASC.',
-      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+      content: {
+        'application/json': {
+          schema: successSchema(z.record(z.string(), z.unknown())),
+          example: {
+            success: true,
+            data: {
+              events: [
+                {
+                  eventId: 'evt-abc-001',
+                  ledger: 512345,
+                  contractId: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+                  topic: 'stream.created',
+                  txHash: 'a3f4b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3',
+                  txIndex: 0,
+                  operationIndex: 0,
+                  eventIndex: 0,
+                  payload: { streamId: 'stream-abc123' },
+                  happenedAt: '2026-01-01T00:00:00.000Z',
+                  ledgerHash: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+                },
+              ],
+              total: 1,
+              limit: 100,
+              offset: 0,
+            },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
+      },
     },
     '401': errorResponses['401'],
   },
@@ -1830,7 +2172,34 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Cursor-paginated event page ordered by `ledger` ASC, `eventId` ASC.',
-      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+      content: {
+        'application/json': {
+          schema: successSchema(z.record(z.string(), z.unknown())),
+          example: {
+            success: true,
+            data: {
+              events: [
+                {
+                  eventId: 'evt-abc-002',
+                  ledger: 512400,
+                  contractId: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
+                  topic: 'stream.cancelled',
+                  txHash: 'b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5',
+                  txIndex: 1,
+                  operationIndex: 0,
+                  eventIndex: 0,
+                  payload: { streamId: 'stream-abc123' },
+                  happenedAt: '2026-01-02T00:00:00.000Z',
+                  ledgerHash: 'b1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6b1b2c3d4e5f6b1b2',
+                },
+              ],
+              hasMore: false,
+              nextAfterEventId: null,
+            },
+            meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+          },
+        },
+      },
     },
     '401': errorResponses['401'],
   },
@@ -1930,14 +2299,21 @@ registry.registerPath({
             eventType: z.string().nullable().openapi({ example: 'stream.created' }),
             event: z.record(z.string(), z.unknown()).nullable().openapi({ description: 'Parsed event payload' }),
           }),
+          example: {
+            ok: true,
+            deliveryId: 'del_01HXYZ',
+            eventType: 'stream.created',
+            event: { streamId: 'stream-abc123', amount: '1000000.0000000' },
+          },
         },
       },
     },
     '400': errorResponses['400'],
-    '401': {
-      description: 'Invalid signature or missing required headers',
-      content: { 'application/json': { schema: ErrorEnvelope } },
-    },
+    '401': errorResponseWithExample(
+      'Invalid signature or missing required headers',
+      'UNAUTHORIZED',
+      'Webhook signature verification failed'
+    ),
     '409': {
       description: 'Duplicate delivery — already processed this delivery ID',
       content: {
@@ -1947,13 +2323,19 @@ registry.registerPath({
             message: z.string(),
             deliveryId: z.string(),
           }),
+          example: {
+            error: 'duplicate_delivery',
+            message: 'Duplicate delivery id',
+            deliveryId: 'del_01HXYZ',
+          },
         },
       },
     },
-    '413': {
-      description: 'Payload too large (> 1 MB)',
-      content: { 'application/json': { schema: ErrorEnvelope } },
-    },
+    '413': errorResponseWithExample(
+      'Payload too large (> 1 MB)',
+      'PAYLOAD_TOO_LARGE',
+      'Request payload exceeds the maximum allowed size'
+    ),
   },
 });
 
@@ -1971,7 +2353,16 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Queued',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      content: {
+        'application/json': {
+          schema: z.record(z.string(), z.unknown()),
+          example: {
+            ok: true,
+            outboxId: 'out_01HXYZ',
+            message: 'Webhook queued for delivery',
+          },
+        },
+      },
     },
     '400': errorResponses['400'],
   },
@@ -1990,7 +2381,15 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Prometheus text format',
-      content: { 'text/plain': { schema: z.string() } },
+      content: {
+        'text/plain': {
+          schema: z.string(),
+          example:
+            '# HELP http_requests_total Total HTTP requests\n' +
+            '# TYPE http_requests_total counter\n' +
+            'http_requests_total{method="GET",path="/health"} 42\n',
+        },
+      },
     },
     '401': {
       description: 'Unauthorized — missing or invalid Bearer authorization scheme/token',
