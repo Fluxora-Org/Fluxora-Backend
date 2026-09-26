@@ -47,6 +47,10 @@ describe('PostgresContractEventStore concurrent event deduplication', () => {
 
     expect([winner.insertedEventIds, loser.insertedEventIds].filter((ids) => ids.length === 1)).toHaveLength(1);
     expect([winner.duplicateEventIds, loser.duplicateEventIds].filter((ids) => ids.length === 1)).toHaveLength(1);
-    expect(queries.every((sql) => sql.includes('WITH input') && sql.includes('ON CONFLICT (event_id) DO NOTHING'))).toBe(true);
+    // `insertMany` also issues a pre-write partition coverage probe (#1456);
+    // assert the shape of the dedup/insert statements only.
+    const insertQueries = queries.filter((sql) => sql.includes('WITH input'));
+    expect(insertQueries).toHaveLength(2);
+    expect(insertQueries.every((sql) => sql.includes('ON CONFLICT (event_id) DO NOTHING'))).toBe(true);
   });
 });

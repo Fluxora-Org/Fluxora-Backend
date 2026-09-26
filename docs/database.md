@@ -204,9 +204,24 @@ The job checks each table via `pg_class.relkind = 'p'` + `pg_partitioned_table.p
 
 Monthly partitions are named `<table>_y<YYYY>m<MM>` (e.g. `contract_events_y2026m07`), matching the convention already used by `tests/db/contractEvents.partitionPruning.test.ts` and `tests/db/vacuumCollector.collect.test.ts`. Month boundaries are computed in **UTC** (`Date.UTC(...)`) to avoid off-by-one errors near midnight on a server running in a non-UTC timezone.
 
+#### Lead time (how far ahead partitions are created)
+
+Partitions are created a **documented interval ahead of use**: the partition covering month `M` is created during month `M - leadTimeMonths`, so it exists for at least `leadTimeMonths` months (≈ 28 × `leadTimeMonths` days) before a single row can require it. That buffer is what makes a failed or missed run survivable — the next run self-heals long before the partition is *needed*.
+
+The default lead time is `DEFAULT_LEAD_TIME_MONTHS = 3` months. It is configurable, in whole calendar months, with this precedence:
+
+| # | Source | Notes |
+|---|---|---|
+| 1 | `leadTimeMonths` option to `runPartitionMaintenance(pool, { leadTimeMonths })` | Highest precedence; used by tests and by callers that need a specific value. |
+| 2 | `monthsAhead` option | Deprecated alias with the same meaning, kept for callers written against the previous signature. |
+| 3 | `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS` env var (`config.partitionMaintenance.leadTimeMonths`) | Deployment-level knob. |
+| 4 | `DEFAULT_LEAD_TIME_MONTHS` (3) | Built-in fallback. |
+
+Keep the configured value `>= 2` so a single missed monthly boundary cannot exhaust the buffer. A non-integer or negative configured value is ignored in favour of the built-in default rather than propagated, so a typo in a deployment's environment cannot silently disable pre-creation. The run result reports the value actually used as `leadTimeMonths`.
+
 #### Schedule and idempotency
 
-1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus the next `monthsAhead` months (default `3`, see `DEFAULT_MONTHS_AHEAD` in `src/jobs/partitionMaintenance.ts`).
+1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus every month starting inside the configured lead time (default `3` months).
 2. It acquires a single **non-blocking** advisory lock (`pg_try_advisory_lock(123456789)`, exported as `PARTITION_MAINTENANCE_LOCK_ID`) before doing any work. If another instance already holds the lock, the run is a no-op — it does not wait or retry, so overlapping cron + manual invocations across multiple app instances never race to create the same partition.
 3. Every `CREATE TABLE` uses `IF NOT EXISTS`, so re-running the job when all partitions already exist performs zero DDL and is always a safe no-op — the defining idempotency property required of this job.
 4. The lock is released in a `finally` block, so a failure partway through (e.g. one table's DDL fails) never leaves the lock held for subsequent runs.
@@ -228,6 +243,7 @@ When this happens, the job:
   }
   ```
 - Increments the `fluxora_partition_maintenance_behind_schedule_total{table="..."}` counter.
+- Raises the `partition_maintenance_behind_schedule` operator alert (see below), so the event is pageable from metrics and not only discoverable from logs.
 - Still creates the missing partition immediately afterward (self-healing) — the alert reports a `DEFAULT`-partition risk window that already occurred, it does not prevent the fix.
 
 ##### Recommended alert
@@ -240,12 +256,50 @@ When this happens, the job:
     summary: "A scheduled partition pre-creation run was missed — rows may have landed in the DEFAULT partition"
 ```
 
+#### Failure alerting (a failure is never only a log line)
+
+Every failure that matters to an operator is raised through `raiseAlert()` in `src/lib/alerts.ts`, which emits a structured `error` log record **and** increments `fluxora_alerts_raised_total{alert,severity}` — so metric-based alerting rules can page on it even when no log shipping is configured. `raiseAlert()` never throws, and can additionally be forwarded to an incident-management provider via `setAlertSink()`.
+
+| Alert name | Severity | Raised when |
+|---|---|---|
+| `partition_creation_failed` | critical | A `CREATE TABLE … PARTITION OF` threw. The error is re-thrown afterwards, so the queue retries (and eventually dead-letters) the run instead of treating it as a success. |
+| `partition_maintenance_behind_schedule` | critical | The current month's partition was missing — a previous run was missed or failed. |
+| `partition_shortfall_detected` | critical | The pre-write guard (below) found a required partition missing just before an insert. |
+
+```yaml
+- alert: PartitionCreationFailed
+  expr: increase(fluxora_alerts_raised_total{alert="partition_creation_failed"}[15m]) > 0
+  severity: critical
+  annotations:
+    summary: "A partition could not be created — writes for that interval are at risk"
+
+- alert: PartitionShortfallBeforeWrite
+  expr: increase(fluxora_alerts_raised_total{alert="partition_shortfall_detected"}[15m]) > 0
+  severity: critical
+  annotations:
+    summary: "A write needed a partition that did not exist — partition maintenance was not running"
+```
+
+#### Pre-write detection (absence is caught before a write fails)
+
+The job is a *scheduled* defence, so between two runs time can advance past the created partitions (a deploy that never started the job, an outage, a mis-set lead time). The next write would then fail with an opaque `no partition of relation "contract_events" found for row` — a write error raised far from its cause.
+
+`ensurePartitionCoverage()` (exported from `src/jobs/partitionMaintenance.ts`, same module as the job so both share the partition-naming and bound math) is called by `PostgresContractEventStore.insertMany()` **before** the insert is issued:
+
+1. It computes the partitions covering every distinct month in the batch's `happened_at` values.
+2. A single catalog query reports whether the parent is range-partitioned *and* which of those partitions exist (no per-row work, one round-trip in the happy path).
+3. If a required partition is missing it raises `partition_shortfall_detected`, then creates the partition so the write that follows cannot fail — alerting and self-healing in one pass. A create that fails raises `partition_creation_failed` and is reported as `failed` on the result.
+
+The guard is **strictly fail-open**: an unmanaged (non-partitioned) table, an inconclusive probe response, or a probe error leaves `insertMany()` behaving exactly as it did before — observability must never be the reason a writable batch fails.
+
 #### Metrics
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted) |
+| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted), by both the job and the pre-write guard |
 | `fluxora_partition_maintenance_behind_schedule_total` | Counter | `table` | Incremented when the current-month partition was found missing (see above) |
+| `fluxora_partition_maintenance_failures_total` | Counter | `table` | Incremented on every failed partition-creation attempt |
+| `fluxora_alerts_raised_total` | Counter | `alert`, `severity` | Every operator alert raised through `src/lib/alerts.ts` |
 
 #### Security
 
@@ -256,10 +310,14 @@ When this happens, the job:
 
 #### Tests
 
-`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), behind-schedule detection and metrics, and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), lead-time resolution (option, deprecated alias, configured default, invalid-value fallback, `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS`), behind-schedule detection and metrics, failure alerting (alerts raised *and* the error still re-thrown), and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+
+`tests/db/contractEvents.partitionCoverage.test.ts` covers the pre-write guard against an in-memory emulation of Postgres: the probe's single round-trip and month deduplication, `partition_shortfall_detected` + self-heal, detection-only mode, failed-create alerting, fail-open behaviour for unmanaged tables / unexpected probe shapes / probe errors, and the issue's validation scenario — advance time past the partitions the job created and assert the shortfall is detected (and alerted on) *before* the write fails.
+
+`tests/lib/alerts.test.ts` covers the alerting facility itself: log level and record shape, metric increment, sink dispatch, name normalisation, and the never-throws guarantee.
 
 ```bash
-pnpm test tests/jobs/partitionMaintenance.test.ts
+pnpm test tests/jobs/partitionMaintenance.test.ts tests/db/contractEvents.partitionCoverage.test.ts tests/lib/alerts.test.ts
 ```
 
 ### Recommended alert thresholds

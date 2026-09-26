@@ -6,12 +6,16 @@ import {
   PARTITION_MAINTENANCE_LOCK_ID,
   CANDIDATE_TABLES,
   DEFAULT_MONTHS_AHEAD,
+  DEFAULT_LEAD_TIME_MONTHS,
   DEFAULT_LOCK_TIMEOUT_MS,
 } from '../../src/jobs/partitionMaintenance.js';
 import {
   partitionsCreatedTotal,
   partitionMaintenanceBehindScheduleTotal,
+  partitionMaintenanceFailuresTotal,
 } from '../../src/metrics/businessMetrics.js';
+import { config } from '../../src/config.js';
+import { setAlertSink, type AlertEvent } from '../../src/lib/alerts.js';
 
 // ── Mock pool builder ─────────────────────────────────────────────────────
 //
@@ -116,6 +120,7 @@ describe('runPartitionMaintenance', () => {
   beforeEach(() => {
     partitionsCreatedTotal.reset();
     partitionMaintenanceBehindScheduleTotal.reset();
+    partitionMaintenanceFailuresTotal.reset();
   });
 
   afterEach(() => {
@@ -625,6 +630,143 @@ describe('runPartitionMaintenance', () => {
       const result = await runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 3 });
 
       expect(result.tables[0].partitionsChecked).toBe(4);
+    });
+  });
+
+  // ── Lead time (documented interval ahead of use) ──────────────────────────
+
+  describe('lead time', () => {
+    let originalLeadTime: number;
+
+    beforeEach(() => {
+      originalLeadTime = config.partitionMaintenance.leadTimeMonths;
+    });
+
+    afterEach(() => {
+      config.partitionMaintenance.leadTimeMonths = originalLeadTime;
+    });
+
+    it('creates the current month plus every month inside the requested lead time', async () => {
+      const { pool, calls } = buildMockPool();
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 5 });
+
+      expect(result.leadTimeMonths).toBe(5);
+      expect(result.tables[0].partitionsChecked).toBe(6);
+      expect(calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'))).toHaveLength(6);
+    });
+
+    it('defaults the lead time to config.partitionMaintenance.leadTimeMonths', async () => {
+      config.partitionMaintenance.leadTimeMonths = 5;
+      const { pool, calls } = buildMockPool();
+
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
+
+      expect(result.leadTimeMonths).toBe(5);
+      expect(calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'))).toHaveLength(6);
+    });
+
+    it('falls back to DEFAULT_LEAD_TIME_MONTHS when the configured lead time is invalid', async () => {
+      config.partitionMaintenance.leadTimeMonths = -3;
+      const { pool } = buildMockPool();
+
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
+
+      expect(result.leadTimeMonths).toBe(DEFAULT_LEAD_TIME_MONTHS);
+    });
+
+    it('still honours the deprecated monthsAhead option (same meaning)', async () => {
+      config.partitionMaintenance.leadTimeMonths = 4;
+      const { pool } = buildMockPool();
+
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 1 });
+
+      expect(result.leadTimeMonths).toBe(1);
+    });
+
+    it('rejects a negative lead time', async () => {
+      const { pool } = buildMockPool();
+      await expect(runPartitionMaintenance(pool, { leadTimeMonths: -1 })).rejects.toThrow(
+        /non-negative integer/,
+      );
+    });
+
+    it('rejects a non-integer lead time', async () => {
+      const { pool } = buildMockPool();
+      await expect(runPartitionMaintenance(pool, { leadTimeMonths: 0.5 })).rejects.toThrow(
+        /non-negative integer/,
+      );
+    });
+
+    it('reads the lead time from PARTITION_MAINTENANCE_LEAD_TIME_MONTHS', async () => {
+      vi.resetModules();
+      process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'] = '5';
+
+      const fresh = await import('../../src/config.js');
+
+      expect(fresh.config.partitionMaintenance.leadTimeMonths).toBe(5);
+      delete process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'];
+      vi.resetModules();
+    });
+
+    it('keeps DEFAULT_MONTHS_AHEAD as a backwards-compatible alias', () => {
+      expect(DEFAULT_MONTHS_AHEAD).toBe(DEFAULT_LEAD_TIME_MONTHS);
+    });
+  });
+
+  // ── Failure alerting (a failure is never only a log line) ─────────────────
+
+  describe('failure alerting', () => {
+    let alerts: AlertEvent[];
+
+    beforeEach(() => {
+      alerts = [];
+      setAlertSink((alert) => alerts.push(alert));
+    });
+
+    afterEach(() => {
+      setAlertSink(null);
+    });
+
+    it('raises partition_creation_failed and still rethrows when a CREATE TABLE fails', async () => {
+      const failureSpy = vi.spyOn(partitionMaintenanceFailuresTotal, 'inc');
+      // The current month already exists, so the only alert this run raises is
+      // the creation failure (no behind-schedule noise).
+      const { pool } = buildMockPool({
+        failOnCreateNumber: 1,
+        existingPartitions: new Set(['contract_events_y2026m07']),
+      });
+
+      await expect(
+        runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 2 }),
+      ).rejects.toThrow(/Injected failure on CREATE TABLE call #1/);
+
+      expect(alerts.map((a) => a.name)).toEqual(['partition_creation_failed']);
+      expect(alerts[0]?.severity).toBe('critical');
+      expect(alerts[0]?.context?.partition).toBe('contract_events_y2026m08');
+      expect(failureSpy).toHaveBeenCalledWith({ table: 'contract_events' });
+    });
+
+    it('raises partition_maintenance_behind_schedule when the current-month partition is missing', async () => {
+      const { pool } = buildMockPool();
+
+      await runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 0 });
+
+      const behind = alerts.find((a) => a.name === 'partition_maintenance_behind_schedule');
+      expect(behind).toBeDefined();
+      expect(behind?.severity).toBe('critical');
+      expect(behind?.context?.partition).toBe('contract_events_y2026m07');
+    });
+
+    it('raises no alert on a healthy run', async () => {
+      const existing = new Set([
+        'contract_events_y2026m07',
+        'contract_events_y2026m08',
+      ]);
+      const { pool } = buildMockPool({ existingPartitions: existing });
+
+      await runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 1 });
+
+      expect(alerts).toEqual([]);
     });
   });
 });

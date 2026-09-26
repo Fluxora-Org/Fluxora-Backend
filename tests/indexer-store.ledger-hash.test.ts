@@ -128,7 +128,9 @@ describe('PostgresContractEventStore — ledger_hash SQL round-trip', () => {
     const capturedValues: unknown[] = [];
     const store = new PostgresContractEventStore({
       query: async <T>(sql: string, values?: unknown[]) => {
-        if (values) capturedValues.push(...values);
+        // `insertMany` also issues a pre-write partition coverage probe (#1456);
+        // only the canonical INSERT carries this test's parameter layout.
+        if (values && sql.includes('INSERT INTO contract_events')) capturedValues.push(...values);
         if (sql.includes('ON CONFLICT')) {
           return { rows: [{ event_id: 'evt-001' }] as T[], rowCount: 1 };
         }

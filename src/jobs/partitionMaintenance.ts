@@ -15,16 +15,63 @@
  *     Tables that are not range-partitioned (e.g. `audit_logs` before it is
  *     migrated to partitioning) are skipped silently — this is expected
  *     steady state, not an error.
- *  2. For the current calendar month plus the next `monthsAhead` months,
- *     ensures a monthly partition named `<table>_y<YYYY>m<MM>` exists,
- *     creating it with `CREATE TABLE IF NOT EXISTS … PARTITION OF …` when
- *     missing.
+ *  2. For the current calendar month plus every month that begins within the
+ *     configured **lead time** (see below), ensures a monthly partition named
+ *     `<table>_y<YYYY>m<MM>` exists, creating it with
+ *     `CREATE TABLE IF NOT EXISTS … PARTITION OF …` when missing.
  *  3. If the **current month's** partition is found missing, that means an
  *     earlier scheduled run failed to create it while it was still in the
  *     future — rows for *today* may already be landing in the unindexed
  *     `DEFAULT` partition. This is reported as "behind schedule" via a
- *     structured error log and the `partitionMaintenanceBehindScheduleTotal`
- *     counter, in addition to being self-healed immediately.
+ *     structured error log, an operator alert, and the
+ *     `partitionMaintenanceBehindScheduleTotal` counter, in addition to being
+ *     self-healed immediately.
+ *
+ * ## Lead time
+ *
+ * Partitions are created a documented interval **ahead of use**: the partition
+ * covering month `M` is created during month `M - leadTimeMonths`, so it exists
+ * for at least `leadTimeMonths` months (≈ 28 × `leadTimeMonths` days) before a
+ * single row can require it. That buffer is what makes a failed or missed run
+ * survivable: the next run self-heals long before the partition is *needed*,
+ * rather than discovering the shortfall on the first insert of the month.
+ *
+ * The lead time is configurable, in whole calendar months, via (highest
+ * precedence first):
+ *
+ *  1. the `leadTimeMonths` option passed to {@link runPartitionMaintenance};
+ *  2. the deprecated `monthsAhead` option (same meaning, kept for callers
+ *     written against the previous signature);
+ *  3. the `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS` environment variable, read
+ *     through `config.partitionMaintenance.leadTimeMonths`;
+ *  4. {@link DEFAULT_LEAD_TIME_MONTHS} (3 months).
+ *
+ * ## Alerting (failures are loud)
+ *
+ * Every failure that matters to an operator goes through
+ * {@link raiseAlert} — not just a log line. That means each one produces a
+ * structured `error` log record **and** an increment of
+ * `fluxora_alerts_raised_total`, so metric-based alerting rules can page on it
+ * even when no log shipping is configured:
+ *
+ *  - `partition_creation_failed` — a `CREATE TABLE … PARTITION OF` threw. The
+ *    failure is re-thrown afterwards so the queue retries / dead-letters the
+ *    run rather than pretending it succeeded.
+ *  - `partition_maintenance_behind_schedule` — the current month's partition
+ *    was missing (a previous run was missed or failed).
+ *
+ * ## Pre-write detection ({@link ensurePartitionCoverage})
+ *
+ * The job is the primary defence, but it is a *scheduled* defence: between two
+ * runs, time can advance past the created partitions (a deploy that never
+ * started the job, a long outage, a mis-set lead time). To make the shortfall
+ * visible *before* it becomes an opaque write error, the same module exports
+ * {@link ensurePartitionCoverage}, which the `contract_events` write path
+ * calls immediately before issuing an insert: it probes whether the partitions
+ * covering the batch's timestamps exist, raises `partition_shortfall_detected`
+ * / `partition_creation_failed` alerts when they do not, and self-heals by
+ * creating them — all in a single catalog round-trip in the happy path, and
+ * strictly fail-open (an inconclusive probe leaves behaviour unchanged).
  *
  * ## Idempotency / concurrency safety
  *
@@ -79,11 +126,14 @@
  *   require super-user access.
  */
 
-import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
+import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import { logger } from '../lib/logger.js';
+import { raiseAlert } from '../lib/alerts.js';
+import { config } from '../config.js';
 import {
   partitionsCreatedTotal,
   partitionMaintenanceBehindScheduleTotal,
+  partitionMaintenanceFailuresTotal,
 } from '../metrics/businessMetrics.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -107,8 +157,22 @@ export const CANDIDATE_TABLES = ['contract_events', 'audit_logs'] as const;
 
 export type CandidateTable = (typeof CANDIDATE_TABLES)[number];
 
-/** Default number of future months pre-created beyond the current month. */
-export const DEFAULT_MONTHS_AHEAD = 3;
+/**
+ * Default partition lead time, in whole calendar months.
+ *
+ * The job ensures a partition exists for the current month plus every month
+ * starting within this lead time, so the partition covering month `M` is
+ * created about `DEFAULT_LEAD_TIME_MONTHS` months before `M` begins. Three
+ * months absorbs a long run of failed or missed daily runs without ever
+ * letting a write reach a month with no partition to hold it.
+ */
+export const DEFAULT_LEAD_TIME_MONTHS = 3;
+
+/**
+ * @deprecated Use {@link DEFAULT_LEAD_TIME_MONTHS}. Retained as an alias so
+ * callers written against the pre-lead-time API keep compiling.
+ */
+export const DEFAULT_MONTHS_AHEAD = DEFAULT_LEAD_TIME_MONTHS;
 
 /**
  * Default maximum duration (ms) for the entire lock-guarded maintenance
@@ -125,7 +189,17 @@ export const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
  * Options accepted by {@link runPartitionMaintenance}.
  */
 export interface PartitionMaintenanceOptions {
-  /** Number of future months (beyond the current month) to pre-create. Defaults to {@link DEFAULT_MONTHS_AHEAD}. */
+  /**
+   * Lead time, in whole calendar months: partitions are ensured for the
+   * current month plus every month that starts within this many months.
+   * Defaults to `config.partitionMaintenance.leadTimeMonths`, which itself
+   * defaults to {@link DEFAULT_LEAD_TIME_MONTHS}.
+   */
+  leadTimeMonths?: number;
+  /**
+   * @deprecated Renamed to {@link PartitionMaintenanceOptions.leadTimeMonths};
+   * still honoured (with the same meaning) when `leadTimeMonths` is omitted.
+   */
   monthsAhead?: number;
   /** Override "now" for deterministic tests. Defaults to `new Date()`. */
   now?: Date;
@@ -157,6 +231,8 @@ export interface TablePartitionResult {
 export interface PartitionMaintenanceResult {
   /** `false` when another instance already held the advisory lock — the run was a no-op. */
   lockAcquired: boolean;
+  /** Lead time (in whole calendar months) this run was executed with. */
+  leadTimeMonths: number;
   /** ISO-8601 timestamp when the run started. */
   startedAt: string;
   /** ISO-8601 timestamp when the run finished. */
@@ -173,11 +249,11 @@ export interface PartitionMaintenanceResult {
  * to what the production path exercises and makes call-recording trivial.
  */
 async function clientQuery<T extends QueryResultRow = QueryResultRow>(
-  client: PoolClient,
+  client: PartitionQueryable,
   sql: string,
   params?: unknown[],
-): Promise<QueryResult<T>> {
-  return client.query<T>(sql, params);
+): Promise<{ rows: T[]; rowCount?: number | null }> {
+  return (await client.query(sql, params)) as { rows: T[]; rowCount?: number | null };
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -194,9 +270,9 @@ async function clientQuery<T extends QueryResultRow = QueryResultRow>(
  *
  * @param pool - PostgreSQL pool (or a mock exposing a compatible `connect`) to run against.
  * @param options - Tuning / injection parameters, or (for backward compatibility)
- *                  a bare `monthsAhead` number.
+ *                  a bare lead-time number of months.
  * @returns A summary of what was (or would have needed to be) created.
- * @throws {Error} If `monthsAhead` is not a non-negative integer.
+ * @throws {Error} If the lead time is not a non-negative integer.
  *
  * @example
  * ```ts
@@ -211,17 +287,19 @@ export async function runPartitionMaintenance(
 ): Promise<PartitionMaintenanceResult> {
   const options: PartitionMaintenanceOptions =
     typeof optionsOrMonthsAhead === 'number'
-      ? { monthsAhead: optionsOrMonthsAhead }
+      ? { leadTimeMonths: optionsOrMonthsAhead }
       : optionsOrMonthsAhead;
 
-  const monthsAhead = options.monthsAhead ?? DEFAULT_MONTHS_AHEAD;
+  const leadTimeMonths = resolveLeadTimeMonths(options);
   const correlationId = options.correlationId;
   const now = options.now ?? new Date();
   const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
   const startedAt = new Date().toISOString();
 
-  if (!Number.isInteger(monthsAhead) || monthsAhead < 0) {
-    throw new Error(`runPartitionMaintenance: monthsAhead must be a non-negative integer, got ${monthsAhead}`);
+  if (!Number.isInteger(leadTimeMonths) || leadTimeMonths < 0) {
+    throw new Error(
+      `runPartitionMaintenance: leadTimeMonths must be a non-negative integer, got ${leadTimeMonths}`,
+    );
   }
 
   // ── Check out a dedicated client so the advisory lock stays held ─────────
@@ -247,7 +325,13 @@ export async function runPartitionMaintenance(
       });
       // Release the client immediately — we never held the lock.
       client.release();
-      return { lockAcquired: false, startedAt, finishedAt: new Date().toISOString(), tables: [] };
+      return {
+        lockAcquired: false,
+        leadTimeMonths,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        tables: [],
+      };
     }
 
     // Apply a statement_timeout for the maintenance section so a hung DDL
@@ -259,7 +343,7 @@ export async function runPartitionMaintenance(
     const tables: TablePartitionResult[] = [];
     try {
       for (const table of CANDIDATE_TABLES) {
-        tables.push(await maintainTablePartitions(client, table, monthsAhead, now, correlationId));
+        tables.push(await maintainTablePartitions(client, table, leadTimeMonths, now, correlationId));
       }
     } finally {
       // Always release the lock, even if a table's maintenance throws, so a
@@ -270,7 +354,7 @@ export async function runPartitionMaintenance(
     const finishedAt = new Date().toISOString();
     logger.info('Partition maintenance run complete', correlationId, {
       event: 'partition_maintenance_complete',
-      monthsAhead,
+      leadTimeMonths,
       tables: tables.map((t) => ({
         table: t.table,
         managed: t.managed,
@@ -279,7 +363,7 @@ export async function runPartitionMaintenance(
       })),
     });
 
-    return { lockAcquired: true, startedAt, finishedAt, tables };
+    return { lockAcquired: true, leadTimeMonths, startedAt, finishedAt, tables };
   } finally {
     // Unconditionally return the client to the pool. This is separate from
     // lock release: even if the unlock call above threw, the connection must
@@ -291,8 +375,8 @@ export async function runPartitionMaintenance(
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /**
- * Ensure the current month plus `monthsAhead` future monthly partitions
- * exist for a single table.
+ * Ensure the current month plus every month starting within the lead time has
+ * a partition, for a single table.
  *
  * Skips (returns `managed: false`) when the table does not exist or is not
  * a RANGE-partitioned table — this is the expected state for `audit_logs`
@@ -301,7 +385,7 @@ export async function runPartitionMaintenance(
 async function maintainTablePartitions(
   client: PoolClient,
   table: CandidateTable,
-  monthsAhead: number,
+  leadTimeMonths: number,
   now: Date,
   correlationId: string | undefined,
 ): Promise<TablePartitionResult> {
@@ -317,7 +401,7 @@ async function maintainTablePartitions(
   const created: string[] = [];
   let behindSchedule = false;
 
-  for (let i = 0; i <= monthsAhead; i++) {
+  for (let i = 0; i <= leadTimeMonths; i++) {
     const rangeStart = monthStartUtc(now, i);
     const rangeEnd = monthStartUtc(now, i + 1);
     const partitionName = partitionNameFor(table, rangeStart);
@@ -338,9 +422,26 @@ async function maintainTablePartitions(
         table,
         partition: partitionName,
       });
+      // Escalate to an operator alert as well: a log line nobody is watching
+      // is exactly the failure mode this job must not have.
+      raiseAlert({
+        name: 'partition_maintenance_behind_schedule',
+        severity: 'critical',
+        message: `Partition maintenance fell behind schedule for '${table}': current-month partition '${partitionName}' was missing`,
+        correlationId,
+        context: { table, partition: partitionName },
+      });
     }
 
-    await createPartition(client, table, partitionName, rangeStart, rangeEnd);
+    try {
+      await createPartition(client, table, partitionName, rangeStart, rangeEnd);
+    } catch (err) {
+      // A failure to create a partition is never just a log line: alert, then
+      // re-throw so the queue retries (and eventually dead-letters) the run.
+      alertPartitionCreationFailure(table, partitionName, correlationId, err);
+      throw err;
+    }
+
     created.push(partitionName);
     partitionsCreatedTotal.inc({ table });
     logger.info('Partition maintenance: created partition', correlationId, {
@@ -352,7 +453,272 @@ async function maintainTablePartitions(
     });
   }
 
-  return { table, managed: true, partitionsChecked: monthsAhead + 1, partitionsCreated: created, behindSchedule };
+  return {
+    table,
+    managed: true,
+    partitionsChecked: leadTimeMonths + 1,
+    partitionsCreated: created,
+    behindSchedule,
+  };
+}
+
+/**
+ * Resolve the lead time for a run, in whole calendar months.
+ *
+ * Precedence: explicit `leadTimeMonths` → deprecated `monthsAhead` →
+ * `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS` (via `config`) →
+ * {@link DEFAULT_LEAD_TIME_MONTHS}. A non-integer or negative configured value
+ * is ignored in favour of the built-in default rather than being propagated,
+ * so a typo in a deployment's environment cannot silently disable
+ * pre-creation.
+ */
+function resolveLeadTimeMonths(options: PartitionMaintenanceOptions): number {
+  const explicit = options.leadTimeMonths ?? options.monthsAhead;
+  if (explicit !== undefined) return explicit;
+
+  const configured = config.partitionMaintenance?.leadTimeMonths;
+  return Number.isInteger(configured) && configured >= 0 ? configured : DEFAULT_LEAD_TIME_MONTHS;
+}
+
+/**
+ * Raise the standard alert (and metric) for a failed `CREATE TABLE …
+ * PARTITION OF`. Shared by the scheduled job and the pre-write coverage guard
+ * so both paths report the same alert name.
+ */
+function alertPartitionCreationFailure(
+  table: string,
+  partitionName: string,
+  correlationId: string | undefined,
+  err: unknown,
+): void {
+  partitionMaintenanceFailuresTotal.inc({ table: table as CandidateTable });
+  raiseAlert({
+    name: 'partition_creation_failed',
+    severity: 'critical',
+    message: `Failed to create partition '${partitionName}' for table '${table}'`,
+    correlationId,
+    context: {
+      table,
+      partition: partitionName,
+      error: err instanceof Error ? err.message : String(err),
+    },
+  });
+}
+
+// ── Pre-write coverage guard ──────────────────────────────────────────────────
+
+/**
+ * Minimal query surface required by {@link ensurePartitionCoverage} and by the
+ * internal helpers shared with the job.
+ *
+ * Deliberately non-generic (and `unknown`-typed rows) so that every query
+ * surface in this codebase is assignable to it without a cast: `pg.PoolClient`
+ * and `pg.Pool` from the driver, `PgClientLike` from `src/indexer/store.ts`, and
+ * the mock clients used in tests. Rows are narrowed at each call site instead.
+ */
+export interface PartitionQueryable {
+  query(
+    text: string,
+    values?: unknown[],
+  ): Promise<{ rows: unknown[]; rowCount?: number | null }>;
+}
+
+/** One row of the coverage probe: whether the parent is managed and whether one required partition exists. */
+interface CoverageProbeRow {
+  /** `true` when the parent table is RANGE-partitioned (and therefore managed by this module). */
+  managed: boolean | null;
+  /** Partition name the row refers to. */
+  partition: string;
+  /** Whether that partition currently exists. */
+  partition_exists: boolean | null;
+}
+
+/** Outcome of a {@link ensurePartitionCoverage} probe. */
+export interface PartitionCoverageResult {
+  /** Table that was probed. */
+  table: string;
+  /**
+   * `true` only when the probe conclusively established that the table is
+   * RANGE-partitioned. `false` means "unmanaged or inconclusive" — the caller
+   * must not treat it as "partitions are missing".
+   */
+  managed: boolean;
+  /** Partition names required to cover the supplied timestamps. */
+  required: string[];
+  /** Required partitions that already existed at probe time. */
+  present: string[];
+  /** Required partitions that were missing at probe time and were created by this call. */
+  healed: string[];
+  /** Required partitions that were missing at probe time. */
+  missing: string[];
+  /** Required partitions that are *still* missing after the heal attempt. */
+  failed: string[];
+}
+
+/**
+ * Single-round-trip probe that reports, for one parent table, whether it is
+ * RANGE-partitioned and which of the candidate partitions exist.
+ *
+ * Both facts come from one statement on purpose: the guard runs immediately
+ * before a write, so it must not double the number of round-trips on the hot
+ * ingest path. A zero-row result means "no such parent table" and is treated
+ * as inconclusive.
+ */
+const COVERAGE_PROBE_SQL = `
+  WITH parent AS (
+    SELECT (c.relkind = 'p' AND p.partstrat = 'r') AS managed
+      FROM pg_class c
+      LEFT JOIN pg_partitioned_table p ON p.partrelid = c.oid
+     WHERE c.oid = to_regclass($1)
+  )
+  SELECT parent.managed AS managed,
+         n AS partition,
+         to_regclass(n) IS NOT NULL AS partition_exists
+    FROM parent
+    CROSS JOIN unnest($2::text[]) AS n
+`;
+
+/**
+ * Detect — before a write is attempted — whether the partitions covering the
+ * supplied timestamps exist, and create the missing ones.
+ *
+ * This is the write-path half of the contract this module implements: the
+ * scheduled job keeps partitions `DEFAULT_LEAD_TIME_MONTHS` ahead of use, and
+ * this guard makes the residual case (time advanced past the created
+ * partitions while the job was not running) visible as
+ * `partition_shortfall_detected` instead of as an opaque
+ * `no partition of relation "contract_events" found for row` insert failure.
+ *
+ * Behaviour:
+ *
+ *  - One catalog query per call, covering every distinct month in
+ *    `timestamps`; no per-row work.
+ *  - Timestamps that cannot be parsed, and duplicates within a month, are
+ *    ignored.
+ *  - When the parent is not RANGE-partitioned (or the probe is inconclusive),
+ *    nothing happens and no alert is raised.
+ *  - When a required partition is missing: raises `partition_shortfall_detected`
+ *    (critical) and, unless `heal` is `false`, creates it — so the write that
+ *    follows cannot fail for a reason we already detected. A failing create
+ *    raises `partition_creation_failed` (critical) and is reported in
+ *    {@link PartitionCoverageResult.failed}.
+ *
+ * **Never throws.** Observability and self-healing must not be able to turn a
+ * writable batch into a failed one: probe errors, malformed rows and DDL
+ * failures all degrade to "inconclusive" / `failed` results.
+ *
+ * @param client - Query surface (store client, pool client or pool).
+ * @param table - Parent table name; quoted before use in DDL.
+ * @param timestamps - ISO-8601 strings or `Date`s that will be written.
+ * @param options - `heal: false` detects without creating; `correlationId` is
+ *                  threaded into logs/alerts.
+ * @returns What was required, present, missing, healed and still failing.
+ */
+export async function ensurePartitionCoverage(
+  client: PartitionQueryable,
+  table: string,
+  timestamps: readonly (string | Date)[],
+  options: { heal?: boolean; correlationId?: string } = {},
+): Promise<PartitionCoverageResult> {
+  const months = monthsCoveringTimestamps(timestamps);
+  const required = months.map((monthStart) => partitionNameFor(table, monthStart));
+  const monthStartByName = new Map<string, Date>(
+    required.map((name, index) => [name, months[index] as Date]),
+  );
+
+  const inconclusive: PartitionCoverageResult = {
+    table,
+    managed: false,
+    required,
+    present: [],
+    healed: [],
+    missing: [],
+    failed: [],
+  };
+
+  if (required.length === 0) return inconclusive;
+
+  let rows: CoverageProbeRow[];
+  try {
+    const res = await client.query(COVERAGE_PROBE_SQL, [table, required]);
+    rows = Array.isArray(res?.rows) ? (res.rows as CoverageProbeRow[]) : [];
+  } catch (err) {
+    // Fail open: the write path keeps its previous behaviour (the insert will
+    // surface the problem if there really is one).
+    logger.error('Partition coverage probe failed; continuing without pre-write check', options.correlationId, {
+      event: 'partition_coverage_probe_failed',
+      table,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return inconclusive;
+  }
+
+  const existsByName = new Map<string, boolean>();
+  for (const row of rows) {
+    if (row?.managed === true && typeof row.partition === 'string') {
+      existsByName.set(row.partition, row.partition_exists === true);
+    }
+  }
+
+  // No row conclusively reported a range-partitioned parent: either this table
+  // is not partitioned (audit_logs today, or a pre-partitioning deployment) or
+  // the response was not shaped as expected. Either way, do nothing.
+  if (existsByName.size === 0) return inconclusive;
+
+  const present = required.filter((name) => existsByName.get(name) === true);
+  const missing = required.filter((name) => existsByName.get(name) === false);
+
+  if (missing.length === 0) {
+    return { table, managed: true, required, present, healed: [], missing, failed: [] };
+  }
+
+  raiseAlert({
+    name: 'partition_shortfall_detected',
+    severity: 'critical',
+    message: `Partition coverage shortfall for '${table}': ${missing.join(', ')} missing before write`,
+    correlationId: options.correlationId,
+    context: { table, partitions: missing },
+  });
+
+  if (options.heal === false) {
+    return { table, managed: true, required, present, healed: [], missing, failed: [...missing] };
+  }
+
+  const healed: string[] = [];
+  const failed: string[] = [];
+  for (const partitionName of missing) {
+    const rangeStart = monthStartByName.get(partitionName) as Date;
+    try {
+      await createPartition(client, table, partitionName, rangeStart, monthStartUtc(rangeStart, 1));
+      healed.push(partitionName);
+      partitionsCreatedTotal.inc({ table: table as CandidateTable });
+      logger.warn('Partition maintenance: created missing partition before write', options.correlationId, {
+        event: 'partition_created_before_write',
+        table,
+        partition: partitionName,
+      });
+    } catch (err) {
+      failed.push(partitionName);
+      alertPartitionCreationFailure(table, partitionName, options.correlationId, err);
+    }
+  }
+
+  return { table, managed: true, required, present, healed, missing, failed };
+}
+
+/**
+ * Distinct UTC month starts covering `timestamps`, ascending. Unparseable
+ * timestamps and duplicates within a month are dropped.
+ */
+function monthsCoveringTimestamps(timestamps: readonly (string | Date)[]): Date[] {
+  const byMonth = new Map<number, Date>();
+  for (const value of timestamps) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) continue;
+    const monthStart = monthStartUtc(date, 0);
+    byMonth.set(monthStart.getTime(), monthStart);
+  }
+  return [...byMonth.values()].sort((a, b) => a.getTime() - b.getTime());
 }
 
 /**
@@ -390,8 +756,8 @@ async function partitionExists(client: PoolClient, partitionName: string): Promi
  * and this call) is a silent no-op rather than an error.
  */
 async function createPartition(
-  client: PoolClient,
-  table: CandidateTable,
+  client: PartitionQueryable,
+  table: string,
   partitionName: string,
   rangeStart: Date,
   rangeEnd: Date,
@@ -414,7 +780,7 @@ function monthStartUtc(base: Date, offsetMonths: number): Date {
 }
 
 /** Builds the deterministic partition name `<table>_y<YYYY>m<MM>` for a given month start. */
-function partitionNameFor(table: CandidateTable, monthStart: Date): string {
+function partitionNameFor(table: string, monthStart: Date): string {
   const year = monthStart.getUTCFullYear();
   const month = (monthStart.getUTCMonth() + 1).toString().padStart(2, '0');
   return `${table}_y${year}m${month}`;

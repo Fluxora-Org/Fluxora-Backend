@@ -70,4 +70,21 @@ export const config = {
   database: {
     url: process.env.DATABASE_URL || 'postgresql://localhost/fluxora',
   },
+  partitionMaintenance: {
+    /**
+     * Documented partition lead time, in whole calendar months.
+     *
+     * The partition-maintenance job (`src/jobs/partitionMaintenance.ts`)
+     * ensures a monthly partition exists for the current month plus every
+     * month that starts within this lead time. With the default of 3, the
+     * partition covering month `M` is created during month `M - 3`, i.e. it
+     * exists for roughly 90 days before any row can need it.
+     *
+     * Raising this value buys more slack for a run of failed/missed jobs at
+     * the cost of a few extra empty partitions; lowering it shortens that
+     * slack. Keep it >= 2 so a single missed monthly boundary cannot exhaust
+     * the buffer. Defaults to `DEFAULT_LEAD_TIME_MONTHS` (3).
+     */
+    leadTimeMonths: envInt('PARTITION_MAINTENANCE_LEAD_TIME_MONTHS', 3),
+  },
 };
