@@ -15,6 +15,15 @@ export function cspNonceMiddleware(req: Request, res: Response, next: NextFuncti
 /**
  * Configure and return Helmet middleware for security headers.
  *
+ * ## Placement
+ *
+ * Helmet sets its headers synchronously as this middleware runs, so anything
+ * mounted *before* it that can end a request will answer without them. Mount
+ * this (and cspNonceMiddleware) first, ahead of middleware that terminates a
+ * request early — readinessGuardMiddleware's 503 and requestTimeoutMiddleware's
+ * 408 are the concrete cases. Later mounts only cover responses that actually
+ * reach a route, which is not the same as "every response".
+ *
  * CSP policy (strict):
  * - default-src 'self'
  * - script-src  'self' 'nonce-<per-request>'   (no unsafe-inline/eval)
