@@ -1,8 +1,10 @@
 /**
  * Metrics for the requestProtection middleware.
  *
- * Exports a prom-client Counter that is incremented whenever the
- * `bodySizeLimitMiddleware` rejects a request with HTTP 413 (Payload Too Large).
+ * Exports prom-client Counters that are incremented whenever the request
+ * protection middleware refuses a request:
+ *   - `bodySizeLimitMiddleware` → HTTP 413 (Payload Too Large)
+ *   - `jsonDepthLimitMiddleware` / `jsonDepthMiddleware` → HTTP 400 (too deeply nested)
  *
  * Label:
  *   `path` — normalized route template (e.g. `/api/streams`), derived from
@@ -36,11 +38,29 @@ import { assertCollectorLabels } from './cardinality.js';
 assertCollectorLabels(['path']);
 assertCollectorLabels(['consumer_hash']);
 
+/**
+ * Counter incremented once for every HTTP 400 rejection caused by JSON nesting
+ * exceeding the configured depth limit. Labelled by `path` (route template).
+ *
+ * @example
+ * // Alert on nesting-bomb probes.
+ * increase(fluxora_request_body_too_deep_total[5m]) > 20
+ */
+
 export const requestBodyTooLargeTotal =
   (registry.getSingleMetric('fluxora_request_body_too_large_total') as Counter<'path'>) ||
   new Counter({
     name: 'fluxora_request_body_too_large_total',
     help: 'Total number of requests rejected with HTTP 413 due to body size exceeding the configured limit, labeled by normalized route path',
+    labelNames: ['path'] as const,
+    registers: [registry],
+  });
+
+export const requestBodyTooDeepTotal =
+  (registry.getSingleMetric('fluxora_request_body_too_deep_total') as Counter<'path'>) ||
+  new Counter({
+    name: 'fluxora_request_body_too_deep_total',
+    help: 'Total number of requests rejected with HTTP 400 because the JSON body nesting depth exceeded the configured limit, labeled by normalized route path',
     labelNames: ['path'] as const,
     registers: [registry],
   });
@@ -87,5 +107,6 @@ export function updateWebhookBucketFill(consumerHash: string, fillLevel: number)
  */
 export function deRegisterRequestProtectionMetrics(): void {
   registry.removeSingleMetric('fluxora_request_body_too_large_total');
+  registry.removeSingleMetric('fluxora_request_body_too_deep_total');
   registry.removeSingleMetric('fluxora_webhook_rate_limiter_bucket_fill');
 }
