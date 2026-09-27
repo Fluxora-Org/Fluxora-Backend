@@ -167,6 +167,24 @@ export interface Config {
   healthCheckTimeoutMs: number;
   /** Interval between background health-check runs, in ms. */
   healthCheckIntervalMs: number;
+  /**
+   * Per-checker timeout override for the Postgres health check, in ms.
+   * When undefined the global `healthCheckTimeoutMs` applies.
+   * Sourced from HEALTH_CHECK_POSTGRES_TIMEOUT_MS.
+   */
+  healthCheckPostgresTimeoutMs: number | undefined;
+  /**
+   * Per-checker timeout override for the Redis health check, in ms.
+   * When undefined the global `healthCheckTimeoutMs` applies.
+   * Sourced from HEALTH_CHECK_REDIS_TIMEOUT_MS.
+   */
+  healthCheckRedisTimeoutMs: number | undefined;
+  /**
+   * Per-checker timeout override for the Stellar RPC health check, in ms.
+   * When undefined the global `healthCheckTimeoutMs` applies.
+   * Sourced from HEALTH_CHECK_STELLAR_TIMEOUT_MS.
+   */
+  healthCheckStellarTimeoutMs: number | undefined;
   /** Enables the grpc.health.v1.Health service (k8s-native gRPC probes). */
   grpcHealthEnabled: boolean;
   /** Port the gRPC health service binds to when enabled. */
@@ -433,6 +451,9 @@ function toConfig(env: ParsedEnv): Config {
     workerEnabled: env.WORKER_ENABLED,
     healthCheckTimeoutMs: env.HEALTH_CHECK_TIMEOUT_MS,
     healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS,
+    healthCheckPostgresTimeoutMs: env.HEALTH_CHECK_POSTGRES_TIMEOUT_MS,
+    healthCheckRedisTimeoutMs: env.HEALTH_CHECK_REDIS_TIMEOUT_MS,
+    healthCheckStellarTimeoutMs: env.HEALTH_CHECK_STELLAR_TIMEOUT_MS,
     grpcHealthEnabled: env.GRPC_HEALTH_ENABLED,
     grpcHealthPort: env.GRPC_HEALTH_PORT,
     grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,

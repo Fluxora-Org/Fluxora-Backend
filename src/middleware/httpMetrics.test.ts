@@ -65,9 +65,6 @@ describe('resolveRoute', () => {
   it('collapses only a single trailing slash, keeping internal empty segments', () => {
     const req = fakeReq({
       baseUrl: '',
-      route: undefined,
-      originalUrl: '/multiple///'
-    };
       // A matched route is required for the label to be derived at all: an
       // unmatched request is labelled UNMATCHED_ROUTE (see above).
       route: { path: '/multiple///' },

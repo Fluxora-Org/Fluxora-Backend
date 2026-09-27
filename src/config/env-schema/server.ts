@@ -100,6 +100,24 @@ export const serverEnvSchema = {
   HEALTH_CHECK_TIMEOUT_MS: integerEnv('HEALTH_CHECK_TIMEOUT_MS', 1).default(5000),
   /** Interval between background health-check runs. Must be strictly greater than 0. @default 30000 */
   HEALTH_CHECK_INTERVAL_MS: integerEnv('HEALTH_CHECK_INTERVAL_MS', 1).default(30000),
+  /**
+   * Per-checker timeout override for the Postgres health check, in ms.
+   * When absent, falls back to HEALTH_CHECK_TIMEOUT_MS.
+   * @default undefined (uses HEALTH_CHECK_TIMEOUT_MS)
+   */
+  HEALTH_CHECK_POSTGRES_TIMEOUT_MS: integerEnv('HEALTH_CHECK_POSTGRES_TIMEOUT_MS', 1).optional(),
+  /**
+   * Per-checker timeout override for the Redis health check, in ms.
+   * When absent, falls back to HEALTH_CHECK_TIMEOUT_MS.
+   * @default undefined (uses HEALTH_CHECK_TIMEOUT_MS)
+   */
+  HEALTH_CHECK_REDIS_TIMEOUT_MS: integerEnv('HEALTH_CHECK_REDIS_TIMEOUT_MS', 1).optional(),
+  /**
+   * Per-checker timeout override for the Stellar RPC health check, in ms.
+   * When absent, falls back to HEALTH_CHECK_TIMEOUT_MS.
+   * @default undefined (uses HEALTH_CHECK_TIMEOUT_MS)
+   */
+  HEALTH_CHECK_STELLAR_TIMEOUT_MS: integerEnv('HEALTH_CHECK_STELLAR_TIMEOUT_MS', 1).optional(),
 
   /** Enables the grpc.health.v1.Health service for Kubernetes-native gRPC probes. @default false */
   GRPC_HEALTH_ENABLED: booleanEnv().default(false),
