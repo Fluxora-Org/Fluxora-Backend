@@ -38,10 +38,10 @@ describe('RedisIndexerLeaderElection', () => {
     indexerReplayBatchesCommittedTotal.inc({ contract_id: 'test' }, 5);
     
     const before = (await indexerReplayBatchesCommittedTotal.get()).values
-      .find((v) => v.labels?.contract_id === 'test')?.value ?? 0;
+      .find((v: any) => v.labels?.contract_id === 'test')?.value ?? 0;
     
     const beforeFailure = (await indexerLeaderElectionFailuresTotal.get()).values
-      .find((v) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
+      .find((v: any) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
 
     const leaseMs = 9000;
     let now = 1_000_000;
@@ -55,11 +55,11 @@ describe('RedisIndexerLeaderElection', () => {
     expect(a.isLeader()).toBe(false);
 
     const afterFailure = (await indexerLeaderElectionFailuresTotal.get()).values
-      .find((v) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
+      .find((v: any) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
     expect(afterFailure - beforeFailure).toBe(1);
 
     const after = (await indexerReplayBatchesCommittedTotal.get()).values
-      .find((v) => v.labels?.contract_id === 'test')?.value ?? 0;
+      .find((v: any) => v.labels?.contract_id === 'test')?.value ?? 0;
     
     // Assert the counter wasn't reset
     expect(after).toBe(before);

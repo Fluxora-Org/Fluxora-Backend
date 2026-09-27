@@ -65,7 +65,7 @@ describe('Webhooks Route Early-Return Safeguards & Error Paths', () => {
         .send(payload);
 
       expect(resDup.status).toBe(409);
-      expect(resDup.body.error).toBe('duplicate_delivery');
+      expect(resDup.body.error.code).toBe('DUPLICATE_DELIVERY');
     });
 
     it('returns early on verification failure without adding to dedup cache', async () => {

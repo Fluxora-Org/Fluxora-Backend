@@ -127,17 +127,16 @@ export interface RowReader {
  * const ledger = r.requireInt('ledger', { min: 0 });
  * ```
  *
- * A column that is absent from the row object is treated exactly like an
- * explicit NULL: `optional*` yields `null`, `require*` throws. A `SELECT` that
- * forgot a column is a bug, and it must not be indistinguishable from a row
- * that legitimately holds NULL.
+ * Explicit SQL NULL is accepted by `optional*`; a missing or undefined
+ * property is rejected because a `SELECT` that forgot a column must not be
+ * indistinguishable from a row that legitimately holds NULL.
  */
 export function rowReader(table: string, row: Record<string, unknown>): RowReader {
   const fail = (column: string, reason: string, value: unknown): never => {
     throw new RowMappingError(table, column, reason, describeValue(value));
   };
 
-  const isAbsent = (value: unknown): boolean => value === null || value === undefined;
+  const isNullish = (value: unknown): boolean => value === null || value === undefined;
 
   const readString = (column: string, value: unknown, options: StringOptions): string => {
     if (typeof value !== 'string') {
@@ -205,7 +204,7 @@ export function rowReader(table: string, row: Record<string, unknown>): RowReade
   return {
     requireString(column, options = {}) {
       const value = row[column];
-      if (isAbsent(value)) {
+      if (isNullish(value)) {
         return fail(column, 'required column was NULL or absent', value);
       }
       return readString(column, value, options);
@@ -213,13 +212,14 @@ export function rowReader(table: string, row: Record<string, unknown>): RowReade
 
     optionalString(column, options = {}) {
       const value = row[column];
-      if (isAbsent(value)) return null;
+      if (value === null) return null;
+      if (value === undefined) return fail(column, 'expected a selected column', value);
       return readString(column, value, options);
     },
 
     requireInt(column, bounds = {}) {
       const value = row[column];
-      if (isAbsent(value)) {
+      if (isNullish(value)) {
         return fail(column, 'required column was NULL or absent', value);
       }
       return readInt(column, value, bounds);
@@ -227,13 +227,14 @@ export function rowReader(table: string, row: Record<string, unknown>): RowReade
 
     optionalInt(column, bounds = {}) {
       const value = row[column];
-      if (isAbsent(value)) return null;
+      if (value === null) return null;
+      if (value === undefined) return fail(column, 'expected a selected column', value);
       return readInt(column, value, bounds);
     },
 
     requireDate(column) {
       const value = row[column];
-      if (isAbsent(value)) {
+      if (isNullish(value)) {
         return fail(column, 'required column was NULL or absent', value);
       }
       return readDate(column, value);
@@ -241,7 +242,8 @@ export function rowReader(table: string, row: Record<string, unknown>): RowReade
 
     optionalDate(column) {
       const value = row[column];
-      if (isAbsent(value)) return null;
+      if (value === null) return null;
+      if (value === undefined) return fail(column, 'expected a selected column', value);
       return readDate(column, value);
     },
 
@@ -249,7 +251,7 @@ export function rowReader(table: string, row: Record<string, unknown>): RowReade
       const value = row[column];
       // A `jsonb` column holding the JSON literal `null` arrives as JS `null`,
       // indistinguishable from SQL NULL. Both mean the payload is missing.
-      if (isAbsent(value)) {
+      if (isNullish(value)) {
         return fail(column, 'required JSON column was NULL or absent', value);
       }
       if (Array.isArray(value)) {

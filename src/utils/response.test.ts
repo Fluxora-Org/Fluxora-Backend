@@ -68,5 +68,10 @@ describe('Response envelope helpers', () => {
             const result = errorResponse('VALIDATION_ERROR', 'Bad input');
             expect(result.error.requestId).toBeUndefined();
         });
+
+        it('should map an unregistered code to INTERNAL_ERROR', () => {
+            const result = errorResponse('UNREGISTERED_CODE', 'Failure');
+            expect(result.error.code).toBe('INTERNAL_ERROR');
+        });
     });
 });

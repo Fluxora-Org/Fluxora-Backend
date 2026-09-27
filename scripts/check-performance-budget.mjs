@@ -75,10 +75,14 @@ export function evaluateSummary(budget, summary) {
       continue;
     }
     const failures = [];
-    if (endpoint.budgets.p95 != null && row.p95_ms != null && row.p95_ms > endpoint.budgets.p95) {
+    if (endpoint.budgets.p95 != null && row.p95_ms == null) {
+      failures.push('p95 is missing from summary');
+    } else if (endpoint.budgets.p95 != null && row.p95_ms > endpoint.budgets.p95) {
       failures.push(`p95 ${row.p95_ms}ms > budget ${endpoint.budgets.p95}ms`);
     }
-    if (endpoint.budgets.p99 != null && row.p99_ms != null && row.p99_ms > endpoint.budgets.p99) {
+    if (endpoint.budgets.p99 != null && row.p99_ms == null) {
+      failures.push('p99 is missing from summary');
+    } else if (endpoint.budgets.p99 != null && row.p99_ms > endpoint.budgets.p99) {
       failures.push(`p99 ${row.p99_ms}ms > budget ${endpoint.budgets.p99}ms`);
     }
     results.push({

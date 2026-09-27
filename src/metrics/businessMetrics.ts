@@ -1,29 +1,20 @@
 import { Counter, Histogram, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
+import type { ApiStreamStatus as StreamStatus } from '../streams/status.js';
+import { isApiStreamStatus as isValidStreamStatus } from '../streams/status.js';
 
-export type StreamStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+export type { StreamStatus };
+export { isValidStreamStatus };
+
 export type WebhookDeliveryOutcome = 'success' | 'failed';
 export type SseConnectionRejectionReason = 'per_ip_limit' | 'per_key_limit' | 'global_limit';
 
-const VALID_STREAM_STATUSES: readonly StreamStatus[] = [
-  'active',
-  'paused',
-  'completed',
-  'cancelled',
-];
 const VALID_OUTCOMES: readonly WebhookDeliveryOutcome[] = ['success', 'failed'];
 const VALID_REJECTION_REASONS: readonly SseConnectionRejectionReason[] = [
   'per_ip_limit',
   'per_key_limit',
   'global_limit',
 ];
-
-/**
- * Returns true if the value is a known StreamStatus label value.
- */
-export function isValidStreamStatus(value: string): value is StreamStatus {
-  return (VALID_STREAM_STATUSES as readonly string[]).includes(value);
-}
 
 /**
  * Returns true if the value is a known webhook delivery outcome label value.
@@ -477,6 +468,52 @@ export const partitionMaintenanceBehindScheduleTotal =
     registers: [registry],
   });
 
+/**
+ * Counter for operator alerts raised via `src/lib/alerts.ts`.
+ *
+ * This is the single metric an on-call rotation needs to watch to catch
+ * "background job failed and only wrote a log line" situations: every alert
+ * raised anywhere in the application increments this counter, labelled by the
+ * alert name and severity.
+ *
+ * @security
+ * - `alert` values come from developer-controlled call sites in this
+ *   repository (never from request data) and are normalised to
+ *   `unknown_alert` when malformed, so label cardinality stays bounded.
+ */
+export const alertsRaisedTotal =
+  (registry.getSingleMetric('fluxora_alerts_raised_total') as Counter<'alert' | 'severity'>) ||
+  new Counter({
+    name: 'fluxora_alerts_raised_total',
+    help: 'Total number of operator alerts raised, labelled by alert name and severity',
+    labelNames: ['alert', 'severity'] as const,
+    registers: [registry],
+  });
+
+/**
+ * Counter for partition-creation failures, labelled by table.
+ *
+ * Incremented whenever a `CREATE TABLE ... PARTITION OF` attempt fails — both
+ * by the scheduled partition-maintenance job and by the pre-write coverage
+ * guard that runs before an insert. Any increment means a write for the
+ * affected interval is at risk, so alert on `increase(...) > 0`.
+ *
+ * @security
+ * - `table` values come from developer-controlled constants (the
+ *   `CANDIDATE_TABLES` list and the indexer store's configured table name),
+ *   not from user input.
+ */
+export const partitionMaintenanceFailuresTotal =
+  (registry.getSingleMetric(
+    'fluxora_partition_maintenance_failures_total'
+  ) as Counter<'table'>) ||
+  new Counter({
+    name: 'fluxora_partition_maintenance_failures_total',
+    help: 'Total number of failed partition creation attempts, labelled by table',
+    labelNames: ['table'] as const,
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
@@ -503,4 +540,6 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_job_dlq_entries_total');
   registry.removeSingleMetric('fluxora_partitions_created_total');
   registry.removeSingleMetric('fluxora_partition_maintenance_behind_schedule_total');
+  registry.removeSingleMetric('fluxora_alerts_raised_total');
+  registry.removeSingleMetric('fluxora_partition_maintenance_failures_total');
 }

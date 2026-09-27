@@ -28,7 +28,9 @@ describe('runBackfill', () => {
     const result = await runBackfill({
       batches,
       concurrency: 2,
-      onCheckpoint: (i) => { checkpoints.push(i); },
+      onCheckpoint: (i) => {
+        checkpoints.push(i);
+      },
       handler: async ({ index }) => {
         active++;
         maxActive = Math.max(maxActive, active);

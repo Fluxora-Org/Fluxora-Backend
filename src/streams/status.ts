@@ -57,6 +57,11 @@ export function isChainStreamStatus(value: unknown): value is ChainStreamStatus 
     (CHAIN_STREAM_STATUSES as readonly string[]).includes(value);
 }
 
+export function isApiStreamStatus(value: unknown): value is ApiStreamStatus {
+  return typeof value === 'string' &&
+    (API_STREAM_STATUSES as readonly string[]).includes(value);
+}
+
 export function defaultChainStatusForStartTime(
   startTime: number,
   now = Math.floor(Date.now() / 1000),
@@ -77,7 +82,7 @@ export function mapChainStatusToApiStatus(
  * Valid API-layer status transitions.
  * Terminal statuses (completed, cancelled) have no outgoing edges.
  */
-const VALID_API_TRANSITIONS: Partial<Record<ApiStreamStatus, readonly ApiStreamStatus[]>> = {
+export const VALID_API_TRANSITIONS: Record<ApiStreamStatus, readonly ApiStreamStatus[]> = {
   active:    ['paused', 'completed', 'cancelled'],
   paused:    ['active', 'cancelled'],
   completed: [],
@@ -88,7 +93,7 @@ const VALID_API_TRANSITIONS: Partial<Record<ApiStreamStatus, readonly ApiStreamS
  * Returns true when the given API status is terminal (completed or cancelled).
  * Terminal streams are immutable and safe to cache at the edge.
  */
-export function isTerminalStatus(status: ApiStreamStatus): boolean {
+export function isTerminalStatus(status: ReportedStreamStatus): boolean {
   return status === 'completed' || status === 'cancelled';
 }
 
@@ -245,5 +250,48 @@ export function assertReportedStatusMatchesChain(
     derived,
     message: `Reported status '${reported}' does not match the chain state: ${because}`,
   };
+}
+
+export interface StreamScheduleInput {
+  startTime: number;
+  endTime: number;
+  status: ApiStreamStatus;
+  now?: number;
+}
+
+const SCHEDULE_PRECEDENCE: Record<ApiStreamStatus, number> = {
+  cancelled: 0,
+  completed: 0,
+  paused: 1,
+  active: 2,
+};
+
+export interface DerivedScheduleStatus {
+  status: ApiStreamStatus;
+  terminal: boolean;
+  source: 'schedule';
+}
+
+export function deriveStreamStatusFromSchedule(
+  input: StreamScheduleInput,
+): DerivedScheduleStatus {
+  const now = input.now ?? Math.floor(Date.now() / 1000);
+  const persisted = isApiStreamStatus(input.status) ? input.status : 'active';
+  const cliffCrossed = input.startTime <= now;
+  const indefinite = input.endTime === 0;
+  const matured = !indefinite && input.endTime <= now;
+
+  if (SCHEDULE_PRECEDENCE[persisted] < SCHEDULE_PRECEDENCE.active) {
+    return { status: persisted, terminal: isTerminalStatus(persisted), source: 'schedule' };
+  }
+
+  if (!cliffCrossed) {
+    return { status: 'active', terminal: false, source: 'schedule' };
+  }
+
+  if (matured) {
+    return { status: 'completed', terminal: true, source: 'schedule' };
+  }
+  return { status: 'active', terminal: false, source: 'schedule' };
 }
 

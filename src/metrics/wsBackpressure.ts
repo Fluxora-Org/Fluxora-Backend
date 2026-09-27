@@ -151,6 +151,88 @@ export const wsSlowClients = metric(
     }),
 );
 
+export const wsMaxSubscriptionsPerConnection = metric(
+  'fluxora_ws_max_subscriptions_per_connection',
+  () =>
+    new Gauge({
+      name: 'fluxora_ws_max_subscriptions_per_connection',
+      help: 'Configured maximum number of subscriptions a single WebSocket connection may hold.',
+      registers: [registry],
+    }),
+);
+
+export const wsMaxOutboundQueuePerConnection = metric(
+  'fluxora_ws_max_outbound_queue_per_connection',
+  () =>
+    new Gauge({
+      name: 'fluxora_ws_max_outbound_queue_per_connection',
+      help: 'Configured maximum outbound queue depth for a single WebSocket connection.',
+      registers: [registry],
+    }),
+);
+
+export const wsMaxOutboundQueueBytesPerConnection = metric(
+  'fluxora_ws_max_outbound_queue_bytes_per_connection',
+  () =>
+    new Gauge({
+      name: 'fluxora_ws_max_outbound_queue_bytes_per_connection',
+      help: 'Configured maximum retained outbound queue bytes for a single WebSocket connection.',
+      registers: [registry],
+    }),
+);
+
+export const wsMaxInboundMessageBytes = metric(
+  'fluxora_ws_max_inbound_message_bytes',
+  () =>
+    new Gauge({
+      name: 'fluxora_ws_max_inbound_message_bytes',
+      help: 'Configured maximum inbound WebSocket payload size in bytes per connection.',
+      registers: [registry],
+    }),
+);
+
+export const wsSubscriptionLimitViolationsTotal = metric(
+  'fluxora_ws_subscription_limit_violations_total',
+  () =>
+    new Counter({
+      name: 'fluxora_ws_subscription_limit_violations_total',
+      help: 'Number of times a client attempted to exceed the per-connection subscription cap.',
+      registers: [registry],
+    }),
+);
+
+export const wsOutboundQueueLimitViolationsTotal = metric(
+  'fluxora_ws_outbound_queue_limit_violations_total',
+  () =>
+    new Counter({
+      name: 'fluxora_ws_outbound_queue_limit_violations_total',
+      help: 'Number of times an outbound queue rejection dropped a queued message because the per-connection queue was full.',
+      registers: [registry],
+    }),
+);
+
+export const wsInboundMessageSizeLimitViolationsTotal = metric(
+  'fluxora_ws_inbound_message_size_limit_violations_total',
+  () =>
+    new Counter({
+      name: 'fluxora_ws_inbound_message_size_limit_violations_total',
+      help: 'Number of inbound WebSocket messages rejected for exceeding the configured maximum bytes.',
+      registers: [registry],
+    }),
+);
+
+export function setWsResourceLimitMetrics(config: {
+  maxSubscriptionsPerConnection: number;
+  maxOutboundQueuePerConnection: number;
+  maxOutboundQueueBytesPerConnection: number;
+  maxInboundMessageBytes: number;
+}): void {
+  wsMaxSubscriptionsPerConnection.set(config.maxSubscriptionsPerConnection);
+  wsMaxOutboundQueuePerConnection.set(config.maxOutboundQueuePerConnection);
+  wsMaxOutboundQueueBytesPerConnection.set(config.maxOutboundQueueBytesPerConnection);
+  wsMaxInboundMessageBytes.set(config.maxInboundMessageBytes);
+}
+
 // ── Subscription cardinality gauge ────────────────────────────────────────
 
 export const wsStreamSubscriberCount = metric(

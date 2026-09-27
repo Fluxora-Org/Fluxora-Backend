@@ -32,6 +32,8 @@ Secret values are never included in validation messages.
 | `STELLAR_RPC_TIMEOUT`             | integer ms                                     | `10000`                                                                                                  |
 | `STELLAR_RPC_MAX_RETRIES`         | integer                                        | `3`                                                                                                      |
 | `STELLAR_RPC_RETRY_DELAY`         | integer ms                                     | `1000`                                                                                                   |
+| `STELLAR_CONTRACT_REACHABILITY_CHECK` | boolean | `true` outside `NODE_ENV=test`; set `false` to skip the startup contract-existence probe |
+| `STELLAR_CONTRACT_REACHABILITY_STRICT` | boolean | `false` (failures are logged prominently); `true` aborts startup on a malformed, wrong-network, or unreachable contract |
 | `JWT_EXPIRES_IN`                  | string                                         | `24h`                                                                                                    |
 | `API_KEYS`                        | comma-separated string                         | Empty, except `test-api-key` in tests                                                                    |
 | `API_KEY_PEPPER`                  | string, min 32 chars                           | unset — required at runtime to mint/validate API keys (see [auth.md](./auth.md#api-keys)). Never logged. |
@@ -41,7 +43,7 @@ Secret values are never included in validation messages.
 | `REQUEST_TIMEOUT_MS`              | integer ms, 1000-300000                        | `30000`                                                                                                  |
 | `LOG_LEVEL`                       | `debug`, `info`, `warn`, `error`               | `info`                                                                                                   |
 | `METRICS_ENABLED`                 | boolean                                        | `true`                                                                                                   |
-| `CORS_ALLOWED_ORIGINS`            | comma-separated origins                        | unset                                                                                                    |
+| `CORS_ALLOWED_ORIGINS`            | comma-separated exact origins                  | unset — denies all production origins                                                                     |
 | `TRACING_ENABLED`                 | boolean                                        | `false`                                                                                                  |
 | `TRACING_SAMPLE_RATE`             | number, 0-1                                    | `1`                                                                                                      |
 | `TRACING_OTEL_ENABLED`            | boolean                                        | `false`                                                                                                  |
@@ -73,6 +75,10 @@ Secret values are never included in validation messages.
 | `RPC_CB_WINDOW_MS`                | integer ms                                     | `30000`                                                                                                  |
 | `RPC_CB_RESET_TIMEOUT_MS`         | integer ms                                     | `60000`                                                                                                  |
 | `RPC_TIMEOUT_MS`                  | integer ms                                     | `5000`                                                                                                   |
+| `RPC_FALLBACK_CACHE_TTL_SECONDS`  | integer seconds, minimum 1                     | `300`                                                                                                    |
+| `RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA` | number, minimum 0                         | `0` (disabled)                                                                                            |
+| `RPC_HEALTH_CHECK_INTERVAL_MS`    | integer ms, minimum 0                          | `0` (disabled)                                                                                            |
+| `RPC_HEALTH_CHECK_FAILURE_THRESHOLD` | integer, minimum 1                         | `3`                                                                                                      |
 | `RATE_LIMIT_ENABLED`              | boolean                                        | `true`                                                                                                   |
 | `RATE_LIMIT_IP_WINDOW_MS`         | integer ms                                     | route default                                                                                            |
 | `RATE_LIMIT_IP_MAX`               | integer                                        | route default                                                                                            |

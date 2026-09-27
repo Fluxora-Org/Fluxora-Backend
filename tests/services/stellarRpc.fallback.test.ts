@@ -328,6 +328,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(), incr: vi.fn(), };
@@ -351,6 +352,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(), incr: vi.fn(), };
@@ -374,6 +376,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(), incr: vi.fn(), };
@@ -397,6 +400,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(), incr: vi.fn(), };

@@ -41,7 +41,7 @@ vi.mock('../../src/streams/sseEmitter.js', () => ({
 // Re-import mocked modules so we can control their behaviour per test
 // ---------------------------------------------------------------------------
 import { streamRepository } from '../../src/db/repositories/streamRepository.js';
-import * as logger from '../../src/utils/logger.js';
+import * as logger from '../../src/lib/logger.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures

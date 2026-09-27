@@ -48,8 +48,8 @@ describe('rowToReplayCursor', () => {
       id: 'uuid-2',
       contract_id: 'c',
       ledger: 1,
-      from_block: undefined,
-      to_block: undefined,
+      from_block: null,
+      to_block: null,
       total_rows: 0,
       last_committed_offset: 0,
       started_at: '2026-02-01T12:00:00.000Z',
@@ -188,6 +188,8 @@ describe('rowToReplayCursor — contract enforcement (#1316)', () => {
     'started_at',
   ] as const;
 
+  const NULLABLE_COLUMNS = ['from_block', 'to_block', 'completed_at'] as const;
+
   describe('NULL, undefined and missing columns', () => {
     it.each(NOT_NULL_COLUMNS)('rejects NULL in NOT NULL column %s', (column) => {
       expectRejection(column, null);
@@ -198,6 +200,14 @@ describe('rowToReplayCursor — contract enforcement (#1316)', () => {
     });
 
     it.each(NOT_NULL_COLUMNS)('rejects an absent NOT NULL column %s', (column) => {
+      expectRejection(column, undefined, true);
+    });
+
+    it.each(NULLABLE_COLUMNS)('rejects undefined in nullable column %s', (column) => {
+      expectRejection(column, undefined);
+    });
+
+    it.each(NULLABLE_COLUMNS)('rejects an absent nullable column %s', (column) => {
       expectRejection(column, undefined, true);
     });
 
@@ -691,6 +701,11 @@ describe('rowToStreamEventRecord — contract enforcement (#1316)', () => {
       // ledger_hash was added as a nullable column so pre-existing rows stayed
       // valid without a backfill. Those rows must still be readable.
       expect(rowToStreamEventRecord({ ...validRow(), ledger_hash: null }).ledgerHash).toBeNull();
+    });
+
+    it('rejects undefined or an absent nullable ledger_hash column', () => {
+      expectRejection('ledger_hash', undefined);
+      expectRejection('ledger_hash', undefined, true);
     });
 
     it('rejects a wrong-typed ledger_hash even though the column is nullable', () => {

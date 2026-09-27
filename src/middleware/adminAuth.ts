@@ -1,8 +1,10 @@
 import type { Request, Response, NextFunction } from 'express';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 import { verifyToken } from '../lib/auth.js';
-import { warn } from '../utils/logger.js';
+import { warn } from '../lib/logger.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
 import crypto from 'crypto';
+import { errorResponse } from '../utils/response.js';
 
 /**
  * Maximum allowed length for the `Authorization` header value, in bytes.
@@ -48,73 +50,102 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
 
   if (!adminKey) {
     recordOutcome('failure');
-    warn('Admin authorization refused — ADMIN_API_KEY is not configured', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+    recordAuditEvent('ADMIN_AUTH_REFUSED', 'auth', 'admin', req.correlationId ?? req.id, {
+      reason: 'unconfigured',
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
     });
-    res.status(503).json({
-      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
+    warn('Admin authorization refused — ADMIN_API_KEY is not configured', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
     });
+    res.status(503).json(errorResponse(ApiErrorCode.CONFIGURATION_ERROR, 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.', undefined, req.correlationId ?? req.id));
     return;
   }
 
   const header = req.headers.authorization;
   if (!header) {
     recordOutcome('failure');
-    warn('Admin authorization refused — missing Authorization header', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+    recordAuditEvent('ADMIN_AUTH_REFUSED', 'auth', 'admin', req.correlationId ?? req.id, {
+      reason: 'missing_header',
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
     });
-    res.status(401).json({ error: 'Missing Authorization header.' });
+    warn('Admin authorization refused — missing Authorization header', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+    });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Missing Authorization header.', undefined, req.correlationId ?? req.id));
     return;
   }
 
   if (header.length > MAX_AUTHORIZATION_HEADER_LENGTH) {
     recordOutcome('failure');
-    warn('Admin authorization refused — Authorization header too large', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+    recordAuditEvent('ADMIN_AUTH_REFUSED', 'auth', 'admin', req.correlationId ?? req.id, {
+      reason: 'oversized_header',
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
       headerLength: header.length,
     });
-    res.status(401).json({ error: 'Authorization header too large.' });
+    warn('Admin authorization refused — Authorization header too large', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+      headerLength: header.length,
+    });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Authorization header too large.', undefined, req.correlationId ?? req.id));
     return;
   }
 
   const parts = header.split(' ');
   if (parts.length !== 2 || parts[0] !== 'Bearer') {
     recordOutcome('failure');
-    warn('Admin authorization refused — invalid Authorization header scheme', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+    recordAuditEvent('ADMIN_AUTH_REFUSED', 'auth', 'admin', req.correlationId ?? req.id, {
+      reason: 'invalid_scheme',
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
     });
-    res.status(401).json({ error: 'Authorization header must use Bearer scheme.' });
+    warn('Admin authorization refused — invalid Authorization header scheme', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+    });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Authorization header must use Bearer scheme.', undefined, req.correlationId ?? req.id));
     return;
   }
 
   const token = parts[1];
   if (!token) {
     recordOutcome('failure');
-    warn('Admin authorization refused — missing Bearer token', {
-      correlationId: (req as any).correlationId ?? (req as any).id,
+    recordAuditEvent('ADMIN_AUTH_REFUSED', 'auth', 'admin', req.correlationId ?? req.id, {
+      reason: 'missing_token',
       path: req.originalUrl || req.path,
       method: req.method,
       ip: req.ip,
     });
-    res.status(401).json({ error: 'Bearer token is missing.' });
+    warn('Admin authorization refused — missing Bearer token', {
+      correlationId: req.correlationId ?? req.id,
+      path: req.originalUrl || req.path,
+      method: req.method,
+      ip: req.ip,
+    });
+    res.status(401).json(errorResponse(ApiErrorCode.UNAUTHORIZED, 'Bearer token is missing.', undefined, req.correlationId ?? req.id));
     return;
   }
 
   // Constant-time-ish comparison to reduce timing side-channels.
   if (token.length === adminKey.length && timingSafeEqual(token, adminKey)) {
-    (req as any).user = { role: 'admin' };
+    req.user = { address: '', role: 'admin' };
     recordOutcome('success');
     next();
     return;
@@ -125,7 +156,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
     const payload = verifyToken(token);
     const role = payload?.role;
     if (role === 'admin' || role === 'data-protection-officer') {
-      (req as any).user = payload;
+      req.user = payload;
       recordOutcome('success');
       next();
       return;
@@ -135,13 +166,19 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   }
 
   recordOutcome('failure');
-  warn('Admin authorization refused — invalid admin credentials', {
-    correlationId: (req as any).correlationId ?? (req as any).id,
+  recordAuditEvent('ADMIN_AUTH_REFUSED', 'auth', 'admin', req.correlationId ?? req.id, {
+    reason: 'invalid_credentials',
     path: req.originalUrl || req.path,
     method: req.method,
     ip: req.ip,
   });
-  res.status(403).json({ error: 'Invalid admin credentials.' });
+  warn('Admin authorization refused — invalid admin credentials', {
+    correlationId: req.correlationId ?? req.id,
+    path: req.originalUrl || req.path,
+    method: req.method,
+    ip: req.ip,
+  });
+  res.status(403).json(errorResponse(ApiErrorCode.FORBIDDEN, 'Invalid admin credentials.', undefined, req.correlationId ?? req.id));
   return;
 }
 

@@ -9,7 +9,7 @@
 
 import { createStreamHub, getStreamHub } from '../ws/hub.js';
 import type { Server } from 'http';
-import { info, warn } from '../utils/logger.js';
+import { info, warn } from '../lib/logger.js';
 import { addDrainableShutdownHook } from '../shutdown.js';
 
 

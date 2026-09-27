@@ -31,18 +31,18 @@ import { tenantRateLimitOverridesRouter } from './admin/tenantRateLimitOverrides
 
 export const adminRouter = Router();
 
+// Every admin route requires a valid Bearer token.
+adminRouter.use(requireAdminAuth);
+
 /**
  * GET /api/admin/status/read-only
- * Read-only endpoint for pause-flag visibility without admin credentials.
- * Exposes non-sensitive service posture only.
+ * Read-only endpoint for pause-flag visibility.
+ * Note: Now covered by admin credentials.
  */
 adminRouter.get('/status/read-only', (req, res) => {
   const requestId = req.correlationId;
   res.json(successResponse({ pauseFlags: getPauseFlags() }, requestId));
 });
-
-// Every admin route requires a valid Bearer token.
-adminRouter.use(requireAdminAuth);
 
 // Per-tenant rate limit override management
 adminRouter.use('/rate-limits/overrides', tenantRateLimitOverridesRouter);
@@ -228,13 +228,16 @@ adminRouter.post('/reindex', async (req, res) => {
  * lag is still violating the freshness threshold.
  */
 adminRouter.post('/indexer/stall/clear', (req, res) => {
+  const requestId = req.correlationId;
   try {
     clearIndexerStall();
-    recordAuditEvent('INDEXER_STALL_CLEARED', 'indexer', 'system', req.correlationId);
-    res.json({ message: 'Indexer stall flag cleared successfully.' });
+    recordAuditEvent('INDEXER_STALL_CLEARED', 'indexer', 'system', requestId);
+    res.json(successResponse({ message: 'Indexer stall flag cleared successfully.' }, requestId));
   } catch (err) {
     if (err instanceof ActiveStallError) {
-      res.status(409).json({ error: err.message });
+      res.status(409).json(
+        errorResponse('ACTIVE_STALL', err.message, undefined, requestId)
+      );
       return;
     }
     throw err;

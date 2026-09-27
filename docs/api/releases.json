@@ -1,0 +1,1900 @@
+{
+  "v1": {
+    "global": {
+      "openapi": "3.1.0",
+      "info": {
+        "title": "Fluxora HTTP API",
+        "version": "0.1.0",
+        "description": "Fluxora Backend: Off-chain companion to the streaming contract.\n\nPresents operator-grade reliability with predictable HTTP semantics, durable views of chain-derived data,\nand explicit failure behavior when dependencies are unhealthy.\n\n## Security Header Baseline\nFluxora applies Helmet at the Express boundary so every HTTP response carries a consistent\nbrowser-facing security-header baseline, including `Content-Security-Policy`,\n`Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`, and\n`Referrer-Policy`. The service also suppresses the `X-Powered-By` header.\n\nThese headers are transport invariants for public clients, authenticated partners,\nadministrators, and internal workers that traverse the HTTP surface. They do not replace\nauthentication, authorization, TLS termination, or proxy hardening.\n\n## Trust Boundaries\n- **Public Internet Clients**: Read-only access to stream listings and health checks\n- **Authenticated Partners**: Create and manage streams with idempotency guarantees\n- **Administrators**: Full access including internal indexer endpoints\n- **Internal Workers**: Indexer endpoints for chain state synchronization\n\n## Failure Modes & Client-Visible Behavior\n- **Invalid Input (400)**: Malformed addresses, negative amounts, oversized payloads\n- **Unauthorized (401)**: Missing or invalid authentication token\n- **Forbidden (403)**: Insufficient permissions for the requested operation\n- **Conflict (409)**: Duplicate submission detected (idempotency key collision)\n- **Payload Too Large (413)**: Request exceeds 256 KiB limit\n- **Service Unavailable (503)**: Dependency outage (database, Stellar RPC, workers)\n- **Internal Server Error (500)**: Unexpected error; check logs with requestId\n",
+        "contact": {
+          "name": "Fluxora Team"
+        },
+        "license": {
+          "name": "MIT"
+        }
+      },
+      "servers": [
+        {
+          "url": "http://localhost:3000",
+          "description": "Local development"
+        },
+        {
+          "url": "https://api.fluxora.example.com",
+          "description": "Production"
+        }
+      ],
+      "components": {
+        "schemas": {
+          "ResponseMeta": {
+            "type": "object",
+            "required": [
+              "timestamp"
+            ],
+            "properties": {
+              "timestamp": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO-8601 timestamp of the response",
+                "example": "2024-01-01T12:00:00.000Z"
+              },
+              "requestId": {
+                "type": "string",
+                "description": "Opaque request identifier for log correlation",
+                "example": "550e8400-e29b-41d4-a716-446655440000"
+              }
+            }
+          },
+          "SuccessResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {},
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "RootResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "example": "Fluxora API"
+                  },
+                  "version": {
+                    "type": "string",
+                    "example": "0.1.0"
+                  },
+                  "docs": {
+                    "type": "string",
+                    "example": "Programmable treasury streaming on Stellar."
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "HealthResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "ok",
+                      "degraded",
+                      "shutting_down"
+                    ],
+                    "description": "Overall service health",
+                    "example": "ok"
+                  },
+                  "service": {
+                    "type": "string",
+                    "example": "fluxora-backend"
+                  },
+                  "network": {
+                    "type": "string",
+                    "description": "Stellar network (testnet, public, etc.)",
+                    "example": "testnet"
+                  },
+                  "contractAddresses": {
+                    "type": "object",
+                    "description": "Deployed contract addresses",
+                    "example": {}
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "example": "2024-01-01T12:00:00.000Z"
+                  },
+                  "indexer": {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "stalled",
+                          "starting",
+                          "unknown"
+                        ]
+                      }
+                    }
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "ReadinessResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "report": {
+                    "type": "object",
+                    "description": "Detailed readiness report"
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "LivenessResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "report": {
+                    "type": "object",
+                    "description": "Detailed liveness report"
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "SessionResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "token": {
+                    "type": "string",
+                    "description": "JWT token for authentication",
+                    "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                  },
+                  "user": {
+                    "type": "object",
+                    "properties": {
+                      "address": {
+                        "type": "string",
+                        "example": "GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX"
+                      },
+                      "role": {
+                        "type": "string",
+                        "example": "operator"
+                      }
+                    }
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "CreateStreamRequest": {
+            "type": "object",
+            "required": [
+              "sender",
+              "recipient",
+              "depositAmount",
+              "ratePerSecond",
+              "startTime"
+            ],
+            "properties": {
+              "sender": {
+                "type": "string",
+                "description": "Stellar public key of the sender.\nMust start with 'G' followed by exactly 55 base32 characters [A-Z2-7].\nTotal length: 56 characters.\n",
+                "pattern": "^G[A-Z2-7]{55}$",
+                "example": "GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX"
+              },
+              "recipient": {
+                "type": "string",
+                "description": "Stellar public key of the recipient.\nMust start with 'G' followed by exactly 55 base32 characters [A-Z2-7].\nTotal length: 56 characters.\n",
+                "pattern": "^G[A-Z2-7]{55}$",
+                "example": "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX"
+              },
+              "depositAmount": {
+                "type": "string",
+                "description": "Total amount to deposit in stroops (1 XLM = 10,000,000 stroops).\nMust be a non-negative decimal string.\nMust be >= ratePerSecond (minimum 1 second of streaming).\nMax: 9223372036854775807 stroops (~922 million XLM).\n",
+                "pattern": "^\\d+(\\.\\d+)?$",
+                "example": "1000000000"
+              },
+              "ratePerSecond": {
+                "type": "string",
+                "description": "Streaming rate in stroops per second.\nMust be a positive decimal string.\n",
+                "pattern": "^\\d+(\\.\\d+)?$",
+                "example": "100000"
+              },
+              "startTime": {
+                "type": "integer",
+                "description": "Unix timestamp (seconds) when streaming begins.\nMust be in the future or within the last hour.\n",
+                "example": 1704067200
+              }
+            }
+          },
+          "Stream": {
+            "type": "object",
+            "description": "A durable, PostgreSQL-backed stream record.\nAll monetary amounts are decimal strings - never numbers.\n",
+            "required": [
+              "id",
+              "sender",
+              "recipient",
+              "depositAmount",
+              "ratePerSecond",
+              "startTime",
+              "endTime",
+              "status"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique stream identifier derived from SHA-256 of request content.\nFormat: stream-{64-char-hex}-{eventIndex}\n",
+                "example": "stream-a3f1c2d...0c-0"
+              },
+              "sender": {
+                "type": "string",
+                "description": "Sender Stellar public key (G + 55 base32 chars).\n",
+                "pattern": "^G[A-Z2-7]{55}$",
+                "example": "GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX"
+              },
+              "recipient": {
+                "type": "string",
+                "description": "Recipient Stellar public key (G + 55 base32 chars).\n",
+                "pattern": "^G[A-Z2-7]{55}$",
+                "example": "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7XNLG5DBNVQWDADUZSQX"
+              },
+              "depositAmount": {
+                "type": "string",
+                "description": "Total deposit as a decimal string (never a number).",
+                "pattern": "^[+-]?[0-9]+(\\.[0-9]+)?$",
+                "example": "1000"
+              },
+              "ratePerSecond": {
+                "type": "string",
+                "description": "Streaming rate per second as a decimal string.",
+                "pattern": "^[+-]?[0-9]+(\\.[0-9]+)?$",
+                "example": "10"
+              },
+              "startTime": {
+                "type": "integer",
+                "description": "Stream start time (Unix epoch seconds).",
+                "example": 1700000000
+              },
+              "endTime": {
+                "type": "integer",
+                "description": "Stream end time (Unix epoch seconds). 0 = indefinite.",
+                "example": 0
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "paused",
+                  "completed",
+                  "cancelled"
+                ],
+                "description": "Current stream status.",
+                "example": "active"
+              }
+            }
+          },
+          "StreamResponse": {
+            "type": "object",
+            "required": [
+              "streams",
+              "has_more",
+              "next_cursor"
+            ],
+            "properties": {
+              "streams": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Stream"
+                }
+              },
+              "has_more": {
+                "type": "boolean",
+                "description": "Whether more pages are available.",
+                "example": true
+              },
+              "next_cursor": {
+                "type": "string",
+                "nullable": true,
+                "description": "Opaque cursor for the next page. Always present in the response.\n`null` when `has_more` is false (no further pages).\nPass as the `cursor` query parameter on the next request.\n",
+                "example": "eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjLTAifQ"
+              },
+              "total": {
+                "type": "integer",
+                "nullable": true,
+                "description": "Total count (only present when include_total=true).",
+                "example": 42
+              }
+            }
+          },
+          "StreamListResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "required": [
+                  "streams",
+                  "has_more",
+                  "next_cursor"
+                ],
+                "properties": {
+                  "streams": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/Stream"
+                    }
+                  },
+                  "has_more": {
+                    "type": "boolean",
+                    "description": "Whether more streams are available.",
+                    "example": false
+                  },
+                  "next_cursor": {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "Opaque cursor for the next page. Always present.\n`null` when there are no further pages.\nEncodes the `id` of the last stream on the current page\nusing keyset (`WHERE id > $cursor ORDER BY id ASC`) semantics.\n",
+                    "example": null
+                  },
+                  "total": {
+                    "type": "integer",
+                    "nullable": true,
+                    "description": "Total number of streams (only if include_total=true).",
+                    "example": null
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "CancelStreamResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "message": {
+                    "type": "string",
+                    "example": "Stream cancelled"
+                  },
+                  "id": {
+                    "type": "string",
+                    "example": "stream-1704067200-abc12"
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "AcceptedResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "example": "queued"
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "EventReplayResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "data",
+              "meta"
+            ],
+            "description": "Response envelope for the cursor-based event replay endpoint.\nAmount fields inside `events[].payload` are always decimal strings.\n",
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "data": {
+                "type": "object",
+                "required": [
+                  "events",
+                  "total",
+                  "limit",
+                  "offset"
+                ],
+                "properties": {
+                  "events": {
+                    "type": "array",
+                    "description": "Ordered list of contract events for this page.",
+                    "items": {
+                      "$ref": "#/components/schemas/StreamEventRecord"
+                    }
+                  },
+                  "total": {
+                    "type": "integer",
+                    "description": "Total events matching the filter after the cursor position.",
+                    "example": 42
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "description": "Effective page size (capped at 1000).",
+                    "example": 100
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "description": "Always 0 when cursor-based pagination is used.",
+                    "example": 0
+                  },
+                  "nextCursor": {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "Pass as `afterEventId` on the next request to advance the\nreplay window. Absent when there are no more events.\n",
+                    "example": "evt-abc123"
+                  }
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/ResponseMeta"
+              }
+            }
+          },
+          "StreamEventRecord": {
+            "type": "object",
+            "description": "An append-only record of a contract event as ingested from the chain.\nAmount fields in `payload` follow the decimal-string serialization policy.\n",
+            "required": [
+              "eventId",
+              "ledger",
+              "ledgerHash",
+              "contractId",
+              "topic",
+              "txHash",
+              "txIndex",
+              "operationIndex",
+              "eventIndex",
+              "payload",
+              "happenedAt",
+              "ingestedAt"
+            ],
+            "properties": {
+              "eventId": {
+                "type": "string",
+                "description": "Stable unique identifier for this event (chain-derived).",
+                "example": "evt-abc123"
+              },
+              "ledger": {
+                "type": "integer",
+                "description": "Ledger sequence number.",
+                "example": 512345
+              },
+              "ledgerHash": {
+                "type": "string",
+                "description": "Ledger hash for reorg detection.",
+                "example": "abc123def456"
+              },
+              "contractId": {
+                "type": "string",
+                "description": "Soroban contract ID.",
+                "example": "CCONTRACT123"
+              },
+              "topic": {
+                "type": "string",
+                "description": "Event topic.",
+                "example": "stream.created"
+              },
+              "txHash": {
+                "type": "string",
+                "description": "Transaction hash.",
+                "example": "tx-abc123"
+              },
+              "txIndex": {
+                "type": "integer",
+                "example": 0
+              },
+              "operationIndex": {
+                "type": "integer",
+                "example": 0
+              },
+              "eventIndex": {
+                "type": "integer",
+                "example": 0
+              },
+              "payload": {
+                "type": "object",
+                "description": "Arbitrary event payload. Amount fields (depositAmount, ratePerSecond,\netc.) are always decimal strings — never numbers.\n",
+                "additionalProperties": true,
+                "example": {
+                  "streamId": "stream-abc123",
+                  "depositAmount": "100.0000000",
+                  "ratePerSecond": "0.0000001"
+                }
+              },
+              "happenedAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO-8601 timestamp when the event occurred on-chain.",
+                "example": "2026-03-26T12:00:00.000Z"
+              },
+              "ingestedAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "ISO-8601 timestamp when the event was ingested into the store.",
+                "example": "2026-03-26T12:00:01.000Z"
+              }
+            }
+          },
+          "ErrorResponse": {
+            "type": "object",
+            "required": [
+              "success",
+              "error"
+            ],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "enum": [
+                  false
+                ],
+                "description": "Always false for error responses",
+                "example": false
+              },
+              "error": {
+                "type": "object",
+                "required": [
+                  "code",
+                  "message"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "description": "Machine-readable error code",
+                    "enum": [
+                      "VALIDATION_ERROR",
+                      "NOT_FOUND",
+                      "CONFLICT",
+                      "UNAUTHORIZED",
+                      "FORBIDDEN",
+                      "PAYLOAD_TOO_LARGE",
+                      "TOO_MANY_REQUESTS",
+                      "REQUEST_TIMEOUT",
+                      "SERVICE_UNAVAILABLE",
+                      "INTERNAL_ERROR",
+                      "DECIMAL_ERROR"
+                    ],
+                    "example": "VALIDATION_ERROR"
+                  },
+                  "message": {
+                    "type": "string",
+                    "description": "Human-readable error message",
+                    "example": "Validation failed"
+                  },
+                  "requestId": {
+                    "type": "string",
+                    "description": "Correlation ID for log triage",
+                    "example": "550e8400-e29b-41d4-a716-446655440000"
+                  },
+                  "details": {
+                    "description": "Additional error context (field-level validation errors, etc.)",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "securitySchemes": {
+          "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "JWT token for authentication. Include in Authorization header:\nAuthorization: Bearer <token>\n"
+          },
+          "AdminAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "Admin API key for privileged operations. Include in Authorization header:\nAuthorization: Bearer <ADMIN_API_KEY>\nSet via ADMIN_API_KEY environment variable.\n"
+          }
+        }
+      },
+      "tags": [
+        {
+          "name": "System",
+          "description": "System health and metadata endpoints"
+        },
+        {
+          "name": "Auth",
+          "description": "Authentication and session management"
+        },
+        {
+          "name": "Streams",
+          "description": "Stream creation, retrieval, and listing"
+        },
+        {
+          "name": "Internal",
+          "description": "Internal endpoints for workers and administrators"
+        }
+      ]
+    },
+    "globalFingerprint": "c470b284c2494ea5030ef15f9437345bce19fccb7daafa7c8532fa4000339d75",
+    "operations": {
+      "DELETE /api/streams/{streamId}/poll": {
+        "fingerprint": "1ba9d5e06d6ec1ee3500455973631f47951fb4193fcd27bcd21724be64d5fb3b",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Cancel a stream",
+            "operationId": "cancelStream",
+            "tags": [
+              "Streams"
+            ],
+            "security": [
+              {
+                "BearerAuth": []
+              }
+            ],
+            "parameters": [
+              {
+                "name": "streamId",
+                "in": "path",
+                "required": true,
+                "description": "Stream identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Stream cancelled successfully",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/CancelStreamResponse"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Missing or invalid authentication token",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "404": {
+                "description": "Stream not found",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "409": {
+                "description": "Stream already cancelled or completed",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /": {
+        "fingerprint": "ab487822c9acd56ee5f1f627675b9b8f4fb5bbb2393fb93f38094de3fcd48603",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "API root information",
+            "operationId": "getRoot",
+            "tags": [
+              "System"
+            ],
+            "responses": {
+              "200": {
+                "description": "API metadata",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/RootResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /api/admin/status/read-only": {
+        "fingerprint": "52e017dbe7cf34937ceed4ace101a488c6d00aeea40a178db6e1c124e0f960d9",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Read-only admin feature-flag status",
+            "operationId": "getAdminStatusReadOnly",
+            "tags": [
+              "Admin"
+            ],
+            "description": "Returns non-sensitive operational pause flags without requiring\nadmin credentials. This endpoint is read-only and does not expose\nreindex internals or mutation capabilities.\n",
+            "responses": {
+              "200": {
+                "description": "Current pause-flag state",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "pauseFlags"
+                      ],
+                      "properties": {
+                        "pauseFlags": {
+                          "type": "object",
+                          "required": [
+                            "streamCreation",
+                            "ingestion"
+                          ],
+                          "properties": {
+                            "streamCreation": {
+                              "type": "boolean",
+                              "description": "Whether creation of new streams is paused."
+                            },
+                            "ingestion": {
+                              "type": "boolean",
+                              "description": "Whether chain ingestion/indexing is paused."
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /api/streams": {
+        "fingerprint": "3ac0a25e0af66ea85a834f3e989ecd877c0171eef736c583cf0ff383afe9188e",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "List streams with cursor pagination and indexed filters",
+            "operationId": "listStreams",
+            "tags": [
+              "Streams"
+            ],
+            "parameters": [
+              {
+                "name": "limit",
+                "in": "query",
+                "required": false,
+                "description": "Number of streams to return (1-100, default 20)",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "default": 20
+                }
+              },
+              {
+                "name": "cursor",
+                "in": "query",
+                "required": false,
+                "description": "Opaque pagination cursor returned in `next_cursor` from a previous\nresponse. Encodes the last seen stream id (base64url). Omit for\nthe first page.\n",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "include_total",
+                "in": "query",
+                "required": false,
+                "description": "When true, include a `total` field in the response reflecting the\ncurrent count of matching streams. This is a point-in-time snapshot\nand is not guaranteed to be consistent with the cursor position.\n",
+                "schema": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              {
+                "name": "status",
+                "in": "query",
+                "required": false,
+                "description": "Filter by stream status (uses the status index).",
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "scheduled",
+                    "active",
+                    "paused",
+                    "completed",
+                    "cancelled"
+                  ]
+                }
+              },
+              {
+                "name": "sender",
+                "in": "query",
+                "required": false,
+                "description": "Filter by sender Stellar address (uses the sender_address index).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "recipient",
+                "in": "query",
+                "required": false,
+                "description": "Filter by recipient Stellar address (uses the recipient_address index).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Cursor-paginated list of streams.\n\n**Ordering guarantee**: results are always returned in `created_at DESC, id DESC`\norder. Because `id` is the primary key (unique), the composite key is unique and\nthe ordering is deterministic — even when multiple streams share the same\n`created_at` timestamp (e.g. batch inserts). Clients can rely on a stable,\nconsistent page ordering across all requests.\n",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/StreamListResponse"
+                    }
+                  }
+                }
+              },
+              "400": {
+                "description": "Invalid query parameters",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "503": {
+                "description": "Service unavailable",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /api/streams/{streamId}": {
+        "fingerprint": "224d10417820717534f5287b27d6d63cdc7ed8b6da5dc467926e6183d32d4fb7",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Get stream details",
+            "operationId": "getStream",
+            "tags": [
+              "Streams"
+            ],
+            "parameters": [
+              {
+                "name": "streamId",
+                "in": "path",
+                "required": true,
+                "description": "Stream identifier (format: stream-{timestamp}-{random})",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Stream details",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/StreamResponse"
+                    }
+                  }
+                }
+              },
+              "404": {
+                "description": "Stream not found",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "503": {
+                "description": "Service unavailable",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /api/streams/{streamId}/poll": {
+        "fingerprint": "3703d474390891e55b891aeff2c79ab20683333e6e1c4d641b7ede9e4a7f06e4",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Long-polling fallback for real-time stream updates",
+            "description": "Long-polling fallback endpoint for enterprise clients behind proxies that block WebSocket upgrades. Holds the HTTP connection open (bounded by a timeout) until a new event for the stream arrives or the timeout elapses, returning the same event envelope shape used by the WebSocket hub.",
+            "operationId": "pollStreamEvents",
+            "tags": [
+              "Streams"
+            ],
+            "security": [
+              {
+                "ApiKeyAuth": []
+              },
+              {
+                "BearerAuth": []
+              }
+            ],
+            "parameters": [
+              {
+                "name": "streamId",
+                "in": "path",
+                "required": true,
+                "description": "Stream identifier",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "since",
+                "in": "query",
+                "required": false,
+                "description": "Event ID cursor for historical resumption replay",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "timeout",
+                "in": "query",
+                "required": false,
+                "description": "Maximum hold duration in seconds (1 to 30, default 30)",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Stream event update or null if timeout elapsed",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "success": {
+                          "type": "boolean",
+                          "example": true
+                        },
+                        "data": {
+                          "nullable": true,
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "example": "stream_update"
+                            },
+                            "streamId": {
+                              "type": "string",
+                              "example": "stream-123"
+                            },
+                            "eventId": {
+                              "type": "string",
+                              "example": "evt-101"
+                            },
+                            "payload": {
+                              "type": "object"
+                            },
+                            "correlationId": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "meta": {
+                          "$ref": "#/components/schemas/ResponseMeta"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "400": {
+                "description": "Invalid parameters or stale replay cursor",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Missing or invalid authentication token",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "404": {
+                "description": "Stream not found",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "429": {
+                "description": "Too many concurrent long-poll connections",
+                "headers": {
+                  "Retry-After": {
+                    "description": "Backoff duration in seconds",
+                    "schema": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /health": {
+        "fingerprint": "8b69f11b40fa2cb0f3ee26053617c989807df413f9936778edd43e24cf7b3cd1",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Health check endpoint",
+            "operationId": "getHealth",
+            "tags": [
+              "System"
+            ],
+            "description": "Returns the health status of the service and its dependencies.\nUsed by load balancers and monitoring systems.\nReturns 503 during graceful shutdown.\n",
+            "responses": {
+              "200": {
+                "description": "Service is healthy or degraded",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HealthResponse"
+                    }
+                  }
+                }
+              },
+              "503": {
+                "description": "Service is shutting down",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HealthResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /health/live": {
+        "fingerprint": "f3579fb096e486adf7b5e3c4a3211a7e9f803f47c6b5568cdea0bcadf193b518",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Liveness probe",
+            "operationId": "getHealthLive",
+            "tags": [
+              "System"
+            ],
+            "description": "Returns detailed health report for all dependencies.\n",
+            "responses": {
+              "200": {
+                "description": "Detailed health report",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/LivenessResponse"
+                    }
+                  }
+                }
+              },
+              "500": {
+                "description": "Failed to get health report",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /health/ready": {
+        "fingerprint": "c11dbd07e4524436a37cd45ae9d92181335db94fad7d480404b4fb90bbad37d5",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Readiness probe",
+            "operationId": "getHealthReady",
+            "tags": [
+              "System"
+            ],
+            "description": "Returns 200 if all dependencies are healthy and service is ready to accept traffic.\nReturns 503 if any dependency is unhealthy or service is shutting down.\n",
+            "responses": {
+              "200": {
+                "description": "Service is ready",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ReadinessResponse"
+                    }
+                  }
+                }
+              },
+              "503": {
+                "description": "Service is not ready",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /internal/indexer/events/replay": {
+        "fingerprint": "9842710bc7727e05b4ab7888db518d00ac84346d6b1839be5195bb5efa2cde23",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Cursor-based event replay from the event store",
+            "operationId": "replayIndexerEvents",
+            "tags": [
+              "Internal"
+            ],
+            "description": "Returns a page of stored contract events starting strictly after the\nsupplied `afterEventId` cursor, ordered by `(ledger ASC, eventId ASC)`.\n\nConsumers advance the replay window by passing the returned `nextCursor`\nvalue as `afterEventId` on the next request. Omit `afterEventId` to\nstart from the beginning of the store.\n\nAmount fields in event payloads follow the decimal-string serialization\npolicy — they are never coerced to numbers.\n\n## Trust Boundaries\n- Public internet clients may not call this route.\n- Authenticated internal workers may replay events for audit and\n  catch-up purposes only.\n\n## Failure Modes\n- An unknown `afterEventId` is treated as \"cursor past end of store\"\n  and returns an empty event list (not a 404).\n- `limit` is silently capped at 1000.\n",
+            "parameters": [
+              {
+                "name": "x-indexer-worker-token",
+                "in": "header",
+                "required": true,
+                "description": "Internal worker authentication token",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "afterEventId",
+                "in": "query",
+                "required": false,
+                "description": "Exclusive cursor. Only events that come strictly after this\neventId (in ledger-ascending order) are returned.\nOmit to start from the beginning of the store.\n",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "fromLedger",
+                "in": "query",
+                "required": false,
+                "description": "Only return events at or after this ledger (inclusive).",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              {
+                "name": "toledger",
+                "in": "query",
+                "required": false,
+                "description": "Only return events at or before this ledger (inclusive).",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              {
+                "name": "contractId",
+                "in": "query",
+                "required": false,
+                "description": "Filter by Soroban contract ID.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "topic",
+                "in": "query",
+                "required": false,
+                "description": "Filter by event topic (e.g. `stream.created`).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "name": "limit",
+                "in": "query",
+                "required": false,
+                "description": "Maximum events per page (default 100, max 1000).",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000,
+                  "default": 100
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Cursor-paginated event page",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/EventReplayResponse"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Missing or invalid internal worker credentials",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "GET /internal/indexer/status": {
+        "fingerprint": "d707dd5e3afb24c9eefa935ff5b1a6b3f9f1420f45e35b7d317d88121b564496",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Get current replay progress",
+            "operationId": "getIndexerStatus",
+            "tags": [
+              "Internal"
+            ],
+            "security": [
+              {
+                "BearerAuth": []
+              }
+            ],
+            "description": "Returns the in-memory snapshot of the current (or last completed) DB replay run.\nRequires the `indexer:replay` permission.\n",
+            "responses": {
+              "200": {
+                "description": "Replay progress snapshot",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/SuccessResponse"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Missing or invalid authentication token",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "403": {
+                "description": "Insufficient permissions (indexer:replay required)",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "POST /api/auth/session": {
+        "fingerprint": "5bd4b7428c07b75d17ec6b8b26ddcbb1de1f12909711acebe3f9660747ed6d48",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Create authentication session",
+            "operationId": "createSession",
+            "tags": [
+              "Auth"
+            ],
+            "description": "Issues a JWT token for authenticated access to privileged endpoints.\nIn this iteration, any valid Stellar address can obtain a session.\n",
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "address"
+                    ],
+                    "properties": {
+                      "address": {
+                        "type": "string",
+                        "description": "Stellar public key",
+                        "pattern": "^G[A-Z2-7]{55}$",
+                        "example": "GBBD47UZQ5CYVVEUVRYNQZX3G5KRZTAYF5XSVS2UKMCCWW5LJJLXNVQX"
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "operator",
+                          "viewer"
+                        ],
+                        "default": "viewer",
+                        "description": "User role for authorization"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "responses": {
+              "200": {
+                "description": "Session created successfully",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/SessionResponse"
+                    }
+                  }
+                }
+              },
+              "400": {
+                "description": "Invalid request",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "POST /api/streams": {
+        "fingerprint": "47385a0e50b34a260150778fa923476dcbdda81421840bd739783062bd165a22",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Create a new stream",
+            "operationId": "createStream",
+            "tags": [
+              "Streams"
+            ],
+            "security": [
+              {
+                "BearerAuth": []
+              }
+            ],
+            "parameters": [
+              {
+                "name": "Idempotency-Key",
+                "in": "header",
+                "required": true,
+                "description": "Unique key that makes this request idempotent. Clients MUST supply a\nfresh value per logical operation and MUST reuse the same value when\nretrying after a network failure.\n\n**Format**: 1–128 characters; allowed charset: `[A-Za-z0-9:_-]`.\nUUID v4 is recommended but any value matching the charset is accepted.\n\n**Behaviour**:\n- Same key + same body → 201 (cached response, `Idempotency-Replayed: true`)\n- Same key + different body → 409 CONFLICT\n- Missing or malformed key → 400 VALIDATION_ERROR\n\n**Security**: The key value is never echoed in error response bodies\nor server logs to prevent accidental secret leakage.\n",
+                "schema": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                }
+              }
+            ],
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CreateStreamRequest"
+                  }
+                }
+              }
+            },
+            "responses": {
+              "201": {
+                "description": "Stream created (or replayed from cache).\nCheck `Idempotency-Replayed` response header and `meta.idempotencyReplayed`\nto distinguish a fresh creation from a cached replay.\n",
+                "headers": {
+                  "Idempotency-Key": {
+                    "description": "Echoes the key supplied by the client.",
+                    "schema": {
+                      "type": "string"
+                    }
+                  },
+                  "Idempotency-Replayed": {
+                    "description": "`true` when the response was served from the idempotency cache;\n`false` on first creation.\n",
+                    "schema": {
+                      "type": "string",
+                      "enum": [
+                        "true",
+                        "false"
+                      ]
+                    }
+                  }
+                },
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/StreamResponse"
+                    }
+                  }
+                }
+              },
+              "400": {
+                "description": "Invalid request. Common causes:\n- Missing or malformed `Idempotency-Key` header\n- Invalid JSON body\n- Invalid Stellar address format\n- Non-string amount field (must be decimal string)\n",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Missing or invalid authentication token",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "409": {
+                "description": "Idempotency-Key collision — the same key was previously used with a\ndifferent request body. Use a new Idempotency-Key or retry with the\noriginal body.\n",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "413": {
+                "description": "Request body exceeds 256 KiB limit",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "422": {
+                "description": "Unprocessable entity — one or more Stellar addresses in the request\nbody do not exist on-chain. The stream cannot be created because it\nwould never match an on-chain event.\n\nThe `details.missingAddresses` array lists every address that was\nnot found. Addresses that could not be verified due to an RPC outage\nare omitted (the request is allowed through in that case).\n",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/ErrorResponse"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "error": {
+                              "type": "object",
+                              "properties": {
+                                "details": {
+                                  "type": "object",
+                                  "properties": {
+                                    "missingAddresses": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string",
+                                        "pattern": "^G[A-Z2-7]{55}$"
+                                      },
+                                      "example": [
+                                        "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+                                      ]
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "503": {
+                "description": "Service unavailable (database, Stellar RPC, or idempotency store down)",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "POST /internal/indexer/events/replay": {
+        "fingerprint": "8475ca13fb5346797fa5b6bad6f05ec18e9e228c933a66ec58fb18d3f3d122a3",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Trigger historical contract-event DB replay",
+            "operationId": "startIndexerReplay",
+            "tags": [
+              "Internal"
+            ],
+            "security": [
+              {
+                "BearerAuth": []
+              }
+            ],
+            "description": "Enqueues a historical backfill of `contract_events` from `historical_events`\nfor a given contract and ledger. The operation runs asynchronously; poll\n`GET /internal/indexer/status` for progress.\n\nRequires the `indexer:replay` permission. Triggers an expensive DB scan —\nkept off the public CORS allowlist and behind the shared rate limiter.\n",
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "contract_id",
+                      "ledger"
+                    ],
+                    "properties": {
+                      "contract_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Contract identifier to replay events for."
+                      },
+                      "ledger": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Ledger number to replay."
+                      },
+                      "from_block": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional lower bound block height (inclusive)."
+                      },
+                      "to_block": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional upper bound block height (inclusive). Must be >= from_block."
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "responses": {
+              "202": {
+                "description": "Replay accepted and running asynchronously",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/SuccessResponse"
+                    }
+                  }
+                }
+              },
+              "400": {
+                "description": "Validation error (invalid body)",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Missing or invalid authentication token",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "403": {
+                "description": "Insufficient permissions (indexer:replay required)",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "409": {
+                "description": "Replay operation already in progress",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "POST /internal/indexer/sync": {
+        "fingerprint": "610a1f1cb6bd17da6f03fffdc5488a8af18402be07bf6cab3dc45acfefaf12d4",
+        "contract": {
+          "pathMetadata": {},
+          "operation": {
+            "summary": "Trigger indexer synchronization",
+            "operationId": "triggerIndexerSync",
+            "tags": [
+              "Internal"
+            ],
+            "security": [
+              {
+                "BearerAuth": []
+              }
+            ],
+            "description": "Internal endpoint for workers to synchronize chain state.\nRequires admin authentication.\n",
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "ledgerSequence": {
+                        "type": "integer",
+                        "description": "Stellar ledger sequence number"
+                      }
+                    },
+                    "required": [
+                      "ledgerSequence"
+                    ]
+                  }
+                }
+              }
+            },
+            "responses": {
+              "202": {
+                "description": "Sync accepted and queued",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/AcceptedResponse"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Unauthorized",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "403": {
+                "description": "Forbidden (insufficient permissions)",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              },
+              "413": {
+                "description": "Request body exceeds 256 KiB limit",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "deprecations": [
+      {
+        "route": "/api/rate-limits/config",
+        "sunsetDate": "2026-09-30T00:00:00.000Z"
+      }
+    ],
+    "deprecationsFingerprint": "103a5c06bad126b77621bd142ea7203d8ab92636a7bd002a45381eb582fa63df"
+  }
+}

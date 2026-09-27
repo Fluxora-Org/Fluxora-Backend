@@ -71,6 +71,20 @@ describe('EnvSchema startup validation', () => {
     });
   });
 
+  it('rejects an invalid RPC timeout during startup', async () => {
+    await expect(importEnvWith(validEnv({ RPC_TIMEOUT_MS: 'not-a-timeout' }))).rejects.toMatchObject({
+      name: 'EnvironmentError',
+      message: expect.stringContaining('RPC_TIMEOUT_MS'),
+    });
+  });
+
+  it('rejects malformed RPC operation deadlines during startup', async () => {
+    await expect(importEnvWith(validEnv({ STELLAR_RPC_OPERATION_DEADLINES: '{not-json' }))).rejects.toMatchObject({
+      name: 'EnvironmentError',
+      message: expect.stringContaining('STELLAR_RPC_OPERATION_DEADLINES'),
+    });
+  });
+
   it('uses defaults when optional vars are absent', async () => {
     const { loadConfig } = await importEnvWith(validEnv());
 

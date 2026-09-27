@@ -553,6 +553,44 @@ export class HealthCheckManager {
   }
 }
 
+// ─── Startup validation (issue #1437) ────────────────────────────────────────
+
+/**
+ * Validate health-related configuration derived from the env schema (issue #1437).
+ *
+ * The env schema already bounds most of these values, but `Config` can also be
+ * constructed programmatically (tests, embedding apps), and a non-positive
+ * timeout/interval here would only misbehave when `/health/ready` or the
+ * background poller actually ran. Check them at startup too.
+ */
+export function validateHealthConfig(config: {
+  healthCheckTimeoutMs: number;
+  healthCheckIntervalMs: number;
+  startupProbeBudgetMs: number;
+  startupProbePostgresTimeoutMs: number;
+  startupProbeRedisTimeoutMs: number;
+  startupProbeStellarTimeoutMs: number;
+}): string[] {
+  const issues: string[] = [];
+
+  const positiveInts: ReadonlyArray<[string, number]> = [
+    ['healthCheckTimeoutMs', config.healthCheckTimeoutMs],
+    ['healthCheckIntervalMs', config.healthCheckIntervalMs],
+    ['startupProbeBudgetMs', config.startupProbeBudgetMs],
+    ['startupProbePostgresTimeoutMs', config.startupProbePostgresTimeoutMs],
+    ['startupProbeRedisTimeoutMs', config.startupProbeRedisTimeoutMs],
+    ['startupProbeStellarTimeoutMs', config.startupProbeStellarTimeoutMs],
+  ];
+
+  for (const [name, value] of positiveInts) {
+    if (!Number.isInteger(value) || value <= 0) {
+      issues.push(`${name} must be a positive integer (got ${value})`);
+    }
+  }
+
+  return issues;
+}
+
 // ─── Built-in stub checkers (used when real clients are not wired up) ─────────
 
 export function createDatabaseHealthChecker(): HealthChecker {

@@ -25,6 +25,7 @@ import { getConfig } from '../config/env.js';
 import type { HealthCheckManager } from '../config/health.js';
 import { checkInstanceReadiness } from './readiness.js';
 import { logger } from '../lib/logger.js';
+import { isShuttingDown } from '../shutdown.js';
 
 // Keep in sync with ./health.proto — the canonical, unmodified grpc.health.v1 spec.
 const HEALTH_PROTO_SOURCE = `
@@ -91,7 +92,12 @@ const HEALTH_SERVICE_DEFINITION = loadHealthServiceDefinition();
  */
 async function resolveServingStatus(
   healthManager: HealthCheckManager,
+  service?: string,
 ): Promise<HealthCheckResponse['status']> {
+  if (service === 'liveness') {
+    return isShuttingDown() ? 'NOT_SERVING' : 'SERVING';
+  }
+
   try {
     const { assessment } = await checkInstanceReadiness(healthManager);
     return assessment.ready ? 'SERVING' : 'NOT_SERVING';
@@ -107,9 +113,9 @@ async function resolveServingStatus(
 /**
  * Build (but do not bind/start) the grpc.health.v1.Health server.
  *
- * `service` on the request is accepted but ignored — this app reports one
- * overall status, not per-service granularity, matching /health/ready's
- * flat status shape.
+ * If `service` is "liveness", it reports only process health (SERVING unless shutting down).
+ * Otherwise it defaults to readiness behavior, mapping the underlying dependency
+ * checks to SERVING/NOT_SERVING.
  */
 export function createGrpcHealthServer(healthManager: HealthCheckManager): grpc.Server {
   const server = new grpc.Server();
@@ -119,7 +125,7 @@ export function createGrpcHealthServer(healthManager: HealthCheckManager): grpc.
       _call: grpc.ServerUnaryCall<HealthCheckRequest, HealthCheckResponse>,
       callback: grpc.sendUnaryData<HealthCheckResponse>,
     ): void {
-      resolveServingStatus(healthManager)
+      resolveServingStatus(healthManager, _call.request.service)
         .then((status) => callback(null, { status }))
         .catch(() => callback(null, { status: 'NOT_SERVING' }));
     },
@@ -127,9 +133,10 @@ export function createGrpcHealthServer(healthManager: HealthCheckManager): grpc.
     watch(call: grpc.ServerWritableStream<HealthCheckRequest, HealthCheckResponse>): void {
       let lastStatus: HealthCheckResponse['status'] | null = null;
       let stopped = false;
+      const service = call.request.service;
 
       const writeIfChanged = async (): Promise<void> => {
-        const status = await resolveServingStatus(healthManager);
+        const status = await resolveServingStatus(healthManager, service);
         if (stopped) return;
         if (status !== lastStatus) {
           lastStatus = status;

@@ -16,7 +16,7 @@ import { getConfig } from '../config/env.js';
 import dns from 'node:dns';
 import http from 'node:http';
 import https from 'node:https';
-import type { IncomingMessage } from 'node:http';
+import type { IncomingMessage, RequestOptions } from 'node:http';
 
 export interface WebhookDispatchOptions {
   url: string;
@@ -45,7 +45,6 @@ interface WebhookHttpResponse {
   headers: Headers;
 }
 
-type LookupCallback = (error: Error | null, address: string, family: number) => void;
 
 type FetchRedirectOptions = Omit<RequestInit, 'redirect'>;
 
@@ -111,36 +110,87 @@ async function followFetchRedirects(
 }
 
 /**
+ * Coerce a validation failure into the `ErrnoException` shape Node's `lookup`
+ * contract requires, so the socket layer reports it as a connect error rather
+ * than crashing on an unexpected value.
+ */
+function asLookupError(validationError: unknown): NodeJS.ErrnoException {
+  return validationError instanceof Error
+    ? (validationError as NodeJS.ErrnoException)
+    : new WebhookTargetValidationError('Resolved webhook address was rejected');
+}
+
+/**
  * Resolve immediately before socket creation and hand Node the validated IP.
  * Returning the address prevents the HTTP client from performing a second DNS
  * lookup that could receive a rebinding answer.
+ *
+ * Node's `lookup` contract depends on `options.all`. With Happy Eyeballs
+ * (`autoSelectFamily`, the default since Node 20) the socket layer sets
+ * `all: true` and expects an *array* of `{ address, family }` records; without
+ * it a single `(address, family)` pair. Answering the wrong shape makes every
+ * delivery fail with `Invalid IP address: undefined` before a socket is even
+ * created, so the request is issued in the shape the caller asked for and the
+ * answer is returned in that same shape.
+ *
+ * In the `all: true` case *every* resolved address is validated, not just the
+ * first: the connect path picks whichever it likes, so failing closed on the
+ * whole set is what stops a private/loopback/link-local record from being
+ * selected behind a benign first answer.
+ *
+ * @internal exported so the `all: true` contract can be asserted directly
+ * rather than inferred from a socket that fails to open.
  */
-function lookupWebhookTarget(
+export const lookupWebhookTarget: https.RequestOptions['lookup'] = (
   hostname: string,
-  options: number | dns.LookupOneOptions,
-  callback: LookupCallback,
-): void {
-  const family = typeof options === 'number' ? options : options.family;
+  options: dns.LookupOptions,
+  callback: (
+    err: NodeJS.ErrnoException | null,
+    address: string | dns.LookupAddress[],
+    family?: number,
+  ) => void,
+): void => {
+  const wantsAll = typeof options === 'object' && options !== null && options.all === true;
+  const family =
+    typeof options === 'number'
+      ? options
+      : options !== null && typeof options === 'object'
+        ? options.family
+        : undefined;
+
+  if (wantsAll) {
+    dns.lookup(hostname, { family, all: true }, (error, addresses) => {
+      if (error) {
+        callback(error, []);
+        return;
+      }
+      try {
+        for (const { address } of addresses) {
+          validateWebhookIPAddress(address);
+        }
+      } catch (validationError) {
+        callback(asLookupError(validationError), []);
+        return;
+      }
+      callback(null, addresses);
+    });
+    return;
+  }
+
   dns.lookup(hostname, { family, all: false }, (error, address, resolvedFamily) => {
     if (error) {
-      callback(error, address, resolvedFamily);
+      callback(error, '', resolvedFamily);
       return;
     }
-
     try {
       validateWebhookIPAddress(address);
-      callback(null, address, resolvedFamily);
     } catch (validationError) {
-      callback(
-        validationError instanceof Error
-          ? validationError
-          : new WebhookTargetValidationError('Resolved webhook address was rejected'),
-        address,
-        resolvedFamily,
-      );
+      callback(asLookupError(validationError), address, resolvedFamily);
+      return;
     }
+    callback(null, address, resolvedFamily);
   });
-}
+};
 
 /**
  * Enhanced webhook dispatcher with durable delivery and proper error handling
@@ -433,10 +483,10 @@ export class WebhookDispatcher {
   ): Promise<WebhookHttpResponse> {
     const parsedUrl = new URL(url);
     return new Promise((resolve, reject) => {
-      const options = {
+      const options: RequestOptions = {
         method: requestOptions.method,
         headers: requestOptions.headers,
-        lookup: lookupWebhookTarget as any,
+        lookup: lookupWebhookTarget as RequestOptions['lookup'],
         signal: requestOptions.signal,
       };
       const handleResponse = (response: IncomingMessage) => {

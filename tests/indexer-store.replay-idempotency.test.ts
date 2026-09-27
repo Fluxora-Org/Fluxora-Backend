@@ -6,9 +6,15 @@
  * documented policy (accepted and stored), and no duplicate business event
  * is emitted.
  *
+ * Issue #1523 extends coverage to the three concrete replay triggers:
+ *   a) crash-recovery replay   — process restarts mid-batch
+ *   b) leader-handover replay  — new leader re-ingests the handover ledger
+ *   c) chain-reorg replay      — rolled-back ledgers are re-ingested with a
+ *                                different ledger hash
+ *
  * The event identity key is `eventId`, derived as `${txHash}-${eventIndex}`.
  * Both InMemoryContractEventStore and PostgresContractEventStore use this key
- * for deduplication via ON CONFLICT (eventId) DO NOTHING or equivalent logic.
+ * for deduplication via ON CONFLICT (event_id) DO NOTHING or equivalent logic.
  *
  * Verified invariants:
  *  1. Replaying the same event is a no-op — no duplicate row is created.
@@ -18,6 +24,8 @@
  *  5. Cursor advancement is unaffected by duplicates.
  *  6. Health metrics (duplicateEventCount, acceptedEventCount) are accurate.
  *  7. No duplicate business event is emitted for re-ingested events.
+ *  8. Crash-recovery, leader-handover, and chain-reorg replays are each
+ *     idempotent (#1523).
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -707,5 +715,278 @@ describe('Replay idempotency — concurrent delivery patterns', () => {
     expect(b3.duplicateEventIds).toEqual(['evt-multi-3']);
 
     expect(store.all()).toHaveLength(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Ledger replay — crash recovery, leader handover, chain reorg (#1523)
+//
+// Acceptance criteria:
+//   AC1: Replaying a ledger produces no duplicate rows.
+//   AC2: The idempotency key (eventId = `${txHash}-${eventIndex}`) is the
+//        sole discriminant — the store's decision is key-only and does not
+//        depend on any other field (ledgerHash, happenedAt, payload, …).
+// ---------------------------------------------------------------------------
+
+describe('Ledger replay idempotency — crash recovery (#1523)', () => {
+  // Scenario: the process crashed after committing the first half of a batch.
+  // On restart the entire batch is replayed from the committed cursor position,
+  // which means some events arrive for the second time.
+
+  let store: InMemoryContractEventStore;
+
+  beforeEach(() => {
+    store = new InMemoryContractEventStore();
+  });
+
+  it('AC1: replaying a fully committed ledger produces no duplicate rows', async () => {
+    const ledger = 500;
+    const events = [
+      makeRecord('tx-crash-0', ledger, { txHash: 'tx-crash', eventIndex: 0 }),
+      makeRecord('tx-crash-1', ledger, { txHash: 'tx-crash', eventIndex: 1 }),
+      makeRecord('tx-crash-2', ledger, { txHash: 'tx-crash', eventIndex: 2 }),
+    ];
+
+    // Initial ingest (pre-crash committed state)
+    await store.insertMany(events);
+    expect(store.all()).toHaveLength(3);
+
+    // Crash-recovery replay — same ledger, same events
+    const replay = await store.insertMany(events);
+    expect(replay.insertedEventIds).toEqual([]);
+    expect(replay.duplicateEventIds).toHaveLength(3);
+
+    // AC1: still exactly 3 rows
+    expect(store.all()).toHaveLength(3);
+  });
+
+  it('AC1: partial-commit recovery — only un-committed events are inserted', async () => {
+    const ledger = 501;
+    const allEvents = [
+      makeRecord('tx-partial-0', ledger, { txHash: 'tx-partial', eventIndex: 0 }),
+      makeRecord('tx-partial-1', ledger, { txHash: 'tx-partial', eventIndex: 1 }),
+      makeRecord('tx-partial-2', ledger, { txHash: 'tx-partial', eventIndex: 2 }),
+    ];
+
+    // Pre-crash: only the first event was committed
+    await store.insertMany([allEvents[0]!]);
+    expect(store.all()).toHaveLength(1);
+
+    // Recovery replay: full batch re-delivered from the beginning of the ledger
+    const replay = await store.insertMany(allEvents);
+    expect(replay.insertedEventIds).toHaveLength(2);
+    expect(replay.insertedEventIds).toEqual(
+      expect.arrayContaining(['tx-partial-1', 'tx-partial-2']),
+    );
+    expect(replay.duplicateEventIds).toEqual(['tx-partial-0']);
+
+    // AC1: exactly 3 rows — no duplicates
+    expect(store.all()).toHaveLength(3);
+  });
+
+  it('AC2: idempotency key is eventId only — different happenedAt is still a duplicate', async () => {
+    // The ledger's close time shifted slightly in the recovered state.
+    // The event is the same chain event; its identity must not change.
+    const original = makeRecord('tx-ts-0', 502, {
+      txHash: 'tx-ts',
+      eventIndex: 0,
+      happenedAt: '2026-06-01T00:00:00.000Z',
+    });
+    await store.insertMany([original]);
+
+    const withDifferentTimestamp = makeRecord('tx-ts-0', 502, {
+      txHash: 'tx-ts',
+      eventIndex: 0,
+      happenedAt: '2026-06-01T00:00:01.000Z', // 1 second later
+    });
+    const replay = await store.insertMany([withDifferentTimestamp]);
+
+    expect(replay.insertedEventIds).toEqual([]);
+    expect(replay.duplicateEventIds).toEqual(['tx-ts-0']);
+
+    // AC1: still one row; original timestamp preserved
+    expect(store.all()).toHaveLength(1);
+    expect(store.all()[0]!.happenedAt).toBe('2026-06-01T00:00:00.000Z');
+  });
+});
+
+describe('Ledger replay idempotency — leader handover (#1523)', () => {
+  // Scenario: a new leader takes over and re-ingests the handover ledger to
+  // ensure it has a complete view before advancing its cursor.
+
+  let store: InMemoryContractEventStore;
+
+  beforeEach(() => {
+    store = new InMemoryContractEventStore();
+  });
+
+  it('AC1: new leader replaying the handover ledger produces no duplicates', async () => {
+    const handoverLedger = 600;
+    const handoverEvents = [
+      makeRecord('tx-ho-0', handoverLedger, { txHash: 'tx-ho', eventIndex: 0 }),
+      makeRecord('tx-ho-1', handoverLedger, { txHash: 'tx-ho', eventIndex: 1 }),
+    ];
+
+    // Old leader committed these events
+    await store.insertMany(handoverEvents);
+    expect(store.byLedger(handoverLedger)).toHaveLength(2);
+
+    // New leader re-ingests the same ledger as its first act
+    const replay = await store.insertMany(handoverEvents);
+    expect(replay.insertedEventIds).toEqual([]);
+    expect(replay.duplicateEventIds).toHaveLength(2);
+
+    // AC1: unchanged
+    expect(store.byLedger(handoverLedger)).toHaveLength(2);
+  });
+
+  it('AC1: new leader re-ingesting a range spanning multiple ledgers produces no duplicates', async () => {
+    // Old leader committed ledgers 601–603
+    for (let ledger = 601; ledger <= 603; ledger++) {
+      await store.insertMany([
+        makeRecord(`tx-range-${ledger}-0`, ledger, { txHash: `tx-range-${ledger}`, eventIndex: 0 }),
+      ]);
+    }
+    expect(store.all()).toHaveLength(3);
+
+    // New leader re-ingests the entire range 601–603 plus one new ledger 604
+    const replayBatch = [
+      makeRecord('tx-range-601-0', 601, { txHash: 'tx-range-601', eventIndex: 0 }),
+      makeRecord('tx-range-602-0', 602, { txHash: 'tx-range-602', eventIndex: 0 }),
+      makeRecord('tx-range-603-0', 603, { txHash: 'tx-range-603', eventIndex: 0 }),
+      makeRecord('tx-range-604-0', 604, { txHash: 'tx-range-604', eventIndex: 0 }),
+    ];
+
+    const result = await store.insertMany(replayBatch);
+    expect(result.insertedEventIds).toEqual(['tx-range-604-0']);
+    expect(result.duplicateEventIds).toHaveLength(3);
+
+    // AC1: exactly 4 rows
+    expect(store.all()).toHaveLength(4);
+  });
+
+  it('AC2: idempotency key is eventId only — leader replaying with a fresh ingestedAt is still a duplicate', async () => {
+    // The old leader set ingestedAt to time T; the new leader would set it to T+1.
+    // The store must treat the re-delivery as a duplicate regardless.
+    const event = makeRecord('tx-leader-0', 600, { txHash: 'tx-leader', eventIndex: 0 });
+    await store.insertMany([event]);
+
+    const reDelivered = { ...event, ingestedAt: new Date().toISOString() };
+    const result = await store.insertMany([reDelivered]);
+
+    expect(result.insertedEventIds).toEqual([]);
+    expect(result.duplicateEventIds).toEqual(['tx-leader-0']);
+    expect(store.all()).toHaveLength(1);
+  });
+});
+
+describe('Ledger replay idempotency — chain reorganisation (#1523)', () => {
+  // Scenario: a reorg evicts ledgers at or above the fork point; the surviving
+  // chain then replays those ledger numbers with different hashes.  Events at
+  // evicted ledgers are rolled back; new events with the same ledger numbers
+  // but different eventIds (different chain) must be ingested cleanly.
+
+  let store: InMemoryContractEventStore;
+
+  beforeEach(() => {
+    store = new InMemoryContractEventStore();
+  });
+
+  it('AC1: after rollback, replaying the canonical chain produces no duplicates', async () => {
+    // Original chain: ledgers 700–702
+    const originalEvents = [
+      makeRecord('tx-reorg-700-0', 700, { txHash: 'tx-reorg-700', eventIndex: 0, ledgerHash: 'hash-700-fork' }),
+      makeRecord('tx-reorg-701-0', 701, { txHash: 'tx-reorg-701', eventIndex: 0, ledgerHash: 'hash-701-fork' }),
+      makeRecord('tx-reorg-702-0', 702, { txHash: 'tx-reorg-702', eventIndex: 0, ledgerHash: 'hash-702-fork' }),
+    ];
+    await store.insertMany(originalEvents);
+    expect(store.all()).toHaveLength(3);
+
+    // Reorg detected at ledger 701: roll back 701 and above
+    await store.rollbackBeforeLedger(701);
+    expect(store.all()).toHaveLength(1); // only ledger 700 survives
+    expect(store.getReorgLog()).toHaveLength(1);
+
+    // Canonical chain: re-ingest 701 and 702 with new hashes + eventIds
+    const canonicalEvents = [
+      makeRecord('tx-canon-701-0', 701, { txHash: 'tx-canon-701', eventIndex: 0, ledgerHash: 'hash-701-canon' }),
+      makeRecord('tx-canon-702-0', 702, { txHash: 'tx-canon-702', eventIndex: 0, ledgerHash: 'hash-702-canon' }),
+    ];
+    const result = await store.insertMany(canonicalEvents);
+    expect(result.insertedEventIds).toHaveLength(2);
+    expect(result.duplicateEventIds).toEqual([]);
+
+    // AC1: exactly 3 rows — original 700 + canonical 701 + canonical 702
+    expect(store.all()).toHaveLength(3);
+  });
+
+  it('AC1: replaying the canonical chain a second time after reorg produces no additional duplicates', async () => {
+    // Setup: ingest original ledger 800, reorg, ingest canonical ledger 800
+    await store.insertMany([
+      makeRecord('tx-orig-800-0', 800, { txHash: 'tx-orig-800', eventIndex: 0, ledgerHash: 'hash-800-fork' }),
+    ]);
+    await store.rollbackBeforeLedger(800);
+    const canonical = makeRecord('tx-canon-800-0', 800, {
+      txHash: 'tx-canon-800',
+      eventIndex: 0,
+      ledgerHash: 'hash-800-canon',
+    });
+    await store.insertMany([canonical]);
+    expect(store.all()).toHaveLength(1);
+
+    // Replay canonical ledger 800 again (e.g. leader restart after the reorg)
+    const replay = await store.insertMany([canonical]);
+    expect(replay.insertedEventIds).toEqual([]);
+    expect(replay.duplicateEventIds).toEqual(['tx-canon-800-0']);
+
+    // AC1: still exactly 1 row
+    expect(store.all()).toHaveLength(1);
+  });
+
+  it('AC2: rolled-back eventIds can be re-inserted on the canonical fork without collision', async () => {
+    // This ensures rollbackBeforeLedger correctly cleans up so that eventIds
+    // from the fork do not block ingestion of canonical events.
+    const forkEventId = 'tx-fork-900-0';
+    await store.insertMany([
+      makeRecord(forkEventId, 900, { txHash: 'tx-fork-900', eventIndex: 0, ledgerHash: 'hash-900-fork' }),
+    ]);
+
+    await store.rollbackBeforeLedger(900);
+    expect(store.all()).toHaveLength(0);
+
+    // Canonical chain happens to produce the same eventId (same tx, same index,
+    // different ledger hash — this is theoretically possible after a micro-fork).
+    const canonicalWithSameId = makeRecord(forkEventId, 900, {
+      txHash: 'tx-fork-900',
+      eventIndex: 0,
+      ledgerHash: 'hash-900-canon',
+    });
+    const result = await store.insertMany([canonicalWithSameId]);
+    expect(result.insertedEventIds).toEqual([forkEventId]);
+    expect(result.duplicateEventIds).toEqual([]);
+    expect(store.all()).toHaveLength(1);
+  });
+
+  it('AC1: Postgres store deduplicates a replayed ledger via the dedup sentinel', async () => {
+    // Verify the Postgres path uses the dedup sentinel table and returns
+    // consistent insertedEventIds / duplicateEventIds on the second replay.
+    const { store: pgStore } = buildMockPostgresStore();
+
+    const ledgerEvents = [
+      makeRecord('tx-pg-reorg-0', 700, { txHash: 'tx-pg-reorg', eventIndex: 0 }),
+      makeRecord('tx-pg-reorg-1', 700, { txHash: 'tx-pg-reorg', eventIndex: 1 }),
+    ];
+
+    const first = await pgStore.insertMany(ledgerEvents);
+    expect(first.insertedEventIds).toHaveLength(2);
+    expect(first.duplicateEventIds).toEqual([]);
+
+    // Second replay (crash-recovery or leader-handover path)
+    const second = await pgStore.insertMany(ledgerEvents);
+    expect(second.insertedEventIds).toEqual([]);
+    expect(second.duplicateEventIds).toHaveLength(2);
+    expect(second.duplicateEventIds).toEqual(
+      expect.arrayContaining(['tx-pg-reorg-0', 'tx-pg-reorg-1']),
+    );
   });
 });

@@ -8,9 +8,9 @@
  * `requirePermission` from src/middleware/auth.ts, which add the revocation
  * check and payload validation on top of this. See docs/auth.md.
  */
-import jwt, { type SignOptions } from 'jsonwebtoken';
+import jwt, { type SignOptions, type VerifyOptions } from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
-import { warn } from '../utils/logger.js';
+import { warn } from './logger.js';
 
 export interface UserPayload {
   address: string;
@@ -74,8 +74,8 @@ export function generateToken(payload: UserPayload): string {
 export function verifyToken(token: string): UserPayload {
   const { jwtSecret, jwtSecretPrevious } = getConfig();
   
-  const verifyOptions: jwt.VerifyOptions = {
-    algorithms: [JWT_ALGORITHM as jwt.Algorithm],
+  const verifyOptions: VerifyOptions = {
+    algorithms: [JWT_ALGORITHM],
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
     clockTolerance: CLOCK_TOLERANCE_SECONDS,
@@ -86,7 +86,7 @@ export function verifyToken(token: string): UserPayload {
   } catch (error) {
     if (jwtSecretPrevious) {
       try {
-        return jwt.verify(token, jwtSecretPrevious, verifyOptions) as UserPayload;
+        return jwt.verify(token, jwtSecretPrevious, verifyOptions) as unknown as UserPayload;
       } catch {
         // Fall through to throw the original error
       }

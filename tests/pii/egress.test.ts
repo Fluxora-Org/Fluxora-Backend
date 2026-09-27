@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { Counter } from 'prom-client';
 import { redactableFields } from '../../src/pii/policy.js';
 import { logger } from '../../src/lib/logger.js';
 import { getTracer, Tracer } from '../../src/tracing/hooks.js';
@@ -57,7 +58,7 @@ describe('PII Egress Validation', () => {
     expect(logWritten).toBe(true);
 
     // Path 3: Traces
-    const tracer = getTracer({ enabled: true });
+    const tracer = getTracer();
     const span = tracer.startSpan({ traceId: '1', tags: record });
     tracer.recordEvent(span, 'test-event', record);
     
@@ -82,7 +83,6 @@ describe('PII Egress Validation', () => {
       }
     };
     
-    import { Counter } from 'prom-client';
     const counter = new Counter({ name: 'test', help: 'test', labelNames: Array.from(fields) });
     counter.inc(record);
     // getting the internal hash map to check what labels got recorded

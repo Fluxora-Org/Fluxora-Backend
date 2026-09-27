@@ -18,7 +18,7 @@
 
 import type { Redis, Cluster } from 'ioredis';
 import { resolveConnectionLimit } from '../config/connectionLimits.js';
-import { logger } from '../logging/logger.js';
+import { logger } from '../lib/logger.js';
 import { calculateNextRetryDelay } from '../lib/retry.js';
 import {
   redisCommandQueueLength,

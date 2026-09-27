@@ -136,12 +136,18 @@ Pager / chat: use the team's on-call rotation. Capture `correlation_id` / reques
 | Alert | Metric | Threshold | Likely causes |
 |---|---|---|---|
 | IndexerBatchErrors | `rate(indexer_batch_errors_total[5m])` | > 0.1/s for 5m | RPC errors, decode failures, DB write errors |
+| IndexerBatchPartialFailureHigh | `sum(rate(indexer_batches_processed_total{outcome="partial"}[5m])) / sum(rate(indexer_batches_processed_total[5m]))` | > 0.01 for 10m | Batches rolled back before COMMIT (stop requested mid-batch); rows dropped, ledger range not advanced |
 | IndexerBatchTooSlow | `histogram_quantile(0.99, rate(indexer_batch_duration_seconds_bucket[5m]))` | > 30s | Heavy ledgers, DB latency |
 | IndexerThroughputDrop | `rate(indexer_batches_processed_total[5m])` | near 0 while lag rising | Process hung |
 
-**First diagnostic:** Diff error logs around last successful batch timestamp; correlate with `rpc_provider_healthy` and DB slow-query rate.
+`indexer_batch_errors_total` counts **partial** batch failures as well as wholly
+failed ones, so the error rate is never understated. The `outcome` label on
+`indexer_batches_processed_total` (`success` / `partial` / `error`) is what
+separates them, and `error_type="batch_aborted"` identifies the partial drop.
 
-**Escalation:** page if throughput is zero for > 5m in production.
+**First diagnostic:** Diff error logs around last successful batch timestamp; correlate with `rpc_provider_healthy` and DB slow-query rate. For `IndexerBatchPartialFailureHigh`, look for `replay_batch_aborted` / `replay_stopped_by_shutdown` log lines and re-run the replay for the affected range.
+
+**Escalation:** page if throughput is zero for > 5m in production. Treat a sustained `IndexerBatchPartialFailureHigh` as a data-completeness issue: the affected ledger range is still un-ingested, so a resume is owed even though no batch threw.
 
 ---
 

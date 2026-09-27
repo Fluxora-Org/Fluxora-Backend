@@ -1,13 +1,44 @@
+/**
+ * Environment configuration — public entry point.
+ *
+ * This module is the single import surface for the rest of the codebase
+ * (`import { loadConfig, Config } from './config/env.js'`). The schema itself
+ * is split into per-subsystem modules (issue #1519):
+ *
+ * - `env-schema/`        — per-subsystem zod fragments (core, database, redis,
+ *                           stellar, auth, http, webhooks, server, indexer,
+ *                           rateLimit, infrastructure) composed in
+ *                           `env-schema/schema.ts`
+ * - `env-config.ts`       — `Config` interface, error types, env → config
+ *                           mapping, and load/initialize/reset singletons
+ * - `env-hot-reload.ts`   — SIGHUP hot-reload machinery (HotConfig)
+ *
+ * The composed schema is unchanged in effect: it accepts and rejects exactly
+ * the same inputs as the original single-file definition, verified by
+ * `tests/config/env.schema-split.test.ts`.
+ *
+ * NOTE: the single-file implementation below is still the one this module
+ * exports. The `env-schema/` fragments are the equivalent split definition
+ * used by `env-config.ts` and are covered on their own by the equivalence
+ * tests, so this module must not re-declare `EnvSchema`/`parseEnv` from them.
+ */
+import { parseEnv } from './env-config.js';
+import { getConfig } from './env-config.js';
+
+export { EnvSchema } from './env-schema/schema.js';
+export type { ParsedEnv } from './env-schema/schema.js';
+export type { NodeEnv, LogLevel } from './env-schema/types.js';
+
 import { z } from 'zod';
 import { warn } from '../lib/logger.js';
 import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
 import {
   getPinnedAddressNetwork,
   isValidStellarContractAddress,
-  STELLAR_CONTRACT_ALLOWLIST,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
   STELLAR_NETWORK_PASSPHRASES,
   type PinnedStellarAddressKind,
-  type PinnedStellarNetwork,
 } from './stellarContracts.js';
 import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
@@ -15,25 +46,23 @@ export {
   STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
   isValidStellarContractAddress,
+  assertNetworkMatchesContracts,
+  logActiveStellarConfig,
 } from './stellarContracts.js';
+export { resolveNetwork } from './stellar.js';
 
-type NodeEnv = 'development' | 'staging' | 'production' | 'test';
-type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type { Config } from './env-config.js';
+export { ConfigError, EnvironmentError, loadConfig, getConfig, initializeConfig, resetConfig } from './env-config.js';
 
-const SECRET_ENV_NAMES = new Set([
-  'JWT_SECRET',
-  'JWT_SECRET_PREVIOUS',
-  'INDEXER_WORKER_TOKEN',
-  'WEBHOOK_SECRET',
-  'WEBHOOK_SECRET_PREVIOUS',
-  'PARTNER_API_TOKEN',
-  'ADMIN_API_TOKEN',
-  'ADMIN_API_KEY',
-  'API_KEYS',
-  'API_KEY_PEPPER',
-  'FLUXORA_WEBHOOK_SECRET',
-  'FLUXORA_WEBHOOK_SECRET_PREVIOUS',
-]);
+export type { HotConfig, ConfigRefreshResult } from './env-hot-reload.js';
+export {
+  captureStartupEnvSnapshot,
+  refreshHotConfig,
+  reloadHotConfig,
+  getLastHotConfig,
+  getHotConfigGeneration,
+  resetStartupEnvSnapshot,
+} from './env-hot-reload.js';
 
 function parseInteger(value: unknown): unknown {
   if (value === undefined || value === '') return undefined;
@@ -134,6 +163,21 @@ function optionalString(name: string) {
   );
 }
 
+function operationDeadlinesEnv() {
+  return z.preprocess(
+    (value) => {
+      if (value === undefined || value === '') return {};
+      if (typeof value !== 'string') return value;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    },
+    z.record(z.string(), z.number().int().min(1, 'RPC operation deadlines must be at least 1ms')),
+  );
+}
+
 function requiredStellarContractAddress(name: string) {
   return z
     .string()
@@ -154,7 +198,7 @@ function validatePinnedAddress(
   ctx: z.RefinementCtx,
   network: StellarNetwork,
   kind: PinnedStellarAddressKind,
-  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS',
+  path: 'STELLAR_CONTRACT_ADDRESS' | 'STELLAR_TOKEN_ADDRESS' | 'CONTRACT_ADDRESS_STREAMING' | string,
   address: string
 ): void {
   if (network === 'local') return;
@@ -172,6 +216,8 @@ function validatePinnedAddress(
         : `${path} is pinned for ${pinnedNetwork} but STELLAR_NETWORK resolves to ${network}`,
   });
 }
+
+export const DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES = 4_096;
 
 export const EnvSchema = z
   .object({
@@ -232,7 +278,12 @@ export const EnvSchema = z
     STELLAR_TOKEN_ADDRESS: requiredStellarContractAddress('STELLAR_TOKEN_ADDRESS'),
     HORIZON_URL: optionalUrlString('HORIZON_URL'),
     HORIZON_NETWORK_PASSPHRASE: optionalString('HORIZON_NETWORK_PASSPHRASE'),
-    CONTRACT_ADDRESS_STREAMING: optionalString('CONTRACT_ADDRESS_STREAMING'),
+    CONTRACT_ADDRESS_STREAMING: z
+      .preprocess((value) => (value === '' ? undefined : value), z.string().trim().optional())
+      .refine(
+        (val) => val === undefined || isValidStellarContractAddress(val),
+        'CONTRACT_ADDRESS_STREAMING must be a valid Stellar contract StrKey'
+      ),
     STELLAR_RPC_URL: urlString('STELLAR_RPC_URL').default('https://soroban-testnet.stellar.org'),
     STELLAR_RPC_TIMEOUT: integerEnv('STELLAR_RPC_TIMEOUT', 1).default(LIMITS.STELLAR_RPC_TIMEOUT),
     STELLAR_RPC_MAX_RETRIES: integerEnv('STELLAR_RPC_MAX_RETRIES', 0).default(
@@ -246,7 +297,7 @@ export const EnvSchema = z
      * Format: JSON object mapping operation names to timeouts in ms.
      * Example: '{"getLatestLedger":2000,"accountExists":8000}'
      */
-    STELLAR_RPC_OPERATION_DEADLINES: z.string().optional(),
+    STELLAR_RPC_OPERATION_DEADLINES: operationDeadlinesEnv(),
 
     JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
     JWT_SECRET_PREVIOUS: z.preprocess(
@@ -353,12 +404,32 @@ export const EnvSchema = z
 
     ENABLE_STREAM_VALIDATION: booleanEnv().default(true),
     ENABLE_RATE_LIMIT: booleanEnv().optional(),
+    EARLY_HINTS_ENABLED: booleanEnv().default(true),
     REQUIRE_PARTNER_AUTH: booleanEnv().default(false),
     PARTNER_API_TOKEN: optionalString('PARTNER_API_TOKEN'),
     REQUIRE_ADMIN_AUTH: booleanEnv().default(false),
     ADMIN_API_TOKEN: optionalString('ADMIN_API_TOKEN'),
     WS_AUTH_REQUIRED: booleanEnv().default(false),
     WS_ALLOWED_ORIGINS: optionalString('WS_ALLOWED_ORIGINS'),
+    WS_MAX_CONNECTIONS_PER_IP: integerEnv('WS_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
+    WS_MAX_SUBSCRIPTIONS_PER_CONNECTION: integerEnv(
+      'WS_MAX_SUBSCRIPTIONS_PER_CONNECTION',
+      1,
+      100_000,
+    ).default(32),
+    WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION: integerEnv(
+      'WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION',
+      1,
+      100_000,
+    ).default(128),
+    WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION: integerEnv(
+      'WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION',
+      1,
+      64 * 1024 * 1024,
+    ).default(1024 * 1024),
+    WS_MAX_INBOUND_MESSAGE_BYTES: integerEnv('WS_MAX_INBOUND_MESSAGE_BYTES', 1, 16 * 1024 * 1024).default(
+      DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES,
+    ),
     WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
     WS_RECONNECT_WINDOW_MS: integerEnv('WS_RECONNECT_WINDOW_MS', 1, 86_400_000).default(60_000),
     SSE_MAX_CONNECTIONS_PER_IP: integerEnv('SSE_MAX_CONNECTIONS_PER_IP', 1, 100_000).default(10),
@@ -428,7 +499,21 @@ export const EnvSchema = z
       LIMITS.RPC_CB_RESET_TIMEOUT_MS
     ),
     RPC_TIMEOUT_MS: integerEnv('RPC_TIMEOUT_MS', 1).default(LIMITS.RPC_TIMEOUT_MS),
+    RPC_FALLBACK_CACHE_TTL_SECONDS: integerEnv('RPC_FALLBACK_CACHE_TTL_SECONDS', 1).default(300),
+    RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA: z.preprocess(parseNumber, z.number().min(0).default(0)),
+    /**
+     * Maximum age, in milliseconds, that a last-known-good fallback entry may
+     * be served at while the RPC circuit is OPEN. Enforced independently of
+     * the Redis TTL above so staleness policy is explicit and testable, not
+     * an incidental side effect of cache eviction. Defaults to the TTL's
+     * equivalent in ms so behavior is unchanged unless explicitly configured.
+     */
+    RPC_FALLBACK_CACHE_MAX_AGE_MS: integerEnv('RPC_FALLBACK_CACHE_MAX_AGE_MS', 1).default(300_000),
+    RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
+    RPC_HEALTH_CHECK_FAILURE_THRESHOLD: integerEnv('RPC_HEALTH_CHECK_FAILURE_THRESHOLD', 1).default(3),
     IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
+    /** Seconds a (streamId, eventId) pair is remembered for duplicate suppression. */
+    DEDUP_WINDOW_SECONDS: integerEnv('DEDUP_WINDOW_SECONDS', 1, 86400 * 7).default(86400),
 
     RATE_LIMIT_ENABLED: booleanEnv().default(true),
     RATE_LIMIT_IP_WINDOW_MS: integerEnv('RATE_LIMIT_IP_WINDOW_MS', 1).optional(),
@@ -531,6 +616,15 @@ export const EnvSchema = z
       'STELLAR_TOKEN_ADDRESS',
       env.STELLAR_TOKEN_ADDRESS
     );
+    if (env.CONTRACT_ADDRESS_STREAMING) {
+      validatePinnedAddress(
+        ctx,
+        stellarNetwork,
+        'streaming',
+        'CONTRACT_ADDRESS_STREAMING',
+        env.CONTRACT_ADDRESS_STREAMING
+      );
+    }
 
     const hasApiKeys = env.API_KEYS !== undefined && env.API_KEYS.trim().length > 0;
     if (hasApiKeys && env.API_KEY_PEPPER === undefined) {
@@ -569,9 +663,11 @@ export const EnvSchema = z
   });
 
 type ParsedEnv = z.infer<typeof EnvSchema>;
+export { DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES } from './env-schema/server.js';
 
 /**
- * Global configuration interface for the Fluxora API.
+ * Effective ceiling on a single inbound WebSocket frame, honouring
+ * `WS_MAX_INBOUND_MESSAGE_BYTES` when it was overridden at startup.
  */
 export interface Config {
   port: number;
@@ -595,6 +691,8 @@ export interface Config {
 
   redisUrl: string;
   redisEnabled: boolean;
+  /** Duplicate-suppression window for stream events and inbound webhooks (DEDUP_WINDOW_SECONDS). */
+  dedupWindowSeconds: number;
   redisMode: 'standalone' | 'sentinel' | 'cluster';
   redisSentinelHosts?: string | undefined;
   redisSentinelName?: string | undefined;
@@ -602,6 +700,19 @@ export interface Config {
 
   stellarNetwork: StellarNetwork;
   stellarRpcUrl: string;
+  stellarRpcTimeout: number;
+  stellarRpcMaxRetries: number;
+  stellarRpcRetryDelay: number;
+  stellarRpcOperationDeadlines: Record<string, number>;
+  rpcCircuitBreakerFailureThreshold: number;
+  rpcCircuitBreakerWindowMs: number;
+  rpcCircuitBreakerResetTimeoutMs: number;
+  rpcTimeoutMs: number;
+  rpcFallbackCacheTtlSeconds: number;
+  rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcFallbackCacheMaxAgeMs: number;
+  rpcHealthCheckIntervalMs: number;
+  rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
   horizonNetworkPassphrase: string;
   contractAddresses: ContractAddresses;
@@ -657,11 +768,19 @@ export interface Config {
 
   enableStreamValidation: boolean;
   enableRateLimit: boolean;
+  earlyHintsEnabled: boolean;
   idempotencyTtlSeconds: number;
   requirePartnerAuth: boolean;
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
+  wsAuthRequired: boolean;
+  wsMaxConnectionsPerIp: number;
+  wsMaxSubscriptionsPerConnection: number;
+  wsMaxOutboundQueuePerConnection: number;
+  wsMaxOutboundQueueBytesPerConnection: number;
+  wsMaxInboundMessageBytes: number;
   sseMaxConnectionsPerIp: number;
   sseMaxConnectionsPerApiKey: number;
   sseMaxGlobalConnections: number;
@@ -794,8 +913,9 @@ function resolveNetwork(env: ParsedEnv): StellarNetwork {
 }
 
 function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
+  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? env.STELLAR_CONTRACT_ADDRESS;
   return {
-    streaming: env.STELLAR_CONTRACT_ADDRESS,
+    streaming,
     contract: env.STELLAR_CONTRACT_ADDRESS,
     token: env.STELLAR_TOKEN_ADDRESS,
   };
@@ -805,6 +925,9 @@ function toConfig(env: ParsedEnv): Config {
   const stellarNetwork = resolveNetwork(env);
   const networkDefaults = STELLAR_NETWORKS[stellarNetwork];
   const isProduction = env.NODE_ENV === 'production';
+  const contractAddresses = resolveContractAddresses(stellarNetwork, env);
+
+  assertNetworkMatchesContracts(stellarNetwork, contractAddresses);
 
   return {
     port: env.PORT,
@@ -824,6 +947,7 @@ function toConfig(env: ParsedEnv): Config {
 
     redisUrl: env.REDIS_URL,
     redisEnabled: env.REDIS_ENABLED,
+    dedupWindowSeconds: env.DEDUP_WINDOW_SECONDS,
     redisMode: env.REDIS_MODE,
     redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
     redisSentinelName: env.REDIS_SENTINEL_NAME,
@@ -831,6 +955,19 @@ function toConfig(env: ParsedEnv): Config {
 
     stellarNetwork,
     stellarRpcUrl: env.STELLAR_RPC_URL,
+    stellarRpcTimeout: env.STELLAR_RPC_TIMEOUT,
+    stellarRpcMaxRetries: env.STELLAR_RPC_MAX_RETRIES,
+    stellarRpcRetryDelay: env.STELLAR_RPC_RETRY_DELAY,
+    stellarRpcOperationDeadlines: env.STELLAR_RPC_OPERATION_DEADLINES,
+    rpcCircuitBreakerFailureThreshold: env.RPC_CB_FAILURE_THRESHOLD,
+    rpcCircuitBreakerWindowMs: env.RPC_CB_WINDOW_MS,
+    rpcCircuitBreakerResetTimeoutMs: env.RPC_CB_RESET_TIMEOUT_MS,
+    rpcTimeoutMs: env.RPC_TIMEOUT_MS,
+    rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
+    rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcFallbackCacheMaxAgeMs: env.RPC_FALLBACK_CACHE_MAX_AGE_MS,
+    rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
+    rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
     horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
@@ -894,11 +1031,18 @@ function toConfig(env: ParsedEnv): Config {
 
     enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
     enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
+    earlyHintsEnabled: env.EARLY_HINTS_ENABLED,
     idempotencyTtlSeconds: env.IDEMPOTENCY_TTL_SECONDS,
     requirePartnerAuth: env.REQUIRE_PARTNER_AUTH,
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    wsAuthRequired: env.WS_AUTH_REQUIRED,
+    wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
+    wsMaxSubscriptionsPerConnection: env.WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    wsMaxOutboundQueuePerConnection: env.WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION,
+    wsMaxOutboundQueueBytesPerConnection: env.WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION,
+    wsMaxInboundMessageBytes: env.WS_MAX_INBOUND_MESSAGE_BYTES,
     sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
     sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
     sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
@@ -939,6 +1083,8 @@ function toConfig(env: ParsedEnv): Config {
     dlqRetentionDays: env.DLQ_RETENTION_DAYS,
     dlqPurgeBatchSize: env.DLQ_PURGE_BATCH_SIZE,
   };
+export function getWsMaxInboundMessageBytes(): number {
+  return getConfig().wsMaxInboundMessageBytes;
 }
 
 /**
@@ -946,367 +1092,3 @@ function toConfig(env: ParsedEnv): Config {
  * server can bind a socket. The parsed value is intentionally not exported.
  */
 parseEnv(process.env);
-
-export function loadConfig(): Config {
-  return toConfig(parseEnv(process.env));
-}
-
-let configInstance: Config | null = null;
-
-export function getConfig(): Config {
-  if (!configInstance) {
-    throw new ConfigError('Configuration not initialized. Call initialize() first.');
-  }
-  return configInstance;
-}
-
-export function initializeConfig(): Config {
-  if (configInstance) {
-    return configInstance;
-  }
-
-  configInstance = loadConfig();
-  return configInstance;
-}
-
-export function resetConfig(): void {
-  configInstance = null;
-}
-
-/**
- * Reset the startup env snapshot back to null.
- *
- * **FOR TESTING ONLY.** Allows each test to exercise
- * `captureStartupEnvSnapshot()` / `reloadHotConfig()` in isolation without
- * full module reloading. Never call this in production code.
- *
- * @internal
- */
-export function resetStartupEnvSnapshot(): void {
-  startupEnvSnapshot = null;
-  lastHotConfig = null;
-  reloadGeneration = 0;
-}
-
-// ─── Hot-reload support ───────────────────────────────────────────────────────
-
-/**
- * The subset of configuration values that can be changed at runtime by
- * sending SIGHUP to the process. All other variables require a full restart.
- */
-export interface HotConfig {
-  rateLimitIpWindowMs: number | undefined;
-  rateLimitIpMax: number | undefined;
-  rateLimitApikeyWindowMs: number | undefined;
-  rateLimitApikeyMax: number | undefined;
-  rateLimitAdminWindowMs: number | undefined;
-  rateLimitAdminMax: number | undefined;
-  tracingSampleRate: number;
-  tracingEnabled: boolean;
-  logLevel: LogLevel;
-  featureFlagsJson: string | undefined;
-  featureFlagsFile: string | undefined;
-}
-
-/**
- * Result of a full config-refresh cycle (parse + apply).
- * Used by the SIGHUP handler and tests to assert deterministic outcomes.
- */
-export interface ConfigRefreshResult {
-  /** Frozen HotConfig snapshot that was applied. */
-  hot: HotConfig;
-  /** Monotonic generation counter; increments on every successful refresh. */
-  generation: number;
-  /** Restart-only keys that differ from the startup snapshot (never applied). */
-  restartOnlyChanges: readonly RestartOnlyKey[];
-  /** Whether the refresh applied a config that differs from the previous one. */
-  changed: boolean;
-  /** Wall-clock duration of the refresh in milliseconds. */
-  durationMs: number;
-}
-
-/**
- * The set of env-var keys whose change requires a full process restart.
- * If any of these change between the startup snapshot and a SIGHUP, a WARN
- * is emitted but the new value is intentionally not applied.
- */
-const RESTART_ONLY_KEYS = [
-  'DATABASE_URL',
-  'REDIS_URL',
-  'JWT_SECRET',
-  'INDEXER_WORKER_TOKEN',
-] as const;
-type RestartOnlyKey = (typeof RESTART_ONLY_KEYS)[number];
-
-/** Snapshot of restart-only env values captured at process startup. */
-let startupEnvSnapshot: Readonly<Record<RestartOnlyKey, string | undefined>> | null = null;
-
-/**
- * Last successfully built HotConfig. Exposed so request paths (rate limiter,
- * tracing, logger) and the SIGHUP handler share one deterministic snapshot
- * across retries and deploys — not a fresh parse of process.env each time.
- */
-let lastHotConfig: HotConfig | null = null;
-
-/** Monotonic generation counter for successful reloads (observability + tests). */
-let reloadGeneration = 0;
-
-/**
- * Serialize concurrent SIGHUP / refresh calls so only one apply runs at a time.
- * Node is single-threaded, but nested/re-entrant signal handlers and tests
- * that fire multiple refreshes in one tick still need a clear total order.
- */
-let reloadInFlight: Promise<ConfigRefreshResult> | null = null;
-
-/**
- * Capture the current values of restart-only env variables.
- * Call this once during startup, before any SIGHUP handler is registered.
- * Subsequent calls are no-ops (the first snapshot is preserved).
- */
-export function captureStartupEnvSnapshot(): void {
-  if (startupEnvSnapshot !== null) return;
-  const snapshot = {} as Record<RestartOnlyKey, string | undefined>;
-  for (const key of RESTART_ONLY_KEYS) {
-    snapshot[key] = process.env[key];
-  }
-  startupEnvSnapshot = Object.freeze(snapshot);
-}
-
-/**
- * Return the last HotConfig produced by `reloadHotConfig()` / `refreshHotConfig()`,
- * or `null` if no reload has run yet. Callers that need stable mid-request
- * views of hot config should prefer this over re-parsing process.env.
- */
-export function getLastHotConfig(): HotConfig | null {
-  return lastHotConfig;
-}
-
-/** Monotonic generation of the last successful hot-config build (0 = never). */
-export function getHotConfigGeneration(): number {
-  return reloadGeneration;
-}
-
-/** Stable serialization of a HotConfig for equality / change detection. */
-function hotConfigFingerprint(hot: HotConfig): string {
-  return [
-    hot.rateLimitIpWindowMs ?? '',
-    hot.rateLimitIpMax ?? '',
-    hot.rateLimitApikeyWindowMs ?? '',
-    hot.rateLimitApikeyMax ?? '',
-    hot.rateLimitAdminWindowMs ?? '',
-    hot.rateLimitAdminMax ?? '',
-    hot.tracingSampleRate,
-    hot.tracingEnabled ? '1' : '0',
-    hot.logLevel,
-    hot.featureFlagsJson ?? '',
-    hot.featureFlagsFile ?? '',
-  ].join('\u0001');
-}
-
-/**
- * Parse optional positive integers for rate-limit fields.
- * Empty, non-numeric, zero, and negative values → undefined (use defaults).
- * Leading/trailing whitespace is tolerated via parseInt.
- */
-function parseOptionalPositiveInt(raw: string | undefined): number | undefined {
-  if (raw === undefined || raw === '') return undefined;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return n;
-}
-
-function parseFloat01(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw === '') return fallback;
-  const n = Number.parseFloat(raw);
-  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
-}
-
-function parseBoolHot(raw: string | undefined, fallback: boolean): boolean {
-  if (raw === undefined || raw === '') return fallback;
-  const v = raw.trim().toLowerCase();
-  if (v === 'true' || v === '1') return true;
-  if (v === 'false' || v === '0') return false;
-  return fallback;
-}
-
-const VALID_LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warn', 'error'];
-
-function parseLogLevelHot(raw: string | undefined, fallback: LogLevel): LogLevel {
-  if (raw !== undefined && (VALID_LOG_LEVELS as readonly string[]).includes(raw)) {
-    return raw as LogLevel;
-  }
-  return fallback;
-}
-
-/**
- * Detect restart-only key drift vs the startup snapshot.
- * Emits one WARN per changed key (variable NAME only — never the value).
- */
-function detectRestartOnlyChanges(): RestartOnlyKey[] {
-  if (startupEnvSnapshot === null) {
-    captureStartupEnvSnapshot();
-  }
-  const changed: RestartOnlyKey[] = [];
-  for (const key of RESTART_ONLY_KEYS) {
-    const original = startupEnvSnapshot![key];
-    const current = process.env[key];
-    if (current !== original) {
-      changed.push(key);
-      warn(`SIGHUP: restart-only variable ${key} changed — restart required to apply`, {
-        variable: key,
-      });
-    }
-  }
-  return changed;
-}
-
-/**
- * Parse the whitelisted hot-reloadable keys from `process.env` and return a
- * fully-built `HotConfig` object.
- *
- * If any restart-only key has changed since startup, a WARN is logged for each
- * changed key. The new value is NOT applied — callers receive only the
- * hot-reloadable portion.
- *
- * The build is atomic: the returned object is fully constructed before it is
- * returned to the caller; no intermediate state is ever visible.
- *
- * Determinism guarantees:
- * - Same `process.env` → same frozen HotConfig fields (stable defaults).
- * - The latest successful build is stored and exposed via `getLastHotConfig()`.
- * - Generation counter increments so deploys/retries can observe apply order.
- *
- * Requires `captureStartupEnvSnapshot()` to have been called first. If it has
- * not been called yet, a snapshot is taken implicitly now so that the function
- * still works in isolation (e.g. in tests).
- */
-export function reloadHotConfig(): HotConfig {
-  detectRestartOnlyChanges();
-
-  const newConfig: HotConfig = {
-    rateLimitIpWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_WINDOW_MS),
-    rateLimitIpMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_MAX),
-    rateLimitApikeyWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_WINDOW_MS),
-    rateLimitApikeyMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_MAX),
-    rateLimitAdminWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_WINDOW_MS),
-    rateLimitAdminMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_MAX),
-    tracingSampleRate: parseFloat01(process.env.TRACING_SAMPLE_RATE, 1),
-    tracingEnabled: parseBoolHot(process.env.TRACING_ENABLED, false),
-    logLevel: parseLogLevelHot(process.env.LOG_LEVEL, 'info'),
-    featureFlagsJson: process.env.FEATURE_FLAGS_JSON || undefined,
-    featureFlagsFile: process.env.FEATURE_FLAGS_FILE || undefined,
-  };
-
-  const frozen = Object.freeze(newConfig);
-  lastHotConfig = frozen;
-  reloadGeneration += 1;
-  return frozen;
-}
-
-/**
- * Full config-refresh path used by the SIGHUP handler.
- *
- * Builds a HotConfig, then invokes the provided apply callbacks in a fixed
- * order. Concurrent callers share one in-flight promise so rapid SIGHUPs
- * (or deploy-time retries) collapse to a single deterministic apply.
- *
- * Auth note: this path never reloads secrets/tokens. Restart-only keys are
- * detected and reported but never applied.
- *
- * @param apply - Side-effect callbacks (rate limits, flags, log level, metrics).
- *                Thrown errors propagate so the SIGHUP handler can log failure
- *                without killing the process.
- */
-export async function refreshHotConfig(apply?: {
-  /** Two-phase commit style (preferred): return a commit fn from preparation. */
-  prepareRateLimits?: (hot: HotConfig) => () => void;
-  prepareFeatureFlags?: (hot: HotConfig) => () => void;
-  prepareLogLevel?: (level: LogLevel) => () => void;
-  /** Legacy direct-apply style (still supported). */
-  applyRateLimits?: (hot: HotConfig) => void;
-  applyFeatureFlags?: () => void;
-  applyLogLevel?: (level: LogLevel) => void;
-  onSuccess?: (result: ConfigRefreshResult) => void;
-  onFailure?: (error: unknown, durationMs: number) => void;
-}): Promise<ConfigRefreshResult> {
-  // Coalesce concurrent callers onto one in-flight apply. Work is deferred to a
-  // microtask so `reloadInFlight` is assigned before any body runs — otherwise a
-  // fully-synchronous async IIFE would finish (and clear the flag) before the
-  // assignment, breaking both coalescing and sequential change detection.
-  if (reloadInFlight) {
-    return reloadInFlight;
-  }
-
-  const started = Date.now();
-  const run = Promise.resolve()
-    .then((): ConfigRefreshResult => {
-      const previous = lastHotConfig;
-      const restartOnlyChanges = detectRestartOnlyChanges();
-
-      const hot: HotConfig = Object.freeze({
-        rateLimitIpWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_WINDOW_MS),
-        rateLimitIpMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_MAX),
-        rateLimitApikeyWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_WINDOW_MS),
-        rateLimitApikeyMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_MAX),
-        rateLimitAdminWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_WINDOW_MS),
-        rateLimitAdminMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_MAX),
-        tracingSampleRate: parseFloat01(process.env.TRACING_SAMPLE_RATE, 1),
-        tracingEnabled: parseBoolHot(process.env.TRACING_ENABLED, false),
-        logLevel: parseLogLevelHot(process.env.LOG_LEVEL, 'info'),
-        featureFlagsJson: process.env.FEATURE_FLAGS_JSON || undefined,
-        featureFlagsFile: process.env.FEATURE_FLAGS_FILE || undefined,
-      });
-
-      const changed =
-        previous === null || hotConfigFingerprint(previous) !== hotConfigFingerprint(hot);
-
-      // Resolve prepare callbacks — prefer the prepare* form (two-phase commit);
-      // fall back to the legacy apply* form for backward compatibility.
-      const commitRateLimits = apply?.prepareRateLimits
-        ? apply.prepareRateLimits(hot)
-        : apply?.applyRateLimits
-          ? () => apply.applyRateLimits!(hot)
-          : undefined;
-
-      const commitFeatureFlags = apply?.prepareFeatureFlags
-        ? apply.prepareFeatureFlags(hot)
-        : apply?.applyFeatureFlags
-          ? () => apply.applyFeatureFlags!()
-          : undefined;
-
-      const commitLogLevel = apply?.prepareLogLevel
-        ? apply.prepareLogLevel(hot.logLevel)
-        : apply?.applyLogLevel
-          ? () => apply.applyLogLevel!(hot.logLevel)
-          : undefined;
-
-      // Commit side effects in a fixed order for deterministic deploys/retries.
-      commitRateLimits?.();
-      commitFeatureFlags?.();
-      commitLogLevel?.();
-
-      lastHotConfig = hot;
-      reloadGeneration += 1;
-
-      const result: ConfigRefreshResult = Object.freeze({
-        hot,
-        generation: reloadGeneration,
-        restartOnlyChanges: Object.freeze([...restartOnlyChanges]),
-        changed,
-        durationMs: Date.now() - started,
-      });
-
-      apply?.onSuccess?.(result);
-      return result;
-    })
-    .catch((error: unknown) => {
-      apply?.onFailure?.(error, Date.now() - started);
-      throw error;
-    })
-    .finally(() => {
-      reloadInFlight = null;
-    });
-
-  reloadInFlight = run;
-  return run;
-}

@@ -36,6 +36,15 @@ export const rpcCircuitOpenFallbackMissesTotal =
     registers: [registry],
   });
 
+export const rpcFallbackCacheExhaustedTotal =
+  (registry.getSingleMetric('rpc_fallback_cache_exhausted_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'rpc_fallback_cache_exhausted_total',
+    help: 'Total Stellar RPC calls refused because the last-known-good cache entry exceeded the maximum fallback age',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
 export const rpcFallbackCacheHitsTotal =
   (registry.getSingleMetric('rpc_fallback_cache_hits_total') as Counter<'operation'>) ||
   new Counter({

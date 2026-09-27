@@ -34,12 +34,14 @@ import {
   rpcCircuitOpenFallbackHitsTotal,
   rpcCircuitOpenFallbackMissesTotal,
   rpcFallbackCacheEarlyRefreshesTotal,
+  rpcFallbackCacheExhaustedTotal,
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,
   rpcProviderHealthyGauge,
   rpcProviderHealthCheckFailuresTotal,
 } from '../metrics/rpcMetrics.js';
 import { withJitteredRetry } from '../lib/retry.js';
+import { getConfig } from '../config/env.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -75,6 +77,12 @@ export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCall
   fallbackCache?: RpcFallbackCache;
   /** XFetch-style beta factor. Set to 0 to disable early-expiry reads. */
   fallbackCacheEarlyExpiryBeta?: number;
+  /**
+   * Maximum age (ms) a fallback entry may be served at while the circuit is
+   * OPEN. Older entries are refused with `RpcFallbackExhaustedError` instead
+   * of being returned. Default 300_000 (5 minutes).
+   */
+  fallbackCacheMaxAgeMs?: number;
   /** Interval (ms) for the background provider health-check loop. 0 disables it. */
   healthCheckIntervalMs?: number;
   /** Consecutive health-check failures before the provider is marked unhealthy. */
@@ -100,6 +108,8 @@ export interface StellarRpcServiceOptions extends CircuitBreakerOptions, RpcCall
 
 interface RpcRequestMetadata {
   cacheStatus?: 'stale';
+  /** Age, in ms, of the fallback entry served for this request (issue #1434). */
+  cacheAgeMs?: number;
 }
 
 const rpcRequestMetadata = new AsyncLocalStorage<RpcRequestMetadata>();
@@ -112,10 +122,16 @@ export function getRpcRequestCacheStatus(): 'stale' | undefined {
   return rpcRequestMetadata.getStore()?.cacheStatus;
 }
 
-function markStaleRpcCacheResponse(): void {
+/** Age, in ms, of the fallback data served for the current request, if any. */
+export function getRpcRequestCacheAgeMs(): number | undefined {
+  return rpcRequestMetadata.getStore()?.cacheAgeMs;
+}
+
+function markStaleRpcCacheResponse(ageMs: number): void {
   const store = rpcRequestMetadata.getStore();
   if (store) {
     store.cacheStatus = 'stale';
+    store.cacheAgeMs = ageMs;
   }
 }
 
@@ -136,6 +152,30 @@ export class CircuitOpenError extends Error {
   constructor() {
     super('Stellar RPC circuit breaker is OPEN — calls suspended during cool-off period');
     this.name = 'CircuitOpenError';
+  }
+}
+
+/**
+ * Thrown when the RPC circuit is OPEN and the only available fallback-cache
+ * entry is older than the configured maximum fallback age (issue #1434).
+ *
+ * This is deliberately a distinct, explicit error from `CircuitOpenError` /
+ * a plain cache miss: it means a stale entry *did* exist, but the backend
+ * refused to serve it because it exceeded the staleness bound, rather than
+ * silently handing back data of unbounded age.
+ */
+export class RpcFallbackExhaustedError extends Error {
+  public readonly kind: RpcFailureKind = 'CIRCUIT_OPEN';
+  constructor(
+    public readonly operation: string,
+    public readonly ageMs: number,
+    public readonly maxAgeMs: number,
+  ) {
+    super(
+      `Stellar RPC fallback cache entry for "${operation}" is ${ageMs}ms old, exceeding the ` +
+        `maximum fallback age of ${maxAgeMs}ms — refusing to serve stale data`,
+    );
+    this.name = 'RpcFallbackExhaustedError';
   }
 }
 
@@ -312,6 +352,7 @@ export class StellarRpcService {
   private readonly fallbackCache: RpcFallbackCache;
   private readonly fallbackCacheTtlSeconds: number;
   private readonly fallbackCacheEarlyExpiryBeta: number;
+  private readonly fallbackCacheMaxAgeMs: number;
   private readonly earlyRefreshes = new Map<string, Promise<void>>();
 
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -335,6 +376,7 @@ export class StellarRpcService {
     this.fallbackCache = opts.fallbackCache ?? new NoOpRpcFallbackCache();
     this.fallbackCacheTtlSeconds = opts.fallbackCacheTtlSeconds ?? 300;
     this.fallbackCacheEarlyExpiryBeta = Math.max(0, opts.fallbackCacheEarlyExpiryBeta ?? 0);
+    this.fallbackCacheMaxAgeMs = Math.max(1, opts.fallbackCacheMaxAgeMs ?? 300_000);
     this.healthCheckIntervalMs = opts.healthCheckIntervalMs ?? 0;
     this.healthCheckFailureThreshold = Math.max(1, opts.healthCheckFailureThreshold ?? 3);
     this.providerLabel = opts.providerLabel ?? 'primary';
@@ -547,15 +589,29 @@ export class StellarRpcService {
         throw err;
       }
 
-      const cached = await this.fallbackCache.get<T>(operation, cacheParts);
-      if (cached !== null) {
-        markStaleRpcCacheResponse();
+      const entry = await this.getStaleCacheEntry<T>(operation, cacheParts);
+      if (entry !== null) {
+        const ageMs = Math.max(0, Date.now() - entry.writtenAt);
+
+        if (ageMs > this.fallbackCacheMaxAgeMs) {
+          rpcFallbackCacheExhaustedTotal.inc({ operation });
+          logger.warn('Stellar RPC fallback cache entry exceeded max age while circuit is OPEN', undefined, {
+            event: 'rpc_fallback_cache_exhausted',
+            operation,
+            ageMs,
+            maxAgeMs: this.fallbackCacheMaxAgeMs,
+          });
+          throw new RpcFallbackExhaustedError(operation, ageMs, this.fallbackCacheMaxAgeMs);
+        }
+
+        markStaleRpcCacheResponse(ageMs);
         rpcCircuitOpenFallbackHitsTotal.inc({ operation });
         logger.warn('Serving Stellar RPC response from stale fallback cache', undefined, {
           event: 'rpc_circuit_open_fallback_hit',
           operation,
+          ageMs,
         });
-        return cached;
+        return entry.value;
       }
 
       rpcCircuitOpenFallbackMissesTotal.inc({ operation });
@@ -565,6 +621,27 @@ export class StellarRpcService {
       });
       throw err;
     }
+  }
+
+  /**
+   * Fetch the fallback entry (value + writtenAt) for the OPEN-circuit path.
+   * Falls back to a plain value-only read (age unknowable, so max-age is not
+   * enforced) when the injected cache doesn't implement `getEntry`.
+   */
+  private async getStaleCacheEntry<T>(
+    operation: string,
+    cacheParts: readonly string[],
+  ): Promise<RpcFallbackCacheEntry<T> | null> {
+    if (this.fallbackCache.getEntry) {
+      return this.fallbackCache.getEntry<T>(operation, cacheParts);
+    }
+
+    const value = await this.fallbackCache.get<T>(operation, cacheParts);
+    if (value === null) return null;
+    // No writtenAt available — treat as age 0 rather than silently skipping
+    // the entry, since NoOpRpcFallbackCache/get-only caches predate age
+    // tracking and must keep working, just without max-age enforcement.
+    return { value, writtenAt: Date.now(), expiresAt: Date.now(), ttlSeconds: 0, refreshDurationMs: 1 };
   }
 
   private async getClosedCircuitCacheEntry<T>(
@@ -768,28 +845,27 @@ let _service: StellarRpcService | null = null;
 
 export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpcService {
   if (!_service) {
+    const config = getConfig();
     const client = getClient ?? (() => {
       throw new RpcProviderError('No Stellar RPC client configured', 'PROVIDER');
     });
     const redisFallbackCache = createConfiguredRpcFallbackCache();
-    const operationDeadlines = parseOperationDeadlines(
-      process.env.STELLAR_RPC_OPERATION_DEADLINES,
-    );
     _service = new StellarRpcService(client, {
-      failureThreshold: parseInt(process.env.RPC_CB_FAILURE_THRESHOLD ?? '5', 10),
-      windowMs: parseInt(process.env.RPC_CB_WINDOW_MS ?? '30000', 10),
-      resetTimeoutMs: parseInt(process.env.RPC_CB_RESET_TIMEOUT_MS ?? '60000', 10),
-      timeoutMs: parseInt(process.env.RPC_TIMEOUT_MS ?? '5000', 10),
-      maxRetries: parseInt(process.env.STELLAR_RPC_MAX_RETRIES ?? '3', 10),
-      retryDelayMs: parseInt(process.env.STELLAR_RPC_RETRY_DELAY ?? '1000', 10),
-      operationDeadlines,
-      fallbackCacheTtlSeconds: parseInt(process.env.RPC_FALLBACK_CACHE_TTL_SECONDS ?? '300', 10),
-      fallbackCacheEarlyExpiryBeta: parseFloat(process.env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA ?? '0'),
+      failureThreshold: config.rpcCircuitBreakerFailureThreshold,
+      windowMs: config.rpcCircuitBreakerWindowMs,
+      resetTimeoutMs: config.rpcCircuitBreakerResetTimeoutMs,
+      timeoutMs: config.rpcTimeoutMs,
+      maxRetries: config.stellarRpcMaxRetries,
+      retryDelayMs: config.stellarRpcRetryDelay,
+      operationDeadlines: config.stellarRpcOperationDeadlines,
+      fallbackCacheTtlSeconds: config.rpcFallbackCacheTtlSeconds,
+      fallbackCacheEarlyExpiryBeta: config.rpcFallbackCacheEarlyExpiryBeta,
+      fallbackCacheMaxAgeMs: config.rpcFallbackCacheMaxAgeMs,
       fallbackCache: redisFallbackCache,
-      healthCheckIntervalMs: parseInt(process.env.RPC_HEALTH_CHECK_INTERVAL_MS ?? '0', 10),
-      healthCheckFailureThreshold: parseInt(process.env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD ?? '3', 10),
+      healthCheckIntervalMs: config.rpcHealthCheckIntervalMs,
+      healthCheckFailureThreshold: config.rpcHealthCheckFailureThreshold,
     });
-    const intervalMs = parseInt(process.env.RPC_HEALTH_CHECK_INTERVAL_MS ?? '0', 10);
+    const intervalMs = config.rpcHealthCheckIntervalMs;
     if (intervalMs > 0) {
       _service.startHealthCheck(intervalMs);
     }
@@ -802,7 +878,8 @@ export function setStellarRpcService(svc: StellarRpcService | null): void {
 }
 
 function createConfiguredRpcFallbackCache(): RpcFallbackCache {
-  if (process.env.REDIS_ENABLED === 'false') {
+  const config = getConfig();
+  if (!config.redisEnabled) {
     return new NoOpRpcFallbackCache();
   }
 
@@ -810,7 +887,7 @@ function createConfiguredRpcFallbackCache(): RpcFallbackCache {
   const getCache = async (): Promise<RpcFallbackCache> => {
     if (!cachePromise) {
       cachePromise = createRedisClient({
-        url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+        url: config.redisUrl,
         enabled: true,
       })
         .then((client) => new RedisRpcFallbackCache(client))

@@ -13,9 +13,30 @@ High-performance contract event indexer with optimized batch processing and Post
 
 ## 📋 Requirements
 
-- Node.js 18+
+- Node.js **20.20.2** (exact, pinned; see [Node.js version](#nodejs-version))
 - PostgreSQL 12+
 - pnpm 9.15.9 (required)
+
+## Node.js version
+
+The service runs on exactly one Node.js version everywhere: **20.20.2**. The
+same version is used locally, in CI and in the Docker image.
+
+| Where | How it names the version |
+| --- | --- |
+| `.nvmrc` | `20.20.2` (source of truth; `nvm use` / `fnm use` read it) |
+| `package.json` | `"engines": { "node": "20.20.2" }` |
+| `Dockerfile` | `ARG NODE_VERSION=20.20.2` (both stages use `node:${NODE_VERSION}-alpine`) |
+| `.github/workflows/*.yml` | `actions/setup-node` with `node-version-file: '.nvmrc'` |
+
+CI runs `node scripts/check-node-version.mjs` (also `pnpm run check:node-version`)
+and fails when any of these disagree, or when a workflow or compose file names
+some other Node.js version.
+
+**Upgrading Node.js** is one reviewed pull request that changes `.nvmrc`,
+`package.json` `engines.node`, the Dockerfile `ARG NODE_VERSION`, and the
+version stated in this README. Run `pnpm run check:node-version` to confirm
+nothing was missed.
 
 ## 🛠️ Installation
 
@@ -215,6 +236,26 @@ The test suite includes:
 4. **Transaction Safety**: Automatic rollback on errors
 5. **Webhook Delivery Logging**: Outbound webhook dispatch logs use the shared structured logger and include only stable identifiers (`deliveryId`, `eventType`, `attemptNumber`) plus `statusCode` when available. Webhook secrets, raw payloads, signatures, and endpoint URLs are excluded from log metadata.
 
+### Dependency Audit Enforcement
+
+All dependencies are continuously audited for security vulnerabilities. Findings at **moderate severity or above** fail the build unless covered by an explicit, time-bound exception.
+
+**Remediation windows:**
+- Critical: 7 days (engineering lead approval required)
+- High: 14 days (team lead approval required)
+- Moderate: 30 days (peer review required)
+
+Run audit checks locally:
+```bash
+# Run enforcing audit check (as used in CI)
+pnpm run audit:check
+
+# Validate exceptions file format
+pnpm run audit:validate
+```
+
+See [docs/security/dependency-audit-policy.md](docs/security/dependency-audit-policy.md) for the complete exception process and remediation guidelines.
+
 ### Webhook Delivery Logging
 
 The class-based `WebhookDispatcher` imports the shared structured logger from `src/lib/logger.ts` and uses the same `(message, correlationId?, meta?)` signature as other services. Dispatch outcomes log only safe delivery metadata:
@@ -273,6 +314,18 @@ See [docs/indexer.md](docs/indexer.md) for comprehensive documentation including
 - Security considerations
 - Troubleshooting guide
 - Monitoring recommendations
+
+## 📦 Client SDKs
+
+Two generated clients are versioned in lockstep with the API and published from
+tagged releases:
+
+- **TypeScript** — `@fluxora/sdk` on [npm](https://www.npmjs.com/package/@fluxora/sdk): `npm install @fluxora/sdk`
+- **Python** — `fluxora-sdk` on [PyPI](https://pypi.org/project/fluxora-sdk/): `pip install fluxora-sdk`
+
+Both SDK versions are copied from `openapi.yaml` `info.version` and are checked
+by `pnpm check:sdk`. See [docs/sdk-publishing.md](docs/sdk-publishing.md) for the
+versioning policy and release process.
 
 ## 🏗️ Architecture
 
@@ -347,7 +400,7 @@ Outbound webhook retries use two Redis-backed per-consumer controls:
 - **Rate limiting** (`src/redis/webhookRateLimit.ts`): sliding-window cap via `WEBHOOK_RETRY_RPS` (default `10`/s).
 - **Circuit breaker** (`src/redis/webhookCircuitBreakerStore.ts`): shared `closed` → `open` → `half-open` state keyed by SHA-256 hash of the consumer URL. After `circuitBreakerThreshold` consecutive failures, deliveries are deferred until `circuitBreakerResetMs`, then a single cross-instance probe is allowed.
 
-`attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for details.
+`attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for the full transition table, the `WEBHOOK_CIRCUIT_BREAKER_*` thresholds, and `GET /internal/webhooks/circuit-breakers`, which reports per receiver whether deliveries are paused (`paused`/`reason`) and when they resume (`resumeAt`).
 
 ## Webhook Causal Ordering Guarantee
 

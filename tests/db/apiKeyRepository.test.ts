@@ -46,6 +46,11 @@ function makeRecord(overrides: Partial<ApiKeyRecord> = {}): ApiKeyRecord {
   };
 }
 
+function expectNoUsableKey(value: unknown, rawKey: string): void {
+  expect(value).not.toHaveProperty('key');
+  expect(JSON.stringify(value)).not.toContain(rawKey);
+}
+
 describe('apiKeyRepository', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -59,8 +64,15 @@ describe('apiKeyRepository', () => {
       const [, sql, params] = mockQuery.mock.calls[0]!;
       expect(sql).toContain('INSERT INTO api_keys');
       expect(params).toEqual([
-        'key-1', 'service-a', 'a'.repeat(64), 'b'.repeat(32), 'flx_abcd',
-        '2024-01-01T00:00:00.000Z', null, true, ['streams:read', 'streams:write'],
+        'key-1',
+        'service-a',
+        'a'.repeat(64),
+        'b'.repeat(32),
+        'flx_abcd',
+        '2024-01-01T00:00:00.000Z',
+        null,
+        true,
+        ['streams:read', 'streams:write'],
       ]);
     });
   });
@@ -117,7 +129,13 @@ describe('apiKeyRepository', () => {
   describe('rotate', () => {
     it('updates hash material and returns the updated record', async () => {
       mockQuery.mockResolvedValueOnce({
-        rows: [makeRow({ key_hash: 'd'.repeat(64), prefix: 'flx_newp', rotated_at: new Date('2024-03-03T00:00:00Z') })],
+        rows: [
+          makeRow({
+            key_hash: 'd'.repeat(64),
+            prefix: 'flx_newp',
+            rotated_at: new Date('2024-03-03T00:00:00Z'),
+          }),
+        ],
       });
       const updated = await apiKeyRepository.rotate('key-1', {
         keyHash: 'd'.repeat(64),
@@ -130,14 +148,24 @@ describe('apiKeyRepository', () => {
       const [, sql, params] = mockQuery.mock.calls[0]!;
       expect(sql).toContain('UPDATE api_keys');
       expect(sql).toContain('RETURNING');
-      expect(params).toEqual(['key-1', 'd'.repeat(64), 'e'.repeat(32), 'flx_newp', '2024-03-03T00:00:00.000Z', ['streams:read', 'streams:write']]);
+      expect(params).toEqual([
+        'key-1',
+        'd'.repeat(64),
+        'e'.repeat(32),
+        'flx_newp',
+        '2024-03-03T00:00:00.000Z',
+        ['streams:read', 'streams:write'],
+      ]);
       expect(updated!.prefix).toBe('flx_newp');
     });
 
     it('returns undefined when the id does not exist', async () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       const updated = await apiKeyRepository.rotate('missing', {
-        keyHash: 'x', salt: 'y', prefix: 'flx_zzzz', rotatedAt: 'now',
+        keyHash: 'x',
+        salt: 'y',
+        prefix: 'flx_zzzz',
+        rotatedAt: 'now',
         scopes: ['streams:read', 'streams:write'],
       });
       expect(updated).toBeUndefined();
@@ -196,6 +224,38 @@ describe('apiKeyRepository', () => {
       const records = await apiKeyRepository.listAll();
       expect(records.map((r) => r.id)).toEqual(['k1', 'k2']);
       expect(records[1]!.active).toBe(false);
+    });
+  });
+
+  describe('read paths never return a usable key', () => {
+    it('returns only hashed or prefix-based data from every record-returning method', async () => {
+      const rawKey = 'flx_plaintext-key-that-must-never-leak';
+      const rowWithContaminatedRawKey = makeRow({ key: rawKey });
+
+      mockQuery
+        .mockResolvedValueOnce({ rows: [rowWithContaminatedRawKey] })
+        .mockResolvedValueOnce({ rows: [rowWithContaminatedRawKey] })
+        .mockResolvedValueOnce({ rows: [rowWithContaminatedRawKey] })
+        .mockResolvedValueOnce({ rows: [rowWithContaminatedRawKey] })
+        .mockResolvedValueOnce({ rows: [rowWithContaminatedRawKey] })
+        .mockResolvedValueOnce({ rows: [rowWithContaminatedRawKey] });
+
+      const byPrefix = await apiKeyRepository.findActiveByPrefix('flx_abcd');
+      const byId = await apiKeyRepository.getById('key-1');
+      const rotated = await apiKeyRepository.rotate('key-1', {
+        keyHash: 'c'.repeat(64),
+        salt: 'd'.repeat(32),
+        prefix: 'flx_newp',
+        rotatedAt: '2024-03-03T00:00:00.000Z',
+        scopes: ['streams:read'],
+      });
+      const revoked = await apiKeyRepository.revoke('key-1');
+      const rehashed = await apiKeyRepository.updateKeyHash('key-1', 'e'.repeat(64));
+      const all = await apiKeyRepository.listAll();
+
+      for (const value of [byPrefix[0], byId, rotated, revoked, rehashed, all[0]]) {
+        expectNoUsableKey(value, rawKey);
+      }
     });
   });
 

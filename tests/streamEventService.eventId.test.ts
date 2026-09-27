@@ -9,11 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-
-// Pure function under test — extracted from the service to avoid dependency mocks
-function deriveEventId(transactionHash: string, eventIndex: number): string {
-  return `${transactionHash}-${eventIndex}`;
-}
+import { deriveStreamEventId as deriveEventId } from '../src/services/streamEventService.js';
 
 // Simple property test runner — runs a predicate over N random samples
 function forAll<T>(

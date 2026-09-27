@@ -1,11 +1,10 @@
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { test, expect } from 'vitest';
 
-import path from 'node:path';
+const wf = readFileSync(path.resolve(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
 
-const wf = readFileSync(path.resolve(__dirname, '../../.github/workflows/ci.yml'), 'utf8');
-
-function parseJobs(workflow: string) {
+function parseJobs(workflow: string): Record<string, string> {
   const jobsSection = workflow.slice(workflow.indexOf('\njobs:') + 1);
   const lines = jobsSection.split('\n');
   const jobs: Record<string, string[]> = {};
@@ -22,7 +21,7 @@ function parseJobs(workflow: string) {
       jobs[current].push(line);
     }
   }
-  return Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, (v as string[]).join('\n')]));
+  return Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.join('\n')])) as Record<string, string>;
 }
 
 const jobs = parseJobs(wf);
@@ -47,7 +46,7 @@ test('lint job has no shell fallback that masks a missing ESLint configuration',
 });
 
 test('informational jobs are marked', () => {
-  for (const [j, b] of Object.entries(jobs)) {
+  for (const b of Object.values(jobs)) {
     if (/^\s*continue-on-error:\s*true\s*$/m.test(b)) {
       expect(b).toMatch(/informational/i);
     }

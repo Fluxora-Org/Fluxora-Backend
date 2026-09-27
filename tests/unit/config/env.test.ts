@@ -2,7 +2,7 @@ const TESTNET_CONTRACT = 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTIS
 const TESTNET_TOKEN = 'CBFFW3D5R2P3BQOS4P2AKFRHHBEVU234RWPK7QGR4LZQIFJGG5EFTAK6';
 const MAINNET_CONTRACT = 'CBXYBENCWPCNLZXXBAMSUO2MLVXH7EFBWLB5JZPWA4MCSOSLLRWX5OUA';
 const MAINNET_TOKEN = 'CCKKLNWH3DU7UCY4FU7E6YDRQKJ2JNOG27UPSCQ3FQ6U4X3QQGJKHTZ5';
-const VALID_UNPINNED_CONTRACT = 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIA';
+const VALID_UNPINNED_CONTRACT = 'CAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSBFLM';
 
 function setBaseEnv(overrides: NodeJS.ProcessEnv = {}) {
   process.env = {
@@ -69,11 +69,54 @@ describe('stellar environment pinning', () => {
     );
   });
 
+  it('halts startup when a testnet contract is configured for mainnet', async () => {
+    setBaseEnv({
+      NODE_ENV: 'production',
+      STELLAR_NETWORK: 'mainnet',
+      STELLAR_CONTRACT_ADDRESS: TESTNET_CONTRACT,
+      STELLAR_TOKEN_ADDRESS: MAINNET_TOKEN,
+      PGCRYPTO_KEY: 'a-very-long-pgcrypto-key-for-testing-only-12345',
+    });
+
+    await expect(loadEnvModule()).rejects.toThrow(
+      'STELLAR_CONTRACT_ADDRESS is pinned for testnet but STELLAR_NETWORK resolves to mainnet'
+    );
+  });
+
   it('halts startup when the token address belongs to the other network', async () => {
     setBaseEnv({ STELLAR_TOKEN_ADDRESS: MAINNET_TOKEN });
 
     await expect(loadEnvModule()).rejects.toThrow(
       'STELLAR_TOKEN_ADDRESS is pinned for mainnet but STELLAR_NETWORK resolves to testnet'
+    );
+  });
+
+  it('halts startup when a testnet token address is configured for mainnet', async () => {
+    setBaseEnv({
+      NODE_ENV: 'production',
+      STELLAR_NETWORK: 'mainnet',
+      STELLAR_CONTRACT_ADDRESS: MAINNET_CONTRACT,
+      STELLAR_TOKEN_ADDRESS: TESTNET_TOKEN,
+      PGCRYPTO_KEY: 'a-very-long-pgcrypto-key-for-testing-only-12345',
+    });
+
+    await expect(loadEnvModule()).rejects.toThrow(
+      'STELLAR_TOKEN_ADDRESS is pinned for testnet but STELLAR_NETWORK resolves to mainnet'
+    );
+  });
+
+  it('halts startup when CONTRACT_ADDRESS_STREAMING belongs to the other network', async () => {
+    setBaseEnv({
+      NODE_ENV: 'production',
+      STELLAR_NETWORK: 'mainnet',
+      STELLAR_CONTRACT_ADDRESS: MAINNET_CONTRACT,
+      STELLAR_TOKEN_ADDRESS: MAINNET_TOKEN,
+      CONTRACT_ADDRESS_STREAMING: TESTNET_CONTRACT,
+      PGCRYPTO_KEY: 'a-very-long-pgcrypto-key-for-testing-only-12345',
+    });
+
+    await expect(loadEnvModule()).rejects.toThrow(
+      'CONTRACT_ADDRESS_STREAMING is pinned for testnet but STELLAR_NETWORK resolves to mainnet'
     );
   });
 

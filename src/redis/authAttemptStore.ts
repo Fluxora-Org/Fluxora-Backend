@@ -3,8 +3,10 @@ import { sanitiseIdentifier } from './rateLimitStore.js';
 
 const ATTEMPTS_PREFIX = 'fluxora:auth_attempts:';
 const LOCKOUT_PREFIX = 'fluxora:auth_lockout:';
+/** Failed-attempt entries are scoped per sanitised identifier and expire after this window. */
 const WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const THRESHOLD = 5;
+/** Lockout records are bounded even if failures continue arriving. */
 const MAX_LOCKOUT_SECONDS = 3600; // 1 hour
 
 function randomHex(): string {
@@ -30,9 +32,22 @@ function buildLockoutKey(key: string): string {
   return `${LOCKOUT_PREFIX}${sanitiseIdentifier(key)}`;
 }
 
+/**
+ * Redis-backed authentication failure tracking.
+ *
+ * Attempt keys are scoped by the sanitised login/IP identifier. The sorted-set
+ * entry and its TTL are refreshed on each failure, but scores older than the
+ * ten-minute window are removed before counting, so history cannot create a
+ * permanent lockout. Lockout keys are always capped at one hour.
+ *
+ * Redis failures are deliberately surfaced to callers instead of converted to
+ * a successful authentication decision. The middleware can then fail closed
+ * or return its configured service-unavailable response.
+ */
 export class AuthAttemptStore {
   constructor(private readonly client: RedisClient) {}
 
+  /** Record one failure, pruning the bounded window before calculating lockout. */
   async recordFailure(key: string): Promise<void> {
     const now = Date.now();
     const attemptsKey = buildAttemptsKey(key);
@@ -68,12 +83,14 @@ export class AuthAttemptStore {
     }
   }
 
+  /** Return failures still inside the ten-minute accounting window. */
   async getAttemptCount(key: string): Promise<number> {
     const now = Date.now();
     const attemptsKey = buildAttemptsKey(key);
     return this.client.zcount(attemptsKey, now - WINDOW_MS, '+inf');
   }
 
+  /** Remove both the rolling failure counter and any active lockout. */
   async resetAttempts(key: string): Promise<void> {
     const attemptsKey = buildAttemptsKey(key);
     const lockoutKey = buildLockoutKey(key);
@@ -81,6 +98,7 @@ export class AuthAttemptStore {
     await this.client.del(lockoutKey);
   }
 
+  /** Return remaining lockout seconds, or zero when no lockout is active. */
   async isLockedOut(key: string): Promise<number> {
     const lockoutKey = buildLockoutKey(key);
     const value = await this.client.get(lockoutKey);

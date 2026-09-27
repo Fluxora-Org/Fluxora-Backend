@@ -50,7 +50,7 @@ describe('API key security properties', () => {
 
   it('persists only a salted hash and returns plaintext only at creation', async () => {
     const created = await createApiKey('security-test');
-    const stored = (await listApiKeys())[0]!;
+    const stored = [...keys.values()][0]!;
 
     expect(stored.keyHash).not.toContain(created.key);
     expect(stored.keyHash).not.toBe(created.key);
@@ -61,7 +61,7 @@ describe('API key security properties', () => {
 
   it('uses the constant-time primitive even when digest lengths differ', async () => {
     const created = await createApiKey('timing-test');
-    const stored = (await listApiKeys())[0]!;
+    const stored = [...keys.values()][0]!;
     stored.keyHash = stored.keyHash.slice(0, -2);
 
     expect(await isValidApiKey(created.key)).toBe(false);

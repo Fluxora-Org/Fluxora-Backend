@@ -15,6 +15,8 @@
  *   and JSON-parsed in the route, preventing injection via crafted tokens.
  * - `status` is validated against the known enum values so unknown strings are
  *   rejected at the schema boundary and never reach the database layer.
+ * - Unknown query keys (including unimplemented sort selectors) are rejected
+ *   instead of being silently stripped and later mistaken for supported input.
  * - All values are passed to the DB as parameterised query arguments — no
  *   string interpolation occurs.
  *
@@ -22,6 +24,7 @@
  */
 
 import { z } from 'zod';
+import { API_STREAM_STATUSES } from '../streams/status.js';
 
 export const DEFAULT_PAGE_LIMIT = 20;
 export const MAX_PAGE_LIMIT     = 100;
@@ -33,7 +36,7 @@ export const MIN_PAGE_LIMIT     = 1;
  * constraint so that unknown strings are rejected at the schema boundary
  * before they reach the repository or database layer.
  */
-export const STREAM_STATUS_VALUES = ['active', 'paused', 'completed', 'cancelled'] as const;
+export const STREAM_STATUS_VALUES = API_STREAM_STATUSES;
 export type StreamStatusValue = (typeof STREAM_STATUS_VALUES)[number];
 
 export const PaginationSchema = z.object({
@@ -64,13 +67,8 @@ export const PaginationSchema = z.object({
     .optional()
     .transform((v) => v ?? DEFAULT_PAGE_LIMIT),
 
-  /**
-   * Filter by stream status.
-   * Pass-through string — no enum validation is applied so the DB drives the
-   * filtering.  Invalid status values produce an empty result set (not an
-   * error).  Valid statuses: active, paused, completed, cancelled.
-   */
-  status: z.string().optional(),
+  /** Filter by one of the database-backed stream status values. */
+  status: z.enum(STREAM_STATUS_VALUES).optional(),
 
   /**
    * Filter by sender Stellar address.
@@ -89,7 +87,7 @@ export const PaginationSchema = z.object({
 
   /** When 'true', include total count of matching rows in the response. */
   include_total: z.enum(['true', 'false']).optional(),
-});
+}).strict();
 
 /**
  * Zod schema for offset-based pagination query parameters used by
