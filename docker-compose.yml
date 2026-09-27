@@ -112,6 +112,22 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: fluxora-blue
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /app/tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /app/tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       DATABASE_URL: postgresql://indexer_user:indexer_password@postgres:5432/indexer_db
       # Shared Redis — both slots must point at the same instance.
@@ -141,6 +157,22 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: fluxora-green
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /app/tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /app/tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       DATABASE_URL: postgresql://indexer_user:indexer_password@postgres:5432/indexer_db
       # Shared Redis — must be identical to app-blue so state is consistent.
