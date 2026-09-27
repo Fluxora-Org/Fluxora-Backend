@@ -410,3 +410,21 @@ SSRF validation failures are logged without exposing the full URL for security. 
 - Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
 - Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
 - DNS resolution: Uses Node.js `dns.promises.lookup()`
+
+## Payload schemas (published, versioned)
+
+Every webhook payload is an external contract: receivers parse it. The
+published, versioned schemas live in `src/webhooks/payloadSchemas.ts`
+(zod), with committed fixtures per event under `src/webhooks/schema-fixtures/`
+(issue #1570).
+
+- Each payload carries a `schema_version` field (currently `1`).
+- **Compatibility rule:** additive changes (new optional fields, new event
+  types) do NOT bump the version. Removing, renaming, retyping, or changing
+  the meaning of an existing field DOES.
+- The committed fixtures pin the current shape of every event; CI fails if
+  code drifts the shape without a deliberate version bump and fixture update.
+- Delivery validates outgoing payloads against the published schema; a
+  mismatch is classified poison (non-retryable), not transient.
+- Schemas are strict: unknown keys are rejected, so adding a field is itself
+  a schema change (additive, no bump, but the fixtures must be updated).
