@@ -180,6 +180,12 @@ jobs:
       - name: Check migration naming policy
         run: pnpm run check:migrations
 
+      # Required gate: every migration must either run in node-pg-migrate's
+      # per-migration transaction or be listed in the atomicity manifest with
+      # re-runnable statements. See docs/migration-atomicity.md.
+      - name: Check migration atomicity and re-run safety
+        run: pnpm run check:migration-atomicity
+
       - name: Check deprecation sunset policy
         run: pnpm run check:deprecations
 
@@ -217,6 +223,7 @@ jobs:
       - name: Run live database integration suites
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+          MIGRATION_ATOMICITY_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
         run: >-
           pnpm exec vitest run --reporter=verbose
           tests/db/vacuumCollector.collect.test.ts
@@ -225,6 +232,7 @@ jobs:
           tests/db/logicalReplication.test.ts
           tests/db/contractEvents.partitionPruning.test.ts
           tests/db/rowMapping.schema.test.ts
+          tests/db/migrations.atomicity.test.ts
 
       # Required gate: failing tests block the pipeline.
       - name: Run tests
