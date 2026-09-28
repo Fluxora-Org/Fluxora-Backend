@@ -331,8 +331,7 @@ describe('corrupt cache entries', () => {
       incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     const result = await cache.get('testOp');
@@ -356,8 +355,7 @@ describe('corrupt cache entries', () => {
       incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     const result = await cache.get('testOp');
@@ -381,8 +379,7 @@ describe('corrupt cache entries', () => {
       incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     const result = await cache.get('testOp');
@@ -406,8 +403,7 @@ describe('corrupt cache entries', () => {
       incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     await expect(cache.get('testOp')).rejects.toThrow('ECONNREFUSED');

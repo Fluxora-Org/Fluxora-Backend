@@ -306,7 +306,8 @@ Webhook consumers verify incoming requests by recomputing the HMAC-SHA256 signat
 When a webhook consumer rotates its signing secret via the admin API, there is a transition period during which some producers may still be signing with the old secret. To avoid spurious verification failures, the verification path supports a **bounded dual-secret grace window**:
 
 - During the grace window, **both** the previous and current secret are accepted.
-- After the grace window expires, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
+- The overlap is configurable with `graceWindowSeconds`; it is active from the rotation timestamp up to, but not including, the expiry timestamp.
+- At and after expiry, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
 - The rotation timestamp and grace-window expiry are **persisted** in the `webhook_secrets` table (not held in memory), so a process restart cannot silently extend or shrink the window.
 - The default grace window is `DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS` (86 400 seconds / 24 hours).
 
@@ -410,3 +411,21 @@ SSRF validation failures are logged without exposing the full URL for security. 
 - Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
 - Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
 - DNS resolution: Uses Node.js `dns.promises.lookup()`
+
+## Payload schemas (published, versioned)
+
+Every webhook payload is an external contract: receivers parse it. The
+published, versioned schemas live in `src/webhooks/payloadSchemas.ts`
+(zod), with committed fixtures per event under `src/webhooks/schema-fixtures/`
+(issue #1570).
+
+- Each payload carries a `schema_version` field (currently `1`).
+- **Compatibility rule:** additive changes (new optional fields, new event
+  types) do NOT bump the version. Removing, renaming, retyping, or changing
+  the meaning of an existing field DOES.
+- The committed fixtures pin the current shape of every event; CI fails if
+  code drifts the shape without a deliberate version bump and fixture update.
+- Delivery validates outgoing payloads against the published schema; a
+  mismatch is classified poison (non-retryable), not transient.
+- Schemas are strict: unknown keys are rejected, so adding a field is itself
+  a schema change (additive, no bump, but the fixtures must be updated).
