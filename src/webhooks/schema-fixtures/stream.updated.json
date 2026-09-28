@@ -1,0 +1,8 @@
+{
+  "event": "stream.updated",
+  "schema_version": 1,
+  "status": "active",
+  "streamed_amount": "250000",
+  "remaining_amount": "999750000",
+  "end_time": 1786859000
+}
