@@ -1,4 +1,5 @@
 /** Shared validation, configuration, and failure-classification helpers for webhook delivery. */
+import { validatePublishedPayload } from './payloadSchemas.js';
 import { logger } from '../lib/logger.js';
 import { loadConfig } from '../config/env.js';
 import type { WebhookDelivery, DLQReasonCode } from './types.js';
@@ -119,6 +120,13 @@ export function enqueuePermanentFailureToDlq(
  * @throws {string} Error message describing the validation failure, if the payload is poisoned
  */
 export function validateWebhookPayload(payload: unknown): void {
+  // Published-schema check first (issue #1570): the payload must match the
+  // versioned wire contract for its event type. A shape mismatch is a
+  // contract change, not transient noise — poison, not retry.
+  if (payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>).event === 'string') {
+    validatePublishedPayload((payload as Record<string, unknown>).event as string, payload);
+  }
+
   // Check if payload is oversized (potential DoS vector)
   if (typeof payload === 'string' && payload.length > 10 * 1024 * 1024) {
     throw 'Payload exceeds maximum size of 10MB (likely garbage or DoS attempt)';
