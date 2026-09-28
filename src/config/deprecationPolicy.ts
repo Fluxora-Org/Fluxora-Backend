@@ -9,18 +9,29 @@ import type { DeprecatedRoute } from '../middleware/deprecation.js';
  * a check that CI (and the test suite) can enforce:
  *
  *   1. every entry must carry a sunset date (missing / blank fails),
- *   2. the date must parse (an unparseable date fails), and
+ *   2. the date must parse (an unparseable date fails),
  *   3. the date must not have passed (a passed sunset fails until the endpoint
- *      is removed or the date is deliberately extended).
+ *      is removed or the date is deliberately extended), and
+ *   4. the sunset must be at least MINIMUM_NOTICE_PERIOD_MS in the future
+ *      from the deprecation registration instant so clients have a reasonable
+ *      window to migrate (SHORT_NOTICE).
  *
  * The policy is a pure function of the registry and a `now`, so the check is
  * deterministic and trivially unit-testable.
  */
 
+/**
+ * Minimum notice period clients must be given before a route is removed.
+ * Set to 90 days expressed in milliseconds, matching the policy documented in
+ * docs/api/deprecation-policy.md.
+ */
+export const MINIMUM_NOTICE_PERIOD_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+
 export type DeprecationViolationCode =
   | 'MISSING_SUNSET'
   | 'INVALID_SUNSET'
-  | 'PAST_SUNSET';
+  | 'PAST_SUNSET'
+  | 'SHORT_NOTICE';
 
 export interface DeprecationViolation {
   code: DeprecationViolationCode;
@@ -92,6 +103,17 @@ export function findDeprecationViolations(
         route,
         sunsetDate: raw,
         message: `Deprecated route ${route} passed its sunset date (${raw}). Remove the endpoint or extend the date deliberately.`,
+      });
+      continue;
+    }
+
+    if (sunset.getTime() - nowMs <= MINIMUM_NOTICE_PERIOD_MS) {
+      const daysGiven = Math.floor((sunset.getTime() - nowMs) / (24 * 60 * 60 * 1000));
+      violations.push({
+        code: 'SHORT_NOTICE',
+        route,
+        sunsetDate: raw,
+        message: `Deprecated route ${route} has a sunset date (${raw}) that gives clients only ${daysGiven} day(s), which is below the required 90-day minimum notice period.`,
       });
     }
   }

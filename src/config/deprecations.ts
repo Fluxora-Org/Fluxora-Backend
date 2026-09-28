@@ -9,7 +9,7 @@ import type { DeprecatedRoute } from '../middleware/deprecation.js';
 export const routeDeprecations: readonly DeprecatedRoute[] = [
   {
     route: '/api/rate-limits/config',
-    sunsetDate: '2026-09-30T00:00:00.000Z',
+    sunsetDate: '2027-03-31T00:00:00.000Z',
     link: '/docs/api/deprecation-policy.md#current-deprecations',
   },
 ];
