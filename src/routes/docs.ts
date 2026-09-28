@@ -32,7 +32,14 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import swaggerUi from 'swagger-ui-express';
 import { buildOpenApiSpec } from '../openapi/spec.js';
+<<<<<<< HEAD
 import { isEnabled, onFlagsReloaded } from '../config/featureFlags.js';
+=======
+import {
+  FLUXORA_JSONLD_CONTEXT_DOCUMENT,
+  FLUXORA_JSONLD_CONTEXT_PATH,
+} from '../serialization/jsonld.js';
+>>>>>>> 5c9fd38 (feat(jsonld): version and pin the JSON-LD context)
 
 export const docsRouter = Router();
 
@@ -101,6 +108,35 @@ docsRouter.get('/openapi.json', (_req: Request, res: Response) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'public, max-age=300');
   res.json(getSpec());
+});
+
+/**
+ * GET /ns/v1 — the JSON-LD context document advertised by every
+ * `/api/streams/:id/export.jsonld` response.
+ *
+ * The path is derived from FLUXORA_JSONLD_CONTEXT_VERSION so the served
+ * location can never disagree with the URI the documents point at. Public and
+ * unauthenticated, like the rest of the docs surface: a context document
+ * contains no secrets, and consumers must be able to resolve it before they
+ * hold an API key.
+ *
+ * Two deliberate departures from the neighbouring docs endpoints:
+ *
+ * - Cache-Control is one year, not the 300s used by /openapi.json. The spec
+ *   tracks the deployed API and changes; a published context version never
+ *   changes, so a client that has fetched v1 may cache it indefinitely.
+ * - Access-Control-Allow-Origin is `*`, overriding the app-wide CORS
+ *   allowlist. The document is a fixed vocabulary with no request-specific or
+ *   tenant data, and linked-data clients commonly run in a browser, so
+ *   origin-gating it would block the resolution this endpoint exists to
+ *   support. The stream documents themselves remain behind the allowlist and
+ *   the API key.
+ */
+docsRouter.get(FLUXORA_JSONLD_CONTEXT_PATH, (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/ld+json');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(FLUXORA_JSONLD_CONTEXT_DOCUMENT);
 });
 
 /** GET /docs — Swagger UI */
