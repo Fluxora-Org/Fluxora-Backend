@@ -44,6 +44,16 @@ export interface RateLimitConfig {
    * When 0 (default), the limiter behaves as a flat sliding-window limit.
    */
   burst: number;
+  /**
+   * Cost of the attempt. Defaults to 1.
+   */
+  weight?: number;
+}
+
+export interface RateLimitDimensions {
+  tenant: string;
+  endpoint: string;
+  outcome: 'first_attempt' | 'retry' | string;
 }
 
 export interface RateLimitResult {
@@ -70,8 +80,8 @@ export const RATE_LIMIT_MIN_WINDOW_MS = 100; // 100ms minimum
  * storage strategy.
  */
 export interface IWebhookRateLimiter {
-  checkLimit(consumerUrl: string, config: RateLimitConfig): Promise<RateLimitResult>;
-  recordFailure(consumerUrl: string, config: RateLimitConfig): Promise<void>;
+  checkLimit(dimensions: RateLimitDimensions, config: RateLimitConfig): Promise<RateLimitResult>;
+  recordFailure(dimensions: RateLimitDimensions, config: RateLimitConfig): Promise<void>;
 }
 
 export class RateLimitConfigError extends Error {
@@ -114,34 +124,30 @@ export class WebhookRateLimiter implements IWebhookRateLimiter {
 
   constructor(private readonly redisClient: RedisClient) {}
 
-  setConsumerConfig(consumerUrl: string, config: RateLimitConfig): void {
+  setConsumerConfig(endpoint: string, config: RateLimitConfig): void {
     validateRateLimitConfig(config);
-    this.consumerConfigs.set(consumerUrl, { ...config });
+    this.consumerConfigs.set(endpoint, { ...config });
   }
 
-  removeConsumerConfig(consumerUrl: string): void {
-    this.consumerConfigs.delete(consumerUrl);
+  removeConsumerConfig(endpoint: string): void {
+    this.consumerConfigs.delete(endpoint);
   }
 
-  resolveConfig(consumerUrl: string, fallback: RateLimitConfig): RateLimitConfig {
-    return this.consumerConfigs.get(consumerUrl) ?? fallback;
+  resolveConfig(endpoint: string, fallback: RateLimitConfig): RateLimitConfig {
+    return this.consumerConfigs.get(endpoint) ?? fallback;
   }
 
   /**
-   * Check whether a delivery attempt to `consumerUrl` is within the
+   * Check whether a delivery attempt is within the
    * configured rate limit and, if so, record the attempt.
-   *
-   * The check-and-record is not strictly atomic (Redis does not support
-   * conditional ZADD + ZCOUNT in a single command), but the pipeline
-   * minimises the race window to sub-millisecond on a local Redis. For
-   * webhook retry use-cases this is an acceptable trade-off.
    */
-  async checkLimit(consumerUrl: string, config: RateLimitConfig): Promise<RateLimitResult> {
+  async checkLimit(dimensions: RateLimitDimensions, config: RateLimitConfig): Promise<RateLimitResult> {
     validateRateLimitConfig(config);
-    const resolvedConfig = this.resolveConfig(consumerUrl, config);
-    const key = `webhook_rl:${hashUrl(consumerUrl)}`;
+    const resolvedConfig = this.resolveConfig(dimensions.endpoint, config);
+    const key = `webhook_rl:${hashDimensions(dimensions)}`;
     const now = Date.now();
     const windowStart = now - resolvedConfig.windowMs;
+    const weight = resolvedConfig.weight ?? 1;
 
     try {
       // Step 1: prune expired entries and count remaining in one pipeline.
@@ -158,7 +164,7 @@ export class WebhookRateLimiter implements IWebhookRateLimiter {
       // Step 2: count current window entries.
       const count = await this.redisClient.zcount(key, windowStart, '+inf');
 
-      if (count >= resolvedConfig.limit) {
+      if (count + weight > resolvedConfig.limit) {
         // Determine when the oldest entry in the window expires so the
         // caller can schedule a deferral for exactly that long.
         const retryAfterMs = resolvedConfig.windowMs;
@@ -168,14 +174,15 @@ export class WebhookRateLimiter implements IWebhookRateLimiter {
       // Step 3: record this attempt with a unique member (timestamp + random
       // suffix) so concurrent attempts from multiple workers don't collide
       // on NX and silently drop each other's records.
-      const member = `${now}:${Math.random().toString(36).slice(2, 8)}`;
       const ttlMs = resolvedConfig.windowMs * 2; // generous TTL so Redis auto-cleans
 
-      const recordResults = await this.redisClient
-        .multi()
-        .zadd(key, 'NX', now, member)
-        .pexpire(key, ttlMs)
-        .exec();
+      const multi = this.redisClient.multi();
+      for (let i = 0; i < weight; i++) {
+        const member = `${now}:${Math.random().toString(36).slice(2, 8)}`;
+        multi.zadd(key, 'NX', now, member);
+      }
+      multi.pexpire(key, ttlMs);
+      const recordResults = await multi.exec();
 
       for (const [err] of recordResults) {
         if (err) throw err;
@@ -185,7 +192,7 @@ export class WebhookRateLimiter implements IWebhookRateLimiter {
     } catch (err) {
       // Fail-open: log and allow the attempt so a Redis outage does not
       // silently halt all webhook deliveries.
-      const consumerHash = hashUrl(consumerUrl);
+      const consumerHash = hashDimensions(dimensions);
       webhookRateLimiterFailOpenTotal.inc({ consumer_hash: consumerHash });
       logger.error('WebhookRateLimiter Redis error — failing open', undefined, {
         operation: 'checkLimit',
@@ -199,14 +206,15 @@ export class WebhookRateLimiter implements IWebhookRateLimiter {
   // recordFailure is intentionally a no-op: the rate limiter counts all
   // outbound attempts regardless of outcome. Failures are handled by the
   // retry policy (backoff + DLQ), not by the rate limiter.
-  async recordFailure(_consumerUrl: string, _config: RateLimitConfig): Promise<void> {}
+  async recordFailure(_dimensions: RateLimitDimensions, _config: RateLimitConfig): Promise<void> {}
 }
 
 export function createWebhookRateLimiter(redisClient: RedisClient): WebhookRateLimiter {
   return new WebhookRateLimiter(redisClient);
 }
 
-/** Hash a consumer URL to a fixed-length, injection-safe Redis key segment. */
-function hashUrl(url: string): string {
-  return createHash('sha256').update(url).digest('hex').slice(0, 16);
+/** Hash dimensions to a fixed-length, injection-safe Redis key segment. */
+export function hashDimensions(dim: RateLimitDimensions): string {
+  const str = `${dim.tenant}|${dim.endpoint}|${dim.outcome}`;
+  return createHash('sha256').update(str).digest('hex').slice(0, 16);
 }

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { type IdempotencyStore, ENVELOPE_VERSION } from '../redis/idempotencyStore.js';
 import { logger } from '../lib/logger.js';
-import { idempotentReplayResponse } from '../utils/response.js';
+import { idempotentReplayResponse, errorResponse } from '../utils/response.js';
 
 /**
  * Canonicalize the request body by sorting keys recursively and stripping whitespace.
@@ -53,10 +53,23 @@ export function createIdempotencyMiddleware(
       return next();
     }
 
+    // Determine tenant from API key or JWT user address, falling back to 'anonymous'
+    const tenantId = req.keyId || req.user?.address || 'anonymous';
+
     const incomingHash = hashBody(req.body);
 
     try {
-      const existing = await store.get(idempotencyKey);
+      const existing = await store.get(idempotencyKey, tenantId);
+
+      if (existing === 'in_progress') {
+        logger.warn('Idempotency conflict detected — concurrent request in progress', req.correlationId as string, {
+          idempotencyKeyLength: idempotencyKey.length,
+          incomingHash,
+        });
+        return res.status(409).json(
+          errorResponse('IDEMPOTENCY_CONFLICT', 'A request with this idempotency key is already in progress.', undefined, req.correlationId as string)
+        );
+      }
 
       if (existing) {
         if (existing.requestFingerprint !== incomingHash) {
@@ -66,11 +79,14 @@ export function createIdempotencyMiddleware(
             storedHash: existing.requestFingerprint,
           });
 
-          return res.status(409).json({
-            error: 'idempotency_conflict',
-            stored_hash: existing.requestFingerprint,
-            incoming_hash: incomingHash,
-          });
+          return res.status(409).json(
+            errorResponse(
+              'IDEMPOTENCY_CONFLICT',
+              'Request body does not match the original request for this idempotency key.',
+              { storedHash: existing.requestFingerprint, incomingHash },
+              req.correlationId as string,
+            )
+          );
         }
 
         logger.info('Replaying idempotent response', req.correlationId as string, { 
@@ -89,6 +105,18 @@ export function createIdempotencyMiddleware(
         );
       }
 
+      // First write path
+      const lockAcquired = await store.start(idempotencyKey, tenantId, ttlSeconds);
+      if (!lockAcquired) {
+        logger.warn('Idempotency conflict detected — failed to acquire lock', req.correlationId as string, {
+          idempotencyKeyLength: idempotencyKey.length,
+          incomingHash,
+        });
+        return res.status(409).json(
+          errorResponse('IDEMPOTENCY_CONFLICT', 'A request with this idempotency key is already in progress.', undefined, req.correlationId as string)
+        );
+      }
+
       // Intercept res.json to cache the successful response
       const originalJson = res.json.bind(res);
 
@@ -97,6 +125,7 @@ export function createIdempotencyMiddleware(
         if (res.statusCode >= 200 && res.statusCode < 300) {
           store.set(
             idempotencyKey,
+            tenantId,
             { version: ENVELOPE_VERSION,
         requestFingerprint: incomingHash, statusCode: res.statusCode, body },
             ttlSeconds,

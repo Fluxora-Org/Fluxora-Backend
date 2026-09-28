@@ -1,5 +1,5 @@
 import { getConfig } from '../config/env.js';
-import { warn, info, debug } from '../utils/logger.js';
+import { warn, info, debug } from '../lib/logger.js';
 import { createRedisClient, type RedisClient } from './client.js';
 
 /**

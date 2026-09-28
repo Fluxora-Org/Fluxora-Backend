@@ -70,13 +70,76 @@ function makeCheck(
   return { key, title, status, summary };
 }
 
+// ─── Startup validation (issue #1437) ────────────────────────────────────────
+
+/**
+ * Validate deployment-parity configuration (issue #1437).
+ *
+ * Mirrors the hard rules the parity checklist reports at request time
+ * (`buildDeploymentChecklistReport`) so they are enforced when the process
+ * boots instead of being discovered by an operator reading /health/deployment:
+ * - REQUIRE_PARTNER_AUTH / REQUIRE_ADMIN_AUTH demand their tokens.
+ * - Prod-like environments (staging/production) must enable Redis, the
+ *   background worker, metrics, and the indexer.
+ */
+export function validateDeploymentConfig(config: {
+  nodeEnv: Config['nodeEnv'];
+  requirePartnerAuth: boolean;
+  partnerApiToken?: string | undefined;
+  requireAdminAuth: boolean;
+  adminApiToken?: string | undefined;
+  redisEnabled: boolean;
+  workerEnabled: boolean;
+  metricsEnabled: boolean;
+  indexerEnabled: boolean;
+  deploymentChecklistVersion: string;
+}): string[] {
+  const issues: string[] = [];
+  const parityRequired = config.nodeEnv !== 'development' && config.nodeEnv !== 'test';
+
+  if (config.requirePartnerAuth && !config.partnerApiToken) {
+    issues.push('PARTNER_API_TOKEN is required when REQUIRE_PARTNER_AUTH is enabled');
+  }
+
+  if (config.requireAdminAuth && !config.adminApiToken) {
+    issues.push('ADMIN_API_TOKEN is required when REQUIRE_ADMIN_AUTH is enabled');
+  }
+
+  if (parityRequired) {
+    if (!config.redisEnabled) {
+      issues.push('REDIS_ENABLED must be true in prod-like environments (staging/production)');
+    }
+    if (!config.workerEnabled) {
+      issues.push('WORKER_ENABLED must be true in prod-like environments (staging/production)');
+    }
+    if (!config.metricsEnabled) {
+      issues.push('METRICS_ENABLED must be true in prod-like environments (staging/production)');
+    }
+    if (!config.indexerEnabled) {
+      issues.push('INDEXER_ENABLED must be true in prod-like environments (staging/production)');
+    }
+  }
+
+  if (
+    typeof config.deploymentChecklistVersion !== 'string' ||
+    config.deploymentChecklistVersion.trim() === ''
+  ) {
+    issues.push('DEPLOYMENT_CHECKLIST_VERSION must be a non-empty string');
+  }
+
+  return issues;
+}
+
 export function buildDeploymentChecklistReport(input: {
   config: Config;
   dependencyHealth: HealthReport;
   indexerHealth: IndexerHealth;
+  /** Number of feature flags blocked by pending migrations (0 = all compatible). */
+  blockedFeatureFlags?: number;
 }): DeploymentChecklistReport {
   const { config, dependencyHealth, indexerHealth } = input;
   const parityRequired = config.nodeEnv !== 'development';
+  const blockedFlags = input.blockedFeatureFlags ?? 0;
 
   const checklist: DeploymentChecklistItem[] = [
     makeCheck(
@@ -165,6 +228,16 @@ export function buildDeploymentChecklistReport(input: {
       config.metricsEnabled
         ? 'Metrics are enabled.'
         : 'Metrics are disabled, reducing production parity for incident response.',
+    ),
+    makeCheck(
+      'schema_compatibility',
+      'Feature flag schema compatibility',
+      blockedFlags > 0
+        ? 'warn'
+        : 'pass',
+      blockedFlags > 0
+        ? `${blockedFlags} feature flag(s) blocked by pending database migrations.`
+        : 'All feature flags are compatible with the current schema.',
     ),
   ];
 

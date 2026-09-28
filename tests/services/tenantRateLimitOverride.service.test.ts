@@ -23,8 +23,10 @@ import {
   createOverride,
   deleteOverride,
   listOverrides,
+  assertOverrideWithinCeiling,
 } from '../../src/services/tenantRateLimitOverride.service.js';
 import { ApiError } from '../../src/errors.js';
+import { DEFAULT_APIKEY_CONFIG, MAX_WINDOW_MS } from '../../src/config/rateLimits.js';
 
 function makeRow(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
@@ -142,36 +144,36 @@ describe('tenantRateLimitOverride service', () => {
   // ---------------------------------------------------------------------------
   describe('createOverride', () => {
     it('inserts correctly and returns the created record', async () => {
-      const createdRow = makeRow();
+      const createdRow = makeRow({ max_requests: 400 });
       mockQuery.mockResolvedValueOnce({ rows: [createdRow] });
 
       const result = await createOverride(
-        { keyId: 'key-1', maxRequests: 5000, windowMs: 60000 },
+        { keyId: 'key-1', maxRequests: 400, windowMs: 60000 },
         'admin:test',
       );
 
       const [, sql, params] = mockQuery.mock.calls[0]!;
       expect(sql).toContain('INSERT INTO tenant_rate_limit_overrides');
       expect(params).toContain('key-1');
-      expect(params).toContain(5000);
+      expect(params).toContain(400);
       expect(params).toContain(60000);
       expect(params).toContain('admin:test');
       expect(result.keyId).toBe('key-1');
-      expect(result.maxRequests).toBe(5000);
+      expect(result.maxRequests).toBe(400);
     });
 
     it('inserts with expires_at when provided', async () => {
       const futureDate = new Date(Date.now() + 86400000).toISOString();
-      const createdRow = makeRow({ key_id: 'key-2', max_requests: 10000, window_ms: 120000, expires_at: new Date(futureDate) });
+      const createdRow = makeRow({ key_id: 'key-2', max_requests: 500, window_ms: 120000, expires_at: new Date(futureDate) });
       mockQuery.mockResolvedValueOnce({ rows: [createdRow] });
 
       const result = await createOverride(
-        { keyId: 'key-2', maxRequests: 10000, windowMs: 120000, expiresAt: futureDate },
+        { keyId: 'key-2', maxRequests: 500, windowMs: 120000, expiresAt: futureDate },
         'admin:test',
       );
 
       expect(result.keyId).toBe('key-2');
-      expect(result.maxRequests).toBe(10000);
+      expect(result.maxRequests).toBe(500);
       expect(result.expiresAt).not.toBeNull();
     });
 
@@ -190,6 +192,79 @@ describe('tenantRateLimitOverride service', () => {
         'jwt:GADDR123',
       );
       expect(result.createdBy).toBe('jwt:GADDR123');
+    });
+
+    it('accepts an override exactly at the global ceiling', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [makeRow({ max_requests: DEFAULT_APIKEY_CONFIG.max })],
+      });
+      const result = await createOverride(
+        { keyId: 'key-at-ceiling', maxRequests: DEFAULT_APIKEY_CONFIG.max, windowMs: 60000 },
+        'admin:test',
+      );
+      expect(result.maxRequests).toBe(DEFAULT_APIKEY_CONFIG.max);
+    });
+
+    it('refuses an override above the global ceiling without writing a row', async () => {
+      try {
+        await createOverride(
+          { keyId: 'key-too-high', maxRequests: DEFAULT_APIKEY_CONFIG.max + 1, windowMs: 60000 },
+          'admin:test',
+        );
+        expect.fail('should have thrown');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ApiError);
+        expect((err as ApiError).statusCode).toBe(422);
+        expect((err as ApiError).code).toBe('UNPROCESSABLE_ENTITY');
+        expect((err as ApiError).message).toContain('exceeds the global ceiling');
+      }
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // assertOverrideWithinCeiling
+  // ---------------------------------------------------------------------------
+  describe('assertOverrideWithinCeiling', () => {
+    const ceiling = { maxRequests: 500, windowMs: MAX_WINDOW_MS };
+
+    it('allows a limit below the ceiling', () => {
+      expect(() =>
+        assertOverrideWithinCeiling({ maxRequests: 100, windowMs: 60000 }, ceiling),
+      ).not.toThrow();
+    });
+
+    it('allows a limit equal to the ceiling (boundary)', () => {
+      expect(() =>
+        assertOverrideWithinCeiling({ maxRequests: 500, windowMs: 60000 }, ceiling),
+      ).not.toThrow();
+    });
+
+    it('refuses a limit one above the ceiling', () => {
+      expect(() =>
+        assertOverrideWithinCeiling({ maxRequests: 501, windowMs: 60000 }, ceiling),
+      ).toThrow(/exceeds the global ceiling of 500/);
+    });
+
+    it('refuses a window longer than the maximum window', () => {
+      expect(() =>
+        assertOverrideWithinCeiling(
+          { maxRequests: 100, windowMs: MAX_WINDOW_MS + 1 },
+          ceiling,
+        ),
+      ).toThrow(/exceeds the maximum allowed window/);
+    });
+
+    it('refuses an override that loosens a tightened global ceiling', () => {
+      // The ceiling tracks the live global config, so an override sized for an
+      // older, more permissive global limit is still refused after that limit
+      // is tightened.
+      expect(() =>
+        assertOverrideWithinCeiling(
+          { maxRequests: 900, windowMs: 60000 },
+          { maxRequests: 300, windowMs: MAX_WINDOW_MS },
+        ),
+      ).toThrow(/exceeds the global ceiling of 300/);
     });
   });
 

@@ -14,6 +14,7 @@ from .exceptions import (
     IdempotencyConflictError,
     ValidationError,
 )
+from .fixtures import OPENAPI_FIXTURES
 
 __version__ = "0.1.0"
 
@@ -27,4 +28,5 @@ __all__ = [
     "ApiError",
     "IdempotencyConflictError",
     "ValidationError",
+    "OPENAPI_FIXTURES",
 ]

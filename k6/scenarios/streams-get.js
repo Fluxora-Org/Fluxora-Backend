@@ -1,7 +1,12 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { BASE_URL } from '../config.js';
-import { checkResponse, errorRate, streamsGetLatency } from '../helpers.js';
+import {
+  checkResponse,
+  errorRate,
+  streamsGetLatency,
+  AUTH_HEADERS,
+} from '../helpers.js';
 
 /**
  * Exercises GET /api/streams/:id.
@@ -20,6 +25,7 @@ import { checkResponse, errorRate, streamsGetLatency } from '../helpers.js';
 export default function streamsGetScenario() {
   // --- Happy path: pick a stream from the list ---
   const listRes = http.get(`${BASE_URL}/api/streams`, {
+    headers: AUTH_HEADERS,
     tags: { endpoint: 'streams_list' },
   });
 
@@ -32,6 +38,7 @@ export default function streamsGetScenario() {
   if (streams.length > 0) {
     const target = streams[Math.floor(Math.random() * streams.length)];
     const res = http.get(`${BASE_URL}/api/streams/${target.id}`, {
+      headers: AUTH_HEADERS,
       tags: { endpoint: 'streams_get' },
     });
     const passed = checkResponse(res, 200, 'GET /api/streams/:id (exists)');
@@ -51,6 +58,7 @@ export default function streamsGetScenario() {
 
   // --- 404 path: request a stream ID that cannot exist ---
   const res404 = http.get(`${BASE_URL}/api/streams/nonexistent-${Date.now()}`, {
+    headers: AUTH_HEADERS,
     tags: { endpoint: 'streams_get' },
   });
   // Route returns { error: "NOT_FOUND" } per the documented failure mode.

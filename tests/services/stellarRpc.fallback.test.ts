@@ -10,6 +10,7 @@ import { createRpcDegradationMiddleware } from '../../src/middleware/rpcDegradat
 import {
   InMemoryRpcFallbackCache,
   RedisRpcFallbackCache,
+  buildRpcFallbackCacheKey,
   buildUnsafeCacheKeyForTest,
   type RpcFallbackCache,
 } from '../../src/redis/rpcFallbackCache.js';
@@ -145,6 +146,7 @@ describe('StellarRpcService fallback cache', () => {
   });
 
   it('isolates accountExists cache entries by hashed account parameter', async () => {
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(new AbortController().signal);
     const cache = new InMemoryRpcFallbackCache();
     const fetchMock = vi.fn(async (url: string) => ({
       status: url.endsWith('/GBEXISTS') ? 200 : 404,
@@ -152,12 +154,10 @@ describe('StellarRpcService fallback cache', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     let horizonUrl = 'https://horizon.test';
-    const svc = new StellarRpcService(() => ({ getLatestLedger: vi.fn(), horizonUrl }), {
-      failureThreshold: 1,
-      resetTimeoutMs: 60_000,
-      fallbackCache: cache,
-      fallbackCacheTtlSeconds: 60,
-    });
+    const svc = new StellarRpcService(
+      () => ({ getLatestLedger: vi.fn(), horizonUrl }),
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60, maxRetries: 0, retryDelayMs: 0 },
+    );
 
     await expect(svc.accountExists('GBEXISTS')).resolves.toBe(true);
     horizonUrl = '';
@@ -275,13 +275,16 @@ describe('rpcFallbackCache key collisions', () => {
   it('does not collide distinct (operation, parts[]) tuples', async () => {
     const cache = new InMemoryRpcFallbackCache();
 
-    // Two genuinely distinct tuples. Under a naive delimiter-join strategy
-    // these could be made to collide; the hashed builder maps them to
-    // distinct keys.
+    // These two tuples would collide under a naive delimiter-join strategy.
+    // With the collision-resistant builder, they must map to distinct keys.
+
+    // Build a tuple-pair that would collide under a naive delimiter-join
+    // (operation/parts treated as raw, unescaped string segments).
     const operation1 = 'getLatestLedger';
     const parts1 = ['a', 'b'];
-    const operation2 = 'getAccount';
-    const parts2 = ['c', 'd'];
+
+    const operation2 = 'getLatestLedger_a';
+    const parts2 = ['b'];
 
     // Ensure safe inputs (avoid relying on delimiter-forging characters).
     expect(() => cache.setEntry(operation1, { v: 1 }, 60, parts1)).not.toThrow();
@@ -311,6 +314,19 @@ describe('rpcFallbackCache key collisions', () => {
     expect(keyC).not.toBe(keyA);
   });
 
+  it('generates distinct keys for near-colliding inputs using buildRpcFallbackCacheKey', () => {
+    const key1 = buildRpcFallbackCacheKey('getAccount', ['a', 'b']);
+    const key2 = buildRpcFallbackCacheKey('getAccount', ['ab']);
+    const key3 = buildRpcFallbackCacheKey('getAccount', ['a', 'b', 'c']);
+
+    expect(key1).not.toBe(key2);
+    expect(key1).not.toBe(key3);
+    expect(key2).not.toBe(key3);
+
+    expect(key1).toContain('rpc:cache::v2::op:');
+    expect(key2).toContain('rpc:cache::v2::op:');
+  });
+
   it('rejects unsafe key parts under SAFE_OPERATION', async () => {
     const cache = new InMemoryRpcFallbackCache();
 
@@ -336,6 +352,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(),
@@ -360,6 +377,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(),
@@ -384,6 +402,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(),
@@ -408,6 +427,7 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
       zcount: vi.fn(),

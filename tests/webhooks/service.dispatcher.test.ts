@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The project tsconfig targets ES2020 without DOM lib; `HeadersInit` comes from
+// the Fetch API type surface, so alias the narrow shape used by these stubs.
+type HeadersInit = Record<string, string>;
 import { WebhookDispatcher } from '../../src/webhooks/service.js';
 import type { EnhancedRetryPolicy } from '../../src/webhooks/retry.js';
 import { FakeRedisClient } from '../../src/redis/__test__/fakeRedisClient.js';
@@ -7,8 +11,8 @@ import { RedisWebhookCircuitBreakerStore } from '../../src/redis/webhookCircuitB
 interface MockClient {
   queries: Array<{ sql: string; params: unknown[] | undefined }>;
   rows: unknown[];
-  query: ReturnType<typeof vi.fn>;
-  release: ReturnType<typeof vi.fn>;
+  query: any;
+  release: any;
 }
 
 const policy: EnhancedRetryPolicy = {
@@ -51,7 +55,7 @@ function createDispatcher(
     batchSize: 5,
     policy,
     pool: {
-      connect: vi.fn(async () => client),
+      connect: vi.fn(async () => client) as any,
     },
     circuitBreakerStore: breaker,
   });
@@ -254,10 +258,10 @@ describe('WebhookDispatcher outbox polling', () => {
       if (sql.includes('UPDATE webhook_outbox SET processed = true')) {
         throw new Error('Simulated crash during DB acknowledgement');
       }
-      return originalQuery(sql, params);
+      return (originalQuery as any)(sql, params);
     });
 
-    let fetchHeaders: HeadersInit | undefined;
+    let fetchHeaders: RequestInit['headers'] | undefined;
     global.fetch = vi.fn(async (url, init) => {
       fetchHeaders = init?.headers;
       return new Response(null, { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -280,7 +284,7 @@ describe('WebhookDispatcher outbox polling', () => {
     vi.spyOn(Date, 'now').mockReturnValue(now2);
     
     const client2 = createClient([originalRow]);
-    let fetchHeaders2: HeadersInit | undefined;
+    let fetchHeaders2: RequestInit['headers'] | undefined;
     global.fetch = vi.fn(async (url, init) => {
       fetchHeaders2 = init?.headers;
       return new Response(null, { status: 200 });
@@ -574,7 +578,7 @@ describe('WebhookDispatcher outbox polling', () => {
         batchSize: 5,
         policy: poisonPolicy,
         pool: {
-          connect: vi.fn(async () => client),
+          connect: vi.fn(async () => client) as any,
         },
         circuitBreakerStore: breaker,
       });

@@ -12,6 +12,11 @@ describe('Idempotency Middleware', () => {
     store = new InMemoryIdempotencyStore();
     app = express();
     app.use(express.json({ limit: '1mb' }));
+    app.use((req, _res, next) => {
+      const header = req.headers['x-tenant-id'];
+      req.keyId = (Array.isArray(header) ? header[0] : header) || 'anonymous';
+      next();
+    });
     app.use(createIdempotencyMiddleware(store));
 
     app.post('/test', (req, res) => {
@@ -30,9 +35,13 @@ describe('Idempotency Middleware', () => {
     expect(response.headers['idempotency-replayed']).toBe('false');
     expect(response.body.data).toEqual(body);
 
-    const cached = await store.get('test-key-1');
+    const cached = await store.get('test-key-1', 'anonymous');
     expect(cached).not.toBeNull();
-    expect(cached?.requestFingerprint).toBeDefined();
+    if (cached && cached !== 'in_progress') {
+      expect(cached.requestFingerprint).toBeDefined();
+    } else {
+      expect.fail('expected cached entry');
+    }
   });
 
   it('should return a replayed response on matching body', async () => {
@@ -126,4 +135,8 @@ describe('Idempotency Middleware', () => {
     expect(response.status).toBe(201);
     expect(response.headers['idempotency-replayed']).toBe('false');
   });
+
+  it('should isolate keys by tenant (tenant A vs tenant B)', async () => { await request(app).post('/test').set('Idempotency-Key', 'tenant-isolated').set('x-tenant-id', 'tenant-a').send({ foo: 'bar' }); const res2 = await request(app).post('/test').set('Idempotency-Key', 'tenant-isolated').set('x-tenant-id', 'tenant-b').send({ foo: 'baz' }); expect(res2.status).toBe(201); expect(res2.headers['idempotency-replayed']).toBe('false'); });
+
+  it('should reject concurrent requests with 409', async () => { app.post('/delayed', async (req, res) => { await new Promise(r => setTimeout(r, 100)); res.status(201).json({ message: 'success' }); }); const req1 = request(app).post('/delayed').set('Idempotency-Key', 'concurrent-key').send({ foo: 'bar' }); const req2 = request(app).post('/delayed').set('Idempotency-Key', 'concurrent-key').send({ foo: 'bar' }); const [res1, res2] = await Promise.all([req1, req2]); expect([res1.status, res2.status].sort()).toEqual([201, 409]); });
 });

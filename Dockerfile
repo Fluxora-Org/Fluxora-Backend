@@ -1,5 +1,9 @@
+# Node.js version pin. Must equal .nvmrc and package.json "engines.node";
+# `pnpm run check:node-version` (enforced in CI) fails when they drift.
+ARG NODE_VERSION=20.20.2
+
 # Build stage
-FROM node:18-alpine AS builder
+FROM node:${NODE_VERSION}-alpine AS builder
 
 WORKDIR /app
 
@@ -19,7 +23,7 @@ COPY . .
 RUN pnpm run build
 
 # Production stage
-FROM node:18-alpine
+FROM node:${NODE_VERSION}-alpine
 
 WORKDIR /app
 

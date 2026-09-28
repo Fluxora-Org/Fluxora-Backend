@@ -16,6 +16,7 @@
  */
 
 import { Span, SpanEvent, TracerHooks, BatchSpanExporter, BatchSpanExporterConfig } from './hooks.js';
+import { logger } from '../lib/logger.js';
 
 /**
  * In-memory span buffer configuration.
@@ -175,17 +176,10 @@ export class SpanBuffer implements TracerHooks {
     try {
       const level = this.config.logLevel ?? 'debug';
       const message = `[tracing] ${name}`;
-      const record = {
-        level,
-        timestamp: new Date().toISOString(),
-        message,
-        ...attributes,
-      };
-
       if (level === 'error') {
-        console.error(JSON.stringify(record));
+        logger.error(message, undefined, attributes);
       } else {
-        console.log(JSON.stringify(record));
+        logger.info(message, undefined, attributes);
       }
     } catch {
       // Logging error; silent failure

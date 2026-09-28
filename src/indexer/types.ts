@@ -11,6 +11,13 @@
  *   (content hash). The hash is the authoritative identity for reorg detection:
  *   two blocks at the same sequence number with different hashes mean a fork.
  * - `ingestedAt` is always set by the store, never trusted from the caller.
+ *
+ * Field provenance
+ * ----------------------------------
+ * For each type below, `types.provenance.md` (kept beside this file) documents
+ * whether every field is read from chain data (naming the Stellar ledger
+ * structure it comes from) or computed by the indexer (stating the derivation).
+ * When adding or renaming a field here, update that document in the same commit.
  */
 
 // -----------------------------------------------------------------------
@@ -73,11 +80,36 @@ export type IndexedTransaction = {
  * A single contract event emitted within a transaction.
  * This is the primary unit of storage in the indexer.
  *
+ * ## Idempotency key
+ *
+ * `eventId` is the globally unique identifier for a contract event and is
+ * the idempotency key for ingestion.  It is derived from the chain as:
+ *
+ *   `${txHash}-${eventIndex}`
+ *
+ * where `txHash` is the hex-encoded transaction hash and `eventIndex` is the
+ * zero-based position of the event within that transaction.  This composite
+ * ensures uniqueness: the same transaction cannot emit two events with the
+ * same index, and the same event cannot appear in two transactions.
+ *
+ * **Replay guarantee**: inserting a `ContractEventRecord` whose `eventId`
+ * already exists in the store is always a safe no-op.  The store uses
+ * `ON CONFLICT (event_id) DO NOTHING` (Postgres) or an equivalent in-memory
+ * Map check to silently discard the duplicate without mutating the existing
+ * row or returning an error.  Callers may therefore replay any ledger range —
+ * after a crash, a leader handover, or a chain reorganisation — without
+ * additional deduplication logic at the call site.
+ *
  * Security note: `payload` is an opaque JSON object sourced from the chain.
  * Any amount-like fields inside `payload` must be validated as DecimalString
  * by the consumer before arithmetic operations.
  */
 export type ContractEventRecord = {
+  /**
+   * Globally unique event identity, derived as `${txHash}-${eventIndex}`.
+   * This is the idempotency key: re-inserting a record with the same eventId
+   * is a silent no-op — the existing row is never mutated.
+   */
   eventId: string;
   ledger: number;
   contractId: string;

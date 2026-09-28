@@ -1,5 +1,11 @@
 /**
- * Comprehensive edge-case tests for resolvePerRouteOverride() in src/tracing/hooks.ts
+ * Comprehensive edge-case tests for resolvePerRouteOverride() in src/tracing/sampling.ts
+ *
+ * `resolvePerRouteOverride` returns the matched override as `{ rate, key }`:
+ * `rate` is the sample rate to apply and `key` is the override that matched,
+ * which callers use to rewrite the recorded route attribute to a canonical,
+ * non-identifying value. These expectations were stale after that signature
+ * change landed and are updated here to assert the real contract (#1518).
  */
 
 import { describe, it, expect } from 'vitest';
@@ -14,9 +20,9 @@ describe('resolvePerRouteOverride()', () => {
         '/api/streams/live': 1.0,
       };
 
-      expect(resolvePerRouteOverride('/api/streams', overrides)).toBe(0.5);
-      expect(resolvePerRouteOverride('/api', overrides)).toBe(0.2);
-      expect(resolvePerRouteOverride('/api/streams/live', overrides)).toBe(1.0);
+      expect(resolvePerRouteOverride('/api/streams', overrides)).toEqual({ rate: 0.5, key: '/api/streams' });
+      expect(resolvePerRouteOverride('/api', overrides)).toEqual({ rate: 0.2, key: '/api' });
+      expect(resolvePerRouteOverride('/api/streams/live', overrides)).toEqual({ rate: 1.0, key: '/api/streams/live' });
     });
 
     it('returns exact match rate when rate is 0', () => {
@@ -25,7 +31,7 @@ describe('resolvePerRouteOverride()', () => {
         '/api': 0.5,
       };
 
-      expect(resolvePerRouteOverride('/health', overrides)).toBe(0);
+      expect(resolvePerRouteOverride('/health', overrides)).toEqual({ rate: 0, key: '/health' });
     });
   });
 
@@ -36,7 +42,7 @@ describe('resolvePerRouteOverride()', () => {
         '/api/streams': 0.5,
       };
 
-      expect(resolvePerRouteOverride('/api/streams/abc', overrides)).toBe(0.5);
+      expect(resolvePerRouteOverride('/api/streams/abc', overrides)).toEqual({ rate: 0.5, key: '/api/streams' });
     });
 
     it('chooses the longest matching key across multiple nested prefixes', () => {
@@ -46,9 +52,9 @@ describe('resolvePerRouteOverride()', () => {
         '/api/streams/live': 1.0,
       };
 
-      expect(resolvePerRouteOverride('/api/streams/live/abc', overrides)).toBe(1.0);
-      expect(resolvePerRouteOverride('/api/streams/vod/123', overrides)).toBe(0.5);
-      expect(resolvePerRouteOverride('/api/users/456', overrides)).toBe(0.2);
+      expect(resolvePerRouteOverride('/api/streams/live/abc', overrides)).toEqual({ rate: 1.0, key: '/api/streams/live' });
+      expect(resolvePerRouteOverride('/api/streams/vod/123', overrides)).toEqual({ rate: 0.5, key: '/api/streams' });
+      expect(resolvePerRouteOverride('/api/users/456', overrides)).toEqual({ rate: 0.2, key: '/api' });
     });
 
     it('handles shorter prefix when longer prefix does not match', () => {
@@ -57,7 +63,7 @@ describe('resolvePerRouteOverride()', () => {
         '/api/streams': 0.5,
       };
 
-      expect(resolvePerRouteOverride('/api/webhooks', overrides)).toBe(0.2);
+      expect(resolvePerRouteOverride('/api/webhooks', overrides)).toEqual({ rate: 0.2, key: '/api' });
     });
   });
 
@@ -76,9 +82,9 @@ describe('resolvePerRouteOverride()', () => {
         '/api/str': 0.8,
       };
 
-      expect(resolvePerRouteOverride('/api/str', overrides)).toBe(0.8);
-      expect(resolvePerRouteOverride('/api/str/foo', overrides)).toBe(0.8);
-      expect(resolvePerRouteOverride('/api/str/foo/bar', overrides)).toBe(0.8);
+      expect(resolvePerRouteOverride('/api/str', overrides)).toEqual({ rate: 0.8, key: '/api/str' });
+      expect(resolvePerRouteOverride('/api/str/foo', overrides)).toEqual({ rate: 0.8, key: '/api/str' });
+      expect(resolvePerRouteOverride('/api/str/foo/bar', overrides)).toEqual({ rate: 0.8, key: '/api/str' });
       expect(resolvePerRouteOverride('/api/stream-x', overrides)).toBeUndefined();
     });
 
@@ -125,8 +131,8 @@ describe('resolvePerRouteOverride()', () => {
         '/api': 0.5,
       };
 
-      expect(resolvePerRouteOverride('/api', overrides)).toBe(0.5);
-      expect(resolvePerRouteOverride('/api/users', overrides)).toBe(0.5);
+      expect(resolvePerRouteOverride('/api', overrides)).toEqual({ rate: 0.5, key: '/api' });
+      expect(resolvePerRouteOverride('/api/users', overrides)).toEqual({ rate: 0.5, key: '/api' });
       expect(resolvePerRouteOverride('/apiv2', overrides)).toBeUndefined();
       expect(resolvePerRouteOverride('/other', overrides)).toBeUndefined();
     });
@@ -136,9 +142,9 @@ describe('resolvePerRouteOverride()', () => {
         '/': 0.1,
       };
 
-      expect(resolvePerRouteOverride('/', overrides)).toBe(0.1);
-      expect(resolvePerRouteOverride('/api/streams', overrides)).toBe(0.1);
-      expect(resolvePerRouteOverride('/health', overrides)).toBe(0.1);
+      expect(resolvePerRouteOverride('/', overrides)).toEqual({ rate: 0.1, key: '/' });
+      expect(resolvePerRouteOverride('/api/streams', overrides)).toEqual({ rate: 0.1, key: '/' });
+      expect(resolvePerRouteOverride('/health', overrides)).toEqual({ rate: 0.1, key: '/' });
     });
 
     it('handles override key with trailing slash correctly', () => {
@@ -146,8 +152,8 @@ describe('resolvePerRouteOverride()', () => {
         '/api/': 0.6,
       };
 
-      expect(resolvePerRouteOverride('/api/streams', overrides)).toBe(0.6);
-      expect(resolvePerRouteOverride('/api/', overrides)).toBe(0.6);
+      expect(resolvePerRouteOverride('/api/streams', overrides)).toEqual({ rate: 0.6, key: '/api/' });
+      expect(resolvePerRouteOverride('/api/', overrides)).toEqual({ rate: 0.6, key: '/api/' });
       expect(resolvePerRouteOverride('/api', overrides)).toBeUndefined();
     });
   });

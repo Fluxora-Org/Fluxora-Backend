@@ -241,6 +241,7 @@ function buildEvent(eventId: string, ledger: number, happenedAt: string) {
 // ── Live DB Integration Tests ─────────────────────────────────────────────────
 // Skipped automatically when DATABASE_URL is not set.
 
+// Keep-gated and intentionally excluded from issue #1248; tracked as live-DB coverage.
 describe.skipIf(!isLiveDb)(
   'contract_events Partition Pruning — live DB integration',
   () => {

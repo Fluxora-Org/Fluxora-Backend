@@ -207,11 +207,11 @@ describe('reloadHotConfig - Validation Edge Cases', () => {
 
     it('handles FEATURE_FLAGS_JSON with invalid entries', () => {
       process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-        { name: 'valid', percentage: 50 },
+        { name: 'valid', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
         { name: '', percentage: 100 }, // invalid empty name
-        { percentage: 100 }, // missing name
-        { name: 'invalid', percentage: 150 }, // invalid percentage
-        { name: 'invalid2', percentage: -10 }, // invalid negative
+        { percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' }, // missing name
+        { name: 'invalid', percentage: 150 , default: false, owner: 'test', removalDate: '2099-01-01' }, // invalid percentage
+        { name: 'invalid2', percentage: -10 , default: false, owner: 'test', removalDate: '2099-01-01' }, // invalid negative
       ]);
 
       reloadFlags();
@@ -228,8 +228,8 @@ describe('reloadHotConfig - Validation Edge Cases', () => {
 
     it('handles FEATURE_FLAGS_JSON as object format', () => {
       process.env.FEATURE_FLAGS_JSON = JSON.stringify({
-        flag1: { percentage: 25 },
-        flag2: { percentage: 75, description: 'test flag' },
+        flag1: { percentage: 25 , default: false, owner: 'test', removalDate: '2099-01-01' },
+        flag2: { percentage: 75, default: false, owner: 'test', removalDate: '2099-01-01', description: 'test flag'  },
       });
 
       reloadFlags();
@@ -463,7 +463,7 @@ describe('Integration: reloadHotConfig + runtime updates', () => {
 
   it('reloads feature flags correctly', () => {
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'test_flag', percentage: 50 },
+      { name: 'test_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
 
     reloadFlags();
@@ -473,7 +473,7 @@ describe('Integration: reloadHotConfig + runtime updates', () => {
 
   it('clears feature flags when JSON is removed', () => {
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'test_flag', percentage: 50 },
+      { name: 'test_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
 
     reloadFlags();
@@ -611,7 +611,7 @@ describe('Config Refresh Path Edge Cases', () => {
   it('handles config refresh during active feature flag usage', () => {
     // Set initial flags
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag1', percentage: 50 },
+      { name: 'flag1', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     reloadFlags();
 
@@ -620,8 +620,8 @@ describe('Config Refresh Path Edge Cases', () => {
 
     // Update flags
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag1', percentage: 75 },
-      { name: 'flag2', percentage: 25 },
+      { name: 'flag1', percentage: 75 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'flag2', percentage: 25 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     reloadFlags();
 
@@ -955,7 +955,7 @@ describe('refreshHotConfig - deterministic apply path', () => {
   it('applies rate limits and feature flags in fixed order', async () => {
     const order: string[] = [];
     process.env.RATE_LIMIT_IP_MAX = '10';
-    process.env.FEATURE_FLAGS_JSON = JSON.stringify([{ name: 'x', percentage: 100 }]);
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([{ name: 'x', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' }]);
 
     await refreshHotConfig({
       applyRateLimits: () => order.push('rate'),

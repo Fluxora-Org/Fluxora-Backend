@@ -4,42 +4,49 @@
  * BASE_URL defaults to http://localhost:3000 and can be overridden via
  * the K6_BASE_URL environment variable:
  *   k6 run -e K6_BASE_URL=https://staging.fluxora.io k6/main.js
+ *
+ * Latency budgets are loaded from performance-budget.json (single source of
+ * truth, reviewed against production observations). A run that exceeds any
+ * budget fails via k6 thresholds.
  */
 
 export const BASE_URL = __ENV.K6_BASE_URL || 'http://localhost:3000';
 
+const budget = JSON.parse(open('./performance-budget.json'));
+
+function pctThresholds(budgets) {
+  const parts = [];
+  if (budgets.p95 != null) parts.push(`p(95)<${budgets.p95}`);
+  if (budgets.p99 != null) parts.push(`p(99)<${budgets.p99}`);
+  return parts;
+}
+
 /**
- * Baseline SLOs — published per endpoint so regressions are pinpointed.
+ * Baseline SLOs — derived from k6/performance-budget.json so regressions are
+ * pinpointed and comparable across releases.
  *
  * Global
  *   p(95) < 500 ms, p(99) < 1 000 ms, error rate < 1 %
  *
  * Per-endpoint (tagged via { endpoint: '<name>' } on each request):
- *   health          p(99) < 200 ms  — used as readiness probe; must be fast
- *   streams_list    p(95) < 500 ms, p(99) < 800 ms
- *   streams_get     p(95) < 400 ms, p(99) < 700 ms
- *   streams_create  p(95) < 600 ms, p(99) < 1 000 ms  — write path is slower
+ *   health / streams_list / streams_get / streams_create — see budget file
  *
  * Custom trend metrics (from helpers.js) mirror the tagged thresholds and
  * appear in the k6 summary as human-readable named series.
  */
+export const PERFORMANCE_BUDGET = budget;
+
 export const THRESHOLDS = {
   // Global baseline
-  http_req_duration: ['p(95)<500', 'p(99)<1000'],
-  http_req_failed:   ['rate<0.01'],
-
-  // Per-endpoint SLOs (tagged requests)
-  'http_req_duration{endpoint:health}':          ['p(99)<200'],
-  'http_req_duration{endpoint:streams_list}':    ['p(95)<500', 'p(99)<800'],
-  'http_req_duration{endpoint:streams_get}':     ['p(95)<400', 'p(99)<700'],
-  'http_req_duration{endpoint:streams_create}':  ['p(95)<600', 'p(99)<1000'],
-
-  // Named trend metrics (mirrors above; surfaced in k6 end-of-test summary)
-  fluxora_health_latency:          ['p(99)<200'],
-  fluxora_streams_list_latency:    ['p(95)<500', 'p(99)<800'],
-  fluxora_streams_get_latency:     ['p(95)<400', 'p(99)<700'],
-  fluxora_streams_create_latency:  ['p(95)<600', 'p(99)<1000'],
+  http_req_duration: pctThresholds(budget.global.http_req_duration),
+  http_req_failed: [`rate<${budget.global.http_req_failed_rate}`],
 };
+
+for (const endpoint of budget.endpoints) {
+  const limits = pctThresholds(endpoint.budgets);
+  THRESHOLDS[`http_req_duration{endpoint:${endpoint.id}}`] = limits;
+  THRESHOLDS[endpoint.trendMetric] = limits;
+}
 
 /**
  * Reusable stage profiles.

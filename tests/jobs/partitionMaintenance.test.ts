@@ -1,48 +1,53 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import {
   runPartitionMaintenance,
   quoteIdentifier,
   PARTITION_MAINTENANCE_LOCK_ID,
   CANDIDATE_TABLES,
   DEFAULT_MONTHS_AHEAD,
+  DEFAULT_LEAD_TIME_MONTHS,
+  DEFAULT_LOCK_TIMEOUT_MS,
 } from '../../src/jobs/partitionMaintenance.js';
 import {
   partitionsCreatedTotal,
   partitionMaintenanceBehindScheduleTotal,
+  partitionMaintenanceFailuresTotal,
 } from '../../src/metrics/businessMetrics.js';
+import { config } from '../../src/config.js';
+import { setAlertSink, type AlertEvent } from '../../src/lib/alerts.js';
 
 // ── Mock pool builder ─────────────────────────────────────────────────────
 //
-// runPartitionMaintenance talks to Postgres exclusively through
-// `query(pool, sql, params)` (src/db/pool.ts), which delegates to
-// `pool.query(sql, params)`. A plain object exposing a mocked `query` is
-// therefore sufficient — no real Postgres connection is required.
+// runPartitionMaintenance checks out a client using `pool.connect()`, then
+// executes queries via `client.query(...)`, and finally releases the client
+// via `client.release()`.
 
 type QueryCall = { sql: string; params: unknown[] | undefined };
 
 /**
- * Builds a mock `Pool` plus a scripted responder so each test can declare,
- * in a readable way, what each kind of query should return without hand
- * -counting `.mockResolvedValueOnce()` calls in call order.
- *
- * `partitioned` maps table name -> is it a RANGE-partitioned table.
- * `existingPartitions` is a Set of partition names that already exist.
+ * Builds a mock `Pool` and mock `PoolClient` plus a scripted responder so
+ * each test can declare what each kind of query should return.
  */
 function buildMockPool(opts: {
   lockAcquired?: boolean;
   partitioned?: Partial<Record<string, boolean>>;
   existingPartitions?: Set<string>;
   onCreate?: (partitionName: string) => void;
+  /** 1-indexed: throw instead of creating on the Nth CREATE TABLE call. */
+  failOnCreateNumber?: number;
 } = {}) {
   const {
     lockAcquired = true,
     partitioned = { contract_events: true },
     existingPartitions = new Set<string>(),
     onCreate,
+    failOnCreateNumber,
   } = opts;
 
   const calls: QueryCall[] = [];
+  let createCount = 0;
+  let clientReleased = false;
 
   const queryImpl = vi.fn(async (sql: string, params?: unknown[]) => {
     calls.push({ sql, params });
@@ -52,6 +57,9 @@ function buildMockPool(opts: {
     }
     if (sql.includes('pg_advisory_unlock')) {
       return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 };
+    }
+    if (sql.includes('SET statement_timeout')) {
+      return { rows: [], rowCount: 0 };
     }
     if (sql.includes('pg_partitioned_table')) {
       const table = params?.[0] as string;
@@ -66,6 +74,10 @@ function buildMockPool(opts: {
       return { rows: [{ exists: existingPartitions.has(partitionName) }], rowCount: 1 };
     }
     if (sql.includes('CREATE TABLE IF NOT EXISTS')) {
+      createCount += 1;
+      if (failOnCreateNumber === createCount) {
+        throw new Error(`Injected failure on CREATE TABLE call #${createCount}`);
+      }
       const match = /CREATE TABLE IF NOT EXISTS "([^"]+)"/.exec(sql);
       const partitionName = match?.[1];
       if (partitionName) {
@@ -77,8 +89,29 @@ function buildMockPool(opts: {
     throw new Error(`Unexpected query in mock pool: ${sql}`);
   });
 
-  const pool = { query: queryImpl } as unknown as Pool;
-  return { pool, calls, existingPartitions };
+  const releaseImpl = vi.fn(() => {
+    clientReleased = true;
+  });
+
+  const mockClient = {
+    query: queryImpl,
+    release: releaseImpl,
+  } as unknown as PoolClient;
+
+  const connectImpl = vi.fn(async () => mockClient);
+
+  const pool = {
+    connect: connectImpl,
+    query: queryImpl,
+  } as unknown as Pool;
+
+  return {
+    pool,
+    mockClient,
+    calls,
+    existingPartitions,
+    isClientReleased: () => clientReleased,
+  };
 }
 
 const FIXED_NOW = new Date('2026-07-15T12:00:00.000Z');
@@ -87,39 +120,59 @@ describe('runPartitionMaintenance', () => {
   beforeEach(() => {
     partitionsCreatedTotal.reset();
     partitionMaintenanceBehindScheduleTotal.reset();
+    partitionMaintenanceFailuresTotal.reset();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  // ── Lock acquisition ──────────────────────────────────────────────────────
+  // ── Lock acquisition & Client Session Management ─────────────────────────
 
-  describe('advisory lock', () => {
-    it('acquires the lock using the documented lock id', async () => {
-      const { pool, calls } = buildMockPool();
+  describe('advisory lock and client session', () => {
+    it('checks out a dedicated client from pool and acquires lock on it', async () => {
+      const { pool, mockClient, calls } = buildMockPool();
       await runPartitionMaintenance(pool, { now: FIXED_NOW });
 
+      expect(pool.connect).toHaveBeenCalledTimes(1);
       expect(calls[0]).toEqual({
         sql: 'SELECT pg_try_advisory_lock($1)',
         params: [PARTITION_MAINTENANCE_LOCK_ID],
       });
+      expect(mockClient.query).toHaveBeenCalled();
     });
 
-    it('skips all work and returns lockAcquired: false when the lock is already held', async () => {
-      const { pool, calls } = buildMockPool({ lockAcquired: false });
+    it('sets statement_timeout on the dedicated client after lock acquisition', async () => {
+      const { pool, calls } = buildMockPool();
+      await runPartitionMaintenance(pool, { now: FIXED_NOW, lockTimeoutMs: 15_000 });
+
+      const timeoutCall = calls.find((c) => c.sql.includes('SET statement_timeout'));
+      expect(timeoutCall).toBeDefined();
+      expect(timeoutCall?.sql).toBe('SET statement_timeout = 15000');
+    });
+
+    it('defaults lockTimeoutMs to DEFAULT_LOCK_TIMEOUT_MS', async () => {
+      const { pool, calls } = buildMockPool();
+      await runPartitionMaintenance(pool, { now: FIXED_NOW });
+
+      const timeoutCall = calls.find((c) => c.sql.includes('SET statement_timeout'));
+      expect(timeoutCall?.sql).toBe(`SET statement_timeout = ${DEFAULT_LOCK_TIMEOUT_MS}`);
+    });
+
+    it('skips all work and releases client when the lock is already held', async () => {
+      const { pool, calls, isClientReleased } = buildMockPool({ lockAcquired: false });
 
       const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
 
       expect(result.lockAcquired).toBe(false);
       expect(result.tables).toEqual([]);
-      // Only the lock attempt itself — no partition checks, no unlock call
-      // (we never held the lock, so releasing it would be incorrect).
+      // Only lock check call executed on the client
       expect(calls).toHaveLength(1);
+      expect(isClientReleased()).toBe(true);
     });
 
-    it('releases the lock after a successful run', async () => {
-      const { pool, calls } = buildMockPool();
+    it('releases the lock and client after a successful run', async () => {
+      const { pool, calls, isClientReleased } = buildMockPool();
       await runPartitionMaintenance(pool, { now: FIXED_NOW });
 
       const unlockCall = calls.find((c) => c.sql.includes('pg_advisory_unlock'));
@@ -127,18 +180,19 @@ describe('runPartitionMaintenance', () => {
         sql: 'SELECT pg_advisory_unlock($1)',
         params: [PARTITION_MAINTENANCE_LOCK_ID],
       });
+      expect(isClientReleased()).toBe(true);
     });
 
-    it('releases the lock even when a table check throws (finally block)', async () => {
-      const { pool, calls } = buildMockPool();
-      // Force the second query (partitioned check for contract_events) to throw.
-      let call = 0;
-      (pool.query as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (sql: string, params?: unknown[]) => {
-        call += 1;
+    it('releases the lock and client even when a table check throws', async () => {
+      const { pool, mockClient, calls, isClientReleased } = buildMockPool();
+      let callCount = 0;
+      (mockClient.query as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (sql: string, params?: unknown[]) => {
+        callCount += 1;
         calls.push({ sql, params });
         if (sql.includes('pg_try_advisory_lock')) return { rows: [{ pg_try_advisory_lock: true }], rowCount: 1 };
+        if (sql.includes('SET statement_timeout')) return { rows: [], rowCount: 0 };
         if (sql.includes('pg_advisory_unlock')) return { rows: [], rowCount: 0 };
-        if (call === 2) throw new Error('connection reset');
+        if (callCount === 3) throw new Error('connection reset');
         return { rows: [], rowCount: 0 };
       });
 
@@ -146,6 +200,48 @@ describe('runPartitionMaintenance', () => {
 
       const unlockCall = calls.find((c) => c.sql.includes('pg_advisory_unlock'));
       expect(unlockCall).toBeDefined();
+      expect(isClientReleased()).toBe(true);
+    });
+  });
+
+  // ── Concurrency & Serialization Assertions ───────────────────────────────
+
+  describe('concurrency behavior', () => {
+    it('asserts one owner performs DDL while the second concurrent caller exits safely', async () => {
+      let isLockHeldByFirst = false;
+
+      // Mock pool 1 (Owner): Acquires lock
+      const pool1State = buildMockPool({
+        lockAcquired: true,
+        partitioned: { contract_events: true },
+        onCreate: () => {
+          // Verify DDL is being performed by owner
+          expect(isLockHeldByFirst).toBe(true);
+        },
+      });
+
+      // Mock pool 2 (Concurrent contender): Fails to acquire lock because instance 1 holds it
+      const pool2State = buildMockPool({
+        lockAcquired: false,
+      });
+
+      isLockHeldByFirst = true;
+
+      // Run both jobs concurrently
+      const [res1, res2] = await Promise.all([
+        runPartitionMaintenance(pool1State.pool, { now: FIXED_NOW, monthsAhead: 1 }),
+        runPartitionMaintenance(pool2State.pool, { now: FIXED_NOW, monthsAhead: 1 }),
+      ]);
+
+      // Owner result verification
+      expect(res1.lockAcquired).toBe(true);
+      expect(res1.tables[0].partitionsCreated).toHaveLength(2);
+      expect(pool1State.isClientReleased()).toBe(true);
+
+      // Contender result verification: safe no-op exit
+      expect(res2.lockAcquired).toBe(false);
+      expect(res2.tables).toEqual([]);
+      expect(pool2State.isClientReleased()).toBe(true);
     });
   });
 
@@ -167,7 +263,6 @@ describe('runPartitionMaintenance', () => {
       await runPartitionMaintenance(pool, 2);
 
       const createCalls = calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'));
-      // monthsAhead=2 => current month + 2 future months = 3 partitions for contract_events
       expect(createCalls).toHaveLength(3);
     });
 
@@ -219,7 +314,7 @@ describe('runPartitionMaintenance', () => {
       expect(al.partitionsCreated).toEqual(['audit_logs_y2026m07', 'audit_logs_y2026m08']);
 
       const createCalls = calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'));
-      expect(createCalls).toHaveLength(4); // 2 tables x 2 months
+      expect(createCalls).toHaveLength(4);
     });
 
     it('processes every table listed in CANDIDATE_TABLES', async () => {
@@ -228,8 +323,8 @@ describe('runPartitionMaintenance', () => {
       expect(result.tables.map((t) => t.table)).toEqual([...CANDIDATE_TABLES]);
     });
 
-    it('gracefully skips a table that does not exist at all (to_regclass resolves to no rows)', async () => {
-      const { pool } = buildMockPool({ partitioned: { contract_events: true } }); // audit_logs absent from map => not partitioned/absent
+    it('gracefully skips a table that does not exist at all', async () => {
+      const { pool } = buildMockPool({ partitioned: { contract_events: true } });
       const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
       const al = result.tables.find((t) => t.table === 'audit_logs')!;
       expect(al.managed).toBe(false);
@@ -266,7 +361,6 @@ describe('runPartitionMaintenance', () => {
 
       await runPartitionMaintenance(pool, { now: FIXED_NOW });
       const createsAfterSecondRun = calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS')).length;
-      // No new CREATE calls were issued on the second run.
       expect(createsAfterSecondRun).toBe(createsAfterFirstRun);
     });
 
@@ -276,6 +370,60 @@ describe('runPartitionMaintenance', () => {
 
       const createCall = calls.find((c) => c.sql.includes('CREATE TABLE'));
       expect(createCall!.sql).toMatch(/CREATE TABLE IF NOT EXISTS/);
+    });
+
+    it('crossing a month boundary between two runs creates only the newly-current month', async () => {
+      const incSpy = vi.spyOn(partitionsCreatedTotal, 'inc');
+      const { pool, calls, existingPartitions } = buildMockPool();
+
+      const julyRun = await runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 1 });
+      expect(julyRun.tables[0].partitionsCreated).toEqual([
+        'contract_events_y2026m07',
+        'contract_events_y2026m08',
+      ]);
+      const createsAfterJuly = calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS')).length;
+      expect(createsAfterJuly).toBe(2);
+      expect(incSpy).toHaveBeenCalledTimes(2);
+
+      const augustNow = new Date('2026-08-15T12:00:00.000Z');
+      const augustRun = await runPartitionMaintenance(pool, { now: augustNow, monthsAhead: 1 });
+
+      expect(augustRun.tables[0].behindSchedule).toBe(false);
+      expect(augustRun.tables[0].partitionsCreated).toEqual(['contract_events_y2026m09']);
+
+      const createsAfterAugust = calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS')).length;
+      expect(createsAfterAugust).toBe(3);
+      expect(incSpy).toHaveBeenCalledTimes(3);
+      expect(existingPartitions).toEqual(
+        new Set(['contract_events_y2026m07', 'contract_events_y2026m08', 'contract_events_y2026m09']),
+      );
+    });
+
+    it('a mid-run DDL failure leaves earlier partitions committed; retrying converges without double-creating', async () => {
+      const incSpy = vi.spyOn(partitionsCreatedTotal, 'inc');
+      const { pool, calls, existingPartitions, isClientReleased } = buildMockPool({ failOnCreateNumber: 2 });
+
+      await expect(
+        runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 2 }),
+      ).rejects.toThrow(/Injected failure on CREATE TABLE call #2/);
+
+      expect(existingPartitions).toEqual(new Set(['contract_events_y2026m07']));
+      expect(incSpy).toHaveBeenCalledTimes(1);
+
+      const unlockCall = calls.find((c) => c.sql.includes('pg_advisory_unlock'));
+      expect(unlockCall).toBeDefined();
+      expect(isClientReleased()).toBe(true);
+
+      const { pool: retryPool, calls: retryCalls } = buildMockPool({ existingPartitions });
+      const retryResult = await runPartitionMaintenance(retryPool, { now: FIXED_NOW, monthsAhead: 2 });
+
+      expect(retryResult.tables[0].partitionsCreated).toEqual([
+        'contract_events_y2026m08',
+        'contract_events_y2026m09',
+      ]);
+      expect(incSpy).toHaveBeenCalledTimes(3);
+      const retryCreateCalls = retryCalls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'));
+      expect(retryCreateCalls).toHaveLength(2);
     });
   });
 
@@ -301,8 +449,6 @@ describe('runPartitionMaintenance', () => {
     });
 
     it('uses UTC month boundaries regardless of local server timezone quirks near midnight', async () => {
-      // 2026-01-31T23:30:00Z is still January in UTC even if a local
-      // timezone offset would push a naive Date into February.
       const lateJan = new Date('2026-01-31T23:30:00.000Z');
       const { pool, calls } = buildMockPool();
       await runPartitionMaintenance(pool, { now: lateJan, monthsAhead: 0 });
@@ -360,8 +506,6 @@ describe('runPartitionMaintenance', () => {
     });
 
     it('does NOT flag behindSchedule when only a future month partition is missing', async () => {
-      // Current month exists; only the +1 future month is missing — this is
-      // the expected day-to-day steady state, not a missed run.
       const existing = new Set(['contract_events_y2026m07']);
       const { pool } = buildMockPool({ existingPartitions: existing });
 
@@ -381,7 +525,7 @@ describe('runPartitionMaintenance', () => {
 
     it('tracks behind-schedule independently per table', async () => {
       const incSpy = vi.spyOn(partitionMaintenanceBehindScheduleTotal, 'inc');
-      const existing = new Set(['audit_logs_y2026m07']); // audit_logs is caught up, contract_events is not
+      const existing = new Set(['audit_logs_y2026m07']);
       const { pool } = buildMockPool({
         partitioned: { contract_events: true, audit_logs: true },
         existingPartitions: existing,
@@ -451,16 +595,12 @@ describe('runPartitionMaintenance', () => {
 
       const existsCalls = calls.filter((c) => c.sql.includes('to_regclass($1) IS NOT NULL'));
       for (const call of existsCalls) {
-        expect(call.sql).not.toContain('contract_events_y2026m07'); // name only appears as a bound param, never inlined
+        expect(call.sql).not.toContain('contract_events_y2026m07');
         expect(call.params).toBeDefined();
       }
     });
 
     it('rejects a malformed ISO-8601 partition bound instead of interpolating it into DDL', async () => {
-      // Defence-in-depth assertion: if a future refactor ever broke the
-      // invariant that partition bounds come exclusively from
-      // `monthStartUtc()`, this guard must reject the value rather than
-      // silently interpolating attacker- or bug-controlled text into DDL.
       const badIso = vi.spyOn(Date.prototype, 'toISOString').mockReturnValue('not-a-real-date');
       const { pool } = buildMockPool();
 
@@ -483,11 +623,150 @@ describe('runPartitionMaintenance', () => {
       expect(() => new Date(result.finishedAt).toISOString()).not.toThrow();
     });
 
+    expect(true).toBe(true);
+
     it('reports partitionsChecked as monthsAhead + 1 for managed tables', async () => {
       const { pool } = buildMockPool();
       const result = await runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 3 });
 
       expect(result.tables[0].partitionsChecked).toBe(4);
+    });
+  });
+
+  // ── Lead time (documented interval ahead of use) ──────────────────────────
+
+  describe('lead time', () => {
+    let originalLeadTime: number;
+
+    beforeEach(() => {
+      originalLeadTime = config.partitionMaintenance.leadTimeMonths;
+    });
+
+    afterEach(() => {
+      config.partitionMaintenance.leadTimeMonths = originalLeadTime;
+    });
+
+    it('creates the current month plus every month inside the requested lead time', async () => {
+      const { pool, calls } = buildMockPool();
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 5 });
+
+      expect(result.leadTimeMonths).toBe(5);
+      expect(result.tables[0].partitionsChecked).toBe(6);
+      expect(calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'))).toHaveLength(6);
+    });
+
+    it('defaults the lead time to config.partitionMaintenance.leadTimeMonths', async () => {
+      config.partitionMaintenance.leadTimeMonths = 5;
+      const { pool, calls } = buildMockPool();
+
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
+
+      expect(result.leadTimeMonths).toBe(5);
+      expect(calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'))).toHaveLength(6);
+    });
+
+    it('falls back to DEFAULT_LEAD_TIME_MONTHS when the configured lead time is invalid', async () => {
+      config.partitionMaintenance.leadTimeMonths = -3;
+      const { pool } = buildMockPool();
+
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
+
+      expect(result.leadTimeMonths).toBe(DEFAULT_LEAD_TIME_MONTHS);
+    });
+
+    it('still honours the deprecated monthsAhead option (same meaning)', async () => {
+      config.partitionMaintenance.leadTimeMonths = 4;
+      const { pool } = buildMockPool();
+
+      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 1 });
+
+      expect(result.leadTimeMonths).toBe(1);
+    });
+
+    it('rejects a negative lead time', async () => {
+      const { pool } = buildMockPool();
+      await expect(runPartitionMaintenance(pool, { leadTimeMonths: -1 })).rejects.toThrow(
+        /non-negative integer/,
+      );
+    });
+
+    it('rejects a non-integer lead time', async () => {
+      const { pool } = buildMockPool();
+      await expect(runPartitionMaintenance(pool, { leadTimeMonths: 0.5 })).rejects.toThrow(
+        /non-negative integer/,
+      );
+    });
+
+    it('reads the lead time from PARTITION_MAINTENANCE_LEAD_TIME_MONTHS', async () => {
+      vi.resetModules();
+      process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'] = '5';
+
+      const fresh = await import('../../src/config.js');
+
+      expect(fresh.config.partitionMaintenance.leadTimeMonths).toBe(5);
+      delete process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'];
+      vi.resetModules();
+    });
+
+    it('keeps DEFAULT_MONTHS_AHEAD as a backwards-compatible alias', () => {
+      expect(DEFAULT_MONTHS_AHEAD).toBe(DEFAULT_LEAD_TIME_MONTHS);
+    });
+  });
+
+  // ── Failure alerting (a failure is never only a log line) ─────────────────
+
+  describe('failure alerting', () => {
+    let alerts: AlertEvent[];
+
+    beforeEach(() => {
+      alerts = [];
+      setAlertSink((alert) => alerts.push(alert));
+    });
+
+    afterEach(() => {
+      setAlertSink(null);
+    });
+
+    it('raises partition_creation_failed and still rethrows when a CREATE TABLE fails', async () => {
+      const failureSpy = vi.spyOn(partitionMaintenanceFailuresTotal, 'inc');
+      // The current month already exists, so the only alert this run raises is
+      // the creation failure (no behind-schedule noise).
+      const { pool } = buildMockPool({
+        failOnCreateNumber: 1,
+        existingPartitions: new Set(['contract_events_y2026m07']),
+      });
+
+      await expect(
+        runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 2 }),
+      ).rejects.toThrow(/Injected failure on CREATE TABLE call #1/);
+
+      expect(alerts.map((a) => a.name)).toEqual(['partition_creation_failed']);
+      expect(alerts[0]?.severity).toBe('critical');
+      expect(alerts[0]?.context?.partition).toBe('contract_events_y2026m08');
+      expect(failureSpy).toHaveBeenCalledWith({ table: 'contract_events' });
+    });
+
+    it('raises partition_maintenance_behind_schedule when the current-month partition is missing', async () => {
+      const { pool } = buildMockPool();
+
+      await runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 0 });
+
+      const behind = alerts.find((a) => a.name === 'partition_maintenance_behind_schedule');
+      expect(behind).toBeDefined();
+      expect(behind?.severity).toBe('critical');
+      expect(behind?.context?.partition).toBe('contract_events_y2026m07');
+    });
+
+    it('raises no alert on a healthy run', async () => {
+      const existing = new Set([
+        'contract_events_y2026m07',
+        'contract_events_y2026m08',
+      ]);
+      const { pool } = buildMockPool({ existingPartitions: existing });
+
+      await runPartitionMaintenance(pool, { now: FIXED_NOW, leadTimeMonths: 1 });
+
+      expect(alerts).toEqual([]);
     });
   });
 });

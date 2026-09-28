@@ -23,6 +23,8 @@ export interface EnhancedRetryPolicy extends WebhookRetryPolicy {
   deadLetterAfterMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerResetMs?: number;
+  /** Previous delay in ms, used for decorrelated jitter calculation. */
+  previousDelayMs?: number;
 }
 
 export interface RetrySchedule {
@@ -95,12 +97,17 @@ export function calculateNextRetryTime(
   attemptNumber: number,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
   now: number = Date.now(),
+  previousDelayMs?: number
 ): number {
   if (attemptNumber >= policy.maxAttempts) return 0;
   const delayMs = calculateNextRetryDelay(attemptNumber, {
     baseDelayMs: policy.initialBackoffMs,
     maxDelayMs: policy.maxBackoffMs,
     maxAttempts: policy.maxAttempts,
+    jitterAlgorithm: policy.jitterAlgorithm ?? 'full',
+    jitterPercent: policy.jitterPercent,
+    random: policy.random,
+    previousDelayMs: previousDelayMs ?? policy.previousDelayMs,
   });
   return now + delayMs;
 }
@@ -112,14 +119,26 @@ export function generateRetrySchedule(
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
   now: number = Date.now(),
 ): RetrySchedule[] {
-  return Array.from({ length: policy.maxAttempts }, (_, i) => {
+  const schedule: RetrySchedule[] = [];
+  let previousDelayMs: number | undefined;
+  const algorithm = policy.jitterAlgorithm ?? 'full';
+  for (let i = 0; i < policy.maxAttempts; i++) {
     const delayMs = calculateNextRetryDelay(i, {
       baseDelayMs: policy.initialBackoffMs,
       maxDelayMs: policy.maxBackoffMs,
       maxAttempts: policy.maxAttempts,
+      jitterAlgorithm: algorithm,
+      jitterPercent: policy.jitterPercent,
+      random: policy.random,
+      previousDelayMs,
     });
-    return { attemptNumber: i + 1, delayMs, retryAt: now + delayMs };
-  });
+    schedule.push({ attemptNumber: i + 1, delayMs, retryAt: now + delayMs });
+    // For decorrelated jitter, track the actual delay for the next iteration
+    if (algorithm === 'decorrelated') {
+      previousDelayMs = delayMs;
+    }
+  }
+  return schedule;
 }
 
 /** Attach retry metadata to an outbox payload and return the next retry time. */
@@ -234,10 +253,18 @@ export function countsTowardCircuitBreaker(
 
 /** Return a human-readable summary of the retry policy (for logging). */
 export function formatRetryPolicy(policy: EnhancedRetryPolicy): string {
+  const jitterAlgo = policy.jitterAlgorithm;
+  let jitterStr: string;
+  if (jitterAlgo === undefined) {
+    // Backward-compatible format for default policy
+    jitterStr = `${policy.jitterPercent}%`;
+  } else {
+    jitterStr = `${jitterAlgo}${policy.jitterPercent !== undefined ? ` ${policy.jitterPercent}%` : ''}`;
+  }
   const base =
     `max_attempts=${policy.maxAttempts}, initial_backoff=${policy.initialBackoffMs}ms, ` +
     `multiplier=${policy.backoffMultiplier}x, max_backoff=${policy.maxBackoffMs}ms, ` +
-    `jitter=decorrelated, timeout=${policy.timeoutMs}ms`;
+    `jitter=${jitterStr}, timeout=${policy.timeoutMs}ms`;
 
   const extras: string[] = [];
   if (policy.deadLetterAfterMs) extras.push(`dlq_after=${policy.deadLetterAfterMs}ms`);
@@ -267,6 +294,7 @@ export interface WebhookDeliveryGateDeps {
   rateLimiter?: IWebhookRateLimiter;
   circuitBreakerStore?: WebhookCircuitBreakerStore;
   rateLimitConfig?: RateLimitConfig;
+  rateLimitDimensions?: { tenant: string; endpoint: string; outcome: string; weight: number };
 }
 
 export interface WebhookDeliveryGateResult {
@@ -285,19 +313,18 @@ function augmentPayloadWithRetry(payload: unknown, attemptNumber: number): unkno
   base['_webhookRetry'] = { attemptNumber };
   return base;
 }
-
 /**
  * Evaluate rate-limit and circuit-breaker gates before an outbound webhook attempt.
  */
 export async function checkWebhookDeliveryGate(
-  consumerUrl: string,
+  consumerKey: string,
   policy: EnhancedRetryPolicy = DEFAULT_RETRY_POLICY,
   deps: WebhookDeliveryGateDeps = {},
   now: number = Date.now()
 ): Promise<WebhookDeliveryGateResult> {
   const circuitBreakerStore = deps.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
 
-  const breaker = await circuitBreakerStore.checkAndClaimAttempt(consumerUrl, policy, now);
+  const breaker = await circuitBreakerStore.checkAndClaimAttempt(consumerKey, policy, now);
   if (!breaker.allowed) {
     return {
       canDeliver: false,
@@ -308,7 +335,9 @@ export async function checkWebhookDeliveryGate(
   }
 
   if (deps.rateLimiter && deps.rateLimitConfig) {
-    const limit = await deps.rateLimiter.checkLimit(consumerUrl, deps.rateLimitConfig);
+    const dimensions = deps.rateLimitDimensions ?? { tenant: 'default', endpoint: consumerKey, outcome: 'first_attempt', weight: 1 };
+    const rlConfig = { ...deps.rateLimitConfig, weight: dimensions.weight };
+    const limit = await deps.rateLimiter.checkLimit(dimensions, rlConfig);
     if (!limit.canAttempt) {
       return {
         canDeliver: false,
@@ -336,11 +365,25 @@ export async function attemptWebhookDeliveryWithRateLimit(
 ): Promise<WebhookOutboxRetryPlan & { attempt?: WebhookDeliveryAttempt }> {
   const policy = input.policy ?? DEFAULT_RETRY_POLICY;
   const now = input.now ?? Date.now();
-  // consumerUrl is optional on the input but is the rate-limit and
-  // circuit-breaker key; fall back to the stream id so callers that omit it
-  // still get per-stream isolation rather than a shared global bucket.
+  // We bound rate limiting by tenant, endpoint, and delivery outcome.
+  // Extract tenant from payload if available, else fallback to streamId.
+  const payloadObj = typeof input.payload === 'object' && input.payload !== null ? input.payload as Record<string, unknown> : {};
+  const tenant = (typeof payloadObj['tenant_id'] === 'string' ? payloadObj['tenant_id'] : null) ?? 
+                 (typeof payloadObj['tenantId'] === 'string' ? payloadObj['tenantId'] : null) ?? 
+                 input.streamId;
+  const endpoint = input.consumerUrl ?? 'unknown_endpoint';
+  const isRetry = input.attemptNumber > 1;
+  const outcome = isRetry ? 'retry' : 'first_attempt';
+  const weight = isRetry ? input.attemptNumber : 1;
+  
+  const dimensions = { tenant, endpoint, outcome, weight };
+  
+  // Circuit breaker still uses consumerUrl as key for endpoint-wide protection
   const consumerKey = input.consumerUrl ?? input.streamId;
-  const gate = await checkWebhookDeliveryGate(consumerKey, policy, deps, now);
+  const gate = await checkWebhookDeliveryGate(consumerKey, policy, {
+    ...deps,
+    rateLimitDimensions: dimensions
+  }, now);
 
   if (!gate.canDeliver) {
     return {

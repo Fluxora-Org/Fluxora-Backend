@@ -5,7 +5,7 @@ Get the contract event indexer running in 5 minutes.
 ## Prerequisites
 
 - Docker & Docker Compose (recommended)
-- OR Node.js 18+ and PostgreSQL 12+
+- OR Node.js 20.20.2 (see `.nvmrc`) and PostgreSQL 12+
 
 ## Option 1: Docker (Recommended)
 

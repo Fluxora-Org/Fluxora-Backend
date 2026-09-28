@@ -5,23 +5,26 @@ import request from 'supertest';
 import { vi } from 'vitest';
 import { WebSocket } from 'ws';
 
-vi.mock('../src/ws/messageHandler', () => ({
-  isValidStellarPublicKey: (value: string) => value.startsWith('G'),
-  parseHandshakeSubscriptionFilter: () => ({ ok: true, filter: null }),
-  parseWsClientMessage: (message: { type?: string; streamId?: string; stream_id?: string }) => {
-    if (message.type === 'subscribe' || message.type === 'unsubscribe') {
-      return {
-        ok: true,
-        message: {
-          type: message.type,
-          filter: { streamId: message.streamId ?? message.stream_id },
-        },
-      };
-    }
-
-    return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${message.type}` };
-  },
-}));
+vi.mock('../src/ws/messageHandler', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/ws/messageHandler')>();
+  return {
+    ...actual,
+    isValidStellarPublicKey: (value: string) => value.startsWith('G'),
+    parseHandshakeSubscriptionFilter: () => ({ ok: true, filter: null }),
+    parseWsClientMessage: (message: { type?: string; streamId?: string; stream_id?: string }) => {
+      if (message.type === 'subscribe' || message.type === 'unsubscribe') {
+        return {
+          ok: true,
+          message: {
+            type: message.type,
+            filter: { streamId: message.streamId ?? message.stream_id },
+          },
+        };
+      }
+      return { ok: false, code: 'UNKNOWN_TYPE', message: `Unknown message type: ${message.type}` };
+    },
+  };
+});
 
 import {
   correlationIdMiddleware,
@@ -34,6 +37,7 @@ import { correlationStore, getCorrelationId } from '../src/tracing/middleware';
 import { StreamHub } from '../src/ws/hub';
 import { webhookDispatcher } from '../src/webhooks/dispatcher';
 import { logger } from '../src/lib/logger.js';
+import { stubOutboundWebhookTransport } from './helpers/webhookTransport';
 
 function createCorrelationIdTestApp() {
   const app = express();
@@ -288,23 +292,16 @@ describe('correlationId middleware', () => {
 describe('correlation ID propagation across transports', () => {
   let server: http.Server;
   let port: number;
-  let originalFetch: typeof global.fetch | undefined;
 
   beforeEach(async () => {
     server = app.listen(0);
     await once(server, 'listening');
     port = (server.address() as { port: number }).port;
-    originalFetch = global.fetch;
   });
 
   afterEach(async () => {
     server.close();
     await once(server, 'close');
-    if (originalFetch) {
-      global.fetch = originalFetch;
-    } else {
-      delete (global as any).fetch;
-    }
   });
 
   function connect(port: number, headers: Record<string, string> = {}): Promise<WebSocket> {
@@ -373,6 +370,7 @@ describe('correlation ID propagation across transports', () => {
 
   it('attaches the initiating correlation ID to websocket broadcast events', async () => {
     const { server: wsServer, hub, port: wsPort } = await setupWs();
+    vi.spyOn(hub as any, 'authorizeSubscriptionFilter').mockResolvedValue({ ok: true, filter: { streamId: 'stream-1' } });
 
     try {
       const clientCorrelationId = '123e4567-e89b-12d3-a456-426614174001';
@@ -416,60 +414,107 @@ describe('correlation ID propagation across transports', () => {
   });
 
   it('includes X-Correlation-ID when dispatching outgoing webhooks', async () => {
-    let captured: RequestInit | undefined;
-    global.fetch = (async (_url: string, options?: RequestInit) => {
-      captured = options;
-      return new Response(null, { status: 200 });
-    }) as unknown as typeof fetch;
+    const transport = stubOutboundWebhookTransport();
 
-    await correlationStore.run('webhook-corr-123', async () => {
-      const result = await webhookDispatcher.dispatch({
-        url: 'https://example.com/webhook',
-        secret: 'secret',
-        payload: JSON.stringify({ foo: 'bar' }),
-        deliveryId: 'deliv-123',
-        eventType: 'stream.created',
+    try {
+      await correlationStore.run('webhook-corr-123', async () => {
+        const result = await webhookDispatcher.dispatch({
+          url: 'https://example.com/webhook',
+          secret: 'secret',
+          payload: JSON.stringify({ foo: 'bar' }),
+          deliveryId: 'deliv-123',
+          eventType: 'stream.created',
+        });
+
+        expect(result.success).toBe(true);
       });
 
-      expect(result.success).toBe(true);
-    });
-
-    const headers = captured?.headers as Record<string, string>;
-    expect(headers[CORRELATION_ID_HEADER]).toBe('webhook-corr-123');
+      expect(transport.last().headers[CORRELATION_ID_HEADER]).toBe('webhook-corr-123');
+    } finally {
+      transport.restore();
+    }
   });
 
   it('propagates a regenerated ID to downstream webhooks after rejecting a bad inbound ID', async () => {
-    let captured: RequestInit | undefined;
+    const transport = stubOutboundWebhookTransport();
     const maliciousId = '11111111-1111-4111-8111-111111111111\nlog=forged';
     const req = { headers: { [CORRELATION_ID_HEADER]: maliciousId } } as any;
     const res = { setHeader: vi.fn() } as any;
 
-    global.fetch = (async (_url: string, options?: RequestInit) => {
-      captured = options;
-      return new Response(null, { status: 200 });
-    }) as unknown as typeof fetch;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        correlationIdMiddleware(req, res, () => {
+          void webhookDispatcher.dispatch({
+            url: 'https://example.com/webhook',
+            secret: 'secret',
+            payload: JSON.stringify({ foo: 'bar' }),
+            deliveryId: 'deliv-bad-correlation-id',
+            eventType: 'stream.created',
+          }).then((result) => {
+            expect(result.success).toBe(true);
+            resolve();
+          }, reject);
+        });
+      });
 
-    await new Promise<void>((resolve, reject) => {
-      correlationIdMiddleware(req, res, () => {
-        void webhookDispatcher.dispatch({
+      const regeneratedId = req.correlationId as string;
+      expect(regeneratedId).not.toBe(maliciousId);
+      expect(regeneratedId).not.toContain('\n');
+      expect(isValidCorrelationId(regeneratedId)).toBe(true);
+      expect(res.setHeader).toHaveBeenCalledWith(CORRELATION_ID_HEADER, regeneratedId);
+      expect(transport.last().headers[CORRELATION_ID_HEADER]).toBe(regeneratedId);
+    } finally {
+      transport.restore();
+    }
+  });
+
+  it('starts a request that schedules a job and webhook and asserts one traceable correlation chain without high-cardinality leakage', async () => {
+    const transport = stubOutboundWebhookTransport();
+    const { JobQueue, setJobQueue, getJobQueue } = await import('../src/jobs/queue');
+    const mockBoss = { send: vi.fn().mockResolvedValue('job-1') };
+    const testQueue = JobQueue.withBoss(mockBoss as any);
+    setJobQueue(testQueue);
+
+    const testApp = express();
+    testApp.use(correlationIdMiddleware);
+    testApp.post('/trigger', async (req, res) => {
+      try {
+        const corr = getCorrelationId();
+        await getJobQueue()!.send('test-job', { data: 'value' });
+        await webhookDispatcher.dispatch({
           url: 'https://example.com/webhook',
           secret: 'secret',
           payload: JSON.stringify({ foo: 'bar' }),
-          deliveryId: 'deliv-bad-correlation-id',
-          eventType: 'stream.created',
-        }).then((result) => {
-          expect(result.success).toBe(true);
-          resolve();
-        }, reject);
-      });
+          deliveryId: 'deliv-xyz',
+          eventType: 'test',
+        });
+        res.json({ correlationId: corr });
+      } catch (err) {
+        res.status(500).json({ error: String(err) });
+      }
     });
 
-    const regeneratedId = req.correlationId as string;
-    const headers = captured?.headers as Record<string, string>;
-    expect(regeneratedId).not.toBe(maliciousId);
-    expect(regeneratedId).not.toContain('\n');
-    expect(isValidCorrelationId(regeneratedId)).toBe(true);
-    expect(res.setHeader).toHaveBeenCalledWith(CORRELATION_ID_HEADER, regeneratedId);
-    expect(headers[CORRELATION_ID_HEADER]).toBe(regeneratedId);
+    try {
+      const res = await request(testApp)
+        .post('/trigger')
+        .set(CORRELATION_ID_HEADER, '123e4567-e89b-12d3-a456-426614174002');
+
+      expect(res.status).toBe(200);
+      expect(res.body.correlationId).toBe('123e4567-e89b-12d3-a456-426614174002');
+      expect(transport.last().headers[CORRELATION_ID_HEADER]).toBe(
+        '123e4567-e89b-12d3-a456-426614174002',
+      );
+      expect(mockBoss.send).toHaveBeenCalledWith(
+        'test-job',
+        {
+          __payload: { data: 'value' },
+          __correlationId: '123e4567-e89b-12d3-a456-426614174002',
+        },
+        expect.any(Object),
+      );
+    } finally {
+      setJobQueue(null);
+      transport.restore();
+    }
   });
 });

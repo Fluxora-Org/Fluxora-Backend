@@ -22,6 +22,27 @@ The spec is built from Zod schemas at startup using [`@asteasolutions/zod-to-ope
 | `bearerAuth` | HTTP Bearer (JWT) | Stream write, audit, admin routes |
 | `indexerWorkerToken` | API key (`x-indexer-worker-token` header) | Internal indexer endpoints |
 
+## Content negotiation
+
+The API only produces `application/json`. Every `/api` route is guarded by
+`requireJsonAccept` (`src/middleware/acceptNegotiation.ts`), which accepts the
+following `Accept` media ranges:
+
+| `Accept` value | Result |
+|----------------|--------|
+| `application/json` | `application/json` (default representation) |
+| `application/*+json` (e.g. `application/vnd.api+json`) | `application/json` |
+| `application/*` | `application/json` |
+| `*/*`, or no `Accept` header | `application/json` |
+| Any other value (e.g. `application/xml`) | `406 Not Acceptable` |
+
+Quality values are honoured: a range disallowed with `q=0` (for example
+`application/json;q=0` or `*/*;q=0`) is not used to satisfy the request and the
+middleware returns `406`, while a positive-but-lower quality
+(`application/json;q=0.1`) is still satisfiable. The `406 Not Acceptable`
+response and the supported media types are documented in the OpenAPI spec
+(`info.description` and the shared `406` response).
+
 ## Cursor Pagination — `GET /api/streams`
 
 ### Encoding

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { assessIndexerHealth, DEFAULT_INDEXER_STALL_THRESHOLD_MS } from '../indexer/stall.js';
 import { HealthCheckManager, type HealthStatus, type DependencyHealth } from '../config/health.js';
+import { checkInstanceReadiness } from '../health/readiness.js';
 import type { Logger } from '../config/logger.js';
 import { Config } from '../config/env.js';
 import { successResponse, errorResponse } from '../utils/response.js';
@@ -24,14 +25,13 @@ healthRouter.get('/', (req: Request, res: Response) => {
   // Return 503 during graceful shutdown.  The body uses a flat shape so
   // operators reading `/health` always see `status` at the top level.
   if (isShuttingDown()) {
-    res.status(503).json({
+    res.status(503).json(errorResponse('SERVICE_SHUTTING_DOWN', 'Service is shutting down', {
       status: 'shutting_down',
       service: 'fluxora-backend',
       network: req.app.locals.config?.stellarNetwork ?? 'unknown',
       contractAddresses: (req.app.locals.config as Config | undefined)?.contractAddresses ?? {},
       timestamp: new Date().toISOString(),
-      message: 'Service is shutting down',
-    });
+    }));
     return;
   }
 
@@ -64,9 +64,16 @@ healthRouter.get('/', (req: Request, res: Response) => {
 /**
  * GET /health/ready - Readiness probe
  *
+ * The readiness verdict comes from `checkInstanceReadiness()`
+ * (src/health/readiness.ts) — the same source the gRPC health service uses —
+ * so this route and `grpc.health.v1.Health.Check` can never disagree about
+ * the same instance.
+ *
  * Degraded classification:
  *  - All dependencies healthy → 200, status "healthy"
- *  - Any dependency degraded (high latency) → 200, status "degraded"
+ *  - Any dependency degraded within the grace period → 200, status "degraded"
+ *  - Any dependency degraded during startup, or degraded past the grace
+ *    period (high latency) → 503, status "degraded"
  *  - Any dependency unhealthy (error / timeout) → 503, status "unhealthy"
  *  - No health manager configured → 503
  *
@@ -92,45 +99,38 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
   }
 
   if (!healthManager) {
-    res.status(503).json({
-      status: 'unhealthy',
-      reason: 'Health manager not configured',
-      dependencies: {},
-    });
+    res.status(503).json(errorResponse('SERVICE_UNAVAILABLE', 'Health manager not configured', { dependencies: {} }));
     return;
   }
 
   try {
-    const report = await healthManager.checkAll();
+    // One `checkAll()` for both surfaces: the report drives the verdict and
+    // the per-dependency statuses reported here.
+    const { report, assessment } = await checkInstanceReadiness(healthManager);
+    const { ready, status, dependencies, blocking, reason } = assessment;
 
-    // Build a flat dependencies map: { [name]: HealthStatus }
-    const dependencies: Record<string, HealthStatus> = {};
-    for (const dep of report.dependencies) {
-      dependencies[dep.name] = dep.status;
-    }
-
-    if (report.status === 'unhealthy') {
+    if (!ready) {
       logger?.warn('Readiness check failed', req.correlationId, {
+        reason,
+        blocking,
         dependencies: report.dependencies.map((d: DependencyHealth) => ({
           name: d.name,
           status: d.status,
           error: d.error,
+          degradedSince: d.degradedSince,
         })),
       });
-      // 503 for unhealthy; return the same flat shape as the healthy / degraded
-      // responses so dashboards and probes can parse a single schema.
-      res.status(503).json({
-        status: report.status,
+      // 503 for unhealthy or unacceptably degraded
+      res.status(503).json(errorResponse('HEALTH_CHECK_ERROR', reason ?? 'Service is not ready', {
+        status,
         version: report.version,
         dependencies,
-      });
+      }));
       return;
     }
 
-    // "degraded" is still ready — return 200 so load balancers keep routing
-    // traffic, but signal the degraded state for observability.
     res.status(200).json({
-      status: report.status, // "healthy" | "degraded"
+      status, // "healthy" | "degraded"
       version: report.version,
       dependencies,
     });
@@ -190,7 +190,11 @@ healthRouter.get('/deployment', async (req: Request, res: Response) => {
     const indexerHealth = assessIndexerHealth();
     const report = buildDeploymentChecklistReport({ config, dependencyHealth, indexerHealth });
     const statusCode = report.status === 'fail' ? 503 : 200;
-    res.status(statusCode).json({ report });
+    if (statusCode === 503) {
+      res.status(statusCode).json(errorResponse('HEALTH_CHECK_ERROR', 'Service readiness check failed', { report }));
+    } else {
+      res.status(statusCode).json({ report });
+    }
   } catch (err) {
     logger?.error('Failed to generate deployment report', req.correlationId, {
       error: err instanceof Error ? err.message : String(err),

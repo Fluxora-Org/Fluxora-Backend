@@ -84,12 +84,21 @@ Security Properties
 | **Audit logging**          | All revocations logged with jti, TTL, and admin address         |
 
 
-Fail-Closed vs. Fail-Open
-The system uses fail-closed behavior: if Redis is unavailable, isRevoked() returns true and rejects the token.
+### Fail-Closed vs. Fail-Open
+
+The system **fails closed**: if Redis is unavailable, `isRevoked()` returns `true` and rejects the token.
+
+- `isRevoked()` (read) → **fail-closed** (rule 1 of the governing outage policy) — a false allow would admit a revoked / compromised token.
+- `revoke()` (write) → **fail-loud** (rule 3) — a revocation that did not persist must `throw JwtRevocationError`, never report success.
+
 Rationale:
-Security: Prevents compromised tokens from being accepted during an outage
-Trade-off: Reduced availability during Redis downtime
-Mitigation: Redis retry strategy (3 retries, exponential backoff) reduces transient failures
+- Security: Prevents compromised tokens from being accepted during an outage
+- Trade-off: Reduced availability during Redis downtime
+- Mitigation: Redis retry strategy (3 retries, exponential backoff) reduces transient failures
+
+> Governing rule for all Redis-backed security stores:
+> [`docs/security/redis-outage-policy.md`](./redis-outage-policy.md). Every security
+> store must derive its outage behaviour from that rule and be listed in its table.
 
 
 Testing

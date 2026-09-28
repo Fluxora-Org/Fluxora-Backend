@@ -48,8 +48,18 @@ export class FakeRedisClient implements RedisClient {
     /** Sorted-set key → (member → score) */
     private readonly sortedSets = new Map<string, SortedSetEntry>();
 
-    /** TTL store — pexpire values (ms). Stored but not enforced; tests control time. */
+    /**
+     * Recorded TTL durations (ms) per key, returned by `getTtl`. A duration is
+     * recorded for observability even though enforcement uses `expiryAt`.
+     */
     private readonly ttls = new Map<string, number>();
+
+    /**
+     * Absolute expiry deadline (ms) per key, derived from `PEXPIRE`. Enforced by
+     * `sweepExpired` so a key — and its sorted-set members — behaves like a real
+     * Redis key with a TTL: once the deadline passes the key is gone.
+     */
+    private readonly expiryAt = new Map<string, number>();
 
     /** Operations that should throw on the next call: op name → error message */
     private readonly pendingThrows = new Map<string, string>();
@@ -74,7 +84,35 @@ export class FakeRedisClient implements RedisClient {
         this.strings.clear();
         this.sortedSets.clear();
         this.ttls.clear();
+        this.expiryAt.clear();
         this.pendingThrows.clear();
+    }
+
+    /**
+     * Delete a key if its PEXPIRE deadline has passed. Called at the start of
+     * every sorted-set operation so expired keys behave as absent, matching
+     * Redis semantics.
+     */
+    private sweepExpired(key: string): void {
+        const deadline = this.expiryAt.get(key);
+        if (deadline !== undefined && Date.now() >= deadline) {
+            this.sortedSets.delete(key);
+            this.ttls.delete(key);
+            this.expiryAt.delete(key);
+        }
+    }
+
+    /**
+     * Test helper: return the most recently set PEXPIRE (ms) for a key, or
+     * undefined when the key has no recorded TTL.
+     */
+    getTtl(key: string): number | undefined {
+        return this.ttls.get(key);
+    }
+
+    /** Test helper: list every sorted-set key currently stored. */
+    getSortedSetKeys(): string[] {
+        return Array.from(this.sortedSets.keys());
     }
 
     // -----------------------------------------------------------------------
@@ -105,6 +143,7 @@ export class FakeRedisClient implements RedisClient {
     /** ZADD key [NX] score member */
     private _zadd(key: string, nx: 'NX', score: number, member: string): number {
         this.maybeThrow('zadd');
+        this.sweepExpired(key);
         const set = this.getOrCreateSet(key);
         if (nx === 'NX' && set.has(member)) {
             return 0; // NX: do not update existing member
@@ -116,6 +155,7 @@ export class FakeRedisClient implements RedisClient {
     /** ZREMRANGEBYSCORE key min max */
     private _zremrangebyscore(key: string, min: string | number, max: string | number): number {
         this.maybeThrow('zremrangebyscore');
+        this.sweepExpired(key);
         const set = this.sortedSets.get(key);
         if (!set) return 0;
         const toRemove = membersInRange(set, min, max);
@@ -128,19 +168,23 @@ export class FakeRedisClient implements RedisClient {
     /** ZCARD key */
     private _zcard(key: string): number {
         this.maybeThrow('zcard');
+        this.sweepExpired(key);
         return this.sortedSets.get(key)?.size ?? 0;
     }
 
     /** PEXPIRE key ms */
     private _pexpire(key: string, ms: number): number {
         this.maybeThrow('pexpire');
+        this.sweepExpired(key);
         this.ttls.set(key, ms);
+        this.expiryAt.set(key, Date.now() + ms);
         return 1;
     }
 
     /** ZCOUNT key min max */
     async zcount(key: string, min: string | number, max: string | number): Promise<number> {
         this.maybeThrow('zcount');
+        this.sweepExpired(key);
         const set = this.sortedSets.get(key);
         if (!set) return 0;
         return membersInRange(set, min, max).length;
@@ -167,11 +211,20 @@ export class FakeRedisClient implements RedisClient {
         return true;
     }
 
+    async incr(key: string): Promise<number> {
+        this.maybeThrow('incr');
+        const current = Number(this.strings.get(key) ?? '0');
+        const next = current + 1;
+        this.strings.set(key, String(next));
+        return next;
+    }
+
     async del(key: string): Promise<void> {
         this.maybeThrow('del');
         this.strings.delete(key);
         this.sortedSets.delete(key);
         this.ttls.delete(key);
+        this.expiryAt.delete(key);
     }
 
     async exists(key: string): Promise<boolean> {

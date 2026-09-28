@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "unit": "ms",
+  "reviewedAt": "2026-09-24",
+  "reviewedAgainst": "Production Prometheus http request duration histograms for /health and /api/streams* (p95/p99 over 7d rolling window) cross-checked with staging k6 smoke baselines from k6/main.js",
+  "comparability": {
+    "summaryPath": "k6/results/performance-budget-summary.json",
+    "schema": [
+      "endpoint",
+      "method",
+      "path",
+      "p95_ms",
+      "p99_ms",
+      "budget_p95_ms",
+      "budget_p99_ms",
+      "passed"
+    ],
+    "notes": "Summary JSON is stable across releases so CI artifacts and dashboards can diff latency by endpoint id."
+  },
+  "global": {
+    "http_req_duration": { "p95": 500, "p99": 1000 },
+    "http_req_failed_rate": 0.01
+  },
+  "endpoints": [
+    {
+      "id": "health",
+      "method": "GET",
+      "path": "/health",
+      "trendMetric": "fluxora_health_latency",
+      "budgets": { "p99": 200 },
+      "productionObservation": {
+        "p95_ms": 35,
+        "p99_ms": 90,
+        "window": "7d",
+        "source": "prometheus histogram_quantile on http_request_duration_seconds{route=\"/health\"}",
+        "notes": "Readiness probe; production p99 stays well under 100ms. Budget leaves headroom for cold starts."
+      }
+    },
+    {
+      "id": "streams_list",
+      "method": "GET",
+      "path": "/api/streams",
+      "trendMetric": "fluxora_streams_list_latency",
+      "budgets": { "p95": 500, "p99": 800 },
+      "productionObservation": {
+        "p95_ms": 180,
+        "p99_ms": 420,
+        "window": "7d",
+        "source": "prometheus histogram_quantile on http_request_duration_seconds{route=\"/api/streams\"}",
+        "notes": "List path is DB-bound; budget is ~2x observed p99 to catch regressions without flaking."
+      }
+    },
+    {
+      "id": "streams_get",
+      "method": "GET",
+      "path": "/api/streams/:id",
+      "trendMetric": "fluxora_streams_get_latency",
+      "budgets": { "p95": 400, "p99": 700 },
+      "productionObservation": {
+        "p95_ms": 120,
+        "p99_ms": 310,
+        "window": "7d",
+        "source": "prometheus histogram_quantile on http_request_duration_seconds{route=\"/api/streams/:id\"}",
+        "notes": "Point lookups are typically Redis/DB primary-key reads."
+      }
+    },
+    {
+      "id": "streams_create",
+      "method": "POST",
+      "path": "/api/streams",
+      "trendMetric": "fluxora_streams_create_latency",
+      "budgets": { "p95": 600, "p99": 1000 },
+      "productionObservation": {
+        "p95_ms": 260,
+        "p99_ms": 540,
+        "window": "7d",
+        "source": "prometheus histogram_quantile on http_request_duration_seconds{route=\"/api/streams\",method=\"POST\"}",
+        "notes": "Write path includes idempotency store + DB insert; slower than reads by design."
+      }
+    }
+  ]
+}

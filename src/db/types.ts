@@ -7,10 +7,10 @@
  * @module db/types
  */
 
-/**
- * Stream status values
- */
-export type StreamStatus = "active" | "paused" | "completed" | "cancelled";
+import type { ApiStreamStatus } from '../streams/status.js';
+import { VALID_API_TRANSITIONS } from '../streams/status.js';
+
+export type StreamStatus = ApiStreamStatus;
 
 /**
  * Stream record from the database
@@ -137,12 +137,7 @@ export const STREAM_INVARIANTS = {
   idPattern: /^stream-[a-f0-9]{64}-\d+$/,
 
   /** Valid status transitions */
-  validTransitions: {
-    active: ["paused", "completed", "cancelled"] as const,
-    paused: ["active", "cancelled"] as const,
-    completed: [] as const,
-    cancelled: [] as const,
-  },
+  validTransitions: VALID_API_TRANSITIONS,
 
   /** Amount constraints */
   amountConstraints: {
@@ -211,6 +206,36 @@ export interface ApiKeyCreated {
   createdAt: string;
 }
 
+/**
+ * Safe display projection of an API key record.
+ *
+ * This is the ONLY shape that should ever be serialised into an HTTP response.
+ * It deliberately omits `keyHash` and `salt`, which are internal credential
+ * material that must never leave the server boundary.
+ *
+ * Fields included:
+ * - `id`        — stable opaque identifier (cuid2), safe to expose
+ * - `name`      — human-readable label set at creation time
+ * - `prefix`    — first 8 chars of the raw key; sufficient for log correlation
+ * - `createdAt` — ISO-8601 creation timestamp
+ * - `rotatedAt` — ISO-8601 last-rotated timestamp, or null
+ * - `active`    — whether the key can still authenticate requests
+ * - `scopes`    — granted permission scopes
+ *
+ * Fields deliberately absent:
+ * - `keyHash`   — HMAC digest; leaking it narrows the offline brute-force surface
+ * - `salt`      — per-key random salt used to derive `keyHash`
+ */
+export interface ApiKeyView {
+  id: string;
+  name: string;
+  prefix: string;
+  createdAt: string;
+  rotatedAt: string | null;
+  active: boolean;
+  scopes: string[];
+}
+
 // ─── Stream Event Store ───────────────────────────────────────────────────────
 
 /**
@@ -223,8 +248,8 @@ export interface StreamEventRecord {
   eventId: string;
   /** Ledger sequence number */
   ledger: number;
-  /** Ledger hash for reorg detection */
-  ledgerHash: string;
+  /** Ledger hash for reorg detection; NULL for legacy rows written before the column existed */
+  ledgerHash: string | null;
   /** Soroban contract ID */
   contractId: string;
   /** Event topic (e.g. "stream.created") */

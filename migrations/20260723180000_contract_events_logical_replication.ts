@@ -17,27 +17,6 @@
  *   event table, replicating UPDATEs, DELETEs, or TRUNCATEs is disabled to minimize
  *   WAL footprint and prevent unauthorized state change broadcasts.
  *
- * PARTITION AWARENESS:
- * `contract_events` is a range-partitioned table (PARTITION BY RANGE happened_at).
- * Using `FOR TABLE contract_events` (without ONLY) ensures that INSERT changes from
- * all child partitions (e.g., `contract_events_y2026m07`, `contract_events_default`)
- * are published. The WAL decoder reports row identities using the parent table name by
- * default. If consumers need row-level routing keyed by partition, set
- * `publish_via_partition_root = false` on the slot; the default (true since PG15)
- * reports rows under the parent table identity, which simplifies consumer schema
- * management.
- *
- * PREREQUISITES (postgresql.conf):
- * - wal_level = logical         (requires server restart)
- * - max_replication_slots >= 5
- * - max_wal_senders >= 5
- *
- * OPERATIONAL SLOT MANAGEMENT:
- * This migration only creates the PUBLICATION. Attaching a replication slot is an
- * operational step performed by the consumer or an operator:
- *   SELECT pg_create_logical_replication_slot('fluxora_contract_events_slot', 'pgoutput');
- * See docs/database.md § "Logical Replication for contract_events" for the full runbook.
- *
  * ROLLBACK:
  * `down()` safely drops `fluxora_contract_events_pub` if it exists.
  */

@@ -90,10 +90,15 @@ export const DEFAULT_ERASURE_TOMBSTONE = '[REDACTED_GDPR_ERASURE]';
  * Redaction helper: Permanently redacts encrypted PII columns for matching streams
  * associated with a recipient address while preserving all financial and ledger data.
  *
- * @param queryExecutor - Database client or pool with a query method (supports transactions)
+ * Uses a single CTE to atomically update eligible rows and count held rows in one
+ * round-trip, eliminating the TOCTOU window that existed when these were two separate
+ * queries. The caller must hold an open transaction; the CTE output is read within the
+ * same statement so the hold count reflects the state at the moment of the update.
+ *
+ * @param queryExecutor - Database client (PoolClient) inside an open transaction
  * @param recipientAddress - Plaintext address target for GDPR right-to-erasure
  * @param tombstone - Tombstone value to write into address columns (default: '[REDACTED_GDPR_ERASURE]')
- * @returns Promise resolving to an object containing `{ rowsErased, rowsSkippedLegalHold }`
+ * @returns Promise resolving to `{ rowsErased, rowsSkippedLegalHold }`
  *
  * @security Uses parameterized queries ($1, $2) to prevent SQL injection.
  * Does NOT delete or alter financial columns (`amount`, `ledger`, `tx_hash`, `stream_id`, etc.).
@@ -103,31 +108,37 @@ export async function redactPiiForAddress(
   recipientAddress: string,
   tombstone: string = DEFAULT_ERASURE_TOMBSTONE,
 ): Promise<{ rowsErased: number; rowsSkippedLegalHold: number }> {
-  const updateResult = await queryExecutor.query(
-    `UPDATE streams
-        SET sender_address         = $1,
-            recipient_address      = $1,
-            sender_address_hash    = NULL,
-            recipient_address_hash = NULL
-      WHERE (recipient_address = $2 OR sender_address = $2)
-        AND COALESCE(legal_hold, FALSE) = FALSE`,
+  // Single statement: update non-held rows and count held rows atomically.
+  // The WITH clause locks the matching rows so a concurrent hold-set between
+  // the UPDATE and COUNT is not possible within the same statement snapshot.
+  const result = await queryExecutor.query(
+    `WITH updated AS (
+       UPDATE streams
+          SET sender_address         = $1,
+              recipient_address      = $1,
+              sender_address_hash    = NULL,
+              recipient_address_hash = NULL,
+              encryption_state       = 'redacted',
+              updated_at             = NOW()
+        WHERE (recipient_address = $2 OR sender_address = $2)
+          AND COALESCE(legal_hold, FALSE) = FALSE
+       RETURNING id
+     ),
+     held AS (
+       SELECT COUNT(*) AS cnt
+         FROM streams
+        WHERE (recipient_address = $2 OR sender_address = $2)
+          AND COALESCE(legal_hold, FALSE) = TRUE
+     )
+     SELECT
+       (SELECT COUNT(*) FROM updated)::int  AS rows_erased,
+       (SELECT cnt       FROM held)::int    AS rows_held`,
     [tombstone, recipientAddress],
   );
 
-  const rowsErased = updateResult.rowCount ?? 0;
-
-  const holdResult = await queryExecutor.query(
-    `SELECT COUNT(*) AS cnt
-       FROM streams
-      WHERE (recipient_address = $1 OR sender_address = $1)
-        AND legal_hold = TRUE`,
-    [recipientAddress],
-  );
-
-  const rowsSkippedLegalHold = parseInt(
-    (holdResult.rows[0] as { cnt: string } | undefined)?.cnt ?? '0',
-    10,
-  );
+  const row = result.rows[0] as { rows_erased: string | number; rows_held: string | number } | undefined;
+  const rowsErased = parseInt(String(row?.rows_erased ?? '0'), 10);
+  const rowsSkippedLegalHold = parseInt(String(row?.rows_held ?? '0'), 10);
 
   return { rowsErased, rowsSkippedLegalHold };
 }

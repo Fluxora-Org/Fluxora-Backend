@@ -71,7 +71,7 @@ describe('isEnabled', () => {
 
   it('always returns false when percentage=0', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'disabled_flag', percentage: 0 },
+      { name: 'disabled_flag', percentage: 0 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -83,7 +83,7 @@ describe('isEnabled', () => {
 
   it('always returns true when percentage=100', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'full_rollout', percentage: 100 },
+      { name: 'full_rollout', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -94,7 +94,7 @@ describe('isEnabled', () => {
 
   it('is deterministic: same requester always gets same decision', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'test_flag', percentage: 50 },
+      { name: 'test_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -110,7 +110,7 @@ describe('isEnabled', () => {
 
   it('distributes ~50% for percentage=50 across 1000 requesters', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'half_rollout', percentage: 50 },
+      { name: 'half_rollout', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -125,8 +125,8 @@ describe('isEnabled', () => {
 
   it('different flags get independent buckets for same requester', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'flag_a', percentage: 50 },
-      { name: 'flag_b', percentage: 50 },
+      { name: 'flag_a', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'flag_b', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -147,7 +147,7 @@ describe('isEnabled', () => {
 
   it('handles anonymous requesterId gracefully', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'anon_flag', percentage: 50 },
+      { name: 'anon_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -174,7 +174,7 @@ describe('reloadFlags', () => {
 
     // Add the flag
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'new_flag', percentage: 100 },
+      { name: 'new_flag', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     reloadFlags();
     expect(isEnabled('new_flag', 'user')).toBe(true);
@@ -182,14 +182,14 @@ describe('reloadFlags', () => {
 
   it('picks up percentage changes after reload', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'rollout_flag', percentage: 0 },
+      { name: 'rollout_flag', percentage: 0 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
     expect(isEnabled('rollout_flag', 'user-1')).toBe(false);
 
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'rollout_flag', percentage: 100 },
+      { name: 'rollout_flag', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     reloadFlags();
     expect(isEnabled('rollout_flag', 'user-1')).toBe(true);
@@ -197,7 +197,7 @@ describe('reloadFlags', () => {
 
   it('returns the new flag map', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'returned_flag', percentage: 75, description: 'Test flag' },
+      { name: 'returned_flag', percentage: 75, default: false, owner: 'test', removalDate: '2099-01-01', description: 'Test flag'  },
     ]);
     const { reloadFlags } = await import('../../src/config/featureFlags.js');
     const map = reloadFlags();
@@ -213,7 +213,7 @@ describe('reloadFlags', () => {
   });
 
   it('parses object-form flags (not-array JSON is valid)', async () => {
-    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify({ percentage: 100, enabled: 50 });
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify({ percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', enabled: 50  });
     const { reloadFlags, getFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
     expect(getFlags().size).toBe(2);
@@ -223,8 +223,8 @@ describe('reloadFlags', () => {
 
   it('skips flag entries with missing name', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { percentage: 100 },
-      { name: 'valid_flag', percentage: 50 },
+      { percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'valid_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { reloadFlags, getFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -234,8 +234,8 @@ describe('reloadFlags', () => {
 
   it('skips flag entries with out-of-range percentage', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'bad_flag', percentage: 150 },
-      { name: 'ok_flag', percentage: 50 },
+      { name: 'bad_flag', percentage: 150 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'ok_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { reloadFlags, getFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -245,7 +245,7 @@ describe('reloadFlags', () => {
 
   it('loads object-form flag definitions', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify({
-      object_flag: { percentage: 100, description: 'Object style' },
+      object_flag: { percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', description: 'Object style'  },
       shorthand_flag: 100,
     });
     const { isEnabled, reloadFlags, getFlags } = await import('../../src/config/featureFlags.js');
@@ -266,8 +266,8 @@ describe('parseFlagsJson', () => {
   it('parses a simple valid array and returns exact map contents', async () => {
     const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
     const result = parseFlagsJson(JSON.stringify([
-      { name: 'flag_a', percentage: 25, description: 'First flag' },
-      { name: 'flag_b', percentage: 75 },
+      { name: 'flag_a', percentage: 25, default: false, owner: 'test', removalDate: '2099-01-01', description: 'First flag'  },
+      { name: 'flag_b', percentage: 75 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]));
     expect(result.size).toBe(2);
     expect(result.get('flag_a')).toEqual({
@@ -284,16 +284,16 @@ describe('parseFlagsJson', () => {
   it('survives mixed valid/invalid entries and retains only the valid ones', async () => {
     const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
     const result = parseFlagsJson(JSON.stringify([
-      { name: 'valid_flag', percentage: 50 },
-      { percentage: 50 },
+      { name: 'valid_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
       { name: '', percentage: 50 },
-      { name: '  ', percentage: 50 },
-      { name: 'negative_pct', percentage: -1 },
-      { name: 'over_100', percentage: 101 },
-      { name: 'null_pct', percentage: null },
-      { name: 'string_pct', percentage: '50' },
-      { name: 'nan_pct', percentage: NaN },
-      { name: 'valid_flag_2', percentage: 100 },
+      { name: '  ', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'negative_pct', percentage: -1 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'over_100', percentage: 101 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'null_pct', percentage: null , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'string_pct', percentage: '50' , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'nan_pct', percentage: NaN , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'valid_flag_2', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]));
     expect(result.size).toBe(2);
     expect(result.has('valid_flag')).toBe(true);
@@ -305,10 +305,10 @@ describe('parseFlagsJson', () => {
   it('accepts boundary percentage 0 and 100 without skipping', async () => {
     const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
     const result = parseFlagsJson(JSON.stringify([
-      { name: 'boundary_0', percentage: 0 },
-      { name: 'boundary_100', percentage: 100 },
-      { name: 'subzero', percentage: -0.1 },
-      { name: 'over100', percentage: 100.1 },
+      { name: 'boundary_0', percentage: 0 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'boundary_100', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'subzero', percentage: -0.1 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'over100', percentage: 100.1 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]));
     expect(result.size).toBe(2);
     expect(result.has('boundary_0')).toBe(true);
@@ -322,9 +322,9 @@ describe('parseFlagsJson', () => {
   it('applies last-wins semantics for duplicate flag names', async () => {
     const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
     const result = parseFlagsJson(JSON.stringify([
-      { name: 'duplicate_flag', percentage: 10, description: 'First' },
-      { name: 'duplicate_flag', percentage: 90, description: 'Second' },
-      { name: 'duplicate_flag', percentage: 50 },
+      { name: 'duplicate_flag', percentage: 10, default: false, owner: 'test', removalDate: '2099-01-01', description: 'First'  },
+      { name: 'duplicate_flag', percentage: 90, default: false, owner: 'test', removalDate: '2099-01-01', description: 'Second'  },
+      { name: 'duplicate_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]));
     expect(result.size).toBe(1);
     expect(result.has('duplicate_flag')).toBe(true);
@@ -335,12 +335,12 @@ describe('parseFlagsJson', () => {
   it('omits non-string description values from parsed definitions', async () => {
     const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
     const result = parseFlagsJson(JSON.stringify([
-      { name: 'with_number_desc', percentage: 25, description: 123 },
-      { name: 'with_null_desc', percentage: 25, description: null },
-      { name: 'with_object_desc', percentage: 25, description: { text: 'desc' } },
-      { name: 'with_array_desc', percentage: 25, description: ['desc'] },
-      { name: 'with_string_desc', percentage: 25, description: 'valid' },
-      { name: 'no_desc', percentage: 25 },
+      { name: 'with_number_desc', percentage: 25, default: false, owner: 'test', removalDate: '2099-01-01', description: 123  },
+      { name: 'with_null_desc', percentage: 25, default: false, owner: 'test', removalDate: '2099-01-01', description: null  },
+      { name: 'with_object_desc', percentage: 25, default: false, owner: 'test', removalDate: '2099-01-01', description: { text: 'desc'  } },
+      { name: 'with_array_desc', percentage: 25, default: false, owner: 'test', removalDate: '2099-01-01', description: ['desc']  },
+      { name: 'with_string_desc', percentage: 25, default: false, owner: 'test', removalDate: '2099-01-01', description: 'valid'  },
+      { name: 'no_desc', percentage: 25 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]));
     expect(result.size).toBe(6);
     expect(result.get('with_number_desc')?.description).toBeUndefined();
@@ -354,7 +354,7 @@ describe('parseFlagsJson', () => {
   it('parses object-form flags with exact contents', async () => {
     const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
     const result = parseFlagsJson(JSON.stringify({
-      flag_a: { percentage: 30, description: 'Object style' },
+      flag_a: { percentage: 30, default: false, owner: 'test', removalDate: '2099-01-01', description: 'Object style'  },
       flag_b: 60,
     }));
     expect(result.size).toBe(2);
@@ -400,7 +400,7 @@ describe('FEATURE_FLAGS_FILE loading', () => {
 
   it('loads flags from a JSON file', async () => {
     writeFileSync(tmpFile, JSON.stringify([
-      { name: 'file_flag', percentage: 100 },
+      { name: 'file_flag', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]));
     process.env['FEATURE_FLAGS_FILE'] = tmpFile;
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
@@ -417,11 +417,11 @@ describe('FEATURE_FLAGS_FILE loading', () => {
 
   it('FEATURE_FLAGS_JSON takes precedence over FEATURE_FLAGS_FILE', async () => {
     writeFileSync(tmpFile, JSON.stringify([
-      { name: 'file_only_flag', percentage: 100 },
+      { name: 'file_only_flag', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]));
     process.env['FEATURE_FLAGS_FILE'] = tmpFile;
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'json_flag', percentage: 100 },
+      { name: 'json_flag', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -433,7 +433,7 @@ describe('FEATURE_FLAGS_FILE loading', () => {
 describe('getFlags', () => {
   it('returns a read-only snapshot', async () => {
     process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-      { name: 'snapshot_flag', percentage: 30 },
+      { name: 'snapshot_flag', percentage: 30 , default: false, owner: 'test', removalDate: '2099-01-01' },
     ]);
     const { getFlags, reloadFlags } = await import('../../src/config/featureFlags.js');
     reloadFlags();
@@ -441,5 +441,237 @@ describe('getFlags', () => {
     expect(flags.has('snapshot_flag')).toBe(true);
     // The returned map should have the correct definition
     expect(flags.get('snapshot_flag')?.percentage).toBe(30);
+  });
+});
+
+describe('parseFlagsJson with minMigration', () => {
+  const ORIG_FLAGS_JSON = process.env['FEATURE_FLAGS_JSON'];
+
+  afterEach(() => {
+    if (ORIG_FLAGS_JSON === undefined) delete process.env['FEATURE_FLAGS_JSON'];
+    else process.env['FEATURE_FLAGS_JSON'] = ORIG_FLAGS_JSON;
+  });
+
+  it('parses minMigration from array-form flags', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'flag_a', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260728000000'  },
+      { name: 'flag_b', percentage: 75 , default: false, owner: 'test', removalDate: '2099-01-01' },
+    ]));
+    expect(result.size).toBe(2);
+    expect(result.get('flag_a')?.minMigration).toBe('20260728000000');
+    expect(result.get('flag_b')?.minMigration).toBeUndefined();
+  });
+
+  it('parses minMigration from object-form flags', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify({
+      flag_a: { percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260623000000'  },
+    }));
+    expect(result.get('flag_a')?.minMigration).toBe('20260623000000');
+  });
+
+  it('skips non-string minMigration values', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'flag_num', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: 123  },
+      { name: 'flag_null', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: null  },
+      { name: 'flag_obj', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: { v: 1  } },
+      { name: 'flag_empty', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '   '  },
+      { name: 'flag_valid', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260728000000'  },
+    ]));
+    expect(result.size).toBe(5);
+    expect(result.get('flag_num')?.minMigration).toBeUndefined();
+    expect(result.get('flag_null')?.minMigration).toBeUndefined();
+    expect(result.get('flag_obj')?.minMigration).toBeUndefined();
+    expect(result.get('flag_empty')?.minMigration).toBeUndefined();
+    expect(result.get('flag_valid')?.minMigration).toBe('20260728000000');
+  });
+
+  it('trims whitespace from minMigration strings', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(JSON.stringify([
+      { name: 'flag', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '  20260728000000  '  },
+    ]));
+    expect(result.get('flag')?.minMigration).toBe('20260728000000');
+  });
+});
+
+describe('checkSchemaCompatibility', () => {
+  it('returns empty map when no flags have minMigration', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_a', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'flag_b', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(0);
+  });
+
+  it('returns empty map when latestMigration satisfies minMigration', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_old', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+      { name: 'flag_same', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260728000000'  },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(0);
+  });
+
+  it('flags minMigration that exceeds latestMigration as incompatible', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_future', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
+      { name: 'flag_ok', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(1);
+    expect(incompatible.has('flag_future')).toBe(true);
+    expect(incompatible.has('flag_ok')).toBe(false);
+  });
+
+  it('treats null latestMigration as incompatible with all minMigration flags', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_a', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+      { name: 'flag_b', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260728000000'  },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, null);
+    expect(incompatible.size).toBe(2);
+    expect(incompatible.has('flag_a')).toBe(true);
+    expect(incompatible.has('flag_b')).toBe(true);
+  });
+
+  it('uses lexicographic comparison for migration ordering', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'flag_early', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601'  },
+      { name: 'flag_late', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260701'  },
+    ]));
+    // '20260615' sorts between '20260601' and '20260701'
+    const incompatible = checkSchemaCompatibility(flags, '20260615');
+    expect(incompatible.size).toBe(1);
+    expect(incompatible.has('flag_early')).toBe(false);
+    expect(incompatible.has('flag_late')).toBe(true);
+  });
+
+  it('handles mixed compatible and incompatible flags', async () => {
+    const { checkSchemaCompatibility, parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const flags = parseFlagsJson(JSON.stringify([
+      { name: 'no_req', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      { name: 'compatible', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+      { name: 'incompatible', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
+    ]));
+    const incompatible = checkSchemaCompatibility(flags, '20260728000000');
+    expect(incompatible.size).toBe(1);
+    expect(incompatible.has('incompatible')).toBe(true);
+  });
+});
+
+describe('parseFlagsJson with schema compatibility', () => {
+  const ORIG_FLAGS_JSON = process.env['FEATURE_FLAGS_JSON'];
+
+  afterEach(() => {
+    if (ORIG_FLAGS_JSON === undefined) delete process.env['FEATURE_FLAGS_JSON'];
+    else process.env['FEATURE_FLAGS_JSON'] = ORIG_FLAGS_JSON;
+  });
+
+  it('strips incompatible flags when latestMigration is provided', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_ok', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+        { name: 'flag_bad', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
+      ]),
+      '20260728000000',
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_ok')).toBe(true);
+    expect(result.has('flag_bad')).toBe(false);
+  });
+
+  it('retains all flags when latestMigration is null (no schema check)', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_a', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
+      ]),
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_a')).toBe(true);
+  });
+
+  it('retains all flags when latestMigration is undefined (no schema check)', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_a', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
+      ]),
+      undefined,
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_a')).toBe(true);
+  });
+
+  it('strips all minMigration flags on fresh DB (null latestMigration)', async () => {
+    const { parseFlagsJson } = await import('../../src/config/featureFlags.js');
+    const result = parseFlagsJson(
+      JSON.stringify([
+        { name: 'flag_req', percentage: 50, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+        { name: 'flag_no_req', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      ]),
+      null,
+    );
+    expect(result.size).toBe(1);
+    expect(result.has('flag_no_req')).toBe(true);
+    expect(result.has('flag_req')).toBe(false);
+  });
+});
+
+describe('isEnabled with schema-gated flags', () => {
+  const ORIG_FLAGS_JSON = process.env['FEATURE_FLAGS_JSON'];
+
+  beforeEach(() => {
+    delete process.env['FEATURE_FLAGS_JSON'];
+  });
+
+  afterEach(() => {
+    if (ORIG_FLAGS_JSON === undefined) delete process.env['FEATURE_FLAGS_JSON'];
+    else process.env['FEATURE_FLAGS_JSON'] = ORIG_FLAGS_JSON;
+  });
+
+  it('returns false for a flag whose minMigration has not been applied', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
+      { name: 'future_flag', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260827000000'  },
+    ]);
+    const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
+    // Reload without schema version — flag is retained but still checkable
+    reloadFlags();
+    // The flag is in the map, but its percentage is 100 so isEnabled returns true
+    expect(isEnabled('future_flag', 'user')).toBe(true);
+
+    // Now reload WITH a schema version that doesn't satisfy the requirement
+    reloadFlags('20260728000000');
+    // Flag was stripped from the map, so isEnabled returns false
+    expect(isEnabled('future_flag', 'user')).toBe(false);
+  });
+
+  it('returns true for a flag whose minMigration has been applied', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
+      { name: 'applied_flag', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+    ]);
+    const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
+    reloadFlags('20260728000000');
+    expect(isEnabled('applied_flag', 'user')).toBe(true);
+  });
+
+  it('preserves percentage behavior for compatible flags', async () => {
+    process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
+      { name: 'pct_flag', percentage: 0, default: false, owner: 'test', removalDate: '2099-01-01', minMigration: '20260601000000'  },
+    ]);
+    const { isEnabled, reloadFlags } = await import('../../src/config/featureFlags.js');
+    reloadFlags('20260728000000');
+    // Flag is compatible (migration applied) but percentage is 0
+    expect(isEnabled('pct_flag', 'user')).toBe(false);
   });
 });

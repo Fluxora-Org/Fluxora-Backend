@@ -1,81 +1,34 @@
 import { z } from 'zod';
+import {
+  DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES,
+  getWsMaxInboundMessageBytes,
+} from '../config/env.js';
 import type { StreamEventReplayFilter } from '../db/types.js';
 import { STELLAR_PUBLIC_KEY_REGEX } from '../validation/schemas.js';
+import { isValidStellarAccountAddress } from '../validation/stellarAddress.js';
 import { logger } from '../lib/logger.js';
 
 const MAX_FILTER_VALUE_LENGTH = 256;
-const MAX_INBOUND_MESSAGE_BYTES = 4_096;
-const STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE = 6 << 3;
-const STELLAR_STRKEY_LENGTH = 56;
-const STELLAR_STRKEY_DECODED_LENGTH = 35;
-const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
-const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+export function getMaxInboundMessageBytes(): number {
+  return getWsMaxInboundMessageBytes();
+}
 
 /**
  * Maximum allowed message size in bytes (issue #674).
- * Must match `MAX_MESSAGE_BYTES` in `src/ws/hub.ts` (4096).
- * Duplicated here to avoid a circular import between hub.ts and messageHandler.ts.
+ * Uses the centralized configuration if it has been initialized; otherwise this
+ * module falls back to the historical default until startup config is ready.
  */
-export const MAX_MESSAGE_BYTES = 4_096;
+export const MAX_MESSAGE_BYTES = DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES;
 
-// SEP-23 StrKey validation for Stellar Ed25519 public keys: base32 shape,
-// version byte, and CRC16-XModem checksum.
-function decodeStellarBase32(value: string): number[] | null {
-  const bytes: number[] = [];
-  let bits = 0;
-  let current = 0;
-
-  for (const char of value) {
-    const digit = STELLAR_STRKEY_ALPHABET.indexOf(char);
-    if (digit === -1) return null;
-
-    current = (current << 5) | digit;
-    bits += 5;
-
-    if (bits >= 8) {
-      bytes.push((current >> (bits - 8)) & 0xff);
-      bits -= 8;
-    }
-  }
-
-  return bytes;
-}
-
-function crc16XModem(bytes: readonly number[]): number {
-  let crc = 0;
-
-  for (const byte of bytes) {
-    crc ^= byte << 8;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc & 0x8000) !== 0 ? (crc << 1) ^ 0x1021 : crc << 1;
-      crc &= 0xffff;
-    }
-  }
-
-  return crc;
-}
-
+// SEP-23 StrKey validation for Stellar Ed25519 public keys is provided by the
+// shared, network-aware contract in ../validation/stellarAddress.js so that the
+// WebSocket boundary applies exactly the same rules as REST routes and the
+// indexer ingest path. The local alias preserves the historical function name.
 export function isValidStellarPublicKey(value: string): boolean {
-  const candidate = value.trim();
-  if (candidate.length !== STELLAR_STRKEY_LENGTH || !STELLAR_PUBLIC_KEY_REGEX.test(candidate)) {
-    return false;
-  }
-
-  const decoded = decodeStellarBase32(candidate);
-  if (decoded === null || decoded.length !== STELLAR_STRKEY_DECODED_LENGTH) {
-    return false;
-  }
-
-  if (decoded[0] !== STELLAR_ED25519_PUBLIC_KEY_VERSION_BYTE) {
-    return false;
-  }
-
-  const payload = decoded.slice(0, STELLAR_STRKEY_PAYLOAD_LENGTH);
-  const expectedChecksum = crc16XModem(payload);
-  const actualChecksum = decoded[STELLAR_STRKEY_PAYLOAD_LENGTH]!
-    | (decoded[STELLAR_STRKEY_PAYLOAD_LENGTH + 1]! << 8);
-
-  return expectedChecksum === actualChecksum;
+  // The shared validator is strict about surrounding whitespace (addresses are
+  // exactly 56 chars), whereas this boundary historically tolerated trailing
+  // spaces; preserve that tolerance by trimming before delegating.
+  return isValidStellarAccountAddress(value.trim());
 }
 
 const streamIdSchema = z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH);
@@ -240,19 +193,23 @@ function validationMessage(issues: z.ZodIssue[]): string {
  * @param raw Parsed JSON value from the client frame.
  * @returns The normalized WebSocket client message or a validation error.
  */
-export function validateWebSocketMessage(data: unknown, correlationId?: string): WsMessageParseResult {
+export function validateWebSocketMessage(
+  data: unknown,
+  correlationId?: string,
+  maxInboundMessageBytes = getMaxInboundMessageBytes(),
+): WsMessageParseResult {
   if (typeof data !== 'string') {
     logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'not_string' });
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Message must be a string' };
   }
 
   const byteLength = Buffer.byteLength(data, 'utf8');
-  if (byteLength > MAX_INBOUND_MESSAGE_BYTES) {
-    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'payload_too_large', byteLength });
+  if (byteLength > maxInboundMessageBytes) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'payload_too_large', byteLength, maxInboundMessageBytes });
     return {
       ok: false,
       code: 'INVALID_MESSAGE',
-      message: `Message exceeds ${MAX_INBOUND_MESSAGE_BYTES} bytes (got ${byteLength})`,
+      message: `Message exceeds ${maxInboundMessageBytes} bytes (got ${byteLength})`,
     };
   }
 
@@ -264,18 +221,23 @@ export function validateWebSocketMessage(data: unknown, correlationId?: string):
     return { ok: false, code: 'INVALID_MESSAGE', message: 'Invalid JSON' };
   }
 
-  return parseWsClientMessage(parsed, correlationId);
+  return parseWsClientMessage(parsed, correlationId, maxInboundMessageBytes);
 }
 
-export function parseWsClientMessage(raw: unknown, correlationId?: string): WsMessageParseResult {
+export function parseWsClientMessage(
+  raw: unknown,
+  correlationId?: string,
+  maxInboundMessageBytes = getMaxInboundMessageBytes(),
+): WsMessageParseResult {
   // Reject oversized payloads before any parsing (issue #674)
   const rawString = typeof raw === 'string' ? raw : JSON.stringify(raw);
-  if (rawString && rawString.length > MAX_MESSAGE_BYTES) {
-    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'oversized_payload', size: rawString.length });
-    return { 
-      ok: false, 
-      code: 'INVALID_MESSAGE', 
-      message: `Message size ${rawString.length} exceeds maximum ${MAX_MESSAGE_BYTES} bytes` 
+  const byteLength = rawString ? Buffer.byteLength(rawString, 'utf8') : 0;
+  if (byteLength > maxInboundMessageBytes) {
+    logger.warn('ws_envelope_reject', correlationId, { code: 'INVALID_MESSAGE', reason: 'oversized_payload', byteLength, maxInboundMessageBytes });
+    return {
+      ok: false,
+      code: 'INVALID_MESSAGE',
+      message: `Message size ${byteLength} exceeds maximum ${maxInboundMessageBytes} bytes`,
     };
   }
 

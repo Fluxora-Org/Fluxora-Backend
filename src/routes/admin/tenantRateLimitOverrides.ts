@@ -196,6 +196,26 @@ tenantRateLimitOverridesRouter.post(
         return;
       }
 
+      // A ceiling breach is a business-rule refusal surfaced by the service as
+      // a 422.  Record the attempt with the tenant identity so the rejection is
+      // auditable alongside successful mutations.
+      if (err instanceof ApiError && err.statusCode === 422) {
+        logger.warn('Tenant rate-limit override request rejected', requestId, {
+          operation: 'create',
+          outcome: 'ceiling_exceeded',
+          keyId,
+        });
+        res.status(422).json(
+          errorResponse(
+            err.code ?? 'UNPROCESSABLE_ENTITY',
+            err.message,
+            err.details,
+            requestId,
+          ),
+        );
+        return;
+      }
+
       if (respondToTemporaryFailure(err, 'create', requestId, res)) return;
       throw err;
     }

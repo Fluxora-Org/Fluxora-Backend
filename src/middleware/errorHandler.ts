@@ -1,13 +1,27 @@
 import type { Request, Response, NextFunction } from 'express';
 import { DecimalSerializationError } from '../serialization/decimal.js';
-import { SerializationLogger, error as logError } from '../utils/logger.js';
+import { SerializationLogger, error as logError } from '../lib/logger.js';
 import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
-import { ApiError, ApiErrorCode } from '../errors.js';
+import { ApiError, ApiErrorCode, toApiErrorCode } from '../errors.js';
 import { getActiveTraceSpanIds } from '../tracing/hooks.js';
+import { RpcFallbackExhaustedError } from '../services/stellar-rpc.js';
 
-export { ApiError, ApiErrorCode } from '../errors.js';
+export {
+  ApiError,
+  ApiErrorCode,
+  notFound,
+  validationError,
+  conflictError,
+  serviceUnavailable,
+  unauthorized,
+  forbidden,
+  payloadTooLarge,
+  tooManyRequests,
+  requestTimeout,
+  gatewayTimeout,
+} from '../errors.js';
 
 export interface ApiErrorResponse {
   success: false;
@@ -37,8 +51,34 @@ export function errorHandler(
   }
 
   if (err instanceof QueryTimeoutError) {
+    logError('Query timeout handled', {
+      errorName: err.name,
+      errorMessage: err.message,
+      stack: err.stack,
+      requestId,
+      ...traceSpanIds,
+    });
     res.status(504).json(
       errorResponse(ApiErrorCode.GATEWAY_TIMEOUT, 'Query timed out', undefined, requestId)
+    );
+    return;
+  }
+
+  if (err instanceof RpcFallbackExhaustedError) {
+    logError('Stellar RPC fallback cache exhausted', {
+      operation: err.operation,
+      ageMs: err.ageMs,
+      maxAgeMs: err.maxAgeMs,
+      requestId,
+      ...traceSpanIds,
+    });
+    res.status(503).json(
+      errorResponse(
+        ApiErrorCode.SERVICE_UNAVAILABLE,
+        'Stellar RPC is unavailable and the last-known-good data is too stale to serve',
+        { operation: err.operation, ageMs: err.ageMs, maxAgeMs: err.maxAgeMs },
+        requestId,
+      ),
     );
     return;
   }
@@ -48,7 +88,7 @@ export function errorHandler(
     res.status(400).json(
       errorResponse(
         ApiErrorCode.DECIMAL_ERROR,
-        err.message,
+        'Invalid decimal value',
         { decimalErrorCode: err.code, field: err.field },
         requestId
       )
@@ -56,23 +96,30 @@ export function errorHandler(
     return;
   }
 
-  if (err instanceof ApiError) {
-    logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId, ...traceSpanIds });
+  if (err instanceof ApiError || (err && typeof (err as ApiError).statusCode === 'number')) {
+    const apiErr = err as ApiError;
+    logError(`API error: ${apiErr.message}`, { code: apiErr.code, statusCode: apiErr.statusCode, details: apiErr.details, requestId, ...traceSpanIds });
 
-    if (err.expose) {
-      res.status(err.statusCode).json(
-        errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
+    if (apiErr.expose) {
+      res.status(apiErr.statusCode).json(
+        errorResponse(apiErr.code ?? ApiErrorCode.INTERNAL_ERROR, apiErr.message, apiErr.details, requestId)
       );
     } else {
-      res.status(err.statusCode).json({
-        success: false,
-        message: 'Internal server error',
-      });
+      res.status(err.statusCode).json(
+        errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId)
+      );
     }
     return;
   }
 
   if ((err as { type?: string }).type === 'entity.too.large') {
+    logError('Request body exceeded configured size limit', {
+      errorName: err.name,
+      errorMessage: err.message,
+      stack: err.stack,
+      requestId,
+      ...traceSpanIds,
+    });
     res.status(413).json(
       errorResponse(
         ApiErrorCode.PAYLOAD_TOO_LARGE,
@@ -86,6 +133,13 @@ export function errorHandler(
 
   // express.json() throws SyntaxError on malformed bodies — surface as 400.
   if (err instanceof SyntaxError && (err as SyntaxError & { status?: number }).status === 400) {
+    logError('Malformed JSON request body', {
+      errorName: err.name,
+      errorMessage: err.message,
+      stack: err.stack,
+      requestId,
+      ...traceSpanIds,
+    });
     res.status(400).json(
       errorResponse(
         ApiErrorCode.VALIDATION_ERROR,
@@ -105,10 +159,9 @@ export function errorHandler(
     ...traceSpanIds,
   });
 
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-  });
+  res.status(500).json(
+    errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId)
+  );
 }
 
 /** Async handler wrapper */

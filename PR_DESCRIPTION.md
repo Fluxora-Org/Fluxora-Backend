@@ -1,136 +1,55 @@
-# feat: add post-replay ledger-sequence integrity check
-
-**Closes #1216**
+Closes #1437
 
 ## Summary
 
-After a manual reindex or replay triggered via `/api/admin/reindex` or `POST /events/replay`, there was no automated check that the resulting `contract_events` rows form a contiguous, gap-free ledger sequence per contract. Silently skipped ledgers (e.g. from a dropped RPC page mid-replay) could go unnoticed.
+Configuration in `deployment.ts`, `stellar.ts`, `stellarContracts.ts`, `rateLimits.ts`, `health.ts`, and `deprecations.ts` was validated lazily, so an invalid deployment could go unnoticed until a request happened to read the bad setting. Each module now exposes a pure `validate*Config()` function returning one human-readable issue per invalid setting, and a new `validateStartupConfig()` aggregator (`src/config/startupValidation.ts`) runs them all during bootstrap.
 
-This PR adds a **post-replay integrity check** that runs asynchronously after every successful replay, verifying ledger-sequence contiguity and flagging gaps or duplicate event entries via structured audit logging and Prometheus counters.
+Validation is triggered at both startup paths, following the project's existing patterns (no new validation framework):
 
----
+- **`src/index.ts`** — at the top of the async bootstrap, before dependency probes or socket binding. Throwing lands in the existing `startup:fatal` catch, which logs and exits(1), so a bad deployment fails immediately.
+- **`src/app.ts` (`createApp`)** — so tests and embedding apps that build the app with an explicit env object get the same contract. A configuration error can never first surface during request handling.
 
-## Changes
+Errors reuse the existing `ConfigError` from `src/config/env.ts`; its message bullets each invalid setting (e.g. `- RATE_LIMIT_IP_MAX must be an integer >= 1 (got "abc")`), and issues from multiple modules are aggregated into a single startup error.
 
-### New files
+### Per-module checks
 
-| File | Purpose |
-|---|---|
-| `src/indexer/replayIntegrity.ts` | Core module — `checkReplayIntegrity()` function with gap detection, duplicate detection, audit logging, and Prometheus counter integration |
-| `tests/indexer/replayIntegrity.test.ts` | 22 comprehensive unit tests covering all edge cases |
-| `docs/indexer.md` | User-facing documentation for the integrity check feature |
-| `PR_DESCRIPTION.md` | This PR description |
+| Module | Startup checks |
+| --- | --- |
+| `rateLimits.ts` | All `RATE_LIMIT_*` / `WEBHOOK_RETRY_*` integer envs are integers within bounds, including the `MAX_WINDOW_MS` PEXPIRE ceiling on windows; unset values still fall back to defaults |
+| `deployment.ts` | `REQUIRE_PARTNER_AUTH`/`REQUIRE_ADMIN_AUTH` demand their tokens; prod-like environments (staging/production) must enable Redis, worker, metrics, and indexer; `DEPLOYMENT_CHECKLIST_VERSION` non-empty |
+| `health.ts` | All health/probe timeout & interval knobs are positive integers |
+| `stellar.ts` | `horizonUrl` is a valid URL, passphrases non-empty and mutually consistent, pinned contract addresses are valid StrKeys |
+| `stellarContracts.ts` | Allowlist entries are valid StrKeys; network passphrases non-empty |
+| `deprecations.ts` | Registry entries have valid ISO dates, routes start with `/`, and header-bearing fields contain no CR/LF injection |
 
-### Modified files
+## Tests
 
-| File | Change |
-|---|---|
-| `src/indexer/service.ts` | Imported `checkReplayIntegrity`; added fire-and-forget integrity check call after `replayEvents()` completes; added `runPostReplayIntegrityCheck()` private helper using a ±1000 ledger window |
-| `src/metrics/indexerMetrics.ts` | Added `indexerReplayIntegrityGapsTotal` and `indexerReplayIntegrityDuplicatesTotal` Prometheus counters (both with `contract_id` label); added deregistration in `deRegisterIndexerMetrics()` |
-| `src/lib/auditLog.ts` | Added `REPLAY_INTEGRITY_ISSUE` to the `AuditAction` union type |
+`src/config/startupValidation.test.ts` (30 cases, all passing) covers:
 
----
+- Startup succeeds with valid configuration (aggregator + `createApp()`).
+- Startup rejects invalid configuration for each configuration module.
+- Errors clearly identify the invalid setting.
+- Configuration errors are caught at construction/startup, never during request handling.
 
-## Design
+## Required context: repository repair commit
 
-### How the check works
+The repository tip (`5b896b0`) shipped with widespread syntax corruption — severed string literals, dropped tokens, CRLF-injected identifiers in `sseConnectionLimiter.ts`, `backfill.ts`, `replayIntegrity.ts`, `shutdown.ts`, `catchupTelemetry.test.ts`, plus imports of helpers no module exported (`notFound`, `deriveStreamId`, `rowToStreamEventRecord`, …) and an ESLint config that crashed on load. **`tsc --noEmit` failed with 70+ syntax errors and the vitest suite could not import the app, so no change to this repo was verifiable.**
 
-1. **Trigger**: After `IndexerService.replayEvents()` marks the cursor as complete and records metrics, it fires `runPostReplayIntegrityCheck()` asynchronously via `.catch()`. The replay response path is never blocked.
+The first commit (`32965fe`) makes only mechanical repairs that restore the evident intent of the surrounding code, each corroborated by an existing call site, sibling code, or an existing test (e.g. `rowToStreamEventRecord` is fully specified by the existing issue-#1316 tests in `tests/db/rowMapping.test.ts`). It includes:
 
-2. **Scope**: The check runs against a ±1000 ledger window around the replayed ledger (not using `from_block`/`to_block`, which are block-height filters on the source `historical_events` table, not ledger numbers on `contract_events`). A separate hard cap of 100 000 ledgers (`MAX_INTEGRITY_RANGE`) prevents OOM from `generate_series` on pathological ranges.
+- `tsc --noEmit`: 76 errors → **0** (full strict typecheck clean)
+- vitest: suite went from "cannot import app" → 3,932 passing tests
+- eslint: config no longer crashes; every file touched by this PR lints with 0 errors
 
-3. **Gap detection**: Uses `generate_series` to materialise the expected ledger list for the contract within the range, then LEFT JOINs with the distinct ledgers actually present in `contract_events`. Missing ledgers are reported as gaps.
+**Known pre-existing issues deliberately not addressed** (unrelated to #1437, documented in the repair commit message): 2 tests in `tests/indexer/catchupTelemetry.test.ts` fail on `IndexerIngestionService` concurrency/checkpoint behavior (the PR #1330 feature appears absent from the tree), and the `errorHandler` 500 fallback shape mismatches `app.test.ts` expectations. The remaining full-suite failures (~200 across 51 files) are integration tests requiring live Postgres/Redis (1508 `ECONNREFUSED` hits) and do not occur in the sandbox.
 
-4. **Duplicate detection**: Groups `contract_events` rows by `(event_id, ledger)` and reports any group with `COUNT(*) > 1`. Although the INSERT uses `ON CONFLICT DO NOTHING`, this catches corner cases like concurrent races or batch-boundary bugs.
+## Verification performed in this PR
 
-5. **On detection**: A structured `REPLAY_INTEGRITY_ISSUE` entry is written to the `audit_logs` table via `recordAuditEventToDb()`, Prometheus counters are incremented, and a structured warning is logged.
+- `pnpm typecheck` → 0 errors
+- `pnpm vitest run src/config/startupValidation.test.ts` → 30/30 passing
+- Targeted suites for every module touched by the repairs (SSE limiter/emitter, backfill, rowMapping, webhook dispatcher, shutdown, startupValidation) → passing
+- `pnpm eslint` on all changed files → 0 errors, 0 new warnings (baseline HEAD had 118 lint errors)
+- Full `vitest run` → 3,932 passed / 201 failed (all accounted for above: live-DB integration tests + the two documented pre-existing behavior gaps)
 
-6. **Failure mode**: The check **never throws**. DB errors are caught, logged at warn level, and returned in the result's `error` field. Audit write failures are caught and logged internally.
-
-### SQL queries (all parameterized — no injection vectors)
-
-| Query | Purpose |
-|---|---|
-| `RANGE_QUERY` | `SELECT MIN(ledger), MAX(ledger) … WHERE contract_id = $1 AND ledger BETWEEN $2 AND $3` |
-| `GAP_QUERY` | CTE with `generate_series($1, $2)` LEFT JOINed against `SELECT DISTINCT ledger …` to find missing ledgers |
-| `DUPLICATE_QUERY` | `SELECT event_id, ledger, COUNT(*) … GROUP BY event_id, ledger HAVING COUNT(*) > 1` |
-
-### Security
-
-- All SQL queries use positional parameters (`$1`, `$2`, …) — no user-supplied values are ever interpolated into query strings.
-- The `contract_id` label on Prometheus counters is truncated to 64 characters to prevent metric cardinality blowup.
-- The audit entry meta field is limited to 100 gap entries and 50 duplicate entries to prevent oversized log payloads.
-- The `MAX_INTEGRITY_RANGE` cap (100 000 ledgers) prevents `generate_series` from exhausting memory or causing slow queries.
-
----
-
-## Test coverage
-
-**22 tests** across 11 describe blocks in `tests/indexer/replayIntegrity.test.ts`:
-
-| Category | Tests | What's covered |
-|---|---|---|
-| Clean pass | 2 | Contiguous gap-free range, single event |
-| Gap detection | 4 | Single gap, multiple gaps, per-contract scoping, multiple events per ledger (no false positives) |
-| Duplicate detection | 3 | Single duplicate, multiple duplicates, unique events on same ledger (no false positives) |
-| Empty range | 1 | No events for contract → `hasIssues: false` |
-| Range clamping | 1 | Range > 100K → warning logged, check still runs on clamped tail |
-| DB error handling | 2 | Error caught and returned in `error` field, warning logged |
-| Audit event | 3 | Entry written on gap detection, not written on clean pass, safe on audit write failure |
-| Prometheus counters | 3 | Gap counter incremented, duplicate counter incremented, neither incremented on clean pass |
-| Contract ID label | 1 | Long contract_id truncated to 64 chars in metric labels |
-| IndexerService integration | 1 | `runPostReplayIntegrityCheck` called after `replayEvents` completes |
-
-All tests pass: `22 passed, 0 failed`
-
----
-
-## Monitoring & Observability
-
-### New Prometheus metrics
-
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `indexer_replay_integrity_gaps_total` | Counter | `contract_id` | Total ledger gaps detected |
-| `indexer_replay_integrity_duplicates_total` | Counter | `contract_id` | Total duplicate event entries detected |
-
-### New audit action
-
-| Action | Resource type | When emitted |
-|---|---|---|
-| `REPLAY_INTEGRITY_ISSUE` | `contract_events` | When gaps or duplicates are detected after a replay |
-
-### Structured log events
-
-| Event | Level | Description |
-|---|---|---|
-| `replay_integrity_issues_detected` | `warn` | Gaps/duplicates found — includes count, range, and sample entries |
-| `replay_integrity_range_clamped` | `warn` | Range exceeded 100K limit and was clamped |
-| `replay_integrity_query_failed` | `warn` | DB query error (transient, caught) |
-| `replay_integrity_audit_failed` | `warn` | Audit write failed (caught, non-blocking) |
-| `post_replay_integrity_check_failed` | `warn` | Integrity check itself threw unexpectedly (safety net) |
-
----
-
-## Backward compatibility
-
-- **Fully backward-compatible**. Existing replays continue to work identically.
-- The integrity check only runs **after a successful replay completes** (not on existing data).
-- No new database migrations required — the check queries the existing `contract_events` table.
-- No new configuration variables introduced.
-
----
-
-## Checklist
-
-- [x] New module: `src/indexer/replayIntegrity.ts`
-- [x] Modified: `src/indexer/service.ts` — integration
-- [x] Modified: `src/metrics/indexerMetrics.ts` — Prometheus counters
-- [x] Modified: `src/lib/auditLog.ts` — audit action type
-- [x] New tests: `tests/indexer/replayIntegrity.test.ts` — 22 tests, all passing
-- [x] New docs: `docs/indexer.md` — user-facing documentation
-- [x] TypeScript: `tsc --noEmit` — no errors in modified files
-- [x] SQL injection safety: all queries parameterized
-- [x] Metric cardinality: contract_id truncated to 64 chars
-- [x] Range safety: capped at 100 000 ledgers
-- [x] Fire-and-forget: never blocks request/response cycle
+Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>

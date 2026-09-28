@@ -26,7 +26,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { WebhookDeliveryStore, type IWebhookDeliveryStore } from '../../src/webhooks/store.js';
+import { WebhookDeliveryStore } from '../../src/webhooks/store.js';
 import { PgWebhookDeliveryStore } from '../../src/webhooks/pgStore.js';
 import type { WebhookDelivery } from '../../src/webhooks/types.js';
 
@@ -332,94 +332,12 @@ describe('PgWebhookDeliveryStore — restart-survival via hydrate() (regression 
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Suite 3 — IWebhookDeliveryStore interface compliance
-// Both implementations must satisfy the same contract.
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe('IWebhookDeliveryStore interface compliance', () => {
-  const implementations: Array<{ name: string; factory: () => IWebhookDeliveryStore }> = [
-    {
-      name: 'WebhookDeliveryStore (in-memory)',
-      factory: () => new WebhookDeliveryStore(),
-    },
-    {
-      name: 'PgWebhookDeliveryStore (write-through)',
-      factory: () => {
-        const pool = {
-          query: vi.fn().mockResolvedValue({ rows: [] }),
-        } as unknown as import('pg').Pool;
-        return new PgWebhookDeliveryStore(pool);
-      },
-    },
-  ];
-
-  for (const impl of implementations) {
-    describe(impl.name, () => {
-      it('store and retrieve a delivery', () => {
-        const store = impl.factory();
-        const delivery = makeDelivery();
-        store.store(delivery);
-        expect(store.get(delivery.id)).toMatchObject({ id: delivery.id });
-        expect(store.getByDeliveryId(delivery.deliveryId)).toMatchObject({ deliveryId: delivery.deliveryId });
-      });
-
-      it('add and retrieve outbox items', () => {
-        const store = impl.factory();
-        const id = store.addToOutbox(makeOutboxItem());
-        expect(id).toMatch(/^outbox_/);
-        const items = store.getAllOutboxItems();
-        expect(items).toHaveLength(1);
-        expect(items[0]?.deliveryId).toBe('deliv_restart_outbox_001');
-      });
-
-      it('add and retrieve DLQ items', () => {
-        const store = impl.factory();
-        const delivery = makeDelivery({ status: 'permanent_failure' });
-        store.addToDeadLetterQueue(delivery, 'exhausted', 'exhausted');
-        const items = store.getDeadLetterQueueItems();
-        expect(items).toHaveLength(1);
-        expect(items[0]?.deliveryId).toBe(delivery.deliveryId);
-      });
-
-      it('isDuplicateDelivery returns false then true after store', () => {
-        const store = impl.factory();
-        const delivery = makeDelivery();
-        expect(store.isDuplicateDelivery(delivery.deliveryId)).toBe(false);
-        store.store(delivery);
-        expect(store.isDuplicateDelivery(delivery.deliveryId)).toBe(true);
-      });
-
-      it('cleanup returns cleaned count', () => {
-        const store = impl.factory();
-        const result = store.cleanup();
-        expect(result).toHaveProperty('cleaned');
-        expect(result).toHaveProperty('errors');
-      });
-
-      it('getMetrics returns expected shape', () => {
-        const store = impl.factory();
-        const m = store.getMetrics();
-        expect(m).toHaveProperty('totalDeliveries');
-        expect(m).toHaveProperty('successfulDeliveries');
-        expect(m).toHaveProperty('failedDeliveries');
-        expect(m).toHaveProperty('dlqItems');
-        expect(m).toHaveProperty('outboxItems');
-      });
-
-      it('clear() empties all state', () => {
-        const store = impl.factory();
-        store.store(makeDelivery());
-        store.addToOutbox(makeOutboxItem());
-        store.addToDeadLetterQueue(makeDelivery({ status: 'permanent_failure' }), 'test', 'other');
-        store.clear();
-        expect(store.getAll()).toHaveLength(0);
-        expect(store.getAllOutboxItems()).toHaveLength(0);
-        expect(store.getDeadLetterQueueItems()).toHaveLength(0);
-      });
-    });
-  }
-});
+// Suite 3 — IWebhookDeliveryStore interface compliance.
+//
+// The shared contract test for both store implementations now lives in
+// `tests/webhooks/store.contract.test.ts`. It runs one parameterised suite
+// against the in-memory and Postgres-backed stores and asserts that switching
+// stores does not change observable behaviour (issue #1528).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Suite 4 — Idempotency and Crash Recovery (Send/Ack Window)

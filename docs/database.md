@@ -20,6 +20,26 @@ return result.rows.map(rowToReplayCursor);
 
 Full convention: [`src/db/repositories/README.md`](../src/db/repositories/README.md).
 
+## Schema/Type Consistency Check
+
+`src/db/types.ts` declares the shapes the application believes PostgreSQL holds. Because nothing in a normal build compares those declarations against the database, a migration that renames or retypes a column can leave the types asserting something untrue, and the mismatch only surfaces later as a value of the wrong shape.
+
+`scripts/check-db-schema-types.mjs` closes that gap. With a migrated `DATABASE_URL` it:
+
+- reads the declared interfaces (and their type aliases) from `src/db/types.ts`,
+- maps each declared property onto its column (camelCase properties become snake_case columns),
+- introspects the mapped tables (`streams`, `api_keys`, `contract_events`) through `information_schema.columns`, and
+- **fails** (exit code 1) when a declared column is missing — a rename or drop — or when its SQL type family disagrees with the declared type — a retype.
+
+Columns that exist in the schema but are not part of the declared domain shape (for example `streams.sender_address_hash` or `streams.legal_hold`) are reported as non-fatal drift, as is a declared non-null property backed by a nullable column.
+
+```bash
+# after `pnpm run migrate` against the test database
+DATABASE_URL=postgresql://test_user:test_password@localhost:5432/indexer_test pnpm run check:db-types
+```
+
+Without `DATABASE_URL` the check is skipped, matching the other live-database suites. CI runs it in the `test` job immediately after applying migrations, so renaming a mapped column in a migration fails the pipeline until `src/db/types.ts` is updated. Intentional representation differences — a timestamp column exposed as an ISO-8601 `string`, or a JSON-serialized `text` column exposed as `string[]` — are recorded with a reason in `SCHEMA_TYPE_CONTRACT` inside the script.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -164,6 +184,29 @@ The `contract_events` table is partitioned by `happened_at` to ensure bounded gr
 4. Validate that detached partitions are backed up per the existing S3 retention policy before actually dropping them.
 5. Run the function in `dryRun = true` mode initially to audit partitions that will be dropped.
 
+### Destructive operation safety
+
+`restoreDatabase` and `dropOldPartitions` are guarded before any database or
+S3 operation runs. Each operation prints the target environment and requires
+`confirm: true`; a production target additionally requires
+`acknowledgeProduction: true`. Set `dryRun: true` to report the planned source,
+target, and number of partitions that would be changed without executing the
+operation.
+
+```ts
+const result = await dropOldPartitions(pool, 'contract_events', 30, {
+  dryRun: true,
+  targetEnvironment: 'staging',
+})
+
+// After reviewing the dry-run result, explicitly confirm a live run:
+await dropOldPartitions(pool, 'contract_events', 30, {
+  dryRun: false,
+  targetEnvironment: 'staging',
+  confirm: true,
+})
+```
+
 ### Partition Pre-creation
 
 To avoid rows landing in the unindexed `DEFAULT` partition, the background job `src/jobs/partitionMaintenance.ts` pre-creates monthly partitions ahead of schedule for every range-partitioned table it manages.
@@ -181,9 +224,24 @@ The job checks each table via `pg_class.relkind = 'p'` + `pg_partitioned_table.p
 
 Monthly partitions are named `<table>_y<YYYY>m<MM>` (e.g. `contract_events_y2026m07`), matching the convention already used by `tests/db/contractEvents.partitionPruning.test.ts` and `tests/db/vacuumCollector.collect.test.ts`. Month boundaries are computed in **UTC** (`Date.UTC(...)`) to avoid off-by-one errors near midnight on a server running in a non-UTC timezone.
 
+#### Lead time (how far ahead partitions are created)
+
+Partitions are created a **documented interval ahead of use**: the partition covering month `M` is created during month `M - leadTimeMonths`, so it exists for at least `leadTimeMonths` months (≈ 28 × `leadTimeMonths` days) before a single row can require it. That buffer is what makes a failed or missed run survivable — the next run self-heals long before the partition is *needed*.
+
+The default lead time is `DEFAULT_LEAD_TIME_MONTHS = 3` months. It is configurable, in whole calendar months, with this precedence:
+
+| # | Source | Notes |
+|---|---|---|
+| 1 | `leadTimeMonths` option to `runPartitionMaintenance(pool, { leadTimeMonths })` | Highest precedence; used by tests and by callers that need a specific value. |
+| 2 | `monthsAhead` option | Deprecated alias with the same meaning, kept for callers written against the previous signature. |
+| 3 | `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS` env var (`config.partitionMaintenance.leadTimeMonths`) | Deployment-level knob. |
+| 4 | `DEFAULT_LEAD_TIME_MONTHS` (3) | Built-in fallback. |
+
+Keep the configured value `>= 2` so a single missed monthly boundary cannot exhaust the buffer. A non-integer or negative configured value is ignored in favour of the built-in default rather than propagated, so a typo in a deployment's environment cannot silently disable pre-creation. The run result reports the value actually used as `leadTimeMonths`.
+
 #### Schedule and idempotency
 
-1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus the next `monthsAhead` months (default `3`, see `DEFAULT_MONTHS_AHEAD` in `src/jobs/partitionMaintenance.ts`).
+1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus every month starting inside the configured lead time (default `3` months).
 2. It acquires a single **non-blocking** advisory lock (`pg_try_advisory_lock(123456789)`, exported as `PARTITION_MAINTENANCE_LOCK_ID`) before doing any work. If another instance already holds the lock, the run is a no-op — it does not wait or retry, so overlapping cron + manual invocations across multiple app instances never race to create the same partition.
 3. Every `CREATE TABLE` uses `IF NOT EXISTS`, so re-running the job when all partitions already exist performs zero DDL and is always a safe no-op — the defining idempotency property required of this job.
 4. The lock is released in a `finally` block, so a failure partway through (e.g. one table's DDL fails) never leaves the lock held for subsequent runs.
@@ -205,6 +263,7 @@ When this happens, the job:
   }
   ```
 - Increments the `fluxora_partition_maintenance_behind_schedule_total{table="..."}` counter.
+- Raises the `partition_maintenance_behind_schedule` operator alert (see below), so the event is pageable from metrics and not only discoverable from logs.
 - Still creates the missing partition immediately afterward (self-healing) — the alert reports a `DEFAULT`-partition risk window that already occurred, it does not prevent the fix.
 
 ##### Recommended alert
@@ -217,12 +276,50 @@ When this happens, the job:
     summary: "A scheduled partition pre-creation run was missed — rows may have landed in the DEFAULT partition"
 ```
 
+#### Failure alerting (a failure is never only a log line)
+
+Every failure that matters to an operator is raised through `raiseAlert()` in `src/lib/alerts.ts`, which emits a structured `error` log record **and** increments `fluxora_alerts_raised_total{alert,severity}` — so metric-based alerting rules can page on it even when no log shipping is configured. `raiseAlert()` never throws, and can additionally be forwarded to an incident-management provider via `setAlertSink()`.
+
+| Alert name | Severity | Raised when |
+|---|---|---|
+| `partition_creation_failed` | critical | A `CREATE TABLE … PARTITION OF` threw. The error is re-thrown afterwards, so the queue retries (and eventually dead-letters) the run instead of treating it as a success. |
+| `partition_maintenance_behind_schedule` | critical | The current month's partition was missing — a previous run was missed or failed. |
+| `partition_shortfall_detected` | critical | The pre-write guard (below) found a required partition missing just before an insert. |
+
+```yaml
+- alert: PartitionCreationFailed
+  expr: increase(fluxora_alerts_raised_total{alert="partition_creation_failed"}[15m]) > 0
+  severity: critical
+  annotations:
+    summary: "A partition could not be created — writes for that interval are at risk"
+
+- alert: PartitionShortfallBeforeWrite
+  expr: increase(fluxora_alerts_raised_total{alert="partition_shortfall_detected"}[15m]) > 0
+  severity: critical
+  annotations:
+    summary: "A write needed a partition that did not exist — partition maintenance was not running"
+```
+
+#### Pre-write detection (absence is caught before a write fails)
+
+The job is a *scheduled* defence, so between two runs time can advance past the created partitions (a deploy that never started the job, an outage, a mis-set lead time). The next write would then fail with an opaque `no partition of relation "contract_events" found for row` — a write error raised far from its cause.
+
+`ensurePartitionCoverage()` (exported from `src/jobs/partitionMaintenance.ts`, same module as the job so both share the partition-naming and bound math) is called by `PostgresContractEventStore.insertMany()` **before** the insert is issued:
+
+1. It computes the partitions covering every distinct month in the batch's `happened_at` values.
+2. A single catalog query reports whether the parent is range-partitioned *and* which of those partitions exist (no per-row work, one round-trip in the happy path).
+3. If a required partition is missing it raises `partition_shortfall_detected`, then creates the partition so the write that follows cannot fail — alerting and self-healing in one pass. A create that fails raises `partition_creation_failed` and is reported as `failed` on the result.
+
+The guard is **strictly fail-open**: an unmanaged (non-partitioned) table, an inconclusive probe response, or a probe error leaves `insertMany()` behaving exactly as it did before — observability must never be the reason a writable batch fails.
+
 #### Metrics
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted) |
+| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted), by both the job and the pre-write guard |
 | `fluxora_partition_maintenance_behind_schedule_total` | Counter | `table` | Incremented when the current-month partition was found missing (see above) |
+| `fluxora_partition_maintenance_failures_total` | Counter | `table` | Incremented on every failed partition-creation attempt |
+| `fluxora_alerts_raised_total` | Counter | `alert`, `severity` | Every operator alert raised through `src/lib/alerts.ts` |
 
 #### Security
 
@@ -233,10 +330,14 @@ When this happens, the job:
 
 #### Tests
 
-`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), behind-schedule detection and metrics, and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), lead-time resolution (option, deprecated alias, configured default, invalid-value fallback, `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS`), behind-schedule detection and metrics, failure alerting (alerts raised *and* the error still re-thrown), and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+
+`tests/db/contractEvents.partitionCoverage.test.ts` covers the pre-write guard against an in-memory emulation of Postgres: the probe's single round-trip and month deduplication, `partition_shortfall_detected` + self-heal, detection-only mode, failed-create alerting, fail-open behaviour for unmanaged tables / unexpected probe shapes / probe errors, and the issue's validation scenario — advance time past the partitions the job created and assert the shortfall is detected (and alerted on) *before* the write fails.
+
+`tests/lib/alerts.test.ts` covers the alerting facility itself: log level and record shape, metric increment, sink dispatch, name normalisation, and the never-throws guarantee.
 
 ```bash
-pnpm test tests/jobs/partitionMaintenance.test.ts
+pnpm test tests/jobs/partitionMaintenance.test.ts tests/db/contractEvents.partitionCoverage.test.ts tests/lib/alerts.test.ts
 ```
 
 ### Recommended alert thresholds
@@ -260,24 +361,12 @@ pnpm test tests/jobs/partitionMaintenance.test.ts
 
 Fluxora provides PostgreSQL logical replication as an enterprise streaming mechanism for external consumers to tail real-time chain events directly from the database. Logical replication provides a high-throughput, push-based alternative to polling `GET /internal/indexer/events` (`src/routes/indexer.ts`).
 
-Migration: `migrations/20260723180000_contract_events_logical_replication.ts`
-Tests: `tests/db/logicalReplication.test.ts`
-
 ### Publication Scope & Security
 
 The publication `fluxora_contract_events_pub` is narrowly scoped to ensure data isolation and security:
 
 - **Single Table Scope**: Scoped exclusively to the `contract_events` table. Tables containing Personally Identifiable Information (PII) or sensitive tokens (such as `streams`, `api_keys`, or `webhook_outbox`) are explicitly excluded from replication.
 - **Append-Only Operations**: Configured with `WITH (publish = 'insert')`. Since `contract_events` is an append-only event ledger, restricting publication strictly to `INSERT` operations eliminates unnecessary WAL replication overhead for table maintenance and prevents exposing operational updates or deletes.
-
-### Partition Awareness
-
-`contract_events` is a range-partitioned table (`PARTITION BY RANGE happened_at`). The publication uses `FOR TABLE contract_events` — **without `ONLY`** — so that INSERT changes from all child partitions (e.g., `contract_events_y2026m07`, `contract_events_default`) flow through the publication automatically as new monthly partitions are created.
-
-> [!NOTE]
-> Using `FOR TABLE ONLY contract_events` would silently publish nothing because all rows live in child partitions, not the parent table. Never add `ONLY` to this publication.
-
-By default (PostgreSQL 15+), `publish_via_partition_root = true` causes the WAL decoder to report all partition rows under the parent `contract_events` table identity. This simplifies consumer schema management — consumers see a single `contract_events` stream regardless of which monthly partition holds the row. For PostgreSQL 12–14, rows are reported under their respective child partition names.
 
 ### Prerequisites & Server Configuration
 
@@ -388,403 +477,4 @@ If a consumer is decommissioned or experiences an extended outage and lag exceed
   for: 10m
   severity: warning
 ```
-
-### Running the Live Integration Tests
-
-The test suite in `tests/db/logicalReplication.test.ts` contains both offline unit tests (always run) and live-DB integration tests (require a real Postgres instance with `wal_level=logical`).
-
-Live tests are guarded by `INTEGRATION_DB=true` so they are **never triggered accidentally** by the test setup placeholder `DATABASE_URL`:
-
-```bash
-# Run live DB tests against a real database
-INTEGRATION_DB=true \
-DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:5432/indexer_db \
-pnpm test tests/db/logicalReplication.test.ts
-```
-
-The live suite verifies:
-- `fluxora_contract_events_pub` exists in `pg_publication` with `pubinsert=true`, `pubupdate=false`, `pubdelete=false`, `pubtruncate=false`
-- The publication is attached **solely** to `contract_events` (verified via `pg_publication_tables`)
-- `down()` fully removes the publication; `up()` re-applies it cleanly (rollback/re-apply cycle)
-
----
-
-## PgBouncer / PgCat Transaction-Pooling Compatibility (issue #754)
-
-At higher connection scale operators commonly front PostgreSQL with
-[PgBouncer](https://www.pgbouncer.org/) or
-[PgCat](https://github.com/levkk/pgcat) in **transaction-pooling mode**
-(`pool_mode = transaction`). This mode returns the server connection to the
-pooler after every transaction rather than keeping it pinned for the
-lifetime of the client connection, enabling many more app connections than
-Postgres server connections.
-
-### Why transaction-pooling is incompatible with the default pool setup
-
-Two features of a plain `pg.Pool` are session-scoped and silently break under
-transaction pooling:
-
-| Feature | Session mode | Transaction mode |
-|---|---|---|
-| `SET statement_timeout = $1` on `connect` | ✅ Works — persists for connection lifetime | ❌ Silently lost — pooler resets session on each transaction boundary |
-| pg driver prepared-statement cache | ✅ Works | ❌ PgBouncer rejects `PREPARE` / `EXECUTE` |
-
-### ⚠ Silent failure mode
-
-If you are running behind a transaction pooler but `POOL_MODE` is **not** set
-to `transaction`, the `SET statement_timeout` call succeeds from the app's
-perspective but is silently discarded by PgBouncer. Queries run **without
-any application-side timeout**. This is not a crash — it is a silent
-correctness failure. Setting `POOL_MODE=transaction` explicitly acknowledges
-and handles this condition.
-
-### Configuration
-
-Set the `POOL_MODE` environment variable:
-
-```bash
-# Session pooling (default — direct Postgres connection or session pooler)
-POOL_MODE=session
-
-# Transaction pooling — use when PgBouncer/PgCat is in transaction mode
-POOL_MODE=transaction
-```
-
-When `POOL_MODE=transaction`:
-
-- The `connect` hook skips `SET statement_timeout`. Configure
-  `statement_timeout` at the pooler layer instead (e.g., pgbouncer.ini
-  `server_reset_query` or `ALTER ROLE app_user SET statement_timeout = '5s'`).
-- A startup warning is logged with `event: pool_transaction_mode_active`.
-
-### Local verification with Docker Compose
-
-A `pgbouncer` Docker Compose profile is provided for local testing:
-
-```bash
-# Start Postgres + PgBouncer in transaction mode
-docker compose --profile pgbouncer up -d
-
-# Connect through PgBouncer (port 6432)
-DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:6432/indexer_db \
-  POOL_MODE=transaction \
-  pnpm dev
-```
-
-The PgBouncer container (`bitnami/pgbouncer:1.22.0`) is configured with
-`PGBOUNCER_POOL_MODE=transaction` and `PGBOUNCER_DEFAULT_POOL_SIZE=20`.
-Port `6432` is bound to `127.0.0.1` only.
-
-### API
-
-```typescript
-import { isTransactionPoolMode } from './src/db/pool.js';
-
-// Check if the active pool is in transaction mode
-if (isTransactionPoolMode()) {
-  // Do not rely on session-scoped state
-}
-```
-
-### Environment variable reference
-
-| Variable | Values | Default | Description |
-|---|---|---|---|
-| `POOL_MODE` | `session` \| `transaction` | `session` | Pool compatibility mode. Set to `transaction` when using PgBouncer/PgCat in transaction-pooling mode. |
-
----
-
-## Partition Pruning for `contract_events`
-
-### Overview & Range Partitioning Strategy
-
-The `contract_events` table is partitioned by range on `happened_at` (`PARTITION BY RANGE (happened_at)`) per migration `20260627000000_contract_events_partitioning.ts`. Range partitioning bounds disk growth and enables aggressive partition pruning during historical range queries.
-
-### Query Predicate Requirements & Pruning Behavior
-
-PostgreSQL partition pruning is driven by predicates on the partition key (`happened_at`). When `StreamEventReplayFilter` query parameters (`fromHappenedAt`, `toHappenedAt`) are passed to `PostgresContractEventStore.getEvents()`, PostgreSQL's query planner automatically prunes non-overlapping partition tables from the execution plan.
-
-- **Single-Partition Bounded Queries**: Queries bounded to a single month (e.g. `happened_at >= '2026-07-01T00:00:00.000Z' AND happened_at <= '2026-07-31T23:59:59.999Z'`) evaluate to an execution plan containing strictly the target partition (e.g., `contract_events_y2026m07`). Other partitions (`contract_events_y2026m06`, `contract_events_y2026m08`, `contract_events_default`) are pruned and omitted from disk scans.
-- **Cross-Partition Range Queries**: Queries spanning multiple partition boundaries (e.g., `happened_at >= '2026-06-15T00:00:00.000Z' AND happened_at <= '2026-07-15T23:59:59.999Z'`) scan only the specific matching partitions (`contract_events_y2026m06` and `contract_events_y2026m07`), excluding irrelevant partitions.
-
-### Verification via EXPLAIN
-
-Partition pruning efficiency is verified via integration tests
-(`tests/db/contractEvents.partitionPruning.test.ts`) that execute
-`EXPLAIN (FORMAT JSON)` against representative store query shapes and inspect
-the plan output structure.
-
-#### Test coverage
-
-| Test category | Description |
-|---|---|
-| **Offline — plan helpers** | `planScansPartition` / `getScannedPartitions` unit-tested against mock EXPLAIN JSON — no database required |
-| **Offline — InMemoryStore** | `InMemoryContractEventStore.getEvents()` filter parity: single-partition range, cross-partition range, no-filter |
-| **Live DB — single-partition EXPLAIN** | Bounded July query scans **only** `contract_events_y2026m07`; June and August partitions are pruned from the plan |
-| **Live DB — cross-partition EXPLAIN** | June-to-July range scans **exactly** `contract_events_y2026m06` and `contract_events_y2026m07`; August is pruned |
-| **Live DB — August-only EXPLAIN** | Bounded August query scans **only** `contract_events_y2026m08` |
-| **Live DB — store correctness** | `PostgresContractEventStore.getEvents()` returns the expected seed rows and excludes out-of-range rows |
-| **Live DB — ON CONFLICT idempotency** | Re-inserting an existing `(happened_at, event_id)` pair is a silent no-op (reported as `duplicateEventIds`) |
-
-#### Running the live tests
-
-```bash
-DATABASE_URL=postgresql://indexer_user:indexer_password@localhost:5432/indexer_db \
-  pnpm test tests/db/contractEvents.partitionPruning.test.ts
-```
-
-Offline-only (no database):
-
-```bash
-pnpm test tests/db/contractEvents.partitionPruning.test.ts
-```
-
-#### `store.ts` — ON CONFLICT target
-
-Because `contract_events` is range-partitioned and its primary key is
-`(happened_at, event_id)`, the `INSERT … ON CONFLICT` clause in
-`PostgresContractEventStore.insertMany()` must specify **both** columns:
-
-```sql
-ON CONFLICT (happened_at, event_id) DO NOTHING
-```
-
-Using only `(event_id)` raises a PostgreSQL error
-(`there is no unique or exclusion constraint matching the ON CONFLICT
-specification`) on partitioned tables and was corrected as part of issue #932.
-
----
-
-## Background Job Queue (pg-boss)
-
-### Overview
-
-Fluxora uses [pg-boss](https://github.com/timgit/pg-boss) for Postgres-backed background job processing. pg-boss provides durable, at-least-once job delivery with built-in retry, exponential backoff, cron scheduling, and dead letter queues — all within PostgreSQL.
-
-### The JobQueue Class
-
-Located at `src/jobs/queue.ts`, the `JobQueue` class wraps pg-boss and integrates with the application's existing `pg.Pool`:
-
-```typescript
-import { JobQueue, getJobQueue, setJobQueue } from './src/jobs/queue.js';
-
-const queue = new JobQueue(pool);
-setJobQueue(queue);
-```
-
-### Configuration
-
-pg-boss creates its own lightweight connection pool (2–4 connections, derived from the application pool's `max`). It uses the `pgboss` schema inside the same PostgreSQL database.
-
-Retry and expiration settings can be configured per job registration or per send:
-
-| Option | Default | Description |
-|---|---|---|
-| `retryLimit` | `2` | Max retries before the job is dead-lettered |
-| `retryDelay` | `60` | Base delay in seconds between retries |
-| `retryBackoff` | `true` | Exponential backoff enabled by default |
-| `retryDelayMax` | — | Cap for backoff-delay growth |
-| `expireInSeconds` | `900` | Max seconds a job may stay in active state |
-| `deadLetter` | — | Queue name to route terminally-failed jobs to |
-
-### Job Handler Registration
-
-Handlers are registered by name before the queue is started:
-
-```typescript
-queue.register('send-email', async (ctx) => {
-  const { id, data } = ctx;
-  await emailService.send(data);
-}, {
-  retryLimit: 3,
-  retryDelay: 30,
-  retryBackoff: true,
-});
-```
-
-The handler receives a `JobHandlerContext` with `id`, `name`, and `data`. Throwing from the handler triggers pg-boss's retry mechanism.
-
-### Sending Jobs
-
-```typescript
-await queue.send('send-email', { to: 'user@example.com', template: 'welcome' }, {
-  retryLimit: 3,
-  deadLetter: 'job_dead_letter_queue',
-});
-```
-
-### Scheduling with Cron
-
-```typescript
-await queue.schedule('partition-maintenance', '0 0 * * *', undefined, {
-  retryLimit: 2,
-  retryDelay: 60,
-});
-```
-
-### Retry and Dead Letter Behavior
-
-1. If a handler throws, pg-boss retries the job with exponential backoff (`retryDelay * 2^retryCount` with jitter).
-2. After exhausting `retryLimit` retries, the job is moved to the configured dead letter queue (`deadLetter` option).
-3. A custom `job_dead_letter` table (see migration below) stores additional metadata about failed jobs for operational inspection.
-
-### Lifecycle
-
-```typescript
-await queue.start();  // Begins processing — registers work handlers
-await queue.stop();   // Graceful shutdown — stops workers and releases resources
-```
-
-### Singleton Access
-
-The module exports `getJobQueue()` / `setJobQueue()` following the same pattern as `pool.ts`:
-
-```typescript
-import { getJobQueue } from './src/jobs/queue.js';
-const queue = getJobQueue();
-if (queue) {
-  await queue.send('my-job', data);
-}
-```
-
-### Migration
-
-Migration `migrations/20260727000000_job_dead_letter.ts` creates the `job_dead_letter` table for jobs that have exhausted retries:
-
-```sql
-CREATE TABLE IF NOT EXISTS job_dead_letter (
-  id BIGSERIAL PRIMARY KEY,
-  job_name TEXT NOT NULL,
-  job_id TEXT NOT NULL,
-  payload JSONB,
-  error_message TEXT,
-  failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  retry_count INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX idx_job_dead_letter_name ON job_dead_letter(job_name);
-```
-
-Apply with:
-
-```bash
-pnpm run migrate
-```
-
-### Tests
-
-Unit tests for the queue are in `tests/jobs/queue.test.ts`. They mock pg-boss using `vi.mock()` to test the `JobQueue` class independently of a real database.
-
----
-
-## Scripted Database Operations & Operator Ergonomics
-
-### Overview & Architecture
-
-Script-based database operations reside in [`src/scripts/db-ops.ts`](../src/scripts/db-ops.ts). This module provides production-grade wrappers around PostgreSQL utilities (`pg_dump` and `pg_restore`) as well as SQL partition cleanup utilities (`dropOldPartitions`).
-
-The design prioritizes zero-disk footprint (streaming dumps directly to/from S3), strict shell injection safety, credential isolation, and fail-safe operator defaults.
-
-```
-                  ┌──────────────────────────────────────────────┐
-                  │              src/scripts/db-ops.ts           │
-                  └──────┬───────────────────────────────┬───────┘
-                         │                               │
-             ┌───────────▼───────────┐       ┌───────────▼───────────┐
-             │    backupDatabase     │       │    restoreDatabase    │
-             └─────┬───────────┬─────┘       └─────┬───────────┬─────┘
-                   │           │                   │           │
-           (Local) │           │ (S3 Stream)  (Local)│           │ (S3 Stream)
-                   ▼           ▼                   ▼           ▼
-             execFile       spawn               execFile     spawn
-            "pg_dump"     "pg_dump"            "pg_restore" "pg_restore"
-             └─► Disk      └─► S3 Upload         ▲           ▲
-                                                 │           │
-                                                Disk       S3 Stream
-```
-
-### Core Operations Reference
-
-#### 1. `backupDatabase(databaseUrl, outputPath, s3Target?)`
-
-Generates a custom-format PostgreSQL database backup (`--format=custom`).
-
-- **Local Mode** (`s3Target` omitted): Executes `pg_dump` via `execFile`, writing output directly to `outputPath`.
-- **S3 Streaming Mode** (`s3Target` provided): Spawns `pg_dump` stdout stream piped into a `PassThrough` stream to AWS S3 using `@aws-sdk/lib-storage` `Upload`. The dump streams directly to S3 without creating temporary files on the local filesystem.
-- **Return Type**: `Promise<DbOperationResult>` where:
-  ```typescript
-  export interface DbOperationResult {
-    success: boolean;
-    message: string;
-    /** Raw stderr / error detail — never contains connection passwords or AWS keys */
-    error?: string;
-  }
-  ```
-
-#### 2. `restoreDatabase(databaseUrl, inputPath, s3Source?)`
-
-Restores a custom-format PostgreSQL database dump using `pg_restore`.
-
-- **Local Mode** (`s3Source` omitted): Executes `pg_restore` via `execFile` from `inputPath`.
-- **S3 Streaming Mode** (`s3Source` provided): Downloads object body via S3 `GetObjectCommand` and streams `response.Body` directly into `pg_restore` standard input (`stdin`).
-- **Flags Used**:
-  - `--clean`: Drops database objects before restoring them.
-  - `--no-owner`: Skips restoration of original object ownership, enabling portable restores across environments with different database roles.
-  - `--no-password`: Prevents prompt hanging when credentials are missing or invalid.
-
-> [!WARNING]
-> `--clean` drops existing database tables/objects before recreating them. Ensure active database connections are closed or quieted before invoking `restoreDatabase` in production.
-
-#### 3. `dropOldPartitions(pool, parentTable, olderThanDays, dryRun = true)`
-
-Performs retention-based partition pruning for range-partitioned tables such as `contract_events`.
-
-- **Bound Extraction**: Queries `pg_inherits` and `pg_class`, extracting upper bound date strings using `/TO \('([^']+)'\)/` from `pg_get_expr(c.relpartbound, c.oid)`.
-- **Default Partition Handling**: Automatically skips the `DEFAULT` partition (`partition_bound === 'DEFAULT'`).
-- **Dry-Run Safety**: Defaults `dryRun = true`. Operators must explicitly pass `dryRun = false` to execute `DROP TABLE IF EXISTS`.
-
-### Security & Credential Protection
-
-1. **Input Validation**:
-   - Connection strings: Validated against `^postgre(?:s|sql):\/\/` before spawning subprocesses. Rejects empty strings, whitespace, and non-postgres schemes (`mysql://`, `redis://`, etc.).
-   - File paths: Validated to reject empty strings and shell control characters (`[\0`$|;&<>]`).
-2. **Subprocess Isolation**:
-   - Uses Node.js `execFile` (array form) and `spawn` with explicit argument vectors.
-   - Arguments are never concatenated into a shell string, eliminating shell injection vectors.
-3. **Password & Credential Masking**:
-   - `DATABASE_URL` credentials and AWS secrets are consumed strictly from environment variables or argument inputs.
-   - Raw database passwords are never printed to console or leaked inside `DbOperationResult.error` strings during error conditions.
-4. **AWS Credential Isolation**:
-   - Uses AWS SDK v3 environment provider chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
-   - S3 credentials are never logged or stored in job results.
-
-### Decimal-String Serialization Guarantee
-
-Financial and numerical fields in Fluxora (e.g. event stream amounts, token balances) are stored as decimal strings in database `TEXT` or `NUMERIC` columns.
-
-The `db-ops` module processes backup and restore operations purely as binary/text byte streams. No JSON coercion or numeric parsing is applied to table records, guaranteeing zero loss of precision for monetary values.
-
-### Operator Ergonomics & Safety Controls
-
-| Ergonomic Control | Behavior | Benefit |
-|---|---|---|
-| **Default Dry Run** | `dropOldPartitions` defaults `dryRun = true` | Prevents accidental data deletion if invoked without arguments |
-| **Lazy AWS SDK Loading** | Dynamic `import('@aws-sdk/client-s3')` and `import('@aws-sdk/lib-storage')` | `db-ops.ts` runs in local-only mode even when `@aws-sdk` packages are not installed |
-| **AWS Region Resolution** | `s3Target.region` ➔ `AWS_REGION` ➔ `AWS_DEFAULT_REGION` ➔ `'us-east-1'` | Flexible environment configuration across AWS ECS, Lambda, and local environments |
-| **Whitespace Normalization** | Trims leading/trailing whitespace from `databaseUrl`, `outputPath`, and `inputPath` | Prevents spurious validation failures from whitespace in config files or CLI input |
-| **Clean Output Interface** | `DbOperationResult` standardizes `{ success, message, error }` | Simplifies caller code, logging, and error handling |
-
-### Regression Surface & Edge-Case Matrix
-
-| Component / Function | Input / Condition | Expected Behavior | Failure Mode / Mitigation |
-|---|---|---|---|
-| `backupDatabase` | Empty or whitespace `databaseUrl` | Returns `{ success: false, message: 'DATABASE_URL is required...' }` | Fast failure before subprocess creation |
-| `backupDatabase` | Non-postgres scheme (`mysql://`) | Returns `{ success: false, message: 'DATABASE_URL must be a valid PostgreSQL...' }` | Fast failure before subprocess creation |
-| `backupDatabase` | File path with `;` or `` ` `` | Returns `{ success: false, message: 'Output path contains invalid characters.' }` | Rejection of unsafe path inputs |
-| `backupDatabase` | Local mode, `pg_dump` fails | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | Error captured without password leakage |
-| `backupDatabase` | S3 mode, AWS SDK missing | Throws Error: `'AWS SDK v3 is not installed...'` | Clear diagnostic message asking user to install SDK |
-| `backupDatabase` | S3 mode, `pg_dump` non-zero exit | Returns `{ success: false, message: 'Backup failed', error: <stderr> }` | S3 upload discarded, error reported |
-| `restoreDatabase` | S3 mode, S3 object body null/empty | Returns `{ success: false, message: 'Restore failed', error: 'S3 object ... returned an empty body' }` | Prevents hanging `pg_restore` on empty input |
-| `dropOldPartitions` | Table has `DEFAULT` partition | `DEFAULT` partition is skipped; never dropped | Prevents dropping catch-all partition |
-| `dropOldPartitions` | Unparseable partition bound | Partition is skipped without throwing | Log/continue without breaking retention task |
-| `dropOldPartitions` | `dryRun = true` | Returns list of partition names in `droppedPartitions`; no `DROP TABLE` query issued | Safe audit before execution |
 

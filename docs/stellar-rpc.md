@@ -10,11 +10,32 @@ Fluxora wraps Stellar RPC calls with a circuit breaker and a last-known-good fal
 | `OPEN` | The provider is considered unhealthy. The service attempts to serve the matching cached response before throwing `CircuitOpenError`. |
 | `HALF_OPEN` | A cool-off period has elapsed. One probe call is attempted against the provider; success closes the circuit and refreshes cache, failure reopens it. |
 
-The breaker is configured with `RPC_CB_FAILURE_THRESHOLD`, `RPC_CB_WINDOW_MS`, `RPC_CB_RESET_TIMEOUT_MS`, and `RPC_TIMEOUT_MS`.
+The breaker is configured with `RPC_CB_FAILURE_THRESHOLD`, `RPC_CB_WINDOW_MS`, `RPC_CB_RESET_TIMEOUT_MS`, and `RPC_TIMEOUT_MS`. These values, retry settings, cache settings, health-check settings, and optional per-operation deadlines are validated by `src/config/env.ts` before startup. Invalid values fail startup instead of being silently replaced by `parseInt`/`parseFloat` fallbacks.
 
 ## RPC Retries
 
-Individual RPC calls (such as fetching the latest ledger or checking account existence) are automatically wrapped in a retry loop using a shared decorrelated jitter helper. If a transient error occurs (such as a timeout or a provider error) and the circuit is not open, the request will be retried up to `STELLAR_RPC_MAX_RETRIES` times (default 3) before failing, with a base delay of `STELLAR_RPC_RETRY_DELAY` (default 1000ms). Jitter ensures that concurrent callers do not thunder-herd the RPC provider.
+Individual RPC calls (such as fetching the latest ledger or checking account existence) are automatically wrapped in a retry loop using a shared decorrelated jitter helper. If a *retryable* error occurs and the circuit is not open, the request is retried up to `STELLAR_RPC_MAX_RETRIES` times (default 3) before failing, with a base delay of `STELLAR_RPC_RETRY_DELAY` (default 1000ms). Jitter ensures that concurrent callers do not thunder-herd the RPC provider.
+
+`STELLAR_RPC_OPERATION_DEADLINES` accepts a JSON object such as `{"getLatestLedger":2000,"accountExists":8000}`. Every deadline must be a positive integer number of milliseconds.
+
+### Read vs. submit fallback policy
+
+Every operation this service currently exposes — `getLatestLedger` and `accountExists` — is a **read**: side-effect-free and safe to repeat any number of times. Retrying reads carries no risk of duplicate submissions, so retry decisions only need to ask "can this plausibly succeed on a second attempt?", not "is it safe to attempt again?". There is presently no submit/write RPC path (e.g. transaction submission) in this service; if one is added, it must carry its own idempotency key (e.g. the transaction hash) so a client-side retry after an ambiguous network failure cannot result in a duplicate on-chain submission — retrying a submit call blindly under this same policy would be unsafe.
+
+### Retryable status classes
+
+`isRetryableRpcError` (in `src/services/stellar-rpc.ts`) classifies every `RpcProviderError` raised by a call site before a retry is attempted:
+
+| Condition | Retried? | Rationale |
+| --- | --- | --- |
+| `TIMEOUT` / `NETWORK` kind | Yes | Connection-level hiccups are plausibly transient. |
+| `PROVIDER` kind, HTTP 429 | Yes | Rate limiting is expected to clear; backoff gives the provider room. |
+| `PROVIDER` kind, HTTP 5xx | Yes | Upstream server errors are plausibly transient. |
+| `PROVIDER` kind, HTTP 4xx (other than 429) | No | A permanent client/request error — retrying cannot change the outcome. |
+| `PROVIDER` kind, no HTTP status (config error, malformed response) | No | Permanent by construction (e.g. a missing `horizonUrl`) — retrying would only add latency and could mask the real error behind a generic timeout. |
+| `CANCELLED` kind | No | The caller explicitly aborted the request. |
+
+Only errors that have already been classified into an `RpcProviderError` by the service's own call sites are evaluated this way; a raw transport error thrown directly by a `RawRpcClient` implementation is left to the outer per-call timeout instead of being retried, so a single call's overall timeout budget can never be silently multiplied by per-attempt backoff sleeps.
 
 ## Fallback Cache
 
@@ -46,6 +67,46 @@ Closed-circuit cache behavior emits:
   - `fluxora_rpc_cache_corrupt_total`
 
 Redis cache read/write failures are logged as warnings and treated as misses or no-op writes. The fallback cache must not become a hard dependency for normal RPC calls.
+
+## Degradation Mode (HTTP Responses)
+
+`rpcDegradationMiddleware` turns circuit-breaker state into an explicit,
+self-describing HTTP contract so callers can always tell degraded data from
+fresh data.
+
+### Entry criteria
+
+The backend is **degraded** whenever the circuit breaker is not `CLOSED`
+(i.e. `OPEN` or `HALF_OPEN`). The breaker trips to `OPEN` once
+`RPC_CB_FAILURE_THRESHOLD` (default 5) failures are observed within
+`RPC_CB_WINDOW_MS` (default 30 000 ms), and it stays `OPEN` for
+`RPC_CB_RESET_TIMEOUT_MS` (default 60 000 ms) before a probe is admitted.
+
+### Markers on every response
+
+| Header / outcome | Value | Meaning |
+| --- | --- | --- |
+| `X-Degradation-State` | `CLOSED` / `OPEN` / `HALF_OPEN` | Current circuit state; present on every response. |
+| `Warning` | `199 fluxora-backend "Stellar RPC unavailable - data may be stale"` | Set on allowed read requests (GET/HEAD/OPTIONS) while degraded. |
+| `X-RPC-Cache` | `stale` | Set when the body came from the last-known-good fallback cache instead of a live RPC call. |
+| `503 SERVICE_UNAVAILABLE` | body `degradation: { circuitState, failureCount, openedAt }` | Mutating requests (POST/PUT/PATCH/DELETE) are rejected while degraded. |
+
+### Exit / automatic recovery
+
+Recovery is automatic: after the reset timeout elapses, the next call is
+admitted as a `HALF_OPEN` probe. A successful probe closes the breaker and
+normal responses resume; a failed probe reopens it. No manual intervention is
+required.
+
+### Observability
+
+Entry to and exit from degradation are logged (`event:
+rpc_degradation_transition`) and exported as Prometheus metrics:
+
+- `rpc_degradation_transitions_total{from,to}` — incremented on each observed
+  transition, e.g. `{from="CLOSED",to="OPEN"}` for entry and
+  `{from="OPEN",to="CLOSED"}` for automatic recovery.
+- `rpc_degraded_mode` — gauge, `1` while degraded and `0` when healthy.
 
 ## Security Notes
 

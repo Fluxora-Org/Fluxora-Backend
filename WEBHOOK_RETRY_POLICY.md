@@ -34,10 +34,31 @@ The Fluxora backend guarantees:
   jitterAlgorithm: 'full',           // full | equal | decorrelated
   previousDelayMs: 2000,             // Optional state for decorrelated jitter
   deadLetterAfterMs: 3600000,        // Send to DLQ after 1 hour (optional)
-  circuitBreakerThreshold: 10,       // Open circuit after 10 failures (optional)
-  circuitBreakerResetMs: 300000      // Reset circuit after 5 minutes (optional)
+  circuitBreakerThreshold: 0,        // Failures that open the circuit (0 = disabled)
+  circuitBreakerResetMs: 300000      // Open window before one half-open probe (optional)
 }
 ```
+
+### Circuit Breaker Thresholds
+
+Circuit-breaker state is kept **per receiver (consumer URL)** in Redis, so every replica and every restart share one view of a struggling endpoint. The complete transition table, the pause reason codes, and the observability endpoint are documented in [`docs/webhooks.md`](docs/webhooks.md#circuit-breaker-resilience). In brief:
+
+| Setting | Env var | Default | Effect |
+|---------|---------|--------:|--------|
+| Threshold | `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD` | `0` (disabled) | The `threshold`-th consecutive retryable failure opens the circuit. Below it, failures are counted but deliveries continue. |
+| Open window | `WEBHOOK_CIRCUIT_BREAKER_RESET_MS` | `300000` | Deliveries are blocked for this long after the circuit opens. |
+| Probe | derived | `min(window, 60000)` | One half-open probe is admitted at the end of the open window; its success closes the circuit, its failure re-opens it for another window. |
+
+Only retryable outcomes (network error, timeout, `408`/`425`/`429`/`5xx`) count toward the threshold — permanent `4xx` and `2xx` responses never open a circuit.
+
+A receiver can be told why its deliveries are paused and when they resume:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" \
+  "http://localhost:3000/internal/webhooks/circuit-breakers?endpointUrl=https%3A%2F%2Freceiver.example%2Fwebhooks"
+```
+
+The response reports `state`, `paused`, a machine-readable `reason` (`deliveries-allowed`, `failure-threshold`, `reset-elapsed`, `half-open-probe-in-flight`), the effective `threshold`/`resetMs`, and `resumeAt` — the timestamp of the first attempt allowed after the pause.
 
 ### Enhanced Backoff Strategies
 
@@ -182,7 +203,7 @@ permanent_failure
 ### Queue a Webhook Delivery
 
 ```
-POST /api/webhooks/queue
+POST /internal/webhooks/queue
 Content-Type: application/json
 
 {
@@ -200,7 +221,7 @@ Content-Type: application/json
 ### Get Delivery Status
 
 ```
-GET /api/webhooks/deliveries/:deliveryId
+GET /internal/webhooks/deliveries/:deliveryId
 ```
 
 Response:
@@ -228,7 +249,7 @@ Response:
 ### List All Deliveries
 
 ```
-GET /api/webhooks/deliveries
+GET /internal/webhooks/deliveries
 ```
 
 Response:
@@ -253,7 +274,7 @@ Response:
 ### Verify Webhook Signature
 
 ```
-POST /api/webhooks/verify?secret=webhook_secret_123
+POST /internal/webhooks/verify?secret=webhook_secret_123
 Content-Type: application/json
 x-fluxora-delivery-id: deliv_123
 x-fluxora-timestamp: 1710000000
@@ -281,7 +302,7 @@ This endpoint should be called periodically (e.g., every 10 seconds) by a backgr
 ### View Outbox Status
 
 ```
-GET /api/webhooks/outbox?priority=high&status=ready
+GET /internal/webhooks/outbox?priority=high&status=ready
 ```
 
 Response:
@@ -308,7 +329,7 @@ Response:
 ### View Dead-Letter Queue
 
 ```
-GET /api/webhooks/dlq?limit=50
+GET /internal/webhooks/dlq?limit=50
 ```
 
 Response:
@@ -334,7 +355,7 @@ Response:
 ### Retry DLQ Item
 
 ```
-POST /api/webhooks/dlq/dlq_123/retry
+POST /internal/webhooks/dlq/dlq_123/retry
 Content-Type: application/json
 
 {
@@ -345,29 +366,44 @@ Content-Type: application/json
 ### View Circuit Breaker Status
 
 ```
-GET /api/webhooks/circuit-breakers
+GET /internal/webhooks/circuit-breakers?endpointUrl=<receiver url>
 ```
 
-Response:
+State is per receiver, so `endpointUrl` is required. The response reports the
+effective thresholds the circuit is applying, whether deliveries are paused, why
+they are paused, and when they resume:
+
 ```json
 {
-  "total": 2,
+  "total": 1,
   "states": [
     {
       "endpointUrl": "https://consumer.example.com/webhook",
       "state": "open",
+      "paused": true,
+      "reason": "failure-threshold",
+      "consecutiveFailures": 15,
       "failureCount": 15,
-      "lastFailureTime": "2024-03-10T12:00:00Z",
-      "nextAttemptTime": "2024-03-10T12:05:00Z"
+      "threshold": 10,
+      "resetMs": 300000,
+      "lastFailureTime": "2024-03-10T12:00:00.000Z",
+      "resumeAt": "2024-03-10T12:05:00.000Z",
+      "nextAttemptTime": "2024-03-10T12:05:00.000Z"
     }
-  ]
+  ],
+  "observedAt": "2024-03-10T12:01:00.000Z"
 }
 ```
+
+`reason` is one of `deliveries-allowed`, `failure-threshold`, `reset-elapsed`,
+or `half-open-probe-in-flight` — see the
+[pause reason table](docs/webhooks.md#observing-a-receivers-circuit-state).
+`resumeAt` is the first moment an attempt is allowed again.
 
 ### Get Delivery Metrics
 
 ```
-GET /api/webhooks/metrics
+GET /internal/webhooks/metrics
 ```
 
 Response:
@@ -426,7 +462,7 @@ if (!verification.ok) {
 ### Health Checks
 
 - `GET /health` - Service health and indexer status
-- `GET /api/webhooks/deliveries` - Webhook delivery queue status
+- `GET /internal/webhooks/deliveries` - Webhook delivery queue status
 
 ### Monitoring Metrics
 
@@ -443,7 +479,7 @@ Operators should monitor:
 When webhook deliveries are failing:
 
 1. Check `/health` endpoint for service status
-2. Query `/api/webhooks/deliveries` to see pending deliveries
+2. Query `/internal/webhooks/deliveries` to see pending deliveries
 3. Inspect logs for delivery attempt details and errors
 4. Verify consumer endpoint is accessible and responding
 5. Check consumer logs for webhook processing errors
@@ -504,7 +540,7 @@ Test webhook delivery locally:
 npm run dev
 
 # Queue a webhook delivery
-curl -X POST http://localhost:3000/api/webhooks/queue \
+curl -X POST http://localhost:3000/internal/webhooks/queue \
   -H "Content-Type: application/json" \
   -d '{
     "event": {
@@ -518,7 +554,7 @@ curl -X POST http://localhost:3000/api/webhooks/queue \
   }'
 
 # Check delivery status
-curl http://localhost:3000/api/webhooks/deliveries
+curl http://localhost:3000/internal/webhooks/deliveries
 ```
 
 ## Non-Goals and Follow-Up Work

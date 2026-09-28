@@ -114,6 +114,7 @@ describe('collectVacuumMetrics — recursive CTE contract structure', () => {
 
 // ── Live DB integration tests ──────────────────────────────────────────────────
 
+// Keep-gated and intentionally excluded from issue #1248; tracked as live-DB coverage.
 describe.skipIf(!isLiveDb)('collectVacuumMetrics — partition rollup (live DB)', () => {
   let pool: pg.Pool | null = null;
   let dbAvailable = false;

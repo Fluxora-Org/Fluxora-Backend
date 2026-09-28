@@ -1,5 +1,7 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import http from 'node:http';
-import { glogger } from './lib/logger.js';
+import { logger } from './lib/logger.js';
+import { markShuttingDown } from './startup/readiness.js';
 
 let shuttingDown = false;
 const hooks: Array<() => Promise<void> | void> = [];
@@ -12,7 +14,7 @@ export interface DrainableService {
  * Returns true if a graceful shutdown is currently in progress.
  */
 export function isShuttingDown(): boolean {
-  return shuttingDown || process.env['FLUXORA_SHUTTOWN'] === 'true' || (globalThis as Record<string, unknown>)['__FLUXORA_SHUTTNOWN__'] === true;
+  return shuttingDown || process.env['FLUXORA_SHUTDOWN'] === 'true' || (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'] === true;
 }
 
 /**
@@ -37,8 +39,8 @@ export function addDrainableShutdownHook(service: DrainableService): void {
  */
 export function _resetShutdownState(): void {
   shuttingDown = false;
-  delete process.env['FLUXORA_SHUTTOWN'];
-  delete (globalThis as Record<string, unknown>)['__FLUXORA_SHUTTOWN__'];
+  delete process.env['FLUXORA_SHUTDOWN'];
+  delete (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'];
   hooks.length = 0;
 }
 
@@ -68,11 +70,13 @@ export function gracefulShutdown(
   shuttingDown = true;
   // Broadcast shutdown to any code (e.g. SSE subscribers) that observes
   // the process environment or global flag via isShuttingDown().
-  process.env['FLUXORA_SHUTTOWN'] = 'true';
-  (globalThis as Record<string, unknown>)['__FLUXORA_SHUTTDOWN__'] = true;
+  process.env['FLUXORA_SHUTDOWN'] = 'true';
+  (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'] = true;
+  // Mark service as shutting down in readiness state (rejects new requests).
+  markShuttingDown();
   logger.warn('Shutdown signal received, draining HTTP connections', undefined, { signal, timeoutMs: timeout });
 
-  return new Promise<void>(resolve) => {
+  return new Promise<void>((resolve) => {
     let settled = false;
 
     const finish = async (forced: boolean) => {

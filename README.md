@@ -13,9 +13,30 @@ High-performance contract event indexer with optimized batch processing and Post
 
 ## 📋 Requirements
 
-- Node.js 18+
+- Node.js **20.20.2** (exact, pinned; see [Node.js version](#nodejs-version))
 - PostgreSQL 12+
 - pnpm 9.15.9 (required)
+
+## Node.js version
+
+The service runs on exactly one Node.js version everywhere: **20.20.2**. The
+same version is used locally, in CI and in the Docker image.
+
+| Where | How it names the version |
+| --- | --- |
+| `.nvmrc` | `20.20.2` (source of truth; `nvm use` / `fnm use` read it) |
+| `package.json` | `"engines": { "node": "20.20.2" }` |
+| `Dockerfile` | `ARG NODE_VERSION=20.20.2` (both stages use `node:${NODE_VERSION}-alpine`) |
+| `.github/workflows/*.yml` | `actions/setup-node` with `node-version-file: '.nvmrc'` |
+
+CI runs `node scripts/check-node-version.mjs` (also `pnpm run check:node-version`)
+and fails when any of these disagree, or when a workflow or compose file names
+some other Node.js version.
+
+**Upgrading Node.js** is one reviewed pull request that changes `.nvmrc`,
+`package.json` `engines.node`, the Dockerfile `ARG NODE_VERSION`, and the
+version stated in this README. Run `pnpm run check:node-version` to confirm
+nothing was missed.
 
 ## 🛠️ Installation
 
@@ -60,7 +81,7 @@ timestamp prefix are applied in ascending numeric order and recorded in the
 |---|---|
 | `1000000000000 – 1000000000999` | Bootstrapping tables converted from the legacy PoolClient runner (`000_*`, `001_*`, `002_*`) |
 | `1774715131962 +` | Streams, audit, webhook-outbox, DLQ, and PII tables |
-| `20260601000000 +` | Calendar-style additions (pgcrypto, pagination indexes, …) |
+| `20260622000000 +` | Calendar-style additions (pagination indexes, pgcrypto, partitioning, …) |
 
 Files without a leading digit (e.g. `run.ts`) are ignored by the scanner and
 will never appear in the `pgmigrations` ledger.
@@ -154,6 +175,7 @@ Response:
 Scripted database backup, restore, and partition retention operations are managed via `src/scripts/db-ops.ts`.
 - `backupDatabase` / `restoreDatabase`: Support local custom-format dumps as well as zero-disk S3 streaming.
 - `dropOldPartitions`: Detaches and drops range partitions older than a specified threshold. Runs in `dryRun = true` mode by default.
+- Destructive restore and partition-drop operations print their target environment, require an explicit `confirm: true` flag, and require `acknowledgeProduction: true` when targeting production. Use `dryRun: true` first to report the planned change.
 
 For complete details on operator ergonomics, security controls, credential protection, and region resolution, see [docs/database.md](docs/database.md#scripted-database-operations--operator-ergonomics).
 
@@ -214,6 +236,26 @@ The test suite includes:
 4. **Transaction Safety**: Automatic rollback on errors
 5. **Webhook Delivery Logging**: Outbound webhook dispatch logs use the shared structured logger and include only stable identifiers (`deliveryId`, `eventType`, `attemptNumber`) plus `statusCode` when available. Webhook secrets, raw payloads, signatures, and endpoint URLs are excluded from log metadata.
 
+### Dependency Audit Enforcement
+
+All dependencies are continuously audited for security vulnerabilities. Findings at **moderate severity or above** fail the build unless covered by an explicit, time-bound exception.
+
+**Remediation windows:**
+- Critical: 7 days (engineering lead approval required)
+- High: 14 days (team lead approval required)
+- Moderate: 30 days (peer review required)
+
+Run audit checks locally:
+```bash
+# Run enforcing audit check (as used in CI)
+pnpm run audit:check
+
+# Validate exceptions file format
+pnpm run audit:validate
+```
+
+See [docs/security/dependency-audit-policy.md](docs/security/dependency-audit-policy.md) for the complete exception process and remediation guidelines.
+
 ### Webhook Delivery Logging
 
 The class-based `WebhookDispatcher` imports the shared structured logger from `src/lib/logger.ts` and uses the same `(message, correlationId?, meta?)` signature as other services. Dispatch outcomes log only safe delivery metadata:
@@ -263,12 +305,27 @@ For a table with 10M events:
 
 ## 📚 Documentation
 
+**Operations / alerting:** see the [Alerting Signals Runbook](docs/observability/alerting-runbook.md) for metric → threshold → first diagnostic → escalation mapping across all collectors. Deeper topic docs live under `docs/observability/`.
+
+
 See [docs/indexer.md](docs/indexer.md) for comprehensive documentation including:
 - Detailed API reference
 - Database schema and indexes
 - Security considerations
 - Troubleshooting guide
 - Monitoring recommendations
+
+## 📦 Client SDKs
+
+Two generated clients are versioned in lockstep with the API and published from
+tagged releases:
+
+- **TypeScript** — `@fluxora/sdk` on [npm](https://www.npmjs.com/package/@fluxora/sdk): `npm install @fluxora/sdk`
+- **Python** — `fluxora-sdk` on [PyPI](https://pypi.org/project/fluxora-sdk/): `pip install fluxora-sdk`
+
+Both SDK versions are copied from `openapi.yaml` `info.version` and are checked
+by `pnpm check:sdk`. See [docs/sdk-publishing.md](docs/sdk-publishing.md) for the
+versioning policy and release process.
 
 ## 🏗️ Architecture
 
@@ -343,7 +400,7 @@ Outbound webhook retries use two Redis-backed per-consumer controls:
 - **Rate limiting** (`src/redis/webhookRateLimit.ts`): sliding-window cap via `WEBHOOK_RETRY_RPS` (default `10`/s).
 - **Circuit breaker** (`src/redis/webhookCircuitBreakerStore.ts`): shared `closed` → `open` → `half-open` state keyed by SHA-256 hash of the consumer URL. After `circuitBreakerThreshold` consecutive failures, deliveries are deferred until `circuitBreakerResetMs`, then a single cross-instance probe is allowed.
 
-`attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for details.
+`attemptWebhookDeliveryWithRateLimit` in `src/webhooks/retry.ts` applies both gates before each delivery. State transitions emit `fluxora_webhook_circuit_breaker_transitions_total`. See [docs/webhooks.md](docs/webhooks.md) for the full transition table, the `WEBHOOK_CIRCUIT_BREAKER_*` thresholds, and `GET /internal/webhooks/circuit-breakers`, which reports per receiver whether deliveries are paused (`paused`/`reason`) and when they resume (`resumeAt`).
 
 ## Webhook Causal Ordering Guarantee
 
@@ -368,6 +425,11 @@ MIT
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes with tests
+   - Protecting a new route? Use the guards from `src/middleware/auth.ts`,
+     the authoritative auth entry point. See [docs/auth.md](docs/auth.md),
+     "Which authentication helper to use".
+   - Returning a collection? Paginate it and add its bound to
+     [docs/response-limits.md](docs/response-limits.md).
 4. Ensure tests pass: `pnpm test`
 5. Submit a pull request
 

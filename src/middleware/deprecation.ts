@@ -1,5 +1,5 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
-import { logger } from '../logging/logger.js';
+import { logger } from '../lib/logger.js';
 
 export interface DeprecatedRoute {
   /** Absolute route path or route prefix to mark as deprecated. */
@@ -100,7 +100,8 @@ function applyDeprecationHeaders(req: Request, res: Response, entries: Normalize
     }
 
     if (entry.sunset.getTime() <= Date.now()) {
-      logger.warn('deprecated route is past its sunset date', req.correlationId as string, {
+      logger.warn('deprecated route is past its sunset date', {
+        correlationId: req.correlationId as string,
         event: 'route.sunset.past',
         method: req.method,
         path: req.path,
@@ -108,7 +109,7 @@ function applyDeprecationHeaders(req: Request, res: Response, entries: Normalize
         sunsetDate: entry.sunsetDate,
         sunsetTimestamp: entry.sunset.toISOString(),
         overdueMs: Date.now() - entry.sunset.getTime(),
-        userAgent: req.headers['user-agent'] ?? 'unknown',
+        userAgent: req.headers?.['user-agent'] ?? 'unknown',
       });
     }
   }

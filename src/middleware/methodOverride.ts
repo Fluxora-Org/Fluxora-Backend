@@ -51,7 +51,7 @@ export function validateOverrideMethod(raw: unknown): string | null {
  * @returns `true` if authentication is present or credentials exist.
  */
 function isAuthenticatedRequest(req: Request): boolean {
-  const hasUser = Boolean(req.user || (req as any).keyId || (req as any).keyScopes);
+  const hasUser = Boolean(req.user || req.keyId || req.keyScopes);
   const hasCredentialHeader = Boolean(req.headers.authorization || req.headers['x-api-key']);
   return hasUser || hasCredentialHeader;
 }
@@ -67,8 +67,8 @@ function getAuditUserId(req: Request): string {
     const u = req.user as { address?: string; sub?: string; role?: string };
     return u.address || u.sub || u.role || 'authenticated_user';
   }
-  if ((req as any).keyId) {
-    return `key:${(req as any).keyId}`;
+  if (req.keyId) {
+    return `key:${req.keyId}`;
   }
   return 'credential_header_present';
 }
@@ -122,10 +122,10 @@ export function methodOverrideMiddleware(
     return next();
   }
 
-  // 2. Read override value from header or query string (header takes precedence)
-  const headerValue = req.headers['x-http-method-override'];
-  const queryValue = req.query._method;
-  const rawOverride = headerValue !== undefined && headerValue !== '' ? headerValue : queryValue;
+  // 2. Read override value from header.
+  // Query parameter overrides (?_method=) are strictly disallowed to prevent
+  // CORS preflight bypasses on browser-originated requests.
+  const rawOverride = req.headers['x-http-method-override'];
 
   // Exit immediately if no override value exists
   if (!rawOverride || (typeof rawOverride === 'string' && rawOverride.trim() === '')) {
@@ -141,6 +141,28 @@ export function methodOverrideMiddleware(
   // Skip method override if request lacks authentication context or credential headers
   if (!isAuthenticatedRequest(req)) {
     return next();
+  }
+
+  // Enforce that browser-originated requests (Origin present) or cookie-bearing requests
+  // MUST satisfy CSRF protections if they are overriding to a mutating method.
+  // However, since CSRF middleware runs later, we ensure the Content-Type is application/json
+  // which forces a CORS preflight for cross-origin requests.
+  const contentType = req.headers['content-type'] || '';
+  const isJson = contentType.includes('application/json');
+  const hasCookie = Boolean(req.headers.cookie);
+  const hasOrigin = Boolean(req.headers.origin);
+  
+  if ((hasCookie || hasOrigin) && !isJson) {
+    const requestId = req.correlationId ?? (res.locals['requestId'] as string | undefined);
+    res.status(415).json(
+      errorResponse(
+        'UNSUPPORTED_MEDIA_TYPE',
+        'Method override on browser requests requires application/json Content-Type',
+        undefined,
+        requestId,
+      ),
+    );
+    return;
   }
 
   // 4. Validate method against allowlist (PATCH, PUT, DELETE)

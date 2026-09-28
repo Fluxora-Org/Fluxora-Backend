@@ -589,7 +589,7 @@ vi.mock('../../src/db/replicaPool.js', () => ({
   setReplicaPool: vi.fn(),
 }));
 
-vi.mock('../../src/utils/logger.js', () => ({
+vi.mock('../../src/lib/logger.js', () => ({
   info: vi.fn(),
   debug: vi.fn(),
   warn: vi.fn(),
@@ -621,15 +621,19 @@ vi.mock('../../src/pii/pgcryptoEncryption.js', () => ({
   encryptAddressValue: vi.fn((v: string) => v),
 }));
 
-vi.mock('../../src/db/queries/streams.js', () => ({
-  streamSelectColumns: vi.fn(
-    () =>
-      'id, status, sender_address, recipient_address, amount, streamed_amount, remaining_amount, rate_per_second, start_time, end_time, contract_id, transaction_hash, event_index, created_at, updated_at',
-  ),
-  senderAddressFilterCondition: vi.fn(() => 'sender_address = $1'),
-  recipientAddressFilterCondition: vi.fn(() => 'recipient_address = $1'),
-  encryptAddressValue: vi.fn((v: string) => v),
-}));
+vi.mock('../../src/db/queries/streams.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/db/queries/streams.js')>();
+  return {
+    ...actual,
+    streamSelectColumns: vi.fn(
+      () =>
+        'id, status, sender_address, recipient_address, amount, streamed_amount, remaining_amount, rate_per_second, start_time, end_time, contract_id, transaction_hash, event_index, created_at, updated_at',
+    ),
+    senderAddressFilterCondition: vi.fn(() => 'sender_address = $1'),
+    recipientAddressFilterCondition: vi.fn(() => 'recipient_address = $1'),
+    encryptAddressValue: vi.fn((v: string) => v),
+  };
+});
 
 describe('streamRepository.findWithCursor – forcePrimary forwarding', () => {
   /**

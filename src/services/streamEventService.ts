@@ -1,3 +1,4 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Stream Event Service - Maps blockchain events to database records
  *
@@ -10,7 +11,7 @@
 
 import { streamRepository } from "../db/repositories/streamRepository.js";
 import { CreateStreamInput, StreamStatus } from "../db/types.js";
-import { info, warn, error as logError, debug } from "../utils/logger.js";
+import { info, warn, error as logError, debug } from "../lib/logger.js";
 import { getStreamHub } from "../ws/hub.js";
 import { enrichActiveSpanWithStream, traceSpan } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";
@@ -85,6 +86,17 @@ export interface EventIngestionResult {
 }
 
 /**
+ * Derive the stable identity used for deduplication and replay.
+ *
+ * A Soroban event is uniquely identified by its transaction hash and event
+ * index. Keeping this derivation in one exported function ensures replay,
+ * backfill, and live ingestion cannot silently drift apart.
+ */
+export function deriveStreamEventId(transactionHash: string, eventIndex: number): string {
+  return `${transactionHash}-${eventIndex}`;
+}
+
+/**
  * Stream Event Service
  *
  * Processes blockchain events with idempotency guarantees:
@@ -152,7 +164,7 @@ export const streamEventService = {
     event: StreamCreatedEvent,
     correlationId?: string,
   ): Promise<EventIngestionResult> {
-    const eventId = `${event.transactionHash}-${event.eventIndex}`;
+    const eventId = deriveStreamEventId(event.transactionHash, event.eventIndex);
 
     info("Processing StreamCreated event", {
       eventId,
@@ -268,7 +280,7 @@ export const streamEventService = {
     event: StreamUpdatedEvent,
     correlationId?: string,
   ): Promise<EventIngestionResult> {
-    const eventId = `${event.transactionHash}-${event.eventIndex}`;
+    const eventId = deriveStreamEventId(event.transactionHash, event.eventIndex);
 
     info("Processing StreamUpdated event", {
       eventId,
@@ -400,7 +412,7 @@ export const streamEventService = {
     event: StreamCancelledEvent,
     correlationId?: string,
   ): Promise<EventIngestionResult> {
-    const eventId = `${event.transactionHash}-${event.eventIndex}`;
+    const eventId = deriveStreamEventId(event.transactionHash, event.eventIndex);
 
     info("Processing StreamCancelled event", {
       eventId,
@@ -582,6 +594,5 @@ export const streamEventService = {
     return results;
   },
 };
-
 
 

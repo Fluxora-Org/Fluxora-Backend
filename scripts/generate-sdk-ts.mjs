@@ -470,6 +470,7 @@ export * from './errors.js';
 export * from './idempotency.js';
 export * from './pagination.js';
 export * from './client.js';
+export * from './fixtures.js';
 `;
 }
 

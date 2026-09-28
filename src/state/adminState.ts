@@ -219,6 +219,10 @@ export function getReindexState(): ReindexState {
   return { ...state.reindex };
 }
 
+export function getReindexLock(): Lock | null {
+  return reindexLock;
+}
+
 /**
  * Kick off a simulated reindex. In production this would trigger a
  * Horizon replay or database rebuild from chain events.

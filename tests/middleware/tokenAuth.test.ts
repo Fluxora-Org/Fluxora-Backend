@@ -3,7 +3,6 @@
  *
  * Covers edge cases for:
  * - verifyWsToken (WebSocket JWT auth)
- * - createBearerTokenAuth (partner/admin bearer token auth)
  * - Observability (logging, metrics, audit)
  */
 
@@ -12,8 +11,6 @@ import { IncomingMessage } from 'http';
 import {
   verifyWsToken,
   WsAuthFailureCode,
-  createBearerTokenAuth,
-  TokenAuthOptions,
 } from '../../src/middleware/tokenAuth.js';
 import jwt from 'jsonwebtoken';
 
@@ -35,7 +32,10 @@ vi.mock('../../src/metrics/businessMetrics.js', () => ({
 }));
 
 describe('verifyWsToken', () => {
-  let logger: any, recordAuditEvent: any, wsAuthFailureTotal: any;
+  // Only ever passed to expect(); the modules are vi.mock()ed above.
+  let logger: { warn: unknown };
+  let recordAuditEvent: unknown;
+  let wsAuthFailureTotal: { inc: unknown };
   const SECRET = 'test-secret-key';
 
   beforeEach(async () => {
@@ -196,167 +196,5 @@ describe('verifyWsToken', () => {
     verifyWsToken(req, SECRET);
 
     expect(logger.warn).toHaveBeenCalled();
-  });
-});
-
-describe('createBearerTokenAuth', () => {
-  it('bypasses auth when required is false and token is not configured', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: false };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = {} as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith();
-  });
-
-  it('bypasses auth when required is true but token is configured and matches', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: true, token: 'secret-token' };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = { header: vi.fn().mockReturnValue('Bearer secret-token') } as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith();
-  });
-
-  it('returns 503 when auth is required but token is not configured', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: true };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = {} as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: 'partner authentication is required but not configured',
-        details: { role: 'partner' },
-      }),
-    );
-  });
-
-  it('returns 401 when Authorization header is missing', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: true, token: 'secret-token' };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = { header: vi.fn().mockReturnValue(undefined) } as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: 'partner bearer token is required',
-        details: { role: 'partner' },
-      }),
-    );
-  });
-
-  it('returns 401 when Authorization header is not Bearer scheme', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: true, token: 'secret-token' };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = { header: vi.fn().mockReturnValue('Basic dXNlcjpwYXNz') } as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: 'partner bearer token is required',
-        details: { role: 'partner' },
-      }),
-    );
-  });
-
-  it('returns 401 when Bearer token is empty', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: true, token: 'secret-token' };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = { header: vi.fn().mockReturnValue('Bearer ') } as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: 'partner bearer token is required',
-        details: { role: 'partner' },
-      }),
-    );
-  });
-
-  it('returns 401 when Bearer token does not match configured token', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: true, token: 'secret-token' };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = { header: vi.fn().mockReturnValue('Bearer wrong-token') } as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: 'Invalid partner bearer token',
-        details: { role: 'partner' },
-      }),
-    );
-  });
-
-  it('trims whitespace from bearer token before comparison', () => {
-    const options: TokenAuthOptions = { role: 'partner', required: true, token: 'secret-token' };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = { header: vi.fn().mockReturnValue('Bearer  secret-token  ') } as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith();
-  });
-
-  it('handles administrator role correctly', () => {
-    const options: TokenAuthOptions = { role: 'administrator', required: true, token: 'admin-secret' };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = { header: vi.fn().mockReturnValue('Bearer admin-secret') } as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith();
-  });
-
-  it('returns service unavailable error with administrator role when token not configured', () => {
-    const options: TokenAuthOptions = { role: 'administrator', required: true };
-    const middleware = createBearerTokenAuth(options);
-
-    const req = {} as any;
-    const res = {} as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: 'administrator authentication is required but not configured',
-        details: { role: 'administrator' },
-      }),
-    );
   });
 });

@@ -145,7 +145,17 @@ To prevent stale or half-open connections (e.g., dropped by NAT timeouts or flak
 - **Pong Response**: Clients are expected to respond with a `pong` frame. Most standard WebSocket client libraries (such as the native browser API) do this automatically.
 - **Termination Threshold**: If a client misses consecutive `pong` responses (default is 2 missed pongs, configurable via `healthProbeMaxMissed`), the server proactively terminates the connection (`ws.terminate()`) and fully cleans up its subscription state.
 
-The aggregate health of all WebSocket connections is exposed via the Prometheus gauge `fluxora_ws_connection_health_total`, labeled by `status="healthy"` or `status="unhealthy"`.
+The aggregate health of all WebSocket connections is exposed via the Prometheus gauge `fluxora_ws_connection_health_total`, labeled by `status`:
+
+| `status` | Meaning |
+| -------- | ------- |
+| `healthy` | Socket is `OPEN` and its outbound queue is draining below the stall threshold. |
+| `stalled` | Socket is `OPEN` but its outbound `bufferedAmount` exceeds `healthProbeStallBytes` (default `BACKPRESSURE_DROP_BYTES`, 1 MiB). Frames are buffering faster than the peer drains them — the connection is **not** healthy even though it is open. |
+| `unhealthy` | The client missed `healthProbeMaxMissed` consecutive pongs and is being terminated. |
+
+The `status` label is a closed set of three values, so its cardinality is fixed at 3 regardless of connection churn; no per-connection identifier is used as a label.
+
+> **Alert threshold:** page when `fluxora_ws_connection_health_total{status="stalled"} > 0` for **2 minutes**. A stall sustained beyond a heartbeat interval means a peer stopped draining its outbound queue; the hub will start dropping frames once the backpressure drop threshold is crossed.
 
 ## Backpressure Policy
 
@@ -166,9 +176,25 @@ the slow connection and increments `droppedMessages`. When
 connection, increments both `droppedMessages` and `terminatedConnections`, and
 removes the connection from subscriptions.
 
-The hub does not queue unbounded per-client messages. Recovery is handled by
-future broadcasts after the client's socket drains, or by reconnecting and using
-the replay API backed by the event store.
+The hub retains outbound messages per connection only while the socket is
+backpressured. `WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION` (default 128) limits the
+message count, and `WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION` (default 1 MiB)
+limits the UTF-8 byte size of their combined serialized payloads. If adding a
+message would exceed either cap, the hub drops the newest message and preserves
+the messages already queued. A message larger than the byte cap is dropped
+without entering the queue. Recovery is handled by future broadcasts after the
+client's socket drains, or by reconnecting and using the replay API backed by
+the event store.
+
+## Inbound Message Size
+
+`WS_MAX_INBOUND_MESSAGE_BYTES` (default 4,096) limits each incoming WebSocket
+message payload in **bytes**, measured as UTF-8 payload bytes rather than
+JavaScript string characters. The same value configures the `ws` transport's
+`maxPayload`, which rejects oversized messages before delivering them to the
+application (close code 1009), and the application-level validator repeats the
+byte check before parsing as defense in depth. Fragmented messages are limited
+by their combined message payload size.
 
 Tests can lower thresholds with:
 
@@ -278,8 +304,8 @@ await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
 
 ### Security notes (partition handling)
 
-- No per-client unbounded queuing: the hub never queues messages for slow
-  clients beyond a single broadcast cycle.
+- Queued messages are bounded per connection by both a message-count cap and
+  a combined UTF-8 byte cap; overflow drops the newest message.
 - Terminated connections have their subscriptions fully cleaned up:
   `streamSubscriptions`, `recipientSubscriptions`, and per-client batch
   accumulators are all purged.
@@ -290,9 +316,20 @@ await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
 ## Security Notes
 
 - Only JSON text frames are accepted; binary frames are rejected.
-- Inbound client messages are capped by `MAX_MESSAGE_BYTES`.
+- Inbound client messages are capped in UTF-8 bytes by
+  `WS_MAX_INBOUND_MESSAGE_BYTES` at the WebSocket transport and application
+  validation layers.
 - Inbound client messages are rate-limited per connection.
 - Optional WebSocket JWT authentication can reject unauthenticated upgrades.
+- When `WS_ALLOWED_ORIGINS` is configured, browser upgrades require an exact
+  match against one of its comma-separated origins. Requests without an
+  `Origin` header remain compatible with non-browser clients.
+- JWTs are verified, including expiration, before the upgrade completes. A
+  refreshed token is used by opening a new connection; there is no unauthenticated
+  health-probe path when `WS_AUTH_REQUIRED=true`.
+- Reconnect attempts are limited per client IP by `WS_RECONNECT_LIMIT` within
+  `WS_RECONNECT_WINDOW_MS`, including attempts whose previous sockets already
+  closed.
 - Backpressure metadata must not include sensitive stream payload contents.
 
 ---
@@ -427,8 +464,9 @@ The flag is also accepted inside a nested `filter` object:
 
 - `events` is always in insertion order (in-order delivery guarantee).
 - `correlationId` is omitted from an entry when not present on the source event.
-- Each frame is bounded by `MAX_MESSAGE_BYTES` (4 096 bytes). If the full batch
-  would exceed that limit, the largest safe prefix (by event count) is sent.
+- Each batch frame is bounded by `MAX_MESSAGE_BYTES` (4 096 bytes), independently
+  of the inbound client-message byte limit. If the full batch would exceed that
+  limit, the largest safe prefix (by event count) is sent.
 
 ### Configuration
 
@@ -489,9 +527,10 @@ rate(fluxora_ws_batch_events_coalesced_total[5m])
   Neither field is client-controlled in a way that allows key collision.
 - Pending timers are cancelled immediately on client disconnect and on
   `hub.close()` — no frames are ever sent to a closed socket.
-- Each outbound frame is checked against `MAX_MESSAGE_BYTES` before delivery.
-  Oversized frames are truncated to the largest event prefix that fits, rather
-  than silently dropped.
+- Each `stream_update_batch` frame is checked against `MAX_MESSAGE_BYTES` before
+  delivery. Oversized batches are truncated to the largest event prefix that
+  fits; other outbound envelopes are bounded by the per-connection queued-byte
+  cap when they enter the outbound queue.
 
 ### Broadcast Resilience
 

@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
 import { createRedisClient, type RedisClient } from '../redis/client.js';
 import { addShutdownHook } from '../shutdown.js';
-import { info, warn, error } from '../utils/logger.js';
+import { info, warn, error } from '../lib/logger.js';
 
 interface JwksKey {
   kty: string;

@@ -47,6 +47,10 @@
  *     Redis instances are never touched.
  *   - Every toxic is removed in afterEach so failures in one test cannot
  *     corrupt later tests.
+ *
+ * The 33 tests in this file remain intentionally gated: they require the
+ * isolated Toxiproxy Docker profile and are tracked by issue #1248. The
+ * standard test command must not report them as passing without that stack.
  */
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
@@ -309,17 +313,20 @@ function buildHealthManager(opts: {
 // ── 0. Connectivity smoke test ────────────────────────────────────────────────
 
 describe('Toxiproxy: connectivity smoke test', () => {
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)('management API returns both registered proxies', async () => {
     const proxies = await toxi.getProxies();
     expect(proxies).toHaveProperty('pg_proxy');
     expect(proxies).toHaveProperty('redis_proxy');
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)('can connect to Postgres through the proxy (SELECT 1)', async () => {
     const result = await pgPool.query<{ '?column?': number }>('SELECT 1');
     expect(result.rows[0]?.['?column?']).toBe(1);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)('can PING Redis through the proxy', async () => {
     const { response } = await redisPing(CHAOS_REDIS_URL, 4_000);
     // AUTH response is +OK, then PING response is +PONG
@@ -336,6 +343,7 @@ describe('Postgres: latency toxic (degraded health)', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports healthy before any toxic',
     async () => {
@@ -347,6 +355,7 @@ describe('Postgres: latency toxic (degraded health)', () => {
     },
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports degraded when latency exceeds DEFAULT_DEGRADED_LATENCY_MS',
     async () => {
@@ -375,6 +384,7 @@ describe('Postgres: latency toxic (degraded health)', () => {
     10_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker returns to healthy after toxic is removed',
     async () => {
@@ -397,6 +407,7 @@ describe('Postgres: latency toxic (degraded health)', () => {
     10_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'poolQuery() still succeeds (slow) during latency injection',
     async () => {
@@ -427,6 +438,7 @@ describe('Postgres: connection timeout / disabled proxy (unhealthy health)', () 
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports unhealthy when proxy is disabled (ECONNREFUSED)',
     async () => {
@@ -447,6 +459,7 @@ describe('Postgres: connection timeout / disabled proxy (unhealthy health)', () 
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports unhealthy when latency exceeds checker timeout',
     async () => {
@@ -469,6 +482,7 @@ describe('Postgres: connection timeout / disabled proxy (unhealthy health)', () 
     8_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker recovers to healthy after proxy is re-enabled',
     async () => {
@@ -497,6 +511,7 @@ describe('Postgres: bandwidth throttle (degraded health)', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'poolQuery SELECT 1 latency increases under heavy bandwidth throttle',
     async () => {
@@ -520,6 +535,7 @@ describe('Postgres: bandwidth throttle (degraded health)', () => {
     8_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports degraded when bandwidth throttle adds > 1000ms latency',
     async () => {
@@ -547,6 +563,7 @@ describe('Postgres: bandwidth throttle (degraded health)', () => {
     10_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health returns to healthy after bandwidth toxic is removed',
     async () => {
@@ -575,6 +592,7 @@ describe('Postgres: TCP reset toxic (unhealthy health)', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports unhealthy when connections are reset immediately',
     async () => {
@@ -598,6 +616,7 @@ describe('Postgres: TCP reset toxic (unhealthy health)', () => {
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'poolQuery throws a network-level error under reset toxic',
     async () => {
@@ -616,6 +635,7 @@ describe('Postgres: TCP reset toxic (unhealthy health)', () => {
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'pool recovers to healthy after reset toxic is removed',
     async () => {
@@ -680,6 +700,7 @@ describe('Redis: latency toxic (degraded health)', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports healthy before any Redis toxic',
     async () => {
@@ -691,6 +712,7 @@ describe('Redis: latency toxic (degraded health)', () => {
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'PING latency is measurably higher under latency toxic',
     async () => {
@@ -711,6 +733,7 @@ describe('Redis: latency toxic (degraded health)', () => {
     8_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports degraded when Redis PING latency > threshold',
     async () => {
@@ -736,6 +759,7 @@ describe('Redis: latency toxic (degraded health)', () => {
     8_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker returns to healthy after Redis latency toxic is removed',
     async () => {
@@ -764,6 +788,7 @@ describe('Redis: connection reset toxic (unhealthy health)', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'redisPing throws when connections are reset immediately',
     async () => {
@@ -780,6 +805,7 @@ describe('Redis: connection reset toxic (unhealthy health)', () => {
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker reports unhealthy when Redis connections are reset',
     async () => {
@@ -804,6 +830,7 @@ describe('Redis: connection reset toxic (unhealthy health)', () => {
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker recovers to healthy after reset toxic is removed',
     async () => {
@@ -832,6 +859,7 @@ describe('Redis: bandwidth throttle (measurable latency impact)', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'PING latency increases under bandwidth throttle',
     async () => {
@@ -851,6 +879,7 @@ describe('Redis: bandwidth throttle (measurable latency impact)', () => {
     8_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'health checker latency is elevated under bandwidth throttle',
     async () => {
@@ -886,6 +915,7 @@ describe('Health aggregation: combined Postgres + Redis checkers', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'overall healthy when both checkers pass',
     async () => {
@@ -915,6 +945,7 @@ describe('Health aggregation: combined Postgres + Redis checkers', () => {
     8_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'overall unhealthy when Postgres is unhealthy and Redis is healthy',
     async () => {
@@ -951,6 +982,7 @@ describe('Health aggregation: combined Postgres + Redis checkers', () => {
     8_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'overall degraded when only Postgres latency is elevated',
     async () => {
@@ -987,6 +1019,7 @@ describe('Health aggregation: combined Postgres + Redis checkers', () => {
     12_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'overall unhealthy trumps degraded (unhealthy > degraded rule)',
     async () => {
@@ -1042,6 +1075,7 @@ describe('Postgres pool.ts error propagation under chaos', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'query() propagates connection errors as-is (not swallowed)',
     async () => {
@@ -1061,6 +1095,7 @@ describe('Postgres pool.ts error propagation under chaos', () => {
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'query() throws QueryTimeoutError when statement_timeout fires under extreme latency',
     async () => {
@@ -1101,6 +1136,7 @@ describe('Security: credentials never leak into health error messages', () => {
     await sleep(SETTLE_MS);
   });
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'Postgres error messages do not contain connection string credentials',
     async () => {
@@ -1122,6 +1158,7 @@ describe('Security: credentials never leak into health error messages', () => {
     6_000,
   );
 
+  // Keep-gated: requires the Toxiproxy chaos stack; tracked by issue #1248.
   it.skipIf(!CHAOS_ENABLED)(
     'Redis error messages do not contain connection string credentials',
     async () => {
