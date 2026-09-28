@@ -496,6 +496,17 @@ export function createApp(options: AppOptions = {}): Express {
     addShutdownHook(() => stopGrpcHealthServer(grpcHealthServer));
   }
 
+  // #1466: security headers must be set on *every* response, including the
+  // ones produced before routing (readiness 503, request timeout 408) and
+  // every error path. helmet writes its headers synchronously when the
+  // middleware runs, so it has to be the first thing mounted — anything that
+  // can end a request (readinessGuard, requestTimeoutMiddleware) would
+  // otherwise answer with a body but without CSP, HSTS or nosniff.
+  // cspNonceMiddleware must precede it so res.locals.cspNonce is populated
+  // when helmet builds the Content-Security-Policy header.
+  app.use(cspNonceMiddleware);
+  app.use(createHelmetMiddleware());
+
   // Blue/green slot header — must run before any response can be sent.
   app.use(deploymentSlotMiddleware);
 
@@ -514,8 +525,6 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(sanitizeResponses);
-  app.use(cspNonceMiddleware);
-  app.use(createHelmetMiddleware());
   // #1555: cap every buffered response body (see docs/response-limits.md).
   // Registered before all routers so it wraps res.send for every route.
   app.use(responseSizeLimitMiddleware);
