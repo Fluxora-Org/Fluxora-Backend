@@ -32,14 +32,11 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import swaggerUi from 'swagger-ui-express';
 import { buildOpenApiSpec } from '../openapi/spec.js';
-<<<<<<< HEAD
 import { isEnabled, onFlagsReloaded } from '../config/featureFlags.js';
-=======
 import {
   FLUXORA_JSONLD_CONTEXT_DOCUMENT,
   FLUXORA_JSONLD_CONTEXT_PATH,
 } from '../serialization/jsonld.js';
->>>>>>> 5c9fd38 (feat(jsonld): version and pin the JSON-LD context)
 
 export const docsRouter = Router();
 

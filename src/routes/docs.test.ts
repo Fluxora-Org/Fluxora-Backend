@@ -10,8 +10,12 @@ import express from 'express';
 import request from 'supertest';
 import { docsRouter, resetSpecCache, FLAG_GATED_PATHS } from './docs.js';
 import { reloadFlags } from '../config/featureFlags.js';
-<<<<<<< HEAD
 import { GRAPHQL_GATEWAY_FLAG } from '../graphql/gateway.js';
+import {
+  FLUXORA_JSONLD_CONTEXT,
+  FLUXORA_JSONLD_CONTEXT_DOCUMENT,
+  FLUXORA_JSONLD_CONTEXT_PATH,
+} from '../serialization/jsonld.js';
 
 /** Build the test app fresh each test so router state is clean. */
 function makeApp(): express.Express {
@@ -19,13 +23,6 @@ function makeApp(): express.Express {
   app.use(docsRouter);
   return app;
 }
-=======
-import {
-  FLUXORA_JSONLD_CONTEXT,
-  FLUXORA_JSONLD_CONTEXT_DOCUMENT,
-  FLUXORA_JSONLD_CONTEXT_PATH,
-} from '../serialization/jsonld.js';
->>>>>>> 5c9fd38 (feat(jsonld): version and pin the JSON-LD context)
 
 describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
   let app: express.Express;
@@ -75,9 +72,8 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
     });
   });
 
-<<<<<<< HEAD
-  // ── Admin/internal exclusion (#1477 criterion 2) ─────────────────────
-=======
+  // ── GET /ns/v1 — JSON-LD context document ─────────────────────────────
+
   describe('GET /ns/v1 (JSON-LD context document)', () => {
     it('serves the pinned context document', async () => {
       const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
@@ -104,12 +100,7 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
     });
   });
 
-  describe('Spec Cache Static Independence & Regression Protection', () => {
-    it('verifies that OpenAPI spec generation is static and unaffected by reloadFlags()', async () => {
-      // 1. Initial request populates cache
-      const resBefore = await request(app).get('/openapi.json');
-      expect(resBefore.status).toBe(200);
->>>>>>> 5c9fd38 (feat(jsonld): version and pin the JSON-LD context)
+  // ── Admin/internal exclusion (#1477 criterion 2) ─────────────────────
 
   describe('admin and internal endpoints are never served', () => {
     it('excludes /api/admin/* paths from the served spec', async () => {
