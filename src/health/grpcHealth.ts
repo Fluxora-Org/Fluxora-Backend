@@ -133,7 +133,7 @@ export function createGrpcHealthServer(healthManager: HealthCheckManager): grpc.
     watch(call: grpc.ServerWritableStream<HealthCheckRequest, HealthCheckResponse>): void {
       let lastStatus: HealthCheckResponse['status'] | null = null;
       let stopped = false;
-      const service = call.request.service;
+      const service = call.request?.service;
 
       const writeIfChanged = async (): Promise<void> => {
         const status = await resolveServingStatus(healthManager, service);

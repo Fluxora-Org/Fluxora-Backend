@@ -13,6 +13,11 @@
  *                           mapping, and load/initialize/reset singletons
  * - `env-hot-reload.ts`  — SIGHUP hot-reload machinery (HotConfig)
  *
+ * The composed schema is unchanged in effect: it accepts and rejects exactly
+ * the same inputs as the original single-file definition, verified by
+ * `tests/config/env.schema-split.test.ts`.
+ */
+import { parseEnv, getConfig } from './env-config.js';
  * The pre-split single-file implementation used to be duplicated here. It
  * redeclared `EnvSchema`, `ParsedEnv`, `Config`, `ConfigError`,
  * `EnvironmentError` and the parse/load singletons that this facade
@@ -28,6 +33,7 @@ export type { ParsedEnv } from './env-schema/schema.js';
 export type { NodeEnv, LogLevel } from './env-schema/types.js';
 
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
+export { resolveNetwork } from './stellar.js';
 export {
   STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
@@ -35,7 +41,11 @@ export {
   assertNetworkMatchesContracts,
   logActiveStellarConfig,
 } from './stellarContracts.js';
-export { resolveNetwork } from './stellar.js';
+
+export { DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES } from './env-schema/server.js';
+export function getWsMaxInboundMessageBytes(): number {
+  return getConfig().wsMaxInboundMessageBytes;
+}
 
 export type { Config } from './env-config.js';
 export {

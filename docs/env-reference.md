@@ -3,6 +3,7 @@
 # Environment Variable Reference
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
+issue #1519). 162 variables across 11 subsystems.
 issue #1519). 161 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
@@ -138,6 +139,9 @@ issue #1519). 161 variables across 11 subsystems.
 | `GRPC_HEALTH_ENABLED` | Enables the grpc.health.v1.Health service for Kubernetes-native gRPC probes. @default false | `false` |
 | `GRPC_HEALTH_PORT` | Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). @default 50051 | `50051` |
 | `HEALTH_CHECK_INTERVAL_MS` | Interval between background health-check runs. Must be strictly greater than 0. @default 30000 | `30000` |
+| `HEALTH_CHECK_POSTGRES_TIMEOUT_MS` | Per-checker timeout override for the Postgres health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. @default undefined (uses HEALTH_CHECK_TIMEOUT_MS) | — |
+| `HEALTH_CHECK_REDIS_TIMEOUT_MS` | Per-checker timeout override for the Redis health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. @default undefined (uses HEALTH_CHECK_TIMEOUT_MS) | — |
+| `HEALTH_CHECK_STELLAR_TIMEOUT_MS` | Per-checker timeout override for the Stellar RPC health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. @default undefined (uses HEALTH_CHECK_TIMEOUT_MS) | — |
 | `HEALTH_CHECK_TIMEOUT_MS` | Per-checker timeout for HealthCheckManager. Must be strictly greater than 0. @default 5000 | `5000` |
 | `INDEXER_ENABLED` | Run the chain-indexing loop inside this process. @default false | `false` |
 | `PARTNER_API_TOKEN` | Bearer token partner clients must present when REQUIRE_PARTNER_AUTH is on. | — |
