@@ -194,8 +194,8 @@ which runs the same transition suite against both the Redis store and the in-pro
 ### How rate limiting works
 
 1. Before firing a retry, the dispatcher calls `attemptWebhookDeliveryWithRateLimit` with the consumer's endpoint URL and the configured `RateLimitConfig` (`{ limit, windowMs }`).
-2. The rate limiter (`src/redis/webhookRateLimit.ts`) maintains a Redis sorted set keyed by a SHA-256 hash of the consumer URL. Each recorded attempt is a member with score = timestamp (ms).
-3. Entries older than `windowMs` are pruned on every check. If the remaining count is at or above `limit`, the attempt is **deferred** rather than dropped.
+2. The rate limiter (`src/redis/webhookRateLimit.ts`) maintains a Redis sorted set keyed by a SHA-256 hash of the receiver endpoint URL. The budget is per receiver: attempts from all tenants and attempt outcomes to that endpoint share it, while different endpoints never consume one another's capacity. Each recorded attempt is a member with score = timestamp (ms).
+3. Entries are pruned when their age reaches `windowMs`; the Redis key expires after `windowMs` without a new admitted attempt. If the remaining count is at or above `limit`, the attempt is **deferred** rather than dropped.
 4. A deferred attempt returns `{ shouldRetry: true, rateLimited: true, retryAt: now + windowMs }`. The dispatcher re-inserts the outbox row with `created_at = retryAt`, so the deferral is durable in PostgreSQL.
 5. `WEBHOOK_RETRY_RPS` (default `10`) controls `limit`; `windowMs` is `1000 ms` (one second).
 
