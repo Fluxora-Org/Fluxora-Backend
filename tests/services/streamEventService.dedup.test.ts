@@ -90,6 +90,14 @@ class TestFailableRedisClient implements RedisClient {
     this.store.set(key, value);
   }
 
+  async incr(key: string): Promise<number> {
+    this.totalOperationAttempts++;
+    if (!this.isAvailable) throw new Error("Redis outage");
+    const val = parseInt(this.store.get(key) || '0', 10) + 1;
+    this.store.set(key, val.toString());
+    return val;
+  }
+
   async setNx(key: string, value: string, _pxMs: number): Promise<boolean> {
     this.totalOperationAttempts++;
     if (!this.isAvailable) {
@@ -119,6 +127,18 @@ class TestFailableRedisClient implements RedisClient {
       throw new Error("Redis outage (simulated exists failure)");
     }
     return this.store.has(key);
+  }
+
+  async incr(key: string): Promise<number> {
+    this.totalOperationAttempts++;
+    if (!this.isAvailable) {
+      this.totalFailuresEncountered++;
+      throw new Error("Redis outage (simulated incr failure)");
+    }
+    const current = parseInt(this.store.get(key) ?? '0', 10);
+    const next = isNaN(current) ? 1 : current + 1;
+    this.store.set(key, String(next));
+    return next;
   }
 
   async close(): Promise<void> {

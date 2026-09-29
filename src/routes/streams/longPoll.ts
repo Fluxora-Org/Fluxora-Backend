@@ -22,7 +22,7 @@ import {
 import { resolveLongPollConnectionLimits, tryAcquireLongPollConnection } from '../../streams/longPoll.js';
 import { streamUpdateEnvelope } from '../../serialization/stream.js';
 import { successResponse } from '../../utils/response.js';
-import { warn } from '../../utils/logger.js';
+import { warn } from '../../lib/logger.js';
 import { parseLastEventIdHeader, parseLongPollTimeoutMs, rethrowDbError } from './guards.js';
 import {
   getReplayEventStore,

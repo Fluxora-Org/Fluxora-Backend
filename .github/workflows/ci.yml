@@ -7,6 +7,25 @@ on:
     branches: [ main, develop ]
 
 jobs:
+  node-version:
+    name: Node.js Version Pin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      # Fails when .nvmrc, package.json "engines.node", the Dockerfile and the
+      # workflows do not all name the same Node.js version. See
+      # scripts/check-node-version.mjs.
+      - name: Check Node.js version pin
+        run: node scripts/check-node-version.mjs
+
   typecheck:
     name: TypeScript Typecheck
     runs-on: ubuntu-latest
@@ -21,7 +40,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -34,10 +53,24 @@ jobs:
   lint:
     name: Lint (changed files)
     runs-on: ubuntu-latest
+    env:
+      # The PR base commit is available even when checkout creates only the
+      # synthetic pull-request merge ref.
+      LINT_BASE: ${{ github.event.pull_request.base.sha }}
 
     steps:
+      # fetch-depth: 0 is required by scripts/lint-changed-files.mjs, which
+      # diffs the changed file set against origin/<base branch>.
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # The changed-files linter needs the PR base ref (origin/main),
+          # not only the shallow merge checkout created for pull requests.
+          # `scripts/lint-changed-files.mjs` diffs `origin/main...HEAD`, which
+          # requires the base branch ref. The default (fetch-depth: 1) only
+          # fetches the PR's own commit, so the script could never resolve
+          # `origin/main` and the job failed before running ESLint at all.
+          fetch-depth: 0
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -45,7 +78,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -70,8 +103,43 @@ jobs:
           POSTGRES_PASSWORD: test_password
         ports:
           - 5432:5432
+        # `pg_isready` — the previous value (`pgisready`) is not an existing
+        # binary, so the healthcheck always failed and GitHub reported
+        # "Failed to initialize container postgres:15-alpine" before any test
+        # ran. Keep comments out of `options`: YAML block scalars pass them
+        # through to `docker create` as arguments.
         options: >-
-          --health-cmd pgisready
+          --health-cmd "pg_isready --host=127.0.0.1 --username=test_user --dbname=indexer_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-start-period 30s
+          --health-retries 20
+
+      # Real Redis for the AdminStateLock integration suite
+      # (tests/state/adminStateLock.concurrentReindex.test.ts). The suite is
+      # gated on REDIS_INTEGRATION=true and asserts distributed-lock
+      # contention and lease-based crash recovery against a live server.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-cmd "pg_isready -U test_user -d indexer_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      # Real Redis for the AdminStateLock integration suite
+      # (tests/state/adminStateLock.concurrentReindex.test.ts). The suite is
+      # gated on REDIS_INTEGRATION=true and asserts distributed-lock
+      # contention and lease-based crash recovery against a live server.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -86,7 +154,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -100,8 +168,40 @@ jobs:
       - name: SDK drift check (TypeScript)
         run: node scripts/generate-sdk-ts.mjs --check
 
+      # The generated SDK version must equal `openapi.yaml` info.version, so a
+      # breaking API change can never ship an SDK that still advertises the old
+      # version. See docs/sdk-publishing.md.
+      - name: SDK version sync check
+        run: node scripts/check-sdk-version-sync.mjs
+      # Fixtures must match OpenAPI examples (same source as example contract tests)
+      - name: SDK fixtures drift check
+        run: pnpm run check:sdk:fixtures
+
       - name: Check migration naming policy
         run: pnpm run check:migrations
+
+      # Required gate: every migration must either run in node-pg-migrate's
+      # per-migration transaction or be listed in the atomicity manifest with
+      # re-runnable statements. See docs/migration-atomicity.md.
+      - name: Check migration atomicity and re-run safety
+        run: pnpm run check:migration-atomicity
+
+      - name: Check deprecation sunset policy
+        run: pnpm run check:deprecations
+
+      # Required gate: the published retention schedule (docs/retention-schedule.md),
+      # the code manifest, the migrations and the purge jobs must agree. A new
+      # table with no stated retention period, a changed window that was not
+      # re-published, or a purge rule pointing at the wrong column all fail here.
+      # See scripts/check-retention-schedule.ts and docs/retention-schedule.md.
+      - name: Check data retention schedule
+        run: pnpm run check:retention
+
+      # Required gate: the API changelog must record every externally visible
+      # change, grouped by API version, with breaking changes marked. Adding or
+      # removing an endpoint without a changelog entry fails the build.
+      - name: Check API changelog
+        run: pnpm run check:api-changelog
 
       # The database suites are guarded by DATABASE_URL so local/offline test
       # runs remain lightweight. In CI, give them a real PostgreSQL schema and
@@ -112,9 +212,18 @@ jobs:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
         run: pnpm run migrate
 
+      # Assert src/db/types.ts still matches the schema the migrations just
+      # produced. A renamed or retyped mapped column fails here until the
+      # declared interface is updated.
+      - name: Assert DB types match the live schema
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+        run: pnpm run check:db-types
+
       - name: Run live database integration suites
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+          MIGRATION_ATOMICITY_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
         run: >-
           pnpm exec vitest run --reporter=verbose
           tests/db/vacuumCollector.collect.test.ts
@@ -122,12 +231,19 @@ jobs:
           tests/db/streams.compositeIndexes.test.ts
           tests/db/logicalReplication.test.ts
           tests/db/contractEvents.partitionPruning.test.ts
+          tests/db/rowMapping.schema.test.ts
+          tests/db/migrations.atomicity.test.ts
 
       # Required gate: failing tests block the pipeline.
       - name: Run tests
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
           REPLAY_BATCH_SIZE: 100
+          # Run the AdminStateLock real-Redis integration suite against the
+          # Redis service above so lock contention/lease coverage executes on
+          # every CI build instead of staying skipped.
+          REDIS_INTEGRATION: 'true'
+          REDIS_TEST_URL: redis://localhost:6379
         run: pnpm test:coverage:ci
 
       - name: Upload coverage to Codecov
@@ -156,18 +272,24 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Validate exceptions file format first
+      - name: Validate audit exceptions
+        run: pnpm run audit:validate
+
       # Required gate: audit failures block the pipeline.
-      - name: Run security audit
-        run: pnpm audit --audit-level=moderate
+      # Findings at moderate+ severity fail the build unless covered by a valid,
+      # non-expired exception. See docs/security/dependency-audit-policy.md.
+      - name: Run enforcing security audit
+        run: pnpm run audit:check
 
   docker:
-    name: Docker Build
+    name: Docker Build & Hardening
     runs-on: ubuntu-latest
     needs: [test]
 
@@ -183,6 +305,20 @@ jobs:
         with:
           context: .
           push: false
-          tags: indexer:${{ github.sha }}
+          load: true
+          tags: fluxora-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Assert image hardening (issue #1508)
+        run: ./scripts/assert-image-hardening.sh fluxora-backend:ci
+
+      - name: Trivy secret scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: fluxora-backend:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+          scanners: 'secret'

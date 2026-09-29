@@ -1,3 +1,8 @@
+/**
+ * Freshness budget before an indexer pause is treated as a stall.
+ * Five minutes is long enough to absorb short backlogs or slow RPCs, but short
+ * enough that the API does not keep serving chain state that has already moved on.
+ */
 export const DEFAULT_INDEXER_STALL_THRESHOLD_MS = 5 * 60 * 1000;
 
 export type IndexerHealthStatus =
@@ -99,23 +104,19 @@ export function assessIndexerHealth(
 
   if (lagMs > thresholdMs) {
     isStallLatched = true;
-  }
-
-  if (isStallLatched) {
     return {
       status: 'stalled',
       stalled: true,
       thresholdMs,
       lastSuccessfulSyncAt: lastSuccessfulSyncAtIso,
       lagMs,
-      summary: lagMs > thresholdMs
-        ? 'Indexer checkpoint is older than the allowed freshness threshold'
-        : 'Indexer has recovered but the stall flag remains latched until cleared by an operator',
+      summary: 'Indexer checkpoint is older than the allowed freshness threshold',
       clientImpact: 'stale_chain_state',
       operatorAction: 'page',
     };
   }
 
+  isStallLatched = false;
   return {
     status: 'healthy',
     stalled: false,

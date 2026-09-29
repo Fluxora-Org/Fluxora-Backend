@@ -1,3 +1,5 @@
+import { errorResponse } from '../utils/response.js';
+
 type CorsRequest = {
   method: string;
   header: (name: string) => string | undefined;
@@ -109,12 +111,7 @@ export function corsAllowlistMiddleware(req: CorsRequest, res: CorsResponse, nex
 
   clearCorsPermissionHeaders(res);
   if (isPreflight(req)) {
-    res.status(403).json({
-      error: {
-        code: 'CORS_ORIGIN_DENIED',
-        message: 'Origin is not allowed by CORS policy',
-      },
-    });
+    res.status(403).json(errorResponse('CORS_ORIGIN_DENIED', 'Origin is not allowed by CORS policy'));
     return;
   }
 

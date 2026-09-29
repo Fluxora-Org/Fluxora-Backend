@@ -1,0 +1,59 @@
+name: Load tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: URL of the deployed Fluxora Backend to exercise
+        required: true
+        type: string
+      profile:
+        description: Load profile to run
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - load
+          - stress
+          - soak
+
+permissions:
+  contents: read
+
+jobs:
+  k6:
+    name: k6 ${{ inputs.profile }} profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Run load profile
+        env:
+          K6_BASE_URL: ${{ inputs.base_url }}
+          K6_API_KEY: ${{ secrets.K6_API_KEY }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          mkdir -p k6/results
+          k6 run \
+            --out json=k6/results/metrics.json \
+            --summary-export k6/results/k6-summary.json \
+            k6/main.js
+
+      - name: Re-check comparable performance summary
+        if: always()
+        run: node scripts/check-performance-budget.mjs --summary k6/results/performance-budget-summary.json
+
+      - name: Retain load-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-${{ inputs.profile }}-${{ github.run_id }}
+          path: k6/results/
+          if-no-files-found: error
+          retention-days: 90

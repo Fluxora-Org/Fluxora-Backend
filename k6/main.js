@@ -139,8 +139,10 @@ export function handleSummary(data) {
     const p99 = tagged.p99 ?? trend.p99;
     const budgetP95 = endpoint.budgets.p95 ?? null;
     const budgetP99 = endpoint.budgets.p99 ?? null;
-    const p95Ok = budgetP95 == null || p95 == null || p95 <= budgetP95;
-    const p99Ok = budgetP99 == null || p99 == null || p99 <= budgetP99;
+    // A missing percentile means the endpoint was not exercised. Treat that
+    // as a failure so a broken scenario cannot silently produce a green run.
+    const p95Ok = budgetP95 == null || (p95 != null && p95 <= budgetP95);
+    const p99Ok = budgetP99 == null || (p99 != null && p99 <= budgetP99);
     return {
       endpoint: endpoint.id,
       method: endpoint.method,

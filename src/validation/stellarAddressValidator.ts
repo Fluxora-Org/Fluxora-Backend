@@ -19,6 +19,16 @@
  * the request through. This prevents an RPC outage from blocking all stream
  * creation. Operators should alert on circuit-open events separately.
  *
+ * Structured logging & metrics (issue #1442)
+ * ------------------------------------------
+ * Every rejection emits one structured `warn` record through `src/lib/logger.ts`
+ * and increments `fluxora_stellar_address_validation_failures_total`. The record
+ * inherits the request correlation identifier from the async context so a
+ * failure can be tied back to the request that caused it. Successful
+ * validations emit nothing: valid addresses are high-volume and carry no
+ * diagnostic signal. The module never emits a raw address — only a bounded
+ * reason, an address length, and the configured network.
+ *
  * Security notes
  * --------------
  * - Addresses are URL-encoded before use in Horizon URLs (done in stellar-rpc.ts).
@@ -33,6 +43,9 @@ import type { StellarNetwork } from '../config/stellar.js';
 import type { RedisClient } from '../redis/client.js';
 import type { StellarRpcService } from '../services/stellar-rpc.js';
 import { CircuitOpenError } from '../services/stellar-rpc.js';
+import { logger } from '../lib/logger.js';
+import { getCorrelationId } from '../tracing/middleware.js';
+import { recordStellarAddressValidationFailure } from '../metrics/stellarAddressMetrics.js';
 import {
   isValidStellarAccountAddress,
   networkLabel,
@@ -96,6 +109,7 @@ export class StellarAddressValidator {
       return !ok;
     });
     if (malformed.length > 0) {
+      this.logValidationFailure('malformed', malformed.length);
       return { valid: false, missingAddresses: malformed, reasons };
     }
 
@@ -115,9 +129,35 @@ export class StellarAddressValidator {
     }
 
     if (missing.length > 0) {
+      this.logValidationFailure('wrong-network', missing.length);
       return { valid: false, missingAddresses: missing, reasons };
     }
     return { valid: true };
+  }
+
+  /**
+   * Record and log a rejected validation event.
+   *
+   * Only failures are logged. A structurally valid address that exists is a
+   * high-volume, low-signal event, so successful validations emit nothing (see
+   * the acceptance criteria on issue #1442). The correlation identifier is
+   * resolved from the async context so the log line can be joined to the
+   * request that produced it.
+   *
+   * @param reason - Bounded rejection cause, used as both the log `reason`
+   *                 meta field and the metric label value.
+   * @param count  - Number of addresses rejected in this validation call.
+   */
+  private logValidationFailure(
+    reason: 'malformed' | 'wrong-network',
+    count: number
+  ): void {
+    recordStellarAddressValidationFailure(reason);
+    logger.warn('stellar address validation failed', getCorrelationId(), {
+      reason,
+      count,
+      network: networkLabel(this.network),
+    });
   }
 
   /**
@@ -139,8 +179,10 @@ export class StellarAddressValidator {
       return exists;
     } catch (err) {
       if (err instanceof CircuitOpenError) {
-        console.warn(
+        recordStellarAddressValidationFailure('rpc-unavailable');
+        logger.warn(
           '[StellarAddressValidator] Circuit breaker OPEN — failing open for address check',
+          getCorrelationId(),
           {
             addressLength: address.length,
             network: networkLabel(this.network),
@@ -149,7 +191,8 @@ export class StellarAddressValidator {
         return null; // fail-open
       }
       // Network / provider error — fail-open with a warning
-      console.warn('[StellarAddressValidator] RPC error — failing open for address check', {
+      recordStellarAddressValidationFailure('rpc-unavailable');
+      logger.warn('[StellarAddressValidator] RPC error — failing open for address check', getCorrelationId(), {
         addressLength: address.length,
         network: networkLabel(this.network),
         error: err instanceof Error ? err.message : String(err),

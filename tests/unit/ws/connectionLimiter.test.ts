@@ -207,6 +207,9 @@ describe('connectionLimiter (Redis-backed bans)', () => {
         async exists() {
           return false;
         },
+        async incr() {
+          throw new Error('Redis down');
+        },
         async close() {},
         multi() {
           return {

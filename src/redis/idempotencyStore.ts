@@ -193,6 +193,9 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       const result = await this.client.setNx(fullKey, 'IN_PROGRESS', ttlSeconds * 1000);
       this.onStateChange?.(true);
       if (result) this.expiryByKey.set(fullKey, expiresAt);
+      const fullKey = this.buildKey(key, tenantId);
+      const result = await this.client.setNx(fullKey, 'IN_PROGRESS', ttlSeconds * 1000);
+      this.onStateChange?.(true);
       return result;
     } catch (err) {
       this.onStateChange?.(false);

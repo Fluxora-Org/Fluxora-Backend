@@ -5,12 +5,17 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   CANONICAL_MIGRATION,
   MigrationNameError,
+  checkContractDirectory,
   checkDirectory,
+  contractFiles,
+  contractOrdinal,
+  formatContractResult,
   formatResult,
   migrationFiles,
   migrationPrefix,
   migrationStem,
   readBaseline,
+  validateContractMigrations,
   validateMigrationNames,
 } from './check-migration-names.mjs';
 
@@ -144,6 +149,135 @@ describe('migration name policy', () => {
       ['20260601_old'],
     );
     expect(result.legacy).toEqual(['20260601_old.ts']);
+  });
+
+  describe('contract migration ordinals (#1485)', () => {
+    const LEDGER = {
+      renames: [
+        {
+          from: '006_streams_event_index_check',
+          to: '008_streams_event_index_check',
+          issue: 1485,
+          reason: 'duplicate 006_ ordinal',
+        },
+      ],
+    };
+
+    it('accepts the renumbered contract set and reports the applied order', () => {
+      const files = [
+        '001_create_streams_table.ts',
+        '006_add_webhook_outbox_dispatch_index.ts',
+        '007_add_webhook_outbox_lock_columns.ts',
+        '008_streams_event_index_check.ts',
+      ];
+      const result = validateContractMigrations(files, LEDGER);
+      expect(result.contracts).toBe(4);
+      expect(result.order).toEqual([...files].sort());
+      expect(result.ordinals).toEqual(['001', '006', '007', '008']);
+      expect(result.renames).toBe(1);
+      expect(formatContractResult(result)).toContain('001_create_streams_table.ts');
+    });
+
+    it('rejects the duplicate 006_ ordinal the issue reported', () => {
+      expect(() =>
+        validateContractMigrations(
+          ['006_add_webhook_outbox_dispatch_index.ts', '006_streams_event_index_check.ts'],
+          LEDGER
+        )
+      ).toThrow(MigrationNameError);
+      try {
+        validateContractMigrations([
+          '006_add_webhook_outbox_dispatch_index.ts',
+          '006_streams_event_index_check.ts',
+        ]);
+      } catch (error) {
+        expect(error.code).toBe('DUPLICATE_ORDINAL');
+        expect(error.collisions).toEqual(['006']);
+      }
+    });
+
+    it('rejects a three-way duplicate and names every owner', () => {
+      try {
+        validateContractMigrations(['006_a.ts', '006_b.ts', '006_c.ts']);
+        throw new Error('expected validation failure');
+      } catch (error) {
+        expect(error.code).toBe('DUPLICATE_ORDINAL');
+        expect(error.message).toContain('006_a.ts, 006_b.ts, 006_c.ts');
+      }
+    });
+
+    it.each([
+      '9_short_ordinal.ts',
+      '0012_wide_ordinal.ts',
+      '001_Uppercase.ts',
+      '001_bad-name.ts',
+      '001_name.sql',
+    ])('rejects non-canonical contract name %s', (file) => {
+      expect(() => validateContractMigrations([file])).toThrow(/Non-canonical/);
+    });
+
+    it('rejects a rename whose old stem is still on disk', () => {
+      try {
+        validateContractMigrations(
+          ['006_streams_event_index_check.ts', '008_streams_event_index_check.ts'],
+          LEDGER
+        );
+        throw new Error('expected validation failure');
+      } catch (error) {
+        expect(error.code).toBe('RENAME_SOURCE_PRESENT');
+      }
+    });
+
+    it('rejects a rename whose target never landed', () => {
+      try {
+        validateContractMigrations(['001_create_streams_table.ts'], LEDGER);
+        throw new Error('expected validation failure');
+      } catch (error) {
+        expect(error.code).toBe('RENAME_TARGET_MISSING');
+      }
+    });
+
+    it('rejects a malformed ledger', () => {
+      expect(() => validateContractMigrations(['001_a.ts'], { renames: 'nope' })).toThrow(
+        /must be an array/
+      );
+      expect(() => validateContractMigrations(['001_a.ts'], { renames: [{ from: 'a' }] })).toThrow(
+        /from.*to/
+      );
+    });
+
+    it('lists only contract files, ignoring templates and helpers', () => {
+      expect(contractFiles(['001_a.ts', 'README.md', 'templates', 'run.ts'])).toEqual(['001_a.ts']);
+    });
+
+    it('extracts the ordinal from a contract filename', () => {
+      expect(contractOrdinal('008_streams_event_index_check.ts')).toBe('008');
+    });
+
+    it('checks a real directory and enforces the ledger on disk', () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fluxora-contract-'));
+      temporary.push(directory);
+      for (const file of ['001_first.ts', '002_second.ts']) {
+        fs.writeFileSync(path.join(directory, file), 'export const up = "";\n');
+      }
+      const ledgerPath = path.join(directory, 'contract-ledger.json');
+      fs.writeFileSync(ledgerPath, JSON.stringify({ renames: [] }));
+
+      expect(checkContractDirectory({ contractDir: directory, ledgerPath }).contracts).toBe(2);
+
+      fs.writeFileSync(path.join(directory, '001_third.ts'), 'export const up = "";\n');
+      expect(() => checkContractDirectory({ contractDir: directory, ledgerPath })).toThrow(
+        /Duplicate contract migration ordinal/
+      );
+    });
+
+    it('reports an empty contract set without failing', () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fluxora-contract-empty-'));
+      temporary.push(directory);
+      const result = checkContractDirectory({ contractDir: directory });
+      expect(result).toMatchObject({ contracts: 0, renames: 0 });
+      expect(formatContractResult(result)).toContain('(none)');
+    });
   });
 
   describe('boundary cases for the canonical format', () => {

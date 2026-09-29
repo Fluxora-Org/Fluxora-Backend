@@ -36,6 +36,7 @@ import {
   loadConfig,
 } from './config/env.js';
 import { validateStartupConfig } from './config/startupValidation.js';
+import { runStellarContractReachabilityCheck } from './config/stellarContractsReachability.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { prepareReloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
@@ -47,6 +48,14 @@ import {
   recordConfigReloadFailure,
   recordConfigReloadSuccess,
 } from './metrics.js';
+import {
+  markDependenciesReady,
+  markPoolReady,
+  markRedisReady,
+  markIndexerReady,
+  markReady,
+  markShuttingDown,
+} from './startup/readiness.js';
 
 let server: ReturnType<typeof app.listen> | undefined;
 
@@ -91,6 +100,21 @@ if (process.env.NODE_ENV !== 'test') {
     // Apply and record the effective log level before anything else logs, so the
     // active threshold for this environment is always visible at startup.
     logActiveLogLevel({ logLevel: cfg.logLevel, nodeEnv: cfg.nodeEnv });
+
+    // ── Stellar contract reachability (issue #1438) ───────────────────────
+    // Format and network pinning are validated synchronously above; confirming
+    // each configured address actually exists on the resolved network needs
+    // I/O, so it runs here — against the ACTIVE configuration (the addresses
+    // resolved from env for `cfg.stellarNetwork`), before the server binds.
+    // Enabled by default outside NODE_ENV=test and non-fatal unless
+    // STELLAR_CONTRACT_REACHABILITY_STRICT=true, in which case a bad address
+    // throws ConfigError and lands in the .catch() below (exit 1).
+    await runStellarContractReachabilityCheck({
+      network: cfg.stellarNetwork,
+      addresses: cfg.contractAddresses,
+      rpcUrl: cfg.stellarRpcUrl,
+      timeoutMs: cfg.stellarRpcTimeout,
+    });
 
     // ── OpenTelemetry SDK & Logs Bridge ───────────────────────────────────
     // Must be called before the first request is served so that
@@ -177,6 +201,9 @@ if (process.env.NODE_ENV !== 'test') {
       budgetMs: cfg.startupProbeBudgetMs,
     });
 
+    // Mark startup dependency probes as complete.
+    markDependenciesReady();
+
     void checkAdminStatePersistence();
 
     server = app.listen(cfg.port, () => {
@@ -185,11 +212,35 @@ if (process.env.NODE_ENV !== 'test') {
         env: cfg.nodeEnv,
       });
 
-      indexerService.resumeIncompleteReplay().catch((err) => {
-        logger.error('indexer:resume_failed', undefined, {
-          error: err instanceof Error ? err.message : String(err),
+      // Indexer startup runs asynchronously after server is listening.
+      // Mark each stage ready as it completes, then mark the service fully ready.
+      indexerService.resumeIncompleteReplay()
+        .then(() => {
+          // Mark pool ready after the app initializes (which happens during require).
+          markPoolReady();
+          // Mark Redis ready after app initialization.
+          markRedisReady();
+          // Mark indexer ready after replay completes.
+          markIndexerReady();
+          // Finally, mark the entire service ready to accept traffic.
+          markReady();
+
+          logger.info('startup:complete', undefined, {
+            phase: 'READY',
+            message: 'All dependencies ready; accepting traffic',
+          });
+        })
+        .catch((err) => {
+          logger.error('indexer:resume_failed', undefined, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Even if indexer resume fails, mark as ready so service doesn't block indefinitely.
+          // The indexer health check will report degraded status.
+          markPoolReady();
+          markRedisReady();
+          markIndexerReady();
+          markReady();
         });
-      });
     });
 
     process.on('SIGTERM', () => void gracefulShutdown(server!, 'SIGTERM'));

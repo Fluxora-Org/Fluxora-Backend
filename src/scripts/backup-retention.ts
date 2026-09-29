@@ -330,7 +330,6 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
     backupId,
     confirmProduction = false,
     targetEnvironment = 'staging',
-    correlationId,
     onStatusChange,
   } = request;
 
@@ -477,13 +476,11 @@ export function classifyBackup(
  */
 export function filterRetainedObjects(
   objects: BackupObject[],
-  policy: RetentionPolicy
+  _policy: RetentionPolicy
 ): BackupObject[] {
   const daily = objects.filter((o) => o.classification === 'daily');
   const weekly = objects.filter((o) => o.classification === 'weekly');
   const monthly = objects.filter((o) => o.classification === 'monthly');
-  const expired = objects.filter((o) => o.classification === 'expired');
-
   // Sort each tier by last modified (newest first)
   weekly.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
   monthly.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
@@ -561,7 +558,8 @@ export function selectObjectsForDeletion(
 async function fetchBackupObjects(
   client: S3Client,
   bucket: string,
-  prefix: string
+  prefix: string,
+  now: Date = new Date()
 ): Promise<BackupObject[]> {
   const objects: BackupObject[] = [];
   let continuationToken: string | undefined;

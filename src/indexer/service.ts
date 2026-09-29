@@ -2,7 +2,7 @@
 import pg from 'pg';
 import { db } from '../db/client.js';
 import { config } from '../config.js';
-import { ReplayCursor, ReplayProgress, ReplayRequest } from '../types.js';
+import { ReplayCursor, ReplayProgress, ReplayRequest } from '../types/index.js';
 import { logger } from '../lib/logger.js';
 import {
   indexerReplayBatchesCommittedTotal,
@@ -17,6 +17,7 @@ import {
 import { checkReplayIntegrity } from './replayIntegrity.js';
 import {
   recordIndexerBatchFailure,
+  recordIndexerBatchPartialFailure,
   recordIndexerBatchSuccess,
 } from '../metrics/indexerRed.js';
 import { ReplayBudgetExceededError, IndexerNotLeaderError } from './replayErrors.js';
@@ -34,6 +35,7 @@ export { ReplayBudgetExceededError, IndexerNotLeaderError, ReplayForcedStopError
 export { replayLock, replayState, requestStopReplay, _resetStopReplay } from './replayRuntimeState.js';
 export { rowToReplayCursor, rowToContractEvent } from './replayRowMappers.js';
 export { ReplayCursorRepository } from './replayCursorRepository.js';
+export { _resetRolledBackLedgers } from './ingestion.js';
 
 /** Seconds elapsed since a `process.hrtime.bigint()` start mark. */
 function elapsedSecondsSince(startedAt: bigint): number {
@@ -277,14 +279,35 @@ export class IndexerService {
           });
           throw batchError;
         }
-        recordIndexerBatchSuccess(request.contract_id, elapsedSecondsSince(batchStartedAt));
+        const batchDurationSeconds = elapsedSecondsSince(batchStartedAt);
 
         if (batchResult.aborted) {
-          // A stop was requested mid-batch; the in-flight batch was rolled
-          // back and not committed. Stop at this boundary.
+          // A stop was requested mid-batch; the in-flight transaction was rolled
+          // back, so every row this batch fetched was discarded and the ledger
+          // range was NOT advanced. That is a partial failure — work was
+          // performed, data was dropped — not a success. Recording it as a
+          // success is what made `indexer_batch_errors_total` report a healthy
+          // zero while rows were being thrown away.
+          const classification = recordIndexerBatchPartialFailure(
+            request.contract_id,
+            batchDurationSeconds,
+            'batch_aborted',
+          );
+          logger.warn('replay_batch_aborted', undefined, {
+            event: 'replay_batch_aborted',
+            contract_id: request.contract_id,
+            ledger: request.ledger,
+            cursor_id: cursor.id,
+            batch_index: batchIndex,
+            offset,
+            error_source: classification.source,
+            error_type: classification.type,
+          });
+          // Stop at this safe batch boundary.
           stoppedByRequest = true;
           break;
         }
+        recordIndexerBatchSuccess(request.contract_id, batchDurationSeconds);
 
         if (batchResult.rowsFetched === 0) {
           // Source exhausted ahead of totalRows count — safe to stop.

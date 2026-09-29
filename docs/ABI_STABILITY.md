@@ -88,7 +88,7 @@ The following routes are **stable** and will not be removed or have their HTTP m
 |---|---|---|---|
 | `POST` | `/internal/indexer/contract-events` | `x-indexer-worker-token` | Ingest contract event batch |
 
-> **Note:** Routes under `/api/admin/`, `/admin/dlq/`, and `/api/audit/` are operator-facing and carry a **best-effort** stability guarantee. They may change in minor versions with notice in the changelog.
+> **Note:** Routes under `/api/admin/`, `/admin/dlq/`, and `/api/audit/` are operator-facing and carry a **best-effort** stability guarantee. They may change in minor versions with notice in the [API changelog](./api/changelog.md).
 
 #### Path Parameter Formats
 
@@ -631,7 +631,7 @@ The following changes are **safe** and do not require a major version bump:
 
 ## 5. Deprecation Process
 
-1. **Announce** — The deprecated surface is marked in the changelog and in this document with a `⚠️ DEPRECATED` notice and a target removal version.
+1. **Announce** — The deprecated surface is marked in the [API changelog](./api/changelog.md) and in this document with a `⚠️ DEPRECATED` notice and a target removal version.
 2. **Grace period** — A minimum of **90 days** (or one major release cycle, whichever is longer) before removal.
 3. **Response header** — Deprecated endpoints return a `Deprecation: true` header and a `Sunset: <date>` header (RFC 8594).
 4. **Remove** — The surface is removed in the next major version. The upgrade guide in [`docs/upgrade.md`](./upgrade.md) documents the migration path.

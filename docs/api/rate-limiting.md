@@ -15,6 +15,10 @@ Fluxora emits four standard rate-limit headers on **every** response — not onl
 
 All four values are sourced directly from the Redis counter TTL, not estimated. `X-RateLimit-Reset` is derived from the `resetAt` value returned by `SlidingWindowStore.increment`, which sets the Redis key's expiry via `PEXPIRE`. When Redis is unavailable and the `InMemoryStore` fallback is active, values come from the in-memory window's expiry timestamp.
 
+### Single source of truth
+
+These headers are declared once in `RATE_LIMIT_HEADERS` (`src/types/rateLimit.ts`) along with their semantic value type (`RateLimitHeaderValues`). Both the middleware emitter (`setRateLimitHeaders` in `src/middleware/rateLimiter.ts`) and the client-facing validation schema (`RateLimitHeadersSchema` in `src/validation/rateLimitHeaders.ts`) are derived from that declared contract, so the headers a caller receives cannot drift from the types above. The contract is asserted by `tests/unit/middleware/rateLimit.headers.contract.test.ts`, which exhausts a limit and checks the emitted headers against the declared type.
+
 ---
 
 ## Compliance

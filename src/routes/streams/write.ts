@@ -23,7 +23,7 @@ import { streamsCreatedTotal, isValidStreamStatus } from '../../metrics/business
 import { toApiStream } from '../../serialization/stream.js';
 import type { ApiStreamStatus } from '../../streams/status.js';
 import { successResponse, idempotentReplayResponse } from '../../utils/response.js';
-import { SerializationLogger, debug, info, warn } from '../../utils/logger.js';
+import { SerializationLogger, debug, info, warn } from '../../lib/logger.js';
 import {
   API_STREAM_STATUS_VALUES,
   assertApiTransition,
@@ -66,10 +66,33 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
 
   const input = parseCreateStreamBody(req.body, requestId);
   const requestFingerprint = fingerprintInput(input);
+  // Tenant scope for the idempotency key must come from the authenticated
+  // principal, never from the request body: `input.sender` is caller-supplied,
+  // so falling back to it would let an unverified field decide whose
+  // idempotency namespace a write lands in. `callerAddress` is the same
+  // principal the ownership check further down uses, and `keyId` keeps
+  // distinct API keys in distinct namespaces.
+  const tenantId = req.callerAddress ?? req.keyId ?? req.user?.address ?? 'anonymous';
   const idempotencyStore = getIdempotencyStore();
-  const existingResponse = await idempotencyStore.get(idempotencyKey);
+  const existingResponse = await idempotencyStore.get(idempotencyKey, tenantId);
+
+  if (existingResponse === 'in_progress') {
+    throw new ApiError(
+      409,
+      ApiErrorCode.CONFLICT,
+      'An identical request is already being processed',
+      { hint: 'Retry after the in-flight request completes' },
+    );
+  }
 
   if (existingResponse) {
+    if (existingResponse === 'in_progress') {
+      throw new ApiError(
+        409,
+        ApiErrorCode.CONFLICT,
+        'Request is currently being processed',
+      );
+    }
     if (existingResponse.requestFingerprint !== requestFingerprint) {
       warn('Idempotency-Key reused with different payload', {
         requestId,
@@ -104,6 +127,7 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const responseEnvelope = successResponse(stream, requestId);
   await idempotencyStore.set(
     idempotencyKey,
+    tenantId,
     { version: ENVELOPE_VERSION, requestFingerprint, statusCode: 201, body: responseEnvelope },
     getIdempotencyTtlSeconds(),
   );

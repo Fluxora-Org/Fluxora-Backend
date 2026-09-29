@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
 import { authJwtVerifyDurationSeconds } from '../metrics/businessMetrics.js';
 import { getApiKeyFromRequest, findRecordByRawKey } from '../lib/apiKey.js';
+import { errorResponse } from '../utils/response.js';
 
 
 /**

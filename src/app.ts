@@ -8,6 +8,7 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
+import { protectRouter, PUBLIC_ROUTE_PATHS } from './routes/protect.js';
 import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders, sanitizeResponses, responseSanitizer } from './middleware/pii.js';
@@ -71,6 +72,7 @@ import { webhookDispatcher } from './webhooks/service.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 import { responseSizeLimitMiddleware } from './middleware/responseSizeLimit.js';
+import { readinessGuardMiddleware } from './middleware/readinessGuard.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
@@ -160,7 +162,7 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
 async function wireStreamEventDedupCache(config: Config): Promise<void> {
   if (!config.redisEnabled) {
     logger.info('Redis disabled — stream event dedup will use in-memory cache');
-    setDedupCache(new InMemoryDedupCache());
+    setDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
     return;
   }
 
@@ -174,8 +176,8 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
       clusterNodes: config.redisClusterNodes,
     });
 
-    const primary = new RedisDedupCache(redisClient);
-    const fallback = new InMemoryDedupCache();
+    const primary = new RedisDedupCache(redisClient, config.dedupWindowSeconds);
+    const fallback = new InMemoryDedupCache(config.dedupWindowSeconds);
     const hybrid = new HybridDedupCache(primary, fallback, true);
 
     setDedupCache(hybrid);
@@ -193,14 +195,14 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       },
     );
-    setDedupCache(new InMemoryDedupCache());
+    setDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
   }
 }
 
 async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
   if (!config.redisEnabled) {
     logger.info('Redis disabled — inbound webhook dedup will use in-memory cache');
-    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    setInboundWebhookDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
     return;
   }
 
@@ -214,8 +216,8 @@ async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
       clusterNodes: config.redisClusterNodes,
     });
 
-    const primary = new RedisDedupCache(redisClient);
-    const fallback = new InMemoryDedupCache();
+    const primary = new RedisDedupCache(redisClient, config.dedupWindowSeconds);
+    const fallback = new InMemoryDedupCache(config.dedupWindowSeconds);
     const hybrid = new HybridDedupCache(primary, fallback, true);
 
     setInboundWebhookDedupCache(hybrid);
@@ -233,7 +235,7 @@ async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       },
     );
-    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    setInboundWebhookDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
   }
 }
 
@@ -495,8 +497,23 @@ export function createApp(options: AppOptions = {}): Express {
     addShutdownHook(() => stopGrpcHealthServer(grpcHealthServer));
   }
 
+  // #1466: security headers must be set on *every* response, including the
+  // ones produced before routing (readiness 503, request timeout 408) and
+  // every error path. helmet writes its headers synchronously when the
+  // middleware runs, so it has to be the first thing mounted — anything that
+  // can end a request (readinessGuard, requestTimeoutMiddleware) would
+  // otherwise answer with a body but without CSP, HSTS or nosniff.
+  // cspNonceMiddleware must precede it so res.locals.cspNonce is populated
+  // when helmet builds the Content-Security-Policy header.
+  app.use(cspNonceMiddleware);
+  app.use(createHelmetMiddleware());
+
   // Blue/green slot header — must run before any response can be sent.
   app.use(deploymentSlotMiddleware);
+
+  // Readiness guard — reject all requests until startup is complete.
+  // Must run before all other middleware so it intercepts every incoming request.
+  app.use(readinessGuardMiddleware());
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   // Correlation ID must run before express.json() so req.correlationId is available
@@ -509,8 +526,6 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(sanitizeResponses);
-  app.use(cspNonceMiddleware);
-  app.use(createHelmetMiddleware());
   // #1555: cap every buffered response body (see docs/response-limits.md).
   // Registered before all routers so it wraps res.send for every route.
   app.use(responseSizeLimitMiddleware);
@@ -552,17 +567,28 @@ export function createApp(options: AppOptions = {}): Express {
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
+  // Public routes are explicitly declared in `routes/protect.ts`.
   app.use('/api/streams', csrfMiddleware, streamsRouter);
-  app.use('/api/admin', adminRouter);
-  app.use('/internal/indexer', indexerRouter);
-  app.use('/internal/webhooks', webhooksRouter);
-  app.use('/api/audit', auditRouter);
-  app.use('/api/privacy', privacyRouter);
-  app.use('/admin/dlq', dlqRouter);
-  app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
+
+  // Protected routers: wrap with `protectRouter` so `authenticate` runs
+  // structurally before any handler in the group.
+  app.use('/api/admin', protectRouter(adminRouter));
+  app.use('/internal/indexer', protectRouter(indexerRouter));
+  app.use('/internal/webhooks', protectRouter(webhooksRouter));
+  app.use('/api/audit', protectRouter(auditRouter));
+  app.use('/api/privacy', protectRouter(privacyRouter));
+  app.use('/admin/dlq', protectRouter(dlqRouter));
+  app.use('/api/rate-limits', protectRouter(createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) })));
 
   // Experimental GraphQL federation gateway — feature-flagged off by default.
   app.use('/api/graphql', graphqlGatewayRouter);
+
+  // --- Temporary mis-registration (for validation) ---
+  // Intentionally register a protected router without `protectRouter` so
+  // the structural auth registration test fails until the mount is fixed.
+  // Remove this before landing the change; kept here so CI will fail when
+  // a route is added without a decision.
+  app.use('/internal/unwrapped', indexerRouter);
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(

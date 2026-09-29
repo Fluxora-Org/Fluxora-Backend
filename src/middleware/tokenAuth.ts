@@ -15,13 +15,17 @@
  * access properly.
  */
 import type { IncomingMessage } from 'http';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import jwt from 'jsonwebtoken';
+
+import { unauthorized } from '../errors.js';
 
 import { logger } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
+import { unauthorized } from './errorHandler.js';
 
 // ── WebSocket JWT auth ────────────────────────────────────────────────────────
 
@@ -168,7 +172,7 @@ export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler
       }
       
       next();
-    } catch (err) {
+    } catch {
       next(
         unauthorized(`Invalid ${options.role} bearer token`, {
           role: options.role,

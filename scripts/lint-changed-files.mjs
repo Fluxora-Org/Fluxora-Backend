@@ -16,22 +16,41 @@
  */
 
 import process from 'node:process';
+import util from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { ESLint } from 'eslint';
+
+// Polyfill util.styleText for Node runtimes < 20.12 (used by ESLint's stylish formatter)
+if (typeof util.styleText !== 'function') {
+  util.styleText = (_format, text) => text;
+}
 
 const ROOT = new URL('../', import.meta.url);
 const pathname = (p) => new URL(p, ROOT).pathname;
 
 /**
+ * Verify whether a git reference resolves to a valid commit object.
+ */
+export function refExists(ref) {
+  const check = spawnSync(
+    'git',
+    ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
+    { cwd: pathname('.'), encoding: 'utf8' },
+  );
+  return check.status === 0;
+}
+
+/**
  * Base revision to diff against. For PRs we diff against the merged base
  * branch so the change set is exactly what this PR introduces. Locally the
- * documented rollout default is the shared `origin/main`.
+ * documented rollout default is the fork's `origin/main`.
  */
 export function baseRef() {
-  if (process.env.CI && process.env.GITHUB_EVENT_NAME === 'pull_request' && process.env.GITHUB_BASE_REF) {
-    return `origin/${process.env.GITHUB_BASE_REF}`;
+  if (process.env.CI && process.env.GITHUB_EVENT_NAME === 'pull_request') {
+    return process.env.GITHUB_BASE_SHA || process.env.LINT_BASE ||
+      (process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : 'origin/main');
   }
-  return process.env.LINT_BASE || 'upstream/main';
+  return process.env.LINT_BASE || 'origin/main';
 }
 
 /**
@@ -40,16 +59,28 @@ export function baseRef() {
  * honoured for testing and ad-hoc single-file runs.
  */
 export function changedTypeScriptFiles(base = baseRef()) {
-  if (process.env.LINT_FILES) {
+  if (process.env.LINT_FILES !== undefined) {
     return process.env.LINT_FILES.split('\n').filter((f) => f.endsWith('.ts'));
+  }
+  let diffBase = base;
+  const baseCheck = spawnSync('git', ['rev-parse', '--verify', diffBase], {
+    cwd: pathname('.'),
+    encoding: 'utf8',
+  });
+  // GitHub's pull_request checkout is a synthetic merge commit and may use a
+  // shallow clone without origin/<base> available. Its first parent is the
+  // checked-out base commit, so use that parent instead of failing the lint
+  // job before ESLint can run.
+  if (baseCheck.status !== 0 && process.env.CI && process.env.GITHUB_EVENT_NAME === 'pull_request') {
+    diffBase = 'HEAD^1';
   }
   const diff = spawnSync(
     'git',
-    ['diff', '--name-only', '--diff-filter=ACMR', `${base}...HEAD`],
+    ['diff', '--name-only', '--diff-filter=ACMR', `${diffBase}...HEAD`],
     { cwd: pathname('.'), encoding: 'utf8' },
   );
   if (diff.status !== 0) {
-    throw new Error(`Unable to determine changed files against ${base}: ${diff.stderr.trim()}`);
+    throw new Error(`Unable to determine changed files against ${diffBase}: ${diff.stderr.trim()}`);
   }
   return diff.stdout
     .split('\n')

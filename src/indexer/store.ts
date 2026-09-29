@@ -10,10 +10,10 @@ export const STALE_CURSOR_ERROR_CODE = 'STALE_CURSOR';
  * Map a raw `contract_events` row into a {@link StreamEventRecord} (issue #1316).
  *
  * Strict row-mapping contract, enforced through the shared `rowReader`:
- * - Every NOT NULL column must be present and non-NULL; an absent column is
- *   treated exactly like NULL (a forgotten SELECT is a bug, not a NULL).
+ * - Every mapped column must be present; an omitted SELECT column is a bug.
  * - `ledger_hash` is nullable — legacy rows written before the column was
- *   added must stay readable — but a wrong-typed value is still rejected.
+ *   added must stay readable — so explicit NULL is accepted, but a
+ *   wrong-typed value is still rejected.
  * - `timestamptz` columns (`happened_at`, `ingested_at`) are normalized to
  *   ISO-8601 strings; epoch numbers and unparsed JSON strings are rejected.
  * - `payload` must be a JSON object (not an array, scalar, or string).
@@ -305,6 +305,25 @@ export class PostgresContractEventStore implements ContractEventStore {
     if (events.length === 0) {
       return { insertedEventIds: [], duplicateEventIds: [] };
     }
+
+    // ── Pre-write partition coverage guard (issue #1456) ───────────────────
+    // `contract_events` is range-partitioned by `happened_at`, so an INSERT
+    // whose timestamp has no covering partition fails with an opaque
+    // "no partition of relation \"contract_events\" found for row" — a write
+    // error raised far from its cause. Probe the partitions this batch needs
+    // *before* issuing the write: if one is missing (the maintenance job did
+    // not run for long enough), an operator alert is raised and the partition
+    // is created here, so the write that follows cannot fail for a reason the
+    // guard already knew about.
+    //
+    // This is a single catalog query, and `ensurePartitionCoverage` is
+    // strictly fail-open — an inconclusive probe (unmanaged table, unexpected
+    // response shape, probe error) leaves this method's behaviour unchanged.
+    await ensurePartitionCoverage(
+      this.client,
+      this.tableName,
+      events.map((event) => event.happenedAt),
+    );
 
     const values: unknown[] = [];
     let placeholderOffset = 1;

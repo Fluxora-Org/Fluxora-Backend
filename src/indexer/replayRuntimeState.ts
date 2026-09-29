@@ -1,5 +1,5 @@
 // Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
-import { ReplayProgress } from '../types.js';
+import { ReplayProgress } from '../types/index.js';
 
 // ── In-memory concurrent-replay lock ──────────────────────────────────────────
 

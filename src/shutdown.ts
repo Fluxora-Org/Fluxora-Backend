@@ -1,6 +1,7 @@
 // Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import http from 'node:http';
 import { logger } from './lib/logger.js';
+import { markShuttingDown } from './startup/readiness.js';
 
 let shuttingDown = false;
 const hooks: Array<() => Promise<void> | void> = [];
@@ -71,6 +72,8 @@ export function gracefulShutdown(
   // the process environment or global flag via isShuttingDown().
   process.env['FLUXORA_SHUTDOWN'] = 'true';
   (globalThis as Record<string, unknown>)['__FLUXORA_SHUTDOWN__'] = true;
+  // Mark service as shutting down in readiness state (rejects new requests).
+  markShuttingDown();
   logger.warn('Shutdown signal received, draining HTTP connections', undefined, { signal, timeoutMs: timeout });
 
   return new Promise<void>((resolve) => {

@@ -20,7 +20,7 @@ import {
 } from '../../streams/sseEmitter.js';
 import { resolveSseConnectionLimits, tryAcquireSseConnection } from '../../streams/sseConnectionLimiter.js';
 import { formatSseStreamUpdate, streamUpdateEnvelope } from '../../serialization/stream.js';
-import { warn } from '../../utils/logger.js';
+import { warn } from '../../lib/logger.js';
 import { parseLastEventIdHeader, rethrowDbError } from './guards.js';
 import {
   getReplayEventStore,

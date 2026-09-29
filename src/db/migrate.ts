@@ -186,7 +186,19 @@ export async function migrate(): Promise<void> {
       logger: {
         info: (msg: string) => info(msg),
         warn: (msg: string) => info(msg), // Mapping warn to info for cleaner logs
-        error: (msg: string) => logError(msg),
+        error: (msg: string) => {
+          // node-pg-migrate 7.x only recognizes 13- or 17-digit numeric
+          // prefixes, while this repository intentionally uses 14-digit UTC
+          // prefixes for several historical migrations. It still sorts them
+          // numerically, so downgrade this known compatibility diagnostic to
+          // informational output instead of making a successful migration look
+          // failed.
+          if (msg.startsWith("Can't determine timestamp for ")) {
+            info(msg);
+            return;
+          }
+          logError(msg);
+        },
       },
     });
 

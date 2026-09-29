@@ -19,14 +19,14 @@ import {
   forbidden,
 } from '../../middleware/errorHandler.js';
 import { canonicalizeBody } from '../../middleware/idempotency.js';
-import { SerializationLogger } from '../../utils/logger.js';
+import { SerializationLogger } from '../../lib/logger.js';
 import { PoolExhaustedError } from '../../db/pool.js';
 import { StatusConflictError } from '../../db/repositories/streamRepository.js';
 import type { ApiCreateStreamInput } from '../../db/repositories/streamApiQueries.js';
 import { CreateStreamSchema, parseBody, formatZodIssues } from '../../validation/schemas.js';
 import type { ApiStreamStatus } from '../../streams/status.js';
 
-const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'];
+const AMOUNT_FIELDS = ['depositAmount', 'ratePerSecond'] as const;
 
 export const API_STREAM_STATUS_VALUES: readonly ApiStreamStatus[] = ['active', 'paused', 'completed', 'cancelled'];
 
@@ -111,7 +111,7 @@ function normalizeCreateInput(body: Record<string, unknown>): ApiCreateStreamInp
   const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } =
     parseResult.data as ApiCreateStreamInput;
 
-  const amountValidation = validateAmountFields({ depositAmount, ratePerSecond }, AMOUNT_FIELDS);
+  const amountValidation = validateAmountFields({ depositAmount, ratePerSecond }, [...AMOUNT_FIELDS]);
   if (!amountValidation.valid) {
     throw new ApiError(
       400,
@@ -155,7 +155,7 @@ export function parseCreateStreamBody(body: unknown, requestId?: string): ApiCre
   } catch (error) {
     const av = validateAmountFields(
       { depositAmount: fields['depositAmount'], ratePerSecond: fields['ratePerSecond'] },
-      AMOUNT_FIELDS,
+      [...AMOUNT_FIELDS],
     );
     if (!av.valid) {
       for (const err of av.errors) {

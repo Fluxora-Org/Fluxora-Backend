@@ -14,7 +14,7 @@ import type { ContractEventStore } from '../../indexer/store.js';
 import { eventMatchesStreamId } from '../../streams/sseEmitter.js';
 import { getStreamHub } from '../../ws/hub.js';
 import { errorResponse } from '../../utils/response.js';
-import { debug, warn } from '../../utils/logger.js';
+import { debug, warn } from '../../lib/logger.js';
 
 /** Replay is bounded so a client-supplied cursor cannot force a full-table scan. */
 const REPLAY_MAX_PAGES = 10;

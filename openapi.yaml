@@ -818,6 +818,46 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 
 components:
+  responses:
+    RateLimitExceeded:
+      description: |
+        The client has exceeded the per-endpoint rate limit. The response
+        includes X-RateLimit-Limit, X-RateLimit-Remaining, and
+        X-RateLimit-Reset on every response (including this one), and
+        Retry-After on this 429 specifically. The body carries the
+        machine-readable error code RATE_LIMIT_EXCEEDED.
+      headers:
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/X-RateLimit-Limit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/X-RateLimit-Remaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/X-RateLimit-Reset'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  headers:
+    X-RateLimit-Limit:
+      description: Configured request cap for the current window.
+      schema: { type: string, pattern: '^\d+$' }
+      example: "100"
+    X-RateLimit-Remaining:
+      description: Requests remaining before the client is rejected.
+      schema: { type: string, pattern: '^\d+$' }
+      example: "99"
+    X-RateLimit-Reset:
+      description: Unix epoch (seconds) at which the current window resets.
+      schema: { type: string, pattern: '^\d+$' }
+      example: "1717000060"
+    Retry-After:
+      description: |
+        Seconds the client must wait before retrying. Emitted only on a 429
+        response. Conforms to RFC 6585.
+      schema: { type: string, pattern: '^\d+$' }
+      example: "42"
   schemas:
     ResponseMeta:
       type: object
@@ -833,6 +873,20 @@ components:
           type: string
           description: Opaque request identifier for log correlation
           example: 550e8400-e29b-41d4-a716-446655440000
+
+    SuccessResponse:
+      type: object
+      required:
+        - success
+        - data
+        - meta
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data: {}
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
 
     RootResponse:
       type: object
@@ -1342,6 +1396,60 @@ components:
                 - SERVICE_UNAVAILABLE
                 - INTERNAL_ERROR
                 - DECIMAL_ERROR
+                - UNSUPPORTED_MEDIA_TYPE
+                - GATEWAY_TIMEOUT
+                - NOT_ACCEPTABLE
+                - PERSISTED_QUERY_INVALID
+                - PERSISTED_QUERY_UNSUPPORTED_VERSION
+                - PERSISTED_QUERY_INVALID_HASH
+                - PERSISTED_QUERY_HASH_MISMATCH
+                - PERSISTED_QUERY_NOT_FOUND
+                - GRAPHQL_PARSE_ERROR
+                - FEATURE_FLAG_DISABLED
+                - CONFIGURATION_ERROR
+                - RESTORE_ERROR
+                - PERSISTENCE_ERROR
+                - API_KEY_ERROR
+                - DIAGNOSTICS_ERROR
+                - SERVICE_SHUTTING_DOWN
+                - HEALTH_CHECK_ERROR
+                - CONSUMER_SUSPENDED
+                - ENTRY_ALREADY_REPLAYED
+                - INVALID_REQUEST
+                - QUEUE_ERROR
+                - INVALID_DELIVERY_ID
+                - DELIVERY_NOT_FOUND
+                - INVALID_PAGINATION
+                - INVALID_OUTBOX_FILTER
+                - INVALID_RETRY_REQUEST
+                - DLQ_ITEM_NOT_FOUND
+                - DLQ_PROCESS_ERROR
+                - DLQ_RETRY_ERROR
+                - INVALID_ENDPOINT_URL
+                - OUTBOX_PROCESSING_ERROR
+                - INVALID_CLEANUP_REQUEST
+                - CLEANUP_ERROR
+                - CORS_ORIGIN_DENIED
+                - RATE_LIMIT_EXCEEDED
+                - INVALID_ADDRESS
+                - ERASURE_FAILED
+                - INTERNAL_CALLER_ADDRESS_MISSING
+                - unsupported_media_type
+                - payload_too_large
+                - invalid_encoding
+                - payload_too_deep
+                - invalid_json
+                - missing_secret
+                - missing_delivery_id
+                - missing_timestamp
+                - missing_signature
+                - invalid_timestamp
+                - timestamp_outside_tolerance
+                - previous_secret_expired
+                - signature_mismatch
+                - duplicate_delivery
+                - UNSUPPORTED_VERSION
+                - IDEMPOTENCY_CONFLICT
               example: VALIDATION_ERROR
             message:
               type: string
@@ -1380,3 +1488,73 @@ tags:
     description: Stream creation, retrieval, and listing
   - name: Internal
     description: Internal endpoints for workers and administrators
+
+# ===========================================================================
+# Rate-limit documentation (issue #1474)
+#
+# The authoritative source of these values is:
+#   - src/config/rateLimits.ts         (ROUTE_BUDGETS, DEFAULT_*_CONFIG)
+#   - src/types/rateLimit.ts           (RATE_LIMIT_HEADERS)
+#
+# tests/openapi.rateLimit.drift.test.ts asserts these values match the
+# constants at build time. If you change a limit in code, this file and
+# that test must be updated together — the test will fail otherwise.
+#
+# Tiers (default, per-request-path when no route budget matches)
+# ---------------------------------------------------------------------------
+x-rate-limits:
+  tiers:
+    ip:
+      windowSeconds: 60
+      max: 100
+      source: DEFAULT_IP_CONFIG
+    apiKey:
+      windowSeconds: 60
+      max: 500
+      source: DEFAULT_APIKEY_CONFIG
+    admin:
+      windowSeconds: 60
+      max: 2000
+      source: DEFAULT_ADMIN_CONFIG
+
+  # Per-route budgets override the tier default. `baseLimit` applies to all
+  # methods; `writeLimit` applies to POST/PUT/PATCH/DELETE (must be <=
+  # baseLimit unless both are 0). `exempt: true` means the route is not
+  # rate limited.
+  routeBudgets:
+    - path: /api/streams
+      baseLimit: 100
+      writeLimit: 20
+      exempt: false
+    - path: /api/auth
+      baseLimit: 50
+      writeLimit: 10
+      exempt: false
+    - path: /api/streams/:id
+      baseLimit: 30
+      writeLimit: 5
+      exempt: false
+    - path: /api/privacy/consent
+      baseLimit: 10
+      writeLimit: 10
+      exempt: false
+    - path: /api/privacy/erasure/:recipientAddress
+      baseLimit: 5
+      writeLimit: 5
+      exempt: false
+    - path: /api/admin
+      baseLimit: 50
+      writeLimit: 10
+      exempt: false
+    - path: /internal/indexer
+      baseLimit: 1000
+      writeLimit: 100
+      exempt: false
+    - path: /metrics
+      baseLimit: 0
+      writeLimit: 0
+      exempt: true
+    - path: /health
+      baseLimit: 0
+      writeLimit: 0
+      exempt: true

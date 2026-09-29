@@ -163,7 +163,7 @@ function isRefused(err: unknown): boolean {
  * that DB-backed tests skip automatically without a database.
  */
 async function connectOrSkip(ctx: { skip: (note?: string) => never }): Promise<pg.Client> {
-  const client = new pg.Client({ connectionString: DATABASE_URL, connectionTimeoutMillis: 5000 });
+  const client = new pg.Client({ connectionString: DATABASE_URL, connectionTimeoutMillis: 5000 } as any);
   try {
     await client.connect();
     return client;

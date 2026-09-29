@@ -4,8 +4,9 @@ import { SerializationLogger, error as logError } from '../lib/logger.js';
 import { errorResponse } from '../utils/response.js';
 import { QueryTimeoutError } from '../db/pool.js';
 import { REQUEST_ID_HEADER } from './correlationId.js';
-import { ApiError, ApiErrorCode } from '../errors.js';
+import { ApiError, ApiErrorCode, toApiErrorCode } from '../errors.js';
 import { getActiveTraceSpanIds } from '../tracing/hooks.js';
+import { RpcFallbackExhaustedError } from '../services/stellar-rpc.js';
 
 export {
   ApiError,
@@ -63,6 +64,25 @@ export function errorHandler(
     return;
   }
 
+  if (err instanceof RpcFallbackExhaustedError) {
+    logError('Stellar RPC fallback cache exhausted', {
+      operation: err.operation,
+      ageMs: err.ageMs,
+      maxAgeMs: err.maxAgeMs,
+      requestId,
+      ...traceSpanIds,
+    });
+    res.status(503).json(
+      errorResponse(
+        ApiErrorCode.SERVICE_UNAVAILABLE,
+        'Stellar RPC is unavailable and the last-known-good data is too stale to serve',
+        { operation: err.operation, ageMs: err.ageMs, maxAgeMs: err.maxAgeMs },
+        requestId,
+      ),
+    );
+    return;
+  }
+
   if (err instanceof DecimalSerializationError) {
     SerializationLogger.validationFailed(err.field ?? 'unknown', err.rawValue, err.code, requestId);
     res.status(400).json(
@@ -76,18 +96,18 @@ export function errorHandler(
     return;
   }
 
-  if (err instanceof ApiError) {
-    logError(`API error: ${err.message}`, { code: err.code, statusCode: err.statusCode, details: err.details, requestId, ...traceSpanIds });
+  if (err instanceof ApiError || (err && typeof (err as ApiError).statusCode === 'number')) {
+    const apiErr = err as ApiError;
+    logError(`API error: ${apiErr.message}`, { code: apiErr.code, statusCode: apiErr.statusCode, details: apiErr.details, requestId, ...traceSpanIds });
 
-    if (err.expose) {
-      res.status(err.statusCode).json(
-        errorResponse(err.code ?? ApiErrorCode.INTERNAL_ERROR, err.message, err.details, requestId)
+    if (apiErr.expose) {
+      res.status(apiErr.statusCode).json(
+        errorResponse(apiErr.code ?? ApiErrorCode.INTERNAL_ERROR, apiErr.message, apiErr.details, requestId)
       );
     } else {
-      res.status(err.statusCode).json({
-        success: false,
-        message: 'Internal server error',
-      });
+      res.status(err.statusCode).json(
+        errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId)
+      );
     }
     return;
   }
@@ -139,10 +159,9 @@ export function errorHandler(
     ...traceSpanIds,
   });
 
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-  });
+  res.status(500).json(
+    errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId)
+  );
 }
 
 /** Async handler wrapper */
