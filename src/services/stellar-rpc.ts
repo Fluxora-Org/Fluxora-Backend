@@ -39,6 +39,9 @@ import {
   rpcFallbackCacheMissesTotal,
   rpcProviderHealthyGauge,
   rpcProviderHealthCheckFailuresTotal,
+  rpcUpstreamCallsTotal,
+  rpcUpstreamCallsFailedTotal,
+  rpcUpstreamCallDurationSeconds,
 } from '../metrics/rpcMetrics.js';
 import { withJitteredRetry } from '../lib/retry.js';
 import { getConfig } from '../config/env.js';
@@ -579,6 +582,7 @@ export class StellarRpcService {
       rpcFallbackCacheMissesTotal.inc({ operation });
     }
 
+    const circuitCallStart = Date.now();
     try {
       const refreshStartedAt = Date.now();
       const result = await this.breaker.call(() => this.callWithTimeout(fn, operation, opts));
@@ -588,6 +592,9 @@ export class StellarRpcService {
       if (!(err instanceof CircuitOpenError)) {
         throw err;
       }
+
+      const circuitDurationMs = Math.max(0, Date.now() - circuitCallStart);
+      recordRpcMetrics(operation, 'failure', circuitDurationMs, 'CIRCUIT_OPEN');
 
       const entry = await this.getStaleCacheEntry<T>(operation, cacheParts);
       if (entry !== null) {
@@ -716,6 +723,8 @@ export class StellarRpcService {
 
     // Reject immediately if already aborted
     if (signal?.aborted) {
+      const durationMs = 0;
+      recordRpcMetrics(operation, 'failure', durationMs, 'CANCELLED');
       throw new RpcProviderError(`${operation} was cancelled`, 'CANCELLED', undefined, 0);
     }
 
@@ -740,6 +749,7 @@ export class StellarRpcService {
             durationMs,
           );
           logFailure(operation, err, durationMs);
+          recordRpcMetrics(operation, 'failure', durationMs, 'TIMEOUT');
           reject(err);
         });
       }, timeoutMs);
@@ -754,6 +764,7 @@ export class StellarRpcService {
             durationMs,
           );
           logFailure(operation, err, durationMs);
+          recordRpcMetrics(operation, 'failure', durationMs, 'CANCELLED');
           reject(err);
         });
       };
@@ -761,7 +772,11 @@ export class StellarRpcService {
       signal?.addEventListener('abort', onAbort, { once: true });
 
       fn().then(
-        (result) => settle(() => resolve(result)),
+        (result) => settle(() => {
+          const durationMs = Date.now() - start;
+          recordRpcMetrics(operation, 'success', durationMs);
+          resolve(result);
+        }),
         (err: unknown) => {
           const durationMs = Date.now() - start;
           settle(() => {
@@ -772,6 +787,7 @@ export class StellarRpcService {
               ? err
               : new RpcProviderError(message, kind, statusCode, durationMs);
             logFailure(operation, wrapped, durationMs);
+            recordRpcMetrics(operation, 'failure', durationMs, kind);
             reject(wrapped);
           });
         },
@@ -789,6 +805,22 @@ function logFailure(operation: string, err: RpcProviderError, durationMs: number
     durationMs,
     error: err.message,
   });
+}
+
+function recordRpcMetrics(
+  operation: string,
+  outcome: 'success' | 'failure',
+  durationMs: number,
+  kind?: RpcFailureKind,
+): void {
+  rpcUpstreamCallsTotal.inc({ operation, outcome });
+  rpcUpstreamCallDurationSeconds.observe(
+    { operation, outcome },
+    Math.max(0, durationMs) / 1000,
+  );
+  if (outcome === 'failure' && kind) {
+    rpcUpstreamCallsFailedTotal.inc({ operation, kind });
+  }
 }
 
 /**
