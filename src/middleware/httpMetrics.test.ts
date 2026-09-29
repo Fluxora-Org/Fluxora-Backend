@@ -31,12 +31,17 @@ describe('resolveRoute', () => {
     expect(resolveRoute(req)).toBe('/search');
   });
 
-  it('removes only one trailing slash when multiple are present', () => {
-    const req = {
+  it('collapses only a single trailing slash, keeping internal empty segments', () => {
+    // A matched route is required for the label to be derived at all: an
+    // unmatched request is labelled UNMATCHED_ROUTE (see above).
+    const req = fakeReq({
       baseUrl: '',
-      route: undefined,
-      originalUrl: '/multiple///'
-    } as unknown as Request;
+      route: { path: '/multiple///' },
+      originalUrl: '/multiple///',
+    });
+    // After collapse of a single trailing slash, remaining empties are kept
+    // by normalizeRouteLabel join; high-cardinality policy does not alter
+    // static vocabulary segments.
     expect(resolveRoute(req)).toBe('/multiple//');
   });
 

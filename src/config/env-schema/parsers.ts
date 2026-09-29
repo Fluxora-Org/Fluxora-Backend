@@ -8,12 +8,14 @@
 import {
   z,
   type ZodBoolean,
+  type ZodDefault,
   type ZodNumber,
   type ZodOptional,
   type ZodPipe,
   type ZodPreprocess,
   type ZodRecord,
   type ZodString,
+  type ZodTransform,
 } from 'zod';
 import { isValidStellarContractAddress } from '../stellarContracts.js';
 /**
@@ -136,6 +138,35 @@ export function integerEnv(
   return max === undefined
     ? schema
     : schema.pipe(z.number().max(max, `${name} must be at most ${max}`));
+}
+
+/**
+ * Integer tunable that is clamped into `[min, max]` instead of rejected when
+ * it is out of range, falling back to `fallback` when unset or non-numeric.
+ *
+ * Used for throughput tunables (e.g. the WebSocket micro-batch window) where a
+ * deployment mistake should degrade to the nearest sane value instead of
+ * failing startup: a `0 ms` flush window or an unbounded batch size would
+ * otherwise turn a typo into a busy-loop. Unset or non-numeric input yields
+ * `fallback`, so a typo is reported through the effective value in
+ * `docs/env-reference.md` rather than as a startup error.
+ */
+export function clampedIntegerEnv(
+  name: string,
+  min: number,
+  max: number,
+  fallback: number
+): ZodDefault<ZodPipe<ZodPreprocess<ZodNumber>, ZodTransform<number, number>>> {
+  return z
+    .preprocess(
+      (value) => {
+        const parsed = parseInteger(value);
+        return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : fallback;
+      },
+      z.number().int(`${name} must be an integer`)
+    )
+    .transform((value) => Math.max(min, Math.min(max, value)))
+    .default(fallback);
 }
 
 /** Boolean accepting `true/1/false/0` (case-insensitive). */
