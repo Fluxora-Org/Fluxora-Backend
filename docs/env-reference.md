@@ -4,6 +4,7 @@
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
 issue #1519). 162 variables across 11 subsystems.
+issue #1519). 161 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
 (required, or optional with a runtime fallback).
@@ -157,6 +158,8 @@ issue #1519). 162 variables across 11 subsystems.
 | `WORKER_ENABLED` | Run background queue workers inside this process. @default false | `false` |
 | `WS_ALLOWED_ORIGINS` | Comma-separated allowed origins for WebSocket connections. | — |
 | `WS_AUTH_REQUIRED` | Require Origin allowlist checks on WebSocket upgrades. @default false | `false` |
+| `WS_BATCH_FLUSH_MS` | WebSocket micro-batch flush window in ms; clamped to 5–5000. @default 50 | `50` |
+| `WS_BATCH_MAX_SIZE` | Max events coalesced into one `stream_update_batch` frame; clamped to 1–500. @default 25 | `25` |
 | `WS_MAX_CONNECTIONS_PER_IP` | Max concurrent WebSocket connections per client IP. @default 10 | `10` |
 | `WS_MAX_INBOUND_MESSAGE_BYTES` | Max size of a single inbound WebSocket frame, in bytes. @default 4096 | `4096` |
 | `WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION` | Max bytes queued for a slow WebSocket client. @default 1048576 | `1048576` |

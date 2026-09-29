@@ -5,7 +5,7 @@
  * Every field is documented with its purpose and default; the composed schema
  * (`src/config/env.ts`) is unchanged in effect.
  */
-import { booleanEnv, integerEnv, optionalString } from './parsers.js';
+import { booleanEnv, clampedIntegerEnv, integerEnv, optionalString } from './parsers.js';
 
 /**
  * Default ceiling on a single inbound WebSocket frame, in bytes.
@@ -14,6 +14,53 @@ import { booleanEnv, integerEnv, optionalString } from './parsers.js';
  * reaching into the parsed config (which is only available after startup).
  */
 export const DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES = 4_096;
+
+/**
+ * Bounds for the WebSocket micro-batching tunables below.
+ *
+ * They are exported so the WebSocket hub and its tests clamp to exactly the
+ * same range the schema validates against.
+ */
+export const WS_BATCH_FLUSH_MS_MIN = 5;
+export const WS_BATCH_FLUSH_MS_MAX = 5_000;
+export const WS_BATCH_MAX_SIZE_MIN = 1;
+export const WS_BATCH_MAX_SIZE_MAX = 500;
+/** Flush window used when `WS_BATCH_FLUSH_MS` is unset or unparseable. */
+export const DEFAULT_WS_BATCH_FLUSH_MS = 50;
+/** Max events per batch used when `WS_BATCH_MAX_SIZE` is unset or unparseable. */
+export const DEFAULT_WS_BATCH_MAX_SIZE = 25;
+
+/**
+ * The micro-batching tunables as a standalone fragment.
+ *
+ * They are part of `serverEnvSchema`, and are also exported on their own so a
+ * consumer that only needs the batching window (the WebSocket hub, which reads
+ * them at module load) can validate the environment through the same schema
+ * definitions the composed schema uses, instead of parsing `process.env` on
+ * its own.
+ */
+export const wsBatchingEnvSchema = {
+  /**
+   * WebSocket micro-batch flush window in ms; clamped to 5–5000.
+   * @default 50
+   */
+  WS_BATCH_FLUSH_MS: clampedIntegerEnv(
+    'WS_BATCH_FLUSH_MS',
+    WS_BATCH_FLUSH_MS_MIN,
+    WS_BATCH_FLUSH_MS_MAX,
+    DEFAULT_WS_BATCH_FLUSH_MS
+  ),
+  /**
+   * Max events coalesced into one `stream_update_batch` frame; clamped to
+   * 1–500. @default 25
+   */
+  WS_BATCH_MAX_SIZE: clampedIntegerEnv(
+    'WS_BATCH_MAX_SIZE',
+    WS_BATCH_MAX_SIZE_MIN,
+    WS_BATCH_MAX_SIZE_MAX,
+    DEFAULT_WS_BATCH_MAX_SIZE
+  ),
+};
 
 export const serverEnvSchema = {
   /** Validate stream queries against allowlisted columns. @default true */
@@ -59,6 +106,9 @@ export const serverEnvSchema = {
     1,
     16 * 1024 * 1024,
   ).default(DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES),
+  // Micro-batching tunables (WS_BATCH_FLUSH_MS, WS_BATCH_MAX_SIZE); see
+  // wsBatchingEnvSchema above for the clamped declarations and their docs.
+  ...wsBatchingEnvSchema,
   /** Max WebSocket reconnect attempts per client window. @default 20 */
   WS_RECONNECT_LIMIT: integerEnv('WS_RECONNECT_LIMIT', 1, 100_000).default(20),
   /** Sliding window for WS reconnect limiting, in ms. @default 60000 */
