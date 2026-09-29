@@ -89,3 +89,14 @@ export function deRegisterRequestProtectionMetrics(): void {
   registry.removeSingleMetric('fluxora_request_body_too_large_total');
   registry.removeSingleMetric('fluxora_webhook_rate_limiter_bucket_fill');
 }
+
+assertCollectorLabels(['reason']);
+
+export const requestRefusedTotal =
+  (registry.getSingleMetric('fluxora_request_refused_total') as Counter<'path' | 'reason'>) ||
+  new Counter({
+    name: 'fluxora_request_refused_total',
+    help: 'Total number of requests refused by request protection, labeled by normalized route path and refusal reason',
+    labelNames: ['path', 'reason'] as const,
+    registers: [registry],
+  });
