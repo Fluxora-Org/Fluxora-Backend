@@ -514,6 +514,32 @@ export const partitionMaintenanceFailuresTotal =
     registers: [registry],
   });
 
+/**
+ * Counter incremented when a single retention-purge batch exceeds the
+ * configured per-run volume cap (`PURGE_MAX_ROWS_PER_RUN`).
+ *
+ * Alert on `increase(...) > 0` — an increment means the purge job hit the
+ * safety ceiling in one run, which suggests either a retention backlog has
+ * built up or the cap is misconfigured.
+ *
+ * Label `table` identifies which retention rule triggered the cap so the
+ * alert can be triaged per data class.
+ *
+ * @security
+ * - `table` values come from developer-controlled manifest constants, not
+ *   from user input, so there is no label-injection risk.
+ */
+export const purgeVolumeCapExceededTotal =
+  (registry.getSingleMetric(
+    'fluxora_purge_volume_cap_exceeded_total'
+  ) as Counter<'table'>) ||
+  new Counter({
+    name: 'fluxora_purge_volume_cap_exceeded_total',
+    help: 'Total number of retention-purge runs that hit the per-run row-deletion cap, labelled by table',
+    labelNames: ['table'] as const,
+    registers: [registry],
+  });
+
 /** Clean helper to de-register metrics between test runs. */
 export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_auth_jwt_verify_duration_seconds');
@@ -542,4 +568,5 @@ export function deRegisterBusinessMetrics(): void {
   registry.removeSingleMetric('fluxora_partition_maintenance_behind_schedule_total');
   registry.removeSingleMetric('fluxora_alerts_raised_total');
   registry.removeSingleMetric('fluxora_partition_maintenance_failures_total');
+  registry.removeSingleMetric('fluxora_purge_volume_cap_exceeded_total');
 }

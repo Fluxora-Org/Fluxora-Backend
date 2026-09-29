@@ -73,6 +73,7 @@ export function createPostgresChecker(
 
   return {
     name: 'postgres',
+    timeoutMs,
     async check() {
       const start = Date.now();
       try {
@@ -123,6 +124,7 @@ export function createStellarRpcChecker(
 
   return {
     name: 'stellar_rpc',
+    timeoutMs,
     async check() {
       const start = Date.now();
       try {
@@ -171,6 +173,7 @@ export function createRedisChecker(
 
   return {
     name: 'redis',
+    timeoutMs,
     async check() {
       const start = Date.now();
       try {

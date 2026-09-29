@@ -67,6 +67,12 @@ export interface HealthReport {
 
 export interface HealthChecker {
   name: string;
+  /**
+   * Per-checker timeout in ms. When present, overrides the manager-level
+   * `healthCheckTimeoutMs` (from `HEALTH_CHECK_TIMEOUT_MS`) for this checker only.
+   * A timed-out check is reported as `unhealthy` rather than hanging.
+   */
+  timeoutMs?: number;
   /** Return `degraded: true` to signal high-latency / partial availability without a hard error. */
   check(): Promise<{ latency: number; error?: string; degraded?: boolean }>;
 }
@@ -444,10 +450,45 @@ function readBudgetFromConfig(): number {
 
 // ─── HealthCheckManager ───────────────────────────────────────────────────────
 
+/**
+ * Race a checker's `check()` promise against a per-checker deadline.
+ *
+ * When the deadline fires the promise rejects with a structured timeout error
+ * so `checkOne()` can mark the dependency `unhealthy` rather than leaving it
+ * pending indefinitely.
+ *
+ * Kept separate from `probeWithTimeout()` (used for startup probes) so their
+ * error messages and semantic context remain distinct.
+ */
+function withCheckerTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  name: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${name} health check timed out after ${ms}ms`)),
+      ms,
+    );
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 export class HealthCheckManager {
   private readonly checkers = new Map<string, HealthChecker>();
   private readonly lastResults = new Map<string, DependencyHealth>();
   private readonly startTime = Date.now();
+
+  /**
+   * Extra slack added to the per-checker timeout to derive the `checkAll`
+   * hard deadline. Accounts for scheduling jitter and microtask-queue depth
+   * so the outer deadline is always a true last-resort rather than a
+   * premature cancellation.
+   */
+  private static readonly CHECKALL_DEADLINE_BUFFER_MS = 500;
 
   private get timeoutMs() { return getConfig().healthCheckTimeoutMs; }
   private get intervalMs() { return getConfig().healthCheckIntervalMs; }
@@ -461,21 +502,60 @@ export class HealthCheckManager {
     });
   }
 
+  /**
+   * Run every registered checker concurrently and return an aggregate report.
+   *
+   * Each checker is individually wrapped in a per-checker timeout
+   * (`checker.timeoutMs ?? HEALTH_CHECK_TIMEOUT_MS`) inside `checkOne()`.
+   * A secondary hard deadline equal to that global timeout plus a scheduling-
+   * jitter buffer is applied to the entire `Promise.all` as a belt-and-
+   * suspenders guard: if any checker somehow escapes its own timeout the
+   * endpoint still responds within a bounded time using the last-cached state.
+   */
   async checkAll(): Promise<HealthReport> {
-    const results = await Promise.all(
-      Array.from(this.checkers.values()).map((checker) => this.checkOne(checker))
-    );
+    const globalTimeoutMs = this.timeoutMs;
+    const hardDeadlineMs = globalTimeoutMs + HealthCheckManager.CHECKALL_DEADLINE_BUFFER_MS;
 
-    const status = this.aggregateStatus(results);
-    const uptime = Math.floor((Date.now() - this.startTime) / 1000);
+    // Hard deadline: if any checker somehow escapes its own timeout,
+    // abort waiting and report the check as unhealthy rather than leaving
+    // the caller hanging or returning stale healthy data.
+    const deadline = new Promise<HealthReport>((resolve) => {
+      const timer = setTimeout(() => {
+        const last = this.getLastReport();
+        const timedOutDeps = last.dependencies.map((d) => ({
+          ...d,
+          status: 'unhealthy' as HealthStatus,
+          error: d.error ?? 'Health check timed out exceeding deadline',
+          lastChecked: new Date().toISOString(),
+        }));
+        resolve({
+          status: 'unhealthy',
+          version: '0.1.0',
+          timestamp: new Date().toISOString(),
+          uptime: Math.floor((Date.now() - this.startTime) / 1000),
+          dependencies: timedOutDeps,
+        });
+      }, hardDeadlineMs);
+      // Allow the Node.js event loop to exit naturally if only this timer is
+      // left pending (e.g. during graceful shutdown tests).
+      if (typeof timer.unref === 'function') timer.unref();
+    });
 
-    return {
-      status,
-      version: '0.1.0',
-      timestamp: new Date().toISOString(),
-      uptime,
-      dependencies: results,
-    };
+    const checks = Promise.all(
+      Array.from(this.checkers.values()).map((checker) => this.checkOne(checker)),
+    ).then((results) => {
+      const status = this.aggregateStatus(results);
+      const uptime = Math.floor((Date.now() - this.startTime) / 1000);
+      return {
+        status,
+        version: '0.1.0',
+        timestamp: new Date().toISOString(),
+        uptime,
+        dependencies: results,
+      } satisfies HealthReport;
+    });
+
+    return Promise.race([checks, deadline]);
   }
 
   getLastReport(version = '0.1.0'): HealthReport {
@@ -489,11 +569,22 @@ export class HealthCheckManager {
     };
   }
 
+  /**
+   * Run a single checker with an explicit per-checker timeout.
+   *
+   * The effective timeout is resolved as:
+   *   `checker.timeoutMs` (per-checker override) ??
+   *   `HEALTH_CHECK_TIMEOUT_MS` (global config default)
+   *
+   * A timed-out or throwing checker is recorded as `unhealthy` with a
+   * sanitised error message — it never leaves a pending promise in the caller.
+   */
   private async checkOne(checker: HealthChecker): Promise<DependencyHealth> {
     const startTime = Date.now();
+    const effectiveTimeout = checker.timeoutMs ?? this.timeoutMs;
 
     try {
-      const result = await checker.check();
+      const result = await withCheckerTimeout(checker.check(), effectiveTimeout, checker.name);
       const latency = result.latency ?? Date.now() - startTime;
 
       let status: HealthStatus;
@@ -507,7 +598,7 @@ export class HealthCheckManager {
 
       const prevHealth = this.lastResults.get(checker.name);
       let degradedSince: string | undefined;
-      
+
       if (status === 'degraded') {
         degradedSince = prevHealth?.status === 'degraded' ? prevHealth.degradedSince : new Date().toISOString();
       }
@@ -562,10 +653,18 @@ export class HealthCheckManager {
  * constructed programmatically (tests, embedding apps), and a non-positive
  * timeout/interval here would only misbehave when `/health/ready` or the
  * background poller actually ran. Check them at startup too.
+ *
+ * The three optional per-checker timeout overrides (`healthCheckPostgresTimeoutMs`,
+ * `healthCheckRedisTimeoutMs`, `healthCheckStellarTimeoutMs`) are only validated
+ * when present — `undefined` means "fall back to the global timeout", which is
+ * always valid.
  */
 export function validateHealthConfig(config: {
   healthCheckTimeoutMs: number;
   healthCheckIntervalMs: number;
+  healthCheckPostgresTimeoutMs?: number | undefined;
+  healthCheckRedisTimeoutMs?: number | undefined;
+  healthCheckStellarTimeoutMs?: number | undefined;
   startupProbeBudgetMs: number;
   startupProbePostgresTimeoutMs: number;
   startupProbeRedisTimeoutMs: number;
@@ -588,34 +687,150 @@ export function validateHealthConfig(config: {
     }
   }
 
+  // Per-checker overrides are optional; only validate when explicitly set.
+  const optionalPositiveInts: ReadonlyArray<[string, number | undefined]> = [
+    ['healthCheckPostgresTimeoutMs', config.healthCheckPostgresTimeoutMs],
+    ['healthCheckRedisTimeoutMs',    config.healthCheckRedisTimeoutMs],
+    ['healthCheckStellarTimeoutMs',  config.healthCheckStellarTimeoutMs],
+  ];
+
+  for (const [name, value] of optionalPositiveInts) {
+    if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+      issues.push(`${name} must be a positive integer when set (got ${value})`);
+    }
+  }
+
   return issues;
 }
 
 // ─── Built-in stub checkers (used when real clients are not wired up) ─────────
 
-export function createDatabaseHealthChecker(): HealthChecker {
+export function createDatabaseHealthChecker(opts: { timeoutMs?: number } = {}): HealthChecker {
   return {
     name: 'database',
+    timeoutMs: opts.timeoutMs ?? 5_000,
     async check() {
       return { latency: 1 };
     },
   };
 }
 
-export function createRedisHealthChecker(): HealthChecker {
+export function createRedisHealthChecker(opts: { timeoutMs?: number } = {}): HealthChecker {
   return {
     name: 'redis',
+    timeoutMs: opts.timeoutMs ?? 5_000,
     async check() {
       return { latency: 1 };
     },
   };
 }
 
-export function createHorizonHealthChecker(_url: string): HealthChecker {
+export function createHorizonHealthChecker(_url: string, opts: { timeoutMs?: number } = {}): HealthChecker {
   return {
     name: 'horizon',
+    timeoutMs: opts.timeoutMs ?? 5_000,
     async check() {
       return { latency: 1 };
     },
   };
+}
+
+// ─── Bounded HealthCheckManager factory ──────────────────────────────────────
+
+/**
+ * Options accepted by {@link createBoundedHealthCheckManager}.
+ *
+ * Every timeout field falls back to `healthCheckTimeoutMs` when absent, which
+ * itself falls back to `HEALTH_CHECK_TIMEOUT_MS` (default 5 000 ms). The
+ * three per-checker overrides let operators tune individual dependencies
+ * without touching the global fallback.
+ */
+export interface BoundedHealthCheckManagerOptions {
+  /**
+   * Global per-checker timeout in ms (sourced from `Config.healthCheckTimeoutMs`).
+   * Applied to any checker that does not declare its own `timeoutMs`.
+   */
+  healthCheckTimeoutMs: number;
+  /** Per-checker override for the Postgres check, in ms. Defaults to `healthCheckTimeoutMs`. */
+  healthCheckPostgresTimeoutMs?: number | undefined;
+  /** Per-checker override for the Redis check, in ms. Defaults to `healthCheckTimeoutMs`. */
+  healthCheckRedisTimeoutMs?: number | undefined;
+  /** Per-checker override for the Stellar RPC check, in ms. Defaults to `healthCheckTimeoutMs`. */
+  healthCheckStellarTimeoutMs?: number | undefined;
+  /**
+   * Additional checkers to register beyond the three standard ones.
+   * Useful for application-layer custom checkers (e.g. background workers).
+   */
+  extraCheckers?: HealthChecker[];
+}
+
+/**
+ * Build a `HealthCheckManager` with per-checker timeouts resolved from config.
+ *
+ * Each of the three standard dependency checks (postgres, redis, stellar_rpc)
+ * is registered with its own explicit `timeoutMs`, derived from the per-checker
+ * env-var override when set, or the global `HEALTH_CHECK_TIMEOUT_MS` otherwise.
+ * The `HealthCheckManager.checkOne()` wrapper enforces this timeout as a
+ * last-resort safety net on top of the checker's own internal timeout guard.
+ *
+ * This is the canonical factory for production boot code. Use it in
+ * `src/index.ts` or wherever `createApp()` is called with a real manager:
+ *
+ * ```typescript
+ * import { createBoundedHealthCheckManager } from './config/health.js';
+ * import { createPostgresChecker, createRedisChecker, createStellarRpcChecker } from './health/checkers.js';
+ *
+ * const healthManager = createBoundedHealthCheckManager({
+ *   ...config,
+ *   extraCheckers: [
+ *     createPostgresChecker(getPoolClient, { timeoutMs: config.healthCheckPostgresTimeoutMs }),
+ *     createRedisChecker(getRedisClient,   { timeoutMs: config.healthCheckRedisTimeoutMs }),
+ *     createStellarRpcChecker(getRpcClient,{ timeoutMs: config.healthCheckStellarTimeoutMs }),
+ *   ],
+ * });
+ * ```
+ *
+ * The factory itself only registers stubs for the three standard checks so
+ * the manager is immediately functional without real clients wired up. Replace
+ * them via `extraCheckers` (which upserts by name) or re-register after
+ * construction when real clients are available.
+ */
+export function createBoundedHealthCheckManager(
+  opts: BoundedHealthCheckManagerOptions,
+): HealthCheckManager {
+  const globalTimeout = opts.healthCheckTimeoutMs;
+
+  const manager = new HealthCheckManager();
+
+  // Register the three standard stub checkers with their resolved timeouts.
+  // When real client factories are available (see extraCheckers), callers
+  // should pass them via extraCheckers instead — they upsert by name.
+  const defaultCheckers: HealthChecker[] = [
+    {
+      name: 'postgres',
+      timeoutMs: opts.healthCheckPostgresTimeoutMs ?? globalTimeout,
+      async check() { return { latency: 1 }; },
+    },
+    {
+      name: 'redis',
+      timeoutMs: opts.healthCheckRedisTimeoutMs ?? globalTimeout,
+      async check() { return { latency: 1 }; },
+    },
+    {
+      name: 'stellar_rpc',
+      timeoutMs: opts.healthCheckStellarTimeoutMs ?? globalTimeout,
+      async check() { return { latency: 1 }; },
+    },
+  ];
+
+  for (const checker of defaultCheckers) {
+    manager.registerChecker(checker);
+  }
+
+  // Extra checkers upsert the defaults by name (registerChecker uses Map.set).
+  for (const checker of opts.extraCheckers ?? []) {
+    manager.registerChecker(checker);
+  }
+
+  return manager;
 }

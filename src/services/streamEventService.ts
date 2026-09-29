@@ -13,6 +13,7 @@ import { streamRepository } from "../db/repositories/streamRepository.js";
 import { CreateStreamInput, StreamStatus } from "../db/types.js";
 import { info, warn, error as logError, debug } from "../lib/logger.js";
 import { getStreamHub } from "../ws/hub.js";
+import { WEBHOOK_SCHEMA_VERSION } from "../webhooks/payloadSchemas.js";
 import { enrichActiveSpanWithStream, traceSpan } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";
 import type { DedupCache } from "../redis/dedup.js";
@@ -224,7 +225,7 @@ export const streamEventService = {
             streamId,
             eventId,
             recipientAddress: input.recipient_address,
-            payload: { ...input, event: 'stream.created' },
+            payload: { ...input, event: 'stream.created', schema_version: WEBHOOK_SCHEMA_VERSION },
           }).catch((err: Error) => {
             logError("Failed to broadcast stream created event", { streamId, eventId, error: err.message });
           });
@@ -350,7 +351,7 @@ export const streamEventService = {
             streamId: event.streamId,
             eventId,
             recipientAddress: updatedStream.recipient_address,
-            payload: { ...update, event: 'stream.updated' },
+            payload: { ...update, event: 'stream.updated', schema_version: WEBHOOK_SCHEMA_VERSION },
           }).catch((err: Error) => {
             logError("Failed to broadcast stream updated event", { streamId: event.streamId, eventId, error: err.message });
           });
@@ -468,7 +469,7 @@ export const streamEventService = {
           streamId: event.streamId,
           eventId,
           recipientAddress: updatedStream.recipient_address,
-          payload: { status: 'cancelled', event: 'stream.cancelled' },
+          payload: { status: 'cancelled', event: 'stream.cancelled', schema_version: WEBHOOK_SCHEMA_VERSION },
         }).catch((err: Error) => {
           logError("Failed to broadcast stream cancelled event", { streamId: event.streamId, eventId, error: err.message });
         });

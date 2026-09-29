@@ -1,13 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import request from 'supertest';
 import { app } from '../../src/app.js';
-import { BODY_LIMIT_BYTES } from '../../src/middleware/requestProtection.js';
+import { DEFAULT_RAW_LIMIT_BYTES } from '../../src/middleware/requestProtection.js';
 import { CORRELATION_ID_HEADER } from '../../src/middleware/correlationId.js';
 
 describe('Early rejection correlation IDs', () => {
   it('includes a correlation ID when rejecting an oversized body with 413', async () => {
     // Generate a payload that exceeds the body size limit
-    const padding = 'x'.repeat(BODY_LIMIT_BYTES + 1);
+    const padding = 'x'.repeat(DEFAULT_RAW_LIMIT_BYTES + 1);
     
     const res = await request(app)
       .post('/api/streams')

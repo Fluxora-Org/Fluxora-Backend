@@ -447,9 +447,9 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     await store.set('k', 'tenant-a', entry, 60);
     const result = asEntry(await store.get('k', 'tenant-a'));
     expect(result).not.toBeNull();
-    expect(result?.requestFingerprint).toBe(entry.requestFingerprint);
-    expect(result?.statusCode).toBe(entry.statusCode);
-    expect(result?.version).toBe(ENVELOPE_VERSION);
+    expect((result as any)?.requestFingerprint).toBe(entry.requestFingerprint);
+    expect((result as any)?.statusCode).toBe(entry.statusCode);
+    expect((result as any)?.version).toBe(ENVELOPE_VERSION);
     expect(warnSpy).not.toHaveBeenCalled();
   });
 });
@@ -485,9 +485,9 @@ describe('RedisIdempotencyStore — cross-instance replay', () => {
 
     const replayed = asEntry(await instanceB.get('idem-key', 'tenant-a'));
     expect(replayed).not.toBeNull();
-    expect(replayed?.statusCode).toBe(201);
-    expect(replayed?.requestFingerprint).toBe(entry.requestFingerprint);
-    expect(replayed?.body).toEqual(entry.body);
+    expect((replayed as any)?.statusCode).toBe(201);
+    expect((replayed as any)?.requestFingerprint).toBe(entry.requestFingerprint);
+    expect((replayed as any)?.body).toEqual(entry.body);
   });
 
   it('instance B detects a conflict (same key, different fingerprint) written by instance A', async () => {
@@ -497,7 +497,7 @@ describe('RedisIdempotencyStore — cross-instance replay', () => {
     const retrieved = asEntry(await instanceB.get('conflict-key', 'tenant-a'));
     // The route handler (not the store) enforces the 409 — the store just
     // returns the stored entry so the caller can compare fingerprints.
-    expect(retrieved?.requestFingerprint).toBe('fp-from-instance-a');
+    expect((retrieved as any)?.requestFingerprint).toBe('fp-from-instance-a');
   });
 
   it('instance A and B store to isolated keys', async () => {

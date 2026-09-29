@@ -32,7 +32,7 @@ describe('mTLS Validation Failure Audit', () => {
 
   it('bypasses mTLS checks if not a TLSSocket', () => {
     req = { socket: {} as any };
-    mtlsValidationMiddleware(req as Request, res as Response, next);
+    mtlsValidationMiddleware(req as Request, res as Response, next as any);
     
     expect(next).toHaveBeenCalledOnce();
     expect(statusMock).not.toHaveBeenCalled();
@@ -47,7 +47,7 @@ describe('mTLS Validation Failure Audit', () => {
     };
     Object.setPrototypeOf(req.socket, TLSSocket.prototype);
 
-    mtlsValidationMiddleware(req as Request, res as Response, next);
+    mtlsValidationMiddleware(req as Request, res as Response, next as any);
     
     expect(next).toHaveBeenCalledOnce();
     expect(statusMock).not.toHaveBeenCalled();
@@ -64,7 +64,7 @@ describe('mTLS Validation Failure Audit', () => {
 
     req = { socket, ip: '127.0.0.1' };
     
-    mtlsValidationMiddleware(req as Request, res as Response, next);
+    mtlsValidationMiddleware(req as Request, res as Response, next as any);
 
     expect(next).not.toHaveBeenCalled();
     expect(statusMock).toHaveBeenCalledWith(401);
@@ -111,7 +111,7 @@ describe('mTLS Validation Failure Audit', () => {
 
     req = { socket, ip: '192.168.1.10', correlationId: 'req-123' } as unknown as Request;
     
-    mtlsValidationMiddleware(req as Request, res as Response, next);
+    mtlsValidationMiddleware(req as Request, res as Response, next as any);
 
     expect(next).not.toHaveBeenCalled();
     expect(statusMock).toHaveBeenCalledWith(403);
@@ -154,7 +154,7 @@ describe('mTLS Validation Failure Audit', () => {
 
     req = { socket, ip: '10.0.0.5' } as unknown as Request;
     
-    mtlsValidationMiddleware(req as Request, res as Response, next);
+    mtlsValidationMiddleware(req as Request, res as Response, next as any);
 
     expect(statusMock).toHaveBeenCalledWith(403);
     

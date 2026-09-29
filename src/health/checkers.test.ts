@@ -4,6 +4,7 @@ import {
   createStellarRpcChecker,
   createRedisChecker,
   sanitiseErrorMessage,
+  DEFAULT_TIMEOUT_MS,
 } from './checkers.js';
 import type { PostgresClient, StellarRpcClient, RedisClient } from './checkers.js';
 
@@ -298,4 +299,65 @@ describe('createRedisChecker', () => {
     expect(result.degraded).toBeUndefined();
     expect(result.error).toBeUndefined();
   });
+});
+
+// ─── timeoutMs propagation onto checker objects (issue #1575) ────────────────
+
+describe('checker factories expose timeoutMs on the returned object', () => {
+  it('createPostgresChecker uses DEFAULT_TIMEOUT_MS when no opts provided', () => {
+    const client: PostgresClient = { query: vi.fn<() => Promise<unknown>>().mockResolvedValue({}) };
+    const checker = createPostgresChecker(() => client);
+    expect(checker.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  it('createPostgresChecker exposes the custom timeoutMs from opts', () => {
+    const client: PostgresClient = { query: vi.fn<() => Promise<unknown>>().mockResolvedValue({}) };
+    const checker = createPostgresChecker(() => client, { timeoutMs: 1234 });
+    expect(checker.timeoutMs).toBe(1234);
+  });
+
+  it('createRedisChecker uses DEFAULT_TIMEOUT_MS when no opts provided', () => {
+    const client: RedisClient = { ping: vi.fn<() => Promise<string>>().mockResolvedValue('PONG') };
+    const checker = createRedisChecker(() => client);
+    expect(checker.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  it('createRedisChecker exposes the custom timeoutMs from opts', () => {
+    const client: RedisClient = { ping: vi.fn<() => Promise<string>>().mockResolvedValue('PONG') };
+    const checker = createRedisChecker(() => client, { timeoutMs: 2500 });
+    expect(checker.timeoutMs).toBe(2500);
+  });
+
+  it('createStellarRpcChecker uses DEFAULT_TIMEOUT_MS when no opts provided', () => {
+    const client: StellarRpcClient = {
+      getLatestLedger: vi.fn<() => Promise<{ sequence: number }>>().mockResolvedValue({ sequence: 1 }),
+    };
+    const checker = createStellarRpcChecker(() => client);
+    expect(checker.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  it('createStellarRpcChecker exposes the custom timeoutMs from opts', () => {
+    const client: StellarRpcClient = {
+      getLatestLedger: vi.fn<() => Promise<{ sequence: number }>>().mockResolvedValue({ sequence: 1 }),
+    };
+    const checker = createStellarRpcChecker(() => client, { timeoutMs: 3750 });
+    expect(checker.timeoutMs).toBe(3750);
+  });
+
+  it('checker timeoutMs matches the value used by the internal withTimeout guard', async () => {
+    // The checker's own internal withTimeout uses the same timeoutMs it
+    // exposes on the object. Verify by setting a tight timeout and confirming
+    // the checker times out at that value (not the DEFAULT_TIMEOUT_MS).
+    const client: PostgresClient = {
+      query: vi.fn<() => Promise<unknown>>().mockImplementation(
+        () => new Promise(() => { /* never resolves */ }),
+      ),
+    };
+    const checker = createPostgresChecker(() => client, { timeoutMs: 60 });
+    expect(checker.timeoutMs).toBe(60);
+
+    const result = await checker.check();
+    // Internal guard fires at 60 ms and returns an error
+    expect(result.error).toMatch(/timed out/);
+  }, 1000);
 });
