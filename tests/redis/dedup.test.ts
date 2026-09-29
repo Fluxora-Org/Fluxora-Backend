@@ -33,6 +33,7 @@ const mockRedisClient = (overrides: Partial<RedisClient> = {}): RedisClient => (
     close: vi.fn().mockResolvedValue(undefined),
     multi: vi.fn(),
     zcount: vi.fn().mockResolvedValue(0),
+    incr: vi.fn().mockResolvedValue(0),
     ...overrides,
 });
 

@@ -1,0 +1,16 @@
+{
+  "event": "stream.created",
+  "schema_version": 1,
+  "id": "9f1d2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f",
+  "sender_address": "GA6X4D4EMJAKLU5HRLP23HX6JBBTOUXKGDAFYYKLM2BSE2MBXUDA6S2J",
+  "recipient_address": "GDQNY3PBOJOKYZSRMK2S7LHHGWZIUISD4QORETLMXEWXIK7JVTL6OW7G",
+  "amount": "1000000000",
+  "streamed_amount": "0",
+  "remaining_amount": "1000000000",
+  "rate_per_second": "100",
+  "start_time": 1786771651,
+  "end_time": 1786858051,
+  "contract_id": "CCT4YCF2MTYVP7PZLATNOUTMRRQN2YBQCJ7QU7MSME4GXG2G6S6CDHZ6",
+  "transaction_hash": "1b6bafc1226570b2415299f5531256716f4d8dc489a9784fcd6ea347d0f63f5f",
+  "event_index": 3
+}
