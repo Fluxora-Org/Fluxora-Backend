@@ -10,18 +10,18 @@
  * counted by `fluxora_webhook_rate_limiter_fail_open_total`.
  *
  * Each attempt is recorded as a member with score = timestamp (ms).
- * Before each check we prune members older than the window, then count
- * the remaining members. If the count is at or above the limit we deny
- * the attempt and return the time until the oldest member expires.
+ * Before each check we prune members whose age is at least the window, then
+ * count the remaining members. If the count is at or above the limit we deny
+ * the attempt and return `windowMs` as the deferral delay.
  *
  * Security notes:
- * - Consumer URL is SHA-256-hashed before use as a Redis key to prevent
+ * - Receiver endpoint is SHA-256-hashed before use as a Redis key to prevent
  *   key-injection via crafted URLs and to bound key length.
  * - On Redis unavailability we ALLOW the attempt (fail-open) so a Redis
  *   outage does not silently drop all webhook deliveries. Operators should
  *   alert on Redis errors separately.
- * - All Redis operations are executed in a single pipeline to minimise
- *   round-trips and reduce the TOCTOU window.
+ * - Pruning and recording use Redis pipelines; the count check is a separate
+ *   command, so concurrent checks may admit slightly more than the limit.
  */
 
 import { createHash } from 'node:crypto';
