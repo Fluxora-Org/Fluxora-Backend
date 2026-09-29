@@ -1,20 +1,27 @@
 /**
- * Per-consumer-URL sliding-window rate limiter for outbound webhook retries.
+ * Per-receiver sliding-window rate limiter for outbound webhook deliveries.
  *
- * Algorithm: Redis sorted set keyed by `webhook_rl:<consumerUrl>`.
+ * Contract: Redis sorted set keyed by `webhook_rl:<sha256(endpoint)[0..16]>`.
+ * All tenants and attempt outcomes targeting the same endpoint share one
+ * budget; a different endpoint always has an independent budget. Entries are
+ * counted only while younger than `windowMs`, pruned at the exact expiry
+ * boundary, and the Redis key expires after `windowMs` without a new attempt.
+ * Redis errors fail open: the attempt is allowed and the failure is logged and
+ * counted by `fluxora_webhook_rate_limiter_fail_open_total`.
+ *
  * Each attempt is recorded as a member with score = timestamp (ms).
- * Before each check we prune members older than the window, then count
- * the remaining members. If the count is at or above the limit we deny
- * the attempt and return the time until the oldest member expires.
+ * Before each check we prune members whose age is at least the window, then
+ * count the remaining members. If the count is at or above the limit we deny
+ * the attempt and return `windowMs` as the deferral delay.
  *
  * Security notes:
- * - Consumer URL is SHA-256-hashed before use as a Redis key to prevent
+ * - Receiver endpoint is SHA-256-hashed before use as a Redis key to prevent
  *   key-injection via crafted URLs and to bound key length.
  * - On Redis unavailability we ALLOW the attempt (fail-open) so a Redis
  *   outage does not silently drop all webhook deliveries. Operators should
  *   alert on Redis errors separately.
- * - All Redis operations are executed in a single pipeline to minimise
- *   round-trips and reduce the TOCTOU window.
+ * - Pruning and recording use Redis pipelines; the count check is a separate
+ *   command, so concurrent checks may admit slightly more than the limit.
  */
 
 import { createHash } from 'node:crypto';
@@ -153,7 +160,7 @@ export class WebhookRateLimiter implements IWebhookRateLimiter {
       // Step 1: prune expired entries and count remaining in one pipeline.
       const pruneResults = await this.redisClient
         .multi()
-        .zremrangebyscore(key, 0, windowStart - 1)
+        .zremrangebyscore(key, '-inf', windowStart)
         .exec();
 
       // Propagate pipeline-level errors.
@@ -174,7 +181,7 @@ export class WebhookRateLimiter implements IWebhookRateLimiter {
       // Step 3: record this attempt with a unique member (timestamp + random
       // suffix) so concurrent attempts from multiple workers don't collide
       // on NX and silently drop each other's records.
-      const ttlMs = resolvedConfig.windowMs * 2; // generous TTL so Redis auto-cleans
+      const ttlMs = resolvedConfig.windowMs;
 
       const multi = this.redisClient.multi();
       for (let i = 0; i < weight; i++) {
@@ -213,8 +220,7 @@ export function createWebhookRateLimiter(redisClient: RedisClient): WebhookRateL
   return new WebhookRateLimiter(redisClient);
 }
 
-/** Hash dimensions to a fixed-length, injection-safe Redis key segment. */
+/** Hash the receiver endpoint to a fixed-length, injection-safe key segment. */
 export function hashDimensions(dim: RateLimitDimensions): string {
-  const str = `${dim.tenant}|${dim.endpoint}|${dim.outcome}`;
-  return createHash('sha256').update(str).digest('hex').slice(0, 16);
+  return createHash('sha256').update(dim.endpoint).digest('hex').slice(0, 16);
 }
