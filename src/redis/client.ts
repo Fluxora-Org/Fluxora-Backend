@@ -165,6 +165,8 @@ export interface RedisPipeline {
 
 export interface RedisClient {
   get(key: string): Promise<string | null>;
+  set(key: string, value: string, options?: { ex?: number; pxat?: number }): Promise<void>;
+  /** SET key value NX PX ms — returns true when the key was created. */
   set(key: string, value: string, options?: { ex?: number }): Promise<void>;
   /**
    * SET key value NX PX ms — returns true when the key was created.
@@ -272,9 +274,11 @@ class IORedisClient implements RedisClient {
     );
   }
 
-  async set(key: string, value: string, options?: { ex?: number }): Promise<void> {
+  async set(key: string, value: string, options?: { ex?: number; pxat?: number }): Promise<void> {
     return this.withCommandMetrics(async () => {
-      if (options?.ex) {
+      if (options?.pxat !== undefined) {
+        await this.client.set(key, value, 'PXAT', options.pxat);
+      } else if (options?.ex) {
         await this.client.set(key, value, 'EX', options.ex);
       } else {
         await this.client.set(key, value);
