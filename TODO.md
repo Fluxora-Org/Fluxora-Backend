@@ -10,7 +10,6 @@
 # TODO - #522 rpcFallbackCache key collision hardening
 
 - [x] Implement collision-resistant, versioned v2 cache key construction in `src/redis/rpcFallbackCache.ts` (hash operation + each cachePart)
-
 - [x] Add inline TSDoc documenting security assumptions and collision resistance
 - [x] Expose a test-safe key builder (or equivalent) to allow unit tests to assert key distinctness
 - [x] Add unit tests in `tests/services/stellarRpc.fallback.test.ts` proving near-colliding inputs map to different keys

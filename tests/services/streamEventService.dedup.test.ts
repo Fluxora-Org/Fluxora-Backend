@@ -90,6 +90,14 @@ class TestFailableRedisClient implements RedisClient {
     this.store.set(key, value);
   }
 
+  async incr(key: string): Promise<number> {
+    this.totalOperationAttempts++;
+    if (!this.isAvailable) throw new Error("Redis outage");
+    const val = parseInt(this.store.get(key) || '0', 10) + 1;
+    this.store.set(key, val.toString());
+    return val;
+  }
+
   async setNx(key: string, value: string, _pxMs: number): Promise<boolean> {
     this.totalOperationAttempts++;
     if (!this.isAvailable) {

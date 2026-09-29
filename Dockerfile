@@ -1,64 +1,53 @@
+# syntax=docker/dockerfile:1.7
+
 # Node.js version pin. Must equal .nvmrc and package.json "engines.node";
 # `pnpm run check:node-version` (enforced in CI) fails when they drift.
 ARG NODE_VERSION=20.20.2
 
-# Build stage
+# ---------- Build stage ----------
 FROM node:${NODE_VERSION}-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files and the preinstall guard
-COPY package.json pnpm-lock.yaml ./
-COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
+RUN corepack enable
 
-# Activate the pinned pnpm version and install dependencies
-RUN corepack enable && \
-    corepack prepare pnpm@9.15.9 --activate && \
+COPY package.json pnpm-lock.yaml* ./
+
+RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 
-# Copy source code
 COPY . .
-
-# Build TypeScript
 RUN pnpm run build
 
-# Production stage
-FROM node:${NODE_VERSION}-alpine
+RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
+    pnpm prune --prod
+
+# ---------- Production stage ----------
+FROM node:${NODE_VERSION}-alpine AS runtime
+
+LABEL org.opencontainers.image.title="fluxora-backend" \
+      org.opencontainers.image.source="https://github.com/Fluxora-Org/Fluxora-Backend" \
+      org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 
-# Keep Corepack's prepared pnpm distribution outside root's home so the
-# non-root runtime user can execute pnpm without downloading it again.
-ENV COREPACK_HOME=/opt/corepack
+RUN addgroup -g 10001 -S fluxora && \
+    adduser  -S -u 10001 -G fluxora -h /app -s /sbin/nologin fluxora
 
-# Copy package files and the preinstall guard
-COPY package.json pnpm-lock.yaml ./
-COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
+RUN corepack enable
 
-# Activate the pinned pnpm version and install production dependencies only
-RUN corepack enable && \
-    corepack prepare pnpm@9.15.9 --activate && \
-    pnpm install --prod --frozen-lockfile
+COPY --from=builder --chown=10001:10001 /app/node_modules ./node_modules
+COPY --from=builder --chown=10001:10001 /app/dist         ./dist
+COPY --from=builder --chown=10001:10001 /app/package.json ./package.json
+COPY --from=builder --chown=10001:10001 /app/pnpm-lock.yaml* ./
 
-# Copy built application from builder
-COPY --from=builder /app/dist ./dist
+RUN mkdir -p /app/tmp && chown -R 10001:10001 /app/tmp
 
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001
+USER 10001:10001
 
-# Change ownership
-RUN chown -R nodejs:nodejs /app /opt/corepack
-
-# Switch to non-root user
-USER nodejs
-
-# Expose port
 EXPOSE 3000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "require('http').get('http://127.0.0.1:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
-# Start application
 CMD ["node", "dist/src/index.js"]
