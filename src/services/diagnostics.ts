@@ -16,12 +16,10 @@
  */
 
 import type pg from 'pg';
-import { logger } from '../lib/logger.js';
 import { getPool, getPoolMetrics } from '../db/pool.js';
 import { getStellarRpcService, type CircuitState } from './stellar-rpc.js';
 import { indexerService } from '../indexer/service.js';
 import { indexerLagSeconds } from '../metrics/businessMetrics.js';
-import { sanitiseErrorMessage } from '../health/checkers.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +66,22 @@ export interface DiagnosticsReport {
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const DEFAULT_CHECK_TIMEOUT_MS = 5_000;
+
+/**
+ * Expose only a fixed failure description. Dependency errors can contain
+ * credentials, connection strings, hostnames, IP addresses, or configuration
+ * values, so diagnostics must never echo the original message.
+ */
+function safeFailure(err: unknown, dependency: string): {
+  status: 'error' | 'timeout';
+  error: string;
+} {
+  const timedOut = err instanceof Error && err.message.includes('timed out');
+  return {
+    status: timedOut ? 'timeout' : 'error',
+    error: `${dependency} check ${timedOut ? 'timed out' : 'failed'}`,
+  };
+}
 
 /**
  * Race a promise against a timeout. If the timeout fires first the promise
@@ -262,11 +276,11 @@ export class DiagnosticsService {
       }
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Database');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }
@@ -298,11 +312,11 @@ export class DiagnosticsService {
       };
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Redis');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }
@@ -327,11 +341,11 @@ export class DiagnosticsService {
       };
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Circuit breaker');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }
@@ -366,11 +380,11 @@ export class DiagnosticsService {
       };
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Indexer');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }
