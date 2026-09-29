@@ -1,0 +1,187 @@
+# Prometheus alerting rules for indexer ledger lag
+#
+# These rules monitor the `indexer_ledger_lag` gauge published by
+# src/metrics/indexerLag.ts and fire alerts when the indexer falls behind
+# the Stellar network tip beyond acceptable thresholds.
+#
+# ## Deployment
+#
+# In a Kubernetes environment with Prometheus Operator, add this file to a
+# PrometheusRule resource:
+#
+# ```yaml
+# apiVersion: monitoring.coreos.com/v1
+# kind: PrometheusRule
+# metadata:
+#   name: fluxora-indexer-lag
+#   namespace: monitoring
+# spec:
+#   groups:
+#   - name: fluxora-indexer-lag
+#     interval: 30s
+#     rules: <paste rules from this file>
+# ```
+#
+# For standalone Prometheus, add this file to the `rule_files` section in
+# prometheus.yml:
+#
+# ```yaml
+# rule_files:
+#   - /etc/prometheus/rules/indexer-lag-alerts.yml
+# ```
+#
+# Then reload Prometheus configuration:
+# ```bash
+# curl -X POST http://localhost:9090/-/reload
+# ```
+#
+# ## Testing
+#
+# To verify the alerts are loaded:
+# ```bash
+# curl http://localhost:9090/api/v1/rules | jq '.data.groups[] | select(.name=="indexer_lag")'
+# ```
+#
+# To simulate firing (in a non-production environment):
+# 1. Pause the indexer process: `kill -STOP <pid>`
+# 2. Wait 6+ minutes for the lag to accumulate
+# 3. Check pending alerts: `curl http://localhost:9090/api/v1/alerts`
+# 4. Resume the process: `kill -CONT <pid>`
+#
+# ## Related documentation
+#
+# - Threshold rationale: src/config/indexer-thresholds.ts
+# - Metric definitions: src/metrics/indexerLag.ts
+# - Operator runbook: docs/observability/alerting-runbook.md
+# - Validation tests: tests/observability/indexer-lag-alert-validation.test.ts
+
+groups:
+  - name: indexer_lag
+    interval: 30s
+    rules:
+      # ── Warning: Indexer is not catching up ────────────────────────────────
+      - alert: IndexerLagWarning
+        expr: indexer_ledger_lag >= 100
+        for: 5m
+        labels:
+          severity: warning
+          component: indexer
+          subsystem: ingestion
+        annotations:
+          summary: "Indexer is lagging behind the Stellar network tip"
+          description: |
+            The indexer has been lagging by {{ $value }} ledgers for at least 5 minutes.
+            At Stellar's ~5 second ledger close time, this represents approximately
+            {{ printf "%.1f" (div $value 12) }} minutes of chain time.
+
+            The indexer is not catching up on its own. Investigate:
+            - RPC provider health (check rpc_provider_healthy gauge)
+            - Batch processing errors (indexer_batch_errors_total counter)
+            - Database write pressure (fluxora_db_query_duration_seconds, db_pool_waiting gauge)
+            - Redis connectivity (redis_connection_status gauge)
+
+            Normal lag is 0–15 ledgers (p99). Sustained lag above 100 ledgers indicates
+            a systemic issue preventing catch-up.
+
+            Current lag: {{ $value }} ledgers (≈{{ printf "%.1f" (mul $value 5) }} seconds)
+          runbook_url: https://github.com/Fluxora-Org/Fluxora-Backend/blob/main/docs/observability/alerting-runbook.md#5-indexer-ledger-lag-srcmetricsindexerlagts
+          dashboard_url: https://grafana.example.com/d/indexer-health
+
+      # ── Critical: Data freshness SLA violated ──────────────────────────────
+      - alert: IndexerLagCritical
+        expr: indexer_ledger_lag >= 300
+        for: 10m
+        labels:
+          severity: critical
+          component: indexer
+          subsystem: ingestion
+          page: "true"
+        annotations:
+          summary: "Indexer lag is critical — data freshness SLA violated"
+          description: |
+            The indexer has been lagging by {{ $value }} ledgers for at least 10 minutes.
+            At Stellar's ~5 second ledger close time, this represents approximately
+            {{ printf "%.1f" (div $value 12) }} minutes of chain time.
+
+            ⚠️  CLIENT IMPACT: API responses for contract events are stale by
+            {{ printf "%.1f" (div $value 12) }} minutes. Clients see outdated balances,
+            missed events, and delayed webhooks. The data freshness SLA is violated.
+
+            IMMEDIATE ACTIONS:
+            1. Check if the indexer process is running and not stalled
+            2. Verify RPC provider is responsive (check rpc_provider_healthy == 1)
+            3. Review indexer_batch_errors_total for upstream/local failures
+            4. Check database pool exhaustion (fluxora_db_pool_exhausted_total)
+            5. Inspect structured logs for batch processing errors
+            6. Consider restarting the indexer if stalled (record decision in incident)
+
+            If lag continues to grow after 15+ minutes, escalate to engineering lead
+            for possible schema/infrastructure issues.
+
+            Current lag: {{ $value }} ledgers (≈{{ printf "%.1f" (mul $value 5) }} seconds, ≈{{ printf "%.1f" (div $value 12) }} minutes)
+          runbook_url: https://github.com/Fluxora-Org/Fluxora-Backend/blob/main/docs/observability/alerting-runbook.md#5-indexer-ledger-lag-srcmetricsindexerlagts
+          dashboard_url: https://grafana.example.com/d/indexer-health
+          incident_priority: P1
+
+      # ── Info: Backfill paused due to live indexing lag ────────────────────
+      - alert: IndexerBackfillPausedTooLong
+        expr: indexer_backfill_paused == 1
+        for: 15m
+        labels:
+          severity: info
+          component: indexer
+          subsystem: backfill
+        annotations:
+          summary: "Indexer backfill has been paused for 15+ minutes"
+          description: |
+            The backfill scheduler has been paused for at least 15 minutes to yield
+            to live indexing. This is an informational alert — the backfill is doing
+            exactly what it should (prioritizing live indexing over historical replay).
+
+            However, a sustained pause indicates that live indexing is struggling to
+            keep up. The backfill will resume automatically once indexer_ledger_lag
+            drops below 50 ledgers.
+
+            DIAGNOSTIC:
+            - Current indexer lag: check indexer_ledger_lag gauge
+            - Batch error rate: check indexer_batch_errors_total counter
+            - RPC health: check rpc_provider_healthy gauge
+            - DB write pressure: check fluxora_db_query_duration_seconds histogram
+
+            If IndexerLagWarning or IndexerLagCritical is also firing, address that
+            alert first. The backfill will resume automatically once lag clears.
+
+            Backfill pause count: {{ $value }} (1 = currently paused)
+          runbook_url: https://github.com/Fluxora-Org/Fluxora-Backend/blob/main/docs/observability/alerting-runbook.md#5-indexer-ledger-lag-srcmetricsindexerlagts
+
+      # ── Catch-up ETA is unreasonably high ──────────────────────────────────
+      - alert: IndexerCatchupEtaHigh
+        expr: indexer_catchup_eta_seconds > 1800
+        for: 10m
+        labels:
+          severity: warning
+          component: indexer
+          subsystem: ingestion
+        annotations:
+          summary: "Indexer catch-up ETA exceeds 30 minutes"
+          description: |
+            The indexer estimates it will take {{ printf "%.1f" (div $value 60) }} minutes
+            to catch up to the network tip, based on its current throughput. This ETA
+            has been above 30 minutes for at least 10 minutes.
+
+            This typically indicates:
+            - Batch processing is too slow (check indexer_batch_duration_seconds p99)
+            - RPC provider is rate-limiting or slow (check rpc_provider_healthy, circuit breaker state)
+            - Database writes are contended (check fluxora_db_slow_queries_total, db_pool_waiting)
+
+            DIAGNOSTIC:
+            - Compare current throughput (indexer_replay_rows_per_second) to baseline
+            - Check indexer_batch_duration_seconds p50/p95/p99
+            - Review indexer_batch_errors_total for retry storms
+            - Verify database pool is not near exhaustion
+
+            If the ETA keeps growing (not shrinking), the indexer is falling further
+            behind — escalate to the on-call backend engineer.
+
+            Estimated catch-up time: {{ printf "%.1f" (div $value 60) }} minutes
+          runbook_url: https://github.com/Fluxora-Org/Fluxora-Backend/blob/main/docs/observability/alerting-runbook.md#5-indexer-ledger-lag-srcmetricsindexerlagts

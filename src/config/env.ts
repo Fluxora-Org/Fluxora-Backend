@@ -2,45 +2,37 @@
  * Environment configuration — public entry point.
  *
  * This module is the single import surface for the rest of the codebase
- * (`import { loadConfig, Config } from './config/env.js'`). The schema itself
- * is split into per-subsystem modules (issue #1519):
+ * (`import { loadConfig, Config } from './config/env.js'`). The schema is split
+ * into per-subsystem modules (issue #1519):
  *
  * - `env-schema/`        — per-subsystem zod fragments (core, database, redis,
  *                           stellar, auth, http, webhooks, server, indexer,
  *                           rateLimit, infrastructure) composed in
  *                           `env-schema/schema.ts`
- * - `env-config.ts`       — `Config` interface, error types, env → config
+ * - `env-config.ts`      — `Config` interface, error types, env → config
  *                           mapping, and load/initialize/reset singletons
- * - `env-hot-reload.ts`   — SIGHUP hot-reload machinery (HotConfig)
+ * - `env-hot-reload.ts`  — SIGHUP hot-reload machinery (HotConfig)
  *
  * The composed schema is unchanged in effect: it accepts and rejects exactly
  * the same inputs as the original single-file definition, verified by
  * `tests/config/env.schema-split.test.ts`.
- *
- * NOTE: the single-file implementation below is still the one this module
- * exports. The `env-schema/` fragments are the equivalent split definition
- * used by `env-config.ts` and are covered on their own by the equivalence
- * tests, so this module must not re-declare `EnvSchema`/`parseEnv` from them.
  */
-import { parseEnv } from './env-config.js';
-import { getConfig } from './env-config.js';
+import { parseEnv, getConfig } from './env-config.js';
+ * The pre-split single-file implementation used to be duplicated here. It
+ * redeclared `EnvSchema`, `ParsedEnv`, `Config`, `ConfigError`,
+ * `EnvironmentError` and the parse/load singletons that this facade
+ * re-exports, so the module exported the same names twice and could not be
+ * compiled or imported. `env-config.ts` holds that implementation verbatim:
+ * the composed schema accepts and rejects exactly the same inputs as the
+ * original definition, verified by `tests/config/env.schema-split.test.ts`.
+ */
+import { getConfig, parseEnv } from './env-config.js';
 
 export type { ParsedEnv } from './env-schema/schema.js';
 export type { NodeEnv, LogLevel } from './env-schema/types.js';
 
-import { z } from 'zod';
-import { warn } from '../lib/logger.js';
-import { type StellarNetwork, STELLAR_NETWORKS, type ContractAddresses } from './stellar.js';
-import {
-  getPinnedAddressNetwork,
-  isValidStellarContractAddress,
-  assertNetworkMatchesContracts,
-  logActiveStellarConfig,
-  STELLAR_NETWORK_PASSPHRASES,
-  type PinnedStellarAddressKind,
-} from './stellarContracts.js';
-import { CONNECTION_LIMIT_DEFAULTS as LIMITS } from './connectionLimits.js';
 export { STELLAR_NETWORKS, type StellarNetwork, type ContractAddresses } from './stellar.js';
+export { resolveNetwork } from './stellar.js';
 export {
   STELLAR_CONTRACT_ALLOWLIST,
   STELLAR_NETWORK_PASSPHRASES,
@@ -48,7 +40,11 @@ export {
   assertNetworkMatchesContracts,
   logActiveStellarConfig,
 } from './stellarContracts.js';
-export { resolveNetwork } from './stellar.js';
+
+export { DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES } from './env-schema/server.js';
+export function getWsMaxInboundMessageBytes(): number {
+  return getConfig().wsMaxInboundMessageBytes;
+}
 
 export type { Config } from './env-config.js';
 export { loadConfig, getConfig, initializeConfig, resetConfig } from './env-config.js';

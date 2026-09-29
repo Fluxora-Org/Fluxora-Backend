@@ -199,7 +199,7 @@ export class FakeRedisClient implements RedisClient {
         return this.strings.get(key) ?? null;
     }
 
-    async set(key: string, value: string, _options?: { ex?: number }): Promise<void> {
+    async set(key: string, value: string, _options?: { ex?: number; pxat?: number }): Promise<void> {
         this.maybeThrow('set');
         this.strings.set(key, value);
     }

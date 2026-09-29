@@ -193,9 +193,9 @@ which runs the same transition suite against both the Redis store and the in-pro
 
 ### How rate limiting works
 
-1. Before firing a retry, the dispatcher calls `attemptWebhookDeliveryWithRateLimit` with the consumer's endpoint URL and the configured `RateLimitConfig` (`{ limit, windowMs }`).
-2. The rate limiter (`src/redis/webhookRateLimit.ts`) maintains a Redis sorted set keyed by a SHA-256 hash of the consumer URL. Each recorded attempt is a member with score = timestamp (ms).
-3. Entries older than `windowMs` are pruned on every check. If the remaining count is at or above `limit`, the attempt is **deferred** rather than dropped.
+1. Before firing a delivery attempt, the dispatcher calls `attemptWebhookDeliveryWithRateLimit` with the receiver's endpoint URL and the configured `RateLimitConfig` (`{ limit, windowMs }`).
+2. The rate limiter (`src/redis/webhookRateLimit.ts`) maintains a Redis sorted set keyed by a SHA-256 hash of the receiver endpoint URL. The budget is per receiver: attempts from all tenants and attempt outcomes to that endpoint share it, while different endpoints never consume one another's capacity. Each recorded attempt is a member with score = timestamp (ms).
+3. Entries are pruned when their age reaches `windowMs`; the Redis key expires after `windowMs` without a new admitted attempt. If the remaining count is at or above `limit`, the attempt is **deferred** rather than dropped.
 4. A deferred attempt returns `{ shouldRetry: true, rateLimited: true, retryAt: now + windowMs }`. The dispatcher re-inserts the outbox row with `created_at = retryAt`, so the deferral is durable in PostgreSQL.
 5. `WEBHOOK_RETRY_RPS` (default `10`) controls `limit`; `windowMs` is `1000 ms` (one second).
 
@@ -306,7 +306,8 @@ Webhook consumers verify incoming requests by recomputing the HMAC-SHA256 signat
 When a webhook consumer rotates its signing secret via the admin API, there is a transition period during which some producers may still be signing with the old secret. To avoid spurious verification failures, the verification path supports a **bounded dual-secret grace window**:
 
 - During the grace window, **both** the previous and current secret are accepted.
-- After the grace window expires, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
+- The overlap is configurable with `graceWindowSeconds`; it is active from the rotation timestamp up to, but not including, the expiry timestamp.
+- At and after expiry, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
 - The rotation timestamp and grace-window expiry are **persisted** in the `webhook_secrets` table (not held in memory), so a process restart cannot silently extend or shrink the window.
 - The default grace window is `DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS` (86 400 seconds / 24 hours).
 
@@ -410,3 +411,21 @@ SSRF validation failures are logged without exposing the full URL for security. 
 - Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
 - Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
 - DNS resolution: Uses Node.js `dns.promises.lookup()`
+
+## Payload schemas (published, versioned)
+
+Every webhook payload is an external contract: receivers parse it. The
+published, versioned schemas live in `src/webhooks/payloadSchemas.ts`
+(zod), with committed fixtures per event under `src/webhooks/schema-fixtures/`
+(issue #1570).
+
+- Each payload carries a `schema_version` field (currently `1`).
+- **Compatibility rule:** additive changes (new optional fields, new event
+  types) do NOT bump the version. Removing, renaming, retyping, or changing
+  the meaning of an existing field DOES.
+- The committed fixtures pin the current shape of every event; CI fails if
+  code drifts the shape without a deliberate version bump and fixture update.
+- Delivery validates outgoing payloads against the published schema; a
+  mismatch is classified poison (non-retryable), not transient.
+- Schemas are strict: unknown keys are rejected, so adding a field is itself
+  a schema change (additive, no bump, but the fixtures must be updated).

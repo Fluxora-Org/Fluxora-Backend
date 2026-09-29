@@ -11,3 +11,8 @@ tests
 **/*.test.ts
 jest.config.js
 jest.config.cjs
+.env
+.env.*
+*.pem
+*.key
+.github

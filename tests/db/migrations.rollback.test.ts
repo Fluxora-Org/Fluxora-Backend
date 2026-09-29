@@ -16,11 +16,16 @@ import * as replayProgress from '../../src/db/migrations/003_create_indexer_repl
 import * as ingestedAt from '../../src/db/migrations/004_contract_events_ingested_at_default.js';
 import * as streamEventIndex from '../../src/db/migrations/005_streams_contract_id_event_index.js';
 import * as dispatchIndex from '../../src/db/migrations/006_add_webhook_outbox_dispatch_index.js';
-import * as eventIndexCheck from '../../src/db/migrations/006_streams_event_index_check.js';
 import * as lockColumns from '../../src/db/migrations/007_add_webhook_outbox_lock_columns.js';
+import * as eventIndexCheck from '../../src/db/migrations/008_streams_event_index_check.js';
 
 const rollbackDatabaseUrl = process.env['MIGRATION_ROLLBACK_DATABASE_URL'];
 
+/**
+ * Applied order, which is the filename ordinal. `scripts/check-migration-names.mjs`
+ * rejects two contracts sharing an ordinal, so this list is the only order the
+ * repository accepts.
+ */
 const migrations = [
   createStreams,
   durableRetry,
@@ -28,8 +33,8 @@ const migrations = [
   ingestedAt,
   streamEventIndex,
   dispatchIndex,
-  eventIndexCheck,
   lockColumns,
+  eventIndexCheck,
 ] as const;
 
 describe('src/db/migrations rollback contracts', () => {
@@ -40,6 +45,11 @@ describe('src/db/migrations rollback contracts', () => {
 
   it('flags the only non-lossless migration', () => {
     expect(ingestedAt.irreversibleReason).toContain('NULL');
+  });
+
+  it('applies the event_index check idempotently so a renumbered environment is not re-run', () => {
+    expect(eventIndexCheck.up).toContain('pg_constraint');
+    expect(eventIndexCheck.up).toContain(eventIndexCheck.CONSTRAINT_NAME);
   });
 });
 
