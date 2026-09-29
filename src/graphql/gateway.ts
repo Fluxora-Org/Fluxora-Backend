@@ -34,9 +34,7 @@
 import { Router, type Request, type Response } from 'express';
 import {
   graphql,
-  GraphQLError,
   parse,
-  GraphQLError,
   type DocumentNode,
   type GraphQLError,
   type SelectionNode,
@@ -45,8 +43,7 @@ import {
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { authenticate, authenticateApiKey, requireScope } from '../middleware/auth.js';
-import { authenticate, requireAuth } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import type { StreamFilter, StreamStatus } from '../db/types.js';
 import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
@@ -554,16 +551,6 @@ graphqlGatewayRouter.post(
       if (extensions !== undefined && extensions !== null) {
         if (typeof extensions !== 'object' || Array.isArray(extensions)) {
           res.status(400).json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
-          return;
-        }
-
-        const persistedQuery = extensions as { version?: unknown; sha256Hash?: unknown };
-        const { version, sha256Hash } = persistedQuery;
-
-        if (version !== 1) {
-          res
-            .status(400)
-            .json(errorResponse('PERSISTED_QUERY_INVALID', 'Invalid extensions payload.', undefined, requestId));
           return;
         }
 

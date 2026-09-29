@@ -27,6 +27,13 @@ export const infrastructureEnvSchema = {
   RPC_FALLBACK_CACHE_TTL_SECONDS: integerEnv('RPC_FALLBACK_CACHE_TTL_SECONDS', 1).default(300),
   /** Beta parameter for the fallback cache's early-expiry probabilistic refresh. @default 0 */
   RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA: z.preprocess(parseNumber, z.number().min(0).default(0)),
+  /**
+   * Maximum age, in ms, that a last-known-good fallback entry may be served
+   * at while the RPC circuit is OPEN. Enforced independently of the TTL
+   * above so staleness policy is explicit and testable; entries older than
+   * this are refused rather than served. @default 300000
+   */
+  RPC_FALLBACK_CACHE_MAX_AGE_MS: integerEnv('RPC_FALLBACK_CACHE_MAX_AGE_MS', 1).default(300_000),
   /** Interval between proactive RPC health checks in ms; 0 disables. @default 0 */
   RPC_HEALTH_CHECK_INTERVAL_MS: integerEnv('RPC_HEALTH_CHECK_INTERVAL_MS', 0).default(0),
   /** Consecutive RPC health-check failures before a target is marked unhealthy. @default 3 */

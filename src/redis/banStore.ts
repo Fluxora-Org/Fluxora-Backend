@@ -5,6 +5,29 @@
  * Uses a read-through in-memory cache for performance.
  * Fails closed on Redis read failures so an outage cannot erase protection.
  *
+ * Scope & Expiry Contract
+ * ----------------------
+ * - Scope: Bans are scoped to IP addresses only. Each ban is identified by the
+ *   IP address provided in the BanOptions.ip field.
+ * - Expiry: All bans MUST have an explicit TTL (time-to-live) in seconds.
+ *   The ttlSeconds field in BanOptions is REQUIRED and must be a positive integer.
+ *   Redis automatically expires keys after TTL, and in-memory stores clean up
+ *   expired entries on read.
+ * - Audit: Every ban operation logs the IP, TTL, expiry timestamp, and source
+ *   (redis/in-memory) for traceability.
+ * - Bounded Lifetime: Entries cannot outlive their documented lifetime due to
+ *   Redis TTL enforcement and in-memory expiry validation.
+ *
+ * Store Unavailability Behavior
+ * -----------------------------
+ * - RedisBanStore: Throws errors on Redis failures. Caller must handle.
+ * - InMemoryBanStore: Always available (no external dependencies).
+ * - HybridBanStore: Fails closed on Redis failures. When Redis is unavailable:
+ *   * isBanned() returns { banned: true } (conservative deny)
+ *   * ban() succeeds via local fallback cache
+ *   * unban() succeeds via local fallback cache
+ *   This ensures protection is never disabled by Redis outage.
+ *
  * Security & Resilience
  * - Fail-safe: Redis outage never disables banning (falls back to local cache).
  * - TTL keys ensure automatic expiry without manual cleanup.
@@ -38,11 +61,19 @@ export interface BanCheckResult {
   expiry?: number;
 }
 
-/** Options for ban creation. */
+/**
+ * Options for ban creation.
+ *
+ * @remarks
+ * - ttlSeconds: REQUIRED. Must be a positive integer > 0. Represents the
+ *   time-to-live in seconds. Redis will automatically expire the ban after this
+ *   duration. In-memory stores also enforce this expiry on read.
+ * - ip: REQUIRED. The IP address to ban. This is the scope of the ban.
+ */
 export interface BanOptions {
-  /** Ban duration in seconds (TTL). */
+  /** Ban duration in seconds (TTL). Must be > 0. */
   ttlSeconds: number;
-  /** IP address to ban. */
+  /** IP address to ban. This defines the ban scope. */
   ip: string;
 }
 
@@ -51,17 +82,34 @@ export interface BanStore {
   /**
    * Check if an IP is currently banned.
    * Returns { banned: true, expiry } if active ban exists.
+   *
+   * Store unavailability behavior:
+   * - RedisBanStore: Throws error on Redis failure
+   * - InMemoryBanStore: Always succeeds
+   * - HybridBanStore: Returns { banned: true } on Redis failure (fail-closed)
    */
   isBanned(ip: string): Promise<BanCheckResult>;
 
   /**
    * Record a ban for the given IP with TTL.
-   * Emits audit log entry.
+   * Emits audit log entry with IP, TTL, expiry timestamp, and source.
+   *
+   * Store unavailability behavior:
+   * - RedisBanStore: Throws error on Redis failure
+   * - InMemoryBanStore: Always succeeds
+   * - HybridBanStore: Succeeds via local fallback on Redis failure
+   *
+   * @throws {Error} If ttlSeconds is not a positive integer
    */
   ban(options: BanOptions): Promise<void>;
 
   /**
    * Remove a ban (used on expiry or manual unban).
+   *
+   * Store unavailability behavior:
+   * - RedisBanStore: Throws error on Redis failure
+   * - InMemoryBanStore: Always succeeds
+   * - HybridBanStore: Succeeds via local fallback on Redis failure
    */
   unban(ip: string): Promise<void>;
 
@@ -97,6 +145,9 @@ export class InMemoryBanStore implements BanStore {
 
   async ban(options: BanOptions): Promise<void> {
     const { ip, ttlSeconds } = options;
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+      throw new Error(`Invalid ttlSeconds: ${ttlSeconds}. Must be a positive integer.`);
+    }
     const expiry = Date.now() + ttlSeconds * 1000;
     this.bans.set(ip, expiry);
     logger.warn('IP banned for WebSocket abuse (local)', undefined, {
@@ -156,6 +207,9 @@ export class RedisBanStore implements BanStore {
 
   async ban(options: BanOptions): Promise<void> {
     const { ip, ttlSeconds } = options;
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+      throw new Error(`Invalid ttlSeconds: ${ttlSeconds}. Must be a positive integer.`);
+    }
     const key = buildKey(ip);
     const expiry = Date.now() + ttlSeconds * 1000;
 
@@ -198,6 +252,11 @@ export class RedisBanStore implements BanStore {
  * known bans. Reads fail closed while Redis is unavailable.
  * Maintains a local read-through cache for fast checks.
  * Ensures banning is never disabled by Redis outage.
+ *
+ * Store unavailability behavior:
+ * - isBanned(): Returns { banned: true } on Redis failure (fail-closed)
+ * - ban(): Succeeds via local fallback on Redis failure
+ * - unban(): Succeeds via local fallback on Redis failure
  */
 export class HybridBanStore implements BanStore {
   usingFallback = false;
@@ -226,6 +285,7 @@ export class HybridBanStore implements BanStore {
           await this.localCache.ban({ ip, ttlSeconds: Math.ceil((result.expiry - Date.now()) / 1000) });
         }
       }
+      this.usingFallback = false;
       return result;
     } catch (err) {
       this.onError?.(err, 'isBanned');

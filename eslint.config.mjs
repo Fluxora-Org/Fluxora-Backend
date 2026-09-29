@@ -79,10 +79,10 @@ export default [
     },
   },
   {
-    // This file is a deliberately standalone CLI entrypoint. It is allowed
+    // These files are deliberately standalone CLI entrypoints. They are allowed
     // to write human-readable progress directly to the terminal before any
     // request-scoped logger exists; see docs/CONSOLE_LOG_AUDIT.md.
-    files: ['src/scripts/backup-retention.ts'],
+    files: ['src/scripts/backup-retention.ts', 'scripts/check-retention-schedule.ts'],
     rules: {
       'no-console': 'off',
     },

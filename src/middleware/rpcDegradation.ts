@@ -21,6 +21,7 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import {
+  getRpcRequestCacheAgeMs,
   getRpcRequestCacheStatus,
   runWithRpcRequestMetadata,
   type StellarRpcService,
@@ -53,6 +54,12 @@ export function createRpcDegradationMiddleware(
       res.writeHead = ((...args: Parameters<Response['writeHead']>) => {
         if (getRpcRequestCacheStatus() === 'stale' && !res.headersSent) {
           res.setHeader('X-RPC-Cache', 'stale');
+          // Surface exactly how old the served data is so callers don't have
+          // to guess from the generic staleness Warning header alone.
+          const ageMs = getRpcRequestCacheAgeMs();
+          if (typeof ageMs === 'number') {
+            res.setHeader('X-RPC-Cache-Age-Ms', String(ageMs));
+          }
         }
         return originalWriteHead(...args);
       }) as Response['writeHead'];

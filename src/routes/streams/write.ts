@@ -51,7 +51,6 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const requestId = req.correlationId;
   const correlationId = req.correlationId;
   const idempotencyKey = parseIdempotencyKeyHeader(req.header('Idempotency-Key'));
-  const tenantId = req.callerAddress ?? req.user?.address ?? 'anonymous';
 
   if (!isIdempotencyHealthy()) {
     warn('Idempotency dependency unavailable', {
@@ -67,7 +66,13 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
 
   const input = parseCreateStreamBody(req.body, requestId);
   const requestFingerprint = fingerprintInput(input);
-  const tenantId = req.keyId || req.user?.address || input.sender || 'anonymous';
+  // Tenant scope for the idempotency key must come from the authenticated
+  // principal, never from the request body: `input.sender` is caller-supplied,
+  // so falling back to it would let an unverified field decide whose
+  // idempotency namespace a write lands in. `callerAddress` is the same
+  // principal the ownership check further down uses, and `keyId` keeps
+  // distinct API keys in distinct namespaces.
+  const tenantId = req.callerAddress ?? req.keyId ?? req.user?.address ?? 'anonymous';
   const idempotencyStore = getIdempotencyStore();
   const existingResponse = await idempotencyStore.get(idempotencyKey, tenantId);
 

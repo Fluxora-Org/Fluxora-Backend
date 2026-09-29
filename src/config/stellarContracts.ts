@@ -90,6 +90,23 @@ export function isValidStellarContractAddress(value: string): boolean {
   return expectedChecksum === actualChecksum;
 }
 
+/**
+ * Decode a Stellar contract StrKey (`C…`) into its 32-byte contract id, or
+ * `null` when the value is not a valid contract address (bad length, alphabet,
+ * version byte, or CRC16). Used by the startup reachability check to build the
+ * contract-instance ledger key (issue #1438).
+ */
+export function stellarContractIdBytes(address: string): Uint8Array | null {
+  const candidate = address.trim();
+  if (!isValidStellarContractAddress(candidate)) return null;
+
+  const decoded = decodeStellarBase32(candidate);
+  if (decoded === null || decoded.length !== STELLAR_STRKEY_DECODED_LENGTH) return null;
+
+  // Layout: 1 version byte, then the 32-byte contract id, then a 2-byte checksum.
+  return Uint8Array.from(decoded.slice(1, 1 + 32));
+}
+
 export function getPinnedAddressNetwork(
   kind: PinnedStellarAddressKind,
   address: string

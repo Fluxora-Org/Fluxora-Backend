@@ -52,22 +52,25 @@ interface MockRow {
 /**
  * Build a minimal pg PoolClient mock.
  *
- * `rows` is consumed one batch at a time:
- *  - First SELECT (information_schema check) returns a schema row.
- *  - Subsequent SELECTs return batches of candidate rows.
- *  - INSERT / DELETE / UPDATE return { rows: [], rowCount: 0 }.
+ * Candidate batches are keyed by **table name**, not by a flat call index, so
+ * a test does not have to know how many rules the schedule has or in what
+ * order they run. `PURGEABLE_RETENTION_SCHEDULE` is derived from the retention
+ * manifest and has grown over time (it gained `webhook_dlq`,
+ * `job_dead_letter` and `tenant_rate_limit_overrides`), and a positional mock
+ * silently mis-assigns every batch the moment a rule is added or reordered.
+ *
+ * `batches[table]` is consumed one entry at a time; once exhausted the table
+ * yields no more candidates. Tables absent from the map yield none either.
  */
-function buildMockClient(candidateBatches: MockRow[][] = [[]]) {
-  let batchIndex = 0;
-  let callCount = 0;
+function buildMockClient(batches: Record<string, MockRow[][]> = {}) {
+  const cursors = new Map<string, number>(Object.keys(batches).map((t) => [t, 0]));
   const queries: string[] = [];
 
   const client = {
     query: vi.fn(async (sql: string, _params?: unknown[]) => {
       queries.push(sql);
-      callCount++;
 
-      // First call per connect is the information_schema check
+      // Schema introspection for the legal-hold check
       if (sql.toLowerCase().includes('information_schema')) {
         return { rows: [{ column_name: 'legal_hold' }], rowCount: 1 };
       }
@@ -79,8 +82,12 @@ function buildMockClient(candidateBatches: MockRow[][] = [[]]) {
 
       // SELECT candidates (FOR UPDATE SKIP LOCKED)
       if (sql.includes('FOR UPDATE SKIP LOCKED')) {
-        const batch = candidateBatches[batchIndex] ?? [];
-        batchIndex++;
+        // `FROM "table"` is the only quoted identifier in the SELECT.
+        const table = /FROM\s+"([^"]+)"/.exec(sql)?.[1] ?? '';
+        const queued = batches[table] ?? [];
+        const index = cursors.get(table) ?? 0;
+        cursors.set(table, index + 1);
+        const batch = queued[index] ?? [];
         return { rows: batch, rowCount: batch.length };
       }
 
@@ -98,6 +105,14 @@ function buildMockPool(clientFactory: () => ReturnType<typeof buildMockClient>) 
   return {
     connect: vi.fn(async () => clientFactory()),
   };
+}
+
+/** How many candidate SELECTs a given table received. */
+function selectCountFor(client: ReturnType<typeof buildMockClient>, table: string): number {
+  return client.query.mock.calls
+    .map(([sql]: any) => sql as string)
+    .filter((sql: string) => sql.includes('FOR UPDATE SKIP LOCKED'))
+    .filter((sql: string) => sql.includes(`FROM "${table}"`)).length;
 }
 
 // ── Fixed reference time ──────────────────────────────────────────────────────
@@ -120,7 +135,7 @@ function baseOptions(pool: ReturnType<typeof buildMockPool>): PurgeJobOptions {
 
 describe('runRetentionPurge — no candidates', () => {
   it('completes with 0 purged and 0 skipped when all batches are empty', async () => {
-    const client = buildMockClient([[]]); // first and only batch is empty
+    const client = buildMockClient(); // no table has any candidates
     const pool = buildMockPool(() => client);
 
     const result = await runRetentionPurge(baseOptions(pool));
@@ -139,17 +154,14 @@ describe('runRetentionPurge — delete action (audit_logs rule)', () => {
     const { recordAuditEventToDb } = await import('../../src/lib/auditLog.js');
     vi.clearAllMocks();
 
-    // Rule 1 (audit_logs): slot 0 → [a1, a2], slot 1 → []
-    // Rule 2 (streams):    slot 2 → []
-    // Rule 3 (webhook):    slot 3 → []
     const batch1: MockRow[] = [expiredRow('a1'), expiredRow('a2')];
 
-    const client = buildMockClient([batch1, [], [], []]);
+    const client = buildMockClient({ audit_logs: [batch1] });
     const pool = buildMockPool(() => client);
 
     const result = await runRetentionPurge(baseOptions(pool));
 
-    const auditRule = result.results.find((r) => r.category === 'Audit logs');
+    const auditRule = result.results.find((r) => r.table === 'audit_logs');
     expect(auditRule).toBeDefined();
     expect(auditRule!.rowsPurged).toBe(2);
     expect(auditRule!.rowsSkipped).toBe(0);
@@ -161,18 +173,15 @@ describe('runRetentionPurge — legal-hold precedence', () => {
     const { recordAuditEventToDb } = await import('../../src/lib/auditLog.js');
     vi.clearAllMocks();
 
-    // PURGEABLE_RETENTION_SCHEDULE has 3 rules (audit_logs, streams, webhook_outbox).
-    // Each rule's first FOR-UPDATE-SKIP-LOCKED SELECT consumes one batchIndex slot.
-    // Rule 1 (audit_logs):     slot 0 → [] (empty, exits immediately)
-    // Rule 2 (streams):        slot 1 → heldBatch (3 rows: 2 held, 1 not)
-    //                          slot 2 → [] (second batch empty, exits loop)
-    // Rule 3 (webhook_outbox): slot 3 → [] (empty, exits immediately)
+    // Batches are keyed by table, so this does not depend on the rule count.
+    // streams: one batch of 3 rows (2 held, 1 not), then an empty batch so the
+    // hasMore loop exits.
     const heldBatch: MockRow[] = [
       expiredRow('s1', true),
       expiredRow('s2', true),
       expiredRow('s3', false),
     ];
-    const client = buildMockClient([[], heldBatch, [], []]);
+    const client = buildMockClient({ streams: [heldBatch, []] });
     const pool = buildMockPool(() => client);
 
     const result = await runRetentionPurge(baseOptions(pool));
@@ -188,11 +197,8 @@ describe('runRetentionPurge — legal-hold precedence', () => {
     const { recordAuditEventToDb } = await import('../../src/lib/auditLog.js');
     vi.clearAllMocks();
 
-    // Rule 1 (audit_logs): slot 0 → []
-    // Rule 2 (streams):    slot 1 → [h1(held), h2(held)], slot 2 → []
-    // Rule 3 (webhook):    slot 3 → []
     const heldBatch: MockRow[] = [expiredRow('h1', true), expiredRow('h2', true)];
-    const client = buildMockClient([[], heldBatch, [], []]);
+    const client = buildMockClient({ streams: [heldBatch, []] });
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge(baseOptions(pool));
@@ -206,11 +212,8 @@ describe('runRetentionPurge — legal-hold precedence', () => {
   it('all-held batch of exactly batchSize exits loop (SKIP LOCKED semantics)', async () => {
     // When a full batch is entirely held rows and the next batch is empty,
     // FOR UPDATE SKIP LOCKED prevents revisiting them — the loop exits.
-    // Rule 1 (audit_logs): slot 0 → []
-    // Rule 2 (streams):    slot 1 → fullHeldBatch (10 rows, all held), slot 2 → []
-    // Rule 3 (webhook):    slot 3 → []
     const fullHeldBatch = Array.from({ length: 10 }, (_, i) => expiredRow(`h${i}`, true));
-    const client = buildMockClient([[], fullHeldBatch, [], []]);
+    const client = buildMockClient({ streams: [fullHeldBatch, []] });
     const pool = buildMockPool(() => client);
 
     const result = await runRetentionPurge(baseOptions(pool));
@@ -223,12 +226,9 @@ describe('runRetentionPurge — legal-hold precedence', () => {
 
 describe('runRetentionPurge — streams redact path', () => {
   it('issues UPDATE with tombstone, not DELETE, for streams rows', async () => {
-    // Rule 1 (audit_logs): slot 0 → []
-    // Rule 2 (streams):    slot 1 → [stream-1], slot 2 → []
-    // Rule 3 (webhook):    slot 3 → []
     const batch: MockRow[] = [expiredRow('stream-1', false)];
 
-    const client = buildMockClient([[], batch, [], []]);
+    const client = buildMockClient({ streams: [batch, []] });
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge(baseOptions(pool));
@@ -239,14 +239,19 @@ describe('runRetentionPurge — streams redact path', () => {
 
     expect(updateCalls.length).toBeGreaterThanOrEqual(1);
     const updateSql = updateCalls[0] as string;
-    expect(updateSql).toContain('[REDACTED:DATA_RETENTION]');
     expect(updateSql).not.toContain('DELETE');
+    // The tombstone is a bound parameter, not string-interpolated, so the SQL
+    // text only proves the statement is an UPDATE. Assert the value separately.
+    const updateParams = client.query.mock.calls.find(([sql]: any) =>
+      sql.trim().startsWith('UPDATE'),
+    )?.[1] as unknown[];
+    expect(updateParams?.[0]).toBe('[REDACTED:DATA_RETENTION]');
   });
 
   it('UPDATE sets encryption_state = \'redacted\'', async () => {
     const batch: MockRow[] = [expiredRow('stream-2', false)];
 
-    const client = buildMockClient([[], batch, [], []]);
+    const client = buildMockClient({ streams: [batch, []] });
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge(baseOptions(pool));
@@ -262,7 +267,7 @@ describe('runRetentionPurge — streams redact path', () => {
   it('UPDATE sets sender_address_hash and recipient_address_hash to NULL', async () => {
     const batch: MockRow[] = [expiredRow('stream-3', false)];
 
-    const client = buildMockClient([[], batch, [], []]);
+    const client = buildMockClient({ streams: [batch, []] });
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge(baseOptions(pool));
@@ -279,12 +284,9 @@ describe('runRetentionPurge — streams redact path', () => {
 
 describe('runRetentionPurge — dryRun mode', () => {
   it('does not issue any DELETE or UPDATE queries in dryRun mode', async () => {
-    // Rule 1 (audit_logs): slot 0 → []
-    // Rule 2 (streams):    slot 1 → [dry-1, dry-2], slot 2 → []
-    // Rule 3 (webhook):    slot 3 → []
     const batch: MockRow[] = [expiredRow('dry-1', false), expiredRow('dry-2', false)];
 
-    const client = buildMockClient([[], batch, [], []]);
+    const client = buildMockClient({ streams: [batch, []] });
     const pool = buildMockPool(() => client);
 
     const opts: PurgeJobOptions = { ...baseOptions(pool), dryRun: true };
@@ -308,7 +310,7 @@ describe('runRetentionPurge — dryRun mode', () => {
 
     const batch: MockRow[] = [expiredRow('dry-3', false)];
 
-    const client = buildMockClient([[], batch, [], []]);
+    const client = buildMockClient({ streams: [batch, []] });
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge({ ...baseOptions(pool), dryRun: true });
@@ -327,11 +329,8 @@ describe('runRetentionPurge — dryRun mode', () => {
     const { recordAuditEventToDb } = await import('../../src/lib/auditLog.js');
     vi.clearAllMocks();
 
-    // Rule 1 (audit_logs): slot 0 → []
-    // Rule 2 (streams):    slot 1 → heldBatch (2 held rows), slot 2 → []
-    // Rule 3 (webhook):    slot 3 → []
     const heldBatch: MockRow[] = [expiredRow('dh-1', true), expiredRow('dh-2', true)];
-    const client = buildMockClient([[], heldBatch, [], []]);
+    const client = buildMockClient({ streams: [heldBatch, []] });
     const pool = buildMockPool(() => client);
 
     const result = await runRetentionPurge({ ...baseOptions(pool), dryRun: true });
@@ -352,7 +351,7 @@ describe('runRetentionPurge — dryRun mode', () => {
     vi.clearAllMocks();
 
     const heldBatch: MockRow[] = [expiredRow('rh-1', true)];
-    const client = buildMockClient([[], heldBatch, [], []]);
+    const client = buildMockClient({ streams: [heldBatch, []] });
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge({ ...baseOptions(pool), dryRun: false });
@@ -366,7 +365,7 @@ describe('runRetentionPurge — dryRun mode', () => {
 
 describe('runRetentionPurge — deletion ordering', () => {
   it('fetches candidates oldest-first via ORDER BY <ageColumn> ASC before LIMIT', async () => {
-    const client = buildMockClient([[], [], [], []]);
+    const client = buildMockClient();
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge(baseOptions(pool));
@@ -391,21 +390,24 @@ describe('runRetentionPurge — PURGE_INITIATED audit', () => {
     const { recordAuditEventToDb } = await import('../../src/lib/auditLog.js');
     vi.clearAllMocks();
 
-    // Rule 1 (audit_logs): slot 0 → []
-    // Rule 2 (streams):    slot 1 → batch1, slot 2 → batch2, slot 3 → []
-    // Rule 3 (webhook):    slot 4 → []
-    const batch1: MockRow[] = [expiredRow('s10', false), expiredRow('s11', false)];
-    const batch2: MockRow[] = [expiredRow('s12', false)];
+    // The loop only continues while a batch is *full* (purged + skipped ===
+    // batchSize), so batch 1 must be a full 10-row batch for a second batch to
+    // happen at all. A 2-row first batch would be partial and terminate after
+    // one iteration.
+    const batch1: MockRow[] = Array.from({ length: 10 }, (_, i) => expiredRow(`s1${i}`, false));
+    const batch2: MockRow[] = [expiredRow('s20', false)];
 
-    const client = buildMockClient([[], batch1, batch2, [], []]);
+    const client = buildMockClient({ streams: [batch1, batch2] });
     const pool = buildMockPool(() => client);
 
     await runRetentionPurge(baseOptions(pool));
 
-    // Two batches with purged > 0 → two PURGE_INITIATED INSERT statements via client.query
-    const insertAuditCalls = client.query.mock.calls
-      .map(([sql]: any) => sql)
-      .filter((s: string) => s.includes('PURGE_INITIATED'));
+    // Two batches with purged > 0 → two PURGE_INITIATED INSERTs. The action is
+    // a bound parameter, so match on the parameters, not the SQL text.
+    const insertAuditCalls = client.query.mock.calls.filter(
+      ([sql, params]: any) =>
+        sql.includes('INSERT INTO audit_logs') && (params?.[1] === 'PURGE_INITIATED'),
+    );
 
     expect(insertAuditCalls.length).toBe(2);
   });
@@ -434,12 +436,9 @@ describe('runRetentionPurge — batch error', () => {
 
 describe('runRetentionPurge — partial batch termination', () => {
   it('stops after a batch smaller than batchSize (no more candidates)', async () => {
-    // Rule 1 (audit_logs): slot 0 → []
-    // Rule 2 (streams):    slot 1 → batch (3 rows < batchSize 10), slot 2 → []
-    // Rule 3 (webhook):    slot 3 → []
     const batch: MockRow[] = [expiredRow('p1'), expiredRow('p2'), expiredRow('p3')];
 
-    const client = buildMockClient([[], batch, [], []]);
+    const client = buildMockClient({ streams: [batch, []] });
     const pool = buildMockPool(() => client);
 
     const result = await runRetentionPurge(baseOptions(pool));
@@ -447,12 +446,11 @@ describe('runRetentionPurge — partial batch termination', () => {
 
     expect(streamsRule!.rowsPurged).toBe(3);
 
-    // One SELECT for the partial batch + one empty SELECT = 2 FOR-UPDATE-SKIP-LOCKED calls
-    // for the streams rule. Plus one each for audit_logs and webhook_outbox = 4 total.
-    const selectCalls = client.query.mock.calls
-      .map(([sql]: any) => sql)
-      .filter((s: string) => s.includes('FOR UPDATE SKIP LOCKED'));
-    expect(selectCalls.length).toBe(4); // audit_logs:1, streams:2, webhook_outbox:1
+    // A 3-row batch is smaller than batchSize 10, so the loop stops after that
+    // single SELECT — it does not need a confirming empty batch. Asserted per
+    // table so the count does not move when another purge rule is added to the
+    // schedule.
+    expect(selectCountFor(client, 'streams')).toBe(1);
   });
 });
 
@@ -492,7 +490,7 @@ describe('runRetentionPurge — generic redact guard', () => {
     PURGEABLE_RETENTION_SCHEDULE.push(unsafeRule);
 
     const batch: MockRow[] = [expiredRow('bad-1', false)];
-    const client = buildMockClient([batch, []]);
+    const client = buildMockClient({ unknown_table: [batch, []] });
     const pool = buildMockPool(() => client);
 
     try {

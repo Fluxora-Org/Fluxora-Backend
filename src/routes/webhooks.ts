@@ -25,6 +25,10 @@ import { OffsetPaginationSchema, DEFAULT_PAGE_LIMIT } from '../validation/pagina
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import type { DedupCache } from '../redis/dedup.js';
 import { checkWebhookPreflight } from '../webhooks/preflight.js';
+import {
+  webhookSecretRepository,
+  DEFAULT_WEBHOOK_SECRET_ID,
+} from '../db/repositories/webhookSecretRepository.js';
 
 let inboundWebhookDedupCache: DedupCache = new InMemoryDedupCache();
 
@@ -86,12 +90,45 @@ webhooksRouter.post(
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
-    if (process.env.FLUXORA_WEBHOOK_SECRET !== undefined) {
-      verifyInput.secret = process.env.FLUXORA_WEBHOOK_SECRET;
+
+    // Prefer the DB-backed rotation state (webhookSecretRepository) so that a
+    // secret rotation's overlap window is actually honored on this path. Any
+    // lookup failure (no row yet, DB unavailable, table not migrated) falls
+    // back to the static env-var secret exactly as before — this keeps
+    // deployments that have never rotated a secret working unchanged.
+    let secretState;
+    try {
+      secretState = await webhookSecretRepository.getSecretState(DEFAULT_WEBHOOK_SECRET_ID);
+    } catch (err) {
+      logger.warn(
+        'Webhook secret rotation lookup failed; falling back to static secret',
+        undefined,
+        { error: err instanceof Error ? err.message : String(err) }
+      );
     }
-    if (process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
-      verifyInput.secretPrevious = process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS;
+
+    if (secretState) {
+      verifyInput.secret = secretState.currentSecret;
+      if (secretState.previousSecret) {
+        verifyInput.secretPrevious = secretState.previousSecret;
+        if (
+          secretState.previousSecretRotatedAt !== null &&
+          secretState.previousSecretExpiresAt !== null
+        ) {
+          verifyInput.previousSecretRotatedAt = secretState.previousSecretRotatedAt;
+          verifyInput.graceWindowSeconds =
+            secretState.previousSecretExpiresAt - secretState.previousSecretRotatedAt;
+        }
+      }
+    } else {
+      if (process.env.FLUXORA_WEBHOOK_SECRET !== undefined) {
+        verifyInput.secret = process.env.FLUXORA_WEBHOOK_SECRET;
+      }
+      if (process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
+        verifyInput.secretPrevious = process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS;
+      }
     }
+
     const deliveryHeader = headers['x-fluxora-delivery-id'];
     if (deliveryHeader !== undefined) verifyInput.deliveryId = deliveryHeader;
     const timestampHeader = headers['x-fluxora-timestamp'];
@@ -119,7 +156,7 @@ webhooksRouter.post(
       eventType: headers['x-fluxora-event'] ?? null,
       event: preflight.parsed,
     });
-  }
+  },
 );
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -362,7 +399,7 @@ webhooksRouter.get('/outbox', (req, res) => {
   const total = items.length;
   const page = items.slice(offset, offset + limit);
 
-  res.json({
+  res.json(successResponse({
     total,
     limit,
     offset,
@@ -578,7 +615,7 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
       },
     ],
     observedAt: new Date(now).toISOString(),
-  });
+  }, requestId));
 });
 
 /**
@@ -586,7 +623,6 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
  * Reset circuit breaker for an endpoint
  */
 webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => {
-  const requestId = req.correlationId;
   const { endpointUrl } = req.params;
 
   // URL decode the endpoint URL

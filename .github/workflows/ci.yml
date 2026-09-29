@@ -180,8 +180,23 @@ jobs:
       - name: Check migration naming policy
         run: pnpm run check:migrations
 
+      # Required gate: every migration must either run in node-pg-migrate's
+      # per-migration transaction or be listed in the atomicity manifest with
+      # re-runnable statements. See docs/migration-atomicity.md.
+      - name: Check migration atomicity and re-run safety
+        run: pnpm run check:migration-atomicity
+
       - name: Check deprecation sunset policy
         run: pnpm run check:deprecations
+
+      # Required gate: the published retention schedule (docs/retention-schedule.md),
+      # the code manifest, the migrations and the purge jobs must agree. A new
+      # table with no stated retention period, a changed window that was not
+      # re-published, or a purge rule pointing at the wrong column all fail here.
+      # See scripts/check-retention-schedule.ts and docs/retention-schedule.md.
+      - name: Check data retention schedule
+        run: pnpm run check:retention
+
       # Required gate: the API changelog must record every externally visible
       # change, grouped by API version, with breaking changes marked. Adding or
       # removing an endpoint without a changelog entry fails the build.
@@ -208,6 +223,7 @@ jobs:
       - name: Run live database integration suites
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+          MIGRATION_ATOMICITY_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
         run: >-
           pnpm exec vitest run --reporter=verbose
           tests/db/vacuumCollector.collect.test.ts
@@ -216,6 +232,7 @@ jobs:
           tests/db/logicalReplication.test.ts
           tests/db/contractEvents.partitionPruning.test.ts
           tests/db/rowMapping.schema.test.ts
+          tests/db/migrations.atomicity.test.ts
 
       # Required gate: failing tests block the pipeline.
       - name: Run tests
@@ -272,7 +289,7 @@ jobs:
         run: pnpm run audit:check
 
   docker:
-    name: Docker Build
+    name: Docker Build & Hardening
     runs-on: ubuntu-latest
     needs: [test]
 
@@ -288,6 +305,20 @@ jobs:
         with:
           context: .
           push: false
-          tags: indexer:${{ github.sha }}
+          load: true
+          tags: fluxora-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Assert image hardening (issue #1508)
+        run: ./scripts/assert-image-hardening.sh fluxora-backend:ci
+
+      - name: Trivy secret scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: fluxora-backend:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+          scanners: 'secret'

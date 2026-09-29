@@ -36,6 +36,7 @@ import {
   loadConfig,
 } from './config/env.js';
 import { validateStartupConfig } from './config/startupValidation.js';
+import { runStellarContractReachabilityCheck } from './config/stellarContractsReachability.js';
 import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { prepareReloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
@@ -99,6 +100,21 @@ if (process.env.NODE_ENV !== 'test') {
     // Apply and record the effective log level before anything else logs, so the
     // active threshold for this environment is always visible at startup.
     logActiveLogLevel({ logLevel: cfg.logLevel, nodeEnv: cfg.nodeEnv });
+
+    // ── Stellar contract reachability (issue #1438) ───────────────────────
+    // Format and network pinning are validated synchronously above; confirming
+    // each configured address actually exists on the resolved network needs
+    // I/O, so it runs here — against the ACTIVE configuration (the addresses
+    // resolved from env for `cfg.stellarNetwork`), before the server binds.
+    // Enabled by default outside NODE_ENV=test and non-fatal unless
+    // STELLAR_CONTRACT_REACHABILITY_STRICT=true, in which case a bad address
+    // throws ConfigError and lands in the .catch() below (exit 1).
+    await runStellarContractReachabilityCheck({
+      network: cfg.stellarNetwork,
+      addresses: cfg.contractAddresses,
+      rpcUrl: cfg.stellarRpcUrl,
+      timeoutMs: cfg.stellarRpcTimeout,
+    });
 
     // ── OpenTelemetry SDK & Logs Bridge ───────────────────────────────────
     // Must be called before the first request is served so that
