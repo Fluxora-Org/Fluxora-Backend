@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { Gauge, Histogram } from 'prom-client';
 import { registry } from '../metrics.js';
 import { logger } from '../lib/logger.js';
@@ -37,7 +38,7 @@ let lastCheckTime: number = 0;
  * @param intervalMs The sampling interval in milliseconds (defaults to METRICS_SAMPLE_INTERVAL_MS or 10000).
  */
 export function startRuntimeMetrics(
-  intervalMs = Number(process.env['METRICS_SAMPLE_INTERVAL_MS']) || 10000
+  intervalMs = Number(getRuntimeEnv()['METRICS_SAMPLE_INTERVAL_MS']) || 10000
 ): void {
   if (intervalTimer) {
     return; // Already running

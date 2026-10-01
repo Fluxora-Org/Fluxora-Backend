@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from './config/runtime-env.js';
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type pg from 'pg';
@@ -79,7 +80,7 @@ import { readinessGuardMiddleware } from './middleware/readinessGuard.js';
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
   includeTestRoutes?: boolean;
-  /** Environment variables used to seed the rate-limiter (defaults to process.env). */
+  /** Environment variables used to seed the rate-limiter (defaults to getRuntimeEnv()). */
   env?: Record<string, string | undefined>;
   /** Socket-level request timeout in ms (defaults to 30000). */
   requestTimeoutMs?: number;
@@ -343,7 +344,7 @@ async function wireAdminStateLock(config: Config): Promise<void> {
  * prevent header injection. Any non-conforming value is replaced with `"blue"`.
  */
 function deploymentSlotMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const raw = process.env.DEPLOYMENT_SLOT ?? 'blue';
+  const raw = getRuntimeEnv().DEPLOYMENT_SLOT ?? 'blue';
   // Sanitise: only allow [a-z0-9-] to prevent header injection.
   const slot = /^[a-z0-9-]+$/i.test(raw) ? raw : 'blue';
   res.setHeader('X-Fluxora-Deployment-Slot', slot);
@@ -399,7 +400,7 @@ async function wireIndexerLeaderElection(config: Config): Promise<void> {
 
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
-  const env = options.env ?? (process.env as Record<string, string | undefined>);
+  const env = options.env ?? (getRuntimeEnv() as Record<string, string | undefined>);
 
   // Startup configuration validation (issue #1437): every config module is
   // checked here so an invalid deployment fails immediately — at require time

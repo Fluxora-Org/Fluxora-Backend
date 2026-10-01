@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Database Backup and Restore Operations
  *
@@ -238,8 +239,8 @@ async function uploadStreamToS3(readable: Readable, target: S3Target): Promise<v
 
   const region =
     target.region ??
-    process.env['AWS_REGION'] ??
-    process.env['AWS_DEFAULT_REGION'] ??
+    getRuntimeEnv()['AWS_REGION'] ??
+    getRuntimeEnv()['AWS_DEFAULT_REGION'] ??
     'us-east-1'
 
    
@@ -274,13 +275,13 @@ async function uploadStreamToS3(readable: Readable, target: S3Target): Promise<v
  *
  * @example — local backup
  * ```ts
- * const result = await backupDatabase(process.env.DATABASE_URL!, './backup.dump')
+ * const result = await backupDatabase(getRuntimeEnv().DATABASE_URL!, './backup.dump')
  * ```
  *
  * @example — S3 streaming backup
  * ```ts
  * const result = await backupDatabase(
- *   process.env.DATABASE_URL!,
+ *   getRuntimeEnv().DATABASE_URL!,
  *   '',   // ignored when s3Target is set
  *   { bucket: 'my-backups', key: 'fluxora/2026-04-23.dump' },
  * )
@@ -414,13 +415,13 @@ export async function backupDatabase(
  *
  * @example — local restore
  * ```ts
- * const result = await restoreDatabase(process.env.DATABASE_URL!, './backup.dump')
+ * const result = await restoreDatabase(getRuntimeEnv().DATABASE_URL!, './backup.dump')
  * ```
  *
  * @example — S3 streaming restore
  * ```ts
  * const result = await restoreDatabase(
- *   process.env.DATABASE_URL!,
+ *   getRuntimeEnv().DATABASE_URL!,
  *   '',   // ignored when s3Source is set
  *   { bucket: 'my-backups', key: 'fluxora/2026-04-23.dump' },
  * )
@@ -507,8 +508,8 @@ export async function restoreDatabase(
 
       const region =
         s3Source.region ??
-        process.env['AWS_REGION'] ??
-        process.env['AWS_DEFAULT_REGION'] ??
+        getRuntimeEnv()['AWS_REGION'] ??
+        getRuntimeEnv()['AWS_DEFAULT_REGION'] ??
         'us-east-1'
 
        

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * HTTP 103 Early Hints support for pagination link preloading.
  *
@@ -76,14 +77,14 @@ export function clientSupportsEarlyHints(req?: Request | IncomingMessage): boole
 
 /**
  * Helper to check whether Early Hints is globally enabled in config.
- * Falls back to process.env.EARLY_HINTS_ENABLED if getConfig() is not yet initialized.
+ * Falls back to getRuntimeEnv().EARLY_HINTS_ENABLED if getConfig() is not yet initialized.
  */
 export function isEarlyHintsConfigEnabled(): boolean {
   if (
-    process.env['EARLY_HINTS_ENABLED'] === 'false' ||
-    process.env['EARLY_HINTS_ENABLED'] === '0' ||
-    process.env['ENABLE_EARLY_HINTS'] === 'false' ||
-    process.env['ENABLE_EARLY_HINTS'] === '0'
+    getRuntimeEnv()['EARLY_HINTS_ENABLED'] === 'false' ||
+    getRuntimeEnv()['EARLY_HINTS_ENABLED'] === '0' ||
+    getRuntimeEnv()['ENABLE_EARLY_HINTS'] === 'false' ||
+    getRuntimeEnv()['ENABLE_EARLY_HINTS'] === '0'
   ) {
     return false;
   }

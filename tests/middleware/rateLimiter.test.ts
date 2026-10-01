@@ -12,6 +12,8 @@ import {
 import { getClientIp } from '../../src/ws/connectionLimiter.js';
 import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
 import * as overrideService from '../../src/services/tenantRateLimitOverride.service.js';
+import { requestRefusedTotal, deRegisterRequestProtectionMetrics } from '../../src/metrics/requestProtectionMetrics.js';
+import { registry } from '../../src/metrics.js';
 
 function mockRequest(props: Partial<Request> = {}): Request & { ip?: string } {
   const remoteAddress = props.ip ?? (props.socket as any)?.remoteAddress ?? '10.0.0.1';
@@ -73,6 +75,14 @@ async function invoke(
 }
 
 describe('extractClientIdentifier', () => {
+  beforeEach(() => {
+    deRegisterRequestProtectionMetrics();
+  });
+
+  afterEach(() => {
+    deRegisterRequestProtectionMetrics();
+  });
+
   it('returns ip when no x-api-key header', () => {
     const req = mockRequest({ headers: {} });
     const result = extractClientIdentifier(req);
@@ -212,6 +222,28 @@ describe('rate limiter middleware', () => {
         }),
       })
     );
+  });
+
+  it('increments requestRefusedTotal with reason=rate_limit_exceeded', async () => {
+    const limiter = createRateLimiter(env, new InMemoryStore());
+    const req = mockRequest({ headers: {}, ip: '6.6.6.6' });
+    const res = mockResponse();
+    const next = mockNext();
+
+    // Hit limit: 3 requests
+    for (let i = 0; i < 3; i++) {
+      await invoke(limiter, req, res, next);
+    }
+
+    // 4th request should be rate limited
+    const fourthNext = mockNext();
+    await invoke(limiter, req, res, fourthNext);
+
+    const metric = await registry.getSingleMetric('fluxora_request_refused_total');
+    const metricValue = (metric as any).get();
+    const rateLimitExceededValue = metricValue.find((m: any) => m.values.reason === 'rate_limit_exceeded');
+    expect(rateLimitExceededValue).toBeDefined();
+    expect(rateLimitExceededValue.value).toBe(1);
   });
 
   it('applies separate counters for different IPs', async () => {

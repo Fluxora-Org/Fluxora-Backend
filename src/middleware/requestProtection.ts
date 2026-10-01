@@ -38,6 +38,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { payloadTooLarge, requestTimeout, validationError } from './errorHandler.js';
 import { requestBodyTooLargeTotal, requestBodyTooDeepTotal } from '../metrics/requestProtectionMetrics.js';
+import { requestBodyTooLargeTotal, requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
 import { normalizeRouteLabel } from '../metrics/cardinality.js';
 import { getConfig } from '../config/env-config.js';
 
@@ -220,6 +221,7 @@ export function bodySizeLimitMiddleware(
        * @see src/metrics/requestProtectionMetrics.ts
        */
       requestBodyTooLargeTotal.inc({ path: normalizedPath(req) });
+      requestRefusedTotal.inc({ path: normalizedPath(req), reason: 'body_too_large' });
       next(payloadTooLarge(`Request body exceeds the ${limit}-byte limit`));
       return;
     }
@@ -248,6 +250,7 @@ export function bodySizeLimitMiddleware(
         next,
         payloadTooLarge(`Request body exceeds the ${limit}-byte limit`),
       );
+      requestRefusedTotal.inc({ path: normalizedPath(req), reason: 'body_too_large' });
     }
   });
 
@@ -445,6 +448,7 @@ export function jsonDepthMiddleware(
         checkDepth(req.body, maxDepth, 0);
       } catch {
         requestBodyTooDeepTotal.inc({ path: normalizedPath(req) });
+        requestRefusedTotal.inc({ path: normalizedPath(req), reason: 'json_depth_exceeded' });
         next(validationError(`JSON nesting depth exceeds the maximum of ${maxDepth}`));
         return;
       }
