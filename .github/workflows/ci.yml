@@ -225,7 +225,7 @@ jobs:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
           MIGRATION_ATOMICITY_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
         run: >-
-          pnpm exec vitest run --reporter=verbose
+          pnpm exec vitest run --reporter=json --outputFile=live-db-vitest.json
           tests/db/vacuumCollector.collect.test.ts
           tests/db/webhookOutbox.dispatchIndex.test.ts
           tests/db/streams.compositeIndexes.test.ts
@@ -233,6 +233,11 @@ jobs:
           tests/db/contractEvents.partitionPruning.test.ts
           tests/db/rowMapping.schema.test.ts
           tests/db/migrations.atomicity.test.ts
+
+      - name: Assert live database suites executed
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/indexer_test
+        run: node scripts/assert-live-db-tests.mjs live-db-vitest.json
 
       # Required gate: failing tests block the pipeline.
       - name: Run tests
