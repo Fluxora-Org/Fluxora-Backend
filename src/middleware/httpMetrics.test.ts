@@ -34,16 +34,14 @@ describe('resolveRoute', () => {
   it('collapses only a single trailing slash, keeping internal empty segments', () => {
     // A matched route is required for the label to be derived at all: an
     // unmatched request is labelled UNMATCHED_ROUTE (see above).
-    const req = fakeReq({
-      route: { path: '/multiple///' },
-      originalUrl: '/multiple///',
-    });
+    const req = {
+      baseUrl: '',
+      route: { path: '/multiple///' } as any,
+      originalUrl: '/multiple///'
+    } as unknown as Request;
     // After collapse of a single trailing slash, remaining empties are kept
     // by normalizeRouteLabel join; high-cardinality policy does not alter
     // static vocabulary segments.
-      route: undefined,
-      originalUrl: '/multiple///'
-    } as unknown as Request;
     expect(resolveRoute(req)).toBe('/multiple//');
   });
 
