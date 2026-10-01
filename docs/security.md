@@ -1,5 +1,17 @@
 # Security: SQL Injection and Dependency Audit
 
+## Request Body Limits
+
+Inbound request bodies are bounded **while they are being read**: oversized and
+deeply nested payloads are refused mid-stream, so a limit protects memory
+instead of merely reporting a violation after the fact. Limits are configurable
+(`MAX_REQUEST_SIZE`, `MAX_JSON_DEPTH`), refusals are counted in
+`fluxora_request_body_too_large_total` and
+`fluxora_request_body_too_deep_total`, and the enforcement order is covered by
+`tests/requestProtection.streaming.test.ts`.
+
+See [request-limits.md](request-limits.md).
+
 ## SQL Injection Regression Tests
 
 We exercise repository entrypoints with adversarial inputs to confirm that

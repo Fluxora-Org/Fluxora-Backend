@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * gRPC transcoding gateway for the Fluxora indexer.
  *
@@ -312,7 +313,7 @@ function checkWorkerToken(
     }) as grpc.ServiceError;
   }
 
-  const expected = (process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token').trim();
+  const expected = (getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token').trim();
   if (!timingSafeEqual(provided, expected)) {
     return Object.assign(new Error('worker_token authentication failed'), {
       code: grpc.status.UNAUTHENTICATED,

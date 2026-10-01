@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * OpenTelemetry SDK bootstrap for Fluxora Backend.
  *
@@ -63,26 +64,26 @@ let sdk: NodeSDK | null = null;
  * Returns true if the SDK was started, false if disabled or already running.
  */
 export function startTracing(): boolean {
-  if (process.env.OTEL_SDK_DISABLED === 'true') return false;
+  if (getRuntimeEnv().OTEL_SDK_DISABLED === 'true') return false;
   if (sdk !== null) return false;
 
   try {
     const endpoint = safeUrl(
-      process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+      getRuntimeEnv().OTEL_EXPORTER_OTLP_ENDPOINT,
       'http://localhost:4318',
     );
 
     const exporter = new OTLPTraceExporter({
       url: `${endpoint}/v1/traces`,
-      headers: parseOtlpHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS),
+      headers: parseOtlpHeaders(getRuntimeEnv().OTEL_EXPORTER_OTLP_HEADERS),
     });
 
     sdk = new NodeSDK({
       resource: resourceFromAttributes({
-        [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'fluxora-backend',
-        [ATTR_SERVICE_VERSION]: process.env.npm_package_version ?? '0.0.0',
-      }) as any,
-      traceExporter: exporter as any,
+        [ATTR_SERVICE_NAME]: getRuntimeEnv().OTEL_SERVICE_NAME ?? 'fluxora-backend',
+        [ATTR_SERVICE_VERSION]: getRuntimeEnv().npm_package_version ?? '0.0.0',
+      }),
+      traceExporter: exporter,
       instrumentations: [
         // Propagates W3C traceparent on inbound HTTP and outbound fetch/http calls.
         new HttpInstrumentation({
@@ -170,7 +171,7 @@ import type { SamplingConfig } from './hooks.js';
  * @returns A fully-typed {@link SamplingConfig} representing the current config.
  */
 export function getSamplingConfig(): SamplingConfig {
-  const strategy = (process.env.TRACING_SAMPLING_STRATEGY ?? 'head') as string;
+  const strategy = (getRuntimeEnv().TRACING_SAMPLING_STRATEGY ?? 'head') as string;
 
   // Shared helpers
   const parseRate = (raw: string | undefined, fallback: number): number => {
@@ -187,7 +188,7 @@ export function getSamplingConfig(): SamplingConfig {
     return fallback;
   };
 
-  const globalRate = parseRate(process.env.TRACING_SAMPLE_RATE, 1);
+  const globalRate = parseRate(getRuntimeEnv().TRACING_SAMPLE_RATE, 1);
 
   if (strategy === 'always') return { strategy: 'always' };
   if (strategy === 'never') return { strategy: 'never' };
@@ -195,13 +196,13 @@ export function getSamplingConfig(): SamplingConfig {
   if (strategy === 'tail') {
     return {
       strategy: 'tail',
-      sampleRate: parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate),
-      keepErrorSpans: parseBool(process.env.TRACING_TAIL_KEEP_ERRORS, true),
+      sampleRate: parseRate(getRuntimeEnv().TRACING_HEAD_SAMPLE_RATE, globalRate),
+      keepErrorSpans: parseBool(getRuntimeEnv().TRACING_TAIL_KEEP_ERRORS, true),
     };
   }
 
   // Default: head-based sampling
-  const headRate = parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate);
+  const headRate = parseRate(getRuntimeEnv().TRACING_HEAD_SAMPLE_RATE, globalRate);
 
   const parseOverrides = (raw: string | undefined, name: string): Record<string, number> | undefined => {
     if (!raw || raw.trim().length === 0) return undefined;
@@ -226,8 +227,8 @@ export function getSamplingConfig(): SamplingConfig {
     return undefined;
   };
 
-  const perRouteOverrides = parseOverrides(process.env.TRACING_PER_ROUTE_OVERRIDES, 'TRACING_PER_ROUTE_OVERRIDES');
-  const perTenantOverrides = parseOverrides(process.env.TRACING_PER_TENANT_OVERRIDES, 'TRACING_PER_TENANT_OVERRIDES');
+  const perRouteOverrides = parseOverrides(getRuntimeEnv().TRACING_PER_ROUTE_OVERRIDES, 'TRACING_PER_ROUTE_OVERRIDES');
+  const perTenantOverrides = parseOverrides(getRuntimeEnv().TRACING_PER_TENANT_OVERRIDES, 'TRACING_PER_TENANT_OVERRIDES');
 
   const config: SamplingConfig = {
     strategy: 'head',
@@ -263,15 +264,15 @@ export function getOTelBatchConfig(): OTelBatchConfig {
 
   return {
     maxExportBatchSize: parseNum(
-      process.env.OTEL_BSP_MAX_EXPORT_BATCH_SIZE ?? process.env.TRACING_BATCH_MAX_SIZE,
+      getRuntimeEnv().OTEL_BSP_MAX_EXPORT_BATCH_SIZE ?? getRuntimeEnv().TRACING_BATCH_MAX_SIZE,
       512,
     ),
     scheduledDelayMillis: parseNum(
-      process.env.OTEL_BSP_SCHEDULED_DELAY_MILLIS ?? process.env.TRACING_BATCH_TIMEOUT_MS,
+      getRuntimeEnv().OTEL_BSP_SCHEDULED_DELAY_MILLIS ?? getRuntimeEnv().TRACING_BATCH_TIMEOUT_MS,
       5000,
     ),
     maxQueueSize: parseNum(
-      process.env.OTEL_BSP_MAX_QUEUE_SIZE ?? process.env.TRACING_BATCH_QUEUE_SIZE,
+      getRuntimeEnv().OTEL_BSP_MAX_QUEUE_SIZE ?? getRuntimeEnv().TRACING_BATCH_QUEUE_SIZE,
       2048,
     ),
   };
