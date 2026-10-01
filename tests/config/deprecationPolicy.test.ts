@@ -13,11 +13,12 @@ import {
   assertDeprecationSunsetDates,
   findDeprecationViolations,
   DeprecationPolicyError,
+  MINIMUM_NOTICE_PERIOD_MS,
   type DeprecationViolation,
 } from '../../src/config/deprecationPolicy.js';
 import { routeDeprecations } from '../../src/config/deprecations.js';
 import { createDeprecationMiddleware } from '../../src/middleware/deprecation.js';
-import { logger } from '../../src/logging/logger.js';
+import { logger } from '../../src/lib/logger.js';
 
 const NOW = new Date('2026-09-01T00:00:00.000Z');
 
@@ -200,5 +201,82 @@ describe('assertDeprecationSunsetDates', () => {
 
   it('accepts an empty registry', () => {
     expect(() => assertDeprecationSunsetDates([], NOW)).not.toThrow();
+  });
+});
+
+describe('SHORT_NOTICE violation (minimum 90-day notice period)', () => {
+  it('exports MINIMUM_NOTICE_PERIOD_MS equal to 90 days in milliseconds', () => {
+    expect(MINIMUM_NOTICE_PERIOD_MS).toBe(90 * 24 * 60 * 60 * 1000);
+  });
+
+  it('accepts a sunset date exactly 90 days in the future', () => {
+    const now = new Date('2026-01-01T00:00:00.000Z');
+    // Must be strictly MORE than 90 days — 90 days + 1 ms passes
+    const sunset = new Date(now.getTime() + MINIMUM_NOTICE_PERIOD_MS + 1);
+    const violations = findDeprecationViolations(
+      [{ route: '/api/v1', sunsetDate: sunset.toISOString() }],
+      now,
+    );
+    expect(violations).toEqual([]);
+  });
+
+  it('flags a sunset date that gives fewer than 90 days notice', () => {
+    const now = new Date('2026-01-01T00:00:00.000Z');
+    const tooSoon = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // only 30 days
+    const violations = findDeprecationViolations(
+      [{ route: '/api/v1', sunsetDate: tooSoon.toISOString() }],
+      now,
+    );
+    expect(violations.map((v) => v.code)).toEqual(['SHORT_NOTICE']);
+    expect(violations[0]?.message).toContain('30');
+    expect(violations[0]?.message).toContain('90-day');
+  });
+
+  it('flags a sunset date exactly on the 90-day boundary (strict minimum)', () => {
+    const now = new Date('2026-01-01T00:00:00.000Z');
+    // Exactly 90 days → still below the required window (< not <=)
+    const exactBoundary = new Date(now.getTime() + MINIMUM_NOTICE_PERIOD_MS);
+    const violations = findDeprecationViolations(
+      [{ route: '/api/v1', sunsetDate: exactBoundary.toISOString() }],
+      now,
+    );
+    expect(violations.map((v) => v.code)).toEqual(['SHORT_NOTICE']);
+  });
+
+  it('includes route and sunsetDate in the SHORT_NOTICE violation', () => {
+    const now = new Date('2026-01-01T00:00:00.000Z');
+    const tooSoon = new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000);
+    const violations = findDeprecationViolations(
+      [{ route: '/api/fast-removal', sunsetDate: tooSoon.toISOString() }],
+      now,
+    );
+    expect(violations[0]?.route).toBe('/api/fast-removal');
+    expect(violations[0]?.sunsetDate).toBe(tooSoon.toISOString());
+  });
+
+  it('reports SHORT_NOTICE alongside other violations in registry order', () => {
+    const now = new Date('2026-01-01T00:00:00.000Z');
+    const tooSoon = new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000);
+    const violations = findDeprecationViolations(
+      [
+        { route: '/api/a' } as { route: string; sunsetDate: string }, // MISSING_SUNSET
+        { route: '/api/b', sunsetDate: tooSoon.toISOString() },      // SHORT_NOTICE
+        { route: '/api/c', sunsetDate: '2028-01-01T00:00:00.000Z' }, // valid
+      ],
+      now,
+    );
+    expect(violations.map((v) => v.route)).toEqual(['/api/a', '/api/b']);
+    expect(violations.map((v) => v.code)).toEqual(['MISSING_SUNSET', 'SHORT_NOTICE']);
+  });
+
+  it('assertDeprecationSunsetDates throws DeprecationPolicyError on SHORT_NOTICE', () => {
+    const now = new Date('2026-01-01T00:00:00.000Z');
+    const tooSoon = new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000);
+    expect(() =>
+      assertDeprecationSunsetDates(
+        [{ route: '/api/v1', sunsetDate: tooSoon.toISOString() }],
+        now,
+      ),
+    ).toThrow(DeprecationPolicyError);
   });
 });
