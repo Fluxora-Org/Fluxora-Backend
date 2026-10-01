@@ -63,8 +63,6 @@ export { DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES } from './env-schema/server.js';
  * Effective ceiling on a single inbound WebSocket frame, honouring
  * `WS_MAX_INBOUND_MESSAGE_BYTES` when it was overridden at startup.
  */
-}
-
 export function getWsMaxInboundMessageBytes(): number {
   return getConfig().wsMaxInboundMessageBytes;
 }
