@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Read-replica PostgreSQL connection pool for Fluxora Backend.
  *
@@ -29,7 +30,7 @@ import { dbReplicationLagSeconds } from '../metrics/dbMetrics.js';
 const { Pool } = pg;
 
 function envInt(name: string, fallback: number): number {
-  const v = process.env[name];
+  const v = getRuntimeEnv()[name];
   if (!v) return fallback;
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : fallback;
@@ -78,13 +79,13 @@ function safeHostname(connectionString: string): string {
  *     (default 25). Keeps replica saturation observable separately from primary.
  */
 export function resolveReplicaPoolConfig(): PoolConfig | null {
-  const replicaUrl = process.env['DATABASE_REPLICA_URL'];
+  const replicaUrl = getRuntimeEnv()['DATABASE_REPLICA_URL'];
   if (!replicaUrl) {
     return null;
   }
 
   const primaryCfg = resolvePoolConfig();
-  const raw = process.env['REPLICA_STATEMENT_TIMEOUT_MS'];
+  const raw = getRuntimeEnv()['REPLICA_STATEMENT_TIMEOUT_MS'];
   const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
   const replicaStatementTimeoutMs = Number.isFinite(parsed) && parsed >= 0
     ? parsed

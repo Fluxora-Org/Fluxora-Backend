@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { getPool, query } from '../db/pool.js';
 import { createId } from '@paralleldrive/cuid2';
 import { ApiError, ApiErrorCode } from '../errors.js';
@@ -88,7 +89,7 @@ export async function getOverrideById(id: string): Promise<RateLimitOverride | n
 export function assertOverrideWithinCeiling(
   params: Pick<CreateOverrideParams, 'maxRequests' | 'windowMs'>,
   ceiling: OverrideCeiling = getOverrideCeiling(
-    process.env as Record<string, string | undefined>,
+    getRuntimeEnv() as Record<string, string | undefined>,
   ),
 ): void {
   if (params.maxRequests > ceiling.maxRequests) {

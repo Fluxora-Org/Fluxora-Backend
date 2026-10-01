@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import type { Request, Response, NextFunction } from 'express';
@@ -281,7 +282,7 @@ export interface RateLimiter {
 // ---------------------------------------------------------------------------
 
 export function createRateLimiter(
-  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  env: Record<string, string | undefined> = getRuntimeEnv() as Record<string, string | undefined>,
   /** Optional store injection — used in tests to bypass Redis. */
   injectedStore?: RateLimitStore,
 ): RateLimiter {
@@ -604,7 +605,7 @@ export function createRateLimiter(
 
 export function isAdminKey(
   key: string,
-  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  env: Record<string, string | undefined> = getRuntimeEnv() as Record<string, string | undefined>,
 ): boolean {
   const adminKeyEnv = env.ADMIN_API_KEY ?? '';
   if (!adminKeyEnv) return false;

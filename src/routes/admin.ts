@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { Router } from 'express';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { getHybridBanStoreStatus } from '../redis/banStore.js';
@@ -566,7 +567,7 @@ adminRouter.post('/restore', async (req, res) => {
   }
 
   // Require S3_BACKUP_BUCKET to be configured before queueing.
-  if (!process.env.S3_BACKUP_BUCKET) {
+  if (!getRuntimeEnv().S3_BACKUP_BUCKET) {
     res.status(503).json(
       errorResponse(
         'CONFIGURATION_ERROR',
