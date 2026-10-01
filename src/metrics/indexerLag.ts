@@ -10,10 +10,28 @@
  *   indexer_ledger_lag
  *     Gauge: current ledger lag (tip - last_indexed_ledger). 0 when caught up.
  *     Helps operators understand how far behind the indexer is.
+ *     Alert thresholds: ≥100 for 5m (warning), ≥300 for 10m (critical).
+ *     See src/config/indexer-thresholds.ts for threshold rationale.
  *
  *   indexer_catchup_eta_seconds
  *     Gauge: estimated seconds until catch-up completion. Null/0 when not lagging.
  *     Computed from a rolling average of recently indexed ledgers/second.
+ *
+ * Alerting
+ * --------
+ * Two Prometheus alerts monitor indexer_ledger_lag:
+ *
+ *   IndexerLagWarning
+ *     Fires when lag ≥ 100 ledgers for 5 minutes. Indicates the indexer is not
+ *     catching up on its own; operator should investigate RPC health, batch
+ *     error rate, and database write pressure.
+ *
+ *   IndexerLagCritical
+ *     Fires when lag ≥ 300 ledgers for 10 minutes. Data freshness SLA is
+ *     violated and lag is user-visible. Requires immediate action (page).
+ *
+ * See docs/observability/indexer-lag-alerts.yml for Prometheus rules and
+ * docs/observability/alerting-runbook.md for the operator response runbook.
  *
  * Security:
  * - Label cardinality is bounded (no user-provided labels)
@@ -28,6 +46,12 @@ import { registry } from '../metrics.js';
 /**
  * Current ledger lag in ledgers (tip - last_indexed_ledger).
  * Updated when the indexer falls behind and during catch-up.
+ *
+ * Alert thresholds:
+ * - Warning: ≥100 ledgers for 5 minutes
+ * - Critical: ≥300 ledgers for 10 minutes
+ *
+ * See src/config/indexer-thresholds.ts for threshold definitions and rationale.
  */
 export const indexerLedgerLag =
   (registry.getSingleMetric('indexer_ledger_lag') as Gauge) ||

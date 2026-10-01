@@ -340,7 +340,7 @@ describe('verifyWebhookSignature — rotation grace window', () => {
         secretPrevious: PREVIOUS_SECRET,
         previousSecretRotatedAt: 1710000000,
         graceWindowSeconds: 0,
-        deliveryId: 'deliv-zero-window-exact',
+        deliveryId: 'deliv-zero-window',
         timestamp: TIMESTAMP,
         signature,
         rawBody: RAW_BODY,
@@ -613,6 +613,49 @@ describe('webhookSecretRepository', () => {
       expect(params[2]).toBe(1710000000);
       expect(params[3]).toBe(1710000000 + 86400);
       Date.now = realNow;
+    });
+
+    it('keeps both secrets verifiable during rotation and only the new one after expiry', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 'default',
+            current_secret: CURRENT_SECRET,
+            previous_secret: PREVIOUS_SECRET,
+            previous_secret_rotated_at: 1710000000,
+            previous_secret_expires_at: 1710000600,
+            created_at: new Date('2024-01-01T00:00:00Z'),
+            updated_at: new Date('2024-01-02T00:00:00Z'),
+          },
+        ],
+      });
+
+      const state = await webhookSecretRepository.rotateSecret('default', {
+        newSecret: CURRENT_SECRET,
+        graceWindowSeconds: 600,
+        rotatedAt: 1710000000,
+      });
+
+      const verify = (secret: string, now: number) =>
+        (() => {
+          const timestamp = now.toString();
+          return verifyWebhookSignature({
+            secret: state.currentSecret,
+            secretPrevious: state.previousSecret ?? undefined,
+            previousSecretRotatedAt: state.previousSecretRotatedAt ?? undefined,
+            graceWindowSeconds: 600,
+            deliveryId: `rotation-${secret}-${now}`,
+            timestamp,
+            signature: sign(secret, timestamp, RAW_BODY),
+            rawBody: RAW_BODY,
+            now,
+          });
+        })();
+
+      expect(verify(CURRENT_SECRET, 1710000300).ok).toBe(true);
+      expect(verify(PREVIOUS_SECRET, 1710000300).ok).toBe(true);
+      expect(verify(CURRENT_SECRET, 1710000600).ok).toBe(true);
+      expect(verify(PREVIOUS_SECRET, 1710000601).code).toBe('previous_secret_expired');
     });
   });
 

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 // Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Indexer routes.
@@ -36,6 +37,7 @@ import { IndexerDependencyState } from '../indexer/types.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { ReplayRequestSchema, parseBody, formatZodIssues } from '../validation/schemas.js';
+import { ReplayProgress } from '../types/index.js';
 import { logger } from '../lib/logger.js';
 import { mtlsValidationMiddleware } from '../indexer/mtls.js';
 import { getReindexLock } from '../state/adminState.js';
@@ -50,7 +52,7 @@ indexerRouter.use(mtlsValidationMiddleware);
 // ── Internal worker-token auth ────────────────────────────────────────────────
 
 const INDEXER_AUTH_HEADER = 'x-indexer-worker-token';
-let indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+let indexerWorkerToken = getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
 
 function resolveActor(req: any): string {
   const forwardedFor = req.header('x-forwarded-for');
@@ -274,7 +276,7 @@ indexerRouter.get(
     try {
       // Use the DB-backed extended snapshot so persisted replay checkpoints
       // survive restarts (falls back to the in-memory snapshot on read error).
-      const progress = await indexerService.getReplayProgressExtended();
+      const progress: ReplayProgress = await indexerService.getReplayProgressExtended();
       res.status(200).json(successResponse(progress, requestId));
     } catch (err: unknown) {
       logger.error('Failed to get indexer status', correlationId, {
@@ -307,7 +309,7 @@ export function resetIndexerState(): void {
   }
   indexerIngestionService.setStore(defaultIndexerEventStore);
   indexerIngestionService.resetRuntimeState();
-  indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+  indexerWorkerToken = getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
   replayLock.release();
   replayState.endReplay();
 }

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from './config/runtime-env.js';
 /**
  * Fluxora Backend — process entry point.
  *
@@ -41,7 +42,7 @@ import { setRuntimeRateLimitConfig } from './config/rateLimits.js';
 import { prepareReloadFlags } from './config/featureFlags.js';
 import { logger } from './lib/logger.js';
 import { logActiveLogLevel, setLogLevel } from './config/logger.js';
-import { probeStartupDependencies } from './config/health.js';
+import { probeStartupDependencies, createBoundedHealthCheckManager } from './config/health.js';
 import { startTracing } from './tracing/index.js';
 import { initLogsBridge } from './tracing/logsBridge.js';
 import {
@@ -54,12 +55,11 @@ import {
   markRedisReady,
   markIndexerReady,
   markReady,
-  markShuttingDown,
 } from './startup/readiness.js';
 
 let server: ReturnType<typeof app.listen> | undefined;
 
-if (process.env.NODE_ENV !== 'test') {
+if (getRuntimeEnv().NODE_ENV !== 'test') {
   // app.ts calls initializeConfig() at module load, so getConfig() is safe here.
   const cfg = getConfig();
 
@@ -185,7 +185,7 @@ if (process.env.NODE_ENV !== 'test') {
         }
         const json = (await response.json()) as { result?: { sequence?: number } };
         if (typeof json.result?.sequence !== 'number') {
-          throw new Error('Stellar RPC returned an invalid ledger response');
+          throw new TypeError('Stellar RPC returned an invalid ledger response');
         }
       } finally {
         clearTimeout(timeoutId);
@@ -205,6 +205,14 @@ if (process.env.NODE_ENV !== 'test') {
     markDependenciesReady();
 
     void checkAdminStatePersistence();
+
+    // Initialize health check manager with explicit bounded timeouts for /health/ready
+    app.locals.healthManager = createBoundedHealthCheckManager({
+      healthCheckTimeoutMs: cfg.healthCheckTimeoutMs,
+      healthCheckPostgresTimeoutMs: cfg.healthCheckPostgresTimeoutMs,
+      healthCheckRedisTimeoutMs: cfg.healthCheckRedisTimeoutMs,
+      healthCheckStellarTimeoutMs: cfg.healthCheckStellarTimeoutMs,
+    });
 
     server = app.listen(cfg.port, () => {
       logger.info('server:listening', undefined, {
@@ -277,7 +285,7 @@ if (process.env.NODE_ENV !== 'test') {
       },
       prepareFeatureFlags: () => prepareReloadFlags(),
       prepareLogLevel: (level) => () => {
-        process.env.LOG_LEVEL = level;
+        getRuntimeEnv().LOG_LEVEL = level;
         setLogLevel(level);
       },
       onSuccess: (result) => {

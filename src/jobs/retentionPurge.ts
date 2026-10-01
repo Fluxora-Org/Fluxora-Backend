@@ -106,6 +106,7 @@ import { getPool } from '../db/pool.js';
 import type { Pool, PoolClient } from 'pg';
 import { recordAuditEventToDb } from '../lib/auditLog.js';
 import { PURGEABLE_RETENTION_SCHEDULE, PurgeableRetentionRule } from '../pii/policy.js';
+import { purgeVolumeCapExceededTotal } from '../metrics/businessMetrics.js';
 
 const STREAM_REDACTION_TOMBSTONE = '[REDACTED:DATA_RETENTION]';
 
@@ -125,6 +126,23 @@ const AUDIT_DELETE_BYPASS = 'app.allow_audit_delete';
  * Configurable for testing via the options object.
  */
 const DEFAULT_BATCH_SIZE = 500;
+
+/**
+ * Hard ceiling on the total number of rows deleted or redacted across **all
+ * batches for a single rule** in one `runRetentionPurge` invocation.
+ *
+ * When `totalRowsPurged` for a rule reaches this value the rule loop halts
+ * early and the `purgeVolumeCapExceededTotal` metric is incremented.  An
+ * alert on `increase(fluxora_purge_volume_cap_exceeded_total[1h]) > 0` fires
+ * so an operator can investigate whether a backlog has built up or the cap
+ * needs tuning.
+ *
+ * The cap is intentionally **per rule per run**, not per batch, so a single
+ * runaway rule cannot consume unbounded DB time regardless of batch size.
+ * Normal steady-state runs will never approach this limit; only an unusual
+ * backlog (e.g. the job was paused for weeks) would trigger it.
+ */
+export const PURGE_MAX_ROWS_PER_RUN = 50_000;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -164,6 +182,15 @@ export interface PurgeJobOptions {
    * Defaults to `false`.
    */
   dryRun?: boolean;
+
+  /**
+   * Maximum rows to purge across all batches for a single rule in this run.
+   * When the total purged for a rule reaches this ceiling the loop exits early
+   * and the `purgeVolumeCapExceededTotal` metric is incremented so an alert
+   * fires.
+   * Defaults to `PURGE_MAX_ROWS_PER_RUN` (50 000).
+   */
+  maxRowsPerRun?: number;
 }
 
 /**
@@ -182,6 +209,12 @@ export interface PurgeRuleResult {
   cutoffDate: string;
   /** Whether the run was a dry run. */
   dryRun: boolean;
+  /**
+   * `true` when the run hit the per-rule volume cap (`maxRowsPerRun`) before
+   * exhausting all candidates.  The metric `purgeVolumeCapExceededTotal` is
+   * also incremented in that case so an alert can fire.
+   */
+  volumeCapReached: boolean;
 }
 
 /**
@@ -226,6 +259,7 @@ export async function runRetentionPurge(options: PurgeJobOptions = {}): Promise<
     pool = getPool(),
     correlationId,
     dryRun = false,
+    maxRowsPerRun = PURGE_MAX_ROWS_PER_RUN,
   } = options;
 
   const startedAt = new Date().toISOString();
@@ -246,6 +280,7 @@ export async function runRetentionPurge(options: PurgeJobOptions = {}): Promise<
       pool,
       correlationId: correlationId ?? '',
       dryRun,
+      maxRowsPerRun,
     });
     results.push(ruleResult);
     totalRowsPurged += ruleResult.rowsPurged;
@@ -284,7 +319,7 @@ async function purgeRule(
   rule: PurgeableRetentionRule,
   options: Required<Omit<PurgeJobOptions, 'now'>> & { now: Date }
 ): Promise<PurgeRuleResult> {
-  const { batchSize, now, pool, correlationId, dryRun } = options;
+  const { batchSize, now, pool, correlationId, dryRun, maxRowsPerRun } = options;
 
   // retentionDays is always a number for purgeable rules (validated by type)
   const retentionDays = rule.retentionDays as number;
@@ -304,6 +339,7 @@ async function purgeRule(
   let rowsPurged = 0;
   let rowsSkipped = 0;
   let batchIndex = 0;
+  let volumeCapReached = false;
 
   logger.info(`Retention purge: processing rule '${rule.category}'`, correlationId, {
     table: rule.table,
@@ -311,6 +347,7 @@ async function purgeRule(
     cutoffDate,
     dryRun,
     hasLegalHold,
+    maxRowsPerRun,
   });
 
   // Keep processing until a batch returns fewer rows than requested, meaning
@@ -320,6 +357,21 @@ async function purgeRule(
   // FOR UPDATE SKIP LOCKED ensures we do not re-visit the same held rows on
   // the next iteration.
   while (true) {
+    // ── Volume-cap guard ───────────────────────────────────────────────────
+    // Stop before fetching a new batch if we have already hit the per-run
+    // ceiling.  Checked at the top of the loop so it also fires when the
+    // previous batch exactly filled the cap.
+    if (rowsPurged >= maxRowsPerRun) {
+      volumeCapReached = true;
+      purgeVolumeCapExceededTotal.inc({ table: rule.table });
+      logger.warn(
+        `Retention purge: volume cap reached for rule '${rule.category}'`,
+        correlationId,
+        { table: rule.table, rowsPurged, maxRowsPerRun }
+      );
+      break;
+    }
+
     const { purged, skipped } = await processBatch(rule, {
       cutoff,
       batchSize,
@@ -349,6 +401,7 @@ async function purgeRule(
     rowsSkipped,
     batches: batchIndex,
     cutoffDate,
+    volumeCapReached,
   });
 
   return {
@@ -358,6 +411,7 @@ async function purgeRule(
     rowsSkipped,
     cutoffDate,
     dryRun,
+    volumeCapReached,
   };
 }
 

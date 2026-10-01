@@ -11,6 +11,11 @@ import request from 'supertest';
 import { docsRouter, resetSpecCache, FLAG_GATED_PATHS } from './docs.js';
 import { reloadFlags } from '../config/featureFlags.js';
 import { GRAPHQL_GATEWAY_FLAG } from '../graphql/gateway.js';
+import {
+  FLUXORA_JSONLD_CONTEXT,
+  FLUXORA_JSONLD_CONTEXT_DOCUMENT,
+  FLUXORA_JSONLD_CONTEXT_PATH,
+} from '../serialization/jsonld.js';
 
 /** Build the test app fresh each test so router state is clean. */
 function makeApp(): express.Express {
@@ -64,6 +69,34 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
 
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toContain('text/html');
+    });
+  });
+
+  // ── GET /ns/v1 — JSON-LD context document ─────────────────────────────
+
+  describe('GET /ns/v1 (JSON-LD context document)', () => {
+    it('serves the pinned context document', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(FLUXORA_JSONLD_CONTEXT_DOCUMENT);
+      expect(res.headers['content-type']).toContain('application/ld+json');
+    });
+
+    it('is permanently cacheable, unlike /openapi.json', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(res.headers['cache-control']).toBe('public, max-age=31536000, immutable');
+    });
+
+    it('is readable cross-origin by browser-based linked-data clients', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(res.headers['access-control-allow-origin']).toBe('*');
+    });
+
+    it('serves the path the documents reference in @context', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(new URL(FLUXORA_JSONLD_CONTEXT).pathname).toBe(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(res.status).toBe(200);
     });
   });
 

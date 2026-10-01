@@ -1,0 +1,11 @@
+{
+  "$comment": "Applied-order ledger for the feature-level migration contracts in src/db/migrations. Ordinals must be unique; check:migrations fails the build otherwise. `renames` records every renumbering so an environment that applied a migration under its previous name is not asked to re-run it.",
+  "renames": [
+    {
+      "from": "006_streams_event_index_check",
+      "to": "008_streams_event_index_check",
+      "issue": 1485,
+      "reason": "Shared the 006_ ordinal with 006_add_webhook_outbox_dispatch_index, so the applied order depended on filename sorting instead of intent."
+    }
+  ]
+}

@@ -13,8 +13,8 @@ import request from 'supertest';
 // ── Mock the diagnostics service before importing app ──────────────────────────
 const mockReport = vi.hoisted(() => ({
   timestamp: '2026-07-29T12:00:00.000Z',
-  dbPool:     { status: 'ok', latencyMs: 2, value: { active: 3, idle: 5, waiting: 0 } },
-  redis:      { status: 'ok', latencyMs: 1, value: { pingMs: 0.5 } },
+  dbPool: { status: 'ok', latencyMs: 2, value: { active: 3, idle: 5, waiting: 0 } },
+  redis: { status: 'ok', latencyMs: 1, value: { pingMs: 0.5 } },
   circuitBreaker: {
     status: 'ok',
     latencyMs: 0,
@@ -165,9 +165,9 @@ describe('GET /api/admin/diagnostics', () => {
       }),
     });
     // transitionedAt can be null (never tripped) or number (epoch ms when tripped)
-    expect(
-      cb.value.transitionedAt === null || typeof cb.value.transitionedAt === 'number',
-    ).toBe(true);
+    expect(cb.value.transitionedAt === null || typeof cb.value.transitionedAt === 'number').toBe(
+      true
+    );
   });
 
   it('indexer sub-check has lagSeconds and replay status', async () => {
@@ -186,8 +186,8 @@ describe('GET /api/admin/diagnostics', () => {
   it('returns diagnostics even when some sub-checks have non-lethal errors', async () => {
     const errorReport = {
       timestamp: '2026-07-29T12:00:00.000Z',
-      dbPool:     { status: 'ok', latencyMs: 2, value: { active: 3, idle: 5, waiting: 0 } },
-      redis:      { status: 'error', latencyMs: 1000, error: 'Connection refused' },
+      dbPool: { status: 'ok', latencyMs: 2, value: { active: 3, idle: 5, waiting: 0 } },
+      redis: { status: 'error', latencyMs: 1000, error: 'Connection refused' },
       circuitBreaker: {
         status: 'ok',
         latencyMs: 0,
@@ -212,18 +212,31 @@ describe('GET /api/admin/diagnostics', () => {
 
   // ── Error handling ───────────────────────────────────────────────────────
 
-  it('returns 503 when the diagnostics service throws', async () => {
-    mockRunDiagnostics.mockRejectedValue(new Error('Unexpected diagnostics failure'));
+  it('returns 503 without exposing exception details when the diagnostics service throws', async () => {
+    mockRunDiagnostics.mockRejectedValue(
+      new Error(
+        'postgresql://service:db-password@db.internal:5432/fluxora ' +
+          'redis://:redis-password@cache.cluster:6379/0 ' +
+          'Bearer diagnostic-secret-token api_key=sk_live_sensitive 10.20.30.40'
+      )
+    );
 
     const res = await authed(request(app).get('/api/admin/diagnostics'));
+    const output = JSON.stringify(res.body);
 
     expect(res.status).toBe(503);
     expect(res.body).toMatchObject({
       success: false,
       error: {
         code: 'DIAGNOSTICS_ERROR',
+        message: 'Diagnostics check failed',
       },
     });
+    expect(output).not.toMatch(/(?:postgres(?:ql)?|redis):\/\/\S+/i);
+    expect(output).not.toMatch(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/i);
+    expect(output).not.toMatch(/\b(?:password|secret|token|api[_-]?key)\s*[:=]\s*[^,\s;]+/i);
+    expect(output).not.toMatch(/\b[a-z0-9-]+\.(?:internal|local|cluster|svc|corp)\b/i);
+    expect(output).not.toMatch(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
   });
 
   it('does not invoke diagnostics when not authenticated', async () => {
