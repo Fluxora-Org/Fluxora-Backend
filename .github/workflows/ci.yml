@@ -229,6 +229,7 @@ jobs:
           tests/db/vacuumCollector.collect.test.ts
           tests/db/webhookOutbox.dispatchIndex.test.ts
           tests/db/streams.compositeIndexes.test.ts
+          tests/db/hotPathQueryIndexes.test.ts
           tests/db/logicalReplication.test.ts
           tests/db/contractEvents.partitionPruning.test.ts
           tests/db/rowMapping.schema.test.ts
