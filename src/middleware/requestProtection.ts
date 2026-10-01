@@ -37,6 +37,7 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import { payloadTooLarge, requestTimeout, validationError } from './errorHandler.js';
+import { requestBodyTooLargeTotal, requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
 import { requestBodyTooLargeTotal, requestBodyTooDeepTotal } from '../metrics/requestProtectionMetrics.js';
 import { requestBodyTooLargeTotal, requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
 import { normalizeRouteLabel } from '../metrics/cardinality.js';
@@ -244,6 +245,7 @@ export function bodySizeLimitMiddleware(
        * @see src/metrics/requestProtectionMetrics.ts
        */
       requestBodyTooLargeTotal.inc({ path: normalizedPath(req) });
+      requestRefusedTotal.inc({ path: normalizedPath(req), reason: 'body_too_large' });
       refuseDuringBodyRead(
         req,
         res,
