@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import type { Request, Response, NextFunction } from 'express';
@@ -17,6 +18,7 @@ import { InMemoryStore, SlidingWindowStore, HybridStore } from '../redis/rateLim
 import { createRedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 import { rateLimitRejectedTotal, rateLimitRedisErrorsTotal } from '../metrics.js';
+import { requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 import { errorResponse } from '../utils/response.js';
 import { getOverride } from '../services/tenantRateLimitOverride.service.js';
@@ -281,7 +283,7 @@ export interface RateLimiter {
 // ---------------------------------------------------------------------------
 
 export function createRateLimiter(
-  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  env: Record<string, string | undefined> = getRuntimeEnv() as Record<string, string | undefined>,
   /** Optional store injection — used in tests to bypass Redis. */
   injectedStore?: RateLimitStore,
 ): RateLimiter {
@@ -496,6 +498,7 @@ export function createRateLimiter(
         window: config.windowMs,
       });
       rateLimitRejectedTotal.inc({ identifier_type: identifierType, route: routeKey });
+      requestRefusedTotal.inc({ path, reason: 'rate_limit_exceeded' });
 
       res
         .status(429)
@@ -604,7 +607,7 @@ export function createRateLimiter(
 
 export function isAdminKey(
   key: string,
-  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  env: Record<string, string | undefined> = getRuntimeEnv() as Record<string, string | undefined>,
 ): boolean {
   const adminKeyEnv = env.ADMIN_API_KEY ?? '';
   if (!adminKeyEnv) return false;

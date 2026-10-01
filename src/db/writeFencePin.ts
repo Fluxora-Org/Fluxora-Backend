@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Write-fence pin: a short-lived, HMAC-SHA256–signed token that instructs
  * downstream read routing to use the **primary** pool for a bounded window
@@ -117,7 +118,7 @@ function rejectWriteFence(reason: WriteFenceRejectReason): false {
  * explicitly set to `"0"` (disables pinning).
  */
 function readTtlSeconds(): number {
-  const raw = process.env['RYW_PIN_TTL_SECONDS'];
+  const raw = getRuntimeEnv()['RYW_PIN_TTL_SECONDS'];
   if (!raw) return DEFAULT_TTL_SECONDS;
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_TTL_SECONDS;
@@ -134,7 +135,7 @@ function readTtlSeconds(): number {
  * @throws {Error} When `JWT_SECRET` is absent or shorter than 32 characters.
  */
 function deriveSigningKey(): Buffer {
-  const secret = process.env['JWT_SECRET'];
+  const secret = getRuntimeEnv()['JWT_SECRET'];
   if (!secret || secret.length < 32) {
     throw new Error(
       'JWT_SECRET must be set and be at least 32 characters long to issue write-fence pins',

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../../config/runtime-env.js';
 /**
  * DLQ repository — dead-letter queue data access plus per-topic suspension tracking.
  *
@@ -155,7 +156,7 @@ function rowToFailureHistory(row: Record<string, unknown>): DlqFailureAttempt[] 
  * Overridable via DLQ_SUSPENSION_THRESHOLD env var (default 5).
  */
 export function getSuspensionThreshold(): number {
-  const raw = process.env.DLQ_SUSPENSION_THRESHOLD;
+  const raw = getRuntimeEnv().DLQ_SUSPENSION_THRESHOLD;
   if (raw !== undefined) {
     const n = Number.parseInt(raw, 10);
     if (Number.isFinite(n) && n > 0) return n;

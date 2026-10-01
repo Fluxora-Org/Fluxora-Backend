@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Database migration runner and startup guard.
  *
@@ -132,7 +133,7 @@ export async function getLatestAppliedMigration(
  * @throws {PendingMigrationsError} When unapplied migrations exist.
  */
 export async function checkPendingMigrations(): Promise<void> {
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = getRuntimeEnv().DATABASE_URL;
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required');
   }
@@ -164,7 +165,7 @@ export async function checkPendingMigrations(): Promise<void> {
  * Run all pending migrations
  */
 export async function migrate(): Promise<void> {
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = getRuntimeEnv().DATABASE_URL;
 
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required for migrations');

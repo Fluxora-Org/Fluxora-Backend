@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Enhanced webhook delivery and management routes
  * Includes outbox, dead-letter queue, and circuit breaker endpoints
@@ -90,7 +91,6 @@ webhooksRouter.post(
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
-
     // Prefer the DB-backed rotation state (webhookSecretRepository) so that a
     // secret rotation's overlap window is actually honored on this path. Any
     // lookup failure (no row yet, DB unavailable, table not migrated) falls
@@ -121,11 +121,11 @@ webhooksRouter.post(
         }
       }
     } else {
-      if (process.env.FLUXORA_WEBHOOK_SECRET !== undefined) {
-        verifyInput.secret = process.env.FLUXORA_WEBHOOK_SECRET;
+      if (getRuntimeEnv().FLUXORA_WEBHOOK_SECRET !== undefined) {
+        verifyInput.secret = getRuntimeEnv().FLUXORA_WEBHOOK_SECRET;
       }
-      if (process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
-        verifyInput.secretPrevious = process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS;
+      if (getRuntimeEnv().FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
+        verifyInput.secretPrevious = getRuntimeEnv().FLUXORA_WEBHOOK_SECRET_PREVIOUS;
       }
     }
 

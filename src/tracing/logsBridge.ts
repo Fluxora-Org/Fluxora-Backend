@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * OpenTelemetry Logs Bridge for Fluxora Backend.
  *
@@ -46,7 +47,7 @@ const INSTRUMENTATION_SCOPE = 'fluxora-backend/logs-bridge';
 
 /** Instrumentation scope version – kept in sync with the package version at runtime. */
 const INSTRUMENTATION_VERSION =
-  (typeof process !== 'undefined' && process.env.npm_package_version) || '0.0.0';
+  (typeof process !== 'undefined' && getRuntimeEnv().npm_package_version) || '0.0.0';
 
 // ── Severity mapping ─────────────────────────────────────────────────────────
 
