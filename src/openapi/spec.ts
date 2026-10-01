@@ -11,6 +11,12 @@ import {
 } from '@asteasolutions/zod-to-openapi';
 import { ApiKeyCreatedSchema as _ApiKeyCreatedBase } from '../lib/apiKey.js';
 import { API_STREAM_STATUSES } from '../streams/status.js';
+import {
+  ContractEventSchema as SharedContractEventSchema,
+  ReplayProgressSchema as SharedReplayProgressSchema,
+  ReplayCursorSchema as SharedReplayCursorSchema,
+  ReplayRequestSchema as SharedReplayRequestSchema,
+} from '../types/index.js';
 
 extendZodWithOpenApi(z);
 
@@ -47,6 +53,34 @@ const ApiKeyCreatedSchema = _ApiKeyCreatedBase.extend({
 export const registry = new OpenAPIRegistry();
 
 // ── Shared schemas ────────────────────────────────────────────────────────────
+
+export const SharedContractEventOpenApiSchema = registry.register(
+  'ContractEvent',
+  SharedContractEventSchema.openapi({
+    description: 'Contract event structure derived from shared type',
+  })
+);
+
+export const ReplayProgressOpenApiSchema = registry.register(
+  'ReplayProgress',
+  SharedReplayProgressSchema.openapi({
+    description: 'Replay progress tracking snapshot derived from shared type',
+  })
+);
+
+export const ReplayCursorOpenApiSchema = registry.register(
+  'ReplayCursor',
+  SharedReplayCursorSchema.openapi({
+    description: 'Durable DB-backed replay cursor derived from shared type',
+  })
+);
+
+export const ReplayRequestOpenApiSchema = registry.register(
+  'ReplayRequest',
+  SharedReplayRequestSchema.openapi({
+    description: 'Replay request parameters derived from shared type',
+  })
+);
 
 const DecimalString = registry.register(
   'DecimalString',
@@ -318,6 +352,11 @@ const errorResponses = {
     'Unprocessable entity',
     'UNPROCESSABLE_ENTITY',
     'Request could not be processed'
+  ),
+  '406': errorResponseWithExample(
+    'Not acceptable',
+    'NOT_ACCEPTABLE',
+    'Content type specified in Accept header is not supported'
   ),
   '429': errorResponseWithExample(
     'Too many requests',
@@ -2300,24 +2339,7 @@ registry.registerPath({
       required: true,
       content: {
         'application/json': {
-          schema: z.object({
-            contract_id: z.string().min(1).openapi({
-              description: 'Contract identifier to replay events for.',
-              example: 'CBIELTK6YBZJU5UP2WWQEQPMCSB5TTNBMMKVDPKA2QCMXGFQKQKJ4AB',
-            }),
-            ledger: z.number().int().nonnegative().openapi({
-              description: 'Ledger number to replay.',
-              example: 512345,
-            }),
-            from_block: z.number().int().nonnegative().optional().openapi({
-              description: 'Optional lower bound block height (inclusive).',
-              example: 0,
-            }),
-            to_block: z.number().int().nonnegative().optional().openapi({
-              description: 'Optional upper bound block height (inclusive). Must be >= from_block.',
-              example: 100,
-            }),
-          }),
+          schema: ReplayRequestOpenApiSchema,
         },
       },
     },
@@ -2325,7 +2347,16 @@ registry.registerPath({
   responses: {
     '202': {
       description: 'Replay accepted and running asynchronously.',
-      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+      content: {
+        'application/json': {
+          schema: successSchema(
+            z.object({
+              message: z.string(),
+              status: ReplayProgressOpenApiSchema,
+            })
+          ),
+        },
+      },
     },
     '400': errorResponses['400'],
     '401': errorResponses['401'],
@@ -2343,7 +2374,7 @@ registry.registerPath({
   responses: {
     '200': {
       description: 'Replay progress snapshot.',
-      content: { 'application/json': { schema: successSchema(z.record(z.string(), z.unknown())) } },
+      content: { 'application/json': { schema: successSchema(ReplayProgressOpenApiSchema) } },
     },
     '401': errorResponses['401'],
     '403': errorResponses['403'],

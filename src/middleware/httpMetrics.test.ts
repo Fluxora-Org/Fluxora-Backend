@@ -37,7 +37,6 @@ describe('resolveRoute', () => {
     const req = {
       baseUrl: '',
       route: { path: '/multiple///' } as any,
-      originalUrl: '/multiple///'
     } as unknown as Request;
     // After collapse of a single trailing slash, remaining empties are kept
     // by normalizeRouteLabel join; high-cardinality policy does not alter
