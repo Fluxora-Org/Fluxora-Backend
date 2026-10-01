@@ -18,6 +18,7 @@ import { InMemoryStore, SlidingWindowStore, HybridStore } from '../redis/rateLim
 import { createRedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 import { rateLimitRejectedTotal, rateLimitRedisErrorsTotal } from '../metrics.js';
+import { requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 import { errorResponse } from '../utils/response.js';
 import { getOverride } from '../services/tenantRateLimitOverride.service.js';
@@ -497,6 +498,7 @@ export function createRateLimiter(
         window: config.windowMs,
       });
       rateLimitRejectedTotal.inc({ identifier_type: identifierType, route: routeKey });
+      requestRefusedTotal.inc({ path, reason: 'rate_limit_exceeded' });
 
       res
         .status(429)
