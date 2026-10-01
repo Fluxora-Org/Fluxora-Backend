@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from './config/runtime-env.js';
 /**
  * Application Configuration
  *
@@ -6,7 +7,7 @@
  */
 
 function envInt(name: string, fallback: number): number {
-  const v = process.env[name];
+  const v = getRuntimeEnv()[name];
   if (!v) return fallback;
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : fallback;
@@ -14,8 +15,8 @@ function envInt(name: string, fallback: number): number {
 
 export const config = {
   stellar: {
-    rpcUrl: process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org',
-    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+    rpcUrl: getRuntimeEnv().STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org',
+    networkPassphrase: getRuntimeEnv().STELLAR_NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
     timeout: envInt('STELLAR_RPC_TIMEOUT', 10_000),
     retry: {
       maxRetries: envInt('STELLAR_RPC_MAX_RETRIES', 3),
@@ -68,7 +69,7 @@ export const config = {
     purgeBatchSize: envInt('DLQ_PURGE_BATCH_SIZE', 500),
   },
   database: {
-    url: process.env.DATABASE_URL || 'postgresql://localhost/fluxora',
+    url: getRuntimeEnv().DATABASE_URL || 'postgresql://localhost/fluxora',
   },
   partitionMaintenance: {
     /**

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { logger } from '../lib/logger.js';
 import type { BanStore, BanCheckResult } from '../redis/banStore.js';
 import { createBanStore } from '../redis/banStore.js';
@@ -39,7 +40,7 @@ const connectionRejectionsCounter = new Counter({
 
 // Update max connections gauge on startup
 function updateMaxConnectionsMetric() {
-  const maxPerIp = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
+  const maxPerIp = parseInt(getRuntimeEnv().WS_MAX_CONNECTIONS_PER_IP || '10', 10);
   maxConnectionsGauge.set(maxPerIp);
 }
 updateMaxConnectionsMetric();
@@ -129,9 +130,9 @@ export async function checkAndReserve(
   }
 
   const now = Date.now();
-  const maxConnections = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
-  const reconnectLimit = parseInt(process.env.WS_RECONNECT_LIMIT || '20', 10);
-  const reconnectWindowMs = parseInt(process.env.WS_RECONNECT_WINDOW_MS || '60000', 10);
+  const maxConnections = parseInt(getRuntimeEnv().WS_MAX_CONNECTIONS_PER_IP || '10', 10);
+  const reconnectLimit = parseInt(getRuntimeEnv().WS_RECONNECT_LIMIT || '20', 10);
+  const reconnectWindowMs = parseInt(getRuntimeEnv().WS_RECONNECT_WINDOW_MS || '60000', 10);
   const key = resolveConnectionKey(ip, clientIdentity);
 
   const attempts = (reconnectHistory.get(key) || []).filter(
@@ -178,8 +179,8 @@ export async function checkAndReserve(
  * Now delegates ban creation to the configured BanStore (Redis + local).
  */
 function recordRejection(key: string, ip: string, now: number, reason: string): void {
-  const abuseThreshold = parseInt(process.env.WS_ABUSE_THRESHOLD || '5', 10);
-  const banTtl = parseInt(process.env.WS_BAN_TTL_S || '3600', 10);
+  const abuseThreshold = parseInt(getRuntimeEnv().WS_ABUSE_THRESHOLD || '5', 10);
+  const banTtl = parseInt(getRuntimeEnv().WS_BAN_TTL_S || '3600', 10);
   const abuseWindowMs = 60_000; // 1 minute sliding window for abuse detection
 
   connectionRejectionsCounter.inc({ reason });

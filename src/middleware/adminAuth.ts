@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import type { Request, Response, NextFunction } from 'express';
 import { authApiKeyLookupDurationSeconds } from '../metrics/businessMetrics.js';
 import { verifyToken } from '../lib/auth.js';
@@ -46,7 +47,7 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
     endTimer({ outcome });
   };
 
-  const adminKey = process.env.ADMIN_API_KEY;
+  const adminKey = getRuntimeEnv().ADMIN_API_KEY;
 
   if (!adminKey) {
     recordOutcome('failure');

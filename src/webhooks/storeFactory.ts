@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * @module webhooks/storeFactory
  *
@@ -55,10 +56,10 @@ export const WEBHOOK_DELIVERY_STORE_ENV = 'WEBHOOK_DELIVERY_STORE';
  * Resolve the configured backend from a raw env value.
  *
  * Exported so the selection rule can be asserted directly without booting a
- * store. Passing no argument reads `process.env.WEBHOOK_DELIVERY_STORE`.
+ * store. Passing no argument reads `getRuntimeEnv().WEBHOOK_DELIVERY_STORE`.
  */
 export function resolveStoreBackend(
-  raw: string | undefined = process.env[WEBHOOK_DELIVERY_STORE_ENV]
+  raw: string | undefined = getRuntimeEnv()[WEBHOOK_DELIVERY_STORE_ENV]
 ): StoreBackend {
   const normalized = (raw ?? '').toLowerCase().trim();
   return normalized === 'postgres' ? 'postgres' : 'memory';
@@ -106,7 +107,7 @@ export function createWebhookDeliveryStore(
   options: WebhookStoreFactoryOptions = {}
 ): IWebhookDeliveryStore {
   const backend = options.backend ?? resolveStoreBackend();
-  const nodeEnv = options.nodeEnv ?? process.env.NODE_ENV ?? 'development';
+  const nodeEnv = options.nodeEnv ?? getRuntimeEnv().NODE_ENV ?? 'development';
   const isProduction = nodeEnv === 'production';
 
   if (backend === 'postgres') {

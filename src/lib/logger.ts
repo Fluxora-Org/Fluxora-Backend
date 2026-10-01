@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Structured JSON logger.
  *
@@ -62,9 +63,9 @@ export function isLogLevel(value: unknown): value is LogLevel {
  * environments default to `debug`, so nothing is silently dropped there.
  */
 function resolveInitialLogLevel(): LogLevel {
-  const configured = process.env.LOG_LEVEL;
+  const configured = getRuntimeEnv().LOG_LEVEL;
   if (isLogLevel(configured)) return configured;
-  return process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging'
+  return getRuntimeEnv().NODE_ENV === 'production' || getRuntimeEnv().NODE_ENV === 'staging'
     ? 'info'
     : 'debug';
 }

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Redis client factory supporting standalone, Sentinel, and Cluster modes.
  *
@@ -602,7 +603,7 @@ const DEFAULT_POLL_INTERVAL_MS = 10_000;
  * Defaults to 500 when not set.
  */
 const REDIS_QUEUE_WARNING_THRESHOLD = Number(
-  process.env['REDIS_QUEUE_WARNING_THRESHOLD'] ?? 500,
+  getRuntimeEnv()['REDIS_QUEUE_WARNING_THRESHOLD'] ?? 500,
 );
 
 /**
@@ -610,7 +611,7 @@ const REDIS_QUEUE_WARNING_THRESHOLD = Number(
  * queue-length exceedance, preventing log floods. Default: 30 000 (30 s).
  */
 const REDIS_QUEUE_WARNING_RATE_LIMIT_MS = Number(
-  process.env['REDIS_QUEUE_WARNING_RATE_LIMIT_MS'] ?? 30_000,
+  getRuntimeEnv()['REDIS_QUEUE_WARNING_RATE_LIMIT_MS'] ?? 30_000,
 );
 
 /** Timestamp (epoch ms) of the last queue-length warning, per instance. */
@@ -670,7 +671,7 @@ function _pollRedisSaturation(): void {
  * @param intervalMs  Polling interval (default: 10 000 ms / 10 s).
  */
 export function startRedisSaturationMetrics(
-  intervalMs = Number(process.env['REDIS_SATURATION_POLL_INTERVAL_MS']) || DEFAULT_POLL_INTERVAL_MS,
+  intervalMs = Number(getRuntimeEnv()['REDIS_SATURATION_POLL_INTERVAL_MS']) || DEFAULT_POLL_INTERVAL_MS,
 ): void {
   if (_metricsIntervalTimer) return;
 

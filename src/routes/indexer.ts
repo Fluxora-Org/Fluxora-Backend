@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 // Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Indexer routes.
@@ -50,7 +51,7 @@ indexerRouter.use(mtlsValidationMiddleware);
 // ── Internal worker-token auth ────────────────────────────────────────────────
 
 const INDEXER_AUTH_HEADER = 'x-indexer-worker-token';
-let indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+let indexerWorkerToken = getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
 
 function resolveActor(req: any): string {
   const forwardedFor = req.header('x-forwarded-for');
@@ -307,7 +308,7 @@ export function resetIndexerState(): void {
   }
   indexerIngestionService.setStore(defaultIndexerEventStore);
   indexerIngestionService.resetRuntimeState();
-  indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+  indexerWorkerToken = getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
   replayLock.release();
   replayState.endReplay();
 }

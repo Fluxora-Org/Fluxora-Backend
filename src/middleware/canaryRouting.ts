@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Canary Routing Middleware
  *
@@ -155,7 +156,7 @@ export function resolveSessionIdentity(req: Request): string | undefined {
  * Options accepted by `createCanaryRoutingMiddleware`.
  *
  * All fields are optional; production callers should rely on environment
- * variables. Tests may pass explicit values to avoid polluting process.env.
+ * variables. Tests may pass explicit values to avoid polluting getRuntimeEnv().
  */
 export interface CanaryRoutingOptions {
   /**
@@ -200,14 +201,14 @@ export function createCanaryRoutingMiddleware(
     const trafficPercent =
       options.trafficPercent ??
       (() => {
-        const raw = process.env['CANARY_TRAFFIC_PERCENT'];
+        const raw = getRuntimeEnv()['CANARY_TRAFFIC_PERCENT'];
         if (raw === undefined || raw === '') return 0;
         const parsed = parseInt(raw, 10);
         return Number.isFinite(parsed) && parsed >= 0 && parsed <= 100 ? parsed : 0;
       })();
 
     const salt =
-      options.salt ?? (process.env['CANARY_SALT'] ?? DEFAULT_CANARY_SALT);
+      options.salt ?? (getRuntimeEnv()['CANARY_SALT'] ?? DEFAULT_CANARY_SALT);
 
     // ── Fast path: canary disabled ────────────────────────────────────────
 
