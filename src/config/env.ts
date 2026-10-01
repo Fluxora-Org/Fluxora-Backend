@@ -23,6 +23,7 @@
  */
 import { getConfig, parseEnv } from './env-config.js';
 
+export { EnvSchema } from './env-schema/schema.js';
 export type { ParsedEnv } from './env-schema/schema.js';
 export type { NodeEnv, LogLevel } from './env-schema/types.js';
 
@@ -37,7 +38,6 @@ export {
 export { resolveNetwork } from './stellar.js';
 
 export type { Config } from './env-config.js';
-export { loadConfig, getConfig, initializeConfig, resetConfig } from './env-config.js';
 export {
   ConfigError,
   EnvironmentError,
@@ -57,13 +57,12 @@ export {
   resetStartupEnvSnapshot,
 } from './env-hot-reload.js';
 
+export { DEFAULT_WS_MAX_INBOUND_MESSAGE_BYTES } from './env-schema/server.js';
 
 /**
  * Effective ceiling on a single inbound WebSocket frame, honouring
  * `WS_MAX_INBOUND_MESSAGE_BYTES` when it was overridden at startup.
  */
-}
-
 export function getWsMaxInboundMessageBytes(): number {
   return getConfig().wsMaxInboundMessageBytes;
 }
