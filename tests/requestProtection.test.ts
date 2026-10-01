@@ -4,20 +4,26 @@
  * Covers:
  *   - Content-Length fast path: rejects before reading body
  *   - Stream byte counting: rejects chunked requests that exceed the limit
+ *   - Limits enforced *while* the body is being read (#1468): the refusal
+ *     happens before the payload is fully buffered, not afterwards
  *   - Within-limit pass-through: valid requests reach the route handler
- *   - JSON depth enforcement: deeply nested bodies are rejected with 400
+ *   - JSON depth enforcement: deeply nested bodies are rejected with 400,
+ *     before the body is fully read and parsed
  *   - BODY_LIMIT_BYTES constant: exported value equals 256 KiB
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterAll, beforeAll } from 'vitest';
 import express from 'express';
 import request from 'supertest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import {
   DEFAULT_RAW_LIMIT_BYTES,
   DEFAULT_DECOMPRESSED_LIMIT_BYTES,
   ROUTE_LIMITS,
   bodySizeLimitMiddleware,
   dynamicJsonParser,
+  jsonDepthLimitMiddleware,
   jsonDepthMiddleware,
   requestTimeoutMiddleware,
 } from '../src/middleware/requestProtection.js';
@@ -35,6 +41,54 @@ function buildApp() {
   app.post('/api/uploads/echo', (req, res) => res.status(200).json(req.body));
   app.use(errorHandler);
   return app;
+}
+
+/** Boot `app` on an ephemeral port. */
+function startServer(app: express.Application): Promise<http.Server> {
+  return new Promise((resolve) => {
+    const server = app.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  return new Promise((resolve) => {
+    server.closeAllConnections?.();
+    server.close(() => resolve());
+  });
+}
+
+/** POST a complete, already-serialised (possibly binary) payload. */
+function postRaw(
+  port: number,
+  path: string,
+  payload: Buffer,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method: 'POST',
+        path,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': String(payload.length),
+          ...headers,
+        },
+      },
+      (res) => {
+        let data = '';
+        res.setEncoding('utf8');
+        res.on('data', (c: string) => {
+          data += c;
+        });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: data }));
+      },
+    );
+    req.on('error', reject);
+    req.end(payload);
+  });
 }
 
 describe('bodySizeLimitMiddleware — Content-Length fast path', () => {
@@ -73,35 +127,52 @@ describe('bodySizeLimitMiddleware - route limits', () => {
   
   it('allows larger raw payloads on webhooks route', async () => {
     const webhookLimit = ROUTE_LIMITS.find(r => r.pathPrefix === '/internal/webhooks')!.rawLimit;
-    const body = '{"a":1}';
+    // A real payload: bigger than the default limit, smaller than the route limit.
+    // (A Content-Length header without matching bytes would simply hang the read.)
+    const padding = 'x'.repeat(webhookLimit - 64);
+    const body = JSON.stringify({ data: padding });
+    expect(Buffer.byteLength(body)).toBeGreaterThan(DEFAULT_RAW_LIMIT_BYTES);
+    expect(Buffer.byteLength(body)).toBeLessThan(webhookLimit);
+
     const res = await request(app)
       .post('/internal/webhooks/echo')
       .set('Content-Type', 'application/json')
-      .set('Content-Length', String(webhookLimit))
       .send(body);
+
     expect(res.status).toBe(200);
   });
 });
 
 describe('dynamicJsonParser - compressed payloads', () => {
   const app = buildApp();
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    server = await startServer(app);
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await closeServer(server);
+  });
 
   it('rejects oversized decompressed bodies (zip bomb)', async () => {
     // We send a small compressed payload that expands to more than the decompressed limit.
     const largeBody = 'x'.repeat(DEFAULT_DECOMPRESSED_LIMIT_BYTES + 1024);
     const compressed = zlib.gzipSync(largeBody);
-    
+
     // The compressed size is well within the RAW limit
     expect(compressed.length).toBeLessThan(DEFAULT_RAW_LIMIT_BYTES);
 
-    const res = await request(app)
-      .post('/echo')
-      .set('Content-Type', 'application/json')
-      .set('Content-Encoding', 'gzip')
-      .send(compressed);
+    // Compressed bytes cannot go through supertest's JSON serialiser, and the
+    // wire path also proves the limit is applied to the *decompressed* stream.
+    const { status, body } = await postRaw(port, '/echo', compressed, {
+      'Content-Encoding': 'gzip',
+    });
 
-    // Express.json returns 413 when decompressed size exceeds limit
-    expect(res.status).toBe(413);
+    expect(status).toBe(413);
+    expect(JSON.parse(body).error.code).toBe('PAYLOAD_TOO_LARGE');
   });
 });
 
@@ -128,13 +199,29 @@ describe('jsonDepthMiddleware', () => {
   });
 
   it('rejects a body that exceeds the depth limit', async () => {
-    // Build an object nested 12 levels deep (> default 10).
+    // Build an object nested past MAX_JSON_DEPTH (20 by default).
     let deep: Record<string, unknown> = { value: 'leaf' };
-    for (let i = 0; i < 12; i++) deep = { child: deep };
+    for (let i = 0; i < 25; i++) deep = { child: deep };
 
     const res = await request(app).post('/echo').send(deep);
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('accepts a body that sits exactly at the depth limit', async () => {
+    const appAtLimit = express();
+    appAtLimit.use(express.json());
+    appAtLimit.use(jsonDepthMiddleware(5));
+    appAtLimit.post('/echo', (req, res) => res.status(200).json(req.body));
+    appAtLimit.use(errorHandler);
+
+    // 5 nested objects: depth 5 is allowed, depth 6 is not.
+    let atLimit: Record<string, unknown> = { value: 'leaf' };
+    for (let i = 0; i < 4; i++) atLimit = { child: atLimit };
+    expect(await request(appAtLimit).post('/echo').send(atLimit).then(r => r.status)).toBe(200);
+
+    const tooDeep: Record<string, unknown> = { child: atLimit };
+    expect(await request(appAtLimit).post('/echo').send(tooDeep).then(r => r.status)).toBe(400);
   });
 
   it('skips depth check for GET requests', async () => {

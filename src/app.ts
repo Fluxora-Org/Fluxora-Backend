@@ -35,6 +35,8 @@ import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import {
   bodySizeLimitMiddleware,
+  jsonDepthLimitMiddleware,
+  jsonDepthMiddleware,
   requestTimeoutMiddleware,
   dynamicJsonParser,
 } from './middleware/requestProtection.js';
@@ -531,9 +533,15 @@ export function createApp(options: AppOptions = {}): Express {
   // Registered before all routers so it wraps res.send for every route.
   app.use(responseSizeLimitMiddleware);
   app.use(bodySizeLimitMiddleware);
+  // #1468: refuse deeply nested JSON while the body is still being read, i.e.
+  // before express.json() materialises the whole object graph. The post-parse
+  // check below stays as a second line of defence (it also covers compressed
+  // bodies, which cannot be scanned on the wire).
+  app.use(jsonDepthLimitMiddleware(appConfig.maxJsonDepth));
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
   app.use(dynamicJsonParser);
+  app.use(jsonDepthMiddleware(appConfig.maxJsonDepth));
   app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);

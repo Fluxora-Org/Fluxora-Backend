@@ -35,7 +35,6 @@ describe('resolveRoute', () => {
     // A matched route is required for the label to be derived at all: an
     // unmatched request is labelled UNMATCHED_ROUTE (see above).
     const req = fakeReq({
-      baseUrl: '',
       route: { path: '/multiple///' },
       originalUrl: '/multiple///',
     });

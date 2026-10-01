@@ -16,17 +16,13 @@
  * The composed schema is unchanged in effect: it accepts and rejects exactly
  * the same inputs as the original single-file definition, verified by
  * `tests/config/env.schema-split.test.ts`.
+ *
+ * This module is therefore a thin re-export surface. It must not re-declare
+ * `EnvSchema` / `parseEnv` / `Config` / `ConfigError` / `EnvironmentError`:
+ * doing so duplicates the definitions in `env-config.ts` and makes the module
+ * unparseable ("Multiple exports with the same name").
  */
 import { parseEnv, getConfig } from './env-config.js';
- * The pre-split single-file implementation used to be duplicated here. It
- * redeclared `EnvSchema`, `ParsedEnv`, `Config`, `ConfigError`,
- * `EnvironmentError` and the parse/load singletons that this facade
- * re-exports, so the module exported the same names twice and could not be
- * compiled or imported. `env-config.ts` holds that implementation verbatim:
- * the composed schema accepts and rejects exactly the same inputs as the
- * original definition, verified by `tests/config/env.schema-split.test.ts`.
- */
-import { getConfig, parseEnv } from './env-config.js';
 
 export { EnvSchema } from './env-schema/schema.js';
 export type { ParsedEnv } from './env-schema/schema.js';
