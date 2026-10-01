@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * PII-aware Express middleware.
  *
@@ -129,7 +130,7 @@ export function safeErrorHandler(
 ): void {
   logger.error('unhandled error', req.correlationId as string, {
     error: redactKeysInString(err.message),
-    stack: process.env.NODE_ENV === 'production' ? undefined : redactKeysInString(err.stack || ''),
+    stack: getRuntimeEnv().NODE_ENV === 'production' ? undefined : redactKeysInString(err.stack || ''),
   });
 
   res.status(500).json(

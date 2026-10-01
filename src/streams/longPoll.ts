@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { longPollActiveConnectionsGauge, longPollConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 
 /**
@@ -104,7 +105,7 @@ function readBoundedPositiveInteger(
  * Fallbacks to SSE config if LONG_POLL env var is missing, ensuring backwards compatibility or unified limit control.
  */
 export function resolveLongPollConnectionLimits(
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = getRuntimeEnv(),
 ): LongPollConnectionLimits {
   const sseIp = readBoundedPositiveInteger(env, 'SSE_MAX_CONNECTIONS_PER_IP', DEFAULT_LONG_POLL_MAX_CONNECTIONS_PER_IP, 1, MAX_LONG_POLL_CONNECTION_LIMIT);
   const sseKey = readBoundedPositiveInteger(env, 'SSE_MAX_CONNECTIONS_PER_API_KEY', DEFAULT_LONG_POLL_MAX_CONNECTIONS_PER_API_KEY, 1, MAX_LONG_POLL_CONNECTION_LIMIT);

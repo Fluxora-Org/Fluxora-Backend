@@ -4,6 +4,13 @@
 
 Fluxora Backend uses a `pg.Pool` (node-postgres) for all database access. The pool is configured via environment variables and includes proactive exhaustion detection to prevent unbounded request queuing.
 
+Database access is centralized through two layers:
+
+1. **`src/db/pool.ts`** — Core pool infrastructure with timeout enforcement, error classification, and metrics
+2. **`src/db/client.ts`** — Application-facing `DatabaseClient` wrapper that delegates to the pool layer
+
+All queries go through the pool layer to ensure consistent timeout enforcement, observability, and error handling.
+
 ## Typed Row Mapping
 
 `pg.Pool.query<T>()` / `PoolClient.query<T>()` constrain `T` to `QueryResultRow` (an index signature). **Do not** pass bare domain interfaces (`ReplayCursor`, `ContractEvent`, `VacuumRow`, `StreamRecord`, …) as that generic — they fail `tsc` with `TS2344`.
@@ -92,6 +99,55 @@ Set `STATEMENT_TIMEOUT_MS=0` to skip the `SET statement_timeout` call entirely. 
 
 Using a parameterized query (`SET statement_timeout = $1`) prevents SQL injection. The timeout value is validated as a non-negative integer by the `integerEnv` schema helper before it reaches the pool.
 
+## Query Cancellation and Request Lifecycle
+
+### How Cancellation Works
+
+When a request is cancelled (e.g., client disconnects, HTTP request aborted), the in-flight database query should also be cancelled to free the connection back to the pool. This prevents "zombie queries" that continue consuming database resources after the caller has given up.
+
+### PostgreSQL Query Cancellation
+
+PostgreSQL supports query cancellation via the `pg_cancel_backend()` function, which sends a `SIGINT` to the backend process executing the query. The node-postgres driver exposes this through the `PoolClient`:
+
+```ts
+const client = await pool.connect();
+try {
+  // Start a long-running query
+  const queryPromise = client.query('SELECT pg_sleep(300)');
+  
+  // If the request is cancelled, we can't cancel the query directly,
+  // but statement_timeout will kill it automatically
+  await queryPromise;
+} finally {
+  client.release();
+}
+```
+
+### Statement Timeout as the Cancellation Mechanism
+
+Fluxora uses **statement_timeout as the primary cancellation mechanism** rather than explicit `pg_cancel_backend()` calls. This approach has several advantages:
+
+1. **Simplicity** — No need to track PIDs or maintain cancellation tokens
+2. **Reliability** — Timeout is enforced by PostgreSQL itself, not by application code
+3. **Consistency** — Every query has a bounded execution time, regardless of cancellation
+4. **Observability** — Timeouts are surfaced as `QueryTimeoutError` and tracked in metrics
+
+When a query exceeds `STATEMENT_TIMEOUT_MS`, PostgreSQL automatically cancels it with error code `57014`, which the pool layer maps to `QueryTimeoutError`.
+
+### Request Abortion
+
+When an HTTP request is aborted (client disconnect, load balancer timeout), Express may or may not propagate the cancellation to the database layer, depending on where the query is in its lifecycle:
+
+- **Before query starts** — The request handler throws early, query never executes
+- **Query in flight** — The query continues until `statement_timeout` fires or it completes naturally
+- **Query completes before timeout** — Result is discarded (client is gone)
+
+This is acceptable because `statement_timeout` bounds the resource consumption even when the client disconnects. No query can hold a connection indefinitely.
+
+### Testing Cancellation
+
+`tests/db/client.test.ts` validates that deliberately slow queries (`SELECT pg_sleep(10)`) are cancelled at the configured timeout bound and throw `QueryTimeoutError`, regardless of whether the client is still waiting for the result.
+
 ## Pool Exhaustion Detection
 
 ### How it works
@@ -158,6 +214,66 @@ Gauges are updated on every `connect`, `acquire`, and `remove` pool event.
 ## Caller Behaviour
 
 `PoolExhaustedError` should be mapped to an HTTP `503 Service Unavailable` response. `QueryTimeoutError` should be mapped to an HTTP `504 Gateway Timeout` response. Both are handled automatically by the error handler in `src/middleware/errorHandler.ts`.
+
+## DatabaseClient (Application Entry Point)
+
+`src/db/client.ts` exports a singleton `DatabaseClient` instance (`db`) that serves as the primary database interface for the application. It wraps the centralized pool infrastructure to ensure every query benefits from timeout enforcement, error classification, and observability.
+
+### Usage
+
+```ts
+import { db } from './db/client.js';
+
+// Simple query
+const result = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+
+// Get a client for transactions
+const client = await db.getClient();
+try {
+  await client.query('BEGIN');
+  await client.query('INSERT INTO ...');
+  await client.query('COMMIT');
+} finally {
+  client.release();
+}
+```
+
+### Guarantees
+
+Every query through `DatabaseClient` is automatically protected by:
+
+1. **Statement timeout enforcement** — Queries exceeding `STATEMENT_TIMEOUT_MS` are cancelled by PostgreSQL (error code `57014` → `QueryTimeoutError`)
+2. **Pool exhaustion detection** — Requests are fast-failed when the queue limit is reached (`PoolExhaustedError`)
+3. **Error classification** — Database errors are mapped to semantic error types:
+   - `QueryTimeoutError` (PG `57014`) → HTTP `504 Gateway Timeout`
+   - `PoolExhaustedError` → HTTP `503 Service Unavailable`
+   - `DuplicateEntryError` (PG `23505`) → HTTP `409 Conflict`
+4. **Observability** — Slow queries, timeouts, and errors are logged and exposed as Prometheus metrics
+
+### Why Use DatabaseClient?
+
+Calling `pool.query()` directly bypasses all timeout enforcement, metrics, and error classification. The pool's raw `.query()` method does not apply the statement timeout or record telemetry — those are implemented in the `query()` helper function exported from `src/db/pool.ts`, which `DatabaseClient` uses internally.
+
+**✅ Correct:**
+```ts
+import { db } from './db/client.js';
+await db.query('SELECT 1'); // ✓ timeout enforced, metrics recorded
+```
+
+**❌ Incorrect:**
+```ts
+import { getPool } from './db/pool.js';
+const pool = getPool();
+await pool.query('SELECT 1'); // ✗ bypasses timeout, no metrics
+```
+
+### Testing
+
+`tests/db/client.test.ts` validates:
+- Query timeout enforcement (deliberate slow queries are cancelled)
+- Error classification (timeouts distinguished from connection errors)
+- Metrics tracking (`dbQueryErrorsTotal`, `dbSlowQueriesTotal`)
+- Connection lifecycle (getClient, close)
 
 ## Operator Runbook
 

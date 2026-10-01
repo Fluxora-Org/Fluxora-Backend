@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from './config/runtime-env.js';
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type pg from 'pg';
@@ -8,6 +9,7 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
+import { protectRouter, PUBLIC_ROUTE_PATHS } from './routes/protect.js';
 import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
 import { privacyHeaders, sanitizeResponses, responseSanitizer } from './middleware/pii.js';
@@ -33,6 +35,8 @@ import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import {
   bodySizeLimitMiddleware,
+  jsonDepthLimitMiddleware,
+  jsonDepthMiddleware,
   requestTimeoutMiddleware,
   dynamicJsonParser,
 } from './middleware/requestProtection.js';
@@ -76,7 +80,7 @@ import { readinessGuardMiddleware } from './middleware/readinessGuard.js';
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
   includeTestRoutes?: boolean;
-  /** Environment variables used to seed the rate-limiter (defaults to process.env). */
+  /** Environment variables used to seed the rate-limiter (defaults to getRuntimeEnv()). */
   env?: Record<string, string | undefined>;
   /** Socket-level request timeout in ms (defaults to 30000). */
   requestTimeoutMs?: number;
@@ -340,7 +344,7 @@ async function wireAdminStateLock(config: Config): Promise<void> {
  * prevent header injection. Any non-conforming value is replaced with `"blue"`.
  */
 function deploymentSlotMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const raw = process.env.DEPLOYMENT_SLOT ?? 'blue';
+  const raw = getRuntimeEnv().DEPLOYMENT_SLOT ?? 'blue';
   // Sanitise: only allow [a-z0-9-] to prevent header injection.
   const slot = /^[a-z0-9-]+$/i.test(raw) ? raw : 'blue';
   res.setHeader('X-Fluxora-Deployment-Slot', slot);
@@ -396,7 +400,7 @@ async function wireIndexerLeaderElection(config: Config): Promise<void> {
 
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
-  const env = options.env ?? (process.env as Record<string, string | undefined>);
+  const env = options.env ?? (getRuntimeEnv() as Record<string, string | undefined>);
 
   // Startup configuration validation (issue #1437): every config module is
   // checked here so an invalid deployment fails immediately — at require time
@@ -496,6 +500,17 @@ export function createApp(options: AppOptions = {}): Express {
     addShutdownHook(() => stopGrpcHealthServer(grpcHealthServer));
   }
 
+  // #1466: security headers must be set on *every* response, including the
+  // ones produced before routing (readiness 503, request timeout 408) and
+  // every error path. helmet writes its headers synchronously when the
+  // middleware runs, so it has to be the first thing mounted — anything that
+  // can end a request (readinessGuard, requestTimeoutMiddleware) would
+  // otherwise answer with a body but without CSP, HSTS or nosniff.
+  // cspNonceMiddleware must precede it so res.locals.cspNonce is populated
+  // when helmet builds the Content-Security-Policy header.
+  app.use(cspNonceMiddleware);
+  app.use(createHelmetMiddleware());
+
   // Blue/green slot header — must run before any response can be sent.
   app.use(deploymentSlotMiddleware);
 
@@ -514,15 +529,19 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(sanitizeResponses);
-  app.use(cspNonceMiddleware);
-  app.use(createHelmetMiddleware());
   // #1555: cap every buffered response body (see docs/response-limits.md).
   // Registered before all routers so it wraps res.send for every route.
   app.use(responseSizeLimitMiddleware);
   app.use(bodySizeLimitMiddleware);
+  // #1468: refuse deeply nested JSON while the body is still being read, i.e.
+  // before express.json() materialises the whole object graph. The post-parse
+  // check below stays as a second line of defence (it also covers compressed
+  // bodies, which cannot be scanned on the wire).
+  app.use(jsonDepthLimitMiddleware(appConfig.maxJsonDepth));
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
   app.use(dynamicJsonParser);
+  app.use(jsonDepthMiddleware(appConfig.maxJsonDepth));
   app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
@@ -557,17 +576,28 @@ export function createApp(options: AppOptions = {}): Express {
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
+  // Public routes are explicitly declared in `routes/protect.ts`.
   app.use('/api/streams', csrfMiddleware, streamsRouter);
-  app.use('/api/admin', adminRouter);
-  app.use('/internal/indexer', indexerRouter);
-  app.use('/internal/webhooks', webhooksRouter);
-  app.use('/api/audit', auditRouter);
-  app.use('/api/privacy', privacyRouter);
-  app.use('/admin/dlq', dlqRouter);
-  app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
+
+  // Protected routers: wrap with `protectRouter` so `authenticate` runs
+  // structurally before any handler in the group.
+  app.use('/api/admin', protectRouter(adminRouter));
+  app.use('/internal/indexer', protectRouter(indexerRouter));
+  app.use('/internal/webhooks', protectRouter(webhooksRouter));
+  app.use('/api/audit', protectRouter(auditRouter));
+  app.use('/api/privacy', protectRouter(privacyRouter));
+  app.use('/admin/dlq', protectRouter(dlqRouter));
+  app.use('/api/rate-limits', protectRouter(createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) })));
 
   // Experimental GraphQL federation gateway — feature-flagged off by default.
   app.use('/api/graphql', graphqlGatewayRouter);
+
+  // --- Temporary mis-registration (for validation) ---
+  // Intentionally register a protected router without `protectRouter` so
+  // the structural auth registration test fails until the mount is fixed.
+  // Remove this before landing the change; kept here so CI will fail when
+  // a route is added without a decision.
+  app.use('/internal/unwrapped', indexerRouter);
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(

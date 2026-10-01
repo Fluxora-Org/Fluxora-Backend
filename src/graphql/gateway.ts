@@ -43,7 +43,7 @@ import {
 import { createHash } from 'node:crypto';
 import { executableSchema, typeDefs } from './schema.js';
 import { isEnabled } from '../config/featureFlags.js';
-import { requireAuth } from '../middleware/auth.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
 import { streamRepository } from '../db/repositories/streamRepository.js';
 import type { StreamFilter, StreamStatus } from '../db/types.js';
 import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';

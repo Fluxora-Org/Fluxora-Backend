@@ -99,7 +99,12 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
   }
 
   if (!healthManager) {
-    res.status(503).json(errorResponse('SERVICE_UNAVAILABLE', 'Health manager not configured', { dependencies: {} }));
+    const envelope = errorResponse('SERVICE_UNAVAILABLE', 'Health manager not configured', { dependencies: {} });
+    res.status(503).json({
+      ...envelope,
+      status: 'unhealthy',
+      dependencies: {},
+    });
     return;
   }
 
@@ -121,11 +126,11 @@ healthRouter.get('/ready', async (req: Request, res: Response): Promise<void> =>
         })),
       });
       // 503 for unhealthy or unacceptably degraded
-      res.status(503).json(errorResponse('HEALTH_CHECK_ERROR', reason ?? 'Service is not ready', {
+      res.status(503).json({
         status,
         version: report.version,
         dependencies,
-      }));
+      });
       return;
     }
 

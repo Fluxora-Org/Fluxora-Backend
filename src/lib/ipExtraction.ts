@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import type { IncomingMessage } from 'node:http';
 
 export interface ClientIpOptions {
@@ -85,7 +86,7 @@ export function getClientIp(req: IncomingMessage, options?: ClientIpOptions): st
   }
 
   let trustProxy =
-    options?.trustProxy ?? (process.env.RATE_LIMIT_TRUST_PROXY !== 'false');
+    options?.trustProxy ?? (getRuntimeEnv().RATE_LIMIT_TRUST_PROXY !== 'false');
 
   // Check Express app-level trust proxy setting if present
   const expressTrustProxy = (req as { app?: { get?: (k: string) => unknown } }).app?.get?.(
@@ -113,9 +114,9 @@ export function getClientIp(req: IncomingMessage, options?: ClientIpOptions): st
         : parseTrustedProxies(options.trustedProxies.join(','));
   } else {
     const envProxies =
-      process.env.TRUSTED_PROXIES ||
-      process.env.WS_TRUSTED_PROXIES ||
-      process.env.RATE_LIMIT_TRUSTED_PROXIES ||
+      getRuntimeEnv().TRUSTED_PROXIES ||
+      getRuntimeEnv().WS_TRUSTED_PROXIES ||
+      getRuntimeEnv().RATE_LIMIT_TRUSTED_PROXIES ||
       '';
     trustedProxies = parseTrustedProxies(envProxies);
 
@@ -133,9 +134,9 @@ export function getClientIp(req: IncomingMessage, options?: ClientIpOptions): st
   let trustedProxyCount =
     options?.trustedProxyCount ??
     parseInt(
-      process.env.TRUSTED_PROXY_COUNT ||
-        process.env.TRUST_PROXY_HOPS ||
-        process.env.RATE_LIMIT_TRUSTED_PROXY_COUNT ||
+      getRuntimeEnv().TRUSTED_PROXY_COUNT ||
+        getRuntimeEnv().TRUST_PROXY_HOPS ||
+        getRuntimeEnv().RATE_LIMIT_TRUSTED_PROXY_COUNT ||
         '0',
       10
     );

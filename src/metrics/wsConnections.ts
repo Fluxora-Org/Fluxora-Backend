@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
 
@@ -30,6 +31,6 @@ export const wsMaxConnectionsPerIpGauge = new Gauge({
  * Called at startup and whenever env might change.
  */
 export function updateMaxConnectionsGauge(): void {
-  const maxConnections = parseInt(process.env.WS_MAX_CONNECTIONS_PER_IP || '10', 10);
+  const maxConnections = parseInt(getRuntimeEnv().WS_MAX_CONNECTIONS_PER_IP || '10', 10);
   wsMaxConnectionsPerIpGauge.set(maxConnections);
 }
