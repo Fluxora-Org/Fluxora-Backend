@@ -23,6 +23,7 @@ const mockRepo = vi.hoisted(() => ({
   recordReplayFailure:    vi.fn(),
   recordReplaySuccess:    vi.fn(),
   resumeConsumer:         vi.fn(),
+  replayEntry:            vi.fn(),
 }));
 
 vi.mock('../src/db/repositories/dlqRepository.js', () => ({
@@ -92,6 +93,7 @@ beforeEach(() => {
   mockRepo.recordReplayFailure.mockResolvedValue(SUSPENSION_HEALTHY);
   mockRepo.resumeConsumer.mockResolvedValue(null);
   mockRepo.insert.mockResolvedValue(undefined);
+  mockRepo.replayEntry.mockResolvedValue(true);
 });
 
 afterEach(() => { _resetAuditLog(); });
@@ -245,7 +247,7 @@ describe('Webhook Dead-Letter Queue', () => {
       .expect(200);
 
     expect(res.body.data.message).toBe('DLQ entry replayed');
-    expect(mockRepo.update).toHaveBeenCalledWith('dlq-001', expect.objectContaining({ attempts: 0 }));
+    expect(mockRepo.replayEntry).toHaveBeenCalledWith('dlq-001', expect.objectContaining({ attempts: 0 }));
     expect(mockRepo.recordReplaySuccess).toHaveBeenCalledWith('stream.created');
   });
 
@@ -259,7 +261,7 @@ describe('Webhook Dead-Letter Queue', () => {
       .expect(409);
 
     expect(res.body.error.code).toBe('CONSUMER_SUSPENDED');
-    expect(mockRepo.update).not.toHaveBeenCalled();
+    expect(mockRepo.replayEntry).not.toHaveBeenCalled();
   });
 
   it('POST /admin/dlq/:id/replay → 404 for unknown entry', async () => {
