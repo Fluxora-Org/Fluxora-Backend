@@ -22,7 +22,7 @@ If the resulting count exceeds the configured limit the request is rejected with
 | Class | File | Description |
 |---|---|---|
 | `SlidingWindowStore` | `src/redis/rateLimitStore.ts` | Redis sorted-set pipeline. Primary backend. |
-| `InMemoryStore` | `src/redis/rateLimitStore.ts` | Per-process counter map. Used as fallback. |
+| `InMemoryStore` | `src/redis/rateLimitStore.ts` | Per-process **sliding-window** counter map. Used as fallback and when Redis is disabled. |
 | `HybridStore` | `src/redis/rateLimitStore.ts` | Wraps primary + fallback; delegates to fallback on Redis errors. |
 
 All three implement the `RateLimitStore` interface (`src/types/rateLimit.ts`):
@@ -34,6 +34,17 @@ interface RateLimitStore {
   close(): Promise<void>;
 }
 ```
+
+### Store contract
+
+Every store honours the same contract:
+
+| Aspect | Contract |
+|---|---|
+| **Key scope** | `key` is the fully-qualified storage key built by the middleware (`{principalType}:{identifier}:{route}`). Stores never merge or broaden keys — two principals always get two counters. `SlidingWindowStore` sanitises the key into `fluxora:rl:{sanitisedKey}` (characters outside `[A-Za-z0-9._-]` become `_`, truncated to 256 chars); `InMemoryStore` stores it verbatim because the key never leaves the process. |
+| **Expiry / lifetime** | A request is counted only while it is inside `windowMs`. `SlidingWindowStore` prunes members with `ZREMRANGEBYSCORE` on every write and refreshes `PEXPIRE {windowMs}`, so the Redis key expires one window after the last request. `InMemoryStore` prunes timestamps older than the window, drops fully-elapsed buckets on access, and periodically sweeps the rest. Entries therefore cannot outlive their window. |
+| **Sliding, not fixed** | Both stores implement a genuine sliding window. A burst at the end of one window plus a burst at the start of the next cannot exceed the configured limit — unlike a fixed window, which admits up to twice the rate across a boundary. |
+| **Unavailable** | `SlidingWindowStore` throws on a pipeline failure or after `close()`. `HybridStore` catches that, reports it via `onError`, sets `usingFallback`, and delegates to the always-available `InMemoryStore`, which enforces the same sliding-window limit per process. |
 
 ---
 
@@ -88,7 +99,9 @@ On HTTP 429 responses, an additional header is set:
 
 ## Fallback behaviour
 
-When Redis is unavailable (connection error, timeout, etc.) the `HybridStore` catches the error, logs a `warn`-level message, increments the `rate_limit_redis_errors_total` Prometheus counter, and delegates to the `InMemoryStore` for that request.
+When Redis is unavailable (connection error, timeout, partial pipeline failure, or a closed store) the `HybridStore` catches the error, logs a `warn`-level message, increments the `rate_limit_redis_errors_total` Prometheus counter, and delegates to the `InMemoryStore` for that request.
+
+The fallback is itself a genuine sliding window, so a Redis outage does not weaken the rate-limit guarantee from sliding to fixed-window: the degraded per-process limit still cannot admit twice the configured rate across a window boundary.
 
 While operating in fallback mode:
 - `X-RateLimit-Store: memory` is set on every response

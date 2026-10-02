@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Structured JSON logger.
  *
@@ -20,6 +21,13 @@ import { getCorrelationId } from '../tracing/middleware.js';
 import { forwardToOtel } from '../tracing/logsBridge.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+/**
+ * Fields that every structured log record must retain for log consumers.
+ * Optional correlation and metadata fields may be added without changing
+ * this compatibility contract.
+ */
+export const LOGGER_CORE_FIELDS = ['timestamp', 'level', 'message'] as const;
 
 export interface LogRecord {
   timestamp: string;
@@ -55,9 +63,9 @@ export function isLogLevel(value: unknown): value is LogLevel {
  * environments default to `debug`, so nothing is silently dropped there.
  */
 function resolveInitialLogLevel(): LogLevel {
-  const configured = process.env.LOG_LEVEL;
+  const configured = getRuntimeEnv().LOG_LEVEL;
   if (isLogLevel(configured)) return configured;
-  return process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging'
+  return getRuntimeEnv().NODE_ENV === 'production' || getRuntimeEnv().NODE_ENV === 'staging'
     ? 'info'
     : 'debug';
 }
@@ -155,26 +163,62 @@ function splitContext(context: LogContext = {}): { correlationId?: string; meta?
   return { correlationId, meta };
 }
 
-export function info(message: string, context: LogContext = {}): void {
-  const { correlationId, meta } = splitContext(context);
-  write('info', message, correlationId, meta);
-}
-
-export function warn(message: string, context: LogContext = {}): void {
-  const { correlationId, meta } = splitContext(context);
-  write('warn', message, correlationId, meta);
-}
-
-export function error(message: string, context: LogContext = {}, err?: Error): void {
-  const { correlationId, meta } = splitContext(context);
-  write('error', message, correlationId, { ...meta, ...(err ? { error: sanitizeError(err) } : {}) });
-}
-
-export function debug(message: string, context: LogContext = {}): void {
-  if (process.env.LOG_LEVEL === 'debug') {
-    const { correlationId, meta } = splitContext(context);
-    write('debug', message, correlationId, meta);
+function normalizeLogArguments(
+  correlationOrContext?: string | LogContext,
+  meta?: Record<string, unknown>,
+): { correlationId?: string; meta?: Record<string, unknown> } {
+  if (typeof correlationOrContext === 'string') {
+    return { correlationId: correlationOrContext, meta };
   }
+
+  if (correlationOrContext && typeof correlationOrContext === 'object') {
+    const { correlationId, ...rest } = correlationOrContext as LogContext;
+    const mergedMeta = Object.keys(rest).length > 0 ? (rest as Record<string, unknown>) : meta;
+    return {
+      correlationId: typeof correlationId === 'string' ? correlationId : undefined,
+      meta: mergedMeta,
+    };
+  }
+
+  return { meta };
+}
+
+export function info(message: string, correlationOrContext?: string | LogContext, meta?: Record<string, unknown>): void {
+  const { correlationId, meta: resolvedMeta } = normalizeLogArguments(correlationOrContext, meta);
+  write('info', message, correlationId, resolvedMeta);
+}
+
+export function warn(message: string, correlationOrContext?: string | LogContext, meta?: Record<string, unknown>): void {
+  const { correlationId, meta: resolvedMeta } = normalizeLogArguments(correlationOrContext, meta);
+  write('warn', message, correlationId, resolvedMeta);
+}
+
+export function error(
+  message: string,
+  correlationOrContext?: string | LogContext,
+  errOrMeta?: Error | Record<string, unknown>,
+  maybeMeta?: Record<string, unknown>,
+): void {
+  const normalized = normalizeLogArguments(
+    typeof correlationOrContext === 'string' || correlationOrContext && typeof correlationOrContext === 'object'
+      ? correlationOrContext
+      : undefined,
+    typeof errOrMeta === 'object' && errOrMeta !== null && !(errOrMeta instanceof Error)
+      ? errOrMeta
+      : maybeMeta,
+  );
+
+  const finalMeta =
+    typeof errOrMeta === 'object' && errOrMeta !== null && errOrMeta instanceof Error
+      ? { ...(normalized.meta ?? {}), error: sanitizeError(errOrMeta) }
+      : { ...(normalized.meta ?? {}), ...(errOrMeta && typeof errOrMeta === 'object' && !(errOrMeta instanceof Error) ? errOrMeta : {}) };
+
+  write('error', message, normalized.correlationId, finalMeta);
+}
+
+export function debug(message: string, correlationOrContext?: string | LogContext, meta?: Record<string, unknown>): void {
+  const { correlationId, meta: resolvedMeta } = normalizeLogArguments(correlationOrContext, meta);
+  write('debug', message, correlationId, resolvedMeta);
 }
 
 export const SerializationLogger = {
@@ -187,17 +231,21 @@ export const SerializationLogger = {
 };
 
 export const logger = {
-  debug(message: string, correlationId?: string, meta?: Record<string, unknown>): void {
-    write('debug', message, correlationId, meta);
+  debug(message: string, correlationOrContext?: string | LogContext, meta?: Record<string, unknown>): void {
+    const { correlationId, meta: resolvedMeta } = normalizeLogArguments(correlationOrContext, meta);
+    write('debug', message, correlationId, resolvedMeta);
   },
-  info(message: string, correlationId?: string, meta?: Record<string, unknown>): void {
-    write('info', message, correlationId, meta);
+  info(message: string, correlationOrContext?: string | LogContext, meta?: Record<string, unknown>): void {
+    const { correlationId, meta: resolvedMeta } = normalizeLogArguments(correlationOrContext, meta);
+    write('info', message, correlationId, resolvedMeta);
   },
-  warn(message: string, correlationId?: string, meta?: Record<string, unknown>): void {
-    write('warn', message, correlationId, meta);
+  warn(message: string, correlationOrContext?: string | LogContext, meta?: Record<string, unknown>): void {
+    const { correlationId, meta: resolvedMeta } = normalizeLogArguments(correlationOrContext, meta);
+    write('warn', message, correlationId, resolvedMeta);
   },
-  error(message: string, correlationId?: string, meta?: Record<string, unknown>): void {
-    write('error', message, correlationId, meta);
+  error(message: string, correlationOrContext?: string | LogContext, meta?: Record<string, unknown>): void {
+    const { correlationId, meta: resolvedMeta } = normalizeLogArguments(correlationOrContext, meta);
+    write('error', message, correlationId, resolvedMeta);
   },
   /**
    * Emit a SIEM-compatible OCSF slow-query log entry (OCSF Database Activity, class_uid 5001).
@@ -230,4 +278,3 @@ export const logger = {
 };
 
 export type Logger = typeof logger;
-

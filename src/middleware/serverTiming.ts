@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import type { NextFunction, Request, Response } from 'express';
 import crypto from 'node:crypto';
 
@@ -86,7 +87,7 @@ export interface ServerTimingOptions {
   enabled?: boolean;
   /**
    * Explicitly set whether the middleware operates in production mode.
-   * Defaults to process.env.NODE_ENV === 'production'.
+   * Defaults to getRuntimeEnv().NODE_ENV === 'production'.
    */
   isProduction?: boolean;
   /**
@@ -105,7 +106,7 @@ export interface ServerTimingOptions {
   nameMap?: Record<string, string>;
   /**
    * Force masking of component names even in non-production environments.
-   * Defaults to process.env.SERVER_TIMING_MASK_COMPONENTS === 'true'.
+   * Defaults to getRuntimeEnv().SERVER_TIMING_MASK_COMPONENTS === 'true'.
    */
   maskComponentNames?: boolean;
 }
@@ -152,19 +153,9 @@ export function isProductionEnvironment(env: NodeJS.ProcessEnv | undefined): boo
  * with administrative/timing scopes, and holders of the configured ADMIN_API_KEY
  * or SERVER_TIMING_SECRET.
  */
-interface AuthenticatedRequestLike {
-  user?: {
-    role?: unknown;
-    permissions?: unknown;
-  };
-  keyScopes?: unknown;
-}
-
 export function isAuthorizedTimingCaller(req: Request): boolean {
-  const authReq = req as unknown as AuthenticatedRequestLike;
-
   // 1. Check req.user if populated by JWT auth middleware
-  const user = authReq.user;
+  const user = req.user;
   if (user) {
     if (user.role === 'admin' || user.role === 'operator' || user.role === 'data-protection-officer') {
       return true;
@@ -178,7 +169,7 @@ export function isAuthorizedTimingCaller(req: Request): boolean {
   }
 
   // 2. Check req.keyScopes if populated by API key auth middleware
-  const keyScopes = authReq.keyScopes;
+  const keyScopes = req.keyScopes;
   if (Array.isArray(keyScopes)) {
     if (
       keyScopes.includes('admin') ||
@@ -196,13 +187,13 @@ export function isAuthorizedTimingCaller(req: Request): boolean {
     const token = authHeader.slice(7).trim();
 
     // Check against ADMIN_API_KEY
-    const adminKey = process.env.ADMIN_API_KEY;
+    const adminKey = getRuntimeEnv().ADMIN_API_KEY;
     if (adminKey && token.length === adminKey.length && timingSafeEqual(token, adminKey)) {
       return true;
     }
 
     // Check against SERVER_TIMING_SECRET / SERVER_TIMING_KEY
-    const timingSecret = process.env.SERVER_TIMING_SECRET || process.env.SERVER_TIMING_KEY;
+    const timingSecret = getRuntimeEnv().SERVER_TIMING_SECRET || getRuntimeEnv().SERVER_TIMING_KEY;
     if (timingSecret && token.length === timingSecret.length && timingSafeEqual(token, timingSecret)) {
       return true;
     }
@@ -212,7 +203,7 @@ export function isAuthorizedTimingCaller(req: Request): boolean {
   // 4. Check dedicated X-Server-Timing-Key or X-Timing-Key request header
   const timingKeyHeader = req.headers['x-server-timing-key'] ?? req.headers['x-timing-key'];
   if (typeof timingKeyHeader === 'string' && timingKeyHeader.length <= MAX_AUTH_HEADER_LENGTH) {
-    const secret = process.env.SERVER_TIMING_SECRET || process.env.SERVER_TIMING_KEY || process.env.ADMIN_API_KEY;
+    const secret = getRuntimeEnv().SERVER_TIMING_SECRET || getRuntimeEnv().SERVER_TIMING_KEY || getRuntimeEnv().ADMIN_API_KEY;
     if (secret && timingKeyHeader.length === secret.length && timingSafeEqual(timingKeyHeader, secret)) {
       return true;
     }
@@ -324,9 +315,9 @@ export function applyServerTimingHeader(
     return;
   }
 
-  const isProd = options?.isProduction ?? isProductionEnvironment(process.env);
+  const isProd = options?.isProduction ?? isProductionEnvironment(getRuntimeEnv());
   const shouldMask =
-    isProd || options?.maskComponentNames === true || process.env.SERVER_TIMING_MASK_COMPONENTS === 'true';
+    isProd || options?.maskComponentNames === true || getRuntimeEnv().SERVER_TIMING_MASK_COMPONENTS === 'true';
 
   if (isProd) {
     // In production configuration:
@@ -389,7 +380,7 @@ export function getServerTimingRegistry(res: Response): ServerTimingRegistry {
     return state.registry;
   }
 
-  if (!isEnabled(process.env)) {
+  if (!isEnabled(getRuntimeEnv())) {
     return createNoopRegistry();
   }
 
@@ -420,7 +411,7 @@ export function serverTimingMiddleware(
   options?: ServerTimingOptions,
 ): (req: Request, res: Response, next: NextFunction) => void {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const enabled = options?.enabled ?? isEnabled(process.env);
+    const enabled = options?.enabled ?? isEnabled(getRuntimeEnv());
     if (!enabled) {
       next();
       return;

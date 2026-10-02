@@ -628,14 +628,17 @@ The degradation middleware does **not** modify response bodies. All amount field
 
 ### Overview
 
-Cross-Origin Resource Sharing (CORS) is enforced by `corsAllowlistMiddleware` in `src/middleware/cors.ts`, applied globally before all routes. The policy differs between development and production environments.
+Cross-Origin Resource Sharing (CORS) is enforced by `corsAllowlistMiddleware` in `src/middleware/cors.ts`, applied globally before all routes. Credentialed requests are permitted only for exact origins in the configured allowlist.
 
 ### Environment Behaviour
 
-| Environment | Allowed origins | Preflight result |
-|-------------|-----------------|------------------|
-| Non-production (`NODE_ENV !== 'production'`) | Any origin | `204 No Content` with full CORS headers |
-| Production | Origins listed in `CORS_ALLOWED_ORIGINS` | `204 No Content` if allowed; `403` if denied |
+| Environment and configuration | Origin policy | Credentialed response sharing |
+|-------------------------------|---------------|---------------------------|
+| Non-production with no allowlist or `*` | Any origin with `Access-Control-Allow-Origin: *` | Not granted |
+| Non-production with an exact allowlist | Exact allowlist entries only | Granted |
+| Production | Exact `CORS_ALLOWED_ORIGINS` entries only; unset denies all origins | Granted |
+
+Global wildcard and wildcard-subdomain entries never receive credential permission. Production configuration containing `*` is rejected at startup, and the middleware also denies wildcard entries as a defense in depth.
 
 ### Configuration
 
@@ -645,31 +648,37 @@ Set `CORS_ALLOWED_ORIGINS` as a comma-separated list of exact origin strings:
 CORS_ALLOWED_ORIGINS=https://app.fluxora.io,https://ops.fluxora.io
 ```
 
+- Entries use exact origin matching; schemes, hosts, and ports are not inferred or expanded.
+- Wildcard and subdomain-pattern entries are not valid credentialed origins.
+- Opaque `null` origins are always denied, even if present in the allowlist.
 - Whitespace around each entry is trimmed automatically.
-- An empty or unset value means **no origin is allowed** in production.
+- An empty or unset value means **no origin is allowed** in production. Set an explicit list in non-production when browser credentials are required.
 
 ### Response Headers
 
 | Header | When present | Value |
 |--------|-------------|-------|
-| `Access-Control-Allow-Origin` | Origin is allowed | Echoed request `Origin` value |
+| `Access-Control-Allow-Origin` | Exact origin is allowed | Echoed request `Origin` value |
+| `Access-Control-Allow-Origin` | Non-production wildcard mode is active | `*` |
+| `Access-Control-Allow-Credentials` | Exact origin is allowed | `true`; never present with wildcard origin permission |
 | `Vary` | Origin is allowed | `Origin` |
 | `Access-Control-Allow-Methods` | Origin is allowed | `GET,POST,PUT,PATCH,DELETE,OPTIONS` |
 | `Access-Control-Allow-Headers` | Origin is allowed | Echoed `Access-Control-Request-Headers` if present; otherwise `Content-Type,Authorization,X-Correlation-ID` |
-| `Access-Control-Max-Age` | Preflight only | `86400` (24 hours) |
+| `Access-Control-Max-Age` | Allowed preflight only | `86400` (24 hours) |
 
 ### Preflight Handling
 
-A preflight request is an `OPTIONS` request that carries an `Origin` header.
+A preflight request is an `OPTIONS` request that carries an `Origin` header. It uses the same origin decision and permission headers as the corresponding actual request, with `Access-Control-Max-Age` added.
 
-- **Allowed origin** → `204 No Content` with all CORS headers including `Access-Control-Max-Age: 86400`.
-- **Denied origin** → `403 Forbidden` with body `{ "error": { "code": "CORS_ORIGIN_DENIED", "message": "Origin is not allowed by CORS policy" } }`.
-- **No `Origin` header** → `204 No Content` with no CORS headers (non-browser probe; passes through).
+- **Allowed exact origin** → `204 No Content`; the request origin is echoed and `Access-Control-Allow-Credentials: true` is present.
+- **Non-production wildcard mode** → `204 No Content` with `Access-Control-Allow-Origin: *` and no credentials header.
+- **Denied origin** → `403 Forbidden` with body `{ "error": { "code": "CORS_ORIGIN_DENIED", "message": "Origin is not allowed by CORS policy" } }` and no CORS permission headers.
+- **No `Origin` header** → `204 No Content` with no CORS permission headers.
 
 ### Non-Preflight Requests
 
-- **Allowed origin** → CORS headers are set; request continues to the route handler.
-- **Denied origin** → No CORS headers; request continues to the route handler (browser will block the response client-side).
+- **Allowed origin** → The same origin, credential, method, and header permissions are set; the request continues to the route handler.
+- **Denied origin** → No CORS permission headers; the request continues to the route handler and the browser blocks cross-origin response access. CORS is not an authorization mechanism.
 - **No `Origin` header** → Request continues to the route handler unchanged.
 
 ### Failure Modes
@@ -677,20 +686,23 @@ A preflight request is an `OPTIONS` request that carries an `Origin` header.
 | Condition | Expected behaviour |
 |-----------|-------------------|
 | `CORS_ALLOWED_ORIGINS` unset in production | All origins denied; preflight returns `403` |
-| Origin not in allowlist (preflight) | `403` with `CORS_ORIGIN_DENIED` |
-| Origin not in allowlist (non-preflight) | No CORS headers; browser enforces same-origin policy |
+| Wildcard entry in production | Startup validation fails; middleware also emits no CORS permission headers |
+| Origin not in allowlist (preflight) | `403` with `CORS_ORIGIN_DENIED` and no CORS permission headers |
+| Origin not in allowlist (non-preflight) | No CORS permission headers; browser enforces same-origin policy |
 | `OPTIONS` without `Origin` | `204` — treated as a non-browser probe |
 
 ### Security Notes
 
-- Origins are matched exactly (no wildcard or prefix matching in production).
-- The `Vary: Origin` header is always set when an origin is allowed, preventing CDN caching of origin-specific responses.
-- `Access-Control-Allow-Headers` echoes the client's `Access-Control-Request-Headers` to avoid blocking legitimate custom headers while still requiring the browser to declare them.
-- `Access-Control-Max-Age: 86400` reduces preflight round-trips without weakening security.
+- Credentialed origins are exact allowlist entries, never global or subdomain wildcards.
+- CORS controls browser response sharing, not cross-site request forgery protection; side-effecting endpoints still require appropriate CSRF defenses.
+- Preflight and actual requests share the same allow decision and response permissions.
+- Disallowed origins receive no `Access-Control-Allow-*` or preflight caching headers.
+- The `Vary: Origin` header is set when an origin is allowed, preventing CDN caching of origin-specific responses.
+- `Access-Control-Max-Age: 86400` reduces preflight round-trips without weakening origin or credential policy.
 
 ### Verification Evidence
 
-- Automated tests: `tests/cors.test.ts` (16 cases, ≥95% coverage of `src/middleware/cors.ts`)
+- Automated tests: `tests/cors.test.ts`
 
 ---
 
@@ -698,7 +710,28 @@ A preflight request is an `OPTIONS` request that carries an `Origin` header.
 
 ### Overview
 
-The CSP is enforced by `createHelmetMiddleware` in `src/middleware/helmet.ts`, applied globally before all routes. A per-request nonce is generated by `cspNonceMiddleware` (mounted immediately before helmet) and embedded in the `Content-Security-Policy` header on every response.
+The CSP is enforced by `createHelmetMiddleware` in `src/middleware/helmet.ts`. A per-request nonce is generated by `cspNonceMiddleware` (mounted immediately before helmet) and embedded in the `Content-Security-Policy` header on every response.
+
+`cspNonceMiddleware` and `createHelmetMiddleware` are the **first two middleware mounted on the app**, ahead of `readinessGuardMiddleware` and `requestTimeoutMiddleware`. helmet writes its headers synchronously as the middleware runs, so any middleware that can end a request before the routers are reached — the readiness guard's 503, the request timeout's 408 — would otherwise answer with a body but no CSP, HSTS or `nosniff`. Mounting helmet first is what makes "every response" true rather than "every response that reached a route".
+
+### Security Headers Emitted
+
+The complete set asserted on every response. A missing or altered entry fails `tests/helmet.test.ts`.
+
+| Header | Value |
+|--------|-------|
+| `Content-Security-Policy` | Strict policy, see directives below |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `SAMEORIGIN` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `X-XSS-Protection` | `0` (disabled; CSP supersedes the legacy auditor) |
+| `X-DNS-Prefetch-Control` | `off` |
+| `X-Download-Options` | `noopen` |
+| `X-Permitted-Cross-Domain-Policies` | `none` |
+| `Cross-Origin-Opener-Policy` | `same-origin` |
+| `Cross-Origin-Resource-Policy` | `same-origin` |
+| `Origin-Agent-Cluster` | `?1` |
 
 ### Policy Directives
 
@@ -743,15 +776,24 @@ The CSP is enforced by `createHelmetMiddleware` in `src/middleware/helmet.ts`, a
 |-----------|-------------------|
 | Route error (4xx/5xx) | CSP header is still emitted; nonce is still unique |
 | Dependency outage | CSP header is still emitted regardless of upstream state |
+| Readiness guard 503 (before routing) | CSP header is still emitted |
+| Request timeout 408 (before routing) | CSP header is still emitted |
+| Redirect (3xx) | CSP header is still emitted |
+| Rejected request body (413/415) | CSP header is still emitted |
 
 ### Operator Observability
 
 - Smoke check: `curl -I http://127.0.0.1:3000/health` — confirm `content-security-policy` is present and contains `nonce-`.
 - Two consecutive requests should produce different nonce values.
+- Check a failure path too: `curl -i http://127.0.0.1:3000/does-not-exist` — the 404 must carry the same headers.
 
 ### Verification Evidence
 
-- Automated tests: `tests/helmet.test.ts` — covers baseline headers plus strict CSP assertions (no `unsafe-inline`, unique nonce per request, `object-src`/`frame-src` none, `upgrade-insecure-requests`).
+- Automated tests: `tests/helmet.test.ts`
+  - Asserts the full header table above on a success response, a handled error (404), an unhandled error (500), a redirect (302), a catch-all 404, a body-size rejection (413) and the real app's readiness-guard 503.
+  - Asserts the same set against the real `createApp()` over HTTP for success, handled error and unhandled error.
+  - Negative controls: the shared assertion helper is itself tested — it must pass on a complete header set, and must fail naming the offending header when any one required header is deleted or altered. This keeps the suite from passing vacuously.
+  - CSP specifics: strict directives present, no `unsafe-inline`/`unsafe-eval`, per-request nonce uniqueness, and graceful degradation to a nonce-free policy when `cspNonceMiddleware` is not mounted.
 
 ---
 

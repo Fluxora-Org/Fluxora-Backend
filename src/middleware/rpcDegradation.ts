@@ -21,12 +21,14 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import {
+  getRpcRequestCacheAgeMs,
   getRpcRequestCacheStatus,
   runWithRpcRequestMetadata,
   type StellarRpcService,
 } from '../services/stellar-rpc.js';
 import { logger } from '../lib/logger.js';
 import { rpcDegradationTransitionsTotal, rpcDegradedModeGauge } from '../metrics/rpcMetrics.js';
+import { errorResponse } from '../utils/response.js';
 
 export const STALE_WARNING = '199 fluxora-backend "Stellar RPC unavailable - data may be stale"';
 
@@ -52,6 +54,12 @@ export function createRpcDegradationMiddleware(
       res.writeHead = ((...args: Parameters<Response['writeHead']>) => {
         if (getRpcRequestCacheStatus() === 'stale' && !res.headersSent) {
           res.setHeader('X-RPC-Cache', 'stale');
+          // Surface exactly how old the served data is so callers don't have
+          // to guess from the generic staleness Warning header alone.
+          const ageMs = getRpcRequestCacheAgeMs();
+          if (typeof ageMs === 'number') {
+            res.setHeader('X-RPC-Cache-Age-Ms', String(ageMs));
+          }
         }
         return originalWriteHead(...args);
       }) as Response['writeHead'];
@@ -98,17 +106,11 @@ export function createRpcDegradationMiddleware(
         circuitState,
       });
 
-      res.status(503).json({
-        error: {
-          code: 'SERVICE_UNAVAILABLE',
-          message: DEGRADED_WRITE_MESSAGE,
-          degradation: {
-            circuitState,
-            failureCount: snapshot.failureCount,
-            openedAt: snapshot.openedAt,
-          },
-        },
-      });
+      res.status(503).json(errorResponse('SERVICE_UNAVAILABLE', DEGRADED_WRITE_MESSAGE, {
+        circuitState,
+        failureCount: snapshot.failureCount,
+        openedAt: snapshot.openedAt,
+      }, req.correlationId));
     });
   };
 }

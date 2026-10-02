@@ -3,7 +3,8 @@
  *
  * Produces a machine-readable, self-describing representation of a single
  * payment stream conforming to the Fluxora JSON-LD vocabulary
- * (`https://fluxora.dev/ns/v1`).
+ * (`https://fluxora.dev/ns/v1`, the current version of
+ * FLUXORA_JSONLD_CONTEXT_VERSION).
  *
  * Purpose
  * ───────
@@ -19,8 +20,10 @@
  *    chain/API boundary. Floating-point conversion is never applied.
  * 2. The `@id` field uses a resolvable URI so the document is self-describing
  *    when dereferenced by linked-data processors.
- * 3. The shape is stable — removing or renaming properties is a breaking change
- *    requiring a new context version.
+ * 3. The shape is versioned. The `@context` URI, the served context document,
+ *    and the emitted properties are all pinned by
+ *    `FLUXORA_JSONLD_CONTEXT_VERSION`; removing or renaming a property is a
+ *    breaking change requiring a version bump.
  * 4. No PII beyond what is already present in the stream record is emitted.
  *    Stellar addresses are public by design.
  *
@@ -28,6 +31,7 @@
  */
 
 import type { StreamRecord } from '../db/types.js';
+import { deriveStreamStatusFromSchedule, type ApiStreamStatus } from '../streams/status.js';
 import { serializeToDecimalString } from './decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -35,14 +39,64 @@ import { serializeToDecimalString } from './decimal.js';
 // ---------------------------------------------------------------------------
 
 /**
+ * Version of the Fluxora JSON-LD vocabulary.
+ *
+ * This integer is the single source of truth for the context URI, the
+ * `@vocab` prefix, and the path the context document is served from. Bump it
+ * whenever the emitted shape changes; every one of those is derived from it so
+ * a bump cannot leave one behind.
+ *
+ * ⚠️  BREAKING-CHANGE RULE: removing or renaming a property, or changing the
+ * datatype of an existing one, requires a new version. Documents already
+ * published under `v1` resolve `v1` for their entire lifetime, so mutating
+ * `v1` in place would silently reinterpret them. Additive properties that
+ * existing consumers can ignore do not require a bump.
+ */
+export const FLUXORA_JSONLD_CONTEXT_VERSION = 1;
+
+/**
  * Canonical JSON-LD `@context` URI for the Fluxora vocabulary.
  *
- * This URI is intentionally versioned at `v1`. If breaking schema changes are
- * ever required, a new context URI (e.g. `https://fluxora.dev/ns/v2`) must be
- * minted rather than mutating this one so existing consumers do not silently
- * break.
+ * Derived from {@link FLUXORA_JSONLD_CONTEXT_VERSION} so the version segment
+ * can never drift from the constant that defines the shape.
  */
-export const FLUXORA_JSONLD_CONTEXT = 'https://fluxora.dev/ns/v1';
+export const FLUXORA_JSONLD_CONTEXT = `https://fluxora.dev/ns/v${FLUXORA_JSONLD_CONTEXT_VERSION}` as const;
+
+/**
+ * Path the context document is served from, i.e. the path component of
+ * {@link FLUXORA_JSONLD_CONTEXT}. A version bump moves the document, so the
+ * URL previously published in `@context` keeps resolving to the version it
+ * named.
+ */
+export const FLUXORA_JSONLD_CONTEXT_PATH = `/ns/v${FLUXORA_JSONLD_CONTEXT_VERSION}`;
+
+/**
+ * The context document served at {@link FLUXORA_JSONLD_CONTEXT}.
+ *
+ * Every term maps to the XSD datatype the serializer emits for that property,
+ * so a consumer that dereferences the context learns the type of each value
+ * without having to guess it. `tests/serialization/jsonld.test.ts` asserts
+ * that this term set matches the keys `toStreamJsonLd()` actually emits.
+ */
+export const FLUXORA_JSONLD_CONTEXT_DOCUMENT = {
+  '@context': {
+    '@version': 1.1,
+    '@vocab': `${FLUXORA_JSONLD_CONTEXT}#`,
+    xsd: 'http://www.w3.org/2001/XMLSchema#',
+    identifier: 'xsd:string',
+    sender: 'xsd:string',
+    recipient: 'xsd:string',
+    depositAmount: 'xsd:decimal',
+    streamedAmount: 'xsd:decimal',
+    remainingAmount: 'xsd:decimal',
+    ratePerSecond: 'xsd:decimal',
+    startTime: 'xsd:integer',
+    endTime: 'xsd:integer',
+    status: 'xsd:string',
+    contractId: 'xsd:string',
+    transactionHash: 'xsd:string',
+  },
+} as const;
 
 /**
  * Base URI used to construct the `@id` of a stream document.
@@ -132,7 +186,11 @@ export function toStreamJsonLd(record: StreamRecord): StreamJsonLd {
     ratePerSecond: serializeToDecimalString(record.rate_per_second, 'ratePerSecond'),
     startTime: record.start_time,
     endTime: record.end_time,
-    status: record.status,
+    status: deriveStreamStatusFromSchedule({
+      startTime: record.start_time,
+      endTime: record.end_time,
+      status: record.status as ApiStreamStatus,
+    }).status,
     contractId: record.contract_id,
     transactionHash: record.transaction_hash,
   };

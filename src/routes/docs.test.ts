@@ -1,20 +1,35 @@
 /**
- * Tests for OpenAPI specification cache behavior and docs route (src/routes/docs.ts)
+ * Tests for OpenAPI specification cache behavior and docs route (src/routes/docs.ts).
+ *
+ * Covers #1477: served docs must never enumerate endpoints that are disabled
+ * by feature flag, nor admin/internal endpoints.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { docsRouter, resetSpecCache } from './docs.js';
+import { docsRouter, resetSpecCache, FLAG_GATED_PATHS } from './docs.js';
 import { reloadFlags } from '../config/featureFlags.js';
+import { GRAPHQL_GATEWAY_FLAG } from '../graphql/gateway.js';
+import {
+  FLUXORA_JSONLD_CONTEXT,
+  FLUXORA_JSONLD_CONTEXT_DOCUMENT,
+  FLUXORA_JSONLD_CONTEXT_PATH,
+} from '../serialization/jsonld.js';
+
+/** Build the test app fresh each test so router state is clean. */
+function makeApp(): express.Express {
+  const app = express();
+  app.use(docsRouter);
+  return app;
+}
 
 describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
   let app: express.Express;
 
   beforeEach(() => {
     resetSpecCache();
-    app = express();
-    app.use(docsRouter);
+    app = makeApp();
   });
 
   afterEach(() => {
@@ -22,6 +37,8 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
     delete process.env['FEATURE_FLAGS_JSON'];
     reloadFlags();
   });
+
+  // ── GET /openapi.json — basic contract ────────────────────────────────
 
   describe('GET /openapi.json', () => {
     it('returns 200 OK with OpenAPI 3.1 JSON content type', async () => {
@@ -34,7 +51,7 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
       expect(res.body.info).toHaveProperty('title', 'Fluxora Backend API');
     });
 
-    it('caches the generated spec object reference across multiple requests', async () => {
+    it('caches the generated spec object across multiple requests', async () => {
       const res1 = await request(app).get('/openapi.json');
       const res2 = await request(app).get('/openapi.json');
 
@@ -43,6 +60,8 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
       expect(res1.body).toEqual(res2.body);
     });
   });
+
+  // ── GET /docs — Swagger UI ────────────────────────────────────────────
 
   describe('GET /docs', () => {
     it('serves Swagger UI html page', async () => {
@@ -53,32 +72,108 @@ describe('OpenAPI Docs Route & Spec Cache Invalidation', () => {
     });
   });
 
-  describe('Spec Cache Static Independence & Regression Protection', () => {
-    it('verifies that OpenAPI spec generation is static and unaffected by reloadFlags()', async () => {
-      // 1. Initial request populates cache
-      const resBefore = await request(app).get('/openapi.json');
-      expect(resBefore.status).toBe(200);
+  // ── GET /ns/v1 — JSON-LD context document ─────────────────────────────
 
-      // 2. Mutate feature flags configuration in env and execute runtime reload
-      process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
-        { name: 'experimental_new_endpoint', percentage: 100, default: false, owner: 'test', removalDate: '2099-01-01' },
-      ]);
-      const newFlags = reloadFlags();
-      expect(newFlags.has('experimental_new_endpoint')).toBe(true);
+  describe('GET /ns/v1 (JSON-LD context document)', () => {
+    it('serves the pinned context document', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
 
-      // 3. Fetch spec again after reload
-      const resAfter = await request(app).get('/openapi.json');
-      expect(resAfter.status).toBe(200);
-
-      // Spec output is identical because OpenAPI spec is static and un-gated by feature flags
-      expect(resAfter.body).toEqual(resBefore.body);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(FLUXORA_JSONLD_CONTEXT_DOCUMENT);
+      expect(res.headers['content-type']).toContain('application/ld+json');
     });
 
-    it('verifies resetSpecCache explicitly invalidates the cached specification', async () => {
+    it('is permanently cacheable, unlike /openapi.json', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(res.headers['cache-control']).toBe('public, max-age=31536000, immutable');
+    });
+
+    it('is readable cross-origin by browser-based linked-data clients', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(res.headers['access-control-allow-origin']).toBe('*');
+    });
+
+    it('serves the path the documents reference in @context', async () => {
+      const res = await request(app).get(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(new URL(FLUXORA_JSONLD_CONTEXT).pathname).toBe(FLUXORA_JSONLD_CONTEXT_PATH);
+      expect(res.status).toBe(200);
+    });
+  });
+
+  // ── Admin/internal exclusion (#1477 criterion 2) ─────────────────────
+
+  describe('admin and internal endpoints are never served', () => {
+    it('excludes /api/admin/* paths from the served spec', async () => {
+      const res = await request(app).get('/openapi.json');
+      const paths = Object.keys(res.body.paths ?? {});
+
+      const adminPaths = paths.filter((p) => p.startsWith('/api/admin'));
+      expect(adminPaths).toEqual([]);
+    });
+
+    it('excludes /internal/* paths from the served spec', async () => {
+      const res = await request(app).get('/openapi.json');
+      const paths = Object.keys(res.body.paths ?? {});
+
+      const internalPaths = paths.filter((p) => p.startsWith('/internal'));
+      expect(internalPaths).toEqual([]);
+    });
+
+    it('excludes admin/indexer/webhooks tags from the served spec', async () => {
+      const res = await request(app).get('/openapi.json');
+      const tagNames = (res.body.tags ?? []).map((t: { name: string }) => t.name);
+
+      expect(tagNames).not.toContain('admin');
+      expect(tagNames).not.toContain('indexer');
+      expect(tagNames).not.toContain('webhooks');
+    });
+  });
+
+  // ── Flag-gated exclusion (#1477 criteria 1 & 4) ───────────────────────
+
+  describe('flag-gated paths are excluded when their flag is off', () => {
+    it('does not serve /api/graphql when experimental_graphql_gateway is disabled', async () => {
+      delete process.env['FEATURE_FLAGS_JSON'];
+      reloadFlags();
+
+      const res = await request(app).get('/openapi.json');
+
+      expect(res.body.paths).not.toHaveProperty('/api/graphql');
+    });
+
+    it('FLAG_GATED_PATHS declares the GraphQL gateway flag', () => {
+      expect(FLAG_GATED_PATHS['/api/graphql']).toBe(GRAPHQL_GATEWAY_FLAG);
+    });
+
+    it('invalidation is wired: reloadFlags() clears the cached spec', async () => {
+      const first = await request(app).get('/openapi.json');
+      expect(first.status).toBe(200);
+
+      process.env['FEATURE_FLAGS_JSON'] = JSON.stringify([
+        {
+          name: GRAPHQL_GATEWAY_FLAG,
+          percentage: 100,
+          description: 'test',
+          default: false,
+          owner: 'test',
+          removalDate: '2099-01-01',
+        },
+      ]);
+      reloadFlags();
+
+      const second = await request(app).get('/openapi.json');
+      expect(second.status).toBe(200);
+      expect(second.body).toHaveProperty('openapi', '3.1.0');
+    });
+  });
+
+  // ── Cache-busting helper ──────────────────────────────────────────────
+
+  describe('resetSpecCache', () => {
+    it('explicitly invalidates the cached specification', async () => {
       const res1 = await request(app).get('/openapi.json');
       expect(res1.status).toBe(200);
 
-      // Explicitly reset cache
       resetSpecCache();
 
       const res2 = await request(app).get('/openapi.json');

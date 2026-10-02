@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 // Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * src/scripts/backup-retention.ts
@@ -277,7 +278,7 @@ async function executeRestore(job: RestoreJob, bucket: string, region: string): 
 
   try {
     // Derive destination key:  restored/<env>/<ts>-<filename>
-    const prefix = normalizeBackupPrefix(process.env.S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX);
+    const prefix = normalizeBackupPrefix(getRuntimeEnv().S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX);
     const filename = job.backupId.slice(prefix.length);
     const destKey = `${prefix}restored/${job.targetEnvironment}/${job.queuedAt.replace(/[:.]/g, '-')}-${filename}`;
     if (!destKey.startsWith(prefix) || destKey.includes('..')) {
@@ -330,12 +331,11 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
     backupId,
     confirmProduction = false,
     targetEnvironment = 'staging',
-    correlationId,
     onStatusChange,
   } = request;
 
   // ── Input validation ──────────────────────────────────────────────────────
-  const configuredPrefix = process.env.S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX;
+  const configuredPrefix = getRuntimeEnv().S3_BACKUP_PREFIX ?? DEFAULT_BACKUP_PREFIX;
   const resolvedBackupId = resolveBackupObjectKey(backupId, configuredPrefix);
 
   if (targetEnvironment === 'production' && !confirmProduction) {
@@ -345,12 +345,12 @@ export function queueRestoreJob(request: RestoreRequest): RestoreJob {
     );
   }
 
-  const bucket = process.env.S3_BACKUP_BUCKET;
+  const bucket = getRuntimeEnv().S3_BACKUP_BUCKET;
   if (!bucket) {
     throw new ConfigurationError('S3_BACKUP_BUCKET environment variable is required for restore operations.');
   }
 
-  const region = process.env.AWS_REGION ?? 'us-east-1';
+  const region = getRuntimeEnv().AWS_REGION ?? 'us-east-1';
 
   // ── Create job record ─────────────────────────────────────────────────────
   const job: RestoreJob = {
@@ -477,13 +477,11 @@ export function classifyBackup(
  */
 export function filterRetainedObjects(
   objects: BackupObject[],
-  policy: RetentionPolicy
+  _policy: RetentionPolicy
 ): BackupObject[] {
   const daily = objects.filter((o) => o.classification === 'daily');
   const weekly = objects.filter((o) => o.classification === 'weekly');
   const monthly = objects.filter((o) => o.classification === 'monthly');
-  const expired = objects.filter((o) => o.classification === 'expired');
-
   // Sort each tier by last modified (newest first)
   weekly.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
   monthly.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
@@ -561,7 +559,8 @@ export function selectObjectsForDeletion(
 async function fetchBackupObjects(
   client: S3Client,
   bucket: string,
-  prefix: string
+  prefix: string,
+  now: Date = new Date()
 ): Promise<BackupObject[]> {
   const objects: BackupObject[] = [];
   let continuationToken: string | undefined;
@@ -672,10 +671,10 @@ export interface BackupRetentionOptions {
 // Its console calls are documented and excluded from the production no-console
 // rule; request/job code must use src/lib/logger.ts instead.
 export async function enforceBackupRetention(options: BackupRetentionOptions = {}): Promise<void> {
-  const bucket = process.env.S3_BACKUP_BUCKET;
-  const defaultPrefix = process.env.S3_BACKUP_PREFIX ?? 'backups/';
+  const bucket = getRuntimeEnv().S3_BACKUP_BUCKET;
+  const defaultPrefix = getRuntimeEnv().S3_BACKUP_PREFIX ?? 'backups/';
   const prefix = options.prefix ?? defaultPrefix;
-  const region = process.env.AWS_REGION ?? 'us-east-1';
+  const region = getRuntimeEnv().AWS_REGION ?? 'us-east-1';
   const dryRun = options.dryRun ?? false;
   const now = options.now ?? new Date();
   const legalHolds = options.legalHolds ?? [];

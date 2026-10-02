@@ -1,6 +1,6 @@
 /** Process one claimed transactional-outbox row and schedule its next state. */
 import { logger } from '../lib/logger.js';
-import type { WebhookEvent, WebhookDelivery } from './types.js';
+import type { WebhookEvent, WebhookDelivery, DLQReasonCode } from './types.js';
 import {
   calculateNextRetryTime,
   attemptWebhookDeliveryWithRateLimit,

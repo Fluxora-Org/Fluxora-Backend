@@ -1,5 +1,17 @@
 # Security: SQL Injection and Dependency Audit
 
+## Request Body Limits
+
+Inbound request bodies are bounded **while they are being read**: oversized and
+deeply nested payloads are refused mid-stream, so a limit protects memory
+instead of merely reporting a violation after the fact. Limits are configurable
+(`MAX_REQUEST_SIZE`, `MAX_JSON_DEPTH`), refusals are counted in
+`fluxora_request_body_too_large_total` and
+`fluxora_request_body_too_deep_total`, and the enforcement order is covered by
+`tests/requestProtection.streaming.test.ts`.
+
+See [request-limits.md](request-limits.md).
+
 ## SQL Injection Regression Tests
 
 We exercise repository entrypoints with adversarial inputs to confirm that
@@ -10,11 +22,44 @@ in `tests/security/streamRepository.sqli.test.ts` and use payloads from
 When running in CI against a real Postgres instance, ensure the test DB is
 isolated and reset between runs.
 
-## Dependency audit (pnpm)
+## Dependency Audit (pnpm)
 
-The repository's CI will run `pnpm audit --audit-level=high --json` and
-fail the build on any high/critical advisories unless an explicit
-exception is recorded in `.pnpm-audit-exceptions` (see CI docs).
+The repository enforces continuous security auditing of all dependencies. Findings at **moderate severity or above** fail the build unless covered by an explicit, time-bound exception.
+
+### Audit Enforcement
+
+The `security` job in CI runs:
+
+```bash
+pnpm run audit:check
+```
+
+This script (`scripts/audit-security.mjs`):
+1. Executes `pnpm audit --audit-level=moderate --json`
+2. Parses moderate/high/critical findings
+3. Validates findings against `.audit-exceptions.json`
+4. Checks exception expiry dates
+5. **Fails the build** if any finding lacks a valid exception or if any exception has expired
+
+### Remediation Windows
+
+| Severity | Maximum Window | Approval Required |
+|----------|---------------|-------------------|
+| Critical | 7 days | Engineering lead |
+| High | 14 days | Team lead |
+| Moderate | 30 days | Peer review |
+
+### Exception Process
+
+Exceptions are recorded in `.audit-exceptions.json` with:
+- Package name
+- Detailed justification (with issue tracker reference)
+- Severity level
+- Expiry date (must align with remediation windows)
+- Approver email
+- Creation date
+
+See `docs/security/dependency-audit-policy.md` for the complete exception process, validation requirements, and policy details.
 
 ## mTLS Client Certificate Validation
 

@@ -4,6 +4,13 @@
 
 Fluxora Backend uses a `pg.Pool` (node-postgres) for all database access. The pool is configured via environment variables and includes proactive exhaustion detection to prevent unbounded request queuing.
 
+Database access is centralized through two layers:
+
+1. **`src/db/pool.ts`** — Core pool infrastructure with timeout enforcement, error classification, and metrics
+2. **`src/db/client.ts`** — Application-facing `DatabaseClient` wrapper that delegates to the pool layer
+
+All queries go through the pool layer to ensure consistent timeout enforcement, observability, and error handling.
+
 ## Typed Row Mapping
 
 `pg.Pool.query<T>()` / `PoolClient.query<T>()` constrain `T` to `QueryResultRow` (an index signature). **Do not** pass bare domain interfaces (`ReplayCursor`, `ContractEvent`, `VacuumRow`, `StreamRecord`, …) as that generic — they fail `tsc` with `TS2344`.
@@ -19,6 +26,26 @@ return result.rows.map(rowToReplayCursor);
 ```
 
 Full convention: [`src/db/repositories/README.md`](../src/db/repositories/README.md).
+
+## Schema/Type Consistency Check
+
+`src/db/types.ts` declares the shapes the application believes PostgreSQL holds. Because nothing in a normal build compares those declarations against the database, a migration that renames or retypes a column can leave the types asserting something untrue, and the mismatch only surfaces later as a value of the wrong shape.
+
+`scripts/check-db-schema-types.mjs` closes that gap. With a migrated `DATABASE_URL` it:
+
+- reads the declared interfaces (and their type aliases) from `src/db/types.ts`,
+- maps each declared property onto its column (camelCase properties become snake_case columns),
+- introspects the mapped tables (`streams`, `api_keys`, `contract_events`) through `information_schema.columns`, and
+- **fails** (exit code 1) when a declared column is missing — a rename or drop — or when its SQL type family disagrees with the declared type — a retype.
+
+Columns that exist in the schema but are not part of the declared domain shape (for example `streams.sender_address_hash` or `streams.legal_hold`) are reported as non-fatal drift, as is a declared non-null property backed by a nullable column.
+
+```bash
+# after `pnpm run migrate` against the test database
+DATABASE_URL=postgresql://test_user:test_password@localhost:5432/indexer_test pnpm run check:db-types
+```
+
+Without `DATABASE_URL` the check is skipped, matching the other live-database suites. CI runs it in the `test` job immediately after applying migrations, so renaming a mapped column in a migration fails the pipeline until `src/db/types.ts` is updated. Intentional representation differences — a timestamp column exposed as an ISO-8601 `string`, or a JSON-serialized `text` column exposed as `string[]` — are recorded with a reason in `SCHEMA_TYPE_CONTRACT` inside the script.
 
 ## Configuration
 
@@ -71,6 +98,55 @@ Set `STATEMENT_TIMEOUT_MS=0` to skip the `SET statement_timeout` call entirely. 
 ### Security note
 
 Using a parameterized query (`SET statement_timeout = $1`) prevents SQL injection. The timeout value is validated as a non-negative integer by the `integerEnv` schema helper before it reaches the pool.
+
+## Query Cancellation and Request Lifecycle
+
+### How Cancellation Works
+
+When a request is cancelled (e.g., client disconnects, HTTP request aborted), the in-flight database query should also be cancelled to free the connection back to the pool. This prevents "zombie queries" that continue consuming database resources after the caller has given up.
+
+### PostgreSQL Query Cancellation
+
+PostgreSQL supports query cancellation via the `pg_cancel_backend()` function, which sends a `SIGINT` to the backend process executing the query. The node-postgres driver exposes this through the `PoolClient`:
+
+```ts
+const client = await pool.connect();
+try {
+  // Start a long-running query
+  const queryPromise = client.query('SELECT pg_sleep(300)');
+  
+  // If the request is cancelled, we can't cancel the query directly,
+  // but statement_timeout will kill it automatically
+  await queryPromise;
+} finally {
+  client.release();
+}
+```
+
+### Statement Timeout as the Cancellation Mechanism
+
+Fluxora uses **statement_timeout as the primary cancellation mechanism** rather than explicit `pg_cancel_backend()` calls. This approach has several advantages:
+
+1. **Simplicity** — No need to track PIDs or maintain cancellation tokens
+2. **Reliability** — Timeout is enforced by PostgreSQL itself, not by application code
+3. **Consistency** — Every query has a bounded execution time, regardless of cancellation
+4. **Observability** — Timeouts are surfaced as `QueryTimeoutError` and tracked in metrics
+
+When a query exceeds `STATEMENT_TIMEOUT_MS`, PostgreSQL automatically cancels it with error code `57014`, which the pool layer maps to `QueryTimeoutError`.
+
+### Request Abortion
+
+When an HTTP request is aborted (client disconnect, load balancer timeout), Express may or may not propagate the cancellation to the database layer, depending on where the query is in its lifecycle:
+
+- **Before query starts** — The request handler throws early, query never executes
+- **Query in flight** — The query continues until `statement_timeout` fires or it completes naturally
+- **Query completes before timeout** — Result is discarded (client is gone)
+
+This is acceptable because `statement_timeout` bounds the resource consumption even when the client disconnects. No query can hold a connection indefinitely.
+
+### Testing Cancellation
+
+`tests/db/client.test.ts` validates that deliberately slow queries (`SELECT pg_sleep(10)`) are cancelled at the configured timeout bound and throw `QueryTimeoutError`, regardless of whether the client is still waiting for the result.
 
 ## Pool Exhaustion Detection
 
@@ -139,6 +215,66 @@ Gauges are updated on every `connect`, `acquire`, and `remove` pool event.
 
 `PoolExhaustedError` should be mapped to an HTTP `503 Service Unavailable` response. `QueryTimeoutError` should be mapped to an HTTP `504 Gateway Timeout` response. Both are handled automatically by the error handler in `src/middleware/errorHandler.ts`.
 
+## DatabaseClient (Application Entry Point)
+
+`src/db/client.ts` exports a singleton `DatabaseClient` instance (`db`) that serves as the primary database interface for the application. It wraps the centralized pool infrastructure to ensure every query benefits from timeout enforcement, error classification, and observability.
+
+### Usage
+
+```ts
+import { db } from './db/client.js';
+
+// Simple query
+const result = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+
+// Get a client for transactions
+const client = await db.getClient();
+try {
+  await client.query('BEGIN');
+  await client.query('INSERT INTO ...');
+  await client.query('COMMIT');
+} finally {
+  client.release();
+}
+```
+
+### Guarantees
+
+Every query through `DatabaseClient` is automatically protected by:
+
+1. **Statement timeout enforcement** — Queries exceeding `STATEMENT_TIMEOUT_MS` are cancelled by PostgreSQL (error code `57014` → `QueryTimeoutError`)
+2. **Pool exhaustion detection** — Requests are fast-failed when the queue limit is reached (`PoolExhaustedError`)
+3. **Error classification** — Database errors are mapped to semantic error types:
+   - `QueryTimeoutError` (PG `57014`) → HTTP `504 Gateway Timeout`
+   - `PoolExhaustedError` → HTTP `503 Service Unavailable`
+   - `DuplicateEntryError` (PG `23505`) → HTTP `409 Conflict`
+4. **Observability** — Slow queries, timeouts, and errors are logged and exposed as Prometheus metrics
+
+### Why Use DatabaseClient?
+
+Calling `pool.query()` directly bypasses all timeout enforcement, metrics, and error classification. The pool's raw `.query()` method does not apply the statement timeout or record telemetry — those are implemented in the `query()` helper function exported from `src/db/pool.ts`, which `DatabaseClient` uses internally.
+
+**✅ Correct:**
+```ts
+import { db } from './db/client.js';
+await db.query('SELECT 1'); // ✓ timeout enforced, metrics recorded
+```
+
+**❌ Incorrect:**
+```ts
+import { getPool } from './db/pool.js';
+const pool = getPool();
+await pool.query('SELECT 1'); // ✗ bypasses timeout, no metrics
+```
+
+### Testing
+
+`tests/db/client.test.ts` validates:
+- Query timeout enforcement (deliberate slow queries are cancelled)
+- Error classification (timeouts distinguished from connection errors)
+- Metrics tracking (`dbQueryErrorsTotal`, `dbSlowQueriesTotal`)
+- Connection lifecycle (getClient, close)
+
 ## Operator Runbook
 
 ### Symptoms
@@ -204,9 +340,24 @@ The job checks each table via `pg_class.relkind = 'p'` + `pg_partitioned_table.p
 
 Monthly partitions are named `<table>_y<YYYY>m<MM>` (e.g. `contract_events_y2026m07`), matching the convention already used by `tests/db/contractEvents.partitionPruning.test.ts` and `tests/db/vacuumCollector.collect.test.ts`. Month boundaries are computed in **UTC** (`Date.UTC(...)`) to avoid off-by-one errors near midnight on a server running in a non-UTC timezone.
 
+#### Lead time (how far ahead partitions are created)
+
+Partitions are created a **documented interval ahead of use**: the partition covering month `M` is created during month `M - leadTimeMonths`, so it exists for at least `leadTimeMonths` months (≈ 28 × `leadTimeMonths` days) before a single row can require it. That buffer is what makes a failed or missed run survivable — the next run self-heals long before the partition is *needed*.
+
+The default lead time is `DEFAULT_LEAD_TIME_MONTHS = 3` months. It is configurable, in whole calendar months, with this precedence:
+
+| # | Source | Notes |
+|---|---|---|
+| 1 | `leadTimeMonths` option to `runPartitionMaintenance(pool, { leadTimeMonths })` | Highest precedence; used by tests and by callers that need a specific value. |
+| 2 | `monthsAhead` option | Deprecated alias with the same meaning, kept for callers written against the previous signature. |
+| 3 | `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS` env var (`config.partitionMaintenance.leadTimeMonths`) | Deployment-level knob. |
+| 4 | `DEFAULT_LEAD_TIME_MONTHS` (3) | Built-in fallback. |
+
+Keep the configured value `>= 2` so a single missed monthly boundary cannot exhaust the buffer. A non-integer or negative configured value is ignored in favour of the built-in default rather than propagated, so a typo in a deployment's environment cannot silently disable pre-creation. The run result reports the value actually used as `leadTimeMonths`.
+
 #### Schedule and idempotency
 
-1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus the next `monthsAhead` months (default `3`, see `DEFAULT_MONTHS_AHEAD` in `src/jobs/partitionMaintenance.ts`).
+1. The job runs on a daily cron schedule (`0 0 * * *`) and once immediately at process startup (`src/jobs/queue.ts`), pre-creating the current month plus every month starting inside the configured lead time (default `3` months).
 2. It acquires a single **non-blocking** advisory lock (`pg_try_advisory_lock(123456789)`, exported as `PARTITION_MAINTENANCE_LOCK_ID`) before doing any work. If another instance already holds the lock, the run is a no-op — it does not wait or retry, so overlapping cron + manual invocations across multiple app instances never race to create the same partition.
 3. Every `CREATE TABLE` uses `IF NOT EXISTS`, so re-running the job when all partitions already exist performs zero DDL and is always a safe no-op — the defining idempotency property required of this job.
 4. The lock is released in a `finally` block, so a failure partway through (e.g. one table's DDL fails) never leaves the lock held for subsequent runs.
@@ -228,6 +379,7 @@ When this happens, the job:
   }
   ```
 - Increments the `fluxora_partition_maintenance_behind_schedule_total{table="..."}` counter.
+- Raises the `partition_maintenance_behind_schedule` operator alert (see below), so the event is pageable from metrics and not only discoverable from logs.
 - Still creates the missing partition immediately afterward (self-healing) — the alert reports a `DEFAULT`-partition risk window that already occurred, it does not prevent the fix.
 
 ##### Recommended alert
@@ -240,12 +392,50 @@ When this happens, the job:
     summary: "A scheduled partition pre-creation run was missed — rows may have landed in the DEFAULT partition"
 ```
 
+#### Failure alerting (a failure is never only a log line)
+
+Every failure that matters to an operator is raised through `raiseAlert()` in `src/lib/alerts.ts`, which emits a structured `error` log record **and** increments `fluxora_alerts_raised_total{alert,severity}` — so metric-based alerting rules can page on it even when no log shipping is configured. `raiseAlert()` never throws, and can additionally be forwarded to an incident-management provider via `setAlertSink()`.
+
+| Alert name | Severity | Raised when |
+|---|---|---|
+| `partition_creation_failed` | critical | A `CREATE TABLE … PARTITION OF` threw. The error is re-thrown afterwards, so the queue retries (and eventually dead-letters) the run instead of treating it as a success. |
+| `partition_maintenance_behind_schedule` | critical | The current month's partition was missing — a previous run was missed or failed. |
+| `partition_shortfall_detected` | critical | The pre-write guard (below) found a required partition missing just before an insert. |
+
+```yaml
+- alert: PartitionCreationFailed
+  expr: increase(fluxora_alerts_raised_total{alert="partition_creation_failed"}[15m]) > 0
+  severity: critical
+  annotations:
+    summary: "A partition could not be created — writes for that interval are at risk"
+
+- alert: PartitionShortfallBeforeWrite
+  expr: increase(fluxora_alerts_raised_total{alert="partition_shortfall_detected"}[15m]) > 0
+  severity: critical
+  annotations:
+    summary: "A write needed a partition that did not exist — partition maintenance was not running"
+```
+
+#### Pre-write detection (absence is caught before a write fails)
+
+The job is a *scheduled* defence, so between two runs time can advance past the created partitions (a deploy that never started the job, an outage, a mis-set lead time). The next write would then fail with an opaque `no partition of relation "contract_events" found for row` — a write error raised far from its cause.
+
+`ensurePartitionCoverage()` (exported from `src/jobs/partitionMaintenance.ts`, same module as the job so both share the partition-naming and bound math) is called by `PostgresContractEventStore.insertMany()` **before** the insert is issued:
+
+1. It computes the partitions covering every distinct month in the batch's `happened_at` values.
+2. A single catalog query reports whether the parent is range-partitioned *and* which of those partitions exist (no per-row work, one round-trip in the happy path).
+3. If a required partition is missing it raises `partition_shortfall_detected`, then creates the partition so the write that follows cannot fail — alerting and self-healing in one pass. A create that fails raises `partition_creation_failed` and is reported as `failed` on the result.
+
+The guard is **strictly fail-open**: an unmanaged (non-partitioned) table, an inconclusive probe response, or a probe error leaves `insertMany()` behaving exactly as it did before — observability must never be the reason a writable batch fails.
+
 #### Metrics
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted) |
+| `fluxora_partitions_created_total` | Counter | `table` | Incremented once per partition actually created (idempotent no-ops are not counted), by both the job and the pre-write guard |
 | `fluxora_partition_maintenance_behind_schedule_total` | Counter | `table` | Incremented when the current-month partition was found missing (see above) |
+| `fluxora_partition_maintenance_failures_total` | Counter | `table` | Incremented on every failed partition-creation attempt |
+| `fluxora_alerts_raised_total` | Counter | `alert`, `severity` | Every operator alert raised through `src/lib/alerts.ts` |
 
 #### Security
 
@@ -256,10 +446,14 @@ When this happens, the job:
 
 #### Tests
 
-`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), behind-schedule detection and metrics, and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+`tests/jobs/partitionMaintenance.test.ts` covers: lock acquisition/skip/release (including release-on-throw), input validation, per-table managed/unmanaged gating, idempotent re-runs, partition naming (including year rollover and UTC boundary edge cases), lead-time resolution (option, deprecated alias, configured default, invalid-value fallback, `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS`), behind-schedule detection and metrics, failure alerting (alerts raised *and* the error still re-thrown), and identifier-quoting security checks — all against a mocked `Pool`, no live database required.
+
+`tests/db/contractEvents.partitionCoverage.test.ts` covers the pre-write guard against an in-memory emulation of Postgres: the probe's single round-trip and month deduplication, `partition_shortfall_detected` + self-heal, detection-only mode, failed-create alerting, fail-open behaviour for unmanaged tables / unexpected probe shapes / probe errors, and the issue's validation scenario — advance time past the partitions the job created and assert the shortfall is detected (and alerted on) *before* the write fails.
+
+`tests/lib/alerts.test.ts` covers the alerting facility itself: log level and record shape, metric increment, sink dispatch, name normalisation, and the never-throws guarantee.
 
 ```bash
-pnpm test tests/jobs/partitionMaintenance.test.ts
+pnpm test tests/jobs/partitionMaintenance.test.ts tests/db/contractEvents.partitionCoverage.test.ts tests/lib/alerts.test.ts
 ```
 
 ### Recommended alert thresholds

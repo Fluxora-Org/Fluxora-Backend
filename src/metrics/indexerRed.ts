@@ -25,11 +25,36 @@
  * | Errors   | (5xx slice of the above)         | `indexer_batch_errors_total`            |
  * | Duration | `http_request_duration_seconds`  | `indexer_batch_duration_seconds`        |
  * | "what"   | `route`                          | `contract_id`                           |
- * | "result" | `status_code`                    | `outcome` (`success` \| `error`)        |
+ * | "result" | `status_code`                    | `outcome` (`success` \| `partial` \| `error`) |
  *
  * Both the rate counter and the duration histogram carry the same label set
  * (`contract_id`, `outcome`) — exactly as the HTTP pair does — so a single
  * PromQL template works for either subsystem.
+ *
+ * ## Partial failures are errors
+ *
+ * A batch does not only fail by throwing. The common case in ingestion is a
+ * batch that *partially* fails: work was performed, but not all of it landed —
+ * e.g. a cooperative stop requested mid-batch rolls the in-flight transaction
+ * back, so every row it fetched is discarded and the ledger range is not
+ * advanced. Counting that as a success makes the error rate report a healthy
+ * zero while data is being dropped.
+ *
+ * `recordIndexerBatchPartialFailure` therefore records the batch as
+ * `outcome="partial"` on the rate counter and duration histogram **and**
+ * increments `indexer_batch_errors_total`, so the documented error-ratio
+ * PromQL counts partial failures without any dashboard change:
+ *
+ * ```promql
+ * sum(rate(indexer_batch_errors_total[5m]))
+ *   / sum(rate(indexer_batches_processed_total[5m]))
+ * ```
+ *
+ * The `outcome` label is what separates a partial failure from a wholly
+ * failed one; both land in the error counter, so the total error rate is
+ * never understated. Alert threshold: `IndexerBatchPartialFailureHigh` fires
+ * when the partial share of processed batches exceeds 1% for 10m — sustained
+ * partial failures mean rows are being dropped and a resume is owed.
  *
  * ## Cardinality and safety
  *
@@ -40,6 +65,8 @@
  *   this file. Raw error messages are **never** used as label values, so an
  *   error carrying user input (or PII) cannot inflate cardinality or leak into
  *   the `/metrics` payload.
+ * - The partial-failure reason is normalised against a closed allow-list, so
+ *   even a widened or untyped caller cannot mint a new label value.
  *
  * @module metrics/indexerRed
  */
@@ -54,7 +81,7 @@ import type { RpcFailureKind } from '../services/stellar-rpc.js';
 // ── Label unions ──────────────────────────────────────────────────────────────
 
 /** Terminal result of one batch processing step. Mirrors HTTP `status_code`. */
-export type IndexerBatchOutcome = 'success' | 'error';
+export type IndexerBatchOutcome = 'success' | 'partial' | 'error';
 
 /**
  * Where a batch failure originated.
@@ -84,9 +111,48 @@ export type IndexerLocalErrorType =
   | 'db_query_timeout'
   | 'db_duplicate_entry'
   | 'db_error'
+  | 'batch_aborted'
   | 'unknown';
 
 export type IndexerBatchErrorType = IndexerRpcErrorType | IndexerLocalErrorType;
+
+/**
+ * Why a batch reached `outcome="partial"` — work was performed but not all of
+ * it was persisted.
+ *
+ * A subset of {@link IndexerLocalErrorType} by construction: a partial failure
+ * is always a local, actionable condition (never an upstream RPC fault), and
+ * recording it as a *different* `error_type` on the error counter is what lets
+ * an operator split partial drops from wholly failed batches.
+ *
+ * Closed union — nothing outside this set can ever appear as a label value.
+ *
+ * - `batch_aborted` — the batch was rolled back before `COMMIT` (a stop was
+ *   requested mid-batch), so the rows it fetched were discarded and the ledger
+ *   range was not advanced.
+ * - `unknown`     — the reason did not match the closed union; the total-
+ *   function fallback so recording can never throw.
+ */
+export type IndexerBatchPartialFailureReason = 'batch_aborted' | 'unknown';
+
+/** Allow-list backing {@link normalizePartialFailureReason}. */
+const PARTIAL_FAILURE_REASONS: ReadonlySet<string> = new Set<string>([
+  'batch_aborted',
+  'unknown',
+]);
+
+/**
+ * Coerce a caller-supplied partial-failure reason onto the closed union.
+ *
+ * Total by design: an unknown, empty, or non-string value collapses to
+ * `unknown`, so a widened TypeScript caller (or plain JS) still cannot create
+ * an unbounded `error_type` series.
+ */
+function normalizePartialFailureReason(reason: string): IndexerBatchPartialFailureReason {
+  return PARTIAL_FAILURE_REASONS.has(reason)
+    ? (reason as IndexerBatchPartialFailureReason)
+    : 'unknown';
+}
 
 /** Result of {@link classifyIndexerBatchError}. */
 export interface IndexerBatchErrorClassification {
@@ -104,10 +170,15 @@ export interface IndexerBatchErrorClassification {
  * This differs from `indexer_replay_batches_committed_total`, which counts
  * only batches that reached COMMIT. A batch that fetched zero rows (source
  * exhausted) still counts here as one `success`, because one unit of work was
- * performed.
+ * performed. A batch that did work but did not land (rolled back before
+ * COMMIT) counts as `partial` — see {@link recordIndexerBatchPartialFailure}.
  *
  * ```promql
  * sum(rate(indexer_batches_processed_total[5m])) by (contract_id)
+ *
+ * # Share of batches that partially failed (rows dropped, range not advanced)
+ * sum(rate(indexer_batches_processed_total{outcome="partial"}[5m]))
+ *   / sum(rate(indexer_batches_processed_total[5m]))
  * ```
  */
 export const indexerBatchesProcessedTotal =
@@ -125,12 +196,19 @@ export const indexerBatchesProcessedTotal =
  * **Errors.** Failed batch processing steps, broken down by where the failure
  * came from and what kind it was.
  *
- * Every increment here is accompanied by an `outcome="error"` increment on
- * {@link indexerBatchesProcessedTotal}, so the error *ratio* is computable
- * from either metric:
+ * This counts **both** wholly failed batches (`outcome="error"`) and partially
+ * failed batches (`outcome="partial"`), so the error ratio below never
+ * understates the failure rate. `error_type="batch_aborted"` identifies the
+ * partial-drop case; the `outcome` label on
+ * {@link indexerBatchesProcessedTotal} is the authoritative total-vs-partial
+ * split.
+ *
+ * Every increment here is accompanied by an `outcome="error"` or
+ * `outcome="partial"` increment on {@link indexerBatchesProcessedTotal}, so the
+ * error *ratio* is computable from either metric:
  *
  * ```promql
- * # Error ratio, all causes
+ * # Error ratio, all causes (includes partial failures)
  * sum(rate(indexer_batch_errors_total[5m]))
  *   / sum(rate(indexer_batches_processed_total[5m]))
  *
@@ -292,6 +370,10 @@ export function recordIndexerBatchSuccess(
  * correct), observes the duration up to the point of failure, and increments
  * the error counter with the classified `(error_source, error_type)` pair.
  *
+ * For a batch that did work but was rolled back rather than thrown from, use
+ * {@link recordIndexerBatchPartialFailure} instead — it lands in the same error
+ * counter but under `outcome="partial"`.
+ *
  * @param contractId       Contract whose ledger batch was being processed.
  * @param durationSeconds  Wall-clock duration until the failure, in seconds.
  * @param error            The thrown value; classified via
@@ -309,6 +391,60 @@ export function recordIndexerBatchFailure(
 
   indexerBatchesProcessedTotal.inc({ contract_id: contract, outcome: 'error' });
   indexerBatchDurationSeconds.observe({ contract_id: contract, outcome: 'error' }, durationSeconds);
+  indexerBatchErrorsTotal.inc({
+    contract_id: contract,
+    error_source: classification.source,
+    error_type: classification.type,
+  });
+
+  return classification;
+}
+
+/**
+ * Record a batch processing step that did work but did not fully land.
+ *
+ * A partial failure is the common case in ingestion: the batch ran, produced
+ * rows, and then those rows were discarded — e.g. a stop requested mid-batch
+ * rolls the in-flight transaction back so the ledger range is not advanced and
+ * a later resume re-reads it. Nothing *threw*, so a whole-batch-only error
+ * counter stays at zero while data is being dropped; this helper is what makes
+ * the collector reflect that state.
+ *
+ * Records, all three of the RED signals:
+ *
+ * - `indexer_batches_processed_total{outcome="partial"}` — the batch is in the
+ *   denominator exactly once.
+ * - `indexer_batch_duration_seconds{outcome="partial"}` — the work was done, so
+ *   the duration is meaningful.
+ * - `indexer_batch_errors_total{error_source="local", error_type=<reason>}` —
+ *   the partial failure is counted as an error, which is what makes the
+ *   documented error-ratio PromQL (`errors / processed`) non-zero.
+ *
+ * The reason is normalised onto {@link IndexerBatchPartialFailureReason}, so the
+ * `error_type` label stays bounded no matter what the caller passes. Recording
+ * never throws.
+ *
+ * @param contractId       Contract whose ledger batch was being processed.
+ * @param durationSeconds  Wall-clock duration of the step, in seconds.
+ * @param reason           Why the batch only partially succeeded.
+ * @returns The classification that was recorded, so callers can reuse it in
+ *          structured logs without re-classifying.
+ */
+export function recordIndexerBatchPartialFailure(
+  contractId: string,
+  durationSeconds: number,
+  reason: IndexerBatchPartialFailureReason,
+): IndexerBatchErrorClassification {
+  const contract = normalizeContractIdLabel(contractId);
+  // Assigning to the shared classification shape is the compile-time guarantee
+  // that a partial reason is always a legal `error_type` label value.
+  const classification: IndexerBatchErrorClassification = {
+    source: 'local',
+    type: normalizePartialFailureReason(reason),
+  };
+
+  indexerBatchesProcessedTotal.inc({ contract_id: contract, outcome: 'partial' });
+  indexerBatchDurationSeconds.observe({ contract_id: contract, outcome: 'partial' }, durationSeconds);
   indexerBatchErrorsTotal.inc({
     contract_id: contract,
     error_source: classification.source,

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Enhanced webhook delivery and management routes
  * Includes outbox, dead-letter queue, and circuit breaker endpoints
@@ -11,15 +12,24 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import { webhookService } from '../webhooks/service.js';
 import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
-import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
+import {
+  getWebhookCircuitBreakerStore,
+  describeWebhookCircuitBreaker,
+  type CircuitBreakerPolicy,
+} from '../redis/webhookCircuitBreakerStore.js';
+import { resolveWebhookRetryPolicy } from '../webhooks/delivery-support.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
-import { OffsetPaginationSchema } from '../validation/paginationSchema.js';
+import { OffsetPaginationSchema, DEFAULT_PAGE_LIMIT } from '../validation/paginationSchema.js';
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import type { DedupCache } from '../redis/dedup.js';
 import { checkWebhookPreflight } from '../webhooks/preflight.js';
+import {
+  webhookSecretRepository,
+  DEFAULT_WEBHOOK_SECRET_ID,
+} from '../db/repositories/webhookSecretRepository.js';
 
 let inboundWebhookDedupCache: DedupCache = new InMemoryDedupCache();
 
@@ -33,6 +43,21 @@ export function getInboundWebhookDedupCache(): DedupCache {
 
 export const webhooksRouter = express.Router();
 
+/**
+ * Effective circuit-breaker thresholds for reporting.
+ *
+ * Observability must never fail because configuration is incomplete, so a
+ * config error falls back to the store defaults (threshold `0` = disabled,
+ * reset `300000` ms) that `describeWebhookCircuitBreaker` applies itself.
+ */
+function circuitBreakerPolicyForStatus(): CircuitBreakerPolicy {
+  try {
+    return resolveWebhookRetryPolicy();
+  } catch {
+    return {};
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // PUBLIC endpoint — no admin token required; verified by HMAC signature only.
 // Must be registered BEFORE the requireAdminAuth guard below.
@@ -42,7 +67,7 @@ export const webhooksRouter = express.Router();
  * POST /internal/webhooks/receive
  *
  * Verifies an incoming Fluxora webhook delivery against the shared secret.
- * Deduplicates using `inboundWebhookDedupCache` (24h TTL, max 10,000 entries per instance).
+ * Deduplicates using `inboundWebhookDedupCache` (DEDUP_WINDOW_SECONDS window, default 24h; see src/redis/dedup.ts).
  * Returns a flat envelope (not the standard successResponse / errorResponse
  * shape) so callers can rely on stable HTTP status codes and the
  * `error` string match the documented `WebhookVerificationCode` values.
@@ -58,7 +83,7 @@ webhooksRouter.post(
     // 1. Shared Preflight (size, depth, encoding, valid json)
     const preflight = checkWebhookPreflight(rawBody, contentType);
     if (!preflight.ok) {
-      res.status(preflight.status).json({ error: preflight.code, message: preflight.message });
+      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
       return;
     }
 
@@ -66,12 +91,44 @@ webhooksRouter.post(
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
-    if (process.env.FLUXORA_WEBHOOK_SECRET !== undefined) {
-      verifyInput.secret = process.env.FLUXORA_WEBHOOK_SECRET;
+    // Prefer the DB-backed rotation state (webhookSecretRepository) so that a
+    // secret rotation's overlap window is actually honored on this path. Any
+    // lookup failure (no row yet, DB unavailable, table not migrated) falls
+    // back to the static env-var secret exactly as before — this keeps
+    // deployments that have never rotated a secret working unchanged.
+    let secretState;
+    try {
+      secretState = await webhookSecretRepository.getSecretState(DEFAULT_WEBHOOK_SECRET_ID);
+    } catch (err) {
+      logger.warn(
+        'Webhook secret rotation lookup failed; falling back to static secret',
+        undefined,
+        { error: err instanceof Error ? err.message : String(err) }
+      );
     }
-    if (process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
-      verifyInput.secretPrevious = process.env.FLUXORA_WEBHOOK_SECRET_PREVIOUS;
+
+    if (secretState) {
+      verifyInput.secret = secretState.currentSecret;
+      if (secretState.previousSecret) {
+        verifyInput.secretPrevious = secretState.previousSecret;
+        if (
+          secretState.previousSecretRotatedAt !== null &&
+          secretState.previousSecretExpiresAt !== null
+        ) {
+          verifyInput.previousSecretRotatedAt = secretState.previousSecretRotatedAt;
+          verifyInput.graceWindowSeconds =
+            secretState.previousSecretExpiresAt - secretState.previousSecretRotatedAt;
+        }
+      }
+    } else {
+      if (getRuntimeEnv().FLUXORA_WEBHOOK_SECRET !== undefined) {
+        verifyInput.secret = getRuntimeEnv().FLUXORA_WEBHOOK_SECRET;
+      }
+      if (getRuntimeEnv().FLUXORA_WEBHOOK_SECRET_PREVIOUS !== undefined) {
+        verifyInput.secretPrevious = getRuntimeEnv().FLUXORA_WEBHOOK_SECRET_PREVIOUS;
+      }
     }
+
     const deliveryHeader = headers['x-fluxora-delivery-id'];
     if (deliveryHeader !== undefined) verifyInput.deliveryId = deliveryHeader;
     const timestampHeader = headers['x-fluxora-timestamp'];
@@ -81,9 +138,7 @@ webhooksRouter.post(
     const verification = verifyWebhookSignature(verifyInput);
 
     if (!verification.ok) {
-      res
-        .status(verification.status)
-        .json({ error: verification.code, message: verification.message });
+      res.status(verification.status).json(errorResponse(verification.code, verification.message, undefined, req.correlationId));
       return;
     }
 
@@ -91,7 +146,7 @@ webhooksRouter.post(
 
     const isNew = await inboundWebhookDedupCache.add('webhook', deliveryId);
     if (!isNew) {
-      res.status(409).json({ error: 'duplicate_delivery', message: 'Duplicate delivery id' });
+      res.status(409).json(errorResponse('DUPLICATE_DELIVERY', 'Duplicate delivery id'));
       return;
     }
 
@@ -101,7 +156,7 @@ webhooksRouter.post(
       eventType: headers['x-fluxora-event'] ?? null,
       event: preflight.parsed,
     });
-  }
+  },
 );
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -120,6 +175,7 @@ webhooksRouter.use(requireAdminAuth);
  * Queue a webhook delivery for reliable processing
  */
 webhooksRouter.post('/queue', express.json(), async (req, res) => {
+  const requestId = req.correlationId;
   try {
     const { event, endpointUrl, secret, priority = 'normal' } = req.body ?? {};
 
@@ -166,22 +222,18 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
       priority,
     });
 
-    res.status(202).json({
-      ok: true,
+    res.status(202).json(successResponse({
       outboxId,
       message: 'Webhook queued for delivery',
-    });
+    }, requestId));
   } catch (error) {
     logger.error('Error queueing webhook', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'QUEUE_ERROR',
-        message: 'Failed to queue webhook',
-      },
-    });
+    res.status(500).json(
+      errorResponse('QUEUE_ERROR', 'Failed to queue webhook', undefined, requestId)
+    );
   }
 });
 
@@ -251,19 +303,20 @@ webhooksRouter.get('/deliveries/:deliveryId', (req: Request, res: Response): voi
  * List all webhook deliveries (for monitoring/debugging)
  */
 webhooksRouter.get('/deliveries', (req, res) => {
+  const requestId = req.correlationId;
   const parsed = OffsetPaginationSchema.safeParse(req.query);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
     res.status(400).json({
       error: {
-        code: 'INVALID_PAGINATION',
+        code: 'VALIDATION_ERROR',
         message: first?.message ?? 'Invalid pagination parameters',
       },
     });
     return;
   }
 
-  const limit = parsed.data.limit ?? 100;
+  const limit = parsed.data.limit ?? DEFAULT_PAGE_LIMIT;
   const offset = parsed.data.offset ?? 0;
   const { status } = req.query;
 
@@ -276,7 +329,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
   const total = deliveries.length;
   const paginated = deliveries.slice(offset, offset + limit);
 
-  res.json({
+  res.json(successResponse({
     total,
     deliveries: paginated.map((delivery) => ({
       id: delivery.id,
@@ -288,7 +341,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
       createdAt: new Date(delivery.createdAt).toISOString(),
       updatedAt: new Date(delivery.updatedAt).toISOString(),
     })),
-  });
+  }, requestId));
 });
 
 /**
@@ -346,7 +399,7 @@ webhooksRouter.get('/outbox', (req, res) => {
   const total = items.length;
   const page = items.slice(offset, offset + limit);
 
-  res.json({
+  res.json(successResponse({
     total,
     limit,
     offset,
@@ -363,7 +416,7 @@ webhooksRouter.get('/outbox', (req, res) => {
       scheduledFor: new Date(item.scheduledFor).toISOString(),
       createdAt: new Date(item.createdAt).toISOString(),
     })),
-  });
+  }, requestId));
 });
 
 /**
@@ -371,24 +424,25 @@ webhooksRouter.get('/outbox', (req, res) => {
  * List dead-letter queue items
  */
 webhooksRouter.get('/dlq', (req, res) => {
+  const requestId = req.correlationId;
   const parsed = OffsetPaginationSchema.safeParse(req.query);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
     res.status(400).json({
       error: {
-        code: 'INVALID_PAGINATION',
+        code: 'VALIDATION_ERROR',
         message: first?.message ?? 'Invalid pagination parameters',
       },
     });
     return;
   }
 
-  const limit = parsed.data.limit ?? 50;
+  const limit = parsed.data.limit ?? DEFAULT_PAGE_LIMIT;
   const offset = parsed.data.offset ?? 0;
 
   const items = webhookDeliveryStore.getDeadLetterQueueItems(limit, offset);
 
-  res.json({
+  res.json(successResponse({
     total: items.length,
     items: items.map((item) => ({
       id: item.id,
@@ -401,7 +455,7 @@ webhooksRouter.get('/dlq', (req, res) => {
       createdAt: new Date(item.createdAt).toISOString(),
       processedAt: item.processedAt ? new Date(item.processedAt).toISOString() : null,
     })),
-  });
+  }, requestId));
 });
 
 /**
@@ -425,6 +479,7 @@ webhooksRouter.get('/dlq', (req, res) => {
  */
 webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
   const { dlqId } = req.params;
+  const requestId = req.correlationId;
   // `secret` is the per-delivery HMAC signing key for the re-queued outbox
   // item, NOT an authorization credential.  Omitting it reuses the original.
   const { secret } = req.body ?? {};
@@ -445,12 +500,9 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
     const dlqItem = dlqItems.find((item) => item.id === dlqId);
 
     if (!dlqItem) {
-      res.status(404).json({
-        error: {
-          code: 'DLQ_ITEM_NOT_FOUND',
-          message: `Dead-letter queue item ${dlqId} not found`,
-        },
-      });
+      res.status(404).json(
+        errorResponse('NOT_FOUND', `Dead-letter queue item ${dlqId} not found`, undefined, requestId)
+      );
       return;
     }
 
@@ -458,12 +510,9 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
     const processed = webhookDeliveryStore.processDeadLetterQueueItem(dlqId);
 
     if (!processed) {
-      res.status(500).json({
-        error: {
-          code: 'DLQ_PROCESS_ERROR',
-          message: 'Failed to process DLQ item',
-        },
-      });
+      res.status(500).json(
+        errorResponse('DLQ_PROCESS_ERROR', 'Failed to process DLQ item', undefined, requestId)
+      );
       return;
     }
 
@@ -494,31 +543,34 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
       deliveryId: dlqItem.deliveryId,
     });
 
-    res.json({
-      ok: true,
+    res.json(successResponse({
       outboxId,
       message: 'DLQ item queued for retry',
-    });
+    }, requestId));
   } catch (error) {
     logger.error('Error retrying DLQ item', undefined, {
       dlqId,
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'DLQ_RETRY_ERROR',
-        message: 'Failed to retry DLQ item',
-      },
-    });
+    res.status(500).json(
+      errorResponse('DLQ_RETRY_ERROR', 'Failed to retry DLQ item', undefined, requestId)
+    );
   }
 });
 
 /**
- * GET /api/webhooks/circuit-breakers
- * Look up Redis-backed circuit breaker state for a consumer endpoint.
+ * GET /internal/webhooks/circuit-breakers?endpointUrl=…
+ *
+ * Reports the circuit breaker state of a single receiver (consumer URL) and,
+ * crucially, *why* deliveries to it are paused and when they resume.
+ *
+ * The thresholds reported (`threshold`, `resetMs`) are the effective ones, read
+ * from `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD` / `WEBHOOK_CIRCUIT_BREAKER_RESET_MS`;
+ * they are the same numbers documented in `docs/webhooks.md`.
  */
 webhooksRouter.get('/circuit-breakers', async (req, res) => {
+  const requestId = req.correlationId;
   const endpointUrl = typeof req.query.endpointUrl === 'string' ? req.query.endpointUrl : undefined;
   if (req.query.endpointUrl !== undefined && endpointUrl === undefined) {
     res.status(400).json({
@@ -530,36 +582,44 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
     return;
   }
   if (!endpointUrl) {
-    res.json({
+    res.json(successResponse({
       total: 0,
       states: [],
       note: 'Provide endpointUrl query parameter to inspect Redis-backed circuit breaker state',
-    });
+    }, requestId));
     return;
   }
 
-  const state = await getWebhookCircuitBreakerStore().getState(endpointUrl);
-  if (!state) {
-    res.json({ total: 0, states: [] });
-    return;
-  }
+  const now = Date.now();
+  const record = await getWebhookCircuitBreakerStore().getState(endpointUrl);
+  const status = describeWebhookCircuitBreaker(record, circuitBreakerPolicyForStatus(), now);
 
-  res.json({
+  res.json(successResponse({
     total: 1,
     states: [
       {
         endpointUrl,
-        state: state.state,
-        failureCount: state.consecutiveFailures,
-        lastFailureTime: null,
-        nextAttemptTime: state.resetAt > 0 ? new Date(state.resetAt).toISOString() : null,
+        state: status.state,
+        /** True while deliveries to this receiver are blocked. */
+        paused: status.paused,
+        /** Why delivery is paused — see docs/webhooks.md "Pause reasons". */
+        reason: status.reason,
+        consecutiveFailures: status.consecutiveFailures,
+        failureCount: status.consecutiveFailures,
+        threshold: status.threshold,
+        resetMs: status.resetMs,
+        lastFailureTime: status.lastFailureAt !== null ? new Date(status.lastFailureAt).toISOString() : null,
+        /** When the next probe may be claimed, or null when nothing is blocked. */
+        resumeAt: status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
+        nextAttemptTime: status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
       },
     ],
-  });
+    observedAt: new Date(now).toISOString(),
+  }, requestId));
 });
 
 /**
- * POST /api/webhooks/circuit-breakers/:endpointUrl/reset
+ * POST /internal/webhooks/circuit-breakers/:endpointUrl/reset
  * Reset circuit breaker for an endpoint
  */
 webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => {
@@ -583,10 +643,28 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => 
   await getWebhookCircuitBreakerStore().recordSuccess(decodedUrl, {});
   logger.info('Circuit breaker reset requested', undefined, { endpointUrl: decodedUrl });
 
+  const status = describeWebhookCircuitBreaker(
+    await getWebhookCircuitBreakerStore().getState(decodedUrl),
+    circuitBreakerPolicyForStatus(),
+    Date.now(),
+  );
+
   res.json({
     ok: true,
     message: 'Circuit breaker reset requested',
     endpointUrl: decodedUrl,
+    states: [
+      {
+        endpointUrl: decodedUrl,
+        state: status.state,
+        paused: status.paused,
+        reason: status.reason,
+        consecutiveFailures: status.consecutiveFailures,
+        threshold: status.threshold,
+        resetMs: status.resetMs,
+        resumeAt: null,
+      },
+    ],
   });
 });
 
@@ -595,6 +673,7 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => 
  * Get webhook delivery metrics
  */
 webhooksRouter.get('/metrics', (req, res) => {
+  const requestId = req.correlationId;
   const metrics = webhookDeliveryStore.getMetrics();
 
   // Calculate success rate
@@ -603,11 +682,11 @@ webhooksRouter.get('/metrics', (req, res) => {
       ? (metrics.successfulDeliveries / metrics.totalDeliveries) * 100
       : 0;
 
-  res.json({
+  res.json(successResponse({
     ...metrics,
     successRate: Math.round(successRate * 100) / 100,
     failureRate: Math.round((100 - successRate) * 100) / 100,
-  });
+  }, requestId));
 });
 
 /**
@@ -667,6 +746,7 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
  * That check has been removed — requireAdminAuth above provides real auth.
  */
 webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
+  const requestId = req.correlationId;
   try {
     const readyItems = webhookDeliveryStore.getReadyOutboxItems();
     let processed = 0;
@@ -692,24 +772,20 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
       }
     }
 
-    res.json({
-      ok: true,
+    res.json(successResponse({
       processed,
       errors,
       total: readyItems.length,
       message: 'Outbox processing completed',
-    });
+    }, requestId));
   } catch (error) {
     logger.error('Error processing webhook outbox', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'OUTBOX_PROCESSING_ERROR',
-        message: 'Failed to process webhook outbox',
-      },
-    });
+    res.status(500).json(
+      errorResponse('OUTBOX_PROCESSING_ERROR', 'Failed to process webhook outbox', undefined, requestId)
+    );
   }
 });
 
@@ -800,22 +876,19 @@ webhooksRouter.post('/cleanup', express.json(), (req, res) => {
       errors: result.errors.length,
     });
 
-    res.json({
-      ok: true,
+    res.json(successResponse({
       cleaned: result.cleaned,
       errors: result.errors,
       olderThanDays,
-    });
+      message: 'Webhook cleanup completed',
+    }, requestId));
   } catch (error) {
     logger.error('Error during webhook cleanup', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json({
-      error: {
-        code: 'CLEANUP_ERROR',
-        message: 'Failed to cleanup webhook data',
-      },
-    });
+    res.status(500).json(
+      errorResponse('CLEANUP_ERROR', 'Failed to cleanup webhook data', undefined, requestId)
+    );
   }
 });

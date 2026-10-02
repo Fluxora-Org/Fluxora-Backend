@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Aggregated system diagnostics service.
  *
@@ -16,12 +17,10 @@
  */
 
 import type pg from 'pg';
-import { logger } from '../lib/logger.js';
 import { getPool, getPoolMetrics } from '../db/pool.js';
 import { getStellarRpcService, type CircuitState } from './stellar-rpc.js';
 import { indexerService } from '../indexer/service.js';
 import { indexerLagSeconds } from '../metrics/businessMetrics.js';
-import { sanitiseErrorMessage } from '../health/checkers.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -70,6 +69,22 @@ export interface DiagnosticsReport {
 const DEFAULT_CHECK_TIMEOUT_MS = 5_000;
 
 /**
+ * Expose only a fixed failure description. Dependency errors can contain
+ * credentials, connection strings, hostnames, IP addresses, or configuration
+ * values, so diagnostics must never echo the original message.
+ */
+function safeFailure(err: unknown, dependency: string): {
+  status: 'error' | 'timeout';
+  error: string;
+} {
+  const timedOut = err instanceof Error && err.message.includes('timed out');
+  return {
+    status: timedOut ? 'timeout' : 'error',
+    error: `${dependency} check ${timedOut ? 'timed out' : 'failed'}`,
+  };
+}
+
+/**
  * Race a promise against a timeout. If the timeout fires first the promise
  * is abandoned (but not cancelled — it still runs to completion or rejection
  * in the background) and the returned promise rejects with `TimeoutError`.
@@ -112,11 +127,11 @@ export interface DiagnosticsServiceDependencies {
  */
 function defaultPingRedis(): Promise<number | null> {
   // If Redis is explicitly disabled, skip the ping check.
-  if (process.env.REDIS_ENABLED === 'false') {
+  if (getRuntimeEnv().REDIS_ENABLED === 'false') {
     return Promise.resolve(null);
   }
 
-  const url = process.env.REDIS_URL ?? 'redis://localhost:6379';
+  const url = getRuntimeEnv().REDIS_URL ?? 'redis://localhost:6379';
   const connectTimeout = 5_000;
 
   // Dynamically import ioredis and create a temporary connection for the PING.
@@ -262,11 +277,11 @@ export class DiagnosticsService {
       }
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Database');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }
@@ -298,11 +313,11 @@ export class DiagnosticsService {
       };
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Redis');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }
@@ -327,11 +342,11 @@ export class DiagnosticsService {
       };
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Circuit breaker');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }
@@ -366,11 +381,11 @@ export class DiagnosticsService {
       };
     } catch (err) {
       const latencyMs = Date.now() - start;
-      const raw = err instanceof Error ? err.message : String(err);
+      const failure = safeFailure(err, 'Indexer');
       return {
-        status: raw.includes('timed out') ? 'timeout' : 'error',
+        status: failure.status,
         latencyMs,
-        error: sanitiseErrorMessage(raw),
+        error: failure.error,
       };
     }
   }

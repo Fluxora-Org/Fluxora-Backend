@@ -1,9 +1,10 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { getConfig } from '../config/env.js';
 import { createRedisClient, type RedisClient } from '../redis/client.js';
 import { addShutdownHook } from '../shutdown.js';
-import { info, warn, error } from '../utils/logger.js';
+import { info, warn, error } from '../lib/logger.js';
 
 interface JwksKey {
   kty: string;
@@ -116,7 +117,7 @@ function recordReplayEntry(replayKey: string, expiresAtMs: number): void {
  * when no other work is pending. It is safe to call multiple times.
  */
 function startReplayCacheSweepTimer(): void {
-  if (replayCacheSweepTimer || process.env.NODE_ENV === 'test') {
+  if (replayCacheSweepTimer || getRuntimeEnv().NODE_ENV === 'test') {
     return;
   }
 
@@ -139,7 +140,7 @@ export function stopReplayCacheSweepTimer(): void {
   }
 }
 
-if (process.env.NODE_ENV !== 'test') {
+if (getRuntimeEnv().NODE_ENV !== 'test') {
   startReplayCacheSweepTimer();
   addShutdownHook(() => stopReplayCacheSweepTimer());
 }

@@ -25,7 +25,11 @@ const STELLAR_KEY_RE = /^G[A-Z2-7]{55}$/;
 
 /** Global variant used for scanning free-form strings. */
 const STELLAR_KEY_GLOBAL_RE = /G[A-Z2-7]{55}/g;
-const BEARER_TOKEN_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
+/**
+ * Only redact actual bearer tokens, not ordinary language like
+ * "Authorization header must use Bearer scheme.".
+ */
+const BEARER_TOKEN_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}(?=\s|$|["'\]])/gi;
 const SENSITIVE_STRING_FIELD_RE = /(password|secret|token|credential|authorization|api[-_]?key|payload|body|query|database[-_]?id|row[-_]?id)\s*[:=]\s*(['"]?)[^\s,'"}]+\2/gi;
 
 /**

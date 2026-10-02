@@ -45,9 +45,8 @@ describe('assessIndexerHealth', () => {
     expect(health.clientImpact).toBe('stale_chain_state');
   });
 
-  describe('stall flag latching and clearing', () => {
-    it('latches the stall flag and requires manual clearing', () => {
-      // 1. Initial stall
+  describe('stall detection and automatic recovery', () => {
+    it('fires an alert when the stall threshold is crossed and clears automatically once healthy', () => {
       let health = assessIndexerHealth({
         enabled: true,
         lastSuccessfulSyncAt: '2026-03-25T20:00:00.000Z',
@@ -55,21 +54,10 @@ describe('assessIndexerHealth', () => {
         stallThresholdMs: 5 * 60 * 1000,
       });
       expect(health.status).toBe('stalled');
-
-      // 2. Recover lag, but flag remains latched
-      health = assessIndexerHealth({
-        enabled: true,
-        lastSuccessfulSyncAt: '2026-03-25T20:00:00.000Z',
-        now: '2026-03-25T20:02:00.000Z', // Now within 5 min threshold
-        stallThresholdMs: 5 * 60 * 1000,
-      });
-      expect(health.status).toBe('stalled');
       expect(health.stalled).toBe(true);
+      expect(health.operatorAction).toBe('page');
+      expect(health.thresholdMs).toBe(5 * 60 * 1000);
 
-      // 3. Clear the flag
-      clearIndexerStall({ now: '2026-03-25T20:02:00.000Z' });
-
-      // 4. Should now be healthy
       health = assessIndexerHealth({
         enabled: true,
         lastSuccessfulSyncAt: '2026-03-25T20:00:00.000Z',
@@ -77,6 +65,8 @@ describe('assessIndexerHealth', () => {
         stallThresholdMs: 5 * 60 * 1000,
       });
       expect(health.status).toBe('healthy');
+      expect(health.stalled).toBe(false);
+      expect(health.operatorAction).toBe('none');
     });
 
     it('refuses to clear the flag if still actively stalled', () => {
@@ -87,13 +77,10 @@ describe('assessIndexerHealth', () => {
         stallThresholdMs: 5 * 60 * 1000,
       };
 
-      // 1. Induce stall
       assessIndexerHealth(input);
 
-      // 2. Try to clear while still lagged
       expect(() => clearIndexerStall(input)).toThrow(ActiveStallError);
 
-      // 3. Flag should remain latched
       const health = assessIndexerHealth(input);
       expect(health.status).toBe('stalled');
     });

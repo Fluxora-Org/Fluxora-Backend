@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Read-replica PostgreSQL connection pool for Fluxora Backend.
  *
@@ -29,7 +30,7 @@ import { dbReplicationLagSeconds } from '../metrics/dbMetrics.js';
 const { Pool } = pg;
 
 function envInt(name: string, fallback: number): number {
-  const v = process.env[name];
+  const v = getRuntimeEnv()[name];
   if (!v) return fallback;
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : fallback;
@@ -43,6 +44,12 @@ let _healthCheckDone = false;
 let _lastLagCheckTime = 0;
 let _lastLagValue: number | null = null;
 const LAG_CHECK_INTERVAL_MS = 30000; // 30 seconds
+/**
+ * Maximum replication lag (seconds) before reads are routed to the primary.
+ * Configurable via REPLICA_MAX_LAG_SECONDS (default 30 s).
+ * Set to 0 to disable lag-based fallback entirely.
+ */
+const LAG_MAX_SECONDS = envInt('REPLICA_MAX_LAG_SECONDS', 30);
 
 /**
  * Extract hostname from a connection string for safe logging.
@@ -72,13 +79,13 @@ function safeHostname(connectionString: string): string {
  *     (default 25). Keeps replica saturation observable separately from primary.
  */
 export function resolveReplicaPoolConfig(): PoolConfig | null {
-  const replicaUrl = process.env['DATABASE_REPLICA_URL'];
+  const replicaUrl = getRuntimeEnv()['DATABASE_REPLICA_URL'];
   if (!replicaUrl) {
     return null;
   }
 
   const primaryCfg = resolvePoolConfig();
-  const raw = process.env['REPLICA_STATEMENT_TIMEOUT_MS'];
+  const raw = getRuntimeEnv()['REPLICA_STATEMENT_TIMEOUT_MS'];
   const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
   const replicaStatementTimeoutMs = Number.isFinite(parsed) && parsed >= 0
     ? parsed
@@ -270,7 +277,22 @@ export async function getReadPool(options: GetReadPoolOptions = {}): Promise<pg.
 
   // Fast path: already resolved.
   if (_healthCheckDone) {
-    return _replicaHealthy && _replicaPool ? _replicaPool : getPool();
+    if (!_replicaHealthy || !_replicaPool) return getPool();
+
+    // Enforce lag-based fallback: if the replica is lagging beyond the
+    // configured threshold, route this read to the primary instead.
+    if (LAG_MAX_SECONDS > 0) {
+      const lag = await checkReplicationLag();
+      if (lag !== null && lag > LAG_MAX_SECONDS) {
+        logger.warn('Replica lag exceeds threshold — routing read to primary', undefined, {
+          lagSeconds: lag,
+          thresholdSeconds: LAG_MAX_SECONDS,
+        });
+        return getPool();
+      }
+    }
+
+    return _replicaPool;
   }
 
   const cfg = resolveReplicaPoolConfig();

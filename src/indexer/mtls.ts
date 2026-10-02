@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { TLSSocket } from 'tls';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { indexerMtlsValidationFailuresTotal } from '../metrics/indexerMetrics.js';
+import { errorResponse } from '../utils/response.js';
 
 /** Module-level flag set during app initialization. */
 let _mtlsRequired = false;
@@ -45,17 +46,11 @@ export function mtlsValidationMiddleware(req: Request, res: Response, next: Next
         'INDEXER_MTLS_FAILURE',
         'indexer_worker',
         req.ip || 'unknown_ip',
-        (req as any).id ?? (req as any).correlationId,
+        req.id ?? req.correlationId,
         { reason: 'non_tls_connection_mtls_required' },
       );
       indexerMtlsValidationFailuresTotal.inc({ reason: 'non_tls_mtls_required' });
-      res.status(403).json({
-        error: {
-          code: 'FORBIDDEN',
-          message: 'mTLS is required but connection is not TLS',
-          requestId: (req as any).id ?? (req as any).correlationId,
-        },
-      });
+      res.status(403).json(errorResponse('FORBIDDEN', 'mTLS is required but connection is not TLS', undefined, req.id ?? req.correlationId));
       return;
     }
     // If not a TLS socket (e.g. local development or behind a reverse proxy that terminates TLS),
@@ -111,17 +106,15 @@ export function mtlsValidationMiddleware(req: Request, res: Response, next: Next
     'INDEXER_MTLS_FAILURE',
     'indexer_worker',
     req.ip || 'unknown_ip',
-    (req as any).id ?? (req as any).correlationId,
+    req.id ?? req.correlationId,
     meta
   );
 
   // Reject the request
-  res.status(isCertMissing ? 401 : 403).json({
-    error: {
-      code: isCertMissing ? 'UNAUTHORIZED' : 'FORBIDDEN',
-      message: 'mTLS client-certificate validation failed',
-      details: authError || 'Certificate missing or invalid',
-      requestId: (req as any).id ?? (req as any).correlationId,
-    }
-  });
+  res.status(isCertMissing ? 401 : 403).json(errorResponse(
+    isCertMissing ? 'UNAUTHORIZED' : 'FORBIDDEN',
+    'mTLS client-certificate validation failed',
+    authError || 'Certificate missing or invalid',
+    req.id ?? req.correlationId,
+  ));
 }

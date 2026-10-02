@@ -8,6 +8,32 @@
 
 Fluxora exposes real-time treasury stream updates on `/ws/streams` using standard WebSockets.
 
+## Module layout
+
+The hub is split into focused modules under `src/ws/`, each owning one concern.
+`src/ws/hub.ts` wires them together and re-exports the public surface, so
+`import { StreamHub, WS_CLOSE_REASONS } from '../ws/hub.js'` keeps working:
+
+| Module | Owns |
+|--------|------|
+| `hub.ts` | Server wiring, broadcast entry point, shutdown, observability surface |
+| `upgradeHandler.ts` | Origin allowlist, JWT auth, atomic per-IP connection limiting |
+| `connectionLifecycle.ts` | Accept/close handling and per-connection cleanup |
+| `connectionRegistry.ts` | Connected sockets, client state, subscription indexes |
+| `subscriptionRouter.ts` | Filter authorization and fanout targeting |
+| `fanout.ts` | Broadcast dispatch, fanout chunking, broadcast tracing span |
+| `backpressure.ts` | Outbound queue, drop/terminate thresholds, counters |
+| `batching.ts` | Opt-in `stream_update_batch` micro-batching |
+| `replay.ts` | Cursor replay from the event store |
+| `healthProbe.ts` | Liveness and stall probes |
+| `hubConfig.ts` | Constants and configuration resolved from the validated env schema |
+| `hubTypes.ts` | Shared type declarations |
+
+Every tunable is declared in the validated environment schema
+(`src/config/env-schema/`) and surfaced through `Config`, so the hub no longer
+reads `process.env` itself and its defaults cannot drift from
+`docs/env-reference.md`.
+
 ## Connection Handshake
 
 During the initial upgrade handshake, clients can optionally filter stream updates by specifying query parameters in the connection URL:
@@ -176,9 +202,25 @@ the slow connection and increments `droppedMessages`. When
 connection, increments both `droppedMessages` and `terminatedConnections`, and
 removes the connection from subscriptions.
 
-The hub does not queue unbounded per-client messages. Recovery is handled by
-future broadcasts after the client's socket drains, or by reconnecting and using
-the replay API backed by the event store.
+The hub retains outbound messages per connection only while the socket is
+backpressured. `WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION` (default 128) limits the
+message count, and `WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION` (default 1 MiB)
+limits the UTF-8 byte size of their combined serialized payloads. If adding a
+message would exceed either cap, the hub drops the newest message and preserves
+the messages already queued. A message larger than the byte cap is dropped
+without entering the queue. Recovery is handled by future broadcasts after the
+client's socket drains, or by reconnecting and using the replay API backed by
+the event store.
+
+## Inbound Message Size
+
+`WS_MAX_INBOUND_MESSAGE_BYTES` (default 4,096) limits each incoming WebSocket
+message payload in **bytes**, measured as UTF-8 payload bytes rather than
+JavaScript string characters. The same value configures the `ws` transport's
+`maxPayload`, which rejects oversized messages before delivering them to the
+application (close code 1009), and the application-level validator repeats the
+byte check before parsing as defense in depth. Fragmented messages are limited
+by their combined message payload size.
 
 Tests can lower thresholds with:
 
@@ -288,8 +330,8 @@ await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
 
 ### Security notes (partition handling)
 
-- No per-client unbounded queuing: the hub never queues messages for slow
-  clients beyond a single broadcast cycle.
+- Queued messages are bounded per connection by both a message-count cap and
+  a combined UTF-8 byte cap; overflow drops the newest message.
 - Terminated connections have their subscriptions fully cleaned up:
   `streamSubscriptions`, `recipientSubscriptions`, and per-client batch
   accumulators are all purged.
@@ -300,7 +342,9 @@ await hub.broadcast({ streamId: 'my-stream', eventId: 'e2', payload: {} });
 ## Security Notes
 
 - Only JSON text frames are accepted; binary frames are rejected.
-- Inbound client messages are capped by `MAX_MESSAGE_BYTES`.
+- Inbound client messages are capped in UTF-8 bytes by
+  `WS_MAX_INBOUND_MESSAGE_BYTES` at the WebSocket transport and application
+  validation layers.
 - Inbound client messages are rate-limited per connection.
 - Optional WebSocket JWT authentication can reject unauthenticated upgrades.
 - When `WS_ALLOWED_ORIGINS` is configured, browser upgrades require an exact
@@ -446,8 +490,9 @@ The flag is also accepted inside a nested `filter` object:
 
 - `events` is always in insertion order (in-order delivery guarantee).
 - `correlationId` is omitted from an entry when not present on the source event.
-- Each frame is bounded by `MAX_MESSAGE_BYTES` (4 096 bytes). If the full batch
-  would exceed that limit, the largest safe prefix (by event count) is sent.
+- Each batch frame is bounded by `MAX_MESSAGE_BYTES` (4 096 bytes), independently
+  of the inbound client-message byte limit. If the full batch would exceed that
+  limit, the largest safe prefix (by event count) is sent.
 
 ### Configuration
 
@@ -456,8 +501,10 @@ The flag is also accepted inside a nested `filter` object:
 | `WS_BATCH_FLUSH_MS` |    50   |   5 | 5 000 | Flush-window duration in milliseconds.                |
 | `WS_BATCH_MAX_SIZE` |    25   |   1 |   500 | Max events per batch before triggering an early flush.|
 
-Both values are clamped to their respective bounds at startup; out-of-range
-values fall back to the clamped boundary rather than crashing.
+Both values are declared in the validated environment schema
+(`src/config/env-schema/server.ts`) and clamped to their respective bounds at
+startup; out-of-range values fall back to the clamped boundary rather than
+crashing, and an unparseable value falls back to the default.
 
 ### Flush triggers
 
@@ -508,9 +555,10 @@ rate(fluxora_ws_batch_events_coalesced_total[5m])
   Neither field is client-controlled in a way that allows key collision.
 - Pending timers are cancelled immediately on client disconnect and on
   `hub.close()` — no frames are ever sent to a closed socket.
-- Each outbound frame is checked against `MAX_MESSAGE_BYTES` before delivery.
-  Oversized frames are truncated to the largest event prefix that fits, rather
-  than silently dropped.
+- Each `stream_update_batch` frame is checked against `MAX_MESSAGE_BYTES` before
+  delivery. Oversized batches are truncated to the largest event prefix that
+  fits; other outbound envelopes are bounded by the per-connection queued-byte
+  cap when they enter the outbound queue.
 
 ### Broadcast Resilience
 

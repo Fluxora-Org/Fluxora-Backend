@@ -1,13 +1,26 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import type { Request, Response, NextFunction } from 'express';
-import type { RateLimitConfig, RateLimitStatus, RateLimitStore, RouteRateLimitConfig } from '../types/rateLimit.js';
+import type {
+  RateLimitConfig,
+  RateLimitStatus,
+  RateLimitStore,
+  RouteRateLimitConfig,
+} from '../types/rateLimit.js';
+import {
+  RATE_LIMIT_HEADERS,
+  type RateLimitHeaderField,
+  type RateLimitHeaderValues,
+} from '../types/rateLimit.js';
 import { getRateLimitConfig, getRouteRateLimitConfig } from '../config/rateLimits.js';
 import { InMemoryStore, SlidingWindowStore, HybridStore } from '../redis/rateLimitStore.js';
 import { createRedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 import { rateLimitRejectedTotal, rateLimitRedisErrorsTotal } from '../metrics.js';
+import { requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
+import { errorResponse } from '../utils/response.js';
 import { getOverride } from '../services/tenantRateLimitOverride.service.js';
 import type { RateLimitOverride } from '../services/tenantRateLimitOverride.service.js';
 
@@ -32,6 +45,33 @@ function getRemainingRequests(count: number, max: number): number {
 
 function secondsUntil(resetAt: number): number {
   return Math.max(0, Math.ceil((resetAt - Date.now()) / 1000));
+}
+
+/**
+ * Emit the rate-limit response headers declared in `RATE_LIMIT_HEADERS`
+ * (`src/types/rateLimit.ts`) onto a response.
+ *
+ * This is the only place rate-limit quota headers are produced: header names
+ * come from the declared mapping and values from the declared
+ * `RateLimitHeaderValues`, so the emitted headers cannot drift from the
+ * type callers implement against. Every declared field must have a value
+ * renderer here; adding a field without one is a compile error.
+ *
+ * `retryAfter` is only emitted when provided (HTTP 429 responses).
+ */
+export function setRateLimitHeaders(res: Response, values: RateLimitHeaderValues): void {
+  const renderers: Record<RateLimitHeaderField, (value: RateLimitHeaderValues[RateLimitHeaderField]) => string> = {
+    limit: (v) => String(v),
+    remaining: (v) => String(v),
+    reset: (v) => String(v),
+    retryAfter: (v) => (v === undefined ? '' : String(v)),
+  };
+
+  for (const field of Object.keys(RATE_LIMIT_HEADERS) as RateLimitHeaderField[]) {
+    const value = values[field];
+    if (value === undefined) continue; // optional declared field (Retry-After on non-429)
+    res.setHeader(RATE_LIMIT_HEADERS[field], renderers[field](value));
+  }
 }
 
 /**
@@ -187,30 +227,18 @@ function buildErrorBody(
   route?: string,
   method?: string,
 ) {
-  const body: {
-    error: {
-      code: string;
-      message: string;
-      retryAfter: number;
-      limit: number;
-      window: string;
-      identifier: string;
-      route?: string;
-      method?: string;
-    };
-  } = {
-    error: {
-      code: 'RATE_LIMIT_EXCEEDED',
-      message: `Too many requests. Retry after ${retryAfterSeconds} seconds.`,
+  return errorResponse(
+    'RATE_LIMIT_EXCEEDED',
+    `Too many requests. Retry after ${retryAfterSeconds} seconds.`,
+    {
       retryAfter: retryAfterSeconds,
       limit,
       window: windowMs === 60_000 ? 'minute' : 'unknown',
       identifier: identifierType === 'ip' ? identifier : maskApiKey(identifier),
+      ...(route ? { route } : {}),
+      ...(method ? { method } : {}),
     },
-  };
-  if (route) body.error.route = route;
-  if (method) body.error.method = method;
-  return body;
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +283,7 @@ export interface RateLimiter {
 // ---------------------------------------------------------------------------
 
 export function createRateLimiter(
-  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  env: Record<string, string | undefined> = getRuntimeEnv() as Record<string, string | undefined>,
   /** Optional store injection — used in tests to bypass Redis. */
   injectedStore?: RateLimitStore,
 ): RateLimiter {
@@ -452,10 +480,13 @@ export function createRateLimiter(
 
     if (count > effectiveLimit) {
       const retryAfter = secondsUntil(resetAt);
-      res.setHeader('Retry-After', String(retryAfter));
-      res.setHeader('X-RateLimit-Limit', String(effectiveLimit));
-      res.setHeader('X-RateLimit-Remaining', '0');
-      res.setHeader('X-RateLimit-Reset', String(resetAtSeconds));
+      // Headers emitted from the declared RATE_LIMIT_HEADERS contract.
+      setRateLimitHeaders(res, {
+        limit: effectiveLimit,
+        remaining: 0,
+        reset: resetAtSeconds,
+        retryAfter,
+      });
 
       // Observability
       logger.warn('Rate limit exceeded', undefined, {
@@ -467,6 +498,7 @@ export function createRateLimiter(
         window: config.windowMs,
       });
       rateLimitRejectedTotal.inc({ identifier_type: identifierType, route: routeKey });
+      requestRefusedTotal.inc({ path, reason: 'rate_limit_exceeded' });
 
       res
         .status(429)
@@ -474,9 +506,12 @@ export function createRateLimiter(
       return;
     }
 
-    res.setHeader('X-RateLimit-Limit', String(effectiveLimit));
-    res.setHeader('X-RateLimit-Remaining', String(getRemainingRequests(count, effectiveLimit)));
-    res.setHeader('X-RateLimit-Reset', String(resetAtSeconds));
+    // Headers emitted from the declared RATE_LIMIT_HEADERS contract.
+    setRateLimitHeaders(res, {
+      limit: effectiveLimit,
+      remaining: getRemainingRequests(count, effectiveLimit),
+      reset: resetAtSeconds,
+    });
 
     next();
   }
@@ -572,7 +607,7 @@ export function createRateLimiter(
 
 export function isAdminKey(
   key: string,
-  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  env: Record<string, string | undefined> = getRuntimeEnv() as Record<string, string | undefined>,
 ): boolean {
   const adminKeyEnv = env.ADMIN_API_KEY ?? '';
   if (!adminKeyEnv) return false;

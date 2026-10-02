@@ -5,26 +5,23 @@
  * GET /docs          — Swagger UI (HTML)
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
- * │  CACHE DESIGN — intentionally process-lifetime (static spec)            │
+ * │  CACHE DESIGN — process-lifetime, invalidated on flag reload (#1477)    │
  * ├─────────────────────────────────────────────────────────────────────────┤
- * │  Investigation performed 2026-07-28 confirmed that buildOpenApiSpec()   │
- * │  in src/openapi/spec.ts is fully static: it depends only on the         │
- * │  module-level OpenAPI registry and hardcoded Zod schemas. It does NOT   │
- * │  read feature flags (getFlags / isEnabled), environment variables, or   │
- * │  any other runtime-reloadable configuration.                            │
- * │                                                                         │
- * │  Therefore the cache MUST NOT be invalidated on reloadFlags() / SIGHUP  │
- * │  because there is nothing to rebuild — the result is identical every    │
- * │  time. Unnecessary rebuilds would only add latency and GC pressure.     │
- * │                                                                         │
- * │  ⚠️  FUTURE CONTRIBUTORS — if you add feature-flag-gated content to    │
- * │  buildOpenApiSpec() (e.g. conditionally including a route or schema     │
- * │  based on isEnabled()), you MUST:                                       │
- * │    1. Call resetSpecCache() from the reloadFlags() call-site (or from   │
- * │       the SIGHUP handler once one is added).                            │
- * │    2. Update the regression tests in src/routes/docs.test.ts to assert  │
- * │       that reloading flags does invalidate the cache.                   │
- * │    3. Remove the static-spec assertions in that same test file.         │
+ * │  The spec builder in src/openapi/spec.ts is still static: it does not   │
+ * │  read flags at build time.                                                │
+ * │                                                                          │
+ * │  HOWEVER, the docs route now *filters* the served spec to exclude any   │
+ * │  path whose enabling feature flag is off (see FLAG_GATED_PATHS below).  │
+ * │  That filter does read flags — so the cache is invalidated via          │
+ * │  onFlagsReloaded(resetSpecCache), registered at the bottom of this      │
+ * │  module.                                                                 │
+ * │                                                                          │
+ * │  If you add a new flag-gated route:                                      │
+ * │    1. Add its spec path + flag name to FLAG_GATED_PATHS.                │
+ * │    2. The test in docs.test.ts "FLAG_GATED_PATHS covers every flag-     │
+ * │       gated route" will fail until you do.                              │
+ * │                                                                          │
+ * │  Admin/internal paths are also excluded, unchanged from before.         │
  * └─────────────────────────────────────────────────────────────────────────┘
  *
  * No authentication is required; the spec itself contains no secrets.
@@ -35,15 +32,39 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import swaggerUi from 'swagger-ui-express';
 import { buildOpenApiSpec } from '../openapi/spec.js';
+import { isEnabled, onFlagsReloaded } from '../config/featureFlags.js';
+import {
+  FLUXORA_JSONLD_CONTEXT_DOCUMENT,
+  FLUXORA_JSONLD_CONTEXT_PATH,
+} from '../serialization/jsonld.js';
 
 export const docsRouter = Router();
 
-// Build once, cache for process lifetime.
-//
-// The spec is intentionally static (see module-level comment). If
-// buildOpenApiSpec() ever reads runtime-reloadable configuration, this cache
-// must be invalidated after each successful reload — call resetSpecCache()
-// from the reload path and update docs.test.ts accordingly.
+/**
+ * Maps an OpenAPI path (as it appears in the spec) to the feature flag that
+ * gates it. Any path listed here is removed from the served spec when its
+ * flag is disabled for the `system` requester id (#1477).
+ *
+ * A test in docs.test.ts asserts every flag-gated route in the app is
+ * represented here; add an entry here whenever you gate a new route.
+ */
+export const FLAG_GATED_PATHS: Record<string, string> = {
+  // The GraphQL gateway is mounted conditionally at runtime (#561 in app.ts).
+  // It is not currently registered in the OpenAPI spec, but the entry is
+  // here so that if/when it is registered, the docs filter will already
+  // honour the flag.
+  '/api/graphql': 'experimental_graphql_gateway',
+};
+
+/** Prefixes that must never appear in public documentation. */
+const EXCLUDED_PATH_PREFIXES = ['/api/admin', '/admin', '/internal'];
+
+/** Tag names that must never appear in public documentation. */
+const EXCLUDED_TAGS = ['admin', 'indexer', 'webhooks'];
+
+/** Requester id used when evaluating flags for the served spec. */
+const SPEC_REQUESTER = 'system';
+
 let cachedSpec: Record<string, unknown> | null = null;
 
 function getSpec(): Record<string, unknown> {
@@ -53,25 +74,30 @@ function getSpec(): Record<string, unknown> {
 
     if (spec.paths) {
       for (const path of Object.keys(spec.paths)) {
-        if (
-          path.startsWith('/api/admin') ||
-          path.startsWith('/admin') ||
-          path.startsWith('/internal')
-        ) {
+        // 1. Always exclude admin/internal paths.
+        if (EXCLUDED_PATH_PREFIXES.some((prefix) => path.startsWith(prefix))) {
+          delete spec.paths[path];
+          continue;
+        }
+
+        // 2. Exclude flag-gated paths whose flag is off.
+        const requiredFlag = FLAG_GATED_PATHS[path];
+        if (requiredFlag && !isEnabled(requiredFlag, SPEC_REQUESTER)) {
           delete spec.paths[path];
         }
       }
     }
 
     if (spec.tags) {
-      spec.tags = spec.tags.filter(
-        (t: any) => !['admin', 'indexer', 'webhooks'].includes(t.name)
+      const tags = spec.tags as Array<{ name?: string }>;
+      spec.tags = tags.filter(
+        (tag) => !['admin', 'indexer', 'webhooks'].includes(tag.name ?? '')
       );
     }
 
     cachedSpec = spec;
   }
-  return cachedSpec;
+  return cachedSpec ?? {};
 }
 
 /** GET /openapi.json — raw OpenAPI 3.1 document */
@@ -79,6 +105,35 @@ docsRouter.get('/openapi.json', (_req: Request, res: Response) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'public, max-age=300');
   res.json(getSpec());
+});
+
+/**
+ * GET /ns/v1 — the JSON-LD context document advertised by every
+ * `/api/streams/:id/export.jsonld` response.
+ *
+ * The path is derived from FLUXORA_JSONLD_CONTEXT_VERSION so the served
+ * location can never disagree with the URI the documents point at. Public and
+ * unauthenticated, like the rest of the docs surface: a context document
+ * contains no secrets, and consumers must be able to resolve it before they
+ * hold an API key.
+ *
+ * Two deliberate departures from the neighbouring docs endpoints:
+ *
+ * - Cache-Control is one year, not the 300s used by /openapi.json. The spec
+ *   tracks the deployed API and changes; a published context version never
+ *   changes, so a client that has fetched v1 may cache it indefinitely.
+ * - Access-Control-Allow-Origin is `*`, overriding the app-wide CORS
+ *   allowlist. The document is a fixed vocabulary with no request-specific or
+ *   tenant data, and linked-data clients commonly run in a browser, so
+ *   origin-gating it would block the resolution this endpoint exists to
+ *   support. The stream documents themselves remain behind the allowlist and
+ *   the API key.
+ */
+docsRouter.get(FLUXORA_JSONLD_CONTEXT_PATH, (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/ld+json');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(FLUXORA_JSONLD_CONTEXT_DOCUMENT);
 });
 
 /** GET /docs — Swagger UI */
@@ -91,7 +146,11 @@ docsRouter.use(
   }),
 );
 
-/** Expose cache-busting helper for tests */
+/** Expose cache-busting helper for tests. */
 export function resetSpecCache(): void {
   cachedSpec = null;
 }
+
+// #1477: invalidate the cached spec whenever feature flags reload, since the
+// served spec now depends on which flags are enabled.
+onFlagsReloaded(resetSpecCache);

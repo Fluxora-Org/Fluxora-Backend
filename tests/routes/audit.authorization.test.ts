@@ -110,7 +110,7 @@ function expectErrorEnvelope(body: unknown, code: string): void {
   expect(envelope.error).toBeDefined();
   expect(envelope.error?.code).toBe(code);
   expect(typeof envelope.error?.message).toBe('string');
-  expect((envelope.error?.message ?? '').length).toBeGreaterThan(0);
+  expect(((envelope.error?.message as string) ?? '').length).toBeGreaterThan(0);
 }
 
 beforeAll(() => {

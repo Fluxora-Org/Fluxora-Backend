@@ -1,5 +1,6 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
-import { logger } from '../logging/logger.js';
+import { logger } from '../lib/logger.js';
+import { deprecatedRouteHitsTotal } from '../metrics.js';
 
 export interface DeprecatedRoute {
   /** Absolute route path or route prefix to mark as deprecated. */
@@ -99,8 +100,12 @@ function applyDeprecationHeaders(req: Request, res: Response, entries: Normalize
       appendLinkHeader(res, entry.link);
     }
 
+    // Increment observable metric for every deprecated route hit.
+    deprecatedRouteHitsTotal.inc({ route: entry.route });
+
     if (entry.sunset.getTime() <= Date.now()) {
-      logger.warn('deprecated route is past its sunset date', req.correlationId as string, {
+      logger.warn('deprecated route is past its sunset date', {
+        correlationId: req.correlationId as string,
         event: 'route.sunset.past',
         method: req.method,
         path: req.path,
@@ -108,7 +113,7 @@ function applyDeprecationHeaders(req: Request, res: Response, entries: Normalize
         sunsetDate: entry.sunsetDate,
         sunsetTimestamp: entry.sunset.toISOString(),
         overdueMs: Date.now() - entry.sunset.getTime(),
-        userAgent: req.headers['user-agent'] ?? 'unknown',
+        userAgent: req.headers?.['user-agent'] ?? 'unknown',
       });
     }
   }
@@ -137,5 +142,59 @@ export function createDeprecationMiddleware(entries: readonly DeprecatedRoute[])
     const matches = normalized.filter((entry) => routeMatches(req, entry.route));
     applyDeprecationHeaders(req, res, matches);
     next();
+  };
+}
+
+/**
+ * Returns a request handler that immediately responds with **410 Gone** for a
+ * retired endpoint.
+ *
+ * Use this instead of a live route handler once the sunset date has passed and
+ * the endpoint has been formally removed. The response:
+ * - carries the last-known `Sunset` date so clients can surface it,
+ * - includes a machine-readable `{ error: 'ENDPOINT_RETIRED' }` body, and
+ * - optionally includes a `Link` header pointing to the migration guide.
+ *
+ * Example:
+ * ```ts
+ * router.all('/api/rate-limits/config', retiredRoute(
+ *   '2026-09-30T00:00:00.000Z',
+ *   '/docs/api/deprecation-policy.md#current-deprecations',
+ * ));
+ * ```
+ */
+export function retiredRoute(sunsetDate: string, link?: string): RequestHandler {
+  assertSafeHeaderValue('Sunset date', sunsetDate);
+
+  const sunset = new Date(sunsetDate);
+  if (Number.isNaN(sunset.getTime())) {
+    throw new Error(`retiredRoute: invalid sunsetDate "${sunsetDate}"`);
+  }
+
+  if (link) {
+    assertSafeHeaderValue('Link URL', link);
+  }
+
+  return (req: Request, res: Response): void => {
+    res.setHeader('Sunset', sunset.toUTCString());
+
+    if (link) {
+      res.setHeader('Link', formatLink(link));
+    }
+
+    logger.warn('request to retired endpoint', {
+      correlationId: req.correlationId as string,
+      event: 'route.retired.hit',
+      method: req.method,
+      path: req.path,
+      sunsetDate,
+      userAgent: req.headers?.['user-agent'] ?? 'unknown',
+    });
+
+    res.status(410).json({
+      error: 'ENDPOINT_RETIRED',
+      message: `This endpoint was retired on ${sunset.toUTCString()}. Consult the migration guide for a replacement.`,
+      ...(link !== undefined ? { link } : {}),
+    });
   };
 }

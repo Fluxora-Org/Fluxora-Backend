@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import {
   sseActiveConnectionsGauge,
   sseConnectionsRejectedTotal,
@@ -55,7 +56,7 @@ export type SseConnectionAttempt =
 const activeConnectionsByIp = new Map<string, number>();
 let activeConnections = 0;
 const activeConnectionsByApiKey = new Map<string, number>();
-const activeTimers = new Set<ReturnType<typeof setTimeout>>();
+const activeTimers = new Set<NodeJS.Timeout>();
 
 function normalizeApiKey(apiKey: string | undefined): string | undefined {
   if (apiKey === undefined) return undefined;
@@ -69,7 +70,7 @@ function normalizeIp(ip: string): string {
 }
 
 function readBoundedPositiveInteger(
-  env: Record<string, string | undefined>,
+  env: NodeJS.ProcessEnv,
   name: string,
   fallback: number,
   min: number,
@@ -92,11 +93,11 @@ function readBoundedPositiveInteger(
  * intentionally request-time rather than module-load-time so tests and runtime
  * configuration reloads do not require reconstructing the router singleton. The
  * bounded fallback parser mirrors the EnvSchema ranges so an invalid late
- * process.env mutation cannot accidentally create unbounded listener/socket
+ * getRuntimeEnv() mutation cannot accidentally create unbounded listener/socket
  * budgets.
  */
 export function resolveSseConnectionLimits(
-  env: Record<string, string | undefined> = process.env,
+  env: NodeJS.ProcessEnv = getRuntimeEnv(),
 ): SseConnectionLimits {
   return {
     maxConnectionsPerIp: readBoundedPositiveInteger(
@@ -212,7 +213,7 @@ export function tryAcquireSseConnection(
   sseActiveConnectionsGauge.set(activeConnections);
 
   let released = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+let timer: NodeJS.Timeout | undefined;
   const acceptedAt = Date.now();
 
   const connection: AcceptedSseConnection = {

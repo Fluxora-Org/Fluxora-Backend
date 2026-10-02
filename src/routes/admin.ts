@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { Router } from 'express';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { getHybridBanStoreStatus } from '../redis/banStore.js';
@@ -31,18 +32,18 @@ import { tenantRateLimitOverridesRouter } from './admin/tenantRateLimitOverrides
 
 export const adminRouter = Router();
 
+// Every admin route requires a valid Bearer token.
+adminRouter.use(requireAdminAuth);
+
 /**
  * GET /api/admin/status/read-only
- * Read-only endpoint for pause-flag visibility without admin credentials.
- * Exposes non-sensitive service posture only.
+ * Read-only endpoint for pause-flag visibility.
+ * Note: Now covered by admin credentials.
  */
 adminRouter.get('/status/read-only', (req, res) => {
   const requestId = req.correlationId;
   res.json(successResponse({ pauseFlags: getPauseFlags() }, requestId));
 });
-
-// Every admin route requires a valid Bearer token.
-adminRouter.use(requireAdminAuth);
 
 // Per-tenant rate limit override management
 adminRouter.use('/rate-limits/overrides', tenantRateLimitOverridesRouter);
@@ -109,14 +110,16 @@ adminRouter.put('/pause', async (req, res) => {
   const { streamCreation, ingestion } = req.body ?? {};
 
   if (streamCreation === undefined && ingestion === undefined) {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'Request body must include at least one of: streamCreation, ingestion.',
-        undefined,
-        requestId
-      )
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse(
+          'VALIDATION_ERROR',
+          'Request body must include at least one of: streamCreation, ingestion.',
+          undefined,
+          requestId
+        )
+      );
     return;
   }
 
@@ -128,14 +131,7 @@ adminRouter.put('/pause', async (req, res) => {
     errors.push('ingestion must be a boolean.');
   }
   if (errors.length > 0) {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        errors.join(' '),
-        undefined,
-        requestId
-      )
-    );
+    res.status(400).json(errorResponse('VALIDATION_ERROR', errors.join(' '), undefined, requestId));
     return;
   }
 
@@ -145,14 +141,16 @@ adminRouter.put('/pause', async (req, res) => {
     updated = await setPauseFlags({ streamCreation, ingestion });
   } catch (err) {
     if (err instanceof AdminStatePersistenceError) {
-      res.status(503).json(
-        errorResponse(
-          'PERSISTENCE_ERROR',
-          'Unable to persist pause flags. Try again later.',
-          undefined,
-          requestId
-        )
-      );
+      res
+        .status(503)
+        .json(
+          errorResponse(
+            'PERSISTENCE_ERROR',
+            'Unable to persist pause flags. Try again later.',
+            undefined,
+            requestId
+          )
+        );
       return;
     }
     throw err;
@@ -193,14 +191,16 @@ adminRouter.post('/reindex', async (req, res) => {
   const requestId = req.correlationId;
   const current = getReindexState();
   if (current.status === 'running') {
-    res.status(409).json(
-      errorResponse(
-        'CONFLICT',
-        'A reindex operation is already in progress.',
-        { reindex: current },
-        requestId
-      )
-    );
+    res
+      .status(409)
+      .json(
+        errorResponse(
+          'CONFLICT',
+          'A reindex operation is already in progress.',
+          { reindex: current },
+          requestId
+        )
+      );
     return;
   }
 
@@ -228,13 +228,14 @@ adminRouter.post('/reindex', async (req, res) => {
  * lag is still violating the freshness threshold.
  */
 adminRouter.post('/indexer/stall/clear', (req, res) => {
+  const requestId = req.correlationId;
   try {
     clearIndexerStall();
-    recordAuditEvent('INDEXER_STALL_CLEARED', 'indexer', 'system', req.correlationId);
-    res.json({ message: 'Indexer stall flag cleared successfully.' });
+    recordAuditEvent('INDEXER_STALL_CLEARED', 'indexer', 'system', requestId);
+    res.json(successResponse({ message: 'Indexer stall flag cleared successfully.' }, requestId));
   } catch (err) {
     if (err instanceof ActiveStallError) {
-      res.status(409).json({ error: err.message });
+      res.status(409).json(errorResponse('ACTIVE_STALL', err.message, undefined, requestId));
       return;
     }
     throw err;
@@ -250,40 +251,36 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
   const { stream_id: streamIdValue } = req.body ?? {};
 
   if (typeof streamIdValue !== 'string') {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'stream_id (string) is required.',
-        undefined,
-        requestId
-      )
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse('VALIDATION_ERROR', 'stream_id (string) is required.', undefined, requestId)
+      );
     return;
   }
 
   const streamId = streamIdValue.trim();
   if (streamId.length === 0) {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'stream_id (string) is required.',
-        undefined,
-        requestId
-      )
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse('VALIDATION_ERROR', 'stream_id (string) is required.', undefined, requestId)
+      );
     return;
   }
 
   const hub = getStreamHub();
   if (!hub) {
-    res.status(503).json(
-      errorResponse(
-        'SERVICE_UNAVAILABLE',
-        'WebSocket hub is not initialized. Try again after the service starts.',
-        undefined,
-        requestId
-      )
-    );
+    res
+      .status(503)
+      .json(
+        errorResponse(
+          'SERVICE_UNAVAILABLE',
+          'WebSocket hub is not initialized. Try again after the service starts.',
+          undefined,
+          requestId
+        )
+      );
     return;
   }
 
@@ -296,14 +293,16 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
       closeReason: 'admin-forced-disconnect',
     });
   } catch (err) {
-    res.status(503).json(
-      errorResponse(
-        'PERSISTENCE_ERROR',
-        'Unable to persist audit log entry. Try again later.',
-        { disconnectedCount },
-        requestId
-      )
-    );
+    res
+      .status(503)
+      .json(
+        errorResponse(
+          'PERSISTENCE_ERROR',
+          'Unable to persist audit log entry. Try again later.',
+          { disconnectedCount },
+          requestId
+        )
+      );
     return;
   }
 
@@ -327,7 +326,10 @@ const bulkActionItemSchema = z.object({
 });
 
 const bulkActionSchema = z.object({
-  batch: z.array(bulkActionItemSchema).min(1, 'Batch cannot be empty').max(500, 'Batch size exceeds limit of 500'),
+  batch: z
+    .array(bulkActionItemSchema)
+    .min(1, 'Batch cannot be empty')
+    .max(500, 'Batch size exceeds limit of 500'),
 });
 
 /**
@@ -340,19 +342,26 @@ adminRouter.post('/streams/bulk-actions', async (req, res) => {
   const parseResult = bulkActionSchema.safeParse(req.body);
 
   if (!parseResult.success) {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'Request validation failed',
-        formatZodIssues(parseResult.error.issues),
-        requestId
-      )
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse(
+          'VALIDATION_ERROR',
+          'Request validation failed',
+          formatZodIssues(parseResult.error.issues),
+          requestId
+        )
+      );
     return;
   }
 
   const { batch } = parseResult.data;
-  const results: Array<{ streamId: string; action: string; status: 'success' | 'failed'; error?: string }> = [];
+  const results: Array<{
+    streamId: string;
+    action: string;
+    status: 'success' | 'failed';
+    error?: string;
+  }> = [];
   let successCount = 0;
   let failureCount = 0;
 
@@ -361,11 +370,15 @@ adminRouter.post('/streams/bulk-actions', async (req, res) => {
       if (item.action === 'pause') {
         await streamRepository.updateStream(item.streamId, { status: 'paused' }, req.correlationId);
       } else if (item.action === 'cancel') {
-        await streamRepository.updateStream(item.streamId, { status: 'cancelled' }, req.correlationId);
+        await streamRepository.updateStream(
+          item.streamId,
+          { status: 'cancelled' },
+          req.correlationId
+        );
       } else if (item.action === 'reindex') {
         await triggerStreamReindex(item.streamId);
       }
-      
+
       results.push({ streamId: item.streamId, action: item.action, status: 'success' });
       successCount++;
     } catch (err) {
@@ -412,28 +425,25 @@ adminRouter.post('/api-keys', async (req, res) => {
   const requestId = req.correlationId;
   const { name } = req.body ?? {};
   if (!name || typeof name !== 'string') {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'name (string) is required.',
-        undefined,
-        requestId
-      )
-    );
+    res
+      .status(400)
+      .json(errorResponse('VALIDATION_ERROR', 'name (string) is required.', undefined, requestId));
     return;
   }
   try {
     const created = await createApiKey(name, undefined, req.correlationId);
     res.status(201).json(successResponse(created, requestId));
   } catch (err) {
-    res.status(400).json(
-      errorResponse(
-        'API_KEY_ERROR',
-        err instanceof Error ? err.message : String(err),
-        undefined,
-        requestId
-      )
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse(
+          'API_KEY_ERROR',
+          err instanceof Error ? err.message : String(err),
+          undefined,
+          requestId
+        )
+      );
   }
 });
 
@@ -479,19 +489,22 @@ adminRouter.delete('/api-keys/:id', async (req, res) => {
 adminRouter.get('/ban-store/status', (req, res) => {
   const requestId = req.correlationId;
   try {
-    const status = typeof getHybridBanStoreStatus === 'function'
-      ? getHybridBanStoreStatus()
-      : { available: false, reason: 'getHybridBanStoreStatus not implemented' };
+    const status =
+      typeof getHybridBanStoreStatus === 'function'
+        ? getHybridBanStoreStatus()
+        : { available: false, reason: 'getHybridBanStoreStatus not implemented' };
     res.json(successResponse({ banStore: status }, requestId));
   } catch (err) {
-    res.status(503).json(
-      errorResponse(
-        'SERVICE_UNAVAILABLE',
-        err instanceof Error ? err.message : String(err),
-        undefined,
-        requestId,
-      ),
-    );
+    res
+      .status(503)
+      .json(
+        errorResponse(
+          'SERVICE_UNAVAILABLE',
+          err instanceof Error ? err.message : String(err),
+          undefined,
+          requestId
+        )
+      );
   }
 });
 
@@ -535,14 +548,16 @@ adminRouter.post('/restore', async (req, res) => {
 
   // ── Input validation ────────────────────────────────────────────────────
   if (!backupId || typeof backupId !== 'string') {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'backupId (non-empty string) is required.',
-        undefined,
-        requestId,
-      ),
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse(
+          'VALIDATION_ERROR',
+          'backupId (non-empty string) is required.',
+          undefined,
+          requestId
+        )
+      );
     return;
   }
 
@@ -551,27 +566,31 @@ adminRouter.post('/restore', async (req, res) => {
     targetEnvironment !== 'staging' &&
     targetEnvironment !== 'production'
   ) {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'targetEnvironment must be "staging" or "production".',
-        undefined,
-        requestId,
-      ),
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse(
+          'VALIDATION_ERROR',
+          'targetEnvironment must be "staging" or "production".',
+          undefined,
+          requestId
+        )
+      );
     return;
   }
 
   // Require S3_BACKUP_BUCKET to be configured before queueing.
-  if (!process.env.S3_BACKUP_BUCKET) {
-    res.status(503).json(
-      errorResponse(
-        'CONFIGURATION_ERROR',
-        'S3_BACKUP_BUCKET environment variable is required for restore operations.',
-        undefined,
-        requestId,
-      ),
-    );
+  if (!getRuntimeEnv().S3_BACKUP_BUCKET) {
+    res
+      .status(503)
+      .json(
+        errorResponse(
+          'CONFIGURATION_ERROR',
+          'S3_BACKUP_BUCKET environment variable is required for restore operations.',
+          undefined,
+          requestId
+        )
+      );
     return;
   }
 
@@ -602,21 +621,19 @@ adminRouter.post('/restore', async (req, res) => {
           backupId: updatedJob.backupId,
           targetEnvironment: updatedJob.targetEnvironment,
           ...(updatedJob.restoredTo !== undefined ? { restoredTo: updatedJob.restoredTo } : {}),
-          ...(updatedJob.errorMessage !== undefined ? { errorMessage: updatedJob.errorMessage } : {}),
+          ...(updatedJob.errorMessage !== undefined
+            ? { errorMessage: updatedJob.errorMessage }
+            : {}),
         });
       },
     });
   } catch (err) {
     if (err instanceof ValidationError) {
-      res.status(400).json(
-        errorResponse('VALIDATION_ERROR', err.message, undefined, requestId),
-      );
+      res.status(400).json(errorResponse('VALIDATION_ERROR', err.message, undefined, requestId));
       return;
     }
     if (err instanceof ConfigurationError) {
-      res.status(503).json(
-        errorResponse('CONFIGURATION_ERROR', err.message, undefined, requestId),
-      );
+      res.status(503).json(errorResponse('CONFIGURATION_ERROR', err.message, undefined, requestId));
       return;
     }
     const message = err instanceof Error ? err.message : String(err);
@@ -630,8 +647,8 @@ adminRouter.post('/restore', async (req, res) => {
         message: 'Restore job queued.',
         job,
       },
-      requestId,
-    ),
+      requestId
+    )
   );
 });
 
@@ -660,35 +677,41 @@ adminRouter.get('/restore/:jobId', (req, res) => {
   // Lightweight ID validation — cuid2 IDs are 24 characters but allow
   // any non-empty string up to 255 chars to future-proof persistent stores.
   if (!jobId || jobId.trim().length === 0) {
-    res.status(400).json(
-      errorResponse('VALIDATION_ERROR', 'jobId must be a non-empty string.', undefined, requestId),
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse('VALIDATION_ERROR', 'jobId must be a non-empty string.', undefined, requestId)
+      );
     return;
   }
 
   if (jobId.length > 255) {
-    res.status(400).json(
-      errorResponse(
-        'VALIDATION_ERROR',
-        'jobId exceeds maximum length of 255 characters.',
-        undefined,
-        requestId,
-      ),
-    );
+    res
+      .status(400)
+      .json(
+        errorResponse(
+          'VALIDATION_ERROR',
+          'jobId exceeds maximum length of 255 characters.',
+          undefined,
+          requestId
+        )
+      );
     return;
   }
 
   const job = getRestoreJob(jobId);
 
   if (!job) {
-    res.status(404).json(
-      errorResponse(
-        'NOT_FOUND',
-        `Restore job "${jobId}" not found. It may have expired or belong to a different replica.`,
-        undefined,
-        requestId,
-      ),
-    );
+    res
+      .status(404)
+      .json(
+        errorResponse(
+          'NOT_FOUND',
+          `Restore job "${jobId}" not found. It may have expired or belong to a different replica.`,
+          undefined,
+          requestId
+        )
+      );
     return;
   }
 
@@ -729,14 +752,9 @@ adminRouter.get('/diagnostics', async (req, res) => {
   try {
     const diagnostics = await getDiagnosticsService().runDiagnostics();
     res.json(successResponse(diagnostics, requestId));
-  } catch (err) {
-    res.status(503).json(
-      errorResponse(
-        'DIAGNOSTICS_ERROR',
-        err instanceof Error ? err.message : 'Diagnostics check failed',
-        undefined,
-        requestId,
-      ),
-    );
+  } catch {
+    res
+      .status(503)
+      .json(errorResponse('DIAGNOSTICS_ERROR', 'Diagnostics check failed', undefined, requestId));
   }
 });

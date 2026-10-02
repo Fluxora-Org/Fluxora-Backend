@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { EventEmitter } from 'node:events';
 
 import type { StreamEventRecord } from '../db/types.js';
@@ -22,7 +23,7 @@ export const SSE_CLOSE_REASONS = {
 export type SseCloseReason = (typeof SSE_CLOSE_REASONS)[keyof typeof SSE_CLOSE_REASONS];
 
 export const SSE_MAX_BUFFERED_EVENTS = parseInt(
-  process.env.SSE_MAX_BUFFERED_EVENTS || '1000',
+  getRuntimeEnv().SSE_MAX_BUFFERED_EVENTS || '1000',
   10,
 );
 
@@ -56,7 +57,7 @@ export type SseStreamSubscriber = (event: LiveSseStreamUpdateEvent) => void;
  * Override via `SSE_REPLAY_BUFFER_SIZE` env var (positive integer).
  */
 export const SSE_REPLAY_BUFFER_SIZE = (() => {
-  const raw = parseInt(process.env.SSE_REPLAY_BUFFER_SIZE ?? '200', 10);
+  const raw = parseInt(getRuntimeEnv().SSE_REPLAY_BUFFER_SIZE ?? '200', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 200;
 })();
 
@@ -332,13 +333,10 @@ export function _resetSseSubscriptionsForTest(): void {
   sseEventListenersGauge.set(0);
 }
 
-// Upstream: accepts null/undefined and uses a simplified implementation.
-export function eventMatchesStreamId(
-  event: StreamEventRecord | null | undefined,
-  streamId: string,
-): boolean {
-  if (!event || !streamId) return false;
-  const payload = event.payload as Record<string, unknown> | undefined;
-  if (payload?.['id'] === streamId || payload?.['streamId'] === streamId) return true;
+/**
+ * True when a replayed store event belongs to the stream identified by
+ * `streamId` (i.e. its chain coordinates derive that stream ID).
+ */
+export function eventMatchesStreamId(event: StreamEventRecord, streamId: string): boolean {
   return deriveStreamId(event.txHash, event.eventIndex) === streamId;
 }

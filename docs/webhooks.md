@@ -79,13 +79,46 @@ To prevent a slow or error-prone consumer from being bombarded with retries, `at
 
 Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCircuitBreakerStore.ts`) so multiple dispatcher instances and process restarts share the same open / half-open / closed view of a struggling consumer.
 
+State is tracked **per receiver URL**, keyed by `webhook_cb:{sha256(url)[0..16]}`. One receiver failing never pauses delivery to another.
+
+### Thresholds
+
+| Setting | Env var | Default | Meaning |
+|---------|---------|--------:|---------|
+| Failure threshold | `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD` | `0` | Consecutive retryable failures that open the circuit. `0` **disables** the breaker — no circuit is ever opened and no delivery is ever paused. |
+| Open window | `WEBHOOK_CIRCUIT_BREAKER_RESET_MS` | `300000` (5 min) | How long the circuit stays open before a single half-open probe is admitted. |
+| Probe lock | derived | `min(resetMs, 60000)` | How long the single half-open probe stays reserved, so replicas sharing the circuit do not each fire one. |
+| State TTL | derived | `max(resetMs * 2, 300000)` | How long a state record is retained. Also the hard upper bound on a half-open pause whose probe never reports: the expired record reads back as `closed`. |
+
+Only retryable failures count toward the threshold (`countsTowardCircuitBreaker` in `src/webhooks/retry.ts`): a network error, a timeout, or a status in `retryableStatusCodes` (`408`, `425`, `429`, `500`, `502`, `503`, `504` by default). A `2xx` — or a permanent `4xx` such as `401`/`404` — never counts and never opens a circuit.
+
 ### State machine
 
-| State | Behaviour |
-|-------|-----------|
-| `closed` | Deliveries allowed; consecutive failures increment toward the threshold. |
-| `open` | Deliveries blocked until `circuitBreakerResetMs` elapses. |
-| `half-open` | After reset expiry, **one** probe delivery is allowed across all instances. Success closes the circuit; failure re-opens it. |
+```text
+                    recordFailure() × threshold            now >= resetAt
+  ┌────────┐ ────────────────────────────────────▶ ┌──────┐ ────────────────▶ ┌───────────┐
+  │ closed │                                       │ open │                   │ half-open │
+  └────────┘ ◀──────────────────────────────────── └──────┘ ◀────────────────── └───────────┘
+     ▲     │       recordSuccess() (any state)         │ ▲    │                     │      │
+     └─────┴──────────────────────────────────────────┘ └────┴─────────────────────┘      │
+                                        recordFailure() (probe failed)  recordSuccess()   │
+```
+
+| From | To | Trigger | Threshold / condition |
+|------|----|---------|----------------------|
+| — | `closed` | First delivery, or a record older than the state TTL | `consecutiveFailures = 0` |
+| `closed` | `closed` | `recordFailure()` | `consecutiveFailures < threshold`; the counter increments and deliveries keep flowing |
+| `closed` | `open` | `recordFailure()` | `consecutiveFailures >= threshold`; `resetAt = now + resetMs` |
+| `open` | `open` | `checkAndClaimAttempt()` before `resetAt` | every attempt is denied, no HTTP call is made; the outbox row is re-enqueued with `created_at = resetAt` |
+| `open` | `open` | `recordFailure()` | the window restarts: `resetAt = now + resetMs`, the counter keeps incrementing |
+| `open` | `half-open` | `checkAndClaimAttempt()` at `now >= resetAt` | exactly one caller wins `SET NX webhook_cb_probe:{sha256}`; every other caller is denied |
+| `half-open` | `closed` | `recordSuccess()` | the probe returned `2xx`; `consecutiveFailures` resets to `0` and the probe lock is released |
+| `half-open` | `open` | `recordFailure()` | the probe failed; re-opens for another `resetMs` and clears the probe lock |
+| `half-open` | `half-open` | `checkAndClaimAttempt()` | a probe is still in flight (this replica or another); all attempts denied. If that probe never reports, the circuit stays paused until the state record expires, then reads as `closed` |
+
+`resetAt` is **exclusive**: an attempt at `now === resetAt` is admitted as the probe, one millisecond earlier is still blocked.
+
+Every transition increments `fluxora_webhook_circuit_breaker_transitions_total{from_state,to_state,consumer_hash}`. Re-entries that do not change state (`closed → closed`, `half-open → half-open`) are not counted; a `0` on a label pair means that edge has not been crossed since the process started. Alerting rules and PromQL for the metric are in [`docs/observability.md`](observability.md#webhook-circuit-breaker-metrics).
 
 ### How it works
 
@@ -93,12 +126,54 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 2. The circuit breaker store reads/writes JSON state at `webhook_cb:{sha256(url)}`. Half-open probe ownership is tracked with `webhook_cb_probe:{sha256(url)}` via Redis `SET NX`.
 3. When the circuit is open, the outbox row is re-enqueued with `created_at = resetAt` — no HTTP call is made.
 4. Successful deliveries reset the breaker; retryable failures increment the shared failure counter.
-5. State transitions increment `fluxora_webhook_circuit_breaker_transitions_total{from_state,to_state}`.
+5. `shouldRetry()` also stops retrying a single event once `consecutiveFailures >= threshold`, so an event is not re-queued behind an open circuit.
+
+### Observing a receiver's circuit state
+
+`GET /internal/webhooks/circuit-breakers?endpointUrl=<receiver url>` (admin auth) reports one receiver's state, whether deliveries are paused, why, and when they resume:
+
+```json
+{
+  "total": 1,
+  "states": [
+    {
+      "endpointUrl": "https://receiver.example/webhooks",
+      "state": "open",
+      "paused": true,
+      "reason": "failure-threshold",
+      "consecutiveFailures": 4,
+      "failureCount": 4,
+      "threshold": 4,
+      "resetMs": 300000,
+      "lastFailureTime": "2023-11-14T22:13:20.003Z",
+      "resumeAt": "2023-11-14T22:18:20.003Z",
+      "nextAttemptTime": "2023-11-14T22:18:20.003Z"
+    }
+  ],
+  "observedAt": "2023-11-14T22:14:20.003Z"
+}
+```
+
+`threshold` and `resetMs` are the effective values for this process, so the response always states the numbers the circuit is actually applying. `nextAttemptTime` is a deprecated alias of `resumeAt` kept for existing dashboards.
+
+`resumeAt` is the **latest** moment the pause can still be in effect. For `failure-threshold` it is exact (`resetAt`). For `half-open-probe-in-flight` it is the state record's expiry — a half-open pause normally ends within seconds, when the probe reports success or failure; the bound only matters when the probing dispatcher died before recording an outcome.
+
+**Pause reasons** — the `reason` field is the answer to "why did deliveries to this receiver stop?":
+
+| `reason` | `paused` | Meaning | Resumes |
+|----------|:--------:|---------|---------|
+| `deliveries-allowed` | `false` | The circuit is `closed`; every attempt is delivered (subject to the rate limiter). | — (`resumeAt: null`) |
+| `failure-threshold` | `true` | `consecutiveFailures >= threshold`. All attempts are blocked; the receiver is presumed down. | at `resumeAt` (`resetAt`), when one probe is admitted |
+| `reset-elapsed` | `false` | The open window has passed but no probe has been claimed yet. The next attempt is admitted as the half-open probe. | immediately, on the next attempt |
+| `half-open-probe-in-flight` | `true` | A single probe delivery is in flight (this replica or another); all other attempts are blocked. | when the probe reports success/failure, or at the latest at `resumeAt` (see below) |
+
+`POST /internal/webhooks/circuit-breakers/:endpointUrl/reset` (admin auth) forces the circuit closed for an operator-forced recovery; the response carries the post-reset state so the caller can confirm `paused: false`.
 
 ### Security notes
 
 - Consumer URLs are SHA-256-hashed before use as Redis key segments (same approach as the rate limiter) to prevent key injection and to avoid storing raw URLs in Redis keys.
 - A crafted URL cannot trip a breaker for a different consumer because keys are derived from the full URL digest.
+- The observability endpoint is admin-authenticated and echoes back the caller-supplied `endpointUrl`; it exposes no receiver state that an admin caller could not already read from the circuit-breaker keys, and it never widens delivery access to a receiver.
 
 ### Failure modes
 
@@ -108,13 +183,19 @@ Per-consumer circuit breaker state is persisted in Redis (`src/redis/webhookCirc
 | Circuit open | Delivery deferred to `resetAt`; no consumer traffic. |
 | Half-open probe succeeds | Circuit resets to closed. |
 | Half-open probe fails | Circuit re-opens for another `circuitBreakerResetMs`. |
+| Half-open probe never reports | The circuit stays `half-open` and paused until the state record expires (`max(circuitBreakerResetMs * 2, 300000)` ms), which reads back as `closed` and resumes delivery without operator action. The probe lock's own TTL does not re-admit delivery. |
+| Threshold `0` (disabled) | The breaker is bypassed entirely: every attempt is allowed and no circuit is ever opened. |
 | Redis unavailable | **Fail-open** for gate checks; deliveries proceed. Failure recording is best-effort. (Rule 2 of [`docs/security/redis-outage-policy.md`](security/redis-outage-policy.md) — availability-only, no deny/abuse gate.) |
+
+Every edge above is asserted by
+[`tests/webhooks/circuitBreaker.stateMachine.test.ts`](../tests/webhooks/circuitBreaker.stateMachine.test.ts),
+which runs the same transition suite against both the Redis store and the in-process fallback store.
 
 ### How rate limiting works
 
-1. Before firing a retry, the dispatcher calls `attemptWebhookDeliveryWithRateLimit` with the consumer's endpoint URL and the configured `RateLimitConfig` (`{ limit, windowMs }`).
-2. The rate limiter (`src/redis/webhookRateLimit.ts`) maintains a Redis sorted set keyed by a SHA-256 hash of the consumer URL. Each recorded attempt is a member with score = timestamp (ms).
-3. Entries older than `windowMs` are pruned on every check. If the remaining count is at or above `limit`, the attempt is **deferred** rather than dropped.
+1. Before firing a delivery attempt, the dispatcher calls `attemptWebhookDeliveryWithRateLimit` with the receiver's endpoint URL and the configured `RateLimitConfig` (`{ limit, windowMs }`).
+2. The rate limiter (`src/redis/webhookRateLimit.ts`) maintains a Redis sorted set keyed by a SHA-256 hash of the receiver endpoint URL. The budget is per receiver: attempts from all tenants and attempt outcomes to that endpoint share it, while different endpoints never consume one another's capacity. Each recorded attempt is a member with score = timestamp (ms).
+3. Entries are pruned when their age reaches `windowMs`; the Redis key expires after `windowMs` without a new admitted attempt. If the remaining count is at or above `limit`, the attempt is **deferred** rather than dropped.
 4. A deferred attempt returns `{ shouldRetry: true, rateLimited: true, retryAt: now + windowMs }`. The dispatcher re-inserts the outbox row with `created_at = retryAt`, so the deferral is durable in PostgreSQL.
 5. `WEBHOOK_RETRY_RPS` (default `10`) controls `limit`; `windowMs` is `1000 ms` (one second).
 
@@ -225,7 +306,8 @@ Webhook consumers verify incoming requests by recomputing the HMAC-SHA256 signat
 When a webhook consumer rotates its signing secret via the admin API, there is a transition period during which some producers may still be signing with the old secret. To avoid spurious verification failures, the verification path supports a **bounded dual-secret grace window**:
 
 - During the grace window, **both** the previous and current secret are accepted.
-- After the grace window expires, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
+- The overlap is configurable with `graceWindowSeconds`; it is active from the rotation timestamp up to, but not including, the expiry timestamp.
+- At and after expiry, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
 - The rotation timestamp and grace-window expiry are **persisted** in the `webhook_secrets` table (not held in memory), so a process restart cannot silently extend or shrink the window.
 - The default grace window is `DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS` (86 400 seconds / 24 hours).
 
@@ -329,3 +411,21 @@ SSRF validation failures are logged without exposing the full URL for security. 
 - Applied in: `WebhookDispatcher.dispatch()` and `dispatchWebhook()` in `src/webhooks/dispatcher.ts`
 - Timeout: Uses `DEFAULT_RETRY_POLICY.timeoutMs` (30 seconds)
 - DNS resolution: Uses Node.js `dns.promises.lookup()`
+
+## Payload schemas (published, versioned)
+
+Every webhook payload is an external contract: receivers parse it. The
+published, versioned schemas live in `src/webhooks/payloadSchemas.ts`
+(zod), with committed fixtures per event under `src/webhooks/schema-fixtures/`
+(issue #1570).
+
+- Each payload carries a `schema_version` field (currently `1`).
+- **Compatibility rule:** additive changes (new optional fields, new event
+  types) do NOT bump the version. Removing, renaming, retyping, or changing
+  the meaning of an existing field DOES.
+- The committed fixtures pin the current shape of every event; CI fails if
+  code drifts the shape without a deliberate version bump and fixture update.
+- Delivery validates outgoing payloads against the published schema; a
+  mismatch is classified poison (non-retryable), not transient.
+- Schemas are strict: unknown keys are rejected, so adding a field is itself
+  a schema change (additive, no bump, but the fixtures must be updated).

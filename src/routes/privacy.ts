@@ -19,6 +19,7 @@ import {
   STREAM_FIELD_POLICIES,
   REQUEST_FIELD_POLICIES,
   RETENTION_SCHEDULE,
+  LEGAL_HOLD_POLICY,
   TRUST_BOUNDARIES,
   DataClassification,
 } from '../pii/policy.js';
@@ -38,13 +39,14 @@ import {
   validationError,
   tooManyRequests,
 } from '../middleware/errorHandler.js';
-import { successResponse } from '../utils/response.js';
+import { successResponse, errorResponse } from '../utils/response.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { recordAuditEventToDb, recordErasureAuditLog, writeAuditEntryToClient } from '../lib/auditLog.js';
 import { hashStringSHA256 } from '../lib/security.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
 import { requireJsonContentType } from '../middleware/contentType.js';
+import { isValidStellarAccountAddress } from '../validation/stellarAddress.js';
 
 export const privacyRouter = Router();
 
@@ -100,12 +102,12 @@ function rejectUnsupportedMethods(allowedMethods: string[]) {
   return (req: Request, res: Response): void => {
     const allow = allowedMethods.join(', ');
     res.setHeader('Allow', allow);
-    res.status(405).json({
-      error: {
-        code: 'METHOD_NOT_ALLOWED',
-        message: `${req.method} is not allowed on this resource`,
-      },
-    });
+    res.status(405).json(
+      errorResponse(
+        'METHOD_NOT_ALLOWED',
+        `${req.method} is not allowed on this resource`,
+      ),
+    );
   };
 }
 
@@ -235,15 +237,24 @@ privacyRouter.all('/policy', rejectUnsupportedMethods(['GET', 'HEAD']));
 /**
  * GET /api/privacy/retention
  *
- * Lightweight view of just the retention schedule for quick
- * compliance checks.
+ * The complete data-retention schedule for the service: every class of
+ * persisted data, the period committed to for it, the mechanism that enforces
+ * that period, and whether a legal hold can override it.
+ *
+ * This is the machine-readable half of `docs/retention-schedule.md`; both are
+ * generated from the same manifest (`RETENTION_MANIFEST` in
+ * `src/pii/retention.ts`) and `scripts/check-retention-schedule.ts` fails CI
+ * when they diverge. It is the endpoint a subject-access or erasure request
+ * should be answered from.
  */
 privacyRouter.get('/retention', (_req: Request, res: Response) => {
   res.json({
     retentionSchedule: RETENTION_SCHEDULE,
+    legalHold: LEGAL_HOLD_POLICY,
     _links: {
       self: '/api/privacy/retention',
       fullPolicy: '/api/privacy/policy',
+      document: 'docs/retention-schedule.md',
     },
   });
 });
@@ -429,12 +440,13 @@ privacyRouter.delete(
     if (
       typeof recipientAddress !== 'string' ||
       recipientAddress.trim().length === 0 ||
-      recipientAddress.length > 256
+      recipientAddress.length > 256 ||
+      !isValidStellarAccountAddress(recipientAddress.trim())
     ) {
       res.status(400).json({
         error: {
           code: 'INVALID_ADDRESS',
-          message: 'recipientAddress must be a non-empty string of at most 256 characters.',
+          message: 'recipientAddress must be a valid Stellar account address.',
         },
       });
       return;
@@ -519,15 +531,20 @@ privacyRouter.delete(
         rowsSkippedLegalHold,
       });
 
-      res.status(200).json({
-        erased: true,
-        rowsErased,
-        rowsSkippedLegalHold,
-        message:
-          rowsSkippedLegalHold > 0
-            ? `${rowsErased} row(s) erased. ${rowsSkippedLegalHold} row(s) skipped due to legal hold.`
-            : `${rowsErased} row(s) erased.`,
-      });
+      res.status(200).json(
+        successResponse(
+          {
+            erased: true,
+            rowsErased,
+            rowsSkippedLegalHold,
+            message:
+              rowsSkippedLegalHold > 0
+                ? `${rowsErased} row(s) erased. ${rowsSkippedLegalHold} row(s) skipped due to legal hold.`
+                : `${rowsErased} row(s) erased.`,
+          },
+          correlationId,
+        ),
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error('PII erasure failed', correlationId, {
@@ -554,12 +571,14 @@ privacyRouter.delete(
         // ignore nested failure
       }
 
-      res.status(500).json({
-        error: {
-          code: 'ERASURE_FAILED',
-          message: 'An internal error occurred while processing the erasure request.',
-        },
-      });
+      res.status(500).json(
+        errorResponse(
+          'ERASURE_FAILED',
+          'An internal error occurred while processing the erasure request.',
+          undefined,
+          correlationId,
+        ),
+      );
     }
   },
 );

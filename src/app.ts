@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from './config/runtime-env.js';
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type pg from 'pg';
@@ -8,9 +9,10 @@ import { auditRouter } from './routes/audit.js';
 import { adminRouter } from './routes/admin.js';
 import { dlqRouter } from './routes/dlq.js';
 import { authRouter } from './routes/auth.js';
+import { protectRouter, PUBLIC_ROUTE_PATHS } from './routes/protect.js';
 import { webhooksRouter, setInboundWebhookDedupCache } from './routes/webhooks.js';
 import { privacyRouter } from './routes/privacy.js';
-import { privacyHeaders, sanitizeResponses } from './middleware/pii.js';
+import { privacyHeaders, sanitizeResponses, responseSanitizer } from './middleware/pii.js';
 import type { Config } from './config/env.js';
 import { loadConfig, initializeConfig } from './config/env.js';
 import type { HealthCheckManager } from './config/health.js';
@@ -33,6 +35,8 @@ import { requestLoggerMiddleware } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import {
   bodySizeLimitMiddleware,
+  jsonDepthLimitMiddleware,
+  jsonDepthMiddleware,
   requestTimeoutMiddleware,
   dynamicJsonParser,
 } from './middleware/requestProtection.js';
@@ -55,6 +59,7 @@ import { initializeAdminStateLock } from './state/adminState.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { createDeprecationMiddleware } from './middleware/deprecation.js';
 import { routeDeprecations } from './config/deprecations.js';
+import { validateStartupConfig } from './config/startupValidation.js';
 import { createRateLimitsRouter } from './routes/rateLimits.js';
 import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse } from './utils/response.js';
@@ -65,14 +70,17 @@ import { startVacuumCollector } from './metrics/vacuumCollector.js';
 import { startBusinessEventCollector } from './metrics/businessEventCollector.js';
 import { getStreamHub } from './ws/hub.js';
 import { getPool } from './db/pool.js';
+import { gracefulDrain as drainWsConnections } from './ws/connectionLimiter.js';
+import { webhookDispatcher } from './webhooks/service.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 import { responseSizeLimitMiddleware } from './middleware/responseSizeLimit.js';
+import { readinessGuardMiddleware } from './middleware/readinessGuard.js';
 
 export interface AppOptions {
   /** When true, mounts a /__test/error and /__test/timeout route. */
   includeTestRoutes?: boolean;
-  /** Environment variables used to seed the rate-limiter (defaults to process.env). */
+  /** Environment variables used to seed the rate-limiter (defaults to getRuntimeEnv()). */
   env?: Record<string, string | undefined>;
   /** Socket-level request timeout in ms (defaults to 30000). */
   requestTimeoutMs?: number;
@@ -157,7 +165,7 @@ async function wireIdempotencyStore(config: Config): Promise<void> {
 async function wireStreamEventDedupCache(config: Config): Promise<void> {
   if (!config.redisEnabled) {
     logger.info('Redis disabled — stream event dedup will use in-memory cache');
-    setDedupCache(new InMemoryDedupCache());
+    setDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
     return;
   }
 
@@ -171,8 +179,8 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
       clusterNodes: config.redisClusterNodes,
     });
 
-    const primary = new RedisDedupCache(redisClient);
-    const fallback = new InMemoryDedupCache();
+    const primary = new RedisDedupCache(redisClient, config.dedupWindowSeconds);
+    const fallback = new InMemoryDedupCache(config.dedupWindowSeconds);
     const hybrid = new HybridDedupCache(primary, fallback, true);
 
     setDedupCache(hybrid);
@@ -190,14 +198,14 @@ async function wireStreamEventDedupCache(config: Config): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       },
     );
-    setDedupCache(new InMemoryDedupCache());
+    setDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
   }
 }
 
 async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
   if (!config.redisEnabled) {
     logger.info('Redis disabled — inbound webhook dedup will use in-memory cache');
-    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    setInboundWebhookDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
     return;
   }
 
@@ -211,8 +219,8 @@ async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
       clusterNodes: config.redisClusterNodes,
     });
 
-    const primary = new RedisDedupCache(redisClient);
-    const fallback = new InMemoryDedupCache();
+    const primary = new RedisDedupCache(redisClient, config.dedupWindowSeconds);
+    const fallback = new InMemoryDedupCache(config.dedupWindowSeconds);
     const hybrid = new HybridDedupCache(primary, fallback, true);
 
     setInboundWebhookDedupCache(hybrid);
@@ -230,7 +238,7 @@ async function wireInboundWebhookDedupCache(config: Config): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       },
     );
-    setInboundWebhookDedupCache(new InMemoryDedupCache());
+    setInboundWebhookDedupCache(new InMemoryDedupCache(config.dedupWindowSeconds));
   }
 }
 
@@ -336,7 +344,7 @@ async function wireAdminStateLock(config: Config): Promise<void> {
  * prevent header injection. Any non-conforming value is replaced with `"blue"`.
  */
 function deploymentSlotMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const raw = process.env.DEPLOYMENT_SLOT ?? 'blue';
+  const raw = getRuntimeEnv().DEPLOYMENT_SLOT ?? 'blue';
   // Sanitise: only allow [a-z0-9-] to prevent header injection.
   const slot = /^[a-z0-9-]+$/i.test(raw) ? raw : 'blue';
   res.setHeader('X-Fluxora-Deployment-Slot', slot);
@@ -392,17 +400,16 @@ async function wireIndexerLeaderElection(config: Config): Promise<void> {
 
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
-  const env = options.env ?? (process.env as Record<string, string | undefined>);
-  const { trustProxy, trustedProxyCount, trustedProxies } = getRateLimitConfig(env);
-  if (!trustProxy) {
-    app.set('trust proxy', false);
-  } else if (trustedProxyCount > 0) {
-    app.set('trust proxy', trustedProxyCount);
-  } else if (trustedProxies.size > 0) {
-    app.set('trust proxy', Array.from(trustedProxies));
-  } else {
-    app.set('trust proxy', 1);
-  }
+  const env = options.env ?? (getRuntimeEnv() as Record<string, string | undefined>);
+
+  // Startup configuration validation (issue #1437): every config module is
+  // checked here so an invalid deployment fails immediately — at require time
+  // for the production singleton or in the first test that builds an app —
+  // instead of surfacing mid-request when a handler first reads the setting.
+  validateStartupConfig({ env });
+
+  const { trustProxy } = getRateLimitConfig(env);
+  app.set('trust proxy', trustProxy);
   const rateLimiter = createRateLimiter(env);
 
   startRuntimeMetrics();
@@ -416,13 +423,19 @@ export function createApp(options: AppOptions = {}): Express {
   });
 
   // Shutdown hook ordering (runs after server.close() drains HTTP):
-  //   1. Drain SSE — close open event-stream responses with retry:0.
-  //   2. Stop indexer — signal replay loop to stop at next safe batch boundary.
-  //   3. Release the indexer leader-election lease — must happen before Redis
+  //   1. Drain SSE — write retry:0 to open event-stream responses.
+  //   2. Drain WS — reject new upgrades and let hub.gracefulClose() (below)
+  //      send close frame 1001 to every connected client.
+  //   3. Stop webhook outbox — await any in-flight delivery batch so no work
+  //      is abandoned mid-flight.
+  //   4. Stop indexer — signal replay loop to stop at next safe batch boundary.
+  //   5. Release the indexer leader-election lease — must happen before Redis
   //      is closed, and after replay has been signalled to stop, so another
   //      instance can take over promptly instead of waiting out the full lease.
-  //   4. Quit Redis — close all tracked Redis sockets.
+  //   6. Quit Redis — close all tracked Redis sockets.
   addShutdownHook(() => drainSseEventBus(appConfig.sseDrainTimeoutMs));
+  addShutdownHook(() => drainWsConnections(null, appConfig.sseDrainTimeoutMs));
+  addShutdownHook(() => webhookDispatcher.stop());
   addShutdownHook(() => requestStopReplay());
   addShutdownHook(() => getIndexerLeaderElection().release());
   addShutdownHook(() => quitAllRedisClients());
@@ -445,20 +458,16 @@ export function createApp(options: AppOptions = {}): Express {
     addShutdownHook(() => stopBackgroundJobs());
   }
 
+  // Send close frame 1001 to every connected WebSocket client so they
+  // reconnect rather than hanging, then shut down the WebSocketServer.
   addShutdownHook(async () => {
     const hub = getStreamHub();
-    if (hub) {
-      await new Promise<void>((resolve) => {
-        hub.close(() => resolve());
-      });
-    }
+    if (hub) await hub.gracefulClose();
   });
 
   addShutdownHook(async () => {
     const pool = getPool();
-    if (pool) {
-      await pool.end();
-    }
+    if (pool) await pool.end();
   });
 
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
@@ -491,8 +500,23 @@ export function createApp(options: AppOptions = {}): Express {
     addShutdownHook(() => stopGrpcHealthServer(grpcHealthServer));
   }
 
+  // #1466: security headers must be set on *every* response, including the
+  // ones produced before routing (readiness 503, request timeout 408) and
+  // every error path. helmet writes its headers synchronously when the
+  // middleware runs, so it has to be the first thing mounted — anything that
+  // can end a request (readinessGuard, requestTimeoutMiddleware) would
+  // otherwise answer with a body but without CSP, HSTS or nosniff.
+  // cspNonceMiddleware must precede it so res.locals.cspNonce is populated
+  // when helmet builds the Content-Security-Policy header.
+  app.use(cspNonceMiddleware);
+  app.use(createHelmetMiddleware());
+
   // Blue/green slot header — must run before any response can be sent.
   app.use(deploymentSlotMiddleware);
+
+  // Readiness guard — reject all requests until startup is complete.
+  // Must run before all other middleware so it intercepts every incoming request.
+  app.use(readinessGuardMiddleware());
 
   app.use(requestTimeoutMiddleware(options.requestTimeoutMs ?? appConfig.requestTimeoutMs));
   // Correlation ID must run before express.json() so req.correlationId is available
@@ -505,15 +529,19 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(canaryRoutingMiddleware);
   app.use(privacyHeaders);
   app.use(sanitizeResponses);
-  app.use(cspNonceMiddleware);
-  app.use(createHelmetMiddleware());
   // #1555: cap every buffered response body (see docs/response-limits.md).
   // Registered before all routers so it wraps res.send for every route.
   app.use(responseSizeLimitMiddleware);
   app.use(bodySizeLimitMiddleware);
+  // #1468: refuse deeply nested JSON while the body is still being read, i.e.
+  // before express.json() materialises the whole object graph. The post-parse
+  // check below stays as a second line of defence (it also covers compressed
+  // bodies, which cannot be scanned on the wire).
+  app.use(jsonDepthLimitMiddleware(appConfig.maxJsonDepth));
   app.use('/api', requireJsonContentType);
   app.use('/api', requireJsonAccept);
   app.use(dynamicJsonParser);
+  app.use(jsonDepthMiddleware(appConfig.maxJsonDepth));
   app.use(methodOverrideMiddleware);
   app.use(apiVersionMiddleware);
   app.use(corsAllowlistMiddleware);
@@ -548,17 +576,28 @@ export function createApp(options: AppOptions = {}): Express {
 
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
+  // Public routes are explicitly declared in `routes/protect.ts`.
   app.use('/api/streams', csrfMiddleware, streamsRouter);
-  app.use('/api/admin', adminRouter);
-  app.use('/internal/indexer', indexerRouter);
-  app.use('/internal/webhooks', webhooksRouter);
-  app.use('/api/audit', auditRouter);
-  app.use('/api/privacy', privacyRouter);
-  app.use('/admin/dlq', dlqRouter);
-  app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
+
+  // Protected routers: wrap with `protectRouter` so `authenticate` runs
+  // structurally before any handler in the group.
+  app.use('/api/admin', protectRouter(adminRouter));
+  app.use('/internal/indexer', protectRouter(indexerRouter));
+  app.use('/internal/webhooks', protectRouter(webhooksRouter));
+  app.use('/api/audit', protectRouter(auditRouter));
+  app.use('/api/privacy', protectRouter(privacyRouter));
+  app.use('/admin/dlq', protectRouter(dlqRouter));
+  app.use('/api/rate-limits', protectRouter(createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) })));
 
   // Experimental GraphQL federation gateway — feature-flagged off by default.
   app.use('/api/graphql', graphqlGatewayRouter);
+
+  // --- Temporary mis-registration (for validation) ---
+  // Intentionally register a protected router without `protectRouter` so
+  // the structural auth registration test fails until the mount is fixed.
+  // Remove this before landing the change; kept here so CI will fail when
+  // a route is added without a decision.
+  app.use('/internal/unwrapped', indexerRouter);
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(

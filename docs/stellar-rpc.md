@@ -10,11 +10,13 @@ Fluxora wraps Stellar RPC calls with a circuit breaker and a last-known-good fal
 | `OPEN` | The provider is considered unhealthy. The service attempts to serve the matching cached response before throwing `CircuitOpenError`. |
 | `HALF_OPEN` | A cool-off period has elapsed. One probe call is attempted against the provider; success closes the circuit and refreshes cache, failure reopens it. |
 
-The breaker is configured with `RPC_CB_FAILURE_THRESHOLD`, `RPC_CB_WINDOW_MS`, `RPC_CB_RESET_TIMEOUT_MS`, and `RPC_TIMEOUT_MS`.
+The breaker is configured with `RPC_CB_FAILURE_THRESHOLD`, `RPC_CB_WINDOW_MS`, `RPC_CB_RESET_TIMEOUT_MS`, and `RPC_TIMEOUT_MS`. These values, retry settings, cache settings, health-check settings, and optional per-operation deadlines are validated by `src/config/env.ts` before startup. Invalid values fail startup instead of being silently replaced by `parseInt`/`parseFloat` fallbacks.
 
 ## RPC Retries
 
 Individual RPC calls (such as fetching the latest ledger or checking account existence) are automatically wrapped in a retry loop using a shared decorrelated jitter helper. If a *retryable* error occurs and the circuit is not open, the request is retried up to `STELLAR_RPC_MAX_RETRIES` times (default 3) before failing, with a base delay of `STELLAR_RPC_RETRY_DELAY` (default 1000ms). Jitter ensures that concurrent callers do not thunder-herd the RPC provider.
+
+`STELLAR_RPC_OPERATION_DEADLINES` accepts a JSON object such as `{"getLatestLedger":2000,"accountExists":8000}`. Every deadline must be a positive integer number of milliseconds.
 
 ### Read vs. submit fallback policy
 

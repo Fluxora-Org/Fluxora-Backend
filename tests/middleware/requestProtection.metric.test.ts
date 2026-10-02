@@ -6,33 +6,34 @@
  *  - The counter is NOT incremented for accepted requests
  *  - The path label uses a normalized route, not the raw URL
  *  - Multiple rejections on different paths produce independent label combinations
+ *  - Depth refusals are counted by fluxora_request_body_too_deep_total
  */
 
 import express from 'express';
 import request from 'supertest';
 import {
   bodySizeLimitMiddleware,
+  jsonDepthLimitMiddleware,
   DEFAULT_RAW_LIMIT_BYTES,
   ROUTE_LIMITS,
 } from '../../src/middleware/requestProtection.js';
 import { errorHandler } from '../../src/middleware/errorHandler.js';
 import {
-  requestBodyTooLargeTotal,
-  deRegisterRequestProtectionMetrics,
+  requestBodyTooLargeTotal as tooLargeCounter,
+  requestBodyTooDeepTotal as tooDeepCounter,
 } from '../../src/metrics/requestProtectionMetrics.js';
 
-// Re-create the counter for each test suite run to avoid state leaking across
-// files when vitest runs tests in the same process.
+// Reset the live collectors between tests. De-registering them instead would
+// leave the middleware incrementing an orphaned collector while this file read
+// a freshly created one, so every assertion after the first would see stale
+// state.
 beforeEach(() => {
-  deRegisterRequestProtectionMetrics();
-});
-
-afterEach(() => {
-  deRegisterRequestProtectionMetrics();
+  tooLargeCounter.reset();
+  tooDeepCounter.reset();
 });
 
 async function getCounterValue(path: string): Promise<number> {
-  const values = await requestBodyTooLargeTotal.get();
+  const values = await tooLargeCounter.get();
   const entry = values.values.find((v) => v.labels['path'] === path);
   return entry?.value ?? 0;
 }
@@ -165,5 +166,50 @@ describe('fluxora_request_body_too_large_total counter', () => {
       expect(countNormalized).toBe(1);
       expect(countWithQuery).toBe(0);
     });
+  });
+});
+
+describe('fluxora_request_body_too_deep_total counter', () => {
+  const MAX_DEPTH = 10;
+  let app: express.Application;
+
+  beforeEach(() => {
+    app = express();
+    app.use(bodySizeLimitMiddleware);
+    app.use(jsonDepthLimitMiddleware(MAX_DEPTH));
+    app.use(express.json());
+    app.post('/api/streams', (_req, res) => res.status(201).json({ ok: true }));
+    app.use(errorHandler);
+  });
+
+  async function getDeepCount(path: string): Promise<number> {
+    const values = await tooDeepCounter.get();
+    const entry = values.values.find((v) => v.labels['path'] === path);
+    return entry?.value ?? 0;
+  }
+
+  function nestedBody(depth: number): Record<string, unknown> {
+    let body: Record<string, unknown> = { value: 'leaf' };
+    for (let i = 0; i < depth; i++) body = { child: body };
+    return body;
+  }
+
+  it('increments once when a body exceeds the depth limit', async () => {
+    await request(app).post('/api/streams').send(nestedBody(MAX_DEPTH + 5)).expect(400);
+
+    expect(await getDeepCount('/api/streams')).toBe(1);
+  });
+
+  it('does not increment for a body within the depth limit', async () => {
+    await request(app).post('/api/streams').send(nestedBody(MAX_DEPTH - 5)).expect(201);
+
+    expect(await getDeepCount('/api/streams')).toBe(0);
+  });
+
+  it('counts the boundary case: depth == limit is refused, depth == limit - 1 is not', async () => {
+    await request(app).post('/api/streams').send(nestedBody(MAX_DEPTH - 1)).expect(201);
+    await request(app).post('/api/streams').send(nestedBody(MAX_DEPTH)).expect(400);
+
+    expect(await getDeepCount('/api/streams')).toBe(1);
   });
 });

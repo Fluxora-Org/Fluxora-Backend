@@ -158,3 +158,22 @@ export function recordConfigReloadFailure(durationMs: number): void {
   configReloadTotal.inc({ result: 'failure' });
   configReloadDurationSeconds.observe(durationMs / 1000);
 }
+
+/**
+ * Total hits on deprecated routes, partitioned by route path.
+ *
+ * Lets operators build dashboards and alerts for deprecated-route traffic so
+ * they know whether clients have migrated before the sunset date arrives.
+ * Label `route` is the configured route prefix (e.g. `/api/rate-limits/config`),
+ * never the raw request path, keeping cardinality bounded.
+ */
+assertCollectorLabels(['route']);
+
+export const deprecatedRouteHitsTotal: Counter<'route'> =
+  (registry.getSingleMetric('fluxora_deprecated_route_hits_total') as Counter<'route'>) ||
+  new Counter({
+    name: 'fluxora_deprecated_route_hits_total',
+    help: 'Total hits on deprecated routes — use this to verify client migration before a sunset date.',
+    labelNames: ['route'] as const,
+    registers: [registry],
+  });

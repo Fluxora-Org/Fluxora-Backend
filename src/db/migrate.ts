@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Database migration runner and startup guard.
  *
@@ -10,7 +11,7 @@
 import { runner } from 'node-pg-migrate';
 import fs from 'fs';
 import pg from 'pg';
-import { info, error as logError } from '../utils/logger.js';
+import { info, error as logError } from '../lib/logger.js';
 import path from 'path';
 
 
@@ -132,7 +133,7 @@ export async function getLatestAppliedMigration(
  * @throws {PendingMigrationsError} When unapplied migrations exist.
  */
 export async function checkPendingMigrations(): Promise<void> {
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = getRuntimeEnv().DATABASE_URL;
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required');
   }
@@ -164,7 +165,7 @@ export async function checkPendingMigrations(): Promise<void> {
  * Run all pending migrations
  */
 export async function migrate(): Promise<void> {
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = getRuntimeEnv().DATABASE_URL;
 
   if (!databaseUrl) {
     throw new Error('DATABASE_URL environment variable is required for migrations');
@@ -186,7 +187,19 @@ export async function migrate(): Promise<void> {
       logger: {
         info: (msg: string) => info(msg),
         warn: (msg: string) => info(msg), // Mapping warn to info for cleaner logs
-        error: (msg: string) => logError(msg),
+        error: (msg: string) => {
+          // node-pg-migrate 7.x only recognizes 13- or 17-digit numeric
+          // prefixes, while this repository intentionally uses 14-digit UTC
+          // prefixes for several historical migrations. It still sorts them
+          // numerically, so downgrade this known compatibility diagnostic to
+          // informational output instead of making a successful migration look
+          // failed.
+          if (msg.startsWith("Can't determine timestamp for ")) {
+            info(msg);
+            return;
+          }
+          logError(msg);
+        },
       },
     });
 

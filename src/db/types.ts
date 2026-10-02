@@ -7,10 +7,10 @@
  * @module db/types
  */
 
-/**
- * Stream status values
- */
-export type StreamStatus = "active" | "paused" | "completed" | "cancelled";
+import type { ApiStreamStatus } from '../streams/status.js';
+import { VALID_API_TRANSITIONS } from '../streams/status.js';
+
+export type StreamStatus = ApiStreamStatus;
 
 /**
  * Stream record from the database
@@ -137,12 +137,7 @@ export const STREAM_INVARIANTS = {
   idPattern: /^stream-[a-f0-9]{64}-\d+$/,
 
   /** Valid status transitions */
-  validTransitions: {
-    active: ["paused", "completed", "cancelled"] as const,
-    paused: ["active", "cancelled"] as const,
-    completed: [] as const,
-    cancelled: [] as const,
-  },
+  validTransitions: VALID_API_TRANSITIONS,
 
   /** Amount constraints */
   amountConstraints: {
@@ -253,8 +248,8 @@ export interface StreamEventRecord {
   eventId: string;
   /** Ledger sequence number */
   ledger: number;
-  /** Ledger hash for reorg detection */
-  ledgerHash: string;
+  /** Ledger hash for reorg detection; NULL for legacy rows written before the column existed */
+  ledgerHash: string | null;
   /** Soroban contract ID */
   contractId: string;
   /** Event topic (e.g. "stream.created") */

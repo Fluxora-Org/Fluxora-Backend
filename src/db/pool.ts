@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * PostgreSQL connection pool for Fluxora Backend.
  *
@@ -93,7 +94,7 @@ export class QueryTimeoutError extends Error {
 // ── Pool config ───────────────────────────────────────────────────────────────
 
 function envInt(name: string, fallback: number): number {
-  const v = process.env[name];
+  const v = getRuntimeEnv()[name];
   if (!v) return fallback;
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : fallback;
@@ -139,12 +140,12 @@ export interface PoolConfig {
 }
 
 export function resolvePoolConfig(): PoolConfig {
-  const rawMode = process.env.POOL_MODE ?? 'session';
+  const rawMode = getRuntimeEnv().POOL_MODE ?? 'session';
   const poolMode: 'session' | 'transaction' =
     rawMode === 'transaction' ? 'transaction' : 'session';
 
   return {
-    connectionString: process.env.DATABASE_URL ?? 'postgresql://localhost/fluxora',
+    connectionString: getRuntimeEnv().DATABASE_URL ?? 'postgresql://localhost/fluxora',
     min: envInt('DB_POOL_MIN', 2),
     max: envInt('DB_POOL_MAX', 10),
     connectionTimeoutMillis: envInt('DB_CONNECTION_TIMEOUT', 5_000),
@@ -299,7 +300,7 @@ export function setPool(pool: pg.Pool | null): void {
  * this flag and adapt accordingly.
  */
 export function isTransactionPoolMode(): boolean {
-  if (!_pool) return (process.env.POOL_MODE === 'transaction');
+  if (!_pool) return (getRuntimeEnv().POOL_MODE === 'transaction');
   return ((_pool as pg.Pool & { _poolMode?: string })._poolMode === 'transaction');
 }
 
@@ -366,7 +367,7 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   pool: pg.Pool,
   sql: string,
   params?: unknown[],
-  thresholdMs: number = parseInt(process.env['SLOW_QUERY_THRESHOLD_MS'] ?? '1000', 10),
+  thresholdMs: number = parseInt(getRuntimeEnv()['SLOW_QUERY_THRESHOLD_MS'] ?? '1000', 10),
 ): Promise<pg.QueryResult<T>> {
   const limit = (pool as pg.Pool & { _queueLimit?: number })._queueLimit ?? envInt('POOL_QUEUE_LIMIT', 50);
 

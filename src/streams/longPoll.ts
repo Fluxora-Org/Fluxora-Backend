@@ -1,5 +1,28 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 import { longPollActiveConnectionsGauge, longPollConnectionsRejectedTotal } from '../metrics/businessMetrics.js';
 
+/**
+ * Long-poll connection timeout and retry behavior.
+ *
+ * Hold Duration (maxConnectionDurationMs):
+ * - Configurable via LONG_POLL_MAX_CONNECTION_DURATION_MS environment variable
+ * - Default: 30,000ms (30 seconds)
+ * - Maximum: 86,400,000ms (24 hours)
+ * - The endpoint holds the HTTP connection open for this duration or until an event arrives
+ *
+ * Timeout Semantics:
+ * - When the hold duration elapses without an event, the response includes:
+ *   - status: 'timeout' field to distinguish from errors
+ *   - retryAfterSeconds: configured retry hint for clients
+ *   - Retry-After HTTP header with the same retry hint
+ * - This allows clients to distinguish idle timeouts from errors and implement backoff
+ *
+ * Retry Behavior:
+ * - Configurable via LONG_POLL_RETRY_AFTER_SECONDS environment variable
+ * - Default: 15 seconds
+ * - Maximum: 86,400 seconds (24 hours)
+ * - Clients should respect the Retry-After header to avoid tight retry loops
+ */
 export const DEFAULT_LONG_POLL_MAX_CONNECTIONS_PER_IP = 10;
 export const DEFAULT_LONG_POLL_MAX_GLOBAL_CONNECTIONS = 1000;
 export const DEFAULT_LONG_POLL_MAX_CONNECTIONS_PER_API_KEY = 50;
@@ -82,7 +105,7 @@ function readBoundedPositiveInteger(
  * Fallbacks to SSE config if LONG_POLL env var is missing, ensuring backwards compatibility or unified limit control.
  */
 export function resolveLongPollConnectionLimits(
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = getRuntimeEnv(),
 ): LongPollConnectionLimits {
   const sseIp = readBoundedPositiveInteger(env, 'SSE_MAX_CONNECTIONS_PER_IP', DEFAULT_LONG_POLL_MAX_CONNECTIONS_PER_IP, 1, MAX_LONG_POLL_CONNECTION_LIMIT);
   const sseKey = readBoundedPositiveInteger(env, 'SSE_MAX_CONNECTIONS_PER_API_KEY', DEFAULT_LONG_POLL_MAX_CONNECTIONS_PER_API_KEY, 1, MAX_LONG_POLL_CONNECTION_LIMIT);

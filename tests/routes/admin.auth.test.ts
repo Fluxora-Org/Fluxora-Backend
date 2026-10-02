@@ -285,33 +285,29 @@ describe('JWT fallback: role-based access control', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. Public endpoint (no auth required)
+// 5. Public endpoint (no auth required) - changed to require auth
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('GET /api/admin/status/read-only — public, no auth required', () => {
-  it('returns 200 with no Authorization header', async () => {
+describe('GET /api/admin/status/read-only — now requires auth', () => {
+  it('returns 401 with no Authorization header', async () => {
     const res = await request(app).get('/api/admin/status/read-only');
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
+    expect(res.status).toBe(401);
+    expect(res.body).toHaveProperty('error');
   });
 
-  it('returns pause flags in data envelope', async () => {
-    const res = await request(app).get('/api/admin/status/read-only');
+  it('accessible with valid admin token', async () => {
+    const res = await request(app)
+      .get('/api/admin/status/read-only')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
+    expect(res.status).toBe(200);
     expect(res.body.data.pauseFlags).toEqual({ streamCreation: false, ingestion: false });
   });
 
-  it('response includes meta.timestamp', async () => {
-    const res = await request(app).get('/api/admin/status/read-only');
-    expect(res.body.meta).toHaveProperty('timestamp');
-    expect(typeof res.body.meta.timestamp).toBe('string');
-  });
-
-  it('accessible even with an invalid Bearer token (auth guard is skipped)', async () => {
+  it('rejects an invalid Bearer token with 403', async () => {
     const res = await request(app)
       .get('/api/admin/status/read-only')
       .set('Authorization', 'Bearer completely-wrong');
-    // Auth guard is NOT applied to this endpoint, so an invalid token is ignored
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(403);
   });
 });
 
@@ -445,6 +441,7 @@ describe('Response shape contract', () => {
 
 describe('Guard applied consistently — every protected route rejects without credentials', () => {
   const protectedRoutes: Array<[string, string]> = [
+    ['GET',    '/api/admin/status/read-only'],
     ['GET',    '/api/admin/status'],
     ['GET',    '/api/admin/pause'],
     ['PUT',    '/api/admin/pause'],
