@@ -9,6 +9,96 @@
  * @see docs/observability/metric-cardinality.md
  */
 
+/** Maximum accepted length for a raw path or a single path segment. */
+export const MAX_PATH_LENGTH = 2048;
+
+/** Maximum accepted length for a Prometheus label name. */
+export const MAX_LABEL_NAME_LENGTH = 255;
+
+/** Maximum accepted length for a Prometheus metric name. */
+export const MAX_METRIC_NAME_LENGTH = 255;
+
+/** Maximum accepted length for a Prometheus text scrape handed to countMetricSeries. */
+export const MAX_PROMETHEUS_TEXT_LENGTH = 1024 * 1024;
+
+/** Machine-readable reason a cardinality input was rejected. */
+export type CardinalityValidationCode =
+  | 'INVALID_TYPE'
+  | 'EMPTY_INPUT'
+  | 'OVERSIZED_INPUT'
+  | 'MALFORMED_INPUT'
+  | 'FORBIDDEN_LABEL';
+
+/**
+ * Typed error for inputs rejected by the cardinality policy.
+ *
+ * Callers can branch on {@link code} while logs / API responses can use
+ * {@link reason}, which never echoes the offending value.
+ */
+export class CardinalityValidationError extends Error {
+  readonly code: CardinalityValidationCode;
+  readonly field: string;
+  readonly inputName: string;
+  readonly reason: string;
+
+  constructor(field: string, code: CardinalityValidationCode, reason: string) {
+    super(`Invalid ${field}: ${reason}`);
+    this.name = 'CardinalityValidationError';
+    this.code = code;
+    this.field = field;
+    this.inputName = field;
+    this.reason = reason;
+  }
+}
+
+/** Control characters never belong in a metric path or label input. */
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/;
+
+/** Prometheus metric names: [a-zA-Z_:][a-zA-Z0-9_:]*. */
+const METRIC_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
+
+/** Prometheus label names: [a-zA-Z_][a-zA-Z0-9_]*. */
+const LABEL_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+
+function assertString(
+  value: unknown,
+  field: string,
+  maxLength: number,
+): asserts value is string {
+  if (typeof value !== 'string') {
+    throw new CardinalityValidationError(
+      field,
+      'INVALID_TYPE',
+      `expected a string, received ${value === null ? 'null' : typeof value}`,
+    );
+  }
+  if (value.trim().length === 0) {
+    throw new CardinalityValidationError(field, 'EMPTY_INPUT', 'value must not be empty');
+  }
+  if (value.length > maxLength) {
+    throw new CardinalityValidationError(
+      field,
+      'OVERSIZED_INPUT',
+      `value must be at most ${maxLength} characters (received ${value.length})`,
+    );
+  }
+}
+
+function assertPathInput(
+  value: unknown,
+  field: string,
+  maxLength = MAX_PATH_LENGTH,
+): asserts value is string {
+  assertString(value, field, maxLength);
+  if (CONTROL_CHARS_RE.test(value)) {
+    throw new CardinalityValidationError(
+      field,
+      'MALFORMED_INPUT',
+      'value must not contain control characters',
+    );
+  }
+}
+
 /** Sentinel used when a path segment is recognised as high-cardinality. */
 export const HIGH_CARDINALITY_BUCKET = ':id';
 
@@ -97,7 +187,8 @@ const CUID_RE = /^c[a-z0-9]{24,}$/i;
  * Returns true when a single path segment looks like an unbounded identifier.
  */
 export function isHighCardinalitySegment(segment: string): boolean {
-  if (!segment || segment === '/' || segment.startsWith(':')) return false;
+  assertPathInput(segment, 'segment');
+  if (segment === '/' || segment.startsWith(':')) return false;
   if (UUID_RE.test(segment)) return true;
   if (STELLAR_STRKEY_RE.test(segment)) return true;
   if (LONG_HEX_RE.test(segment)) return true;
@@ -115,7 +206,7 @@ export function isHighCardinalitySegment(segment: string): boolean {
  * Bucket a single path segment according to the cardinality policy.
  */
 export function bucketPathSegment(segment: string): string {
-  if (!segment) return segment;
+  assertPathInput(segment, 'segment');
   if (STELLAR_STRKEY_RE.test(segment)) return ADDRESS_BUCKET;
   if (isHighCardinalitySegment(segment)) return HIGH_CARDINALITY_BUCKET;
   return segment;
@@ -134,7 +225,7 @@ export function bucketPathSegment(segment: string): string {
  * // => '/api/streams/:id'
  */
 export function normalizeRouteLabel(rawPath: string): string {
-  if (!rawPath) return UNKNOWN_ROUTE_BUCKET;
+  assertPathInput(rawPath, 'rawPath');
 
   let path = rawPath.split('?')[0] ?? rawPath;
   if (path.length > 1 && path.endsWith('/')) {
@@ -162,12 +253,35 @@ export function normalizeRouteLabel(rawPath: string): string {
  * label names cannot ship unnoticed.
  */
 export function assertCollectorLabels(labelNames: readonly string[]): void {
+  if (!Array.isArray(labelNames)) {
+    throw new CardinalityValidationError(
+      'labelNames',
+      'INVALID_TYPE',
+      'expected an array of label names',
+    );
+  }
+
+  // Validate the whole list before rejecting anything so callers get a
+  // deterministic, typed error without any partial side effects.
+  for (const [index, name] of labelNames.entries()) {
+    assertString(name, `labelNames[${index}]`, MAX_LABEL_NAME_LENGTH);
+    if (!LABEL_NAME_RE.test(name)) {
+      throw new CardinalityValidationError(
+        `labelNames[${index}]`,
+        'MALFORMED_INPUT',
+        'label name must match [a-zA-Z_][a-zA-Z0-9_]*',
+      );
+    }
+  }
+
   for (const name of labelNames) {
     if (FORBIDDEN_LABEL_NAMES.has(name)) {
-      throw new Error(
-        `Metric label "${name}" is forbidden by the cardinality policy ` +
-          `(docs/observability/metric-cardinality.md). Use a closed enum or ` +
-          `normalizeRouteLabel() / a hash bucket instead.`,
+      throw new CardinalityValidationError(
+        'labelNames',
+        'FORBIDDEN_LABEL',
+        `metric label "${name}" is forbidden by the cardinality policy ` +
+          `(docs/observability/metric-cardinality.md); use a closed enum or ` +
+          `normalizeRouteLabel() / a hash bucket instead`,
       );
     }
   }
@@ -178,6 +292,16 @@ export function assertCollectorLabels(labelNames: readonly string[]): void {
  * Used by tests to assert series count stays bounded under varied input.
  */
 export function countMetricSeries(prometheusText: string, metricName: string): number {
+  assertString(prometheusText, 'prometheusText', MAX_PROMETHEUS_TEXT_LENGTH);
+  assertString(metricName, 'metricName', MAX_METRIC_NAME_LENGTH);
+  if (!METRIC_NAME_RE.test(metricName)) {
+    throw new CardinalityValidationError(
+      'metricName',
+      'MALFORMED_INPUT',
+      'metric name must match [a-zA-Z_:][a-zA-Z0-9_:]*',
+    );
+  }
+
   const series = new Set<string>();
   const prefix = `${metricName}{`;
   for (const line of prometheusText.split('\n')) {
