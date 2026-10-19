@@ -1,7 +1,7 @@
 import { getRuntimeEnv } from '../config/runtime-env.js';
 import { getPool, query } from '../db/pool.js';
 import { createId } from '@paralleldrive/cuid2';
-import { ApiError, ApiErrorCode } from '../errors.js';
+import { ApiError, ApiErrorCode, validationError } from '../errors.js';
 import { getOverrideCeiling, type OverrideCeiling } from '../config/rateLimits.js';
 
 export interface RateLimitOverride {
@@ -35,7 +35,65 @@ function rowToOverride(row: Record<string, unknown>): RateLimitOverride {
   };
 }
 
-const SELECT_COLUMNS = 'id, key_id, max_requests, window_ms, expires_at, created_by, created_at, updated_at';
+const SELECT_COLUMNS =
+  'id, key_id, max_requests, window_ms, expires_at, created_by, created_at, updated_at';
+const MAX_IDENTIFIER_LENGTH = 128;
+const MAX_REQUESTS_UPPER_BOUND = 10_000_000;
+const MIN_WINDOW_MS = 1_000;
+
+function validateIdentifier(fieldName: string, value: string): void {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw validationError(`${fieldName} must be a non-empty string`, { field: fieldName, value });
+  }
+  if (value.length > MAX_IDENTIFIER_LENGTH) {
+    throw validationError(`${fieldName} is too long`, {
+      field: fieldName,
+      length: value.length,
+      maxLength: MAX_IDENTIFIER_LENGTH,
+    });
+  }
+}
+
+function validateCreateOverrideParams(params: CreateOverrideParams): void {
+  if (params === null || typeof params !== 'object') {
+    throw validationError('Override payload must be an object', { received: params });
+  }
+
+  validateIdentifier('keyId', params.keyId);
+
+  if (!Number.isInteger(params.maxRequests) || params.maxRequests <= 0) {
+    throw validationError('maxRequests must be a positive integer', {
+      field: 'maxRequests',
+      value: params.maxRequests,
+    });
+  }
+
+  if (params.maxRequests > MAX_REQUESTS_UPPER_BOUND) {
+    throw validationError(`maxRequests must not exceed ${MAX_REQUESTS_UPPER_BOUND}`, {
+      field: 'maxRequests',
+      value: params.maxRequests,
+      maxAllowed: MAX_REQUESTS_UPPER_BOUND,
+    });
+  }
+
+  if (!Number.isInteger(params.windowMs) || params.windowMs < MIN_WINDOW_MS) {
+    throw validationError(`windowMs must be an integer of at least ${MIN_WINDOW_MS} milliseconds`, {
+      field: 'windowMs',
+      value: params.windowMs,
+      minValue: MIN_WINDOW_MS,
+    });
+  }
+
+  if (params.expiresAt !== undefined && params.expiresAt !== null) {
+    const parsed = Date.parse(params.expiresAt);
+    if (!Number.isFinite(parsed)) {
+      throw validationError('expiresAt must be a valid ISO-8601 timestamp', {
+        field: 'expiresAt',
+        value: params.expiresAt,
+      });
+    }
+  }
+}
 
 /**
  * Look up an active override by tenant key ID.
@@ -46,12 +104,14 @@ const SELECT_COLUMNS = 'id, key_id, max_requests, window_ms, expires_at, created
  * application-server clock skew.
  */
 export async function getOverride(keyId: string): Promise<RateLimitOverride | null> {
+  validateIdentifier('keyId', keyId);
+
   const pool = getPool();
   const result = await query<Record<string, unknown>>(
     pool,
     `SELECT ${SELECT_COLUMNS} FROM tenant_rate_limit_overrides
      WHERE key_id = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-    [keyId],
+    [keyId]
   );
   return result.rows[0] ? rowToOverride(result.rows[0]) : null;
 }
@@ -64,12 +124,14 @@ export async function getOverride(keyId: string): Promise<RateLimitOverride | nu
  * an expired record is treated as absent by all read paths.
  */
 export async function getOverrideById(id: string): Promise<RateLimitOverride | null> {
+  validateIdentifier('id', id);
+
   const pool = getPool();
   const result = await query<Record<string, unknown>>(
     pool,
     `SELECT ${SELECT_COLUMNS} FROM tenant_rate_limit_overrides
      WHERE id = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-    [id],
+    [id]
   );
   return result.rows[0] ? rowToOverride(result.rows[0]) : null;
 }
@@ -89,15 +151,15 @@ export async function getOverrideById(id: string): Promise<RateLimitOverride | n
 export function assertOverrideWithinCeiling(
   params: Pick<CreateOverrideParams, 'maxRequests' | 'windowMs'>,
   ceiling: OverrideCeiling = getOverrideCeiling(
-    getRuntimeEnv() as Record<string, string | undefined>,
-  ),
+    getRuntimeEnv() as Record<string, string | undefined>
+  )
 ): void {
   if (params.maxRequests > ceiling.maxRequests) {
     throw new ApiError(
       422,
       ApiErrorCode.UNPROCESSABLE_ENTITY,
       `maxRequests ${params.maxRequests} exceeds the global ceiling of ${ceiling.maxRequests}`,
-      { maxRequests: params.maxRequests, ceiling: ceiling.maxRequests },
+      { maxRequests: params.maxRequests, ceiling: ceiling.maxRequests }
     );
   }
   if (params.windowMs > ceiling.windowMs) {
@@ -105,15 +167,17 @@ export function assertOverrideWithinCeiling(
       422,
       ApiErrorCode.UNPROCESSABLE_ENTITY,
       `windowMs ${params.windowMs} exceeds the maximum allowed window of ${ceiling.windowMs}`,
-      { windowMs: params.windowMs, ceiling: ceiling.windowMs },
+      { windowMs: params.windowMs, ceiling: ceiling.windowMs }
     );
   }
 }
 
 export async function createOverride(
   params: CreateOverrideParams,
-  createdBy: string,
+  createdBy: string
 ): Promise<RateLimitOverride> {
+  validateCreateOverrideParams(params);
+  validateIdentifier('createdBy', createdBy);
   assertOverrideWithinCeiling(params);
 
   const pool = getPool();
@@ -123,7 +187,7 @@ export async function createOverride(
     `INSERT INTO tenant_rate_limit_overrides (id, key_id, max_requests, window_ms, expires_at, created_by)
      VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING ${SELECT_COLUMNS}`,
-    [id, params.keyId, params.maxRequests, params.windowMs, params.expiresAt ?? null, createdBy],
+    [id, params.keyId, params.maxRequests, params.windowMs, params.expiresAt ?? null, createdBy]
   );
   return rowToOverride(result.rows[0]!);
 }
@@ -137,11 +201,13 @@ export async function createOverride(
  * exist.
  */
 export async function deleteOverride(id: string): Promise<RateLimitOverride> {
+  validateIdentifier('id', id);
+
   const pool = getPool();
   const result = await query<Record<string, unknown>>(
     pool,
     `DELETE FROM tenant_rate_limit_overrides WHERE id = $1 RETURNING ${SELECT_COLUMNS}`,
-    [id],
+    [id]
   );
   if (result.rows.length === 0) {
     throw new ApiError(404, 'NOT_FOUND', `Override not found: ${id}`);
@@ -163,7 +229,7 @@ export async function listOverrides(): Promise<RateLimitOverride[]> {
     pool,
     `SELECT ${SELECT_COLUMNS} FROM tenant_rate_limit_overrides
      WHERE expires_at IS NULL OR expires_at > NOW()
-     ORDER BY created_at DESC`,
+     ORDER BY created_at DESC`
   );
   return result.rows.map(rowToOverride);
 }
