@@ -5,7 +5,7 @@
  * (`src/config/env.ts`) is unchanged in effect. The API_KEY_PEPPER ⇄ API_KEYS
  * co-presence invariant lives in the composed schema's `superRefine`.
  */
-import { z } from 'zod;';
+import { z } from 'zod';
 import { optionalString, optionalUrlString } from './parsers.js';
 
 function secretWithMin(name: string, message: string) {
