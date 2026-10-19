@@ -120,7 +120,7 @@ export class StreamPaginator {
   async *autoPaginate(): AsyncGenerator<Stream, void, unknown> {
     while (this.hasMore) {
       const page = await this.nextPage();
-      if (!page) break;
+      if (!page || page.length === 0) break;
       for (const item of page) {
         yield item;
       }
