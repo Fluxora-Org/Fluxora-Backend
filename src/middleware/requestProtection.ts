@@ -37,9 +37,11 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import { payloadTooLarge, requestTimeout, validationError } from './errorHandler.js';
-import { requestBodyTooLargeTotal, requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
-import { requestBodyTooLargeTotal, requestBodyTooDeepTotal } from '../metrics/requestProtectionMetrics.js';
-import { requestBodyTooLargeTotal, requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
+import {
+  requestBodyTooLargeTotal,
+  requestBodyTooDeepTotal,
+  requestRefusedTotal,
+} from '../metrics/requestProtectionMetrics.js';
 import { normalizeRouteLabel } from '../metrics/cardinality.js';
 import { getConfig } from '../config/env-config.js';
 
