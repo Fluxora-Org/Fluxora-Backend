@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import pg from 'pg';
 import {
   businessEventsTotal,
+  BusinessEventValidationError,
   collectBusinessEvents,
   deRegisterBusinessEventMetrics,
 } from '../../src/metrics/businessEventCollector.js';
@@ -64,5 +65,27 @@ describe('businessEventCollector', () => {
     // the value is either zero or the label disappears.
     // In our implementation, reset() clears the samples, so it becomes undefined.
     expect(await getMetricValue('withdrawal.made')).toBeUndefined();
+  });
+
+  it('rejects malformed, empty, and oversized business event rows before mutating the metric state', async () => {
+    await collectBusinessEvents(
+      fakePool([{ event_type: 'stream.created', count: '2' }])
+    );
+    expect(await getMetricValue('stream.created')).toBe(2);
+
+    await expect(
+      collectBusinessEvents(fakePool([{ event_type: '', count: '1' }]))
+    ).rejects.toBeInstanceOf(BusinessEventValidationError);
+    expect(await getMetricValue('stream.created')).toBe(2);
+
+    await expect(
+      collectBusinessEvents(fakePool([{ event_type: 'stream.created', count: 'not-a-number' }]))
+    ).rejects.toBeInstanceOf(BusinessEventValidationError);
+    expect(await getMetricValue('stream.created')).toBe(2);
+
+    await expect(
+      collectBusinessEvents(fakePool([{ event_type: 'stream.created', count: String(Number.MAX_SAFE_INTEGER + 1) }]))
+    ).rejects.toBeInstanceOf(BusinessEventValidationError);
+    expect(await getMetricValue('stream.created')).toBe(2);
   });
 });
