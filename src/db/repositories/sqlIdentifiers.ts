@@ -1,3 +1,4 @@
+
 /**
  * SQL identifier allowlisting.
  *

@@ -14,7 +14,12 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    include: ['tests/**/*.test.ts', 'src/**/*.test.ts', 'scripts/**/*.test.mjs'],
+    include: [
+      'tests/**/*.test.ts',
+      'src/**/*.test.ts',
+      'migrations/**/*.test.ts',
+      'scripts/**/*.test.mjs',
+    ],
     setupFiles: ['./tests/setup.ts'],
     coverage: {
       provider: 'v8',

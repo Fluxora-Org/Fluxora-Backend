@@ -23,6 +23,17 @@ import { isIP } from 'node:net';
 import dns from 'node:dns';
 
 /**
+ * Maximum allowed length for a webhook URL.
+ * Webhook targets exceeding this limit are rejected early before parsing or DNS resolution.
+ */
+export const MAX_WEBHOOK_URL_LENGTH = 2048;
+
+/**
+ * Maximum allowed length for an IP address string.
+ */
+export const MAX_IP_ADDRESS_LENGTH = 256;
+
+/**
  * Error thrown when a webhook target URL fails SSRF validation.
  */
 export class WebhookTargetValidationError extends Error {
@@ -175,7 +186,7 @@ function isBlockedIPv4(ip: string): { blocked: boolean; reason?: string } {
     }
     
     return { blocked: false };
-  } catch (error) {
+  } catch {
     // If we can't parse the IP, fail closed
     return { blocked: true, reason: 'Unparseable IPv4 address' };
   }
@@ -187,6 +198,7 @@ function isBlockedIPv4(ip: string): { blocked: boolean; reason?: string } {
 function isBlockedIPv6(ip: string): { blocked: boolean; reason?: string } {
   try {
     const value = ipv6ToBigInt(ip);
+    if (value === 0n) return { blocked: true, reason: 'IPv6 unspecified address' };
     if (value === 1n) return { blocked: true, reason: 'IPv6 loopback address' };
 
     // IPv4-mapped addresses must inherit the policy of their IPv4 value.
@@ -220,7 +232,7 @@ async function resolveHostname(hostname: string): Promise<string[]> {
     
     // Convert to array for consistent interface
     return [address];
-  } catch (error) {
+  } catch {
     // If DNS resolution fails, fail closed
     throw new WebhookTargetValidationError(
       `DNS resolution failed for hostname: ${hostname}`
@@ -252,19 +264,27 @@ function validateAllowlist(hostname: string, allowlist: string[] | undefined): v
   if (!allowlist || allowlist.length === 0) {
     return; // No allowlist configured, allow all non-blocked hosts
   }
-  
-  const normalizedHostname = hostname.toLowerCase();
-  const normalizedAllowlist = allowlist.map(h => h.toLowerCase());
-  
-  // Check exact match first
-  if (normalizedAllowlist.includes(normalizedHostname)) {
-    return;
+
+  if (!Array.isArray(allowlist)) {
+    throw new WebhookTargetValidationError('Allowlist must be an array of hostnames');
   }
   
-  // Check wildcard matches (*.example.com)
-  for (const allowed of normalizedAllowlist) {
-    if (allowed.startsWith('*.')) {
-      const domain = allowed.substring(2);
+  const normalizedHostname = hostname.toLowerCase();
+  
+  for (const allowed of allowlist) {
+    if (typeof allowed !== 'string' || allowed.trim().length === 0) {
+      throw new WebhookTargetValidationError('Allowlist entries must be non-empty strings');
+    }
+    const normalizedAllowed = allowed.toLowerCase();
+
+    // Check exact match first
+    if (normalizedAllowed === normalizedHostname) {
+      return;
+    }
+    
+    // Check wildcard matches (*.example.com)
+    if (normalizedAllowed.startsWith('*.')) {
+      const domain = normalizedAllowed.substring(2);
       if (normalizedHostname === domain || normalizedHostname.endsWith('.' + domain)) {
         return;
       }
@@ -280,7 +300,22 @@ function validateAllowlist(hostname: string, allowlist: string[] | undefined): v
  * Validate that an IP address is not in a blocked range.
  */
 export function validateWebhookIPAddress(ip: string): void {
-  const normalizedIp = ip.replace(/^\[|\]$/g, '');
+  if (typeof ip !== 'string') {
+    throw new WebhookTargetValidationError('IP address must be a string');
+  }
+
+  const trimmedIp = ip.trim();
+  if (trimmedIp.length === 0) {
+    throw new WebhookTargetValidationError('IP address cannot be empty');
+  }
+
+  if (ip.length > MAX_IP_ADDRESS_LENGTH) {
+    throw new WebhookTargetValidationError(
+      `IP address exceeds maximum length of ${MAX_IP_ADDRESS_LENGTH} characters`
+    );
+  }
+
+  const normalizedIp = trimmedIp.replace(/^\[|\]$/g, '');
   const family = isIP(normalizedIp);
   if (family === 6) {
     const result = isBlockedIPv6(normalizedIp);
@@ -338,11 +373,31 @@ export async function validateWebhookTarget(
   const allowlist = options?.allowlist;
 
   try {
+    // Input validation - reject non-string, empty, and oversized inputs early
+    if (typeof url !== 'string') {
+      throw new WebhookTargetValidationError('Webhook URL must be a string');
+    }
+
+    const trimmedUrl = url.trim();
+    if (trimmedUrl.length === 0) {
+      throw new WebhookTargetValidationError('Webhook URL cannot be empty');
+    }
+
+    if (url.length > MAX_WEBHOOK_URL_LENGTH) {
+      throw new WebhookTargetValidationError(
+        `Webhook URL exceeds maximum length of ${MAX_WEBHOOK_URL_LENGTH} characters`
+      );
+    }
+
+    if (options !== undefined && options !== null && typeof options !== 'object') {
+      throw new WebhookTargetValidationError('Options must be an object');
+    }
+
     // Parse URL
     let parsedUrl: URL;
     try {
-      parsedUrl = new URL(url);
-    } catch (error) {
+      parsedUrl = new URL(trimmedUrl);
+    } catch {
       throw new WebhookTargetValidationError(
         `Invalid webhook URL format: ${url}`
       );
@@ -353,6 +408,11 @@ export async function validateWebhookTarget(
 
     // Extract hostname
     const hostname = parsedUrl.hostname;
+    if (!hostname || hostname.trim().length === 0) {
+      throw new WebhookTargetValidationError(
+        'Webhook URL must include a valid hostname'
+      );
+    }
 
     // Check allowlist first (if configured)
     validateAllowlist(hostname, allowlist);

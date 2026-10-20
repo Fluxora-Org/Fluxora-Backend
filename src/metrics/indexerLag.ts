@@ -36,10 +36,109 @@
  * Security:
  * - Label cardinality is bounded (no user-provided labels)
  * - Values are sanitized to prevent metric corruption
+ *
+ * Issue #1788 — Harden the input validation in indexerLag
+ * --------------------------------------------------------
+ * All public setter functions validate their arguments before touching any
+ * metric state. Rejection happens before any write, and the caller receives
+ * a typed `IndexerLagValidationError` that describes which constraint was
+ * violated and why, so it can be surfaced in logs without ambiguity.
  */
 
 import { Counter, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
+
+// ── Validation constants ──────────────────────────────────────────────────────
+
+/** Ledger numbers are unsigned 32-bit integers on Stellar. */
+export const MAX_LEDGER_SEQUENCE = 4_294_967_295; // 2^32 - 1
+
+/**
+ * Upper bound for catchup ETA. Anything above ~2 years of seconds in a single
+ * metric sample is almost certainly a programming error (e.g. milliseconds
+ * passed instead of seconds).
+ */
+export const MAX_ETA_SECONDS = 63_072_000; // 2 years in seconds
+
+// ── Typed validation error ────────────────────────────────────────────────────
+
+/** Reason codes for IndexerLagValidationError */
+export type IndexerLagValidationErrorReason =
+  | 'NOT_A_NUMBER'
+  | 'NOT_FINITE'
+  | 'NEGATIVE'
+  | 'NOT_AN_INTEGER'
+  | 'EXCEEDS_MAX'
+  | 'INVALID_DIRECTION';
+
+/**
+ * Thrown by validated setters when an argument does not satisfy the documented
+ * constraints. The caller can inspect `reason` to distinguish error classes
+ * without string-matching.
+ */
+export class IndexerLagValidationError extends Error {
+  readonly reason: IndexerLagValidationErrorReason;
+  readonly field: string;
+  readonly value: unknown;
+
+  constructor(opts: {
+    field: string;
+    reason: IndexerLagValidationErrorReason;
+    value: unknown;
+    message: string;
+  }) {
+    super(opts.message);
+    this.name = 'IndexerLagValidationError';
+    this.reason = opts.reason;
+    this.field = opts.field;
+    this.value = opts.value;
+  }
+}
+
+// ── Internal validator helpers ────────────────────────────────────────────────
+
+function assertNonNegativeInteger(field: string, value: unknown, max?: number): void {
+  if (typeof value !== 'number') {
+    throw new IndexerLagValidationError({
+      field,
+      reason: 'NOT_A_NUMBER',
+      value,
+      message: `${field} must be a number, got ${typeof value}`,
+    });
+  }
+  if (!Number.isFinite(value)) {
+    throw new IndexerLagValidationError({
+      field,
+      reason: 'NOT_FINITE',
+      value,
+      message: `${field} must be finite, got ${value}`,
+    });
+  }
+  if (value < 0) {
+    throw new IndexerLagValidationError({
+      field,
+      reason: 'NEGATIVE',
+      value,
+      message: `${field} must be non-negative, got ${value}`,
+    });
+  }
+  if (!Number.isInteger(value)) {
+    throw new IndexerLagValidationError({
+      field,
+      reason: 'NOT_AN_INTEGER',
+      value,
+      message: `${field} must be an integer, got ${value}`,
+    });
+  }
+  if (max !== undefined && value > max) {
+    throw new IndexerLagValidationError({
+      field,
+      reason: 'EXCEEDS_MAX',
+      value,
+      message: `${field} must be ≤ ${max}, got ${value}`,
+    });
+  }
+}
 
 // ── Gauges ─────────────────────────────────────────────────────────────────────
 
@@ -74,22 +173,43 @@ export const indexerCatchupEtaSeconds =
     registers: [registry],
   });
 
+// ── Validated setters (issue #1788) ──────────────────────────────────────────
+
+/**
+ * Set the current ledger lag.
+ *
+ * Validates before any metric write:
+ * - `lag` must be a finite, non-negative integer
+ * - `lag` must not exceed `MAX_LEDGER_SEQUENCE`
+ *
+ * @throws {IndexerLagValidationError} when validation fails; no metric is written.
+ */
+export function setLedgerLag(lag: unknown): void {
+  assertNonNegativeInteger('lag', lag, MAX_LEDGER_SEQUENCE);
+  indexerLedgerLag.set(lag as number);
+}
+
+/**
+ * Set the estimated catch-up ETA in seconds.
+ *
+ * Validates before any metric write:
+ * - `seconds` must be a finite, non-negative integer
+ * - `seconds` must not exceed `MAX_ETA_SECONDS`
+ *
+ * Pass `0` to indicate the indexer is caught up or the ETA is unknown.
+ *
+ * @throws {IndexerLagValidationError} when validation fails; no metric is written.
+ */
+export function setCatchupEtaSeconds(seconds: unknown): void {
+  assertNonNegativeInteger('seconds', seconds, MAX_ETA_SECONDS);
+  indexerCatchupEtaSeconds.set(seconds as number);
+}
+
 // ── Backfill yield-to-live-indexing observability ─────────────────────────────
-//
-// `src/indexer/backfillScheduler.ts` consults `indexer_ledger_lag` before
-// starting each batch and pauses when live indexing is behind. These two
-// series make that decision observable:
-//
-//   - the gauge answers "is the backfill currently paused?"
-//   - the counter answers "how often, and in which direction, did it flip?"
-//
-// An operator alert can then be written as: the backfill has been paused for
-// more than N minutes, which is a direct signal that live indexing is behind.
 
 /**
  * Whether the backfill scheduler is currently yielding to live indexing.
- * `1` while paused, `0` while running. Kept as a gauge (not a counter) so the
- * current state is queryable without knowing the transition count.
+ * `1` while paused, `0` while running.
  */
 export const indexerBackfillPaused =
   (registry.getSingleMetric('indexer_backfill_paused') as Gauge) ||
@@ -101,10 +221,6 @@ export const indexerBackfillPaused =
 
 /**
  * Count of backfill yield transitions, labelled by direction.
- *
- * `event="paused"` when the scheduler stops starting batches because live
- * indexing is behind; `event="resumed"` when it automatically continues after
- * the lag drops back below the threshold.
  */
 export const indexerBackfillYieldEventsTotal =
   (registry.getSingleMetric('indexer_backfill_yield_events_total') as Counter<'event'>) ||
@@ -114,6 +230,28 @@ export const indexerBackfillYieldEventsTotal =
     labelNames: ['event'] as const,
     registers: [registry],
   });
+
+/**
+ * Record a backfill scheduler yield-direction transition.
+ *
+ * Validates that `direction` is exactly `'paused'` or `'resumed'` before
+ * writing to the metric, preventing label-cardinality explosion from
+ * accidental free-form strings reaching the metric store.
+ *
+ * @throws {IndexerLagValidationError} when `direction` is neither value.
+ */
+export function recordBackfillYieldEvent(direction: unknown): void {
+  if (direction !== 'paused' && direction !== 'resumed') {
+    throw new IndexerLagValidationError({
+      field: 'direction',
+      reason: 'INVALID_DIRECTION',
+      value: direction,
+      message: `direction must be "paused" or "resumed", got ${JSON.stringify(direction)}`,
+    });
+  }
+  indexerBackfillPaused.set(direction === 'paused' ? 1 : 0);
+  indexerBackfillYieldEventsTotal.inc({ event: direction });
+}
 
 // ── Deregister (for test isolation) ──────────────────────────────────────────
 
@@ -125,8 +263,7 @@ export function deRegisterIndexerLagMetrics(): void {
 }
 
 /**
- * Reset the backfill yield series without deregistering them, so repeated test
- * runs start from a clean slate while the registered collectors stay valid.
+ * Reset the backfill yield series without deregistering them.
  */
 export function resetBackfillYieldMetrics(): void {
   indexerBackfillPaused.set(0);

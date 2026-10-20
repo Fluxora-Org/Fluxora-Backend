@@ -67,14 +67,90 @@ export const stellarAddressValidationFailuresTotal =
   });
 
 /**
+ * Maximum byte length accepted for a `reason` string.
+ *
+ * The longest valid reason is `rpc-unavailable` (15 chars). We allow a small
+ * headroom but reject anything that could not be a legitimate enum member,
+ * preventing log/label inflation from oversized input.
+ */
+const MAX_REASON_LENGTH = 64;
+
+/**
+ * Typed error thrown by {@link recordStellarAddressValidationFailure} when the
+ * supplied `reason` is rejected by the runtime guard.
+ *
+ * The caller can inspect `validationError` to understand why the input was
+ * rejected without parsing the message string.
+ */
+export class StellarAddressMetricsValidationError extends Error {
+  /**
+   * Machine-readable rejection cause.
+   *
+   * - `'empty'`    — the value was an empty string (or whitespace-only).
+   * - `'not-string'` — the value was not a string at all.
+   * - `'oversized'` — the value exceeded {@link MAX_REASON_LENGTH} bytes.
+   * - `'unknown-reason'` — the value is not a member of
+   *                        {@link STELLAR_ADDRESS_FAILURE_REASONS}.
+   */
+  readonly validationError: 'empty' | 'not-string' | 'oversized' | 'unknown-reason';
+
+  constructor(
+    validationError: StellarAddressMetricsValidationError['validationError'],
+    message: string,
+  ) {
+    super(message);
+    this.name = 'StellarAddressMetricsValidationError';
+    this.validationError = validationError;
+  }
+}
+
+/**
  * Record a single address-validation failure.
  *
- * @param reason - Bounded rejection cause; unknown values are rejected at the
- *                 type level.
+ * Performs runtime guards **before** touching any metric state so that a
+ * malformed caller cannot pollute the counter with unknown label values.
+ *
+ * @param reason - Bounded rejection cause; unknown values are rejected at both
+ *                 compile time (TypeScript) and at runtime.
+ * @throws {StellarAddressMetricsValidationError} when `reason` is empty,
+ *   not a string, oversized, or not a member of
+ *   {@link STELLAR_ADDRESS_FAILURE_REASONS}.
  */
 export function recordStellarAddressValidationFailure(
   reason: StellarAddressFailureReason,
 ): void {
+  // --- runtime guards (run before any state mutation) ---
+
+  if (typeof reason !== 'string') {
+    throw new StellarAddressMetricsValidationError(
+      'not-string',
+      `recordStellarAddressValidationFailure: expected a string reason, got ${typeof reason}`,
+    );
+  }
+
+  if (reason.trim().length === 0) {
+    throw new StellarAddressMetricsValidationError(
+      'empty',
+      'recordStellarAddressValidationFailure: reason must not be empty',
+    );
+  }
+
+  if (reason.length > MAX_REASON_LENGTH) {
+    throw new StellarAddressMetricsValidationError(
+      'oversized',
+      `recordStellarAddressValidationFailure: reason exceeds maximum length of ${MAX_REASON_LENGTH} characters (got ${reason.length})`,
+    );
+  }
+
+  if (!(STELLAR_ADDRESS_FAILURE_REASONS as readonly string[]).includes(reason)) {
+    throw new StellarAddressMetricsValidationError(
+      'unknown-reason',
+      `recordStellarAddressValidationFailure: unknown reason "${reason}". ` +
+        `Allowed values: ${STELLAR_ADDRESS_FAILURE_REASONS.join(', ')}`,
+    );
+  }
+
+  // --- state mutation only after all guards pass ---
   stellarAddressValidationFailuresTotal.inc({ reason });
 }
 

@@ -1,3 +1,4 @@
+
 /**
  * WebSocket subscription routing.
  *
@@ -17,6 +18,7 @@
  * @module ws/subscriptionRouter
  */
 
+import { Buffer } from 'buffer';
 import type { IncomingMessage } from 'http';
 import { WebSocket } from 'ws';
 import { streamRepository } from '../db/repositories/streamRepository.js';
@@ -32,6 +34,19 @@ import type { ClientState, StreamUpdateEvent } from './hubTypes.js';
 export type SubscriptionAuthorization =
   | { ok: true; filter: SubscriptionFilter }
   | { ok: false; code: string; message: string };
+
+/** Typed reason an input was rejected before any state was written. */
+export type SubscriptionRejectionCode =
+  | 'INVALID_MESSAGE'
+  | 'INVALID_FILTER'
+  | 'OVERSIZED_INPUT'
+  | 'EMPTY_INPUT';
+
+/** Maximum accepted length of a handshake subscription query string. */
+export const MAX_HANDSHAKE_QUERY_LENGTH = 2048;
+
+/** Maximum accepted length of a single subscription filter field. */
+export const MAX_FILTER_FIELD_LENGTH = 256;
 
 /** A subscriber that opted into `stream_update_batch` frames. */
 export interface BatchTarget {
@@ -72,6 +87,11 @@ export class SubscriptionRouter {
     ws: WebSocket,
     filter: SubscriptionFilter
   ): Promise<SubscriptionAuthorization> {
+    const validation = validateSubscriptionFilter(filter);
+    if (!validation.ok) {
+      return validation;
+    }
+
     const state = this.registry.get(ws);
     if (!state) {
       return { ok: false, code: 'UNAUTHORIZED', message: 'WebSocket client is not registered' };
@@ -141,6 +161,12 @@ export class SubscriptionRouter {
     const state = this.registry.get(ws);
     if (!state) return;
 
+    const validation = validateSubscriptionFilter(filter);
+    if (!validation.ok) {
+      this.sendError(ws, validation.code, validation.message);
+      return;
+    }
+
     if (state.subscriptionFilters.has(subscriptionKey(filter))) return;
     if (state.subscriptionFilters.size >= this.maxSubscriptionsPerConnection) {
       this.onSubscriptionLimitExceeded();
@@ -173,6 +199,12 @@ export class SubscriptionRouter {
    * a failure or a throw is reported to the client as a protocol error.
    */
   applyHandshakeSubscription(ws: WebSocket, req: IncomingMessage): void {
+    const rawUrl = req.url ?? '/';
+    if (Buffer.byteLength(rawUrl, 'utf8') > MAX_HANDSHAKE_QUERY_LENGTH) {
+      this.sendError(ws, 'OVERSIZED_INPUT', 'Handshake subscription query string is too large');
+      return;
+    }
+
     const result = parseHandshakeSubscriptionFilter(req.url ?? '/');
     if (!result.ok) {
       this.sendError(ws, 'INVALID_MESSAGE', result.message);
@@ -243,6 +275,51 @@ export class SubscriptionRouter {
 
     return targets;
   }
+}
+
+/**
+ * Validate a subscription filter before it is authorized or stored.
+ *
+ * Rejects malformed, empty and oversized filters with a typed error so the
+ * caller can tell why the input was rejected. Pure: never touches the
+ * registry, so rejection happens before any state is written.
+ */
+export function validateSubscriptionFilter(
+  filter: SubscriptionFilter
+): SubscriptionAuthorization {
+  if (typeof filter !== 'object' || filter === null || Array.isArray(filter)) {
+    return { ok: false, code: 'INVALID_FILTER', message: 'Subscription filter must be an object' };
+  }
+
+  const { streamId, recipientAddress } = filter;
+
+  if (streamId === undefined && recipientAddress === undefined) {
+    return { ok: false, code: 'EMPTY_INPUT', message: 'Subscription filter must not be empty' };
+  }
+
+  if (streamId !== undefined) {
+    if (typeof streamId !== 'string' || streamId.trim() === '') {
+      return { ok: false, code: 'INVALID_FILTER', message: 'streamId must be a non-empty string' };
+    }
+    if (streamId.length > MAX_FILTER_FIELD_LENGTH) {
+      return { ok: false, code: 'OVERSIZED_INPUT', message: 'streamId is too long' };
+    }
+  }
+
+  if (recipientAddress !== undefined) {
+    if (typeof recipientAddress !== 'string' || recipientAddress.trim() === '') {
+      return {
+        ok: false,
+        code: 'INVALID_FILTER',
+        message: 'recipientAddress must be a non-empty string',
+      };
+    }
+    if (recipientAddress.length > MAX_FILTER_FIELD_LENGTH) {
+      return { ok: false, code: 'OVERSIZED_INPUT', message: 'recipientAddress is too long' };
+    }
+  }
+
+  return { ok: true, filter };
 }
 
 /**

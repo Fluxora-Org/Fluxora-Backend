@@ -1,21 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { errorHandler } from './errorHandler.js';
 import { bodySizeLimitMiddleware, jsonDepthMiddleware, dynamicJsonParser } from './requestProtection.js';
-import { requestRefusedTotal, deRegisterRequestProtectionMetrics } from '../metrics/requestProtectionMetrics.js';
+import { requestRefusedTotal } from '../metrics/requestProtectionMetrics.js';
 import { registry } from '../metrics.js';
 
 describe('Request Protection Middleware', () => {
   let app: express.Application;
 
   beforeEach(() => {
-    deRegisterRequestProtectionMetrics();
+    requestRefusedTotal.reset();
     app = express();
-  });
-
-  afterEach(() => {
-    deRegisterRequestProtectionMetrics();
   });
 
   describe('body size limit', () => {
@@ -35,8 +31,8 @@ describe('Request Protection Middleware', () => {
         .send(largeBody)
         .expect(413);
 
-      const metric = await registry.getSingleMetric('fluxora_request_refused_total');
-      const metricValue = (metric as any).get();
+      const metric = registry.getSingleMetric('fluxora_request_refused_total');
+      const metricValue = await (metric as any).get();
       expect(metricValue).toBeDefined();
     });
 
@@ -48,9 +44,9 @@ describe('Request Protection Middleware', () => {
         .send(largeBody)
         .expect(413);
 
-      const metric = await registry.getSingleMetric('fluxora_request_refused_total');
-      const metricValue = (metric as any).get();
-      const bodyTooLargeValue = metricValue.find((m: any) => m.values.reason === 'body_too_large');
+      const metric = registry.getSingleMetric('fluxora_request_refused_total');
+      const metricValue = await (metric as any).get();
+      const bodyTooLargeValue = metricValue.values.find((v: any) => v.labels.reason === 'body_too_large');
       expect(bodyTooLargeValue).toBeDefined();
       expect(bodyTooLargeValue.value).toBe(1);
     });
@@ -80,9 +76,9 @@ describe('Request Protection Middleware', () => {
         .send(deepBody)
         .expect(400);
 
-      const metric = await registry.getSingleMetric('fluxora_request_refused_total');
-      const metricValue = (metric as any).get();
-      const depthExceededValue = metricValue.find((m: any) => m.values.reason === 'json_depth_exceeded');
+      const metric = registry.getSingleMetric('fluxora_request_refused_total');
+      const metricValue = await (metric as any).get();
+      const depthExceededValue = metricValue.values.find((v: any) => v.labels.reason === 'json_depth_exceeded');
       expect(depthExceededValue).toBeDefined();
       expect(depthExceededValue.value).toBe(1);
     });

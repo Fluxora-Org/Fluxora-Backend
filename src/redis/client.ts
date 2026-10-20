@@ -215,23 +215,183 @@ export interface RedisClientFactory {
 }
 
 // ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum accepted Redis key length (characters).
+ *
+ * Every internal key scheme is `prefix + tenant + id` and stays well under
+ * 300 characters; 1024 is a generous ceiling that still bounds abuse.
+ * (Redis itself allows keys up to 512 MB — far beyond any sane application
+ * use — so an application-level limit is required to reject oversized input
+ * before it reaches the wire.)
+ */
+export const REDIS_MAX_KEY_LENGTH = 1024;
+
+/**
+ * Maximum accepted Redis value length (characters).
+ *
+ * 1 MiB matches the default `MAX_REQUEST_SIZE` in `src/config/env-schema/http.ts`
+ * and comfortably covers idempotency envelopes (full response bodies) while
+ * rejecting multi-megabyte payloads that would bloat Redis memory.
+ */
+export const REDIS_MAX_VALUE_LENGTH = 1_048_576; // 1 MiB
+
+/**
+ * Typed error thrown when Redis input fails validation.
+ *
+ * Carries a machine-readable `field` so callers can tell which argument
+ * (e.g. `key`, `value`, `options.ex`, `pxMs`, `config.url`) was rejected
+ * and why (the rule is included in `message`).
+ */
+export class RedisInputError extends Error {
+  /** Which argument failed validation (e.g. `key`, `options.ex`). */
+  readonly field: string;
+
+  constructor(field: string, rule: string) {
+    super(`Redis input validation failed for '${field}': ${rule}`);
+    this.name = 'RedisInputError';
+    this.field = field;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** Assert `key` is a non-empty, non-whitespace, bounded-length string. */
+function assertRedisKey(key: unknown, field = 'key'): string {
+  if (typeof key !== 'string') {
+    throw new RedisInputError(field, `must be a string, got ${key === null ? 'null' : typeof key}`);
+  }
+  if (key.trim() === '') {
+    throw new RedisInputError(field, 'must be a non-empty string');
+  }
+  if (key.length > REDIS_MAX_KEY_LENGTH) {
+    throw new RedisInputError(field, `must not exceed ${REDIS_MAX_KEY_LENGTH} characters`);
+  }
+  return key;
+}
+
+/**
+ * Assert `value` is a string within the value size bound.
+ *
+ * An empty string is a valid Redis value (`SET key ""`), so only type and
+ * size are enforced — not emptiness.
+ */
+function assertRedisValue(value: unknown, field = 'value'): string {
+  if (typeof value !== 'string') {
+    throw new RedisInputError(
+      field,
+      `must be a string, got ${value === null ? 'null' : typeof value}`,
+    );
+  }
+  if (value.length > REDIS_MAX_VALUE_LENGTH) {
+    throw new RedisInputError(field, `must not exceed ${REDIS_MAX_VALUE_LENGTH} characters`);
+  }
+  return value;
+}
+
+/** Assert `value` is a safe positive integer (≥ 1). */
+function assertPositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new RedisInputError(field, 'must be a positive integer');
+  }
+  return value;
+}
+
+/** Assert `value` is a safe non-negative integer (≥ 0). */
+function assertNonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new RedisInputError(field, 'must be a non-negative integer');
+  }
+  return value;
+}
+
+/** Assert `config.url` is a non-empty string that parses as a URL. */
+function assertRedisUrl(url: unknown): string {
+  if (typeof url !== 'string' || url.trim() === '') {
+    throw new RedisInputError(
+      'config.url',
+      `must be a non-empty string, got ${url === null ? 'null' : typeof url}`,
+    );
+  }
+  try {
+    new URL(url);
+  } catch {
+    throw new RedisInputError('config.url', `must be a valid URL, got '${url}'`);
+  }
+  return url;
+}
+
+/** Assert `value` is a finite number (used for sorted-set scores). */
+function assertFiniteScore(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new RedisInputError(field, 'must be a finite number');
+  }
+  return value;
+}
+
+const SCORE_BOUND_STRING = /^(?:[+-]?inf|[+-]?\d+(?:\.\d+)?)$/;
+
+/**
+ * Assert a sorted-set score bound: a finite number, or a string of the form
+ * `-inf`, `+inf`, `inf`, or a plain numeric string.
+ */
+function assertScoreBound(value: unknown, field: string): string | number {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new RedisInputError(field, 'must be a finite number or an ±inf bound string');
+    }
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (SCORE_BOUND_STRING.test(value)) {
+      return value;
+    }
+    throw new RedisInputError(
+      field,
+      `must be a finite number, numeric string, or ±inf bound, got '${value}'`,
+    );
+  }
+  throw new RedisInputError(
+    field,
+    `must be a finite number or ±inf bound string, got ${value === null ? 'null' : typeof value}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/** Parse "host:port" pairs from a comma-separated string. */
-function parseHostPorts(raw: string): Array<{ host: string; port: number }> {
-  return raw
+/**
+ * Parse "host:port" pairs from a comma-separated string.
+ *
+ * @param field Argument name used in {@link RedisInputError} so callers can
+ * tell whether `sentinelHosts` or `clusterNodes` was malformed.
+ */
+function parseHostPorts(
+  raw: string,
+  field: string,
+): Array<{ host: string; port: number }> {
+  const entries = raw
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
     .map((s) => {
       const lastColon = s.lastIndexOf(':');
-      if (lastColon === -1) throw new Error(`Invalid host:port entry: "${s}"`);
+      if (lastColon === -1) {
+        throw new RedisInputError(field, `invalid host:port entry: "${s}"`);
+      }
       const host = s.slice(0, lastColon);
       const port = parseInt(s.slice(lastColon + 1), 10);
-      if (!host || isNaN(port)) throw new Error(`Invalid host:port entry: "${s}"`);
+      if (!host || Number.isNaN(port)) {
+        throw new RedisInputError(field, `invalid host:port entry: "${s}"`);
+      }
       return { host, port };
     });
+  if (entries.length === 0) {
+    throw new RedisInputError(field, 'must contain at least one host:port entry');
+  }
+  return entries;
 }
 
 /** Attach structured log listeners to any ioredis client (Redis | Cluster). */
@@ -270,16 +430,25 @@ class IORedisClient implements RedisClient {
   }
 
   async get(key: string): Promise<string | null> {
+    assertRedisKey(key);
     return this.withCommandMetrics(
       () => this.client.get(key) as Promise<string | null>,
     );
   }
 
   async set(key: string, value: string, options?: { ex?: number; pxat?: number }): Promise<void> {
+    assertRedisKey(key);
+    assertRedisValue(value);
+    if (options?.ex !== undefined) {
+      assertPositiveInteger(options.ex, 'options.ex');
+    }
+    if (options?.pxat !== undefined) {
+      assertNonNegativeInteger(options.pxat, 'options.pxat');
+    }
     return this.withCommandMetrics(async () => {
       if (options?.pxat !== undefined) {
         await this.client.set(key, value, 'PXAT', options.pxat);
-      } else if (options?.ex) {
+      } else if (options?.ex !== undefined) {
         await this.client.set(key, value, 'EX', options.ex);
       } else {
         await this.client.set(key, value);
@@ -288,6 +457,9 @@ class IORedisClient implements RedisClient {
   }
 
   async setNx(key: string, value: string, pxMs: number): Promise<boolean> {
+    assertRedisKey(key);
+    assertRedisValue(value);
+    assertPositiveInteger(pxMs, 'pxMs');
     return this.withCommandMetrics(async () => {
       const result = await this.client.set(key, value, 'PX', pxMs, 'NX');
       return result === 'OK';
@@ -295,16 +467,20 @@ class IORedisClient implements RedisClient {
   }
 
   async del(key: string): Promise<void> {
+    assertRedisKey(key);
     return this.withCommandMetrics(async () => {
       await this.client.del(key);
     });
   }
 
   async incr(key: string): Promise<number> {
+    assertRedisKey(key);
     return this.withCommandMetrics(() => this.client.incr(key));
   }
 
   async delIfValue(key: string, value: string): Promise<void> {
+    assertRedisKey(key);
+    assertRedisValue(value);
     return this.withCommandMetrics(async () => {
       await this.client.eval(
         "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
@@ -316,6 +492,7 @@ class IORedisClient implements RedisClient {
   }
 
   async exists(key: string): Promise<boolean> {
+    assertRedisKey(key);
     return this.withCommandMetrics(async () => (await this.client.exists(key)) === 1);
   }
 
@@ -328,18 +505,27 @@ class IORedisClient implements RedisClient {
     const instanceName = this.instanceName;
     const wrapper: RedisPipeline = {
       zadd(key, nx, score, member) {
+        assertRedisKey(key);
+        assertFiniteScore(score, 'score');
+        assertRedisValue(member, 'member');
         pipeline.zadd(key, 'NX', score, member);
         return wrapper;
       },
       zremrangebyscore(key, min, max) {
+        assertRedisKey(key);
+        assertScoreBound(min, 'min');
+        assertScoreBound(max, 'max');
         pipeline.zremrangebyscore(key, min, max);
         return wrapper;
       },
       zcard(key) {
+        assertRedisKey(key);
         pipeline.zcard(key);
         return wrapper;
       },
       pexpire(key, ms) {
+        assertRedisKey(key);
+        assertNonNegativeInteger(ms, 'ms');
         pipeline.pexpire(key, ms);
         return wrapper;
       },
@@ -356,6 +542,9 @@ class IORedisClient implements RedisClient {
   }
 
   async zcount(key: string, min: string | number, max: string | number): Promise<number> {
+    assertRedisKey(key);
+    assertScoreBound(min, 'min');
+    assertScoreBound(max, 'max');
     return this.withCommandMetrics(() => this.client.zcount(key, min, max));
   }
 }
@@ -366,6 +555,7 @@ class IORedisClient implements RedisClient {
 
 export class DefaultRedisClientFactory implements RedisClientFactory {
   async createClient(config: RedisConfig): Promise<RedisClient> {
+    assertRedisUrl(config.url);
     const ioredis = await import('ioredis');
     const mode = config.mode ?? 'standalone';
 
@@ -417,10 +607,13 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
     config: RedisConfig,
   ): Promise<Redis> {
     if (!config.sentinelHosts) {
-      throw new Error('REDIS_SENTINEL_HOSTS is required when REDIS_MODE=sentinel');
+      throw new RedisInputError(
+        'config.sentinelHosts',
+        'is required when mode is sentinel',
+      );
     }
     const name = config.sentinelName ?? 'mymaster';
-    const sentinels = parseHostPorts(config.sentinelHosts);
+    const sentinels = parseHostPorts(config.sentinelHosts, 'config.sentinelHosts');
 
     // Extract password from REDIS_URL if present
     const { URL } = await import('url');
@@ -451,9 +644,12 @@ export class DefaultRedisClientFactory implements RedisClientFactory {
     config: RedisConfig,
   ): Promise<Cluster> {
     if (!config.clusterNodes) {
-      throw new Error('REDIS_CLUSTER_NODES is required when REDIS_MODE=cluster');
+      throw new RedisInputError(
+        'config.clusterNodes',
+        'is required when mode is cluster',
+      );
     }
-    const nodes = parseHostPorts(config.clusterNodes);
+    const nodes = parseHostPorts(config.clusterNodes, 'config.clusterNodes');
 
     const { URL } = await import('url');
     const password = (() => {
@@ -762,23 +958,74 @@ export function _resetRedisClientRegistry(): void {
 // ---------------------------------------------------------------------------
 
 export class NoOpRedisClient implements RedisClient {
-  async get(): Promise<string | null> { return null; }
-  async set(): Promise<void> { return; }
+  async get(key: string): Promise<string | null> {
+    assertRedisKey(key);
+    return null;
+  }
+  async set(key: string, value: string, options?: { ex?: number; pxat?: number }): Promise<void> {
+    assertRedisKey(key);
+    assertRedisValue(value);
+    if (options?.ex !== undefined) {
+      assertPositiveInteger(options.ex, 'options.ex');
+    }
+    if (options?.pxat !== undefined) {
+      assertNonNegativeInteger(options.pxat, 'options.pxat');
+    }
+    return;
+  }
   /** Always returns true — simulates an uncontended single-process lock. */
-  async setNx(): Promise<boolean> { return true; }
-  async del(): Promise<void> { return; }
-  async exists(): Promise<boolean> { return false; }
-  async incr(): Promise<number> { return 1; }
-  async close(): Promise<void> { return; }
+  async setNx(key: string, value: string, pxMs: number): Promise<boolean> {
+    assertRedisKey(key);
+    assertRedisValue(value);
+    assertPositiveInteger(pxMs, 'pxMs');
+    return true;
+  }
+  async del(key: string): Promise<void> {
+    assertRedisKey(key);
+    return;
+  }
+  async exists(key: string): Promise<boolean> {
+    assertRedisKey(key);
+    return false;
+  }
+  async incr(key: string): Promise<number> {
+    assertRedisKey(key);
+    return 1;
+  }
+  async close(): Promise<void> {
+    return;
+  }
   multi(): RedisPipeline {
     const noop: RedisPipeline = {
-      zadd() { return noop; },
-      zremrangebyscore() { return noop; },
-      zcard() { return noop; },
-      pexpire() { return noop; },
+      zadd(key, nx, score, member) {
+        assertRedisKey(key);
+        assertFiniteScore(score, 'score');
+        assertRedisValue(member, 'member');
+        return noop;
+      },
+      zremrangebyscore(key, min, max) {
+        assertRedisKey(key);
+        assertScoreBound(min, 'min');
+        assertScoreBound(max, 'max');
+        return noop;
+      },
+      zcard(key) {
+        assertRedisKey(key);
+        return noop;
+      },
+      pexpire(key, ms) {
+        assertRedisKey(key);
+        assertNonNegativeInteger(ms, 'ms');
+        return noop;
+      },
       async exec() { return []; },
     };
     return noop;
   }
-  async zcount(): Promise<number> { return 0; }
+  async zcount(key: string, min: string | number, max: string | number): Promise<number> {
+    assertRedisKey(key);
+    assertScoreBound(min, 'min');
+    assertScoreBound(max, 'max');
+    return 0;
+  }
 }

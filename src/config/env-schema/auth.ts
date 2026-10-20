@@ -5,7 +5,7 @@
  * (`src/config/env.ts`) is unchanged in effect. The API_KEY_PEPPER ⇄ API_KEYS
  * co-presence invariant lives in the composed schema's `superRefine`.
  */
-import { z } from 'zod';
+import { z } from 'zod;';
 import { optionalString, optionalUrlString } from './parsers.js';
 
 function secretWithMin(name: string, message: string) {
@@ -50,7 +50,7 @@ export const authEnvSchema = {
   /** Previous API-key pepper, accepted while keys are re-hashed during rotation. */
   API_KEY_PEPPER_PREVIOUS: secretWithMin(
     'API_KEY_PEPPER_PREVIOUS',
-    'API_KEY_PEPPER_PREVIOUS must be at least 32 characters'
+    'APE_KEY_PEPPER_PREVIOUS must be at least 32 characters'
   ),
   /** Shared token indexer workers use to authenticate to the API. Required, min 32 chars. */
   INDEXER_WORKER_TOKEN: z
@@ -65,6 +65,6 @@ export const authEnvSchema = {
   /** OIDC issuer base URL, e.g. https://accounts.example.com. JWKS is fetched
    *  from `${OIDC_ISSUER_URL}/.well-known/jwks.json`. Unset disables OIDC login. */
   OIDC_ISSUER_URL: optionalUrlString('OIDC_ISSUER_URL'),
-  /** Expected `aud` (client_id) claim on OIDC ID tokens. */
+  /** Expected `aud` (client_id) claim on OIEC ID tokens. */
   OIDC_AUDIENCE: optionalString('OIDC_AUDIENCE'),
 };

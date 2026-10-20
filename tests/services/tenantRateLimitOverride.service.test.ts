@@ -51,6 +51,14 @@ describe('tenantRateLimitOverride service', () => {
   // getOverride (by keyId)
   // ---------------------------------------------------------------------------
   describe('getOverride', () => {
+    it('rejects empty keyId before any database query', async () => {
+      await expect(getOverride('')).rejects.toMatchObject({
+        statusCode: 400,
+        code: 'VALIDATION_ERROR',
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
     it('returns null when no override exists', async () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       const result = await getOverride('key-nonexistent');
@@ -98,6 +106,18 @@ describe('tenantRateLimitOverride service', () => {
   // getOverrideById (by primary key)
   // ---------------------------------------------------------------------------
   describe('getOverrideById', () => {
+    it('rejects blank or malformed ids before any database lookup', async () => {
+      await expect(getOverrideById('')).rejects.toMatchObject({
+        statusCode: 400,
+        code: 'VALIDATION_ERROR',
+      });
+      await expect(getOverrideById('   ')).rejects.toMatchObject({
+        statusCode: 400,
+        code: 'VALIDATION_ERROR',
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
     it('returns null when no override exists for the given id', async () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       const result = await getOverrideById('nonexistent-id');
@@ -143,13 +163,41 @@ describe('tenantRateLimitOverride service', () => {
   // createOverride
   // ---------------------------------------------------------------------------
   describe('createOverride', () => {
+    it('rejects empty keyId before writing any state', async () => {
+      await expect(
+        createOverride({ keyId: '', maxRequests: 100, windowMs: 60000 }, 'admin:test')
+      ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed, negative, and oversized inputs before the insert runs', async () => {
+      const invalidCases = [
+        { keyId: '   ', maxRequests: 100, windowMs: 60000 },
+        { keyId: 'key-1', maxRequests: 0, windowMs: 60000 },
+        { keyId: 'key-1', maxRequests: -5, windowMs: 60000 },
+        { keyId: 'key-1', maxRequests: Number.NaN, windowMs: 60000 },
+        { keyId: 'key-1', maxRequests: 100, windowMs: 0 },
+        { keyId: 'key-1', maxRequests: 100, windowMs: 999 },
+        { keyId: 'key-1', maxRequests: 10_000_001, windowMs: 60000 },
+        { keyId: 'key-1', maxRequests: 100, windowMs: 60000, expiresAt: 'not-a-date' },
+      ];
+
+      for (const payload of invalidCases) {
+        await expect(createOverride(payload as never, 'admin:test')).rejects.toMatchObject({
+          statusCode: 400,
+          code: 'VALIDATION_ERROR',
+        });
+      }
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
     it('inserts correctly and returns the created record', async () => {
       const createdRow = makeRow({ max_requests: 400 });
       mockQuery.mockResolvedValueOnce({ rows: [createdRow] });
 
       const result = await createOverride(
         { keyId: 'key-1', maxRequests: 400, windowMs: 60000 },
-        'admin:test',
+        'admin:test'
       );
 
       const [, sql, params] = mockQuery.mock.calls[0]!;
@@ -164,12 +212,17 @@ describe('tenantRateLimitOverride service', () => {
 
     it('inserts with expires_at when provided', async () => {
       const futureDate = new Date(Date.now() + 86400000).toISOString();
-      const createdRow = makeRow({ key_id: 'key-2', max_requests: 500, window_ms: 120000, expires_at: new Date(futureDate) });
+      const createdRow = makeRow({
+        key_id: 'key-2',
+        max_requests: 500,
+        window_ms: 120000,
+        expires_at: new Date(futureDate),
+      });
       mockQuery.mockResolvedValueOnce({ rows: [createdRow] });
 
       const result = await createOverride(
         { keyId: 'key-2', maxRequests: 500, windowMs: 120000, expiresAt: futureDate },
-        'admin:test',
+        'admin:test'
       );
 
       expect(result.keyId).toBe('key-2');
@@ -189,7 +242,7 @@ describe('tenantRateLimitOverride service', () => {
       mockQuery.mockResolvedValueOnce({ rows: [makeRow({ created_by: 'jwt:GADDR123' })] });
       const result = await createOverride(
         { keyId: 'key-jwt', maxRequests: 500, windowMs: 5000 },
-        'jwt:GADDR123',
+        'jwt:GADDR123'
       );
       expect(result.createdBy).toBe('jwt:GADDR123');
     });
@@ -200,7 +253,7 @@ describe('tenantRateLimitOverride service', () => {
       });
       const result = await createOverride(
         { keyId: 'key-at-ceiling', maxRequests: DEFAULT_APIKEY_CONFIG.max, windowMs: 60000 },
-        'admin:test',
+        'admin:test'
       );
       expect(result.maxRequests).toBe(DEFAULT_APIKEY_CONFIG.max);
     });
@@ -209,7 +262,7 @@ describe('tenantRateLimitOverride service', () => {
       try {
         await createOverride(
           { keyId: 'key-too-high', maxRequests: DEFAULT_APIKEY_CONFIG.max + 1, windowMs: 60000 },
-          'admin:test',
+          'admin:test'
         );
         expect.fail('should have thrown');
       } catch (err) {
@@ -230,28 +283,25 @@ describe('tenantRateLimitOverride service', () => {
 
     it('allows a limit below the ceiling', () => {
       expect(() =>
-        assertOverrideWithinCeiling({ maxRequests: 100, windowMs: 60000 }, ceiling),
+        assertOverrideWithinCeiling({ maxRequests: 100, windowMs: 60000 }, ceiling)
       ).not.toThrow();
     });
 
     it('allows a limit equal to the ceiling (boundary)', () => {
       expect(() =>
-        assertOverrideWithinCeiling({ maxRequests: 500, windowMs: 60000 }, ceiling),
+        assertOverrideWithinCeiling({ maxRequests: 500, windowMs: 60000 }, ceiling)
       ).not.toThrow();
     });
 
     it('refuses a limit one above the ceiling', () => {
       expect(() =>
-        assertOverrideWithinCeiling({ maxRequests: 501, windowMs: 60000 }, ceiling),
+        assertOverrideWithinCeiling({ maxRequests: 501, windowMs: 60000 }, ceiling)
       ).toThrow(/exceeds the global ceiling of 500/);
     });
 
     it('refuses a window longer than the maximum window', () => {
       expect(() =>
-        assertOverrideWithinCeiling(
-          { maxRequests: 100, windowMs: MAX_WINDOW_MS + 1 },
-          ceiling,
-        ),
+        assertOverrideWithinCeiling({ maxRequests: 100, windowMs: MAX_WINDOW_MS + 1 }, ceiling)
       ).toThrow(/exceeds the maximum allowed window/);
     });
 
@@ -262,8 +312,8 @@ describe('tenantRateLimitOverride service', () => {
       expect(() =>
         assertOverrideWithinCeiling(
           { maxRequests: 900, windowMs: 60000 },
-          { maxRequests: 300, windowMs: MAX_WINDOW_MS },
-        ),
+          { maxRequests: 300, windowMs: MAX_WINDOW_MS }
+        )
       ).toThrow(/exceeds the global ceiling of 300/);
     });
   });
@@ -291,7 +341,9 @@ describe('tenantRateLimitOverride service', () => {
 
     it('throws a 404 ApiError when record does not exist', async () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
-      await expect(deleteOverride('nonexistent')).rejects.toThrow('Override not found: nonexistent');
+      await expect(deleteOverride('nonexistent')).rejects.toThrow(
+        'Override not found: nonexistent'
+      );
     });
 
     it('throws an ApiError with statusCode 404', async () => {
@@ -319,8 +371,16 @@ describe('tenantRateLimitOverride service', () => {
   // ---------------------------------------------------------------------------
   describe('listOverrides', () => {
     it('returns all records ordered by created_at DESC', async () => {
-      const row1 = makeRow({ id: 'override-1', key_id: 'key-1', created_at: new Date('2024-01-02T00:00:00Z') });
-      const row2 = makeRow({ id: 'override-2', key_id: 'key-2', created_at: new Date('2024-01-01T00:00:00Z') });
+      const row1 = makeRow({
+        id: 'override-1',
+        key_id: 'key-1',
+        created_at: new Date('2024-01-02T00:00:00Z'),
+      });
+      const row2 = makeRow({
+        id: 'override-2',
+        key_id: 'key-2',
+        created_at: new Date('2024-01-01T00:00:00Z'),
+      });
       mockQuery.mockResolvedValueOnce({ rows: [row1, row2] });
 
       const result = await listOverrides();
