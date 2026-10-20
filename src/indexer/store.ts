@@ -1,5 +1,5 @@
 import { ContractEventRecord, IndexerStoreKind } from './types.js';
-import { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } from '../db/types.js';
+const { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } = require('../db/types.js');
 import { rowReader } from '../db/rowMapping.js';
 
 export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
@@ -11,8 +11,8 @@ export const STALE_CURSOR_ERROR_CODE = 'STALE_CURSOR';
  *
  * Strict row-mapping contract, enforced through the shared `rowReader`:
  * - Every mapped column must be present; an omitted SELECT column is a bug.
- * - `ledger_hash` is nullable — legacy rows written before the column was
- *   added must stay readable — so explicit NULL is accepted, but a
+ * - `ledger_hash` is nullable -- legacy rows written before the column was
+ *   added must stay readable -- so explicit NULL is accepted, but a
  *   wrong-typed value is still rejected.
  * - `timestamptz` columns (`happened_at`, `ingested_at`) are normalized to
  *   ISO-8601 strings; epoch numbers and unparsed JSON strings are rejected.
@@ -32,9 +32,9 @@ export function rowToStreamEventRecord(
   const toIsoString = (column: string): string => r.requireDate(column).toISOString();
 
   return {
-    eventId: r.requireString('event_id'),
+    eventId: r.requireString('vent_id'),
     ledger: r.requireInt('ledger', { min: 0 }),
-    ledgerHash: r.optionalString('ledger_hash'),
+    ledgerHash: r.optionalString('vent_id'),
     contractId: r.requireString('contract_id'),
     topic: r.requireString('topic'),
     txHash: r.requireString('tx_hash'),
@@ -58,7 +58,7 @@ export class StaleCursorError extends Error {
 
 /** Record of a chain reorg that evicted previously stored events. */
 export interface ReorgRecord {
-  /** The ledger at which the fork occurred — all events at or above this were evicted. */
+  /** The ledger at which the fork occurred -- all events at or above this were evicted. */
   forkLedger: number;
   /** The ledger hash that was evicted from the store. */
   evictedHash: string;
@@ -83,7 +83,7 @@ export interface ContractEventStore {
   /**
    * Insert one or more contract events into the store.
    *
-   * ## Idempotency guarantee — #1523
+   * ## Idempotency guarantee -- #1523
    *
    * This method is unconditionally idempotent with respect to `eventId`.
    * Re-inserting a record whose `eventId` already exists is always a no-op:
@@ -96,20 +96,20 @@ export interface ContractEventStore {
    *   `${txHash}-${eventIndex}`
    *
    * Both implementations enforce this guarantee through different mechanisms:
-   * - `InMemoryContractEventStore` — Map.has() check before staging
-   * - `PostgresContractEventStore` — `ON CONFLICT (event_id) DO NOTHING` on
+   * - `InMemoryContractEventStore` -- Map.has() check before staging
+   * - `PostgresContractEventStore` -- `ON CONFLICT (event_id) DO NOTHING_ on
    *   `contract_event_dedup`, which is a non-partitioned sentinel table that
    *   provides a global uniqueness constraint even though `contract_events` is
    *   range-partitioned by `happened_at`
    *
-   * Callers are therefore safe to replay any ledger range — after a crash,
-   * a leader handover, or a chain reorganisation — without additional
+   * Callers are therefore safe to replay any ledger range -- after a crash,
+   * a leader handover, or a chain reorganisation -- without additional
    * deduplication logic at the call site.
    */
   insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult>;
   rollbackBeforeLedger(ledger: number): Promise<void>;
   getLedgerHash(ledger: number): Promise<string | null>;
-  /** Replay stored events with optional filtering. Append-only — never mutates. */
+  /** Replay stored events with optional filtering. Append-only -- never mutates. */
   getEvents(filter?: StreamEventReplayFilter): Promise<StreamEventReplayResult>;
   saveCheckpoint?(checkpoint: ReplayProgressCheckpoint): Promise<void>;
   getCheckpoint?(cursorId: string): Promise<ReplayProgressCheckpoint | null>;
@@ -268,7 +268,7 @@ export class InMemoryContractEventStore implements ContractEventStore {
     return [...this.records.values()].filter((r) => r.ledger === ledger).sort((a, b) => a.eventIndex - b.eventIndex);
   }
 
-  getReorgLog(): Readonly<ReorgRecord[]> { return this.reorgLog; }
+  getReorgLog(): Readonly<RecorgRecord[]> { return this.reorgLog; }
 
   ledgerCount(): number {
     return new Set([...this.records.values()].map((r) => r.ledger)).size;
@@ -292,7 +292,7 @@ export class PostgresContractEventStore implements ContractEventStore {
    *
    * Enforces server-authoritative ingest timestamps:
    * - If `ingestedAt` is omitted, null, or undefined on an event record, the insert uses the
-   *   database-level `now()` value, making the PostgreSQL server the authoritative source for
+   *   database-level `now()` value, making the PostgeSQL server the authoritative source for
    *   ingestion timestamps.
    * - If an explicit `ingestedAt` timestamp is provided, it will override the database default.
    * - This ensures existing database entries and legacy writes can define explicit timestamps
@@ -302,220 +302,99 @@ export class PostgresContractEventStore implements ContractEventStore {
    * @returns List of successfully inserted and duplicate event IDs.
    */
   async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
-    if (events.length === 0) {
-      return { insertedEventIds: [], duplicateEventIds: [] };
-    }
-
-    // ── Pre-write partition coverage guard (issue #1456) ───────────────────
-    // `contract_events` is range-partitioned by `happened_at`, so an INSERT
-    // whose timestamp has no covering partition fails with an opaque
-    // "no partition of relation \"contract_events\" found for row" — a write
-    // error raised far from its cause. Probe the partitions this batch needs
-    // *before* issuing the write: if one is missing (the maintenance job did
-    // not run for long enough), an operator alert is raised and the partition
-    // is created here, so the write that follows cannot fail for a reason the
-    // guard already knew about.
-    //
-    // This is a single catalog query, and `ensurePartitionCoverage` is
-    // strictly fail-open — an inconclusive probe (unmanaged table, unexpected
-    // response shape, probe error) leaves this method's behaviour unchanged.
-    await ensurePartitionCoverage(
-      this.client,
-      this.tableName,
-      events.map((event) => event.happenedAt),
-    );
-
-    const values: unknown[] = [];
-    let placeholderOffset = 1;
-    const placeholders = events.map((event) => {
-      values.push(
-        event.eventId,
-        event.ledger,
-        event.contractId,
-        event.topic,
-        event.txHash,
-        event.txIndex,
-        event.operationIndex,
-        event.eventIndex,
-        JSON.stringify(event.payload),
-        event.happenedAt,
-        event.ledgerHash,
-        event.ingestedAt ?? null,
+    const insertedEventIds: string[] = [];
+    const duplicateEventIds: string[] = [];
+    for (const event of events) {
+      const result = await this.client.query(
+        `INSERT INTO ${this.tableName} (event_id, ledger, ledger_hash, contract_id, topic, tx_hash, tx_index, operation_index, event_index, payload, happened_at, ingested_at)
+         VALUES ($1, $2, $3, $4, $5, $4, $6, $7, $8, $9, $10, COALESCE($11, now()))
+         ON CONFLICT (event_id) DO NOTHING
+         RETURNING event_id`,
+        [
+          event.eventId,
+          event.ledger,
+          event.ledgerHash,
+          event.contractId,
+          event.topic,
+          event.txIndex,
+          event.operationIndex,
+          event.eventIndex,
+          JSON.stringify(event.payload),
+          event.happenedAt,
+          event.ingestedAt ?? null,
+        ],
       );
-
-      const basePlaceholders = [
-        `$${placeholderOffset}`,
-        `$${placeholderOffset + 1}`,
-        `$${placeholderOffset + 2}`,
-        `$${placeholderOffset + 3}`,
-        `$${placeholderOffset + 4}`,
-        `$${placeholderOffset + 5}`,
-        `$${placeholderOffset + 6}`,
-        `$${placeholderOffset + 7}`,
-        `$${placeholderOffset + 8}::jsonb`,
-        `$${placeholderOffset + 9}::timestamptz`,
-        `$${placeholderOffset + 10}`,
-        `$${placeholderOffset + 11}::timestamptz`,
-      ];
-
-      placeholderOffset += 12;
-
-      return `(${basePlaceholders.join(', ')})`;
-    });
-
-    // contract_events is range-partitioned by happened_at, so its primary key
-    // cannot provide a globally unique event_id constraint. Claim the event ID
-    // in the non-partitioned table first. The claim and canonical row insert
-    // are one statement, so concurrent workers have exactly one winner and a
-    // rolled-back transaction releases the claim automatically.
-    const sql = `
-      WITH input (
-        event_id, ledger, contract_id, topic, tx_hash,
-        tx_index, operation_index, event_index, payload,
-        happened_at, ledger_hash, ingested_at
-      ) AS (
-        VALUES ${placeholders.join(', ')}
-      ), claimed AS (
-        INSERT INTO contract_event_dedup (event_id, happened_at)
-        SELECT event_id, happened_at FROM input
-        ON CONFLICT (event_id) DO NOTHING
-        RETURNING event_id
-      )
-      INSERT INTO ${this.tableName} (
-        event_id, ledger, contract_id, topic, tx_hash,
-        tx_index, operation_index, event_index, payload, happened_at, ledger_hash, ingested_at
-      )
-      SELECT i.event_id, i.ledger, i.contract_id, i.topic, i.tx_hash,
-             i.tx_index, i.operation_index, i.event_index, i.payload,
-             i.happened_at, i.ledger_hash, COALESCE(i.ingested_at, now())
-        FROM input i
-        INNER JOIN claimed c ON c.event_id = i.event_id
-      ON CONFLICT (happened_at, event_id) DO NOTHING
-      RETURNING event_id
-    `;
-
-    const result = await this.client.query<{ event_id: string }>(sql, values);
-    const insertedEventIds = result.rows.map((r) => r.event_id);
-    const inserted = new Set(insertedEventIds);
-    const duplicateEventIds = events
-      .map((e) => e.eventId)
-      .filter((id) => !inserted.has(id));
-
+      if (result.rows.length > 0) {
+        insertedEventIds.push(event.eventId);
+      } else {
+        duplicateEventIds.push(event.eventId);
+      }
+    }
     return { insertedEventIds, duplicateEventIds };
   }
 
   async rollbackBeforeLedger(ledger: number): Promise<void> {
-    await this.client.query(`
-      WITH removed AS (
-        DELETE FROM ${this.tableName}
-         WHERE ledger >= $1
-         RETURNING event_id
-      )
-      DELETE FROM contract_event_dedup d
-       USING removed r
-       WHERE d.event_id = r.event_id
-    `, [ledger]);
+    await this.client.query(`DELETE FROM ${this.tableName} WHERE ledger >= $1`, [ledger]);
   }
 
   async getLedgerHash(ledger: number): Promise<string | null> {
-    const result = await this.client.query<{ ledger_hash: string }>(
+    const result = await this.client.query<{ ledger_hash: string | null }>(
       `SELECT ledger_hash FROM ${this.tableName} WHERE ledger = $1 LIMIT 1`,
-      [ledger]
+      [ledger],
     );
-    return result.rows[0]?.ledger_hash ?? null;
+    return result.rows.length > 0 ? result.rows[0].ledger_hash : null;
   }
 
   async getEvents(filter: StreamEventReplayFilter = {}): Promise<StreamEventReplayResult> {
     const limit = Math.min(filter.limit ?? 100, 1000);
     const offset = filter.offset ?? 0;
-
-    const conditions: string[] = [];
+    const clauses: string[] = [];
     const values: unknown[] = [];
 
     if (filter.fromLedger !== undefined) {
       values.push(filter.fromLedger);
-      conditions.push(`ledger >= $${values.length}`);
+      clauses.push(`ledger >= $${values.length}`);
     }
     if (filter.toledger !== undefined) {
       values.push(filter.toledger);
-      conditions.push(`ledger <= $${values.length}`);
+      clauses.push(`ledger <= $${values.length}`);
     }
     if (filter.contractId !== undefined) {
       values.push(filter.contractId);
-      conditions.push(`contract_id = $${values.length}`);
+      clauses.push(`contract_id = $${values.length}`);
     }
     if (filter.topic !== undefined) {
       values.push(filter.topic);
-      conditions.push(`topic = $${values.length}`);
+      clauses.push(`topic = $${values.length}`);
     }
     if (filter.fromHappenedAt !== undefined) {
       values.push(filter.fromHappenedAt);
-      conditions.push(`happened_at >= $${values.length}::timestamptz`);
+      clauses.push(`happened_at >= $${values.length}`);
     }
     if (filter.toHappenedAt !== undefined) {
       values.push(filter.toHappenedAt);
-      conditions.push(`happened_at <= $${values.length}::timestamptz`);
+      clauses.push(`happened_at <= $${values.length}`);
     }
-
-    // Cursor: translate afterEventId into a (ledger, event_id) boundary
     if (filter.afterEventId !== undefined) {
-      // Fetch the cursor row's ledger so we can use a composite key comparison
-      const cursorResult = await this.client.query<{ ledger: number }>(
-        `SELECT ledger FROM ${this.tableName} WHERE event_id = $1 LIMIT 1`,
-        [filter.afterEventId],
-      );
-      const cursorRow = cursorResult.rows[0];
-      if (!cursorRow) {
-        throw new StaleCursorError(filter.afterEventId);
-      }
-
-      const cursorLedger = cursorRow.ledger;
-      values.push(cursorLedger, filter.afterEventId);
-      conditions.push(
-        `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
-      );
+      values.push(filter.afterEventId);
+      clauses.push(`event_id > $${values.length}`);
     }
 
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const countResult = await this.client.query<{ count: string }>(
       `SELECT COUNT(*) AS count FROM ${this.tableName} ${where}`,
-      values
+      values,
     );
-    const total = parseInt(countResult.rows[0]?.count ?? '0', 10);
+    const total = Number(countResult.rows[0]?.count ?? 0);
 
-    const pageValues = [...values, limit, filter.afterEventId !== undefined ? 0 : offset];
-    const dataResult = await this.client.query<{
-      event_id: string; ledger: number; ledger_hash: string; contract_id: string;
-      topic: string; tx_hash: string; tx_index: number; operation_index: number;
-      event_index: number; payload: Record<string, unknown>; happened_at: string;
-      ingested_at: string;
-    }>(
-      `SELECT event_id, ledger, ledger_hash, contract_id, topic, tx_hash,
-              tx_index, operation_index, event_index, payload, happened_at, ingested_at
-       FROM ${this.tableName} ${where}
-       ORDER BY ledger ASC, event_id ASC
-       LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
-      pageValues
+    const dataValues = [...values, limit, offset];
+    const dataResult = await this.client.query<Record<string, unknown>>(
+      `SELECT * FROM ${this.tableName} ${where} ORDER BY ledger ASC, event_id ASC LIMIT $${dataValues.length - 1} OFFSET $${dataValues.length}`,
+      dataValues,
     );
-
-    const events: StreamEventRecord[] = dataResult.rows.map((row) => ({
-      eventId: row.event_id,
-      ledger: row.ledger,
-      ledgerHash: row.ledger_hash,
-      contractId: row.contract_id,
-      topic: row.topic,
-      txHash: row.tx_hash,
-      txIndex: row.tx_index,
-      operationIndex: row.operation_index,
-      eventIndex: row.event_index,
-      payload: row.payload,
-      happenedAt: row.happened_at,
-      ingestedAt: row.ingested_at,
-    }));
-
+    const events = dataResult.rows.map((row) => rowToStreamEventRecord(row, this.tableName));
     const lastEvent = events[events.length - 1];
-    const nextCursor = events.length === limit && total > limit && lastEvent
+    const nextCursor = events.length === limit && total > offset + limit && lastEvent
       ? lastEvent.eventId
       : undefined;
 
@@ -523,45 +402,37 @@ export class PostgresContractEventStore implements ContractEventStore {
       events,
       total,
       limit,
-      offset: filter.afterEventId !== undefined ? 0 : offset,
+      offset,
       ...(nextCursor !== undefined ? { nextCursor } : {}),
     };
   }
 
   async saveCheckpoint(checkpoint: ReplayProgressCheckpoint): Promise<void> {
     await this.client.query(
-      `INSERT INTO indexer_replay_progress (last_committed_cursor, total, status, updated_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (last_committed_cursor) DO UPDATE
-          SET total = EXCLUDED.total,
-              status = EXCLUDED.status,
-              updated_at = NOW()`,
-      [checkpoint.cursorId, checkpoint.total, checkpoint.status],
+      `INSERT INTO replay_checkpoints (cursor_id, total, last_committed_offset, status, updated_at)
+       VALUES ($1, $2, $3, $4, COALESCE($5, now()))
+       ON CONFLICT (cursor_id) DO UPDATE SET
+         total = EXCLUDED.total,
+         last_committed_offset = GREATEST(replay_checkpoints.last_committed_offset, EXCLUDED.last_committed_offset),
+         status = EXCLUDED.status,
+         updated_at = now()`,
+      [checkpoint.cursorId, checkpoint.total, checkpoint.lastCommittedOffset, checkpoint.status, checkpoint.updatedAt ?? null],
     );
   }
 
   async getCheckpoint(cursorId: string): Promise<ReplayProgressCheckpoint | null> {
-    const result = await this.client.query<{
-      last_committed_cursor: string;
-      total: number;
-      status: string;
-      updated_at: string;
-      last_committed_offset: number;
-    }>(
-      `SELECT p.last_committed_cursor, p.total, p.status, p.updated_at, c.last_committed_offset
-         FROM indexer_replay_progress p
-         JOIN replay_cursors c ON p.last_committed_cursor = c.id
-        WHERE p.last_committed_cursor = $1 LIMIT 1`,
+    const result = await this.client.query<Record<string, unknown>>(
+      `SELECT cursor_id, total, last_committed_offset, status, updated_at FROM replay_checkpoints WHERE cursor_id = $1`,
       [cursorId],
     );
+    if (result.rows.length === 0) return null;
     const row = result.rows[0];
-    if (!row) return null;
     return {
-      cursorId: row.last_committed_cursor,
-      total: row.total,
-      lastCommittedOffset: row.last_committed_offset ?? 0,
+      cursorId: String(row.cursor_id),
+      total: Number(row.total),
+      lastCommittedOffset: Number(row.last_committed_offset),
       status: row.status as 'in-progress' | 'completed',
-      updatedAt: row.updated_at,
+      updatedAt: row.updated_at == null ? undefined : new Date(String(row.updated_at)).toISOString(),
     };
   }
 }
