@@ -14,7 +14,8 @@
  */
 import crypto from 'crypto';
 import type { StreamFilter, StreamRecord } from '../types.js';
-import { streamRepository, type UpsertResult } from './streamRepository.js';
+const { streamRepository } = require('./streamRepository.js') as typeof import('./streamRepository.js');
+import type { UpsertResult } from './streamRepository.js';
 
 /** Validated, normalised POST /api/streams body. Field order is significant: see createStreamFromApi. */
 export type ApiCreateStreamInput = {
@@ -62,7 +63,7 @@ export function listStreams(
 
 /** One unfiltered page of the export walk, keyed after `afterId`. */
 export function fetchExportPage(afterId: string | undefined): Promise<StreamPage> {
-  return streamRepository.findWithCursor({}, EXPORT_PAGE_SIZE, afterId);
+  return streamRepository.findWithCursor([], EXPORT_PAGE_SIZE, afterId);
 }
 
 /**
