@@ -1,6 +1,7 @@
 import { ContractEventRecord, IndexerStoreKind } from './types.js';
 import { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } from '../db/types.js';
 import { rowReader } from '../db/rowMapping.js';
+import { ensurePartitionCoverage } from '../jobs/partitionMaintenance.js';
 
 export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
 

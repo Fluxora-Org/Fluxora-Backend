@@ -8,7 +8,6 @@
  * re-defaulted in code without updating the document.
  */
 
-import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, test } from 'vitest';
