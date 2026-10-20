@@ -29,14 +29,130 @@
  * - **Unavailable** — see `SlidingWindowStore` and `HybridStore`. A failed or
  *   closed Redis store throws; `HybridStore` catches that and delegates to its
  *   (always-available) in-memory fallback so requests keep being limited.
+ * - **Input validation** — every store rejects malformed, empty, oversized keys
+ *   and out-of-range windows with a typed `RateLimitInputError` *before* any
+ *   state is read or written, so a bad call can never create a bucket, embed an
+ *   unbounded Redis key, or mutate a counter. See `assertKey` / `assertWindowMs`.
  */
 
 import type { RateLimitStore } from '../types/rateLimit.js';
 import type { RedisClient } from './client.js';
+import { MAX_WINDOW_MS } from '../config/rateLimits.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Maximum accepted key length (characters).
+ *
+ * Every caller builds keys as `v1:{principalType}:{principalKey}:{routeKey}`
+ * (see `buildStoreKey` in `src/middleware/rateLimiter.ts`): a bounded prefix,
+ * a hashed/normalised principal, and a route segment capped at 96 chars — so
+ * legitimate keys stay well under 300 characters. 1024 is a generous ceiling
+ * that still rejects oversized input before it is sanitised or written.
+ */
+export const MAX_RATE_LIMIT_KEY_LENGTH = 1024;
+
+/**
+ * Minimum accepted window length (milliseconds).
+ *
+ * The rate-limit config surface already enforces a 1000 ms floor
+ * (`validateConfigPatch` in `src/routes/rateLimits.ts`); the store enforces the
+ * same floor so a store can never be driven below one second directly.
+ */
+export const MIN_RATE_LIMIT_WINDOW_MS = 1000;
+
+/**
+ * Typed error thrown when a rate-limit store call is given invalid input.
+ *
+ * Carries a machine-readable `field` (which argument was rejected) and `rule`
+ * (the exact reason) so the caller can distinguish a `key` rejection from a
+ * `windowMs` rejection *without* parsing the message string. The guard runs
+ * **before any state is read or written**, so a malformed call cannot create a
+ * bucket, embed an unbounded Redis key, or otherwise mutate store state.
+ */
+export class RateLimitInputError extends Error {
+    /** Which argument failed validation (e.g. `key`, `windowMs`). */
+    readonly field: string;
+
+    /** Machine-readable rejection cause (e.g. `not-a-string`, `oversized`). */
+    readonly rule: string;
+
+    constructor(field: string, rule: string) {
+        super(`Invalid rate-limit input for '${field}': ${rule}`);
+        this.name = 'RateLimitInputError';
+        this.field = field;
+        this.rule = rule;
+        Object.setPrototypeOf(this, new.target.prototype);
+    }
+}
+
+/**
+ * Assert `key` is a non-empty, non-whitespace, bounded-length string.
+ *
+ * @param field - Argument name reported in the thrown error (e.g. `key`).
+ * @throws {RateLimitInputError} when `key` is not a string, is empty, or
+ *   exceeds {@link MAX_RATE_LIMIT_KEY_LENGTH}.
+ */
+function assertKey(key: unknown, field = 'key'): asserts key is string {
+    if (typeof key !== 'string') {
+        throw new RateLimitInputError(field, 'must be a non-empty string');
+    }
+    if (key.trim() === '') {
+        throw new RateLimitInputError(field, 'must be a non-empty string');
+    }
+    if (key.length > MAX_RATE_LIMIT_KEY_LENGTH) {
+        throw new RateLimitInputError(
+            field,
+            `must not exceed ${MAX_RATE_LIMIT_KEY_LENGTH} characters (got ${key.length})`,
+        );
+    }
+}
+
+/**
+ * Assert `windowMs` is an integer number of milliseconds within the supported
+ * range `[MIN_RATE_LIMIT_WINDOW_MS, MAX_WINDOW_MS]`.
+ *
+ * Out-of-range windows are not merely cosmetic: `SlidingWindowStore` passes
+ * `windowMs` straight to `PEXPIRE` and to timestamp arithmetic, so a zero,
+ * negative, `NaN`, or unbounded window would corrupt the sliding window (keys
+ * written with a garbage TTL, every entry either never pruned or pruned on
+ * arrival).
+ *
+ * @throws {RateLimitInputError} when `windowMs` is non-finite, a non-integer,
+ *   or outside the supported range.
+ */
+function assertWindowMs(windowMs: unknown, field = 'windowMs'): asserts windowMs is number {
+    if (typeof windowMs !== 'number' || !Number.isFinite(windowMs)) {
+        throw new RateLimitInputError(field, 'must be a finite number');
+    }
+    if (!Number.isInteger(windowMs)) {
+        throw new RateLimitInputError(field, 'must be an integer');
+    }
+    if (windowMs < MIN_RATE_LIMIT_WINDOW_MS) {
+        throw new RateLimitInputError(
+            field,
+            `must be at least ${MIN_RATE_LIMIT_WINDOW_MS}ms (got ${windowMs})`,
+        );
+    }
+    if (windowMs > MAX_WINDOW_MS) {
+        throw new RateLimitInputError(
+            field,
+            `must not exceed ${MAX_WINDOW_MS}ms (got ${windowMs})`,
+        );
+    }
+}
+
+/**
+ * Validate the arguments shared by every read/write store operation.
+ *
+ * Runs before any operation touches state.
+ */
+function assertOperationInputs(key: unknown, windowMs: unknown): void {
+    assertKey(key);
+    assertWindowMs(windowMs);
+}
 
 /**
  * Sanitise an identifier for use as a Redis key segment.
@@ -133,6 +249,7 @@ export class InMemoryStore implements RateLimitStore {
         windowMs: number,
         _limit: number,
     ): Promise<{ count: number; resetAt: number }> {
+        assertOperationInputs(key, windowMs);
         const now = Date.now();
         this.maybeSweep(now);
 
@@ -153,6 +270,7 @@ export class InMemoryStore implements RateLimitStore {
         key: string,
         windowMs: number,
     ): Promise<{ count: number; resetAt: number }> {
+        assertOperationInputs(key, windowMs);
         const now = Date.now();
         this.maybeSweep(now);
 
@@ -230,6 +348,7 @@ export class SlidingWindowStore implements RateLimitStore {
         windowMs: number,
         _limit: number,
     ): Promise<{ count: number; resetAt: number }> {
+        assertOperationInputs(key, windowMs);
         this.assertOpen();
 
         const now = Date.now();
@@ -273,6 +392,7 @@ export class SlidingWindowStore implements RateLimitStore {
         key: string,
         windowMs: number,
     ): Promise<{ count: number; resetAt: number }> {
+        assertOperationInputs(key, windowMs);
         this.assertOpen();
 
         const now = Date.now();
@@ -323,6 +443,7 @@ export class HybridStore implements RateLimitStore {
         windowMs: number,
         limit: number,
     ): Promise<{ count: number; resetAt: number }> {
+        assertOperationInputs(key, windowMs);
         try {
             return await this.primary.increment(key, windowMs, limit);
         } catch (err) {
@@ -336,6 +457,7 @@ export class HybridStore implements RateLimitStore {
         key: string,
         windowMs: number,
     ): Promise<{ count: number; resetAt: number }> {
+        assertOperationInputs(key, windowMs);
         try {
             return await this.primary.getCount(key, windowMs);
         } catch (err) {
