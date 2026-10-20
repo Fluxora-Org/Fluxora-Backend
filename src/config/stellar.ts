@@ -2,6 +2,20 @@ import { isValidStellarContractAddress } from './stellarContracts.js';
 
 export type StellarNetwork = 'testnet' | 'mainnet' | 'local';
 
+export type StellarNetworkInputErrorReason = 'empty' | 'malformed' | 'oversized';
+
+export class StellarNetworkInputError extends Error {
+  constructor(readonly reason: StellarNetworkInputErrorReason) {
+    const messages: Record<StellarNetworkInputErrorReason, string> = {
+      empty: 'STELLAR_NETWORK must not be empty',
+      malformed: 'STELLAR_NETWORK must be testnet, mainnet, or local',
+      oversized: 'STELLAR_NETWORK must not exceed 7 characters',
+    };
+    super(messages[reason]);
+    this.name = 'StellarNetworkInputError';
+  }
+}
+
 export interface StellarNetworkConfig {
   horizonUrl: string;
   /** Stellar network passphrase used to sign transactions on this network. */
@@ -49,15 +63,28 @@ export interface ContractAddresses {
 export function resolveNetwork(
   env: {
     NODE_ENV?: string;
-    STELLAR_NETWORK?: StellarNetwork;
-  } = process.env as { NODE_ENV?: string; STELLAR_NETWORK?: StellarNetwork }
+    STELLAR_NETWORK?: unknown;
+  } = process.env
 ): StellarNetwork {
-  if (
-    env.STELLAR_NETWORK === 'mainnet' ||
-    env.STELLAR_NETWORK === 'testnet' ||
-    env.STELLAR_NETWORK === 'local'
-  ) {
-    return env.STELLAR_NETWORK;
+  const configuredNetwork = env.STELLAR_NETWORK;
+  if (configuredNetwork !== undefined) {
+    if (typeof configuredNetwork !== 'string') {
+      throw new StellarNetworkInputError('malformed');
+    }
+    if (configuredNetwork.trim() === '') {
+      throw new StellarNetworkInputError('empty');
+    }
+    if (configuredNetwork.length > 7) {
+      throw new StellarNetworkInputError('oversized');
+    }
+    if (
+      configuredNetwork === 'mainnet' ||
+      configuredNetwork === 'testnet' ||
+      configuredNetwork === 'local'
+    ) {
+      return configuredNetwork;
+    }
+    throw new StellarNetworkInputError('malformed');
   }
   return env.NODE_ENV === 'production' ? 'mainnet' : 'testnet';
 }
