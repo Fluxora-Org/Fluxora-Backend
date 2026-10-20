@@ -42,7 +42,6 @@ export const STELLAR_STRKEY_LENGTH = 56;
 export const STELLAR_STRKEY_DECODED_LENGTH = 35;
 export const STELLAR_STRKEY_PAYLOAD_LENGTH = 33;
 export const STELLAR_STRKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-export const STELLAR_ACCOUNT_CACHE_PREFIX = 'fluxora:stellar:account:';
 
 /** Cache key prefix for validated Stellar account existence results in Redis. */
 export const STELLAR_ACCOUNT_CACHE_PREFIX = 'fluxora:stellar:account:';
@@ -65,7 +64,7 @@ export const STELLAR_STRKEY_VERSION = {
  */
 export const STELLAR_MUXED_STRKEY_LENGTH = 69;
 export const STELLAR_MUXED_STRKEY_DECODED_LENGTH = 43;
-export const STELLAR_MUXED_STRKEY_PAYLOAD_LENGTH = 40;
+export const STELLAR_MUXED_STRKEY_PAYLOAD_LENGTH = 41;
 
 /**
  * Fast structural regex used at synchronous boundaries. It rejects:
