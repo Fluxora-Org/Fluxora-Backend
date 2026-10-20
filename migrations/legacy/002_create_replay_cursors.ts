@@ -1,4 +1,5 @@
 import { PoolClient } from 'pg';
+import { randomUUID } from 'crypto';
 
 /**
  * Migration: Create replay_cursors table
@@ -19,6 +20,150 @@ import { PoolClient } from 'pg';
  *    application layer (concurrent-replay lock), not at the DB level, so that
  *    historical completed rows are retained for auditing.
  */
+
+/**
+ * Typed error raised when a caller supplies malformed input to the
+ * replay-cursor helpers below. Callers can branch on `code` to distinguish
+ * the reason for rejection without string-matching the message.
+ */
+export class ReplayCursorValidationError extends Error {
+  public readonly code: ReplayCursorValidationCode;
+  public readonly field: string;
+
+  constructor(code: ReplayCursorValidationCode, field: string, message: string) {
+    super(message);
+    this.name = 'ReplayCursorValidationError';
+    this.code = code;
+    this.field = field;
+  }
+}
+
+export type ReplayCursorValidationCode =
+  | 'MISSING_FIELD'
+  | 'WRONG_TYPE'
+  | 'EMPTY_VALUE'
+  | 'OVERSIZED_VALUE'
+  | 'OUT_OF_RANGE'
+  | 'INVALID_RANGE';
+
+/** Maximum accepted length for `contract_id` (bytes, UTF-8). */
+export const MAX_CONTRACT_ID_LENGTH = 256;
+
+/** Maximum accepted absolute value for integer block/offset fields. */
+export const MAX_INTEGER_VALUE = 2_147_483_647;
+
+export interface ReplayCursorInput {
+  contract_id: string;
+  ledger: number;
+  from_block?: number | null;
+  to_block?: number | null;
+  total_rows: number;
+  last_committed_offset?: number;
+}
+
+function assertInteger(
+  field: string,
+  value: unknown,
+  opts: { min?: number; max?: number; optional?: boolean } = {},
+): void {
+  if (value === undefined || value === null) {
+    if (opts.optional) return;
+    throw new ReplayCursorValidationError(
+      'MISSING_FIELD',
+      field,
+      `Field "${field}" is required`,
+    );
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new ReplayCursorValidationError(
+      'WRONG_TYPE',
+      field,
+      `Field "${field}" must be an integer`,
+    );
+  }
+  const min = opts.min ?? -MAX_INTEGER_VALUE;
+  const max = opts.max ?? MAX_INTEGER_VALUE;
+  if (value < min || value > max) {
+    throw new ReplayCursorValidationError(
+      'OUT_OF_RANGE',
+      field,
+      `Field "${field}" must be between ${min} and ${max}`,
+    );
+  }
+}
+
+/**
+ * Validates a replay-cursor payload before any state is written.
+ * Throws `ReplayCursorValidationError` on malformed, empty or oversized input.
+ */
+export function validateReplayCursorInput(input: unknown): ReplayCursorInput {
+  if (input === null || typeof input !== 'object') {
+    throw new ReplayCursorValidationError(
+      'WRONG_TYPE',
+      'input',
+      'Replay cursor input must be an object',
+    );
+  }
+  const raw = input as Record<string, unknown>;
+
+  const contractId = raw.contract_id;
+  if (contractId === undefined || contractId === null) {
+    throw new ReplayCursorValidationError(
+      'MISSING_FIELD',
+      'contract_id',
+      'Field "contract_id" is required',
+    );
+  }
+  if (typeof contractId !== 'string') {
+    throw new ReplayCursorValidationError(
+      'WRONG_TYPE',
+      'contract_id',
+      'Field "contract_id" must be a string',
+    );
+  }
+  if (contractId.trim().length === 0) {
+    throw new ReplayCursorValidationError(
+      'EMPTY_VALUE',
+      'contract_id',
+      'Field "contract_id" must not be empty',
+    );
+  }
+  if (Buffer.byteLength(contractId, 'utf8') > MAX_CONTRACT_ID_LENGTH) {
+    throw new ReplayCursorValidationError(
+      'OVERSIZED_VALUE',
+      'contract_id',
+      `Field "contract_id" must not exceed ${MAX_CONTRACT_ID_LENGTH} bytes`,
+    );
+  }
+
+  assertInteger('ledger', raw.ledger, { min: 0 });
+  assertInteger('total_rows', raw.total_rows, { min: 0 });
+  assertInteger('from_block', raw.from_block, { min: 0, optional: true });
+  assertInteger('to_block', raw.to_block, { min: 0, optional: true });
+  assertInteger('last_committed_offset', raw.last_committed_offset, {
+    min: 0,
+    optional: true,
+  });
+
+  const fromBlock = (raw.from_block ?? null) as number | null;
+  const toBlock = (raw.to_block ?? null) as number | null;
+  if (fromBlock !== null && toBlock !== null && fromBlock > toBlock) {
+    throw new ReplayCursorValidationError(
+      'INVALID_RANGE',
+      'from_block',
+      'Field "from_block" must not be greater than "to_block"',
+    );
+  }
+
+  return {
+    contract_id: contractId,
+    ledger: raw.ledger as number,
+    from_block: fromBlock,
+    to_block: toBlock,
+    total_rows: raw.total_rows as number,
+    last_committed_offset: (raw.last_committed_offset ?? 0) as number,
+  };
+}
 
 export async function up(client: PoolClient): Promise<void> {
   console.log('Creating replay_cursors table...');
@@ -46,6 +191,36 @@ export async function up(client: PoolClient): Promise<void> {
   `);
 
   console.log('replay_cursors table created successfully');
+}
+
+/**
+ * Inserts a new replay cursor row after validating the input.
+ * Validation runs before any SQL is issued, so a rejected payload never
+ * touches the database.
+ */
+export async function createReplayCursor(
+  client: PoolClient,
+  input: unknown,
+): Promise<string> {
+  const valid = validateReplayCursorInput(input);
+  const id = randomUUID();
+
+  await client.query(
+    `INSERT INTO replay_cursors
+       (id, contract_id, ledger, from_block, to_block, total_rows, last_committed_offset)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      id,
+      valid.contract_id,
+      valid.ledger,
+      valid.from_block,
+      valid.to_block,
+      valid.total_rows,
+      valid.last_committed_offset,
+    ],
+  );
+
+  return id;
 }
 
 export async function down(client: PoolClient): Promise<void> {
