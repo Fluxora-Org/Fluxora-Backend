@@ -50,9 +50,11 @@ Both checks are scoped to a single `(contract_id, ledger-range)` pair and use
 indexed lookups — never a full-table scan. The gap check uses `generate_series`
 to materialise the expected ledger list without pulling all rows.
 
-The maximum checked range is **100 000 ledgers** (`MAX_INTEGRITY_RANGE`). If the
-replay span exceeds this, the range is clamped from the tail and a warning is
-logged. This prevents OOM in pathological cases.
+The maximum checked range is **100 000 ledgers** (`MAX_INTEGRITY_RANGE`). A
+larger replay span is not clamped: a `replay_integrity_large_range` warning is
+logged and the full requested range is processed in chunks of 10 000 ledgers
+with bounded concurrency, so a single `generate_series` can never materialise
+the whole span at once.
 
 ### Source
 
@@ -62,20 +64,22 @@ logged. This prevents OOM in pathological cases.
 
 ### Testing
 
-Tests are in `tests/indexer/replayIntegrity.test.ts` and cover:
+Tests are in `src/indexer/replayIntegrity.test.ts` and cover:
 
-- Clean pass (gap-free)
-- Single and multiple gap detection
-- Per-contract scoping (gaps in one contract don't affect another)
-- Multiple events per ledger (no false positives)
-- Duplicate event detection
-- Empty range handling
-- Range clamping
-- DB error handling (caught gracefully)
-- Audit event recording
-- Prometheus counter increment/decrement
-- Contract ID label truncation
-- Integration with IndexerService
+- Clean pass (gap-free, duplicate-free)
+- Gap and duplicate detection, including audit, Prometheus counter and
+  structured-log side effects
+- Deterministic ordering of reported gaps/duplicates
+- Audit payload capping for very large issue lists
+- Empty and zero ranges, inverted range normalisation, single-ledger ranges
+- `MAX_INTEGRITY_RANGE` boundary (warns above it, silent at it) and chunk
+  splitting of the resolved range
+- Bounded chunk concurrency (`MAX_CONCURRENT_CHECKS`)
+- Transient chunk failure retries, retry-budget exhaustion, and partial chunk
+  failure (healthy chunks still reported alongside `error`)
+- DB failure handling (never throws; error is logged and swallowed)
+- Audit write failure (finding is still reported)
+- Contract ID label truncation on metric labels
 
 ---
 
