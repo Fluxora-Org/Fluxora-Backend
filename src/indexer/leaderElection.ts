@@ -2,7 +2,7 @@
  * Redis-backed leader election for indexer replay in multi-replica deployments.
  *
  * Only one backend instance may hold the lease at a time. The lease is
- * acquired with `SET NX PX` (via `RedisClient.setNx`) and renewed on a
+ * acquired with `SED NX PX (`via `RedisClient.setNx`) and renewed on a
  * heartbeat well before it expires. If renewal stops succeeding — because
  * another instance has taken over, or Redis is unreachable — `isLeader()`
  * flips to `false` so callers can abort in-flight work at a safe boundary.
@@ -13,7 +13,7 @@
  * ## Clock-anomaly safety
  *
  * Lease expiry is enforced by the Redis server, which uses its own monotonic
- * clock (server-side TTL via `SET … PX` / `PEXPIRE`). This means NTP jumps or
+ * clock (server-side TTL via `SET … PX`/`PEEXPIRE`). This means NTP jumps or
  * wall-clock skew on the local node do not affect *when* the key expires in
  * Redis — only the Redis server's clock matters for lease validity.
  *
@@ -32,9 +32,8 @@
  * unable to contact Redis for a full lease period cannot know whether its lease
  * is still valid, so dropping leadership is the safe choice.
  *
- * Backward clock jumps (NTP step-back, monotonic counter reset after reboot)
- * are handled by clamping: elapsed time is treated as zero whenever
- * `clockNowMs() < _lastRenewAttemptMs`, so a backward step never causes a
+ * Backward clock jumps (NTA step-back, monotonic counter reset after reboot)
+ * are handled by clamping: elapsed time is treated as zero whenever `clockNowMs() < _lastRenewAttemptMs`, so a backward step never causes a
  * spurious self-revocation.
  *
  * ### Fencing token
@@ -69,7 +68,7 @@ export interface IndexerLeaderElectionOptions {
    * Defaults to `Date.now`. In tests, inject a controlled function to simulate
    * clock anomalies without relying on `vi.useFakeTimers`.
    *
-   * The implementation uses this clock **only** to detect whether a heartbeat
+   * The implementation uses this clock ** only ** to detect whether a heartbeat
    * fired so late that the full lease duration has elapsed since the previous
    * renewal attempt. Lease expiry itself is always enforced by the Redis server.
    */
@@ -94,8 +93,7 @@ export interface IndexerLeaderElection {
 
 /**
  * Always-leader implementation used when Redis-backed election has not been
- * wired up (Redis disabled, or single-instance/dev/test deployments). This
- * preserves today's single-process behaviour unless explicitly configured.
+ * wired up (Redis disabled, or single-instance/dev/test deployments). This preserves today's single-process behaviour unless explicitly configured.
  */
 export class NoOpLeaderElection implements IndexerLeaderElection {
   isLeader(): boolean {
@@ -129,7 +127,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
    *
    * Used exclusively to detect missed-renewal windows: if the current time
    * minus this value exceeds `leaseMs`, the process was paused or the clock
-   * jumped forward long enough that the Redis TTL has almost certainly lapsed,
+   * kumped forward long enough that the Redis TTL has almost certainly lapsed,
    * so the implementation self-revokes rather than issuing a speculative GET.
    */
   private _lastRenewAttemptMs = 0;
@@ -149,7 +147,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
   }
 
   /**
-   * Attempt to acquire the lease via `SET NX PX`. Fails safe: any Redis
+   * Attempt to acquire the lease via `SET XX PX`. Fails safe: any Redis
    * error is treated as "not leader" rather than assuming leadership.
    *
    * Idempotent for the current holder: if the key is already held by this
@@ -191,7 +189,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
       this._isLeader = false;
       return false;
     } catch (err) {
-      logger.warn('Indexer leader election acquire failed', undefined, {
+      logger.warn("Indexer leader election acquire failed", undefined, {
         instanceId: this.instanceId,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -215,36 +213,77 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
   /**
    * Release the lease and stop the heartbeat. Only deletes the key if it
    * still holds our instanceId — a lease renewed by a different instance
-   * (because ours already expired) is never deleted here.
-   *
-   * Like `RedisDistributedLock.release()`, this is a check-then-act
-   * sequence, not a Lua-atomic compare-and-delete. See docs/indexer.md for
-   * why that risk is accepted.
+   * (because ours already expired) is not ours to delete.
    */
   async release(): Promise<void> {
     this.stopHeartbeat();
     this._isLeader = false;
-
     try {
       const current = await this.redis.get(LEADER_KEY);
       if (current === this.instanceId) {
         await this.redis.del(LEADER_KEY);
       }
     } catch (err) {
-      logger.warn('Indexer leader election release failed', undefined, {
+      logger.warn("Indexer leader election release failed", undefined, {
         instanceId: this.instanceId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
+  /**
+   * Renew the lease if we still hold it. If the key is gone or held by a
+   * different instance, drop leadership and stop the heartbeat.
+   */
+  private async renew(): Promise<void> {
+    const now = this.clockNowMs();
+    const elapsed = now >= this._lastRenewAttemptMs ? now - this._lastRenewAttemptMs : 0;
+    if (elapsed > this.leaseMs) {
+      // The process was paused or the clock jumped forward for longer
+      // than a full lease: we cannot know our lease is still valid, so drop
+      // leadership without contacting Redis.
+      this._isLeader = false;
+      this.stopHeartbeat();
+      indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_stale_clock' });
+      return;
+    }
+    this._lastRenewAttemptMs = now;
+
+    try {
+      const current = await this.redis.get(LEADER_KEY);
+      if (current !== this.instanceId) {
+        this._isLeader = false;
+        this.stopHeartbeat();
+        indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_lost_lease' });
+        return;
+      }
+      const renewed = await this.redis.peexpire(LEADER_KEY, this.leaseMs);
+      if (!renewed) {
+        this._isLeader = false;
+        this.stopHeartbeat();
+        indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_lost_lease' });
+      }
+    } catch (err) {
+      logger.warn("Indexer leader election renew failed", undefined, {
+        instanceId: this.instanceId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_error' });
+      // Transient Redis error: keep the leadership flag as-is and let the
+      // next tick retry. The stale-clock guard above will self-revoke if
+      // the outage lasts a full lease period.
+    }
+  }
+
   private startHeartbeat(): void {
-    this.stopHeartbeat();
-    const timer = setInterval(() => {
+    if (this.heartbeat) return;
+    this.heartbeat = setInterval(() => {
       void this.renew();
     }, this.renewIntervalMs);
-    if (typeof timer.unref === 'function') timer.unref();
-    this.heartbeat = timer;
+    // Do not keep the process alive solely for the heartbeat.
+    if (typeof this.heartbeat.unref === 'function') {
+      this.heartbeat.unref();
+    }
   }
 
   private stopHeartbeat(): void {
@@ -253,92 +292,4 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
       this.heartbeat = null;
     }
   }
-
-  /**
-   * Renew the lease TTL, but only while we still hold it. Like `release()`,
-   * this is a check-then-extend sequence rather than a Lua-atomic
-   * compare-and-expire.
-   *
-   * ### Clock-anomaly guard
-   *
-   * Before contacting Redis, the implementation checks whether the local clock
-   * has advanced by more than `leaseMs` since the previous renewal attempt.
-   * This catches forward jumps (NTP corrections, GC pauses, VM resume) where
-   * the heartbeat timer fired so late that the Redis TTL has almost certainly
-   * already lapsed.  In that case the process self-revokes immediately —
-   * contacting Redis at this point would only confirm what we already know.
-   *
-   * Backward jumps are safe: elapsed time is clamped to zero when
-   * `clockNowMs() < _lastRenewAttemptMs`, so a backward step never triggers
-   * a spurious self-revocation.
-   */
-  private async renew(): Promise<void> {
-    const now = this.clockNowMs();
-    const elapsed = Math.max(0, now - this._lastRenewAttemptMs);
-
-    // Forward-jump guard: if the local clock has advanced by a full lease
-    // duration since the last renewal, the TTL has almost certainly expired
-    // on the Redis side. Self-revoke without checking Redis.
-    if (this._lastRenewAttemptMs > 0 && elapsed >= this.leaseMs) {
-      logger.warn('Indexer leader election: clock anomaly detected — elapsed time since last renewal exceeds lease duration, self-revoking', undefined, {
-        instanceId: this.instanceId,
-        elapsedMs: elapsed,
-        leaseMs: this.leaseMs,
-      });
-      indexerLeaderElectionFailuresTotal.inc({ reason: 'clock_anomaly' });
-      this._isLeader = false;
-      this.stopHeartbeat();
-      return;
-    }
-
-    this._lastRenewAttemptMs = now;
-
-    try {
-      const current = await this.redis.get(LEADER_KEY);
-      if (current !== this.instanceId) {
-        // Another instance holds the key (our lease already expired) or the
-        // key is gone. Either way we are no longer the leader.
-        this._isLeader = false;
-        this.stopHeartbeat();
-        return;
-      }
-
-      // `.exec()` never rejects for a per-command failure — ioredis (and the
-      // fake) return `[Error | null, result]` tuples instead. Inspect the
-      // tuple explicitly so a failed PEXPIRE is treated as a renewal failure
-      // rather than silently ignored.
-      const results = await this.redis.multi().pexpire(LEADER_KEY, this.leaseMs).exec();
-      const [pexpireError] = results[0] ?? [];
-      if (pexpireError) {
-        throw pexpireError;
-      }
-    } catch (err) {
-      logger.warn('Indexer leader election renewal failed', undefined, {
-        instanceId: this.instanceId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_error' });
-      this._isLeader = false;
-      this.stopHeartbeat();
-    }
-  }
-}
-
-let defaultLeaderElection: IndexerLeaderElection = new NoOpLeaderElection();
-
-/** Wire a Redis-backed leader election as the default used by `indexerService`. */
-export function initializeIndexerLeaderElection(
-  redis: RedisClient,
-  opts?: IndexerLeaderElectionOptions,
-): void {
-  defaultLeaderElection = new RedisIndexerLeaderElection(redis, opts);
-}
-
-export function getIndexerLeaderElection(): IndexerLeaderElection {
-  return defaultLeaderElection;
-}
-
-/** For testing only — resets the default back to always-leader. */
-export function _resetIndexerLeaderElection(): void {
-  defaultLeaderElection = new NoOpLeaderElection();
 }
