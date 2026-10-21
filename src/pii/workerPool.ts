@@ -76,6 +76,13 @@ export interface WorkerPoolOptions {
    * Default: 1000
    */
   maxQueueSize?: number;
+
+  /**
+   * Maximum allowed size, in bytes, of a task message once JSON-serialized.
+   * Messages exceeding this are rejected by `exec()` before being queued or
+   * dispatched. Default: `DEFAULT_MAX_MESSAGE_SIZE_BYTES` (1 MiB).
+   */
+  maxMessageSizeBytes?: number;
 }
 
 export class PoolShutdownError extends Error {
@@ -90,6 +97,22 @@ export class PoolQueueFullError extends Error {
   constructor() {
     super('WorkerPool queue is full (backpressure applied)');
     this.name = 'PoolQueueFullError';
+  }
+}
+
+/**
+ * Thrown by `exec()` when a task message fails input validation — it is
+ * null/undefined, empty, not structured-cloneable, or exceeds the pool's
+ * configured size limit. `reason` carries the specific cause so callers can
+ * distinguish failure modes without parsing the message string.
+ */
+export class PoolInvalidInputError extends Error {
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(`Invalid task message: ${reason}`);
+    this.name = 'PoolInvalidInputError';
+    this.reason = reason;
   }
 }
 
@@ -111,6 +134,14 @@ export const DEFAULT_MAX_WORKERS = 8;
 export const BATCH_HASH_THRESHOLD = 50;
 
 /**
+ * Default cap, in bytes, on a task message once JSON-serialized. Chosen to
+ * comfortably fit legitimate HMAC hashing tasks (a handful of short strings)
+ * while rejecting payloads large enough to stall a worker's event loop or
+ * balloon memory via structured clone.
+ */
+export const DEFAULT_MAX_MESSAGE_SIZE_BYTES = 1024 * 1024; // 1 MiB
+
+/**
  * Resolve the default worker count: `min(os.availableParallelism(), cap)`.
  * Falls back to 2 if `availableParallelism` is unavailable (older Node).
  */
@@ -119,6 +150,68 @@ export function resolveWorkerCount(cap: number = DEFAULT_MAX_WORKERS): number {
     ? os.availableParallelism()
     : os.cpus().length;
   return Math.max(1, Math.min(available, cap));
+}
+
+/**
+ * Validate a task message before it is queued or dispatched to a worker.
+ *
+ * Rejects:
+ *   - `null`/`undefined` messages
+ *   - empty strings, arrays, and plain objects
+ *   - values that cannot be structured-cloned to a worker (functions,
+ *     symbols, circular references — surfaced via a failed `JSON.stringify`,
+ *     which is a reliable proxy for structured-clone support here)
+ *   - messages whose serialized size exceeds `maxSizeBytes`
+ *
+ * Throws `PoolInvalidInputError` with a `reason` describing which check
+ * failed. Never mutates pool state — callers run this before touching the
+ * queue or worker slots.
+ */
+export function validateTaskMessage(
+  message: unknown,
+  maxSizeBytes: number = DEFAULT_MAX_MESSAGE_SIZE_BYTES,
+): void {
+  if (message === undefined || message === null) {
+    throw new PoolInvalidInputError('message must not be null or undefined');
+  }
+
+  if (typeof message === 'string' && message.length === 0) {
+    throw new PoolInvalidInputError('message must not be an empty string');
+  }
+
+  if (Array.isArray(message) && message.length === 0) {
+    throw new PoolInvalidInputError('message must not be an empty array');
+  }
+
+  if (
+    typeof message === 'object' &&
+    !Array.isArray(message) &&
+    Object.keys(message as Record<string, unknown>).length === 0
+  ) {
+    throw new PoolInvalidInputError('message must not be an empty object');
+  }
+
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(message);
+  } catch (err) {
+    throw new PoolInvalidInputError(
+      `message is not serializable: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  if (serialized === undefined) {
+    throw new PoolInvalidInputError(
+      'message is not serializable (functions and symbols cannot be cloned to a worker)',
+    );
+  }
+
+  const sizeBytes = Buffer.byteLength(serialized, 'utf8');
+  if (sizeBytes > maxSizeBytes) {
+    throw new PoolInvalidInputError(
+      `message size (${sizeBytes} bytes) exceeds the maximum allowed size of ${maxSizeBytes} bytes`,
+    );
+  }
 }
 
 // ── Pool implementation ────────────────────────────────────────────────────
@@ -150,6 +243,7 @@ export class WorkerPool {
   private readonly workerData: Record<string, unknown> | undefined;
   private readonly maxWorkers: number;
   private readonly maxQueueSize: number;
+  private readonly maxMessageSizeBytes: number;
   private nextTaskId = 0;
   private activeTasks = 0;
   private shutdownFlag = false;
@@ -160,6 +254,7 @@ export class WorkerPool {
     this.workerUrl = workerUrl;
     this.maxWorkers = resolveWorkerCount(options?.maxWorkers);
     this.maxQueueSize = options?.maxQueueSize ?? 1000;
+    this.maxMessageSizeBytes = options?.maxMessageSizeBytes ?? DEFAULT_MAX_MESSAGE_SIZE_BYTES;
     this.workerData = options?.workerData;
   }
 
@@ -181,6 +276,12 @@ export class WorkerPool {
   exec<T>(message: unknown): Promise<T> {
     if (this.shutdownFlag) {
       return Promise.reject(new PoolShutdownError());
+    }
+
+    try {
+      validateTaskMessage(message, this.maxMessageSizeBytes);
+    } catch (err) {
+      return Promise.reject(err);
     }
 
     // Degrade to synchronous fallback if no workers are available.
