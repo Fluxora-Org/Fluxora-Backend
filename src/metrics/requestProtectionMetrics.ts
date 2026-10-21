@@ -29,7 +29,34 @@
 
 import { Counter, Gauge } from 'prom-client';
 import { registry } from '../metrics.js';
-import { assertCollectorLabels } from './cardinality.js';
+
+/**
+ * Typed error thrown when a metric mutation function receives invalid
+ * input. The `field` property lets the caller tell which argument was rejected
+ * and the `code` property identifies the kind of validation failure.
+ */
+export type InvalidMetricInputCode =
+  |'wrong_type'
+  | 'empty_value'
+  | 'too_long'
+  | 'not_finite'
+  | 'negative';
+
+export class InvalidMetricInputError extends Error {
+  public readonly code: InvalidMetricInputCode;
+  public readonly field: string;
+
+  constructor(code: InvalidMetricInputCode, field: string, message: string) {
+    super(message);
+    this.name = 'InvalidMetricInputError';
+    this.code = code;
+    this.field = field;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** Maximum accepted length for the `consumerHash` label. */
+const MAX_CONSUMER_HASH_LENGTH = 256;
 
 /**
  * Counter incremented once for every request refused by protection mechanisms.
@@ -53,12 +80,9 @@ import { assertCollectorLabels } from './cardinality.js';
  * // Alert on body size limit violations (potential DoS)
  * increase(fluxora_request_refused_total{reason="body_too_large"}[5m]) > 20
  */
-assertCollectorLabels(['path']);
-assertCollectorLabels(['reason']);
-
 export const requestRefusedTotal =
   (registry.getSingleMetric('fluxora_request_refused_total') as Counter<'path' | 'reason'>) ||
-  new Counter({
+  new Counter( {
     name: 'fluxora_request_refused_total',
     help: 'Total number of requests refused by protection mechanisms, labeled by normalized route path and refusal reason',
     labelNames: ['path', 'reason'] as const,
@@ -66,13 +90,12 @@ export const requestRefusedTotal =
   });
 
 /**
- * Counter incremented once for every HTTP 413 rejection produced by
+ * Counter incremented once for every HTTP 413 rejection produced by 
  * `bodySizeLimitMiddleware`. Labelled by `path` (route template).
  *
  * @deprecated Use requestRefusedTotal with reason='body_too_large' instead.
  * Kept for backward compatibility.
  */
-assertCollectorLabels(['path']);
 
 /**
  * Counter incremented once for every HTTP 400 rejection caused by JSON nesting
@@ -94,7 +117,7 @@ export const requestBodyTooLargeTotal =
 
 export const requestBodyTooDeepTotal =
   (registry.getSingleMetric('fluxora_request_body_too_deep_total') as Counter<'path'>) ||
-  new Counter({
+  new Counter(  {
     name: 'fluxora_request_body_too_deep_total',
     help: 'Total number of requests rejected with HTTP 400 because the JSON body nesting depth exceeded the configured limit, labeled by normalized route path',
     labelNames: ['path'] as const,
@@ -104,7 +127,7 @@ export const requestBodyTooDeepTotal =
 /**
  * Token-bucket fill level for the webhook outbound rate limiter.
  *
- * A Gauge per consumer endpoint that shows how many tokens remain in the
+ * An Gauge per consumer endpoint that shows how many tokens remain in the
  * bucket. When the gauge approaches 0 the consumer is being throttled;
  * when it stays near the configured burst maximum the consumer is idle.
  *
@@ -118,9 +141,7 @@ export const requestBodyTooDeepTotal =
  *   service names) from appearing in metric label values.
  */
 export const webhookRateLimiterBucketFill =
-  (registry.getSingleMetric(
-    'fluxora_webhook_rate_limiter_bucket_fill'
-  ) as Gauge<'consumer_hash'>) ||
+  (registry.getSingleMetric('fluxora_webhook_rate_limiter_bucket_fill') as Gauge<'consumer_hash'>)  ||
   new Gauge({
     name: 'fluxora_webhook_rate_limiter_bucket_fill',
     help: 'Current token-bucket fill level for outbound webhook rate limiter, labeled by consumer hash',
@@ -131,10 +152,50 @@ export const webhookRateLimiterBucketFill =
 /**
  * Update the bucket-fill gauge for a given consumer.
  *
+ * Validates inputs before touching the prom-client registry so that a
+ * malformed, empty or oversized value cannot corrupt the metric state.
+ *
+ * @throws {InvalidMetricInputError} when `consumerHash` or `fillLevel` is invalid.
+ *
  * @param consumerHash - SHA-256 prefix of the consumer endpoint URL.
  * @param fillLevel    - Current number of tokens in the bucket (may be fractional).
  */
 export function updateWebhookBucketFill(consumerHash: string, fillLevel: number): void {
+  if (typeof consumerHash !== 'string') {
+    throw new InvalidMetricInputError(
+      'wrong_type',
+      'consumerHash',
+      'consumerHash must be a string',
+    );
+  }
+  if (consumerHash.trim().length === 0) {
+    throw new InvalidMetricInputError(
+      'empty_value',
+      'consumerHash',
+      'consumerHash must be a non-empty string',
+    );
+  }
+  if (consumerHash.length > MAX_CONSUMER_HASH_LENGTH) {
+    throw new InvalidMetricInputError(
+      'too_long',
+      'consumerHash',
+      `consumerHash must be at most ${MAX_CONSUMER_HASH_LENGTH} characters`,
+    );
+  }
+  if (typeof fillLevel !== 'number' || !Number.isFinite(fillLevel)) {
+    throw new InvalidMetricInputError(
+      'not_finite',
+      'fillLevel',
+      'fillLevel must be a finite number',
+    );
+  }
+  if (fillLevel < 0) {
+    throw new InvalidMetricInputError(
+      'negative',
+      'fillLevel',
+      'fillLevel must be non-negative',
+    );
+  }
   webhookRateLimiterBucketFill.set({ consumer_hash: consumerHash }, fillLevel);
 }
 
