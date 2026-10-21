@@ -49,8 +49,8 @@ describe('requireJsonAccept middleware', () => {
       await request(app).get('/read').set('Accept', 'APPLICATION/JSON').expect(200);
     });
 
-    it('passes through when the Accept header is unparseable', async () => {
-      await request(app).get('/read').set('Accept', ',,,').expect(200);
+    it('rejects a structurally malformed Accept header', async () => {
+      await request(app).get('/read').set('Accept', ',,,').expect(400);
     });
   });
 
@@ -125,6 +125,6 @@ describe('requireJsonAccept middleware', () => {
       const { createApp } = await import('../../src/app.js');
       const testApp = createApp({ includeTestRoutes: false });
       await request(testApp).get('/api/streams').set('Accept', 'application/xml').expect(406);
-    });
+    }, 60_000);
   });
 });

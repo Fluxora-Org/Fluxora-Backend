@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
+import { ApiError, ApiErrorCode } from '../errors.js';
 import { errorResponse } from '../utils/response.js';
 
 /** A single parsed `Accept` header entry with its RFC 9110 quality value. */
@@ -10,6 +11,103 @@ interface AcceptEntry {
 }
 
 const DEFAULT_QUALITY = 1.0;
+
+/**
+ * Maximum accepted length of the raw `Accept` header value.
+ *
+ * Matches the 8 KiB header limit already used for other request headers in this
+ * codebase (e.g. `Authorization`). Longer values are rejected before parsing.
+ */
+export const MAX_ACCEPT_HEADER_LENGTH = 8192;
+
+export type AcceptRejectionReason = 'empty' | 'oversized' | 'malformed';
+
+/**
+ * Typed error passed to `next()` when the `Accept` header cannot be validated.
+ * Extends `ApiError` so the standard error handler converts it into the normal
+ * error envelope with an appropriate status code.
+ */
+export class AcceptNegotiationValidationError extends ApiError {
+  public readonly reason: AcceptRejectionReason;
+
+  constructor(message: string, reason: AcceptRejectionReason) {
+    const statusCode = reason === 'oversized' ? 413 : 400;
+    const code =
+      reason === 'oversized' ? ApiErrorCode.PAYLOAD_TOO_LARGE : ApiErrorCode.VALIDATION_ERROR;
+    super(statusCode, code, message, { reason });
+    this.name = 'AcceptNegotiationValidationError';
+    this.reason = reason;
+  }
+}
+
+const TOKEN = "[!#$%&'*+\\-.^_`|~0-9A-Za-z]+";
+const MEDIA_RANGE_PATTERN = new RegExp(`^(?:\\*/\\*|(?!\\*)${TOKEN}/(?:${TOKEN}|\\*))$`);
+const PARAMETER_PATTERN = new RegExp(`^${TOKEN}=(?:${TOKEN}|"(?:[^"\\\\]|\\\\.)*")$`);
+
+/**
+ * Validates the raw `Accept` header before it is parsed.
+ *
+ * Rejects non-string, empty/whitespace-only, oversized, and structurally
+ * malformed values with a typed {@link AcceptNegotiationValidationError}.
+ * A missing header is not passed here: RFC 9110 treats it as an implicit `*\/*`.
+ */
+export function validateAcceptHeader(acceptHeader: unknown): string {
+  if (typeof acceptHeader !== 'string') {
+    throw new AcceptNegotiationValidationError(
+      'Accept header must be a string',
+      'malformed',
+    );
+  }
+
+  if (acceptHeader.trim().length === 0) {
+    throw new AcceptNegotiationValidationError('Accept header cannot be empty', 'empty');
+  }
+
+  if (acceptHeader.length > MAX_ACCEPT_HEADER_LENGTH) {
+    throw new AcceptNegotiationValidationError(
+      `Accept header exceeds maximum allowed length of ${MAX_ACCEPT_HEADER_LENGTH} characters`,
+      'oversized',
+    );
+  }
+
+  // Allow HTAB as optional whitespace, but reject other control characters.
+  if (/[\r\n\0\x00-\x08\x0A-\x1F\x7F]/.test(acceptHeader)) {
+    throw new AcceptNegotiationValidationError(
+      'Accept header contains forbidden control characters',
+      'malformed',
+    );
+  }
+
+  for (const entry of acceptHeader.split(',')) {
+    const trimmedEntry = entry.trim();
+    if (trimmedEntry.length === 0) {
+      throw new AcceptNegotiationValidationError(
+        'Accept header contains an empty media range',
+        'malformed',
+      );
+    }
+
+    const [rawMediaType, ...params] = trimmedEntry.split(';');
+    const mediaType = (rawMediaType ?? '').trim().toLowerCase();
+    if (!MEDIA_RANGE_PATTERN.test(mediaType)) {
+      throw new AcceptNegotiationValidationError(
+        'Accept header contains a malformed media range',
+        'malformed',
+      );
+    }
+
+    for (const param of params) {
+      if (!PARAMETER_PATTERN.test(param.trim())) {
+        throw new AcceptNegotiationValidationError(
+          'Accept header contains a malformed parameter',
+          'malformed',
+        );
+      }
+    }
+  }
+
+  return acceptHeader;
+}
 
 /**
  * Parses the Accept header into media-type/quality pairs.
@@ -76,6 +174,8 @@ function isJsonAcceptable(mediaType: string): boolean {
  *   is listed at a lower quality; the server can still satisfy with JSON)
  * - `Accept: application/json;q=0` → 406 Not Acceptable (`q=0` disallows the
  *   media range, so the server has nothing it can produce)
+ * - Empty, oversized or malformed header → 400/413 with a typed validation
+ *   error passed to the standard error handler
  *
  * Security note: the raw `Accept` header value is **not** echoed in the
  * response body to prevent header-injection reflection.
@@ -87,17 +187,20 @@ export function requireJsonAccept(
 ): void {
   const acceptHeader = req.headers['accept'];
 
-  // No Accept header — implicit wildcard, always acceptable.
-  if (!acceptHeader) {
+  // No Accept header — implicit wildcard, always acceptable. An empty header
+  // value is *not* the same as an absent header and is rejected below.
+  if (acceptHeader === undefined) {
     next();
     return;
   }
 
-  const entries = parseAcceptHeader(acceptHeader);
-
-  // Empty or unparseable header — treat as wildcard.
-  if (entries.length === 0) {
-    next();
+  let entries: AcceptEntry[];
+  try {
+    validateAcceptHeader(acceptHeader);
+    entries = parseAcceptHeader(acceptHeader);
+  } catch (err) {
+    // Reject invalid input before any response headers or body are written.
+    next(err);
     return;
   }
 
