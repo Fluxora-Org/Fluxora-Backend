@@ -18,7 +18,7 @@ import { getRuntimeEnv } from '../config/runtime-env.js';
  *   - POST /events/replay and GET /status require a JWT with Permission.INDEXER_REPLAY.
  *   - All routes sit behind the shared rate limiter; none are on the public CORS allowlist.
  */
-import { Router } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import {
   payloadTooLarge,
   unauthorized,
@@ -54,13 +54,13 @@ indexerRouter.use(mtlsValidationMiddleware);
 const INDEXER_AUTH_HEADER = 'x-indexer-worker-token';
 let indexerWorkerToken = getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
 
-function resolveActor(req: any): string {
+function resolveActor(req: Request): string {
   const forwardedFor = req.header('x-forwarded-for');
   const remoteAddress = req.ip || req.socket?.remoteAddress || 'unknown';
   return String(forwardedFor ?? remoteAddress);
 }
 
-function requireIndexerToken(req: any): void {
+function requireIndexerToken(req: Request): void {
   const providedToken = req.header(INDEXER_AUTH_HEADER);
   if (typeof providedToken !== 'string' || providedToken.trim() === '') {
     throw unauthorized('Indexer worker authentication is required');
@@ -70,7 +70,7 @@ function requireIndexerToken(req: any): void {
   }
 }
 
-function enforceContentLength(req: any): void {
+function enforceContentLength(req: Request): void {
   const header = req.header('content-length');
   if (!header) return;
   const parsed = Number.parseInt(header, 10);
@@ -90,7 +90,7 @@ function parseIntParam(val: unknown, name = 'Parameter'): number | undefined {
 
 // ── POST /contract-events ─────────────────────────────────────────────────────
 
-indexerRouter.post('/contract-events', async (req: any, res: any, next: any) => {
+indexerRouter.post('/contract-events', async (req: Request, res: Response, next: NextFunction) => {
   try {
     requireIndexerToken(req);
     enforceContentLength(req);
@@ -116,7 +116,7 @@ indexerRouter.post('/contract-events', async (req: any, res: any, next: any) => 
 
 import { StaleCursorError } from '../indexer/store.js';
 
-indexerRouter.get('/events/replay', async (req: any, res: any, next: any) => {
+indexerRouter.get('/events/replay', async (req: Request, res: Response, next: NextFunction) => {
   try {
     requireIndexerToken(req);
 
@@ -151,7 +151,7 @@ indexerRouter.get('/events/replay', async (req: any, res: any, next: any) => {
 
 // ── GET /events ───────────────────────────────────────────────────────────────
 
-indexerRouter.get('/events', async (req: any, res: any, next: any) => {
+indexerRouter.get('/events', async (req: Request, res: Response, next: NextFunction) => {
   try {
     requireIndexerToken(req);
 
@@ -183,78 +183,91 @@ indexerRouter.post(
   authenticate,
   requireAuth,
   requirePermission(Permission.INDEXER_REPLAY),
-  async (req: any, res: any) => {
+  async (req: Request, res: Response, next: NextFunction) => {
     const requestId = req.correlationId;
     const correlationId = req.correlationId;
 
-    const parsed = parseBody(ReplayRequestSchema, req.body);
-    if (!parsed.success) {
-      res.status(400).json(
-        errorResponse('VALIDATION_ERROR', 'Request body validation failed', formatZodIssues(parsed.issues), requestId),
-      );
-      return;
-    }
-
-    const { contract_id, ledger, from_block, to_block } = parsed.data;
-
-    if (from_block !== undefined && to_block !== undefined && from_block > to_block) {
-      res.status(400).json(
-        errorResponse('VALIDATION_ERROR', 'from_block cannot be greater than to_block', undefined, requestId),
-      );
-      return;
-    }
-
-    // Guard against concurrent control operations
-    if (replayLock.isHeld() || indexerService.getReplayProgress().isReplaying) {
-      res.status(409).json(
-        errorResponse('CONFLICT', 'Replay operation already in progress', undefined, requestId),
-      );
-      return;
-    }
-
-    const lockProvider = getReindexLock();
+    // Express 4 does not catch a rejection from an async handler: anything that
+    // throws below (the lock provider, the audit log) would otherwise leave the
+    // request hanging and surface as an unhandled rejection. Route it to the
+    // shared error handler instead, and give back a lock no replay will release.
     let lock: Lock | undefined;
-
-    if (lockProvider) {
-      try {
-        lock = await lockProvider.acquire();
-      } catch (err) {
-        if (err instanceof AdminStateLockError) {
-          res.status(409).json(
-            errorResponse('CONFLICT', 'A reindex operation is already in progress.', undefined, requestId),
-          );
-          return;
-        }
-        throw err;
+    let replayStarted = false;
+    try {
+      const parsed = parseBody(ReplayRequestSchema, req.body);
+      if (!parsed.success) {
+        res.status(400).json(
+          errorResponse('VALIDATION_ERROR', 'Request body validation failed', formatZodIssues(parsed.issues), requestId),
+        );
+        return;
       }
-    }
 
-    recordAuditEvent('REINDEX_TRIGGERED', 'indexer', 'admin', correlationId, {
-      contract_id,
-      ledger,
-      from_block,
-      to_block,
-    });
+      const { contract_id, ledger, from_block, to_block } = parsed.data;
 
-    indexerService.replayEvents({ contract_id, ledger, from_block, to_block })
-      .catch((err: unknown) => {
-        logger.error('Replay failed', correlationId, {
-          contract_id,
-          ledger,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      })
-      .finally(() => {
-        if (lock) {
-          lock.release().catch(() => {});
+      if (from_block !== undefined && to_block !== undefined && from_block > to_block) {
+        res.status(400).json(
+          errorResponse('VALIDATION_ERROR', 'from_block cannot be greater than to_block', undefined, requestId),
+        );
+        return;
+      }
+
+      // Guard against concurrent control operations
+      if (replayLock.isHeld() || indexerService.getReplayProgress().isReplaying) {
+        res.status(409).json(
+          errorResponse('CONFLICT', 'Replay operation already in progress', undefined, requestId),
+        );
+        return;
+      }
+
+      const lockProvider = getReindexLock();
+
+      if (lockProvider) {
+        try {
+          lock = await lockProvider.acquire();
+        } catch (err) {
+          if (err instanceof AdminStateLockError) {
+            res.status(409).json(
+              errorResponse('CONFLICT', 'A reindex operation is already in progress.', undefined, requestId),
+            );
+            return;
+          }
+          throw err;
         }
+      }
+
+      recordAuditEvent('REINDEX_TRIGGERED', 'indexer', 'admin', correlationId, {
+        contract_id,
+        ledger,
+        from_block,
+        to_block,
       });
 
-    logger.info('Replay started', correlationId, { contract_id, ledger, from_block, to_block });
+      replayStarted = true;
+      indexerService.replayEvents({ contract_id, ledger, from_block, to_block })
+        .catch((err: unknown) => {
+          logger.error('Replay failed', correlationId, {
+            contract_id,
+            ledger,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          if (lock) {
+            lock.release().catch(() => {});
+          }
+        });
 
-    res.status(202).json(
-      successResponse({ message: 'Replay started', status: indexerService.getReplayProgress() }, requestId),
-    );
+      logger.info('Replay started', correlationId, { contract_id, ledger, from_block, to_block });
+
+      res.status(202).json(
+        successResponse({ message: 'Replay started', status: indexerService.getReplayProgress() }, requestId),
+      );
+    } catch (caught) {
+      if (lock && !replayStarted) {
+        lock.release().catch(() => {});
+      }
+      next(caught);
+    }
   },
 );
 
@@ -270,7 +283,7 @@ indexerRouter.get(
   authenticate,
   requireAuth,
   requirePermission(Permission.INDEXER_REPLAY),
-  async (req: any, res: any) => {
+  async (req: Request, res: Response) => {
     const requestId = req.correlationId;
     const correlationId = req.correlationId;
     try {
@@ -314,7 +327,15 @@ export function resetIndexerState(): void {
   replayState.endReplay();
 }
 
-export function getIndexerHealth() {
+export type IndexerHealth = ReturnType<typeof indexerIngestionService.getHealthSnapshot> & {
+  isReplaying: boolean;
+  authHeader: string;
+  maxBatchSize: number;
+  rateLimit: { requests: number; windowMs: number };
+  catchupTelemetry: ReturnType<typeof indexerIngestionService.getCatchupTelemetry>;
+};
+
+export function getIndexerHealth(): IndexerHealth {
   return {
     ...indexerIngestionService.getHealthSnapshot(),
     isReplaying: indexerService.getReplayProgress().isReplaying,

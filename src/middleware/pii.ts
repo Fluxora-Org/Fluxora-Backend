@@ -9,6 +9,7 @@ import { getRuntimeEnv } from '../config/runtime-env.js';
 
 import type { Request, Response, NextFunction } from 'express';
 import { logger } from '../lib/logger.js';
+import { errorResponse } from '../utils/response.js';
 import { redactKeysInString, sanitize } from '../pii/sanitizer.js';
 
 /**
@@ -144,7 +145,7 @@ export function safeErrorHandler(
  */
 export function responseSanitizer(req: Request, res: Response, next: NextFunction): void {
   const originalJson = res.json;
-  res.json = function(body: any) {
+  res.json = function(body: Record<string, unknown>) {
     try {
       body = sanitize(body);
     } catch (e) {
