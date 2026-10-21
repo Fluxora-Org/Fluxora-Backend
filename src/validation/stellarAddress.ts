@@ -64,7 +64,7 @@ export const STELLAR_STRKEY_VERSION = {
  */
 export const STELLAR_MUXED_STRKEY_LENGTH = 69;
 export const STELLAR_MUXED_STRKEY_DECODED_LENGTH = 43;
-export const STELLAR_MUXED_STRKEY_PAYLOAD_LENGTH = 40;
+export const STELLAR_MUXED_STRKEY_PAYLOAD_LENGTH = 41;
 
 /**
  * Fast structural regex used at synchronous boundaries. It rejects:
