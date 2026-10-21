@@ -6,6 +6,7 @@ import { warn } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import crypto from 'crypto';
 import { errorResponse } from '../utils/response.js';
+import { ApiErrorCode } from '../errors.js';
 
 /**
  * Maximum allowed length for the `Authorization` header value, in bytes.
