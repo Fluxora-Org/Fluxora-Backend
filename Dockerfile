@@ -12,6 +12,7 @@ WORKDIR /app
 RUN corepack enable
 
 COPY package.json pnpm-lock.yaml* ./
+COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
 
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
