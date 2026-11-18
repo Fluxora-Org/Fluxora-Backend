@@ -217,6 +217,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/streams → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "GET /api/streams → 503": {
             "application/json": {
                 "default": {
@@ -276,6 +288,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "UNAUTHORIZED",
                         "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "POST /api/streams → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -347,6 +371,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/streams/{id} → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "GET /api/streams/{id} → 503": {
             "application/json": {
                 "default": {
@@ -398,6 +434,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "DELETE /api/streams/{id} → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "DELETE /api/streams/{id} → 409": {
             "application/json": {
                 "default": {
@@ -429,6 +477,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "NOT_FOUND",
                         "message": "Resource not found",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "HEAD /api/streams/{id} → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -498,6 +558,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "PATCH /api/streams/{id}/status → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "PATCH /api/streams/{id}/status → 409": {
             "application/json": {
                 "default": {
@@ -557,6 +629,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "POST /api/auth/session → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "GET /api/audit → 200": {
             "application/json": {
                 "default": {
@@ -606,6 +690,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/audit → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "GET /api/privacy/policy → 200": {
             "application/json": {
                 "default": {
@@ -643,6 +739,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/privacy/policy → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "GET /api/privacy/retention → 200": {
             "application/json": {
                 "default": {
@@ -659,6 +767,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "_links": {
                         "self": "/api/privacy/retention",
                         "fullPolicy": "/api/privacy/policy",
+                    },
+                },
+            },
+        },
+        "GET /api/privacy/retention → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
                     },
                 },
             },
@@ -713,6 +833,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/admin/status → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "GET /api/admin/pause → 200": {
             "application/json": {
                 "default": {
@@ -735,6 +867,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "UNAUTHORIZED",
                         "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "GET /api/admin/pause → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -782,6 +926,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "PUT /api/admin/pause → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "PUT /api/admin/pause → 503": {
             "application/json": {
                 "default": {
@@ -822,6 +978,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/admin/reindex → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "POST /api/admin/reindex → 202": {
             "application/json": {
                 "default": {
@@ -848,6 +1016,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "UNAUTHORIZED",
                         "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "POST /api/admin/reindex → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -905,6 +1085,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "POST /api/admin/ws/disconnect → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "POST /api/admin/ws/disconnect → 503": {
             "application/json": {
                 "default": {
@@ -952,6 +1144,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/admin/api-keys → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "POST /api/admin/api-keys → 201": {
             "application/json": {
                 "default": {
@@ -982,6 +1186,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "UNAUTHORIZED",
                         "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "POST /api/admin/api-keys → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -1022,6 +1238,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "POST /api/admin/api-keys/{id}/rotate → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "DELETE /api/admin/api-keys/{id} → 401": {
             "application/json": {
                 "default": {
@@ -1041,6 +1269,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "NOT_FOUND",
                         "message": "Resource not found",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "DELETE /api/admin/api-keys/{id} → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -1083,6 +1323,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "FORBIDDEN",
                         "message": "Insufficient permissions to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "GET /api/admin/deprecations → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -1395,6 +1647,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "GET /api/rate-limits → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "GET /api/rate-limits/config → 200": {
             "application/json": {
                 "default": {
@@ -1424,6 +1688,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "UNAUTHORIZED",
                         "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "GET /api/rate-limits/config → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -1472,6 +1748,18 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     "error": {
                         "code": "UNAUTHORIZED",
                         "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "PUT /api/rate-limits/config → 406": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_ACCEPTABLE",
+                        "message": "Content type specified in Accept header is not supported",
                         "requestId": "req_abc123",
                     },
                 },
@@ -1682,6 +1970,96 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                 },
             },
         },
+        "POST /internal/indexer/events/replay → 202": {
+            "application/json": {},
+        },
+        "POST /internal/indexer/events/replay → 400": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Request validation failed",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "POST /internal/indexer/events/replay → 401": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "POST /internal/indexer/events/replay → 403": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "FORBIDDEN",
+                        "message": "Insufficient permissions to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "POST /internal/indexer/events/replay → 409": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "CONFLICT",
+                        "message": "Resource conflict",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "GET /internal/indexer/status → 200": {
+            "application/json": {},
+        },
+        "GET /internal/indexer/status → 401": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Authentication required to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "GET /internal/indexer/status → 403": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "FORBIDDEN",
+                        "message": "Insufficient permissions to access this resource",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
+        "GET /internal/indexer/status → 500": {
+            "application/json": {
+                "default": {
+                    "success": False,
+                    "error": {
+                        "code": "INTERNAL_ERROR",
+                        "message": "An unexpected error occurred",
+                        "requestId": "req_abc123",
+                    },
+                },
+            },
+        },
         "POST /internal/webhooks/receive → 200": {
             "application/json": {
                 "default": {
@@ -1807,6 +2185,14 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
         "POST /api/admin/api-keys": {
             "application/json": {},
         },
+        "POST /admin/dlq/{id}/retry": {
+            "application/json": {
+                "default": {
+                    "failed": True,
+                    "error": "signature mismatch",
+                },
+            },
+        },
         "PUT /api/rate-limits/config": {
             "application/json": {
                 "default": {
@@ -1860,6 +2246,9 @@ OPENAPI_FIXTURES: Dict[str, Any] = {
                     ],
                 },
             },
+        },
+        "POST /internal/indexer/events/replay": {
+            "application/json": {},
         },
         "POST /internal/webhooks/receive": {
             "application/json": {},

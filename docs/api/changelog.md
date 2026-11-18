@@ -94,4 +94,4 @@ when the header is omitted; every accepted response echoes the resolved version 
 
 ### Deprecated
 
-- `ALL /api/rate-limits/config` — The active rate-limit configuration endpoint is scheduled for removal on **2026-09-30** (sunset date `2026-09-30T00:00:00.000Z`); use deployment-managed rate-limit configuration and call `GET /api/rate-limits` for caller status. See [the deprecation policy](./deprecation-policy.md) for the consumer guide; responses carry `Deprecation: true`, `Sunset`, and `Link` headers until removal.
+- `ALL /api/rate-limits/config` — The active rate-limit configuration endpoint is scheduled for removal on **2027-03-31** (sunset date `2027-03-31T00:00:00.000Z`); use deployment-managed rate-limit configuration and call `GET /api/rate-limits` for caller status. See [the deprecation policy](./deprecation-policy.md) for the consumer guide; responses carry `Deprecation: true`, `Sunset`, and `Link` headers until removal.
