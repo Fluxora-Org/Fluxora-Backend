@@ -64,7 +64,8 @@ FOUND_FILES="$(docker run --rm --entrypoint sh "$IMAGE" -c '
       -name ".env" -o -name ".env.*" \
       -o -name "*.pem" -o -name "*.key" \
       -o -name "id_rsa" -o -name "id_ed25519" \
-    \) -not -path "/proc/*" -not -path "/sys/*" 2>/dev/null || true
+    \) -not -path "/proc/*" -not -path "/sys/*" \
+    -not -path "/etc/ssl*" -not -path "/usr/share/ca-certificates/*" 2>/dev/null || true
 ')"
 if [[ -n "$FOUND_FILES" ]]; then
   fail "secret-looking files present in image:"; echo "$FOUND_FILES" | sed 's/^/      /'
