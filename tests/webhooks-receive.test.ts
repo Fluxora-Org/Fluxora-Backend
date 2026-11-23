@@ -77,7 +77,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(body);
 
     expect(res.status).toBe(401);
-    expect(res.body.error).toBe('missing_delivery_id');
+    expect(res.body.error.code).toBe('missing_delivery_id');
   });
 
   it('rejects when x-fluxora-timestamp is missing (401)', async () => {
@@ -91,7 +91,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(body);
 
     expect(res.status).toBe(401);
-    expect(res.body.error).toBe('missing_timestamp');
+    expect(res.body.error.code).toBe('missing_timestamp');
   });
 
   it('rejects when x-fluxora-signature is missing (401)', async () => {
@@ -105,7 +105,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(body);
 
     expect(res.status).toBe(401);
-    expect(res.body.error).toBe('missing_signature');
+    expect(res.body.error.code).toBe('missing_signature');
   });
 
   it('rejects a stale timestamp (401)', async () => {
@@ -125,7 +125,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(body);
 
     expect(res.status).toBe(401);
-    expect(res.body.error).toBe('timestamp_outside_tolerance');
+    expect(res.body.error.code).toBe('timestamp_outside_tolerance');
   });
 
   it('rejects a signature mismatch (401)', async () => {
@@ -138,7 +138,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(body);
 
     expect(res.status).toBe(401);
-    expect(res.body.error).toBe('signature_mismatch');
+    expect(res.body.error.code).toBe('signature_mismatch');
   });
 
   it('rejects a duplicate delivery id (409)', async () => {
@@ -159,7 +159,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(body);
 
     expect(res.status).toBe(409);
-    expect(res.body.error).toBe('duplicate_delivery');
+    expect(res.body.error.code).toBe('duplicate_delivery');
   });
 
   it('rejects an oversized payload (413)', async () => {
@@ -200,7 +200,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(deeplyNested);
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe('payload_too_deep');
+    expect(res.body.error.code).toBe('payload_too_deep');
   });
 
   it('rejects invalid encoding (400)', async () => {
@@ -227,7 +227,7 @@ describe('POST /internal/webhooks/receive', () => {
       .send(invalidBody);
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe('invalid_encoding');
+    expect(res.body.error.code).toBe('invalid_encoding');
   });
 
   it('rejects missing or non-json content-type (415)', async () => {
@@ -241,6 +241,6 @@ describe('POST /internal/webhooks/receive', () => {
       .send(body);
 
     expect(res.status).toBe(415);
-    expect(res.body.error).toBe('unsupported_media_type');
+    expect(res.body.error.code).toBe('unsupported_media_type');
   });
 });
