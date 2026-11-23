@@ -77,6 +77,7 @@ export interface Config {
   rpcTimeoutMs: number;
   rpcFallbackCacheTtlSeconds: number;
   rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcFallbackCacheMaxAgeMs: number;
   rpcHealthCheckIntervalMs: number;
   rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
@@ -382,6 +383,7 @@ function toConfig(env: ParsedEnv): Config {
     rpcTimeoutMs: env.RPC_TIMEOUT_MS,
     rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
     rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcFallbackCacheMaxAgeMs: env.RPC_FALLBACK_CACHE_MAX_AGE_MS,
     rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
     rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
