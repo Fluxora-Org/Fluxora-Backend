@@ -66,25 +66,6 @@ vi.mock('../../src/db/pool.js', () => ({
   },
 }));
 
-vi.mock('../../src/config.js', () => ({
-  config: {
-    stellar: {
-      rpcUrl: 'https://soroban-testnet.stellar.org',
-      networkPassphrase: 'Test SDF Network ; September 2015',
-      timeout: 10000,
-      retry: { maxRetries: 3, initialDelayMs: 1000 },
-    },
-    database: {
-      url: process.env.DATABASE_URL || 'postgresql://localhost:5432/indexer_db',
-    },
-    indexer: {
-      replayBatchSize: 1000,
-    },
-    server: {
-      port: 3000,
-    },
-  },
-}));
 
 const mockGetEvents = vi.fn();
 const mockEventStore = {
