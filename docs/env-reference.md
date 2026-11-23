@@ -3,8 +3,7 @@
 # Environment Variable Reference
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
-issue #1519). 162 variables across 11 subsystems.
-issue #1519). 161 variables across 11 subsystems.
+issue #1519). 163 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
 (required, or optional with a runtime fallback).
@@ -89,6 +88,7 @@ issue #1519). 161 variables across 11 subsystems.
 | Variable | Purpose | Default |
 |---|---|---|
 | `CORS_ALLOWED_ORIGINS` | Comma-separated CORS origins; '*' is rejected in production. | — |
+| `EARLY_HINTS_ENABLED` | Kill switch for HTTP 103 Early Hints responses. Set to `false` to disable hints globally. @default true | `true` |
 | `GRAPHQL_INTROSPECTION_ENABLED` | Allow the GraphQL introspection query. @default true | `true` |
 | `GRAPHQL_PERSISTED_QUERY_ALLOWLIST` | Comma-separated SHA-256 allowlist for GraphQL persisted queries. | — |
 | `GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION` | Require APQ hashes to match the allowlist. @default true | `true` |
@@ -140,91 +140,4 @@ issue #1519). 161 variables across 11 subsystems.
 | `GRPC_HEALTH_PORT` | Port the gRPC health service binds to when enabled. Separate from PORT (HTTP). @default 50051 | `50051` |
 | `HEALTH_CHECK_INTERVAL_MS` | Interval between background health-check runs. Must be strictly greater than 0. @default 30000 | `30000` |
 | `HEALTH_CHECK_POSTGRES_TIMEOUT_MS` | Per-checker timeout override for the Postgres health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. @default undefined (uses HEALTH_CHECK_TIMEOUT_MS) | — |
-| `HEALTH_CHECK_REDIS_TIMEOUT_MS` | Per-checker timeout override for the Redis health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. @default undefined (uses HEALTH_CHECK_TIMEOUT_MS) | — |
-| `HEALTH_CHECK_STELLAR_TIMEOUT_MS` | Per-checker timeout override for the Stellar RPC health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. @default undefined (uses HEALTH_CHECK_TIMEOUT_MS) | — |
-| `HEALTH_CHECK_TIMEOUT_MS` | Per-checker timeout for HealthCheckManager. Must be strictly greater than 0. @default 5000 | `5000` |
-| `INDEXER_ENABLED` | Run the chain-indexing loop inside this process. @default false | `false` |
-| `PARTNER_API_TOKEN` | Bearer token partner clients must present when REQUIRE_PARTNER_AUTH is on. | — |
-| `REQUIRE_ADMIN_AUTH` | Require the admin API token on admin endpoints. @default false | `false` |
-| `REQUIRE_PARTNER_AUTH` | Require the partner API token on partner endpoints. @default false | `false` |
-| `SSE_DRAIN_TIMEOUT_MS` | Milliseconds to wait for each SSE connection to drain during shutdown before force-closing. @default 30000 | `30000` |
-| `SSE_HEARTBEAT_INTERVAL_MS` | Interval in milliseconds between SSE heartbeat comments per connection. @default 30000 | `30000` |
-| `SSE_MAX_CONNECTION_DURATION_MS` | Max lifetime of one SSE connection in ms. @default 1800000 (30 min) | `1800000` |
-| `SSE_MAX_CONNECTIONS_PER_API_KEY` | SSE connections allowed per API key. @default 50 | `50` |
-| `SSE_MAX_CONNECTIONS_PER_IP` | SSE connections allowed per client IP. @default 10 | `10` |
-| `SSE_MAX_GLOBAL_CONNECTIONS` | SSE connections allowed process-wide. @default 1000 | `1000` |
-| `SSE_RETRY_AFTER_SECONDS` | Seconds advertised to SSE clients after a 429 via Retry-After. @default 15 | `15` |
-| `SSE_RETRY_MS` | Milliseconds the browser EventSource waits before reconnecting (sent as SSE retry: directive). @default 5000 | `5000` |
-| `WORKER_ENABLED` | Run background queue workers inside this process. @default false | `false` |
-| `WS_ALLOWED_ORIGINS` | Comma-separated allowed origins for WebSocket connections. | — |
-| `WS_AUTH_REQUIRED` | Require Origin allowlist checks on WebSocket upgrades. @default false | `false` |
-| `WS_BATCH_FLUSH_MS` | WebSocket micro-batch flush window in ms; clamped to 5–5000. @default 50 | `50` |
-| `WS_BATCH_MAX_SIZE` | Max events coalesced into one `stream_update_batch` frame; clamped to 1–500. @default 25 | `25` |
-| `WS_MAX_CONNECTIONS_PER_IP` | Max concurrent WebSocket connections per client IP. @default 10 | `10` |
-| `WS_MAX_INBOUND_MESSAGE_BYTES` | Max size of a single inbound WebSocket frame, in bytes. @default 4096 | `4096` |
-| `WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION` | Max bytes queued for a slow WebSocket client. @default 1048576 | `1048576` |
-| `WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION` | Max messages queued for a slow WebSocket client before backpressure. @default 128 | `128` |
-| `WS_MAX_SUBSCRIPTIONS_PER_CONNECTION` | Max subscription filters a single WebSocket connection may hold. @default 32 | `32` |
-| `WS_RECONNECT_LIMIT` | Max WebSocket reconnect attempts per client window. @default 20 | `20` |
-| `WS_RECONNECT_WINDOW_MS` | Sliding window for WS reconnect limiting, in ms. @default 60000 | `60000` |
-
-## Indexer
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `ADMIN_STATE_FILE` | File path used to persist admin state (ban list) across restarts. | — |
-| `DEPLOYMENT_CHECKLIST_VERSION` | Version stamp recorded against the deployment checklist. @default '2026-03-27' | `2026-03-27` |
-| `INDEXER_BACKFILL_BATCH_SIZE` | Number of ledger ranges in a single backfill batch. @default 100 | `100` |
-| `INDEXER_BACKFILL_COMMIT_INTERVAL` | Number of ordered batches completed before the checkpoint advances. @default 1 | `1` |
-| `INDEXER_BACKFILL_CONCURRENCY` | Maximum number of backfill batches processed concurrently. @default 1 | `1` |
-| `INDEXER_BACKFILL_MAX_RETRIES` | Maximum retries for a failed backfill batch. @default 3 | `3` |
-| `INDEXER_BACKFILL_RETRY_DELAY_MS` | Delay between backfill batch retries in ms. @default 1000 | `1000` |
-| `INDEXER_BACKFILL_STRICT_ORDER` | Require backfill checkpoints to advance in ledger order. @default true | `true` |
-| `INDEXER_LAST_SUCCESSFUL_SYNC_AT` | Manually recorded timestamp of the last successful sync, surfaced in status endpoints for operational dashboards. | — |
-| `INDEXER_MTLS_REQUIRED` | When true, reject non-TLS indexer worker connections (fail-closed). Defaults to true in production, false otherwise. | — |
-| `INDEXER_STALL_THRESHOLD_MS` | Flag the indexer as stalled when no ledger progress for this long, in ms. @default 300000 (5 min) | `300000` |
-
-## Rate limiting
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `RATE_LIMIT_ADMIN_MAX` | Max admin requests per window. @default 30 | — |
-| `RATE_LIMIT_ADMIN_WINDOW_MS` | Sliding window for admin-endpoint limits, in ms. @default 60000 | — |
-| `RATE_LIMIT_ALLOWLIST_IPS` | Comma-separated IPs exempt from rate limiting. | — |
-| `RATE_LIMIT_APIKEY_MAX` | Max requests per API key per window. @default 600 | — |
-| `RATE_LIMIT_APIKEY_WINDOW_MS` | Sliding window for per-API-key limits, in ms. @default 60000 | — |
-| `RATE_LIMIT_ENABLED` | Master switch for HTTP rate limiting. @default true | `true` |
-| `RATE_LIMIT_IP_MAX` | Max requests per IP per window. @default 100 | — |
-| `RATE_LIMIT_IP_WINDOW_MS` | Sliding window for per-IP limits, in ms. @default 60000 | — |
-| `RATE_LIMIT_TRUST_PROXY` | Honor X-Forwarded-For from reverse proxies. @default true | `true` |
-| `RATE_LIMIT_TRUSTED_PROXIES` | Comma-separated list of trusted proxies for rate-limit keying. | — |
-| `TRUSTED_PROXIES` | Comma-separated list of trusted proxy IPs/CIDRs (global fallback). | — |
-| `TRUSTED_PROXY_COUNT` | Number of trusted proxies in front of the service (0 = direct). @default 0 | `0` |
-| `WS_TRUSTED_PROXIES` | Comma-separated list of trusted proxies for WebSocket client-IP resolution. | — |
-
-## Infrastructure & Ops
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `AWS_DEFAULT_REGION` | AWS region for S3 backup uploads (SDK fallback variable). | — |
-| `AWS_REGION` | AWS region for S3 backup uploads (explicit). | — |
-| `CANARY_TRAFFIC_PERCENT` | Percentage of traffic (0–100) to route through the canary code path. 0 disables canary tagging entirely (default). Set to e.g. 10 to tag 10 % of clients deterministically as canary based on a SHA-256 hash of their identity (API key or IP). @default 0 | `0` |
-| `DLQ_PURGE_BATCH_SIZE` | Maximum rows to delete per batch in the DLQ retention purge job. Keeps lock duration short on the dead_letter_queue table. Defaults to 500. @default 500 | `500` |
-| `DLQ_RETENTION_DAYS` | Retention period in days for dead_letter_queue entries. Entries in a terminal state (status = 'replayed' or permanently failed) older than this many days are eligible for automatic purge. Defaults to 30 days. Set to 0 to disable the purge job entirely. @default 30 | `30` |
-| `IDEMPOTENCY_TTL_SECONDS` | Retention window for idempotency keys in seconds (max 7 days). @default 86400 | `86400` |
-| `RPC_CB_FAILURE_THRESHOLD` | Failed RPC calls within the window before the circuit opens. @default 5 | `5` |
-| `RPC_CB_RESET_TIMEOUT_MS` | Time before an open RPC circuit half-opens, in ms. @default 60000 | `60000` |
-| `RPC_CB_WINDOW_MS` | Sliding window for RPC failure counting, in ms. @default 30000 | `30000` |
-| `RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA` | Beta parameter for the fallback cache's early-expiry probabilistic refresh. @default 0 | — |
-| `RPC_FALLBACK_CACHE_MAX_AGE_MS` | Maximum age, in ms, that a last-known-good fallback entry may be served at while the RPC circuit is OPEN. Enforced independently of the TTL above so staleness policy is explicit and testable; entries older than this are refused rather than served. @default 300000 | `300000` |
-| `RPC_FALLBACK_CACHE_TTL_SECONDS` | TTL of the RPC fallback cache in seconds. @default 300 | `300` |
-| `RPC_HEALTH_CHECK_FAILURE_THRESHOLD` | Consecutive RPC health-check failures before a target is marked unhealthy. @default 3 | `3` |
-| `RPC_HEALTH_CHECK_INTERVAL_MS` | Interval between proactive RPC health checks in ms; 0 disables. @default 0 | `0` |
-| `RPC_TIMEOUT_MS` | Per-attempt RPC timeout in ms. @default 5000 | `5000` |
-| `S3_BACKUP_BUCKET` | S3 bucket holding database backups. @default unset (backups disabled) | — |
-| `S3_BACKUP_PREFIX` | Key prefix under which backups are written in S3_BACKUP_BUCKET. | — |
-| `STARTUP_PROBE_BUDGET_MS` | Total wall-clock budget for soft-tier startup retries, in ms. @default 30000 | `30000` |
-| `STARTUP_PROBE_POSTGRES_TIMEOUT_MS` | Per-attempt timeout for the Postgres (hard-tier) probe, in ms. @default 5000 | `5000` |
-| `STARTUP_PROBE_REDIS_TIMEOUT_MS` | Per-attempt timeout for each Redis (soft-tier) retry, in ms. @default 3000 | `3000` |
-| `STARTUP_PROBE_STELLAR_TIMEOUT_MS` | Per-attempt timeout for each Stellar RPC (soft-tier) retry, in ms. @default 5000 | `5000` |
-
+| `HEALTH_CHECK_REDIS_TIMEOUT_MS` | Per-checker timeout override for the Redis health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. | — |
