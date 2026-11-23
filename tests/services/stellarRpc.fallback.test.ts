@@ -17,7 +17,7 @@ import {
 import type { RedisClient } from '../../src/redis/client.js';
 import {
   deRegisterRpcMetrics,
-  fluxora_rpc_cache_corrupt_total,
+  rpcCacheCorruptTotal,
   rpcFallbackCacheEarlyRefreshesTotal,
   rpcFallbackCacheHitsTotal,
   rpcFallbackCacheMissesTotal,
@@ -342,7 +342,7 @@ describe('rpcFallbackCache key collisions', () => {
 describe('corrupt cache entries', () => {
   afterEach(() => {
     vi.restoreAllMocks();
-    fluxora_rpc_cache_corrupt_total.reset();
+    rpcCacheCorruptTotal.reset();
   });
 
   it('returns null and deletes key and increments counter for empty string value', async () => {
@@ -364,7 +364,7 @@ describe('corrupt cache entries', () => {
     expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('rpc:cache::v2::op:'));
     expect(cache.corruptEntriesTotal).toBe(1);
 
-    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    const metric = await rpcCacheCorruptTotal.get();
     expect(metric.values[0]?.value).toBe(1);
     expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'syntax_error' });
   });
@@ -388,7 +388,7 @@ describe('corrupt cache entries', () => {
     expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('rpc:cache::v2::op:'));
     expect(cache.corruptEntriesTotal).toBe(1);
 
-    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    const metric = await rpcCacheCorruptTotal.get();
     expect(metric.values[0]?.value).toBe(1);
     expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'syntax_error' });
   });
@@ -412,7 +412,7 @@ describe('corrupt cache entries', () => {
     expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('rpc:cache::v2::op:'));
     expect(cache.corruptEntriesTotal).toBe(1);
 
-    const metric = await fluxora_rpc_cache_corrupt_total.get();
+    const metric = await rpcCacheCorruptTotal.get();
     expect(metric.values[0]?.value).toBe(1);
     expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'wrong_shape' });
   });
