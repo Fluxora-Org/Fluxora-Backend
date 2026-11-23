@@ -172,7 +172,10 @@ describe('requireJsonContentType middleware', () => {
         .set('Content-Type', 'text/plain')
         .send('not json')
         .expect((res) => {
-          expect(res.status).not.toBe(415);
+          // The webhook route applies its own preflight (lowercase error code)
+          // and may reject the body with 415; what matters here is that
+          // requireJsonContentType's uppercase envelope did not fire.
+          expect(res.body.error?.code).not.toBe('UNSUPPORTED_MEDIA_TYPE');
         });
     });
   });

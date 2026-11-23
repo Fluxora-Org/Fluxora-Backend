@@ -1,7 +1,6 @@
 import { ContractEventRecord, IndexerStoreKind } from './types.js';
-const { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } = require('../db/types.js');
+import type { StreamEventReplayFilter, StreamEventReplayResult, StreamEventRecord } from '../db/types.js';
 import { rowReader } from '../db/rowMapping.js';
-import { ensurePartitionCoverage } from '../jobs/partitionMaintenance.js';
 
 export type InsertContractEventsResult = { insertedEventIds: string[]; duplicateEventIds: string[]; };
 

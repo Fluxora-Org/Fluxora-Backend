@@ -16,6 +16,10 @@ function buildApp() {
   return app;
 }
 
+// One app instance for every request in the suite: mounting a fresh app per
+// assertion left sockets to be torn down mid-response ("socket hang up").
+const app = buildApp();
+
 describe('requireAdminAuth middleware', () => {
   const ADMIN_KEY = 'test-admin-secret-key-1234';
   let originalKey: string | undefined;
@@ -38,55 +42,67 @@ describe('requireAdminAuth middleware', () => {
 
   it('returns 503 when ADMIN_API_KEY is not set', async () => {
     delete process.env.ADMIN_API_KEY;
-    const res = await request(buildApp()).get('/protected');
+    const res = await request(app).get('/protected');
     expect(res.status).toBe(503);
-    expect(res.body.error).toMatch(/not configured/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('CONFIGURATION_ERROR');
+    expect(res.body.error.message).toMatch(/not configured/i);
   });
 
   it('returns 401 when Authorization header is missing', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
-    const res = await request(buildApp()).get('/protected');
+    const res = await request(app).get('/protected');
     expect(res.status).toBe(401);
-    expect(res.body.error).toMatch(/Missing Authorization/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(res.body.error.message).toMatch(/Missing Authorization/i);
   });
 
   it('returns 401 when Authorization header is not Bearer scheme', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
-    const res = await request(buildApp())
+    const res = await request(app)
       .get('/protected')
       .set('Authorization', `Basic ${ADMIN_KEY}`);
     expect(res.status).toBe(401);
-    expect(res.body.error).toMatch(/Bearer scheme/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(res.body.error.message).toMatch(/Bearer scheme/i);
   });
 
   it('returns 401 when Authorization header has too many parts', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
-    const res = await request(buildApp())
+    const res = await request(app)
       .get('/protected')
       .set('Authorization', 'Bearer token extra');
     expect(res.status).toBe(401);
-    expect(res.body.error).toMatch(/Bearer scheme/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(res.body.error.message).toMatch(/Bearer scheme/i);
   });
 
   it('returns 403 when token is wrong', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
-    const res = await request(buildApp())
+    const res = await request(app)
       .get('/protected')
       .set('Authorization', 'Bearer wrong-key');
     expect(res.status).toBe(403);
-    expect(res.body.error).toMatch(/Invalid admin credentials/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+    expect(res.body.error.message).toMatch(/Invalid admin credentials/i);
   });
 
   it('returns 403 when token has wrong length', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
-    const res = await request(buildApp()).get('/protected').set('Authorization', 'Bearer short');
+    const res = await request(app).get('/protected').set('Authorization', 'Bearer short');
     expect(res.status).toBe(403);
-    expect(res.body.error).toMatch(/Invalid admin credentials/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+    expect(res.body.error.message).toMatch(/Invalid admin credentials/i);
   });
 
   it('passes through when token matches ADMIN_API_KEY', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
-    const res = await request(buildApp())
+    const res = await request(app)
       .get('/protected')
       .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(200);
@@ -99,7 +115,7 @@ describe('requireAdminAuth middleware', () => {
       process.env.ADMIN_API_KEY = ADMIN_KEY;
       const token = generateToken({ address: 'GADMIN', role, permissions: [] });
 
-      const res = await request(buildApp())
+      const res = await request(app)
         .get('/protected')
         .set('Authorization', `Bearer ${token}`);
 
@@ -114,12 +130,14 @@ describe('requireAdminAuth middleware', () => {
       process.env.ADMIN_API_KEY = ADMIN_KEY;
       const token = generateToken({ address: 'GNONADMIN', role });
 
-      const res = await request(buildApp())
+      const res = await request(app)
         .get('/protected')
         .set('Authorization', `Bearer ${token}`);
 
       expect(res.status).toBe(403);
-      expect(res.body).toEqual({ error: 'Invalid admin credentials.' });
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe('FORBIDDEN');
+      expect(res.body.error.message).toMatch(/Invalid admin credentials/i);
     }
   );
 
@@ -127,12 +145,14 @@ describe('requireAdminAuth middleware', () => {
     delete process.env.ADMIN_API_KEY;
     const token = generateToken({ address: 'GADMIN', role: 'admin' });
 
-    const res = await request(buildApp()).get('/protected').set('Authorization', `Bearer ${token}`);
+    const res = await request(app).get('/protected').set('Authorization', `Bearer ${token}`);
 
     expect(res.status).toBe(503);
-    expect(res.body).toEqual({
-      error: 'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.',
-    });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('CONFIGURATION_ERROR');
+    expect(res.body.error.message).toBe(
+      'Admin API is not configured. Set ADMIN_API_KEY to enable admin access.'
+    );
   });
 
   it.each([
@@ -141,39 +161,47 @@ describe('requireAdminAuth middleware', () => {
   ])('returns 401 for %s instead of normalizing the header', async (_case, header) => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
 
-    const res = await request(buildApp()).get('/protected').set('Authorization', header);
+    const res = await request(app).get('/protected').set('Authorization', header);
 
     expect(res.status).toBe(401);
-    expect(res.body).toEqual({ error: 'Authorization header must use Bearer scheme.' });
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(res.body.error.message).toBe('Authorization header must use Bearer scheme.');
   });
 
   it('returns 401 when Authorization header exceeds maximum length', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
     const oversized = 'Bearer ' + 'A'.repeat(8186);
-    const res = await request(buildApp()).get('/protected').set('Authorization', oversized);
+    const res = await request(app).get('/protected').set('Authorization', oversized);
     expect(res.status).toBe(401);
-    expect(res.body.error).toMatch(/too large/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(res.body.error.message).toMatch(/too large/i);
   });
 
   it('processes Authorization header at exactly maximum length through normal auth flow', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
     const exact = 'Bearer ' + 'A'.repeat(8185);
     expect(exact.length).toBe(8192);
-    const res = await request(buildApp()).get('/protected').set('Authorization', exact);
+    const res = await request(app).get('/protected').set('Authorization', exact);
     // Header passed the length check and entered normal auth (token won't match)
     expect(res.status).toBe(403);
-    expect(res.body.error).toMatch(/Invalid admin credentials/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+    expect(res.body.error.message).toMatch(/Invalid admin credentials/i);
   });
 
   it('rejects oversized headers before token parsing and timing-safe comparison', async () => {
     process.env.ADMIN_API_KEY = ADMIN_KEY;
     const oversized = 'Bearer ' + ADMIN_KEY + 'A'.repeat(8200);
     expect(oversized.length).toBeGreaterThan(8192);
-    const res = await request(buildApp()).get('/protected').set('Authorization', oversized);
+    const res = await request(app).get('/protected').set('Authorization', oversized);
     // Returns oversized error (401) rather than credential error (403),
     // proving split/timingSafeEqual were never reached.
     expect(res.status).toBe(401);
-    expect(res.body.error).toMatch(/too large/i);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(res.body.error.message).toMatch(/too large/i);
   });
 
   // ── API key lookup histogram (issue #361) ──
@@ -204,7 +232,7 @@ describe('requireAdminAuth middleware', () => {
 
     it('records outcome=success for a correct admin token (count series labels limited to outcome)', async () => {
       process.env.ADMIN_API_KEY = ADMIN_KEY;
-      await request(buildApp())
+      await request(app)
         .get('/protected')
         .set('Authorization', `Bearer ${ADMIN_KEY}`)
         .expect(200);
@@ -220,7 +248,7 @@ describe('requireAdminAuth middleware', () => {
       process.env.ADMIN_API_KEY = ADMIN_KEY;
       const token = generateToken({ address: 'GADMIN', role: 'admin' });
 
-      await request(buildApp())
+      await request(app)
         .get('/protected')
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
@@ -234,7 +262,7 @@ describe('requireAdminAuth middleware', () => {
 
     it('records outcome=failure for an incorrect admin token', async () => {
       process.env.ADMIN_API_KEY = ADMIN_KEY;
-      await request(buildApp())
+      await request(app)
         .get('/protected')
         .set('Authorization', 'Bearer wrong-key')
         .expect(403);
@@ -247,7 +275,7 @@ describe('requireAdminAuth middleware', () => {
 
     it('records outcome=failure when ADMIN_API_KEY is not configured (still observable, no credential leak)', async () => {
       delete process.env.ADMIN_API_KEY;
-      await request(buildApp())
+      await request(app)
         .get('/protected')
         .set('Authorization', `Bearer ${ADMIN_KEY}`)
         .expect(503);
