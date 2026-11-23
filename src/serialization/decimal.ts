@@ -37,8 +37,15 @@ export const MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 /**
  * Maximum allowed integer part of a decimal amount (int64 max).
  * Values whose integer part exceeds this are rejected with OUT_OF_RANGE.
+ * Negative values may reach the int64 minimum magnitude (2^63), which is
+ * one greater than MAX_DECIMAL_INTEGER_PART.
  */
 export const MAX_DECIMAL_INTEGER_PART = 9_223_372_036_854_775_807n;
+
+/**
+ * Largest magnitude allowed for a negative integer part (|int64 min| = 2^63).
+ */
+export const MAX_NEGATIVE_DECIMAL_INTEGER_PART = 9_223_372_036_854_775_808n;
 
 /**
  * Normalize a validated decimal string by stripping trailing fractional zeros.
@@ -57,16 +64,16 @@ export const MAX_DECIMAL_INTEGER_PART = 9_223_372_036_854_775_807n;
  */
 export function normalizeDecimalString(value: string): string {
   const dotIndex = value.indexOf('.');
-  if (dotIndex === -1) return value;
+  if (dotIndex === -1) return normalizeZero(value);
 
   // Strip trailing zeros from the fractional part
   let end = value.length;
   while (end > dotIndex + 1 && value[end - 1] === '0') end--;
 
   // If only the dot remains, drop it too
-  if (end === dotIndex + 1) return value.slice(0, dotIndex);
+  if (end === dotIndex + 1) return normalizeZero(value.slice(0, dotIndex));
 
-  return value.slice(0, end);
+  return normalizeZero(value.slice(0, end));
 }
 
 /**
