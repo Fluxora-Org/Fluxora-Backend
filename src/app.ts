@@ -590,14 +590,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use('/api/rate-limits', protectRouter(createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) })));
 
   // Experimental GraphQL federation gateway — feature-flagged off by default.
-  app.use('/api/graphql', graphqlGatewayRouter);
-
-  // --- Temporary mis-registration (for validation) ---
-  // Intentionally register a protected router without `protectRouter` so
-  // the structural auth registration test fails until the mount is fixed.
-  // Remove this before landing the change; kept here so CI will fail when
-  // a route is added without a decision.
-  app.use('/internal/unwrapped', indexerRouter);
+  app.use('/api/graphql', protectRouter(graphqlGatewayRouter));
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(
