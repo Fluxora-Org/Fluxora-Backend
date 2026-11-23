@@ -39,6 +39,18 @@ export const SECRET_PATTERNS: readonly SecretPattern[] = [
     replacement: REDACTED_SECRET,
   },
   {
+    id: 'bearer_token',
+    kind: 'api_key',
+    pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi,
+    replacement: 'Bearer [REDACTED]',
+  },
+  {
+    id: 'jwt_token',
+    kind: 'api_key',
+    pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+    replacement: REDACTED_SECRET,
+  },
+  {
     id: 'api_key_assignment',
     kind: 'api_key',
     pattern: /\b(?:api[_-]?key|x-api-key)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}['"]?/gi,
