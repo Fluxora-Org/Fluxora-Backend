@@ -20,6 +20,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  type PoolStateSnapshot,
   dbPoolActive,
   dbPoolIdle,
   dbPoolWaiting,
@@ -34,7 +35,7 @@ import { logger } from '../../src/lib/logger.js';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-function makePoolState(totalCount: number, idleCount: number, waitingCount: number) {
+function makePoolState(totalCount: number, idleCount: number, waitingCount: number): PoolStateSnapshot {
   return { totalCount, idleCount, waitingCount };
 }
 
@@ -54,6 +55,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   deRegisterPoolMetrics();
   dbPoolNegativeActive.reset();
   dbPoolSaturationRatio.reset();

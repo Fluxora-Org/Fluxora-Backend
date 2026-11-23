@@ -147,7 +147,7 @@ export function syncPoolGauges(pool: PoolStateSnapshot, poolName: string): void 
 
   if (rawActive < 0) {
     dbPoolNegativeActive.inc({ pool: poolName });
-    logger.warn('pg.Pool accounting inconsistency: totalCount < idleCount', undefined, {
+    logger.warn('pg.Pool accounting inconsistency: totalCount < idleCount', {
       pool: poolName,
       totalCount: pool.totalCount,
       idleCount: pool.idleCount,
