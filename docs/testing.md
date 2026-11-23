@@ -143,6 +143,32 @@ for test mode:
 No test file connects to a real database, Redis, or RPC endpoint unless it
 explicitly sets up those services.
 
+## Test Type-Check (Ratcheted)
+
+The test suite has its own TypeScript configuration, `tsconfig.test.json`, which
+extends the base `tsconfig.json` and includes `tests/**/*`. This gives
+contributors a separate type-check for tests that is independent of the
+production-source gate (`tsconfig.json`).
+
+Run it with:
+
+```bash
+pnpm run typecheck:tests
+```
+
+The command runs `tsc --noEmit -p tsconfig.test.json`, counts the resulting
+`error TS` diagnostics, and compares the count against the committed baseline
+in `scripts/test-types-baseline.json` (managed by
+`scripts/check-test-types-baseline.mjs`). The check fails only when the error
+count *increases*, so existing debt is frozen while improvements are always
+allowed. The baseline can only go down; raising it requires maintainer approval.
+
+To refresh the baseline after fixing type errors, run:
+
+```bash
+node scripts/check-test-types-baseline.mjs --update-baseline
+```
+
 ## CI Pipeline
 
 The CI workflow (`.github/workflows/ci.yml`) has a blocking TypeScript gate that
