@@ -32,8 +32,7 @@ describe('resolveRoute', () => {
   });
 
   it('collapses only a single trailing slash, keeping internal empty segments', () => {
-    // A matched route is required for the label to be derived at all: an
-    // unmatched request is labelled UNMATCHED_ROUTE (see above).
+    // Matched route templates are normalized too, preserving their shape.
     const req = {
       baseUrl: '',
       route: { path: '/multiple///' } as any,
