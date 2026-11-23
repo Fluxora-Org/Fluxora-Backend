@@ -113,7 +113,10 @@ describe('verifyWsToken', () => {
     const req = { headers: { authorization: `Bearer ${validToken}` }, url: '/ws' } as IncomingMessage;
     const result = verifyWsToken(req, SECRET);
 
-    expect(result).toEqual({ ok: true, payload: { sub: 'user123', role: 'operator' } });
+    expect(result).toEqual({
+      ok: true,
+      payload: { sub: 'user123', role: 'operator', iat: expect.any(Number) },
+    });
     expect(logger.warn).not.toHaveBeenCalled();
     expect(wsAuthFailureTotal.inc).not.toHaveBeenCalled();
   });
@@ -123,7 +126,10 @@ describe('verifyWsToken', () => {
     const req = { headers: {}, url: '/ws?token=' + validToken } as IncomingMessage;
     const result = verifyWsToken(req, SECRET);
 
-    expect(result).toEqual({ ok: true, payload: { sub: 'user123', role: 'operator' } });
+    expect(result).toEqual({
+      ok: true,
+      payload: { sub: 'user123', role: 'operator', iat: expect.any(Number) },
+    });
   });
 
   it('prefers Authorization header over query string', () => {
@@ -135,7 +141,10 @@ describe('verifyWsToken', () => {
     } as IncomingMessage;
     const result = verifyWsToken(req, SECRET);
 
-    expect(result).toEqual({ ok: true, payload: { sub: 'header-user', role: 'admin' } });
+    expect(result).toEqual({
+      ok: true,
+      payload: { sub: 'header-user', role: 'admin', iat: expect.any(Number) },
+    });
   });
 
   it('returns INVALID_TOKEN when JWT verification fails', () => {
