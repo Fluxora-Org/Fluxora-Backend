@@ -14,7 +14,7 @@
  */
 import crypto from 'crypto';
 import type { StreamFilter, StreamRecord } from '../types.js';
-const { streamRepository } = require('./streamRepository.js') as typeof import('./streamRepository.js');
+import { streamRepository } from './streamRepository.js';
 import type { UpsertResult } from './streamRepository.js';
 
 /** Validated, normalised POST /api/streams body. Field order is significant: see createStreamFromApi. */
