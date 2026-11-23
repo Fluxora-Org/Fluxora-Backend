@@ -12,9 +12,10 @@ import { getRuntimeEnv } from '../config/runtime-env.js';
 import * as fs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { NoOpRedisClient, type RedisClient } from '../redis/client.js';
-import { RedisDistributedLock, NoOpLock, Lock, AdminStateLockError, REINDEX_LOCK_NAMESPACE } from './adminStateLock.js';
+import { RedisDistributedLock, Lock, AdminStateLockError, REINDEX_LOCK_NAMESPACE } from './adminStateLock.js';
 import { logger } from '../lib/logger.js';
 import { adminReindexJobDurationSeconds } from '../metrics/businessMetrics.js';
+import { requestStopReplay } from '../indexer/replayRuntimeState.js';
 
 export interface PauseFlags {
   /** Block new stream creation via the public API. */
@@ -23,14 +24,44 @@ export interface PauseFlags {
   ingestion: boolean;
 }
 
-export type ReindexStatus = 'idle' | 'running' | 'completed' | 'failed';
+export type ReindexStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+/** What a reindex replays: one contract's events on one ledger, optionally bounded by block. */
+export interface ReindexTarget {
+  contract_id: string;
+  ledger: number;
+  from_block?: number;
+  to_block?: number;
+}
 
 export interface ReindexState {
   status: ReindexStatus;
   startedAt: string | null;
   completedAt: string | null;
   error: string | null;
+  /** Source rows committed so far, taken from replay batch results. */
   processedItems: number;
+  /** Source rows the replay will process; null until the replay has counted them. */
+  totalItems: number | null;
+  /** The range being (or last) replayed; null before the first reindex. */
+  target: ReindexTarget | null;
+}
+
+/**
+ * The replay machinery a reindex drives. Production uses
+ * {@link indexerReplayRunner}; tests inject a fake via `_setReindexRunnerForTest`.
+ */
+export interface ReindexRunner {
+  /**
+   * Replay `target`, calling `onProgress` with cumulative counts. Resolves
+   * with how the replay ended; rejects if it failed.
+   */
+  run(
+    target: ReindexTarget,
+    onProgress: (update: { processedRows: number; totalRows: number }) => void,
+  ): Promise<{ outcome: 'completed' | 'cancelled'; processedRows: number; totalRows: number }>;
+  /** Ask the running replay to stop at its next safe batch boundary. */
+  cancel(): void;
 }
 
 interface AdminState {
@@ -50,14 +81,20 @@ const state: AdminState = {
     streamCreation: false,
     ingestion: false,
   },
-  reindex: {
+  reindex: idleReindexState(),
+};
+
+function idleReindexState(): ReindexState {
+  return {
     status: 'idle',
     startedAt: null,
     completedAt: null,
     error: null,
     processedItems: 0,
-  },
-};
+    totalItems: null,
+    target: null,
+  };
+}
 
 let pauseFlagsLock: Lock | null = null;
 let reindexLock: Lock | null = null;
@@ -217,7 +254,11 @@ export function isStreamCreationPaused(): boolean {
 }
 
 export function getReindexState(): ReindexState {
-  return { ...state.reindex };
+  return cloneReindexState(state.reindex);
+}
+
+function cloneReindexState(r: ReindexState): ReindexState {
+  return { ...r, target: r.target ? { ...r.target } : null };
 }
 
 export function getReindexLock(): Lock | null {
@@ -225,121 +266,171 @@ export function getReindexLock(): Lock | null {
 }
 
 /**
- * Kick off a simulated reindex. In production this would trigger a
- * Horizon replay or database rebuild from chain events.
+ * Default runner: the indexer's DB-backed replay (`IndexerService.replayEvents`,
+ * which drives `ReplayBatchRunner` one committed batch at a time). Loaded
+ * lazily so importing admin state never pulls in the database layer.
+ */
+export const indexerReplayRunner: ReindexRunner = {
+  async run(target, onProgress) {
+    const { indexerService } = await import('../indexer/service.js');
+    return indexerService.replayEvents(target, { onProgress });
+  },
+  cancel() {
+    requestStopReplay();
+  },
+};
+
+let reindexRunner: ReindexRunner = indexerReplayRunner;
+
+/**
+ * Start a reindex of `target` by replaying its events through the indexer.
  *
- * Acquires a distributed lock (Redis-backed) for the entire duration of the
- * reindex job to prevent overlapping reindex jobs across independent process
- * instances sharing the same Redis.  If the lock cannot be acquired, the
- * caller receives the current state so the route layer can return 409.
+ * Progress (`processedItems` / `totalItems`) is updated from each committed
+ * replay batch. The job ends as `completed` when the replay reaches the end of
+ * its rows, `cancelled` after {@link cancelReindex}, or `failed` with the
+ * replay's error message.
+ *
+ * When a distributed lock is configured it is held for the whole job, so
+ * independent processes sharing Redis never run overlapping reindexes. If the
+ * lock cannot be acquired, or a reindex is already running here, the caller
+ * gets the current state back unchanged and the route layer answers 409.
  *
  * @security The lock key includes a PID + timestamp for auditability.
  *           Lock expiry (TTL) prevents deadlocks if the process crashes
  *           while holding the lock.
  */
-export async function triggerReindex(): Promise<ReindexState> {
-  // Fast path: if already running (same process), short-circuit.
+export async function triggerReindex(target: ReindexTarget): Promise<ReindexState> {
+  // Fast path: already running in this process.
   if (state.reindex.status === 'running') {
-    return { ...state.reindex };
+    return getReindexState();
   }
 
-  // If a distributed lock is available, serialize across processes.
+  let lock: Lock | null = null;
   if (reindexLock) {
-    let lock: Lock | null = null;
     try {
       lock = await reindexLock.acquire();
     } catch {
-      // Lock acquisition failed — another instance holds it or Redis is down.
-      // Return current state so the route layer can return 409.
-      return { ...state.reindex };
+      // Another process holds the reindex lock.
+      return getReindexState();
     }
 
-    // Re-check after acquiring lock (double-checked locking pattern).
-    // Cast to widen: `state.reindex` may have been reassigned by a concurrent
-    // caller during the `await` above, but TS's narrowing from the early
-    // return doesn't account for mutation across an await boundary.
+    // Re-check after the (async) acquire: another caller in this process may
+    // have started a job while we waited.
     if ((state.reindex.status as ReindexStatus) === 'running') {
       await lock.release();
-      return { ...state.reindex };
+      return getReindexState();
     }
-
-    state.reindex = {
-      status: 'running',
-      startedAt: new Date().toISOString(),
-      completedAt: null,
-      error: null,
-      processedItems: 0,
-    };
-
-    const result = { ...state.reindex };
-
-    // Fire-and-forget: the job runs in the background.  The lock is held
-    // for the entire job duration so no other process can start a reindex.
-    runReindexJob()
-      .catch(() => { /* errors are captured in state */ })
-      .finally(() => { lock!.release().catch(() => {}); });
-
-    return result;
   }
 
-  // Fallback: no distributed lock configured (file-lock or single-process).
   state.reindex = {
     status: 'running',
     startedAt: new Date().toISOString(),
     completedAt: null,
     error: null,
     processedItems: 0,
+    totalItems: null,
+    target: { ...target },
   };
+  const started = getReindexState();
+  const job = state.reindex;
 
-  runReindexJob().catch(() => { /* errors are captured in state */ });
+  runReindexJob(job, reindexRunner)
+    .catch(() => {
+      /* errors are captured in state */
+    })
+    .finally(() => {
+      lock?.release().catch(() => {});
+    });
 
-  return { ...state.reindex };
+  return started;
 }
 
 /**
- * Kick off a simulated reindex for a specific stream.
- * In production this would trigger a stream-specific Horizon replay.
+ * Reindex the events behind one stream: the stream's contract on `range.ledger`,
+ * optionally bounded by block. Throws if the stream does not exist or a reindex
+ * is already running, so bulk callers report the item as failed rather than
+ * claiming work that was never started.
  */
-export async function triggerStreamReindex(streamId: string): Promise<ReindexState> {
-  logger.info('Triggering stream-specific reindex', undefined, { streamId });
-  return triggerReindex();
+export async function triggerStreamReindex(
+  streamId: string,
+  range: Omit<ReindexTarget, 'contract_id'>,
+): Promise<ReindexState> {
+  const { streamRepository } = await import('../db/repositories/streamRepository.js');
+  const stream = await streamRepository.getById(streamId);
+  if (!stream) {
+    throw new Error(`Stream ${streamId} not found`);
+  }
+
+  if (state.reindex.status === 'running') {
+    throw new Error('A reindex operation is already in progress.');
+  }
+
+  logger.info('Triggering stream-specific reindex', undefined, {
+    streamId,
+    contractId: stream.contract_id,
+    ledger: range.ledger,
+  });
+  const result = await triggerReindex({ ...range, contract_id: stream.contract_id });
+  if (result.status !== 'running' || result.target?.contract_id !== stream.contract_id) {
+    throw new Error('A reindex operation is already in progress.');
+  }
+  return result;
 }
 
-async function runReindexJob(): Promise<void> {
+/**
+ * Ask the running reindex to stop. The replay finishes its in-flight batch
+ * boundary, keeps every committed batch, and the job ends as `cancelled`.
+ * Returns the current state; a no-op when nothing is running.
+ */
+export function cancelReindex(): ReindexState {
+  if (state.reindex.status === 'running') {
+    logger.info('Cancelling reindex', undefined, { target: state.reindex.target });
+    reindexRunner.cancel();
+  }
+  return getReindexState();
+}
+
+async function runReindexJob(job: ReindexState, runner: ReindexRunner): Promise<void> {
   const endTimer = adminReindexJobDurationSeconds.startTimer();
+  // `job` is the state object for this run; a test reset swaps in a new one,
+  // so a late-finishing job never overwrites a newer state.
+  const isCurrent = () => state.reindex === job;
   try {
-    // Simulate incremental reindex work (placeholder for Horizon replay).
-    const steps = 5;
-    for (let i = 1; i <= steps; i++) {
-      await sleep(50);
-      state.reindex.processedItems = i;
-    }
-    state.reindex.status = 'completed';
-    state.reindex.completedAt = new Date().toISOString();
-    endTimer({ outcome: 'success' });
+    if (!job.target) throw new Error('Reindex target is missing');
+    const result = await runner.run(job.target, ({ processedRows, totalRows }) => {
+      if (!isCurrent()) return;
+      job.processedItems = processedRows;
+      job.totalItems = totalRows;
+    });
+    if (!isCurrent()) return;
+    job.processedItems = result.processedRows;
+    job.totalItems = result.totalRows;
+    job.status = result.outcome === 'cancelled' ? 'cancelled' : 'completed';
+    job.completedAt = new Date().toISOString();
+    endTimer({ outcome: result.outcome === 'cancelled' ? 'cancelled' : 'success' });
   } catch (err) {
-    state.reindex.status = 'failed';
-    state.reindex.completedAt = new Date().toISOString();
-    state.reindex.error = err instanceof Error ? err.message : String(err);
     endTimer({ outcome: 'failure' });
+    if (!isCurrent()) return;
+    job.status = 'failed';
+    job.completedAt = new Date().toISOString();
+    job.error = err instanceof Error ? err.message : String(err);
+    logger.warn('Reindex failed', undefined, { target: job.target, error: job.error });
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Replace the replay runner used by `triggerReindex()`.
+ * @security Only for testing; never called in production code paths.
+ */
+export function _setReindexRunnerForTest(runner: ReindexRunner | null): void {
+  reindexRunner = runner ?? indexerReplayRunner;
 }
 
 /** Reset state — only exposed for tests. */
 export function _resetForTest(options: { clearPersistence?: boolean; clearLock?: boolean } = {}): void {
   state.pauseFlags.streamCreation = false;
   state.pauseFlags.ingestion = false;
-  state.reindex = {
-    status: 'idle',
-    startedAt: null,
-    completedAt: null,
-    error: null,
-    processedItems: 0,
-  };
+  state.reindex = idleReindexState();
 
   if (options.clearLock !== false) {
     pauseFlagsLock = null;

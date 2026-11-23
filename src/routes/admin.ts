@@ -8,6 +8,7 @@ import {
   getReindexState,
   triggerReindex,
   triggerStreamReindex,
+  cancelReindex,
   AdminStatePersistenceError,
 } from '../state/adminState.js';
 import { z } from 'zod';
@@ -183,12 +184,42 @@ adminRouter.get('/reindex', (req, res) => {
   res.json(successResponse(getReindexState(), requestId));
 });
 
+const reindexTargetSchema = z
+  .object({
+    contract_id: z.string().min(1, 'contract_id is required'),
+    ledger: z.number().int().nonnegative(),
+    from_block: z.number().int().nonnegative().optional(),
+    to_block: z.number().int().nonnegative().optional(),
+  })
+  .strict()
+  .refine((t) => t.from_block === undefined || t.to_block === undefined || t.from_block <= t.to_block, {
+    message: 'from_block must be less than or equal to to_block',
+    path: ['from_block'],
+  });
+
 /**
  * POST /api/admin/reindex
- * Triggers a reindex operation. Returns 409 if one is already running.
+ * Replays `{ contract_id, ledger, from_block?, to_block? }` through the indexer.
+ * Answers 202 with the running job, 400 for a missing or invalid range, and
+ * 409 if a reindex is already running. Poll GET /api/admin/reindex for progress.
  */
 adminRouter.post('/reindex', async (req, res) => {
   const requestId = req.correlationId;
+  const parsed = reindexTargetSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res
+      .status(400)
+      .json(
+        errorResponse(
+          'VALIDATION_ERROR',
+          'Request validation failed',
+          formatZodIssues(parsed.error.issues),
+          requestId
+        )
+      );
+    return;
+  }
+
   const current = getReindexState();
   if (current.status === 'running') {
     res
@@ -204,11 +235,26 @@ adminRouter.post('/reindex', async (req, res) => {
     return;
   }
 
-  const state = await triggerReindex();
+  const state = await triggerReindex(parsed.data);
+  if (state.status !== 'running' || state.startedAt === current.startedAt) {
+    // Lost the race to another caller, or another process holds the lock.
+    res
+      .status(409)
+      .json(
+        errorResponse(
+          'CONFLICT',
+          'A reindex operation is already in progress.',
+          { reindex: state },
+          requestId
+        )
+      );
+    return;
+  }
 
   recordAuditEvent('REINDEX_TRIGGERED', 'reindex', 'system', requestId, {
     status: state.status,
     startedAt: state.startedAt,
+    ...parsed.data,
   });
 
   res.status(202).json(
@@ -220,6 +266,28 @@ adminRouter.post('/reindex', async (req, res) => {
       requestId
     )
   );
+});
+
+/**
+ * DELETE /api/admin/reindex
+ * Cancels the running reindex. The replay stops at its next batch boundary,
+ * keeps committed batches, and the job ends as `cancelled`. 409 if none runs.
+ */
+adminRouter.delete('/reindex', (req, res) => {
+  const requestId = req.correlationId;
+  if (getReindexState().status !== 'running') {
+    res
+      .status(409)
+      .json(errorResponse('CONFLICT', 'No reindex operation is running.', undefined, requestId));
+    return;
+  }
+
+  const state = cancelReindex();
+  recordAuditEvent('REINDEX_CANCEL_REQUESTED', 'reindex', 'system', requestId, {
+    startedAt: state.startedAt,
+    processedItems: state.processedItems,
+  });
+  res.status(202).json(successResponse({ message: 'Reindex cancellation requested.', reindex: state }, requestId));
 });
 
 /**
@@ -292,7 +360,7 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
       closeCode: 4000,
       closeReason: 'admin-forced-disconnect',
     });
-  } catch (err) {
+  } catch {
     res
       .status(503)
       .json(
@@ -320,10 +388,19 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
 
 // ─── Bulk Operations ──────────────────────────────────────────────────────────
 
-const bulkActionItemSchema = z.object({
-  streamId: z.string().min(1, 'streamId cannot be empty'),
-  action: z.enum(['pause', 'cancel', 'reindex']),
-});
+const bulkActionItemSchema = z
+  .object({
+    streamId: z.string().min(1, 'streamId cannot be empty'),
+    action: z.enum(['pause', 'cancel', 'reindex']),
+    /** Required for `reindex`: the ledger to replay the stream's contract on. */
+    ledger: z.number().int().nonnegative().optional(),
+    from_block: z.number().int().nonnegative().optional(),
+    to_block: z.number().int().nonnegative().optional(),
+  })
+  .refine((item) => item.action !== 'reindex' || item.ledger !== undefined, {
+    message: 'ledger is required for the reindex action',
+    path: ['ledger'],
+  });
 
 const bulkActionSchema = z.object({
   batch: z
@@ -376,7 +453,11 @@ adminRouter.post('/streams/bulk-actions', async (req, res) => {
           req.correlationId
         );
       } else if (item.action === 'reindex') {
-        await triggerStreamReindex(item.streamId);
+        await triggerStreamReindex(item.streamId, {
+          ledger: item.ledger as number,
+          ...(item.from_block !== undefined ? { from_block: item.from_block } : {}),
+          ...(item.to_block !== undefined ? { to_block: item.to_block } : {}),
+        });
       }
 
       results.push({ streamId: item.streamId, action: item.action, status: 'success' });
