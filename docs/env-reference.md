@@ -3,7 +3,7 @@
 # Environment Variable Reference
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
-issue #1519). 162 variables across 11 subsystems.
+issue #1519). 161 variables across 11 subsystems.
 issue #1519). 161 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
@@ -211,6 +211,7 @@ issue #1519). 161 variables across 11 subsystems.
 | `CANARY_TRAFFIC_PERCENT` | Percentage of traffic (0–100) to route through the canary code path. 0 disables canary tagging entirely (default). Set to e.g. 10 to tag 10 % of clients deterministically as canary based on a SHA-256 hash of their identity (API key or IP). @default 0 | `0` |
 | `DLQ_PURGE_BATCH_SIZE` | Maximum rows to delete per batch in the DLQ retention purge job. Keeps lock duration short on the dead_letter_queue table. Defaults to 500. @default 500 | `500` |
 | `DLQ_RETENTION_DAYS` | Retention period in days for dead_letter_queue entries. Entries in a terminal state (status = 'replayed' or permanently failed) older than this many days are eligible for automatic purge. Defaults to 30 days. Set to 0 to disable the purge job entirely. @default 30 | `30` |
+| `DEDUP_WINDOW_SECONDS` | Retention window for stream-event dedup keys in seconds (integer, 1–604800 i.e. max 7 days). @default 86400 | `86400` |
 | `IDEMPOTENCY_TTL_SECONDS` | Retention window for idempotency keys in seconds (max 7 days). @default 86400 | `86400` |
 | `RPC_CB_FAILURE_THRESHOLD` | Failed RPC calls within the window before the circuit opens. @default 5 | `5` |
 | `RPC_CB_RESET_TIMEOUT_MS` | Time before an open RPC circuit half-opens, in ms. @default 60000 | `60000` |
