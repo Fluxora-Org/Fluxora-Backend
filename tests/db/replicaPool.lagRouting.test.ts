@@ -7,11 +7,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Hoist mock factories before imports.
-const { mockPrimaryQuery, mockReplicaQuery, mockLag } = vi.hoisted(() => {
+const { mockPrimaryQuery, mockReplicaQuery } = vi.hoisted(() => {
   const mockPrimaryQuery = vi.fn().mockResolvedValue({ rows: [] });
   const mockReplicaQuery = vi.fn().mockResolvedValue({ rows: [] });
-  const mockLag = vi.fn<[], Promise<number | null>>();
-  return { mockPrimaryQuery, mockReplicaQuery, mockLag };
+  return { mockPrimaryQuery, mockReplicaQuery };
 });
 
 vi.mock('../../src/db/pool.js', () => ({
@@ -37,24 +36,21 @@ vi.mock('../../src/metrics/dbMetrics.js', () => ({
   dbReplicationLagSeconds: { set: vi.fn() },
 }));
 
+import { logger } from '../../src/lib/logger.js';
 import {
   getReadPool,
   resetReplicaPool,
   setReplicaPool,
-  checkReplicationLag,
 } from '../../src/db/replicaPool.js';
-
-// We spy on checkReplicationLag to simulate different lag values.
-vi.mock('../../src/db/replicaPool.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/db/replicaPool.js')>();
-  return {
-    ...actual,
-    checkReplicationLag: mockLag,
-  };
-});
 
 describe('getReadPool — lag-based primary fallback', () => {
   const fakeReplica = { query: mockReplicaQuery } as any;
+
+  function setMeasuredLag(lagSeconds: number | null): void {
+    mockReplicaQuery.mockResolvedValue({
+      rows: [{ lag_seconds: lagSeconds }],
+    });
+  }
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -64,13 +60,14 @@ describe('getReadPool — lag-based primary fallback', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     resetReplicaPool();
     // Reset env var
     delete process.env['REPLICA_MAX_LAG_SECONDS'];
   });
 
   it('returns the replica pool when lag is within the threshold', async () => {
-    mockLag.mockResolvedValue(5); // 5 s < 30 s default
+    setMeasuredLag(5); // 5 s < 30 s default
     process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
 
     const pool = await getReadPool();
@@ -78,7 +75,7 @@ describe('getReadPool — lag-based primary fallback', () => {
   });
 
   it('falls back to primary when lag exceeds the configured threshold', async () => {
-    mockLag.mockResolvedValue(45); // 45 s > 30 s
+    setMeasuredLag(45); // 45 s > 30 s
     process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
 
     const pool = await getReadPool();
@@ -87,7 +84,7 @@ describe('getReadPool — lag-based primary fallback', () => {
   });
 
   it('returns the replica when lag equals exactly the threshold (boundary)', async () => {
-    mockLag.mockResolvedValue(30); // equal — should NOT fall back
+    setMeasuredLag(30); // equal — should NOT fall back
     process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
 
     const pool = await getReadPool();
@@ -97,16 +94,16 @@ describe('getReadPool — lag-based primary fallback', () => {
   it('skips lag check and returns replica when REPLICA_MAX_LAG_SECONDS=0 (disabled)', async () => {
     process.env['REPLICA_MAX_LAG_SECONDS'] = '0';
     // Even with very high reported lag
-    mockLag.mockResolvedValue(999);
+    setMeasuredLag(999);
 
     const pool = await getReadPool();
     expect(pool).toBe(fakeReplica);
-    // checkReplicationLag should not have been called
-    expect(mockLag).not.toHaveBeenCalled();
+    // checkReplicationLag should not have queried the replica
+    expect(mockReplicaQuery).not.toHaveBeenCalled();
   });
 
   it('returns replica when lag check returns null (unavailable metric)', async () => {
-    mockLag.mockResolvedValue(null);
+    setMeasuredLag(null);
     process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
 
     const pool = await getReadPool();
@@ -115,11 +112,38 @@ describe('getReadPool — lag-based primary fallback', () => {
   });
 
   it('still respects forcePrimary=true regardless of lag', async () => {
-    mockLag.mockResolvedValue(0); // zero lag
+    setMeasuredLag(0); // zero lag
     process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
 
     const pool = await getReadPool({ forcePrimary: true });
     expect(pool).not.toBe(fakeReplica);
-    expect(mockLag).not.toHaveBeenCalled();
+    expect(mockReplicaQuery).not.toHaveBeenCalled();
+  });
+
+  it('emits fallback warning once per transition and recovers after cache TTL', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    process.env['REPLICA_MAX_LAG_SECONDS'] = '30';
+
+    // Transition 1: replica becomes stale
+    setMeasuredLag(45);
+    expect(await getReadPool()).not.toBe(fakeReplica);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    // Repeated call within cache TTL stays on primary without re-logging
+    expect(await getReadPool()).not.toBe(fakeReplica);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    // Advance past 30 s lag-check cache TTL; lag recovers
+    vi.advanceTimersByTime(30_000);
+    setMeasuredLag(5);
+    expect(await getReadPool()).toBe(fakeReplica);
+    expect(logger.info).toHaveBeenCalledTimes(1);
+
+    // Advance past 30 s TTL again; lag spikes again -> logs once for new transition
+    vi.advanceTimersByTime(30_000);
+    setMeasuredLag(60);
+    expect(await getReadPool()).not.toBe(fakeReplica);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
   });
 });
