@@ -39,3 +39,7 @@ coverage/
 tmp/
 temp/
 *.tmp
+
+# Stray backup and original copies
+*.bak
+*.orig
