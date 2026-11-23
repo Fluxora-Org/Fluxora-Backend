@@ -13,7 +13,7 @@
 import { createHash } from 'crypto';
 import type { RedisClient } from './client.js';
 import { logger } from '../lib/logger.js';
-import { fluxora_rpc_cache_corrupt_total } from '../metrics/rpcMetrics.js';
+import { rpcCacheCorruptTotal } from '../metrics/rpcMetrics.js';
 
 export const RPC_FALLBACK_CACHE_PREFIX = 'rpc:cache::';
 
@@ -192,7 +192,7 @@ function parseCachedValue<T>(raw: string, key: string): T | null {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!isCacheEnvelope<T>(parsed)) {
-      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'wrong_shape' });
+      rpcCacheCorruptTotal.inc({ operation: 'unknown', reason: 'wrong_shape' });
       logger.warn('Corrupt entry in RPC fallback cache', undefined, {
         event: 'rpc_fallback_cache_corrupt_entry',
         key,
@@ -203,7 +203,7 @@ function parseCachedValue<T>(raw: string, key: string): T | null {
     return parsed.value;
   } catch (err) {
     if (err instanceof SyntaxError) {
-      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'syntax_error' });
+      rpcCacheCorruptTotal.inc({ operation: 'unknown', reason: 'syntax_error' });
       logger.warn('Corrupt entry in RPC fallback cache', undefined, {
         event: 'rpc_fallback_cache_corrupt_entry',
         key,
@@ -220,7 +220,7 @@ function parseCacheEntry<T>(raw: string, key: string): RpcFallbackCacheEntry<T> 
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!isCacheEnvelope<T>(parsed)) {
-      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'wrong_shape' });
+      rpcCacheCorruptTotal.inc({ operation: 'unknown', reason: 'wrong_shape' });
       logger.warn('Corrupt entry in RPC fallback cache metadata', undefined, {
         event: 'rpc_fallback_cache_corrupt_entry',
         key,
@@ -237,7 +237,7 @@ function parseCacheEntry<T>(raw: string, key: string): RpcFallbackCacheEntry<T> 
     };
   } catch (err) {
     if (err instanceof SyntaxError) {
-      fluxora_rpc_cache_corrupt_total.inc({ operation: 'unknown', reason: 'syntax_error' });
+      rpcCacheCorruptTotal.inc({ operation: 'unknown', reason: 'syntax_error' });
       logger.warn('Corrupt entry in RPC fallback cache metadata', undefined, {
         event: 'rpc_fallback_cache_corrupt_entry',
         key,

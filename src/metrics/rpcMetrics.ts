@@ -195,6 +195,20 @@ export const rpcUpstreamCallDurationSeconds =
     registers: [registry],
   });
 
+/**
+ * Counter for corrupt payloads encountered while reading the Stellar RPC
+ * fallback cache (unparseable JSON or an envelope that fails validation).
+ * Incremented by the cache reader, which still degrades to a miss.
+ */
+export const rpcCacheCorruptTotal =
+  (registry.getSingleMetric('fluxora_rpc_cache_corrupt_total') as Counter<'operation' | 'reason'>) ||
+  new Counter({
+    name: 'fluxora_rpc_cache_corrupt_total',
+    help: 'Total corrupt entries encountered while reading the Stellar RPC fallback cache',
+    labelNames: ['operation', 'reason'] as const,
+    registers: [registry],
+  });
+
 export const RPC_CALL_OUTCOMES = ['success', 'failure'] as const;
 export const RPC_FAILURE_KINDS = [
   'TIMEOUT',
@@ -218,6 +232,7 @@ export function deRegisterRpcMetrics(): void {
     'rpc_upstream_calls_total',
     'rpc_upstream_calls_failed_total',
     'rpc_upstream_call_duration_seconds',
+    'fluxora_rpc_cache_corrupt_total',
     'rpc_degraded_mode',
   ]) {
     registry.removeSingleMetric(name);
