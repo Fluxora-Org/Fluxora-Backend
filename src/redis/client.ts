@@ -188,6 +188,11 @@ export interface RedisClient {
    * re-acquired by a different owner.  Treat any error as final.
    */
   delIfValue?(key: string, value: string): Promise<void>;
+  /**
+   * Extend a key's TTL only when its current value matches the expected owner.
+   * The comparison and PEXPIRE are performed atomically.
+   */
+  pexpireIfValue(key: string, value: string, ms: number): Promise<boolean>;
   exists(key: string): Promise<boolean>;
   /**
    * Atomically increment an integer counter; returns the new value.
@@ -488,6 +493,22 @@ class IORedisClient implements RedisClient {
         key,
         value,
       );
+    });
+  }
+
+  async pexpireIfValue(key: string, value: string, ms: number): Promise<boolean> {
+    assertRedisKey(key);
+    assertRedisValue(value);
+    assertNonNegativeInteger(ms, 'ms');
+    return this.withCommandMetrics(async () => {
+      const result = await this.client.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
+        1,
+        key,
+        value,
+        ms,
+      );
+      return Number(result) === 1;
     });
   }
 
@@ -979,6 +1000,12 @@ export class NoOpRedisClient implements RedisClient {
     assertRedisValue(value);
     assertPositiveInteger(pxMs, 'pxMs');
     return true;
+  }
+  async pexpireIfValue(key: string, value: string, ms: number): Promise<boolean> {
+    assertRedisKey(key);
+    assertRedisValue(value);
+    assertNonNegativeInteger(ms, 'ms');
+    return false;
   }
   async del(key: string): Promise<void> {
     assertRedisKey(key);

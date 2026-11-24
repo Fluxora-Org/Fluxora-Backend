@@ -111,6 +111,15 @@ class TestFailableRedisClient implements RedisClient {
     return true;
   }
 
+  async pexpireIfValue(key: string, value: string, _ms: number): Promise<boolean> {
+    this.totalOperationAttempts++;
+    if (!this.isAvailable) {
+      this.totalFailuresEncountered++;
+      throw new Error("Redis outage (simulated renewal failure)");
+    }
+    return this.store.get(key) === value;
+  }
+
   async del(key: string): Promise<void> {
     this.totalOperationAttempts++;
     if (!this.isAvailable) {
