@@ -112,20 +112,12 @@ describe('RedisIndexerLeaderElection', () => {
   it('renews the lease via PEXPIRE on heartbeat while still the holder', async () => {
     const leaseMs = 9000;
 
-    // FakeRedisClient stores TTLs but never enforces expiry (by design — see
-    // its doc comment), so the only reliable way to prove renewal actually
-    // fired is to intercept the PEXPIRE call itself rather than relying on
-    // key expiry.
+    // Observe the atomic compare-and-expire call and the resulting fake TTL.
     const pexpireCalls: Array<[string, number]> = [];
-    const originalMulti = redis.multi.bind(redis);
-    vi.spyOn(redis, 'multi').mockImplementation(() => {
-      const pipeline = originalMulti();
-      const originalPexpire = pipeline.pexpire.bind(pipeline);
-      pipeline.pexpire = (key: string, ms: number) => {
-        pexpireCalls.push([key, ms]);
-        return originalPexpire(key, ms);
-      };
-      return pipeline;
+    const originalPexpireIfValue = redis.pexpireIfValue.bind(redis);
+    vi.spyOn(redis, 'pexpireIfValue').mockImplementation((key, value, ms) => {
+      pexpireCalls.push([key, ms]);
+      return originalPexpireIfValue(key, value, ms);
     });
 
     const le = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
@@ -136,6 +128,7 @@ describe('RedisIndexerLeaderElection', () => {
 
     expect(le.isLeader()).toBe(true);
     expect(pexpireCalls).toContainEqual(['indexer:leader-election:replay', leaseMs]);
+    expect(redis.getTtl('indexer:leader-election:replay')).toBe(leaseMs);
   });
 
   it('drops leadership when another instance has taken over the key (lease expired)', async () => {
@@ -159,7 +152,7 @@ describe('RedisIndexerLeaderElection', () => {
     const le = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
     await le.tryAcquire();
 
-    redis.throwOnNext('pexpire', 'simulated redis outage during renewal');
+    redis.throwOnNext('pexpireIfValue', 'simulated redis outage during renewal');
     await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
 
     expect(le.isLeader()).toBe(false);
@@ -270,22 +263,10 @@ describe('RedisIndexerLeaderElection — multiple instance competition', () => {
   });
 
   /**
-   * Concurrent-takeover regression test for the check-then-act race in
-   * renew() and release().
-   *
-   * Forces the exact window where:
-   *   1. Instance A's heartbeat fires and `get` confirms A still holds the key.
-   *   2. Between A's `get` and A's `pexpire`, the lease expires and B acquires.
-   *   3. A's stale `pexpire` executes, inadvertently extending B's lease.
-   *
-   * The dual-leadership window must be bounded to at most one renewIntervalMs:
-   * on the next heartbeat, A's `get` returns B's instanceId, A drops leadership
-   * and stops the heartbeat. See docs/indexer.md §"Security note — non-atomic
-   * renew/release" for why this risk is accepted.
-   *
-   * @see docs/indexer.md line ~295
+   * Concurrent-takeover regression test for atomic renewal: A must not extend
+   * B's lease even if a separate read would return stale data.
    */
-  it('renew() check-then-act race: stale pexpire after B takes over — A recovers within one interval', async () => {
+  it('renew() does not extend a lease held by another instance', async () => {
     const leaseMs = 9000;
     const a = new RedisIndexerLeaderElection(redis, { instanceId: 'a', leaseMs });
     const b = new RedisIndexerLeaderElection(redis, { instanceId: 'b', leaseMs });
@@ -299,33 +280,12 @@ describe('RedisIndexerLeaderElection — multiple instance competition', () => {
     await b.tryAcquire();
     expect(b.isLeader()).toBe(true);
 
-    // Spy on redis.get to simulate A seeing stale data on its next heartbeat:
-    // A's `get` returns 'a' (the value A expects) even though B now holds the key.
-    // This forces exactly the race: A's get succeeds (stale), then A's pexpire
-    // fires and extends B's lease.
-    let staleReturned = false;
-    const originalGet = redis.get.bind(redis);
-    vi.spyOn(redis, 'get').mockImplementation(async (key: string) => {
-      if (key === 'indexer:leader-election:replay' && !staleReturned) {
-        staleReturned = true;
-        return 'a';
-      }
-      return originalGet(key);
-    });
-
-    // Advance one interval: A's heartbeat fires, spy returns 'a' (stale view),
-    // A proceeds to pexpire which extends B's lease. A still thinks it's leader.
+    // A's compare-and-expire sees B's value and cannot renew the key.
     await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
-    expect(a.isLeader()).toBe(true);
-    expect(b.isLeader()).toBe(true);
-
-    // Advance another interval: A's heartbeat fires again, this time get returns 'b'
-    // (no spy interference), A detects B holds the key and drops leadership.
-    await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
-
     expect(a.isLeader()).toBe(false);
     expect(b.isLeader()).toBe(true);
     await expect(redis.get('indexer:leader-election:replay')).resolves.toBe('b');
+    expect(redis.getTtl('indexer:leader-election:replay')).toBeUndefined();
   });
 
   /**
@@ -769,7 +729,7 @@ describe('RedisIndexerLeaderElection — clock-anomaly regression', () => {
     const tokenA = a.getFencingToken();
 
     // Simulate Redis outage for A's next PEXPIRE: A self-revokes.
-    redis.throwOnNext('pexpire', 'Redis connection lost');
+    redis.throwOnNext('pexpireIfValue', 'Redis connection lost');
     await vi.advanceTimersByTimeAsync(Math.floor(leaseMs / 3) + 10);
     expect(a.isLeader()).toBe(false);
 

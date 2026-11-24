@@ -96,6 +96,7 @@ export class FakeRedisClient implements RedisClient {
     private sweepExpired(key: string): void {
         const deadline = this.expiryAt.get(key);
         if (deadline !== undefined && Date.now() >= deadline) {
+            this.strings.delete(key);
             this.sortedSets.delete(key);
             this.ttls.delete(key);
             this.expiryAt.delete(key);
@@ -197,6 +198,15 @@ export class FakeRedisClient implements RedisClient {
     async get(key: string): Promise<string | null> {
         this.maybeThrow('get');
         return this.strings.get(key) ?? null;
+    }
+
+    async pexpireIfValue(key: string, value: string, ms: number): Promise<boolean> {
+        this.maybeThrow('pexpireIfValue');
+        this.sweepExpired(key);
+        if (this.strings.get(key) !== value) return false;
+        this.ttls.set(key, ms);
+        this.expiryAt.set(key, Date.now() + ms);
+        return true;
     }
 
     async set(key: string, value: string, _options?: { ex?: number; pxat?: number }): Promise<void> {

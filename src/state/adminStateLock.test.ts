@@ -47,6 +47,13 @@ class FakeRedis implements RedisClient {
     return true;
   }
 
+  async pexpireIfValue(key: string, value: string, ms: number): Promise<boolean> {
+    const entry = this.store.get(key);
+    if (!entry || entry.expiresAt <= this.now || entry.value !== value) return false;
+    this.store.set(key, { value, expiresAt: this.now + ms });
+    return true;
+  }
+
   async del(key: string): Promise<void> {
     this.store.delete(key);
   }
