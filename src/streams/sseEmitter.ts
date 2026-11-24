@@ -27,9 +27,6 @@ export const SSE_MAX_BUFFERED_EVENTS = parseInt(
   10,
 );
 
-export const sseEventBus = new EventEmitter();
-
-sseEventBus.setMaxListeners(1000);
 
 // Upstream moved deriveStreamId to top and dropped the 'stream-' prefix.
 export function deriveStreamId(transactionHash: string, eventIndex: number): string {
@@ -83,9 +80,11 @@ const replayBufferByStreamId = new Map<string, LiveSseStreamUpdateEvent[]>();
 
 /**
  * Append a live event to the per-stream ring buffer, evicting the oldest entry
- * when the buffer is full. Called inside `dispatchLiveSseEvent` BEFORE fan-out.
+ * when the buffer is full. Called from `sseEventBus.emit` BEFORE any listener
+ * runs, whether or not the stream currently has live subscribers.
  */
 function bufferLiveEvent(event: LiveSseStreamUpdateEvent): void {
+  if (!event || typeof event.streamId !== 'string' || typeof event.eventId !== 'string') return;
   let buf = replayBufferByStreamId.get(event.streamId);
   if (!buf) {
     buf = [];
@@ -119,6 +118,32 @@ export function replayFromBuffer(
   return buf.slice(idx + 1);
 }
 
+/**
+ * Event bus for live SSE stream updates.
+ *
+ * Every `stream_update` emission is appended to the replay buffer before any
+ * listener runs. Buffering does not depend on the fan-out dispatcher being
+ * attached, so a client that reconnects after the last subscriber left can
+ * still resume from `Last-Event-ID`.
+ */
+class SseEventBus extends EventEmitter {
+  override emit(eventName: string | symbol, ...args: unknown[]): boolean {
+    if (eventName === SSE_STREAM_UPDATE_EVENT) {
+      bufferLiveEvent(args[0] as LiveSseStreamUpdateEvent);
+    }
+    return super.emit(eventName, ...args);
+  }
+}
+
+export const sseEventBus: EventEmitter = new SseEventBus();
+
+sseEventBus.setMaxListeners(1000);
+
+/** Clears the per-stream replay buffer. Test-only. */
+export function _resetSseReplayBufferForTest(): void {
+  replayBufferByStreamId.clear();
+}
+
 // ── Live subscriber fan-out ───────────────────────────────────────────────────
 
 const liveSubscribersByStreamId = new Map<string, Set<SseStreamSubscriber>>();
@@ -133,10 +158,6 @@ function totalLiveSubscriberCount(): number {
 
 function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
   if (!event || typeof event.streamId !== 'string') return;
-
-  // Buffer BEFORE fan-out — event is in the ring buffer before any subscriber
-  // callback fires, preventing a gap between replay and live delivery.
-  bufferLiveEvent(event);
 
   const subscribers = liveSubscribersByStreamId.get(event.streamId);
   if (!subscribers || subscribers.size === 0) return;
@@ -326,7 +347,7 @@ export async function drainSseEventBus(timeoutMs: number): Promise<void> {
 
 export function _resetSseSubscriptionsForTest(): void {
   liveSubscribersByStreamId.clear();
-  replayBufferByStreamId.clear();
+  _resetSseReplayBufferForTest();
   sseShutdownCallbacks.clear();
   sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
   sseLiveSubscribersGauge.set(0);
