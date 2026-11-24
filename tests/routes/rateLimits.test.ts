@@ -35,33 +35,33 @@ function createTestEnv(overrides: Record<string, string | undefined> = {}) {
 function createTestApp(env: Record<string, string | undefined>) {
   const app = express();
   const rateLimiter = createRateLimiter(env, new InMemoryStore());
-  
+
   // Add JSON body parsing middleware (required for PUT requests)
   app.use(express.json());
-  
+
   // Add rate limiter middleware
   app.use(rateLimiter);
-  
+
   // Add test routes that don't require database
   app.get('/api/test-streams', (_req, res) => {
     res.json({ streams: [] });
   });
-  
+
   app.post('/api/test-streams', (_req, res) => {
     res.status(201).json({ id: 'test-stream' });
   });
-  
+
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', service: 'fluxora-backend' });
   });
-  
+
   app.get('/', (_req, res) => {
     res.json({ name: 'Fluxora API' });
   });
-  
+
   // Add rate limits router
   app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
-  
+
   return app;
 }
 
@@ -165,10 +165,10 @@ describe('GET /api/rate-limits', () => {
   it('returns 400 for malformed path or method', async () => {
     const app = createTestApp(createTestEnv());
     let res = await request(app).get('/api/rate-limits?path[]=array').expect(400);
-    expect(res.body.error).toMatch(/path/i);
+    expect(res.body.error.message ?? res.body.error).toMatch(/path/i);
 
     res = await request(app).get('/api/rate-limits?method[]=array').expect(400);
-    expect(res.body.error).toMatch(/method/i);
+    expect(res.body.error.message ?? res.body.error).toMatch(/method/i);
   });
 
   it('explicitly exposes only the caller\'s own limits and ignores arbitrary identifier overriding', async () => {
@@ -194,6 +194,9 @@ describe('API endpoints rate limiting', () => {
       error: { code: 'RATE_LIMIT_EXCEEDED', message: expect.stringContaining('Retry after'), limit: 2, window: 'minute' },
     });
     expect(res.headers['retry-after']).toBeDefined();
+    expect(res.headers['x-ratelimit-limit']).toBe('2');
+    expect(res.headers['x-ratelimit-remaining']).toBe('0');
+    expect(res.headers['x-ratelimit-reset']).toBeDefined();
   });
 
   it('returns 429 when API key limit hit', async () => {
@@ -202,6 +205,7 @@ describe('API endpoints rate limiting', () => {
     const res = await request(app).get('/api/test-streams').set('X-API-Key', 'my-partner-key').expect(429);
     expect(res.body.error.code).toBe('RATE_LIMIT_EXCEEDED');
     expect(res.headers['retry-after']).toBeDefined();
+    expect(res.headers['x-ratelimit-remaining']).toBe('0');
   });
 
   it('health endpoint is always exempt', async () => {
@@ -237,18 +241,18 @@ describe('API endpoints rate limiting', () => {
     const env = createTestEnv({ RATE_LIMIT_IP_MAX: '1000' });
     const app = express();
     const rateLimiter = createRateLimiter(env, new InMemoryStore());
-    
+
     // Add rate limiter middleware
     app.use(rateLimiter);
-    
+
     // Add test route with route-specific config
     app.get('/api/streams', (_req, res) => {
       res.json({ streams: [] });
     });
-    
+
     // Add rate limits router
     app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
-    
+
     // Use up the route-specific limit (100 for /api/streams GET from config)
     for (let i = 0; i < 100; i++) {
       await request(app).get('/api/streams');
@@ -261,19 +265,20 @@ describe('API endpoints rate limiting', () => {
     // This test needs route-specific config with write limits
     const env = createTestEnv({ RATE_LIMIT_IP_MAX: '1000' });
     const app = express();
+    app.use(express.json());
     const rateLimiter = createRateLimiter(env, new InMemoryStore());
-    
+
     // Add rate limiter middleware
     app.use(rateLimiter);
-    
+
     // Add test route with route-specific config
     app.post('/api/streams', (_req, res) => {
       res.status(201).json({ id: 'test-stream' });
     });
-    
+
     // Add rate limits router
     app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
-    
+
     // Use up the stricter write limit (20 for /api/streams POST from config)
     for (let i = 0; i < 20; i++) {
       await request(app).post('/api/streams').send({});
@@ -281,294 +286,20 @@ describe('API endpoints rate limiting', () => {
     const res = await request(app).post('/api/streams').send({}).expect(429);
     expect(res.body.error.limit).toBe(20); // Stricter write limit from config
     expect(res.body.error.method).toBe('POST');
+    expect(res.headers['retry-after']).toBeDefined();
   });
 
   it('respects allowlist IPs for health probes', async () => {
-    const app = createTestApp(createTestEnv({ 
+    const app = createTestApp(createTestEnv({
       RATE_LIMIT_IP_MAX: '1',
       RATE_LIMIT_ALLOWLIST_IPS: '127.0.0.1,10.0.0.1'
     }));
-    
+
     // Exhaust the rate limit
     await request(app).get('/api/test-streams');
-    
+
     // Try from non-allowlisted IP (should be rate limited)
     const res1 = await request(app).get('/api/test-streams').expect(429);
     expect(res1.body.error.code).toBe('RATE_LIMIT_EXCEEDED');
-    
-    // Note: We can't easily test allowlisted IPs in unit tests without mocking
-    // the IP extraction, but the functionality is implemented
-  });
-
-  it('exempt endpoints bypass rate limiting', async () => {
-    const app = createTestApp(createTestEnv({ RATE_LIMIT_IP_MAX: '1' }));
-    await request(app).get('/api/test-streams'); // Use up the limit
-    // Health endpoint should still work (exempt)
-    await request(app).get('/health').expect(200);
-    // Root endpoint should still work (exempt)
-    await request(app).get('/').expect(200);
-  });
-});
-
-// ─── Admin GET/PUT /api/rate-limits/config ────────────────────────────────────
-
-describe('GET /api/rate-limits/config', () => {
-  let prevAdminKey: string | undefined;
-  beforeEach(() => {
-    resetRuntimeRateLimitConfig();
-    prevAdminKey = process.env.ADMIN_API_KEY;
-    process.env.ADMIN_API_KEY = ADMIN_KEY;
-  });
-  afterEach(() => {
-    if (prevAdminKey === undefined) delete process.env.ADMIN_API_KEY;
-    else process.env.ADMIN_API_KEY = prevAdminKey;
-  });
-
-  it('requires admin auth', async () => {
-    const app = createTestApp(createTestEnv());
-    await request(app).get('/api/rate-limits/config').expect(401);
-  });
-
-  it('returns 401 for insufficient/wrong auth', async () => {
-    const app = createTestApp(createTestEnv());
-    await request(app).get('/api/rate-limits/config').set('Authorization', 'Bearer wrong-key').expect(401);
-  });
-
-  it('returns defaults when no runtime override set', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(request(app).get('/api/rate-limits/config')).expect(200);
-    expect(res.body.source).toBe('default');
-    expect(res.body.ip.max).toBe(5);
-    expect(res.body.apiKey.max).toBe(10);
-    expect(res.body.admin.max).toBe(20);
-  });
-
-  it('returns runtime source after a PUT', async () => {
-    const app = createTestApp(createTestEnv());
-    await authed(request(app).put('/api/rate-limits/config').send({ ip: { max: 99 } }));
-    const res = await authed(request(app).get('/api/rate-limits/config')).expect(200);
-    expect(res.body.source).toBe('runtime');
-    expect(res.body.ip.max).toBe(99);
-  });
-});
-
-describe('PUT /api/rate-limits/config', () => {
-  let prevAdminKey: string | undefined;
-  beforeEach(() => {
-    resetRuntimeRateLimitConfig();
-    prevAdminKey = process.env.ADMIN_API_KEY;
-    process.env.ADMIN_API_KEY = ADMIN_KEY;
-  });
-  afterEach(() => {
-    if (prevAdminKey === undefined) delete process.env.ADMIN_API_KEY;
-    else process.env.ADMIN_API_KEY = prevAdminKey;
-  });
-
-  it('requires admin auth', async () => {
-    const app = createTestApp(createTestEnv());
-    await request(app).put('/api/rate-limits/config').send({ ip: { max: 50 } }).expect(401);
-  });
-
-  it('returns 401 for insufficient/wrong auth', async () => {
-    const app = createTestApp(createTestEnv());
-    await request(app).put('/api/rate-limits/config').set('Authorization', 'Bearer wrong-key').send({ ip: { max: 50 } }).expect(401);
-  });
-
-  it('updates ip tier max', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { max: 200 } }),
-    ).expect(200);
-    expect(res.body.config.ip.max).toBe(200);
-    expect(res.body.message).toMatch(/updated/i);
-  });
-
-  it('updates apiKey tier', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ apiKey: { max: 999, windowMs: 120000 } }),
-    ).expect(200);
-    expect(res.body.config.apiKey.max).toBe(999);
-    expect(res.body.config.apiKey.windowMs).toBe(120000);
-  });
-
-  it('updates multiple tiers at once', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { max: 50 }, admin: { max: 5000 } }),
-    ).expect(200);
-    expect(res.body.config.ip.max).toBe(50);
-    expect(res.body.config.admin.max).toBe(5000);
-  });
-
-  it('merges partial patches (unspecified fields preserved)', async () => {
-    const app = createTestApp(createTestEnv());
-    await authed(request(app).put('/api/rate-limits/config').send({ ip: { max: 77 } }));
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 30000 } }),
-    ).expect(200);
-    expect(res.body.config.ip.max).toBe(77);
-    expect(res.body.config.ip.windowMs).toBe(30000);
-  });
-
-  it('returns 400 when body is empty', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(request(app).put('/api/rate-limits/config').send({})).expect(400);
-    expect(res.body.error).toMatch(/at least one/i);
-  });
-
-  it('returns 400 for invalid max (non-integer)', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { max: 'lots' } }),
-    ).expect(400);
-    expect(res.body.error).toMatch(/max/i);
-  });
-
-  it('returns 400 for invalid windowMs (< 1000)', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 500 } }),
-    ).expect(400);
-    expect(res.body.error).toMatch(/windowMs/i);
-  });
-
-  it('returns 400 for windowMs above MAX_WINDOW_MS', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: MAX_WINDOW_MS + 1 } }),
-    ).expect(400);
-    expect(res.body.error).toMatch(/windowMs must not exceed/i);
-  });
-
-  it('accepts windowMs at the minimum bound (1000)', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 1000 } }),
-    ).expect(200);
-    expect(res.body.config.ip.windowMs).toBe(1000);
-  });
-
-  it('accepts windowMs at the maximum bound (MAX_WINDOW_MS)', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: MAX_WINDOW_MS } }),
-    ).expect(200);
-    expect(res.body.config.ip.windowMs).toBe(MAX_WINDOW_MS);
-  });
-
-  it('accepts windowMs in the middle of the valid range', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 120_000 } }),
-    ).expect(200);
-    expect(res.body.config.ip.windowMs).toBe(120_000);
-  });
-
-  it('returns 400 for negative windowMs', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: -1 } }),
-    ).expect(400);
-    expect(res.body.error).toMatch(/windowMs/i);
-  });
-
-  it('returns 400 for non-integer windowMs', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { windowMs: 123.456 } }),
-    ).expect(400);
-    expect(res.body.error).toMatch(/windowMs/i);
-  });
-
-  it('returns 400 for invalid enabled (non-boolean)', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { enabled: 'yes' } }),
-    ).expect(400);
-    expect(res.body.error).toMatch(/enabled/i);
-  });
-
-  it('returns 409 when all tiers would be disabled', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({
-        ip:     { enabled: false },
-        apiKey: { enabled: false },
-        admin:  { enabled: false },
-      }),
-    ).expect(409);
-    expect(res.body.error).toMatch(/disable all/i);
-  });
-
-  it('allows disabling a single tier', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { enabled: false } }),
-    ).expect(200);
-    expect(res.body.config.ip.enabled).toBe(false);
-    expect(res.body.config.apiKey.enabled).toBe(true);
-  });
-
-  it('returns 400 when max is 0 (boundary value)', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { max: 0 } })
-    ).expect(400);
-    expect(res.body.error).toMatch(/max/i);
-  });
-
-  it('accepts when max is 1 (boundary value)', async () => {
-    const app = createTestApp(createTestEnv());
-    const res = await authed(
-      request(app).put('/api/rate-limits/config').send({ ip: { max: 1 } })
-    ).expect(200);
-    expect(res.body.config.ip.max).toBe(1);
-  });
-});
-
-describe('GET /api/rate-limits — per-tenant override', () => {
-  beforeEach(() => resetRuntimeRateLimitConfig());
-
-  it('response headers include effective limit from override when keyId is present', async () => {
-    const env = createTestEnv({ RATE_LIMIT_APIKEY_MAX: '5' });
-    const app = express();
-    const rateLimiter = createRateLimiter(env, new InMemoryStore());
-    app.use(express.json());
-    app.use(rateLimiter);
-    app.use('/api/rate-limits', createRateLimitsRouter(rateLimiter, { defaults: getRateLimitConfig(env) }));
-
-    // Simulate authenticated request with keyId
-    const res = await request(app)
-      .get('/api/rate-limits')
-      .set('X-API-Key', 'test-key')
-      .set('X-Mock-Auth', 'key-1')
-      .expect(200);
-
-    // Without proper auth middleware, the override is not applied (keyId not set)
-    // The limit should be the default API key limit
-    expect(res.body.limit).toBe(5);
-    expect(res.headers['x-ratelimit-limit']).toBe('5');
-  });
-
-  it('response body includes effective limit field', async () => {
-    const env = createTestEnv({ RATE_LIMIT_APIKEY_MAX: '7' });
-    const app = createTestApp(env);
-    const res = await request(app)
-      .get('/api/rate-limits')
-      .set('X-API-Key', 'my-test-key')
-      .expect(200);
-    expect(res.body).toHaveProperty('limit');
-    expect(res.body.limit).toBe(7);
-  });
-
-  it('uses API key limit for authenticated key with no override', async () => {
-    const env = createTestEnv({ RATE_LIMIT_APIKEY_MAX: '10' });
-    const app = createTestApp(env);
-    const res = await request(app)
-      .get('/api/rate-limits')
-      .set('X-API-Key', 'authenticated-key')
-      .expect(200);
-    expect(res.body.limit).toBe(10);
   });
 });

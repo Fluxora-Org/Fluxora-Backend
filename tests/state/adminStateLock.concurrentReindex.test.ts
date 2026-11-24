@@ -37,6 +37,7 @@ import {
 } from '../../src/state/adminStateLock.js';
 import { createRedisClient, quitAllRedisClients } from '../../src/redis/client.js';
 import type { LogRecord } from '../../src/lib/logger.js';
+import { TEST_REINDEX_TARGET, timedReindexRunner } from '../helpers/fakeReindexRunner.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,16 +149,16 @@ describe('AdminStateLock concurrent reindex serialization', () => {
     const competingLock = new RedisDistributedLock(sharedRedis, 'reindex');
     const heldLock = await competingLock.acquire();
 
-    // Now triggerReindex() tries to acquire the lock but finds it held.
+    // Now triggerReindex(TEST_REINDEX_TARGET) tries to acquire the lock but finds it held.
     // It should return idle state so the route layer can return 409.
-    const loserResult = await triggerReindex();
+    const loserResult = await triggerReindex(TEST_REINDEX_TARGET);
     expect(loserResult.status).toBe('idle');
 
     // Release the competing lock.
     await heldLock.release();
 
-    // With the lock free, triggerReindex() should succeed.
-    const winnerResult = await triggerReindex();
+    // With the lock free, triggerReindex(TEST_REINDEX_TARGET) should succeed.
+    const winnerResult = await triggerReindex(TEST_REINDEX_TARGET);
     expect(winnerResult.status).toBe('running');
 
     // Wait for background job to complete.
@@ -174,14 +175,14 @@ describe('AdminStateLock concurrent reindex serialization', () => {
       await createProcessScope('reindex');
 
     // First reindex: should succeed.
-    const first = await triggerReindex();
+    const first = await triggerReindex(TEST_REINDEX_TARGET);
     expect(first.status).toBe('running');
 
     // Wait for background job to complete (5 × 50 ms + margin).
     await wait(400);
 
     // Second reindex: lock was released after job completed, should succeed.
-    const second = await triggerReindex();
+    const second = await triggerReindex(TEST_REINDEX_TARGET);
     expect(second.status).toBe('running');
 
     // Wait and verify final state.
@@ -197,7 +198,7 @@ describe('AdminStateLock concurrent reindex serialization', () => {
     const { triggerReindex } = await createProcessScope('reindex');
 
     // Trigger first reindex.
-    const first = await triggerReindex();
+    const first = await triggerReindex(TEST_REINDEX_TARGET);
     expect(first.status).toBe('running');
 
     // Wait for it to complete.
@@ -209,7 +210,7 @@ describe('AdminStateLock concurrent reindex serialization', () => {
     expect(lockStillExists).toBe(false);
 
     // A subsequent reindex should succeed because the lock was released.
-    const second = await triggerReindex();
+    const second = await triggerReindex(TEST_REINDEX_TARGET);
     expect(second.status).toBe('running');
 
     await wait(400);
@@ -226,9 +227,9 @@ describe('AdminStateLock concurrent reindex serialization', () => {
     const competingLock = new RedisDistributedLock(sharedRedis, 'reindex');
     const heldLock = await competingLock.acquire();
 
-    // triggerReindex() tries to acquire the lock but finds it held.
+    // triggerReindex(TEST_REINDEX_TARGET) tries to acquire the lock but finds it held.
     // Should return idle (not running) so the route handler can return 409.
-    const loserResult = await triggerReindex();
+    const loserResult = await triggerReindex(TEST_REINDEX_TARGET);
     expect(loserResult.status).not.toBe('running');
     expect(loserResult.status).toBe('idle');
 
@@ -309,7 +310,7 @@ describe('AdminStateLock concurrent reindex serialization', () => {
   });
 
   // -----------------------------------------------------------------------
-  // 8. triggerReindex() returns idle state when lock acquisition fails
+  // 8. triggerReindex(TEST_REINDEX_TARGET) returns idle state when lock acquisition fails
   // -----------------------------------------------------------------------
 
   it('triggerReindex returns idle state when lock cannot be acquired', async () => {
@@ -321,13 +322,14 @@ describe('AdminStateLock concurrent reindex serialization', () => {
     vi.resetModules();
     const mod = await import('../../src/state/adminState.js');
     mod._resetForTest();
+    mod._setReindexRunnerForTest(timedReindexRunner());
     mod._setReindexLockForTest(
       new RedisDistributedLock(sharedRedis, 'reindex', {
         timeoutMs: TEST_LOCK_TIMEOUT_MS,
       }),
     );
 
-    const result = await mod.triggerReindex();
+    const result = await mod.triggerReindex(TEST_REINDEX_TARGET);
 
     // Should return current idle state, not 'running'.
     expect(result.status).toBe('idle');
@@ -345,17 +347,17 @@ describe('AdminStateLock concurrent reindex serialization', () => {
       await createProcessScope('reindex');
 
     // First reindex.
-    const r1 = await triggerReindex();
+    const r1 = await triggerReindex(TEST_REINDEX_TARGET);
     expect(r1.status).toBe('running');
     await wait(400);
 
     // Second reindex (after lock released).
-    const r2 = await triggerReindex();
+    const r2 = await triggerReindex(TEST_REINDEX_TARGET);
     expect(r2.status).toBe('running');
     await wait(400);
 
     // Third reindex.
-    const r3 = await triggerReindex();
+    const r3 = await triggerReindex(TEST_REINDEX_TARGET);
     expect(r3.status).toBe('running');
     await wait(400);
 
@@ -370,12 +372,12 @@ describe('AdminStateLock concurrent reindex serialization', () => {
     const { triggerReindex, getReindexState } =
       await createProcessScopeNoLock();
 
-    const first = await triggerReindex();
+    const first = await triggerReindex(TEST_REINDEX_TARGET);
     expect(first.status).toBe('running');
 
     await wait(400);
 
-    const second = await triggerReindex();
+    const second = await triggerReindex(TEST_REINDEX_TARGET);
     expect(second.status).toBe('running');
 
     await wait(400);
@@ -635,6 +637,7 @@ async function createProcessScope(lockNamespace: string, timeoutMs?: number) {
   vi.resetModules();
   const mod = await import('../../src/state/adminState.js');
   mod._resetForTest();
+  mod._setReindexRunnerForTest(timedReindexRunner());
   mod._setReindexLockForTest(
     new RedisDistributedLock(sharedRedis, lockNamespace, { timeoutMs }),
   );
@@ -652,6 +655,7 @@ async function createProcessScopeNoLock() {
   vi.resetModules();
   const mod = await import('../../src/state/adminState.js');
   mod._resetForTest();
+  mod._setReindexRunnerForTest(timedReindexRunner());
   // Do NOT set a reindex lock — simulates no Redis configured.
   return {
     triggerReindex: mod.triggerReindex,
@@ -685,6 +689,7 @@ describe.skipIf(!REDIS_INTEGRATION_ENABLED)('Integration: AdminStateLock with re
     vi.resetModules();
     const mod = await import('../../src/state/adminState.js');
     mod._resetForTest({ clearLock: true, clearPersistence: true });
+    mod._setReindexRunnerForTest(timedReindexRunner());
   });
 
   it('serializes reindex triggers across two process instances using real Redis', async () => {
@@ -694,6 +699,7 @@ describe.skipIf(!REDIS_INTEGRATION_ENABLED)('Integration: AdminStateLock with re
       const client = await createRedisClient({ url: REDIS_TEST_URL, enabled: true });
       const mod = await import('../../src/state/adminState.js');
       mod._resetForTest();
+      mod._setReindexRunnerForTest(timedReindexRunner());
       const lock = new RedisDistributedLock(client, lockNamespace, { timeoutMs });
       mod._setReindexLockForTest(lock);
       return { triggerReindex: mod.triggerReindex, getReindexState: mod.getReindexState, client, lock };
@@ -706,12 +712,12 @@ describe.skipIf(!REDIS_INTEGRATION_ENABLED)('Integration: AdminStateLock with re
     const held = await pB.lock.acquire();
 
     // Process A should observe the lock and return idle state.
-    const loser = await pA.triggerReindex();
+    const loser = await pA.triggerReindex(TEST_REINDEX_TARGET);
     expect(loser.status).toBe('idle');
 
     // Release the competing lock and retry — should start running.
     await held.release();
-    const winner = await pA.triggerReindex();
+    const winner = await pA.triggerReindex(TEST_REINDEX_TARGET);
     expect(winner.status).toBe('running');
 
     // Wait for background job to complete and assert final state.

@@ -22,9 +22,15 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+vi.mock('../config/env.js', () => ({
+  getConfig: vi.fn(() => ({ earlyHintsEnabled: true })),
+}));
+
 import { sendEarlyHints } from './earlyHints.js';
 import type { EarlyHintsConfig } from './earlyHints.js';
 import type { Response } from 'express';
+import { mockEarlyHintsConfig } from '../../tests/helpers/earlyHintsConfig.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -67,6 +73,7 @@ describe('sendEarlyHints()', () => {
     // Freeze the event loop scheduler so setImmediate callbacks are NOT
     // executed until we explicitly flush them with vi.runAllTimers().
     vi.useFakeTimers();
+    mockEarlyHintsConfig();
   });
 
   afterEach(() => {

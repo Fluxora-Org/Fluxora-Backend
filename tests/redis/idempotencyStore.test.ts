@@ -88,14 +88,22 @@ describe('RedisIdempotencyStore', () => {
   });
 
   it('forwards the TTL to the Redis client', async () => {
+    const now = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
     const setSpy = vi.spyOn(fake, 'set');
     const entry = makeEntry();
     await store.set('key-ttl', 'tenant-a', entry, 7200);
     expect(setSpy).toHaveBeenCalledWith(
       `${IDEMPOTENCY_KEY_PREFIX}tenant-a:key-ttl`,
       expect.any(String),
-      { ex: 7200 },
+      { pxat: now + 7200 * 1000 },
     );
+    const [, rawPayload] = setSpy.mock.calls[0];
+    expect(JSON.parse(rawPayload)).toEqual({
+      ...entry,
+      version: ENVELOPE_VERSION,
+    });
+    nowSpy.mockRestore();
   });
 
   it('different keys are independent', async () => {
@@ -116,9 +124,10 @@ describe('RedisIdempotencyStore', () => {
     expect(result).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Idempotency store'),
+      undefined,
       expect.objectContaining({
         operation: 'get',
-        keyLength: expect.any(Number),
+        keyLength: 1,
         error: expect.any(String),
       }),
     );
@@ -132,9 +141,10 @@ describe('RedisIdempotencyStore', () => {
     await expect(store.set('k', 'tenant-a', makeEntry(), 60)).resolves.toBeUndefined();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Idempotency store'),
+      undefined,
       expect.objectContaining({
         operation: 'set',
-        keyLength: expect.any(Number),
+        keyLength: 1,
         error: expect.any(String),
       }),
     );
@@ -325,7 +335,12 @@ describe('RedisIdempotencyStore — structured logger', () => {
 
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.stringContaining('Idempotency store'),
-      expect.objectContaining({ operation: 'get' }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 0,
+        error: expect.any(String),
+      }),
     );
   });
 
@@ -357,7 +372,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: expect.stringContaining('version mismatch') }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: expect.stringContaining('version mismatch'),
+      }),
     );
   });
 
@@ -366,7 +386,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: expect.stringContaining('version mismatch') }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: expect.stringContaining('version mismatch'),
+      }),
     );
   });
 
@@ -376,7 +401,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: 'missing version field' }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: 'missing version field',
+      }),
     );
   });
 
@@ -386,7 +416,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: 'missing or invalid requestFingerprint' }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: 'missing or invalid requestFingerprint',
+      }),
     );
   });
 
@@ -396,7 +431,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: 'missing or invalid statusCode' }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: 'missing or invalid statusCode',
+      }),
     );
   });
 
@@ -406,7 +446,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: 'missing body' }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: 'missing body',
+      }),
     );
   });
 
@@ -415,7 +460,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: 'envelope is not an object' }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: 'envelope is not an object',
+      }),
     );
   });
 
@@ -424,7 +474,12 @@ describe('RedisIdempotencyStore — envelope validation', () => {
     expect(await store.get('k', 'tenant-a')).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('envelope validation failed'),
-      expect.objectContaining({ reason: 'invalid JSON' }),
+      undefined,
+      expect.objectContaining({
+        operation: 'get',
+        keyLength: 1,
+        reason: 'invalid JSON',
+      }),
     );
   });
 
@@ -509,13 +564,22 @@ describe('RedisIdempotencyStore — cross-instance replay', () => {
   });
 
   it('TTL is forwarded correctly from config-derived value', async () => {
+    const now = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
     const setSpy = vi.spyOn(sharedFake, 'set');
     const configTtl = 86400; // matches IDEMPOTENCY_TTL_SECONDS default
-    await instanceA.set('key-ttl', 'tenant-a', makeEntry(), configTtl);
+    const entry = makeEntry();
+    await instanceA.set('key-ttl', 'tenant-a', entry, configTtl);
     expect(setSpy).toHaveBeenCalledWith(
       `${IDEMPOTENCY_KEY_PREFIX}tenant-a:key-ttl`,
       expect.any(String),
-      { ex: configTtl },
+      { pxat: now + configTtl * 1000 },
     );
+    const [, rawPayload] = setSpy.mock.calls[0];
+    expect(JSON.parse(rawPayload)).toEqual({
+      ...entry,
+      version: ENVELOPE_VERSION,
+    });
+    nowSpy.mockRestore();
   });
 });

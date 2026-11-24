@@ -97,6 +97,12 @@ Secret values are never included in validation messages.
 
 Booleans accept `true`, `false`, `1`, and `0`.
 
+Integer fields accept trimmed whole-number strings; exponent notation such as
+`1e3` is not an integer input. The generic numeric parser uses `parseFloat`,
+which accepts a numeric prefix (`10kb` parses as `10`), so byte-size fields
+must use their dedicated parser. Byte-size units `kb`, `mb`, and `gb` are
+binary (powers of 1024), and fractional byte results are rounded down.
+
 Connection-pool sizes, acquisition/statement timeouts and retry budgets for
 PostgreSQL, Redis and the Stellar RPC endpoint are collected in
 [connection-limits.md](./connection-limits.md), which is checked against

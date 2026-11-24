@@ -1,9 +1,13 @@
-import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Database migration runner and startup guard.
  *
  * Uses node-pg-migrate to apply migrations to PostgreSQL.
  * Provides checkPendingMigrations() for fail-fast startup validation.
+ *
+ * This module must stay independent of `src/config/env.ts` (directly or via
+ * `config/runtime-env.ts` / `lib/logger.ts`): that module validates every
+ * application secret on import, and the migration job only needs
+ * DATABASE_URL. Settings come from {@link loadMigrationEnv} instead.
  *
  * @module db/migrate
  */
@@ -11,8 +15,14 @@ import { getRuntimeEnv } from '../config/runtime-env.js';
 import { runner } from 'node-pg-migrate';
 import fs from 'fs';
 import pg from 'pg';
-import { info, error as logError } from '../lib/logger.js';
 import path from 'path';
+import {
+  loadMigrationEnv,
+  migrationLogger,
+  type MigrationEnv,
+} from './migration-env.js';
+
+const { info, error: logError } = migrationLogger;
 
 
 const MIGRATIONS_DIR = path.join(__dirname, '../../migrations');
@@ -31,6 +41,17 @@ export class PendingMigrationsError extends Error {
     );
     this.name = 'PendingMigrationsError';
   }
+}
+
+/** pg client settings derived from the migration environment. */
+function clientConfig(env: MigrationEnv): pg.ClientConfig {
+  return {
+    connectionString: env.databaseUrl,
+    ssl: env.ssl,
+    ...(env.connectionTimeoutMillis !== undefined
+      ? { connectionTimeoutMillis: env.connectionTimeoutMillis }
+      : {}),
+  };
 }
 
 /**
@@ -63,8 +84,8 @@ function getMigrationNamesOnDisk(): string[] {
  * Query the pgmigrations table for applied migration names.
  * Returns an empty array if the table does not yet exist (fresh DB).
  */
-async function getAppliedMigrationNames(databaseUrl: string): Promise<string[]> {
-  const client = new pg.Client({ connectionString: databaseUrl });
+async function getAppliedMigrationNames(env: MigrationEnv): Promise<string[]> {
+  const client = new pg.Client(clientConfig(env));
   await client.connect();
   try {
     // Check whether the migrations table exists before querying it.
@@ -129,14 +150,11 @@ export async function getLatestAppliedMigration(
  * Throws PendingMigrationsError if unapplied migrations are found so
  * the server never starts against a stale schema.
  *
- * @throws {Error} When DATABASE_URL is not set.
+ * @throws {MigrationEnvError} When DATABASE_URL is missing or invalid.
  * @throws {PendingMigrationsError} When unapplied migrations exist.
  */
 export async function checkPendingMigrations(): Promise<void> {
-  const databaseUrl = getRuntimeEnv().DATABASE_URL;
-  if (!databaseUrl) {
-    throw new Error('DATABASE_URL environment variable is required');
-  }
+  const env = loadMigrationEnv();
 
   info('Checking for pending migrations...');
 
@@ -148,7 +166,7 @@ export async function checkPendingMigrations(): Promise<void> {
     return;
   }
 
-  const applied = await getAppliedMigrationNames(databaseUrl);
+  const applied = await getAppliedMigrationNames(env);
   const appliedSet = new Set(applied);
   const pending = onDisk.filter((name) => !appliedSet.has(name));
 
@@ -162,20 +180,18 @@ export async function checkPendingMigrations(): Promise<void> {
 }
 
 /**
- * Run all pending migrations
+ * Run all pending migrations.
+ *
+ * @throws {MigrationEnvError} When DATABASE_URL is missing or invalid.
  */
 export async function migrate(): Promise<void> {
-  const databaseUrl = getRuntimeEnv().DATABASE_URL;
-
-  if (!databaseUrl) {
-    throw new Error('DATABASE_URL environment variable is required for migrations');
-  }
+  const env = loadMigrationEnv();
 
   try {
     info('Running database migrations...');
 
     await runner({
-      databaseUrl,
+      databaseUrl: clientConfig(env),
       dir: MIGRATIONS_DIR,
       // Keep the checked-in migration baseline beside the migration files for
       // naming-policy validation, but never ask node-pg-migrate to load JSON
@@ -226,7 +242,31 @@ const isMain =
   process.argv[1]?.endsWith('migrate.ts') ||
   process.argv[1]?.endsWith('migrate.js');
 
-if (isMain) {
+export const MIGRATE_USAGE = `Usage: pnpm run migrate [--help]
+
+Applies all pending migrations in ./migrations (direction: up).
+
+Environment:
+  DATABASE_URL            PostgreSQL connection string (required)
+  DB_CONNECTION_TIMEOUT   Connection timeout in ms, 1000-60000 (optional)
+  DATABASE_SSL            true | false | no-verify (optional, default false)
+
+No application secrets (Stellar, JWT, indexer) are needed.`;
+
+if (isMain && (process.argv.includes('--help') || process.argv.includes('-h'))) {
+  try {
+    // Validate the environment so `--help` doubles as a configuration check.
+    loadMigrationEnv();
+    process.stdout.write(`${MIGRATE_USAGE}
+`);
+    process.exit(0);
+  } catch (err) {
+    process.stdout.write(`${MIGRATE_USAGE}
+`);
+    logError(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+} else if (isMain) {
   migrate()
     .then(() => process.exit(0))
     .catch((err) => {

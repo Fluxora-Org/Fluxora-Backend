@@ -110,7 +110,8 @@ export enum ApiErrorCode {
   TIMESTAMP_OUTSIDE_TOLERANCE = 'timestamp_outside_tolerance',
   PREVIOUS_SECRET_EXPIRED = 'previous_secret_expired',
   SIGNATURE_MISMATCH = 'signature_mismatch',
-  DUPLICATE_DELIVERY = 'duplicate_delivery',
+  DUPLICATE_DELIVERY = 'DUPLICATE_DELIVERY',
+  DUPLICATE_DELIVERY_LOWER = 'duplicate_delivery',
   UNSUPPORTED_VERSION = 'UNSUPPORTED_VERSION',
   IDEMPOTENCY_CONFLICT = 'IDEMPOTENCY_CONFLICT',
 }

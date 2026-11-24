@@ -479,9 +479,9 @@ async function handleGetEvents(
     const result = await runWithCallPolicy(call, () => indexerIngestionService.getEvents(filter));
 
     const events: GrpcStreamEventRecord[] = (result.events ?? []).map((e: import('../db/types.js').StreamEventRecord) => ({
-      eventId: e.eventId ?? '',
+      eventId: (e as unknown as Record<string, unknown>).event_id as string ?? '',
       ledger: (e as unknown as Record<string, unknown>).ledger as number ?? 0,
-      contractId: e.contractId ?? '',
+      contractId: (e as unknown as Record<string, unknown>).contract_id as string ?? '',
       topic: (e as unknown as Record<string, unknown>).topic as string ?? '',
       txHash: (e as unknown as Record<string, unknown>).tx_hash as string ?? '',
       payloadJson: JSON.stringify((e as unknown as Record<string, unknown>).payload ?? {}),

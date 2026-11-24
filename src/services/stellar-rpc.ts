@@ -31,6 +31,7 @@ import {
 } from '../redis/rpcFallbackCache.js';
 import { createRedisClient } from '../redis/client.js';
 import {
+  getRpcProviderLabelFromEndpoint,
   rpcCircuitOpenFallbackHitsTotal,
   rpcCircuitOpenFallbackMissesTotal,
   rpcFallbackCacheEarlyRefreshesTotal,
@@ -896,6 +897,7 @@ export function getStellarRpcService(getClient?: () => RawRpcClient): StellarRpc
       fallbackCache: redisFallbackCache,
       healthCheckIntervalMs: config.rpcHealthCheckIntervalMs,
       healthCheckFailureThreshold: config.rpcHealthCheckFailureThreshold,
+      providerLabel: getRpcProviderLabelFromEndpoint(config.stellarRpcUrl),
     });
     const intervalMs = config.rpcHealthCheckIntervalMs;
     if (intervalMs > 0) {

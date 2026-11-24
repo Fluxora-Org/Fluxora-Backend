@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createIdempotencyMiddleware, hashBody, canonicalizeBody } from '../middleware/idempotency.js';
 import { InMemoryIdempotencyStore } from '../redis/idempotencyStore.js';
+import { ApiErrorCode } from '../middleware/errorHandler.js';
 
 function mockRes() {
   const res: any = {
@@ -82,10 +83,10 @@ describe('idempotency collision detection', () => {
 
     expect(next2).not.toHaveBeenCalled();
     expect(res2.statusCode).toBe(409);
-    expect((res2.body as any).error).toBe('idempotency_conflict');
-    expect(typeof (res2.body as any).stored_hash).toBe('string');
-    expect(typeof (res2.body as any).incoming_hash).toBe('string');
-    expect((res2.body as any).stored_hash).not.toBe((res2.body as any).incoming_hash);
+    expect((res2.body as any).error.code).toBe(ApiErrorCode.IDEMPOTENCY_CONFLICT);
+    expect(typeof (res2.body as any).error.details.storedHash).toBe('string');
+    expect(typeof (res2.body as any).error.details.incomingHash).toBe('string');
+    expect((res2.body as any).error.details.storedHash).not.toBe((res2.body as any).error.details.incomingHash);
     // The two bodies must hash differently (the root cause of the conflict).
     expect(hashBody({ amount: 10 })).not.toBe(hashBody({ amount: 999 }));
   });

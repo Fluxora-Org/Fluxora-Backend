@@ -221,9 +221,10 @@ describe('CORS Input Validation and Middleware', () => {
       expect(isOriginAllowed('null', allowed)).toBe(false);
     });
 
-    it('throws CorsValidationError for malformed origin passed to isOriginAllowed', () => {
+    it('returns false without throwing for malformed origin passed to isOriginAllowed', () => {
       const allowed = new Set(['https://app.fluxora.io']);
-      expect(() => isOriginAllowed('malformed-origin', allowed)).toThrow(CorsValidationError);
+      expect(isOriginAllowed('malformed-origin', allowed)).toBe(false);
+      expect(isOriginAllowed('*', allowed)).toBe(false);
     });
   });
 

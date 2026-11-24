@@ -10,7 +10,9 @@ import {
   AGGREGATE_ROUTE,
 } from '../../src/middleware/rateLimiter.js';
 import { getClientIp } from '../../src/ws/connectionLimiter.js';
-import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
+import { InMemoryStore, HybridStore } from '../../src/redis/rateLimitStore.js';
+import * as redisClientModule from '../../src/redis/client.js';
+import type { RedisClient } from '../../src/redis/client.js';
 import * as overrideService from '../../src/services/tenantRateLimitOverride.service.js';
 import { requestRefusedTotal, deRegisterRequestProtectionMetrics } from '../../src/metrics/requestProtectionMetrics.js';
 import { registry } from '../../src/metrics.js';
@@ -217,8 +219,10 @@ describe('rate limiter middleware', () => {
       expect.objectContaining({
         error: expect.objectContaining({
           code: 'RATE_LIMIT_EXCEEDED',
-          limit: 3,
-          window: 'minute',
+          details: expect.objectContaining({
+            limit: 3,
+            window: 'minute',
+          }),
         }),
       })
     );
@@ -230,6 +234,11 @@ describe('rate limiter middleware', () => {
     const res = mockResponse();
     const next = mockNext();
 
+    // Capture baseline before triggering the rate limit
+    const before = await requestRefusedTotal.get();
+    const beforeValue =
+      before.values.find((m) => m.labels.reason === 'rate_limit_exceeded')?.value ?? 0;
+
     // Hit limit: 3 requests
     for (let i = 0; i < 3; i++) {
       await invoke(limiter, req, res, next);
@@ -239,11 +248,10 @@ describe('rate limiter middleware', () => {
     const fourthNext = mockNext();
     await invoke(limiter, req, res, fourthNext);
 
-    const metric = await registry.getSingleMetric('fluxora_request_refused_total');
-    const metricValue = (metric as any).get();
-    const rateLimitExceededValue = metricValue.find((m: any) => m.values.reason === 'rate_limit_exceeded');
+    const metric = await requestRefusedTotal.get();
+    const rateLimitExceededValue = metric.values.find((m) => m.labels.reason === 'rate_limit_exceeded');
     expect(rateLimitExceededValue).toBeDefined();
-    expect(rateLimitExceededValue.value).toBe(1);
+    expect(rateLimitExceededValue!.value).toBe(beforeValue + 1);
   });
 
   it('applies separate counters for different IPs', async () => {
@@ -742,5 +750,140 @@ describe('getStatus', () => {
     const status = await limiter.getStatus('my-very-long-api-key-12345', 'apiKey');
     expect(status.identifier).toBe('my-v...2345');
     expect(status.identifierType).toBe('apiKey');
+  });
+});
+
+describe('rate limiter — atomic primary attachment before Redis is ready', () => {
+  function createMockRedisClient(): RedisClient {
+    const sortedSets = new Map<string, Map<string, number>>();
+
+    return {
+      multi() {
+        const ops: Array<() => unknown> = [];
+        const chain = {
+          zadd(key: string, _nx: string, score: number, member: string) {
+            ops.push(() => {
+              let set = sortedSets.get(key);
+              if (!set) {
+                set = new Map();
+                sortedSets.set(key, set);
+              }
+              if (!set.has(member)) set.set(member, score);
+              return 1;
+            });
+            return chain;
+          },
+          zremrangebyscore(key: string, _min: string | number, max: number) {
+            ops.push(() => {
+              const set = sortedSets.get(key);
+              if (!set) return 0;
+              let removed = 0;
+              for (const [m, s] of set) {
+                if (s <= max) {
+                  set.delete(m);
+                  removed++;
+                }
+              }
+              return removed;
+            });
+            return chain;
+          },
+          zcard(key: string) {
+            ops.push(() => sortedSets.get(key)?.size ?? 0);
+            return chain;
+          },
+          pexpire(_key: string, _ms: number) {
+            ops.push(() => 1);
+            return chain;
+          },
+          async exec() {
+            return ops.map((op) => [null, op()] as [Error | null, unknown]);
+          },
+        };
+        return chain;
+      },
+      async zcount(key: string, min: number | string, _max: number | string) {
+        const set = sortedSets.get(key);
+        if (!set) return 0;
+        const minNum = typeof min === 'number' ? min : Number(min);
+        let count = 0;
+        for (const score of set.values()) {
+          if (score >= minNum) count++;
+        }
+        return count;
+      },
+      close: vi.fn().mockResolvedValue(undefined),
+    } as unknown as RedisClient;
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('preserves counts across atomic primary attachment when early requests arrive before Redis is ready', async () => {
+    let resolveRedis!: (client: RedisClient) => void;
+    const redisPromise = new Promise<RedisClient>((resolve) => {
+      resolveRedis = resolve;
+    });
+
+    vi.spyOn(redisClientModule, 'createRedisClient').mockReturnValue(redisPromise);
+
+    const env: Record<string, string | undefined> = {
+      RATE_LIMIT_ENABLED: 'true',
+      RATE_LIMIT_IP_MAX: '3',
+      RATE_LIMIT_IP_WINDOW_MS: '60000',
+      RATE_LIMIT_TRUST_PROXY: 'false',
+      REDIS_ENABLED: 'true',
+      REDIS_URL: 'redis://localhost:6379',
+    };
+
+    const limiter = createRateLimiter(env);
+    const initialStore = limiter.store;
+    expect(initialStore).toBeInstanceOf(HybridStore);
+
+    const req = mockRequest({ headers: {}, ip: '10.20.30.40' });
+
+    // First 2 requests arrive BEFORE Redis is ready — counted in fallback
+    const res1 = mockResponse();
+    await invoke(limiter, req, res1, mockNext());
+    expect(res1.setHeader).toHaveBeenCalledWith('X-RateLimit-Store', 'memory');
+    expect(res1.setHeader).toHaveBeenCalledWith('X-RateLimit-Remaining', '2');
+
+    const res2 = mockResponse();
+    await invoke(limiter, req, res2, mockNext());
+    expect(res2.setHeader).toHaveBeenCalledWith('X-RateLimit-Store', 'memory');
+    expect(res2.setHeader).toHaveBeenCalledWith('X-RateLimit-Remaining', '1');
+
+    // Now Redis becomes ready and attaches atomically to the same HybridStore
+    const mockClient = createMockRedisClient();
+    resolveRedis(mockClient);
+    await redisPromise;
+    await Promise.resolve(); // flush .then() microtask
+
+    // Store reference must remain the exact same HybridStore instance (no swap)
+    expect(limiter.store).toBe(initialStore);
+
+    // 3rd request goes to Redis primary, and MUST include the 2 pre-attach counts
+    const res3 = mockResponse();
+    const next3 = mockNext();
+    await invoke(limiter, req, res3, next3);
+    expect(next3).toHaveBeenCalled();
+    expect(res3.setHeader).toHaveBeenCalledWith('X-RateLimit-Store', 'redis');
+    expect(res3.setHeader).toHaveBeenCalledWith('X-RateLimit-Remaining', '0');
+
+    // 4th request MUST be rejected with 429 (counts were not lost across switch)
+    const res4 = mockResponse();
+    const next4 = mockNext();
+    await invoke(limiter, req, res4, next4);
+    expect(next4).not.toHaveBeenCalled();
+    expect(res4.status).toHaveBeenCalledWith(429);
+
+    // getStatus also reflects the combined count on Redis
+    const status = await limiter.getStatus('10.20.30.40', 'ip', '/__rate-limit-test__');
+    expect(status.store).toBe('redis');
+    expect(status.remaining).toBe(0);
+
+    await limiter.close();
+    expect(mockClient.close).toHaveBeenCalledTimes(1);
   });
 });
