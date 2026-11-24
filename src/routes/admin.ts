@@ -292,7 +292,7 @@ adminRouter.post('/ws/disconnect', async (req, res) => {
       closeCode: 4000,
       closeReason: 'admin-forced-disconnect',
     });
-  } catch (err) {
+  } catch {
     res
       .status(503)
       .json(
@@ -489,10 +489,7 @@ adminRouter.delete('/api-keys/:id', async (req, res) => {
 adminRouter.get('/ban-store/status', (req, res) => {
   const requestId = req.correlationId;
   try {
-    const status =
-      typeof getHybridBanStoreStatus === 'function'
-        ? getHybridBanStoreStatus()
-        : { available: false, reason: 'getHybridBanStoreStatus not implemented' };
+    const status = getHybridBanStoreStatus();
     res.json(successResponse({ banStore: status }, requestId));
   } catch (err) {
     res

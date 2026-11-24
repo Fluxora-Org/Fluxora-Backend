@@ -1564,6 +1564,41 @@ const DeprecatedRouteEntry = registry.register(
 
 registry.registerPath({
   method: 'get',
+  path: '/api/admin/ban-store/status',
+  summary: 'Ban store health',
+  description:
+    'Reports whether the global HybridBanStore is initialised (`available`) and whether it is ' +
+    'currently serving bans from its in-memory fallback because Redis is unreachable (`usingFallback`).',
+  tags: ['admin'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    '200': successResponse(
+      z.object({
+        banStore: z.object({
+          available: z.boolean().openapi({
+            description: 'True once the global HybridBanStore has been initialised',
+          }),
+          usingFallback: z.boolean().openapi({
+            description: 'True while bans are served from the in-memory fallback instead of Redis',
+          }),
+        }),
+      }),
+      {
+        success: true,
+        data: { banStore: { available: true, usingFallback: false } },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+      },
+      'Ban store status'
+    ),
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+    '406': errorResponses['406'],
+    '503': errorResponses['503'],
+  },
+});
+
+registry.registerPath({
+  method: 'get',
   path: '/api/admin/deprecations',
   summary: 'List deprecated routes',
   description: 'Returns all registered deprecated routes with their sunset dates and computed daysUntilSunset. Past-sunset entries have negative daysUntilSunset.',
