@@ -349,6 +349,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
  * List outbox items (for monitoring)
  */
 webhooksRouter.get('/outbox', (req, res) => {
+  const requestId = req.correlationId;
   // #1555: the outbox is an unbounded queue, so this listing is paginated
   // (limit 1–100, default 100) instead of returning every item. The default
   // keeps existing callers with ≤ 100 items seeing the same list.
@@ -850,6 +851,7 @@ webhooksRouter.post('/retry', express.json(), async (req, res) => {
  * Clean up old webhook data (internal endpoint for maintenance)
  */
 webhooksRouter.post('/cleanup', express.json(), (req, res) => {
+  const requestId = req.correlationId;
   const { olderThanDays = 7 } = req.body ?? {};
   if (
     typeof olderThanDays !== 'number' ||

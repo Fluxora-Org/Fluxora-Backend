@@ -306,8 +306,8 @@ describe('GET /deliveries — functional', () => {
   it('returns an empty deliveries list initially', async () => {
     const res = await authed(request(app).get(`${BASE}/deliveries`));
     expect(res.status).toBe(200);
-    expect(res.body.total).toBe(0);
-    expect(res.body.deliveries).toEqual([]);
+    expect(res.body.data.total).toBe(0);
+    expect(res.body.data.deliveries).toEqual([]);
   });
 });
 
@@ -315,8 +315,8 @@ describe('GET /outbox — functional', () => {
   it('returns an empty outbox', async () => {
     const res = await authed(request(app).get(`${BASE}/outbox`));
     expect(res.status).toBe(200);
-    expect(res.body.total).toBe(0);
-    expect(res.body.items).toEqual([]);
+    expect(res.body.data.total).toBe(0);
+    expect(res.body.data.items).toEqual([]);
   });
 });
 
@@ -324,8 +324,8 @@ describe('GET /dlq — functional', () => {
   it('returns an empty DLQ', async () => {
     const res = await authed(request(app).get(`${BASE}/dlq`));
     expect(res.status).toBe(200);
-    expect(res.body.total).toBe(0);
-    expect(res.body.items).toEqual([]);
+    expect(res.body.data.total).toBe(0);
+    expect(res.body.data.items).toEqual([]);
   });
 });
 
@@ -333,9 +333,9 @@ describe('GET /metrics — functional', () => {
   it('returns metric fields', async () => {
     const res = await authed(request(app).get(`${BASE}/metrics`));
     expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('totalDeliveries');
-    expect(res.body).toHaveProperty('successRate');
-    expect(res.body).toHaveProperty('failureRate');
+    expect(res.body.data).toHaveProperty('totalDeliveries');
+    expect(res.body.data).toHaveProperty('successRate');
+    expect(res.body.data).toHaveProperty('failureRate');
   });
 });
 
@@ -343,7 +343,7 @@ describe('GET /circuit-breakers — functional', () => {
   it('returns empty states without endpointUrl param', async () => {
     const res = await authed(request(app).get(`${BASE}/circuit-breakers`));
     expect(res.status).toBe(200);
-    expect(res.body.total).toBe(0);
+    expect(res.body.data.total).toBe(0);
   });
 });
 
@@ -356,8 +356,8 @@ describe('POST /process-outbox — functional', () => {
         .send({})
     );
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.processed).toBe(0);
+    expect(res.body.data.processed).toBe(0);
+    expect(res.body.data.errors).toBe(0);
   });
 
   it('processes outbox items and removes them', async () => {
@@ -383,9 +383,8 @@ describe('POST /process-outbox — functional', () => {
         .send({})
     );
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.processed).toBe(1);
-    expect(res.body.total).toBe(1);
+    expect(res.body.data.processed).toBe(1);
+    expect(res.body.data.total).toBe(1);
   });
 });
 
@@ -411,8 +410,8 @@ describe('POST /cleanup — functional', () => {
         .send({ olderThanDays: 7 })
     );
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body).toHaveProperty('cleaned');
+    expect(res.body.data).toHaveProperty('cleaned');
+    expect(res.body.data.olderThanDays).toBe(7);
   });
 });
 
@@ -472,7 +471,7 @@ describe('Removal of ad-hoc secret checks', () => {
         .send({})
     );
     expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
+    expect(res.body.data.processed).toBe(0);
   });
 
   it('POST /retry no longer requires ?secret= query param', async () => {
