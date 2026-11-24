@@ -105,7 +105,7 @@ export function errorHandler(
         errorResponse(apiErr.code ?? ApiErrorCode.INTERNAL_ERROR, apiErr.message, apiErr.details, requestId)
       );
     } else {
-      res.status(err.statusCode).json(
+      res.status(apiErr.statusCode).json(
         errorResponse(ApiErrorCode.INTERNAL_ERROR, 'Internal server error', undefined, requestId)
       );
     }

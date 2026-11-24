@@ -105,4 +105,14 @@ export const infrastructureEnvSchema = {
    * @default 500
    */
   DLQ_PURGE_BATCH_SIZE: integerEnv('DLQ_PURGE_BATCH_SIZE', 1, 5000).default(500),
+
+  /**
+   * Partition lead time in whole calendar months for the partition maintenance job.
+   * Ensures monthly partitions exist for the current month plus this many months ahead.
+   * @default 3
+   */
+  PARTITION_MAINTENANCE_LEAD_TIME_MONTHS: integerEnv(
+    'PARTITION_MAINTENANCE_LEAD_TIME_MONTHS',
+    0
+  ).default(3),
 };

@@ -80,14 +80,7 @@ webhooksRouter.post(
     const headers = req.headers as Record<string, string | undefined>;
     const contentType = headers['content-type'];
 
-    // 1. Shared Preflight (size, depth, encoding, valid json)
-    const preflight = checkWebhookPreflight(rawBody, contentType);
-    if (!preflight.ok) {
-      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
-      return;
-    }
-
-    // 2. Signature verification
+    // Verify the sender before returning content-type or payload validation errors.
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
@@ -139,6 +132,12 @@ webhooksRouter.post(
 
     if (!verification.ok) {
       res.status(verification.status).json(errorResponse(verification.code, verification.message, undefined, req.correlationId));
+      return;
+    }
+
+    const preflight = checkWebhookPreflight(rawBody, contentType);
+    if (!preflight.ok) {
+      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
       return;
     }
 
@@ -852,6 +851,7 @@ webhooksRouter.post('/retry', express.json(), async (req, res) => {
  * Clean up old webhook data (internal endpoint for maintenance)
  */
 webhooksRouter.post('/cleanup', express.json(), (req, res) => {
+  const requestId = req.id;
   const requestId = req.correlationId;
   const { olderThanDays = 7 } = req.body ?? {};
   if (
@@ -860,12 +860,14 @@ webhooksRouter.post('/cleanup', express.json(), (req, res) => {
     olderThanDays < 0 ||
     !Number.isInteger(olderThanDays)
   ) {
-    res.status(400).json({
-      error: {
-        code: 'INVALID_CLEANUP_REQUEST',
-        message: 'olderThanDays must be a non-negative integer',
-      },
-    });
+    res.status(400).json(
+      errorResponse(
+        'INVALID_CLEANUP_REQUEST',
+        'olderThanDays must be a non-negative integer',
+        undefined,
+        requestId
+      )
+    );
     return;
   }
   const olderThanMs = olderThanDays * 24 * 60 * 60 * 1000;

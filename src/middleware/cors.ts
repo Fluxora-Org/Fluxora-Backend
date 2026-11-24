@@ -1,5 +1,6 @@
 import { ApiError, ApiErrorCode } from '../errors.js';
 import { getRuntimeEnv } from '../config/runtime-env.js';
+import { logger } from '../lib/logger.js';
 import { errorResponse } from '../utils/response.js';
 
 export type CorsRequest = {
@@ -216,7 +217,18 @@ export function validateRequestMethod(method: unknown): string | undefined {
 }
 
 export function isOriginAllowed(origin: string, allowedOrigins: Set<string>): boolean {
-  validateOrigin(origin);
+  try {
+    validateOrigin(origin);
+  } catch (err) {
+    if (err instanceof CorsValidationError) {
+      logger.debug('CORS origin rejected during allowlist check', {
+        reason: err.reason,
+        message: err.message,
+      });
+      return false;
+    }
+    throw err;
+  }
   return origin !== 'null' && !origin.includes('*') && allowedOrigins.has(origin);
 }
 

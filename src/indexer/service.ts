@@ -1,7 +1,15 @@
 // Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import pg from 'pg';
 import { db } from '../db/client.js';
-import { config } from '../config.js';
+import { getConfig, loadConfig, type Config } from '../config/env.js';
+
+function resolveConfig(): Config {
+  try {
+    return getConfig();
+  } catch {
+    return loadConfig();
+  }
+}
 import { ReplayCursor, ReplayProgress, ReplayRequest } from '../types/index.js';
 import { logger } from '../lib/logger.js';
 import {
@@ -102,16 +110,17 @@ export class IndexerService {
     // Use the injected pool or fall back to the shared db pool.
     // Accessing db.pool directly is avoided to keep the service testable.
     this.pool = pool ?? (db as unknown as { pool: pg.Pool }).pool;
-    this.maxRangeBlocks = maxRangeBlocks ?? config.indexer.maxRangeBlocks;
-    this.replayBudgetMs = replayBudgetMs ?? config.indexer.replayBudgetMs;
+    const cfg = resolveConfig();
+    this.maxRangeBlocks = maxRangeBlocks ?? cfg.indexerMaxReplayRangeBlocks;
+    this.replayBudgetMs = replayBudgetMs ?? cfg.indexerReplayBudgetMs;
     this.cursorRepo = cursorRepo ?? new ReplayCursorRepository();
     this.progressRepo = new ReplayProgressCheckpointRepository();
     this.batchRunner = new ReplayBatchRunner(
       this.pool,
       this.cursorRepo,
       this.progressRepo,
-      batchSize ?? config.indexer.replayBatchSize,
-      replayStopForcedTimeoutMs ?? config.indexer.replayStopForcedTimeoutMs,
+      batchSize ?? cfg.indexerReplayBatchSize,
+      replayStopForcedTimeoutMs ?? cfg.indexerReplayStopForcedTimeoutMs,
     );
     // Only stored when explicitly injected (tests). Otherwise every call
     // resolves the *current* default via getLeaderElection() below —

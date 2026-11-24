@@ -301,6 +301,8 @@ Webhook consumers verify incoming requests by recomputing the HMAC-SHA256 signat
 4. Compute the expected signature and compare using a constant-time comparison (`timingSafeEqual` over HMAC-hashed inputs) to prevent timing attacks.
 5. If `isDuplicateDelivery(deliveryId)` returns true, reject with `409 duplicate_delivery`.
 
+The inbound `POST /internal/webhooks/receive` route verifies the signature before checking the content type or parsing the JSON payload. Consequently, an invalid signature returns `401` even when the request has an unsupported content type; a correctly signed request with an unsupported content type returns `415`. After successful verification and payload validation, repeated delivery IDs return `409` with code `DUPLICATE_DELIVERY`.
+
 ### Secret rotation grace window
 
 When a webhook consumer rotates its signing secret via the admin API, there is a transition period during which some producers may still be signing with the old secret. To avoid spurious verification failures, the verification path supports a **bounded dual-secret grace window**:

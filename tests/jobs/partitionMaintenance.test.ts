@@ -14,7 +14,12 @@ import {
   partitionMaintenanceBehindScheduleTotal,
   partitionMaintenanceFailuresTotal,
 } from '../../src/metrics/businessMetrics.js';
-import { config } from '../../src/config.js';
+import {
+  EnvironmentError,
+  initializeConfig,
+  loadConfig,
+  resetConfig,
+} from '../../src/config/env.js';
 import { setAlertSink, type AlertEvent } from '../../src/lib/alerts.js';
 
 // ── Mock pool builder ─────────────────────────────────────────────────────
@@ -636,14 +641,20 @@ describe('runPartitionMaintenance', () => {
   // ── Lead time (documented interval ahead of use) ──────────────────────────
 
   describe('lead time', () => {
-    let originalLeadTime: number;
+    const originalEnvValue = process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'];
 
     beforeEach(() => {
-      originalLeadTime = config.partitionMaintenance.leadTimeMonths;
+      resetConfig();
+      delete process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'];
     });
 
     afterEach(() => {
-      config.partitionMaintenance.leadTimeMonths = originalLeadTime;
+      resetConfig();
+      if (originalEnvValue === undefined) {
+        delete process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'];
+      } else {
+        process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'] = originalEnvValue;
+      }
     });
 
     it('creates the current month plus every month inside the requested lead time', async () => {
@@ -655,8 +666,9 @@ describe('runPartitionMaintenance', () => {
       expect(calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'))).toHaveLength(6);
     });
 
-    it('defaults the lead time to config.partitionMaintenance.leadTimeMonths', async () => {
-      config.partitionMaintenance.leadTimeMonths = 5;
+    it('defaults the lead time to config.partitionMaintenanceLeadTimeMonths', async () => {
+      process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'] = '5';
+      initializeConfig();
       const { pool, calls } = buildMockPool();
 
       const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
@@ -665,17 +677,14 @@ describe('runPartitionMaintenance', () => {
       expect(calls.filter((c) => c.sql.includes('CREATE TABLE IF NOT EXISTS'))).toHaveLength(6);
     });
 
-    it('falls back to DEFAULT_LEAD_TIME_MONTHS when the configured lead time is invalid', async () => {
-      config.partitionMaintenance.leadTimeMonths = -3;
-      const { pool } = buildMockPool();
-
-      const result = await runPartitionMaintenance(pool, { now: FIXED_NOW });
-
-      expect(result.leadTimeMonths).toBe(DEFAULT_LEAD_TIME_MONTHS);
+    it('rejects an invalid PARTITION_MAINTENANCE_LEAD_TIME_MONTHS at config load time', () => {
+      process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'] = '-3';
+      expect(() => loadConfig()).toThrow(EnvironmentError);
     });
 
     it('still honours the deprecated monthsAhead option (same meaning)', async () => {
-      config.partitionMaintenance.leadTimeMonths = 4;
+      process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'] = '4';
+      initializeConfig();
       const { pool } = buildMockPool();
 
       const result = await runPartitionMaintenance(pool, { now: FIXED_NOW, monthsAhead: 1 });
@@ -697,15 +706,12 @@ describe('runPartitionMaintenance', () => {
       );
     });
 
-    it('reads the lead time from PARTITION_MAINTENANCE_LEAD_TIME_MONTHS', async () => {
-      vi.resetModules();
+    it('reads the lead time from PARTITION_MAINTENANCE_LEAD_TIME_MONTHS', () => {
       process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'] = '5';
 
-      const fresh = await import('../../src/config.js');
+      const fresh = loadConfig();
 
-      expect(fresh.config.partitionMaintenance.leadTimeMonths).toBe(5);
-      delete process.env['PARTITION_MAINTENANCE_LEAD_TIME_MONTHS'];
-      vi.resetModules();
+      expect(fresh.partitionMaintenanceLeadTimeMonths).toBe(5);
     });
 
     it('keeps DEFAULT_MONTHS_AHEAD as a backwards-compatible alias', () => {
