@@ -63,7 +63,7 @@ export function listStreams(
 
 /** One unfiltered page of the export walk, keyed after `afterId`. */
 export function fetchExportPage(afterId: string | undefined): Promise<StreamPage> {
-  return streamRepository.findWithCursor([], EXPORT_PAGE_SIZE, afterId);
+  return streamRepository.findWithCursor(buildStreamFilter({}), EXPORT_PAGE_SIZE, afterId);
 }
 
 /**

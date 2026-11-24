@@ -35,4 +35,10 @@ describe('404 catch-all handler', () => {
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe('NOT_FOUND');
   });
+
+  it('returns 404 for removed /internal/unwrapped/events route', async () => {
+    const res = await request(app).get('/internal/unwrapped/events');
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+  });
 });

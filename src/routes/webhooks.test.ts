@@ -5,6 +5,7 @@ import { webhooksRouter, setInboundWebhookDedupCache, getInboundWebhookDedupCach
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { computeWebhookSignature } from '../webhooks/signature.js';
 import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
+import { isErrorEnvelope } from '../utils/response.js';
 
 function makeApp() {
   const app = express();
@@ -75,15 +76,33 @@ describe('Webhooks Route Early-Return Safeguards & Error Paths', () => {
       const res = await request(app)
         .post('/internal/webhooks/receive')
         .set('x-fluxora-delivery-id', 'deliv_bad')
-        .set('x-fluxora-timestamp', '12345')
+        .set('x-fluxora-timestamp', Math.floor(Date.now() / 1000).toString())
         .set('x-fluxora-signature', 'invalid-sig')
+        .set('Content-Type', 'text/plain')
         .send('{}');
 
       expect(res.status).toBe(401);
       expect(res.body).toHaveProperty('error');
-      // Verify dedup cache was NOT populated
       const isNew = await cache.add('webhook', 'deliv_bad');
       expect(isNew).toBe(true);
+    });
+
+    it('checks content type after a valid signature', async () => {
+      const app = makeApp();
+      const payload = '{}';
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const signature = computeWebhookSignature('test-secret', timestamp, payload);
+
+      const res = await request(app)
+        .post('/internal/webhooks/receive')
+        .set('x-fluxora-delivery-id', 'deliv_wrong_content_type')
+        .set('x-fluxora-timestamp', timestamp)
+        .set('x-fluxora-signature', signature)
+        .set('Content-Type', 'text/plain')
+        .send(payload);
+
+      expect(res.status).toBe(415);
+      expect(await getInboundWebhookDedupCache().add('webhook', 'deliv_wrong_content_type')).toBe(true);
     });
   });
 
@@ -180,6 +199,109 @@ describe('Webhooks Route Early-Return Safeguards & Error Paths', () => {
       expect(res.status).toBe(401);
       expect(res.body).toHaveProperty('error');
       expect(res.body.error).toHaveProperty('code');
+    });
+  });
+
+  describe('POST /internal/webhooks/cleanup', () => {
+    it('returns standard error envelope when olderThanDays is a string', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-string';
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .send({ olderThanDays: '7' });
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-string',
+        },
+      });
+    });
+
+    it('returns standard error envelope when olderThanDays is negative', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-negative';
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .send({ olderThanDays: -1 });
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-negative',
+        },
+      });
+    });
+
+    it('returns standard error envelope when olderThanDays is a float', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-float';
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .send({ olderThanDays: 1.5 });
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-float',
+        },
+      });
+    });
+
+    it('returns standard error envelope when olderThanDays is NaN', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-nan';
+        req.body = { olderThanDays: Number.NaN };
+        (req as express.Request & { _body?: boolean })._body = true;
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-nan',
+        },
+      });
     });
   });
 });

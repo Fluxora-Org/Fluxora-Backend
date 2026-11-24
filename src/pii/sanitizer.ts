@@ -30,7 +30,10 @@ const STELLAR_KEY_GLOBAL_RE = /G[A-Z2-7]{55}/g;
  * "Authorization header must use Bearer scheme.".
  */
 const BEARER_TOKEN_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}(?=\s|$|["'\]])/gi;
-const SENSITIVE_STRING_FIELD_RE = /(password|secret|token|credential|authorization|api[-_]?key|payload|body|query|database[-_]?id|row[-_]?id)\s*[:=]\s*(['"]?)[^\s,'"}]+\2/gi;
+const SENSITIVE_STRING_FIELD_RE =
+  /(password|secret|token|credential|authorization|api[-_]?key|cookie|session|bearer)\s*[:=]\s*(['"]?)(?:\[[^\]\s]+\]|[^\s,'"}\]]+)\2/gi;
+const SENSITIVE_BLOB_FIELD_RE =
+  /(payload|body|query|database[-_]?id|row[-_]?id)\s*[:=]\s*(['"]?).+/gi;
 
 /**
  * Masks a Stellar public key, preserving the first 4 and last 4
@@ -54,6 +57,26 @@ export function isStellarKey(value: string): boolean {
   return STELLAR_KEY_RE.test(value);
 }
 
+function redactSensitiveAssignmentValues(input: string): string {
+  const withAuthBearer = input.replace(
+    /(authorization|bearer)\s*[:=]\s*(['"]?)Bearer\s+[A-Za-z0-9._~+/=-]{8,}\2/gi,
+    (_match, key: string) => `${key}: [REDACTED]`,
+  );
+  const withMaskedValues = withAuthBearer.replace(
+    SENSITIVE_STRING_FIELD_RE,
+    (match, key: string, quote: string) => {
+      const valueMatch = match.match(/[:=]\s*(['"]?)(\[[^\]\s]+\]|[^\s,'"}\]]+)\1\s*$/i);
+      const value = valueMatch?.[2] ?? '';
+      if (value === '[REDACTED]' || value === '[REDACTED_SECRET]') {
+        return `${key}: ${quote}${value}${quote}`;
+      }
+      const redactedValue = isStellarKey(value) ? maskStellarKey(value) : REDACTED;
+      return `${key}: ${quote}${redactedValue}${quote}`;
+    },
+  );
+  return withMaskedValues.replace(SENSITIVE_BLOB_FIELD_RE, '$1: [REDACTED]');
+}
+
 /**
  * Scans a free-form string for Stellar public keys and replaces
  * each occurrence with a masked version. Handles keys embedded
@@ -61,10 +84,11 @@ export function isStellarKey(value: string): boolean {
  */
 export function redactKeysInString(input: string): string {
   return redactSecretsInString(
-    input
-      .replace(STELLAR_KEY_GLOBAL_RE, (match) => maskStellarKey(match))
-      .replace(BEARER_TOKEN_RE, 'Bearer [REDACTED]')
-      .replace(SENSITIVE_STRING_FIELD_RE, '$1: [REDACTED]'),
+    redactSensitiveAssignmentValues(
+      input
+        .replace(STELLAR_KEY_GLOBAL_RE, (match) => maskStellarKey(match))
+        .replace(BEARER_TOKEN_RE, 'Bearer [REDACTED]'),
+    ),
   );
 }
 
@@ -109,7 +133,18 @@ export function sanitizeError(error: Error): Record<string, unknown> {
   // Copy any additional error properties
   for (const [key, value] of Object.entries(error)) {
     if (!['name', 'message', 'stack'].includes(key)) {
-      result[key] = sanitizeValue(value, fields);
+      if (fields.has(key.toLowerCase())) {
+        if (typeof value === 'string') {
+          result[key] = isStellarKey(value) ? maskStellarKey(value) : REDACTED;
+        } else if (Array.isArray(value) || (typeof value === 'object' && value !== null)) {
+          sanitizeValue(value, fields);
+          result[key] = REDACTED;
+        } else {
+          result[key] = REDACTED;
+        }
+      } else {
+        result[key] = sanitizeValue(value, fields);
+      }
     }
   }
 
@@ -144,7 +179,10 @@ function sanitizeValue(value: unknown, fields: Set<string>): unknown {
         // IMPORTANT: we never call Number() or parseFloat() here —
         // decimal strings must remain strings.
         if (typeof val === 'string') {
-          result[key] = maskStellarKey(val);
+          result[key] = isStellarKey(val) ? maskStellarKey(val) : REDACTED;
+        } else if (Array.isArray(val) || (typeof val === 'object' && val !== null)) {
+          sanitizeValue(val, fields);
+          result[key] = REDACTED;
         } else {
           result[key] = REDACTED;
         }

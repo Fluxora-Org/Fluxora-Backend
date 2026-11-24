@@ -3,6 +3,7 @@ import request from 'supertest';
 import { app } from '../../src/app.js';
 import { resetStreamIdempotencyStore } from '../../src/routes/streams.js';
 import { streamRepository } from '../../src/db/repositories/streamRepository.js';
+import { EXPORT_PAGE_SIZE, fetchExportPage } from '../../src/db/repositories/streamApiQueries.js';
 
 // Mock repository
 vi.mock('../../src/db/repositories/streamRepository.js', () => ({
@@ -135,5 +136,35 @@ describe('GET /api/streams/export', () => {
       .get('/api/streams/export')
       .set('x-api-key', 'valid-api-key');
     expect(res.status).toBe(403);
+  });
+});
+
+describe('fetchExportPage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('passes an empty filter object and forwards afterId to findWithCursor', async () => {
+    const page = { streams: [], hasMore: false };
+    (streamRepository.findWithCursor as any).mockResolvedValueOnce(page);
+
+    const result = await fetchExportPage('stream-42');
+
+    expect(result).toBe(page);
+    expect(streamRepository.findWithCursor).toHaveBeenCalledTimes(1);
+    const [filterArg, limitArg, afterIdArg] = (streamRepository.findWithCursor as any).mock.calls[0];
+    expect(Array.isArray(filterArg)).toBe(false);
+    expect(filterArg).toEqual({});
+    expect(limitArg).toBe(EXPORT_PAGE_SIZE);
+    expect(afterIdArg).toBe('stream-42');
+  });
+
+  it('forwards undefined afterId on the initial page', async () => {
+    const page = { streams: [], hasMore: false };
+    (streamRepository.findWithCursor as any).mockResolvedValueOnce(page);
+
+    await fetchExportPage(undefined);
+
+    expect(streamRepository.findWithCursor).toHaveBeenCalledWith({}, EXPORT_PAGE_SIZE, undefined);
   });
 });

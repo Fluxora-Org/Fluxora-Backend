@@ -59,6 +59,24 @@ Without `DATABASE_URL` the check is skipped, matching the other live-database su
 | `POOL_QUEUE_LIMIT` | `50` | Max requests allowed to queue before fast-failing with 503 |
 | `STATEMENT_TIMEOUT_MS` | `5000` | Per-connection statement timeout in ms. Set to `0` to disable. |
 
+### Migration job environment
+
+`pnpm run migrate` (`src/db/migrate.ts`) does not load the application config,
+so it needs only database settings. Stellar, JWT and indexer secrets are not
+required and should not be given to the migration job.
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | — | PostgreSQL connection string (required, `postgres://` or `postgresql://`) |
+| `DB_CONNECTION_TIMEOUT` | driver default | ms to wait for a connection (1000-60000) |
+| `DATABASE_SSL` | `false` | `true` enables TLS; `no-verify` enables TLS without certificate verification |
+
+```bash
+DATABASE_URL=postgresql://u:p@localhost:5432/fluxora pnpm run migrate
+# Print usage and validate the environment without connecting:
+DATABASE_URL=postgresql://u:p@localhost:5432/fluxora pnpm exec tsx src/db/migrate.ts --help
+```
+
 ## Statement Timeout
 
 ### How it works

@@ -77,6 +77,7 @@ export interface Config {
   rpcTimeoutMs: number;
   rpcFallbackCacheTtlSeconds: number;
   rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcFallbackCacheMaxAgeMs: number;
   rpcHealthCheckIntervalMs: number;
   rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
@@ -140,6 +141,8 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Window in seconds during which duplicate stream events are suppressed (1..604800). */
+  dedupWindowSeconds: number;
   /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
   wsAuthRequired: boolean;
   /** Origins allowed to perform browser WebSocket upgrades (WS_ALLOWED_ORIGINS). */
@@ -214,6 +217,14 @@ export interface Config {
   indexerBackfillMaxRetries: number;
   /** Delay between backfill batch retries, in ms. */
   indexerBackfillRetryDelayMs: number;
+  /** Number of source rows fetched and inserted per replay batch transaction. */
+  indexerReplayBatchSize: number;
+  /** Maximum allowed `to_block - from_block` replay range; 0 = unlimited. */
+  indexerMaxReplayRangeBlocks: number;
+  /** Wall-clock budget in ms for a single replay run; 0 = unlimited. */
+  indexerReplayBudgetMs: number;
+  /** Forced-stop timeout in ms bounding a single batch's DB wait after cancellation; 0 = wait indefinitely. */
+  indexerReplayStopForcedTimeoutMs: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -254,6 +265,12 @@ export interface Config {
    * Defaults to 500.
    */
   dlqPurgeBatchSize: number;
+
+  /**
+   * Partition lead time in whole calendar months for the partition maintenance job.
+   * Defaults to 3.
+   */
+  partitionMaintenanceLeadTimeMonths: number;
 }
 
 export class ConfigError extends Error {
@@ -320,4 +337,229 @@ export function parseEnv(env: NodeJS.ProcessEnv): ParsedEnv {
     }
     throw error;
   }
+}
+
+function resolveNetwork(env: ParsedEnv): StellarNetwork {
+  return resolveStellarNetwork(env);
+}
+
+function resolveContractAddresses(network: StellarNetwork, env: ParsedEnv): ContractAddresses {
+  const streaming = env.CONTRACT_ADDRESS_STREAMING ?? env.STELLAR_CONTRACT_ADDRESS;
+  return {
+    streaming,
+    contract: env.STELLAR_CONTRACT_ADDRESS,
+    token: env.STELLAR_TOKEN_ADDRESS,
+  };
+}
+
+function toConfig(env: ParsedEnv): Config {
+  const stellarNetwork = resolveNetwork(env);
+  const networkDefaults = STELLAR_NETWORKS[stellarNetwork];
+  const isProduction = env.NODE_ENV === 'production';
+  const contractAddresses = resolveContractAddresses(stellarNetwork, env);
+
+  assertNetworkMatchesContracts(stellarNetwork, contractAddresses);
+
+  return {
+    port: env.PORT,
+    nodeEnv: env.NODE_ENV,
+    apiVersion: '0.1.0',
+
+    databaseUrl: env.DATABASE_URL,
+    databaseReplicaUrl: env.DATABASE_REPLICA_URL,
+    databasePoolMin: env.DB_POOL_MIN,
+    databasePoolMax: env.DB_POOL_MAX,
+    databaseConnectionTimeout: env.DB_CONNECTION_TIMEOUT,
+    databaseIdleTimeout: env.DB_IDLE_TIMEOUT,
+    slowQueryThresholdMs: env.SLOW_QUERY_THRESHOLD_MS,
+    statementTimeoutMs: env.STATEMENT_TIMEOUT_MS,
+    replicaStatementTimeoutMs: env.REPLICA_STATEMENT_TIMEOUT_MS ?? env.STATEMENT_TIMEOUT_MS,
+    replicaQueueLimit: env.REPLICA_QUEUE_LIMIT,
+
+    redisUrl: env.REDIS_URL,
+    redisEnabled: env.REDIS_ENABLED,
+    redisMode: env.REDIS_MODE,
+    redisSentinelHosts: env.REDIS_SENTINEL_HOSTS,
+    redisSentinelName: env.REDIS_SENTINEL_NAME,
+    redisClusterNodes: env.REDIS_CLUSTER_NODES,
+    redisConnectTimeoutMs: env.REDIS_CONNECT_TIMEOUT_MS,
+    redisMaxRetriesPerRequest: env.REDIS_MAX_RETRIES_PER_REQUEST,
+    redisRetryBaseDelayMs: env.REDIS_RETRY_BASE_DELAY_MS,
+    redisRetryMaxDelayMs: env.REDIS_RETRY_MAX_DELAY_MS,
+    redisRetryMaxAttempts: env.REDIS_RETRY_MAX_ATTEMPTS,
+
+    stellarNetwork,
+    stellarRpcUrl: env.STELLAR_RPC_URL,
+    stellarRpcTimeout: env.STELLAR_RPC_TIMEOUT,
+    stellarRpcMaxRetries: env.STELLAR_RPC_MAX_RETRIES,
+    stellarRpcRetryDelay: env.STELLAR_RPC_RETRY_DELAY,
+    stellarRpcOperationDeadlines: env.STELLAR_RPC_OPERATION_DEADLINES,
+    rpcCircuitBreakerFailureThreshold: env.RPC_CB_FAILURE_THRESHOLD,
+    rpcCircuitBreakerWindowMs: env.RPC_CB_WINDOW_MS,
+    rpcCircuitBreakerResetTimeoutMs: env.RPC_CB_RESET_TIMEOUT_MS,
+    rpcTimeoutMs: env.RPC_TIMEOUT_MS,
+    rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
+    rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcFallbackCacheMaxAgeMs: env.RPC_FALLBACK_CACHE_MAX_AGE_MS,
+    rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
+    rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
+    horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
+    horizonNetworkPassphrase: env.HORIZON_NETWORK_PASSPHRASE ?? networkDefaults.passphrase,
+    contractAddresses: resolveContractAddresses(stellarNetwork, env),
+
+    jwtSecret: env.JWT_SECRET,
+    jwtSecretPrevious: env.JWT_SECRET_PREVIOUS,
+    pgcryptoKey: env.PGCRYPTO_KEY,
+    pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
+    jwtExpiresIn: env.JWT_EXPIRES_IN,
+    apiKeys: (env.API_KEYS ?? (env.NODE_ENV === 'test' ? 'test-api-key' : ''))
+      .split(',')
+      .map((key) => key.trim())
+      .filter((key) => key.length > 0),
+    apiKeyPepper: env.API_KEY_PEPPER,
+    apiKeyPepperPrevious: env.API_KEY_PEPPER_PREVIOUS,
+    indexerWorkerToken: env.INDEXER_WORKER_TOKEN,
+
+    oidcIssuerUrl: env.OIDC_ISSUER_URL,
+    oidcAudience: env.OIDC_AUDIENCE,
+
+    maxRequestSizeBytes: env.MAX_REQUEST_SIZE,
+    maxJsonDepth: env.MAX_JSON_DEPTH,
+    requestTimeoutMs: env.REQUEST_TIMEOUT_MS,
+    graphqlPersistedQueryAllowlist: env.GRAPHQL_PERSISTED_QUERY_ALLOWLIST
+      ? env.GRAPHQL_PERSISTED_QUERY_ALLOWLIST.split(',')
+          .map((hash) => hash.trim())
+          .filter((hash) => hash.length > 0)
+      : [],
+    graphqlPersistedQueryHashVerification: env.GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION,
+    graphqlUnpersistedQueryPolicy: env.GRAPHQL_UNPERSISTED_QUERY_POLICY,
+    graphqlIntrospectionEnabled: env.GRAPHQL_INTROSPECTION_ENABLED,
+
+    logLevel: env.LOG_LEVEL,
+    metricsEnabled: env.METRICS_ENABLED,
+
+    tracingEnabled: env.TRACING_ENABLED,
+    tracingSampleRate: env.TRACING_SAMPLE_RATE,
+    tracingSamplingStrategy: env.TRACING_SAMPLING_STRATEGY,
+    tracingHeadSampleRate: env.TRACING_HEAD_SAMPLE_RATE,
+    tracingTailKeepErrors: env.TRACING_TAIL_KEEP_ERRORS,
+    tracingPerRouteOverrides: env.TRACING_PER_ROUTE_OVERRIDES,
+    tracingOtelEnabled: env.TRACING_OTEL_ENABLED,
+    tracingLogEvents: env.TRACING_LOG_EVENTS,
+
+    webhookUrl: env.WEBHOOK_URL,
+    webhookSecret: env.WEBHOOK_SECRET,
+    webhookSecretPrevious: env.WEBHOOK_SECRET_PREVIOUS,
+    webhookPollIntervalMs: env.WEBHOOK_POLL_INTERVAL_MS,
+    webhookBatchSize: env.WEBHOOK_BATCH_SIZE,
+    webhookRetryRps: env.WEBHOOK_RETRY_RPS,
+    webhookRetryBurst: env.WEBHOOK_RETRY_BURST,
+    webhookCircuitBreakerThreshold: env.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD,
+    webhookCircuitBreakerResetMs: env.WEBHOOK_CIRCUIT_BREAKER_RESET_MS,
+    webhookBatchMaxBackoffMs: env.WEBHOOK_BATCH_MAX_BACKOFF_MS,
+    webhookMaxResponseBytes: env.WEBHOOK_MAX_RESPONSE_BYTES,
+    webhookAllowedHosts: env.WEBHOOK_ALLOWED_HOSTS
+      ? env.WEBHOOK_ALLOWED_HOSTS.split(',')
+          .map((h) => h.trim())
+          .filter((h) => h.length > 0)
+      : undefined,
+
+    enableStreamValidation: env.ENABLE_STREAM_VALIDATION,
+    enableRateLimit: env.ENABLE_RATE_LIMIT ?? !isProduction,
+    idempotencyTtlSeconds: env.IDEMPOTENCY_TTL_SECONDS,
+    requirePartnerAuth: env.REQUIRE_PARTNER_AUTH,
+    partnerApiToken: env.PARTNER_API_TOKEN,
+    requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
+    adminApiToken: env.ADMIN_API_TOKEN,
+    dedupWindowSeconds: env.DEDUP_WINDOW_SECONDS,
+    /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
+    wsAuthRequired: env.WS_AUTH_REQUIRED,
+    wsAllowedOrigins: splitCommaSeparated(env.WS_ALLOWED_ORIGINS),
+    wsMaxConnectionsPerIp: env.WS_MAX_CONNECTIONS_PER_IP,
+    wsMaxSubscriptionsPerConnection: env.WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    wsMaxOutboundQueuePerConnection: env.WS_MAX_OUTBOUND_QUEUE_PER_CONNECTION,
+    wsMaxOutboundQueueBytesPerConnection: env.WS_MAX_OUTBOUND_QUEUE_BYTES_PER_CONNECTION,
+    wsMaxInboundMessageBytes: env.WS_MAX_INBOUND_MESSAGE_BYTES,
+    wsBatchFlushMs: env.WS_BATCH_FLUSH_MS,
+    wsBatchMaxSize: env.WS_BATCH_MAX_SIZE,
+    sseMaxConnectionsPerIp: env.SSE_MAX_CONNECTIONS_PER_IP,
+    sseMaxConnectionsPerApiKey: env.SSE_MAX_CONNECTIONS_PER_API_KEY,
+    sseMaxGlobalConnections: env.SSE_MAX_GLOBAL_CONNECTIONS,
+    sseMaxConnectionDurationMs: env.SSE_MAX_CONNECTION_DURATION_MS,
+    sseRetryAfterSeconds: env.SSE_RETRY_AFTER_SECONDS,
+    sseRetryMs: env.SSE_RETRY_MS,
+    sseHeartbeatIntervalMs: env.SSE_HEARTBEAT_INTERVAL_MS,
+    sseDrainTimeoutMs: env.SSE_DRAIN_TIMEOUT_MS,
+    indexerEnabled: env.INDEXER_ENABLED,
+    workerEnabled: env.WORKER_ENABLED,
+    healthCheckTimeoutMs: env.HEALTH_CHECK_TIMEOUT_MS,
+    healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS,
+    healthCheckPostgresTimeoutMs: env.HEALTH_CHECK_POSTGRES_TIMEOUT_MS,
+    healthCheckRedisTimeoutMs: env.HEALTH_CHECK_REDIS_TIMEOUT_MS,
+    healthCheckStellarTimeoutMs: env.HEALTH_CHECK_STELLAR_TIMEOUT_MS,
+    grpcHealthEnabled: env.GRPC_HEALTH_ENABLED,
+    grpcHealthPort: env.GRPC_HEALTH_PORT,
+    grpcGatewayEnabled: env.GRPC_GATEWAY_ENABLED,
+    grpcGatewayPort: env.GRPC_GATEWAY_PORT,
+    indexerMtlsRequired: env.INDEXER_MTLS_REQUIRED ?? isProduction,
+    indexerBackfillConcurrency: env.INDEXER_BACKFILL_CONCURRENCY,
+    indexerBackfillBatchSize: env.INDEXER_BACKFILL_BATCH_SIZE,
+    indexerBackfillStrictOrder: env.INDEXER_BACKFILL_STRICT_ORDER,
+    indexerBackfillCommitInterval: env.INDEXER_BACKFILL_COMMIT_INTERVAL,
+    indexerBackfillMaxRetries: env.INDEXER_BACKFILL_MAX_RETRIES,
+    indexerBackfillRetryDelayMs: env.INDEXER_BACKFILL_RETRY_DELAY_MS,
+    indexerReplayBatchSize: env.INDEXER_REPLAY_BATCH_SIZE,
+    indexerMaxReplayRangeBlocks: env.INDEXER_MAX_REPLAY_RANGE_BLOCKS,
+    indexerReplayBudgetMs: env.INDEXER_REPLAY_BUDGET_MS,
+    indexerReplayStopForcedTimeoutMs: env.INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS,
+    indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
+    indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
+    deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
+
+    s3BackupBucket: env.S3_BACKUP_BUCKET,
+    s3BackupPrefix: env.S3_BACKUP_PREFIX,
+
+    startupProbeBudgetMs: env.STARTUP_PROBE_BUDGET_MS,
+    startupProbePostgresTimeoutMs: env.STARTUP_PROBE_POSTGRES_TIMEOUT_MS,
+    startupProbeRedisTimeoutMs: env.STARTUP_PROBE_REDIS_TIMEOUT_MS,
+    startupProbeStellarTimeoutMs: env.STARTUP_PROBE_STELLAR_TIMEOUT_MS,
+
+    canaryTrafficPercent: env.CANARY_TRAFFIC_PERCENT,
+
+    dlqRetentionDays: env.DLQ_RETENTION_DAYS,
+    dlqPurgeBatchSize: env.DLQ_PURGE_BATCH_SIZE,
+    partitionMaintenanceLeadTimeMonths: env.PARTITION_MAINTENANCE_LEAD_TIME_MONTHS,
+  };
+}
+
+export function loadConfig(): Config {
+  return toConfig(parseEnv(process.env));
+}
+
+let configInstance: Config | null = null;
+
+export function getConfig(): Config {
+  if (!configInstance) {
+    throw new ConfigError('Configuration not initialized. Call initialize() first.');
+  }
+  return configInstance;
+}
+
+export function initializeConfig(): Config {
+  if (configInstance) {
+    return configInstance;
+  }
+
+  configInstance = loadConfig();
+  if (process.env.NODE_ENV !== 'test') {
+    logActiveStellarConfig({
+      network: configInstance.stellarNetwork,
+      contractAddresses: configInstance.contractAddresses,
+    });
+  }
+  return configInstance;
+}
+
+export function resetConfig(): void {
+  configInstance = null;
 }

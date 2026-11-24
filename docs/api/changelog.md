@@ -66,10 +66,6 @@ when the header is omitted; every accepted response echoes the resolved version 
 
 ### Added
 
-- `*` — Requests may select the API contract with the `Accept-Version` header (`v1`, `1`, or `1.0`
-  all resolve to `v1`; the header is case-insensitive). Requests for any unsupported version are
-  refused with `400 unsupported_version` and a list of supported versions. Every accepted response
-  echoes the resolved version in the `X-API-Version` response header.
 - `GET /` — Service metadata (`name`, `version`, `docs`).
 - `GET /health` — Liveness and dependency health status; returns `503` while the service is shutting
   down.
@@ -91,6 +87,17 @@ when the header is omitted; every accepted response echoes the resolved version 
 - `POST /internal/indexer/events/replay` — Starts historical contract-event replay.
 - `GET /internal/indexer/events/replay` — Reports current replay progress and status.
 - `GET /internal/indexer/status` — Reports indexer status and state.
+
+### Changed
+
+- `*` [breaking] — Expanded the `ErrorResponse.error.code` enum with additional machine-readable
+  error codes (`UNSUPPORTED_MEDIA_TYPE`, `GATEWAY_TIMEOUT`, `RATE_LIMIT_EXCEEDED`,
+  `UNSUPPORTED_VERSION`, `IDEMPOTENCY_CONFLICT`, and others). Clients that use exhaustive matching
+  on the error code enum must add cases for the new values. Added shared `components/headers`
+  (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `Retry-After`) and
+  `components/responses` to the OpenAPI contract; rate-limit and retry headers are now emitted on
+  `429` responses. Version negotiation via the `Accept-Version` header (`v1`, `1`, or `1.0` all
+  resolve to `v1`; header is case-insensitive) is unchanged.
 
 ### Deprecated
 

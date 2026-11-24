@@ -22,9 +22,14 @@
  * Happy path — global store in fallback mode
  *   • Returns 200 with { available: true, usingFallback: true }
  *
+ * Real store state (no mocks; drives the global HybridBanStore)
+ *   • Store not initialised                  → { available: false, usingFallback: false }
+ *   • Store healthy                          → { available: true, usingFallback: false }
+ *   • Store in fallback, then recovered      → usingFallback flips true → false
+ *   • Response never carries the old `reason: 'not implemented'` field
+ *
  * Error paths
  *   • getHybridBanStoreStatus throws          → 503 with SERVICE_UNAVAILABLE
- *   • getHybridBanStoreStatus is not-a-function → graceful 200 fallback
  *
  * Response envelope
  *   • Success response wraps in { success: true, data, meta }
@@ -37,6 +42,7 @@ import { app } from '../../src/app.js';
 import { _resetForTest } from '../../src/state/adminState.js';
 import { initializeConfig } from '../../src/config/env.js';
 import { generateToken } from '../../src/lib/auth.js';
+import { setGlobalHybridBanStore, type HybridBanStore } from '../../src/redis/banStore.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -44,8 +50,14 @@ const ADMIN_KEY = 'test-admin-key-for-ban-store';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/**
+ * Authenticates as an admin. `/api/admin` is mounted behind `protectRouter`,
+ * whose `authenticate` step requires a JWT before `requireAdminAuth` runs, so
+ * the response-shape tests use an admin JWT rather than the static key.
+ */
 function authed(req: request.Test): request.Test {
-  return req.set('Authorization', `Bearer ${ADMIN_KEY}`);
+  const token = generateToken({ address: 'addr-admin', role: 'admin' });
+  return req.set('Authorization', `Bearer ${token}`);
 }
 
 // ── Setup / teardown ──────────────────────────────────────────────────────────
@@ -104,7 +116,9 @@ describe('GET /api/admin/ban-store/status — auth gate', () => {
   });
 
   it('passes with correct static key', async () => {
-    const res = await authed(request(app).get('/api/admin/ban-store/status'));
+    const res = await request(app)
+      .get('/api/admin/ban-store/status')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`);
     expect(res.status).toBe(200);
   });
 
@@ -171,6 +185,53 @@ describe('GET /api/admin/ban-store/status — happy path', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 2b. Real store state — no mocks on getHybridBanStoreStatus
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('GET /api/admin/ban-store/status — real store state', () => {
+  /** Minimal stand-in: the status only reads `usingFallback` off the store. */
+  function installStore(usingFallback: boolean): { usingFallback: boolean } {
+    const store = { usingFallback };
+    setGlobalHybridBanStore(store as unknown as HybridBanStore);
+    return store;
+  }
+
+  afterEach(() => {
+    setGlobalHybridBanStore(null as unknown as HybridBanStore);
+  });
+
+  it('reports available:false, usingFallback:false before the store is initialised', async () => {
+    setGlobalHybridBanStore(null as unknown as HybridBanStore);
+    const res = await authed(request(app).get('/api/admin/ban-store/status'));
+    expect(res.status).toBe(200);
+    expect(res.body.data.banStore).toEqual({ available: false, usingFallback: false });
+  });
+
+  it('reports available:true, usingFallback:false when Redis is healthy', async () => {
+    installStore(false);
+    const res = await authed(request(app).get('/api/admin/ban-store/status'));
+    expect(res.status).toBe(200);
+    expect(res.body.data.banStore).toEqual({ available: true, usingFallback: false });
+  });
+
+  it('reports usingFallback:true while in fallback and false once Redis recovers', async () => {
+    const store = installStore(true);
+    const degraded = await authed(request(app).get('/api/admin/ban-store/status'));
+    expect(degraded.body.data.banStore).toEqual({ available: true, usingFallback: true });
+
+    store.usingFallback = false;
+    const recovered = await authed(request(app).get('/api/admin/ban-store/status'));
+    expect(recovered.body.data.banStore).toEqual({ available: true, usingFallback: false });
+  });
+
+  it('never returns the removed "not implemented" fallback shape', async () => {
+    const res = await authed(request(app).get('/api/admin/ban-store/status'));
+    expect(res.body.data.banStore).not.toHaveProperty('reason');
+    expect(Object.keys(res.body.data.banStore).sort()).toEqual(['available', 'usingFallback']);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 3. Error paths
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -203,23 +264,6 @@ describe('GET /api/admin/ban-store/status — error paths', () => {
     expect(res.body.error.message).toBe('Redis connection lost');
     expect(body).not.toMatch(/node_modules/);
     expect(body).not.toMatch(/at Object\./);
-  });
-
-  it('returns 200 with available:false when getHybridBanStoreStatus is not a function (graceful fallback)', async () => {
-    // The route has a typeof guard: if not a function it falls back gracefully.
-    vi.spyOn(
-      await import('../../src/redis/banStore.js'),
-      'getHybridBanStoreStatus',
-    ).mockReturnValue(undefined as any);
-
-    // When the mock returns undefined, the route's typeof check treats it as
-    // not-a-function (the real function always returns an object). In practice
-    // the route guards this with `typeof getHybridBanStoreStatus === 'function'`.
-    // We test that a non-throwing, non-function result doesn't crash the handler.
-    // The route falls back to { available: false, reason: '...' }.
-    const res = await authed(request(app).get('/api/admin/ban-store/status'));
-    // Should not crash (not 500)
-    expect(res.status).not.toBe(500);
   });
 });
 

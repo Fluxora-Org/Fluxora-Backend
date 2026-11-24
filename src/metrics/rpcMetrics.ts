@@ -76,6 +76,24 @@ export function validateLabelValue(field: string, value: unknown): string {
 }
 
 /**
+ * Return the validated hostname for an RPC endpoint without exposing URL
+ * credentials, query parameters, or other endpoint details in metric labels.
+ */
+export function getRpcProviderLabelFromEndpoint(endpoint: string): string {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new RpcMetricsValidationError(
+      'MALFORMED',
+      'provider',
+      'RPC endpoint must be a valid absolute URL',
+    );
+  }
+  return validateLabelValue('provider', url.hostname);
+}
+
+/**
  * Validate an object of labels against an allowed label set.
  *
  * Rejects non-object input, unknown label keys, missing required keys, empty
@@ -226,6 +244,26 @@ export const rpcDegradedModeGauge =
     registers: [registry],
   });
 
+export const rpcProviderHealthyGauge =
+  (registry.getSingleMetric('rpc_provider_healthy') as Gauge<'provider'>) ||
+  new Gauge({
+    name: 'rpc_provider_healthy',
+    help: 'Whether a Stellar RPC provider is healthy (1 = healthy, 0 = unhealthy)',
+    labelNames: ['provider'] as const,
+    registers: [registry],
+  });
+
+export const rpcProviderHealthCheckFailuresTotal =
+  (registry.getSingleMetric('rpc_provider_health_check_failures_total') as Counter<
+    'provider' | 'reason'
+  >) ||
+  new Counter({
+    name: 'rpc_provider_health_check_failures_total',
+    help: 'Total Stellar RPC provider health-check failures by provider and failure reason',
+    labelNames: ['provider', 'reason'] as const,
+    registers: [registry],
+  });
+
 export function deRegisterRpcMetrics(): void {
   for (const name of [
     'rpc_degradation_transitions_total',
@@ -234,6 +272,8 @@ export function deRegisterRpcMetrics(): void {
     'rpc_upstream_call_duration_seconds',
     'fluxora_rpc_cache_corrupt_total',
     'rpc_degraded_mode',
+    'rpc_provider_healthy',
+    'rpc_provider_health_check_failures_total',
   ]) {
     registry.removeSingleMetric(name);
   }

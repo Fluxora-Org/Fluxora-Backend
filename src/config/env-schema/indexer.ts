@@ -29,6 +29,19 @@ export const indexerEnvSchema = {
   INDEXER_BACKFILL_MAX_RETRIES: integerEnv('INDEXER_BACKFILL_MAX_RETRIES', 0, 100).default(3),
   /** Delay between backfill batch retries in ms. @default 1000 */
   INDEXER_BACKFILL_RETRY_DELAY_MS: integerEnv('INDEXER_BACKFILL_RETRY_DELAY_MS', 0).default(1000),
+  /** Number of source rows fetched and inserted per replay batch transaction. @default 250 */
+  INDEXER_REPLAY_BATCH_SIZE: integerEnv('INDEXER_REPLAY_BATCH_SIZE', 1).default(250),
+  /** Maximum allowed `to_block - from_block` replay range; 0 = unlimited. @default 10000000 */
+  INDEXER_MAX_REPLAY_RANGE_BLOCKS: integerEnv('INDEXER_MAX_REPLAY_RANGE_BLOCKS', 0).default(
+    10_000_000
+  ),
+  /** Wall-clock budget in ms for a single replay run; 0 = unlimited. @default 0 */
+  INDEXER_REPLAY_BUDGET_MS: integerEnv('INDEXER_REPLAY_BUDGET_MS', 0).default(0),
+  /** Forced-stop timeout in ms bounding a single batch's DB wait after cancellation; 0 = wait indefinitely. @default 10000 */
+  INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS: integerEnv(
+    'INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS',
+    0
+  ).default(10_000),
   /**
    * Manually recorded timestamp of the last successful sync, surfaced in
    * status endpoints for operational dashboards.

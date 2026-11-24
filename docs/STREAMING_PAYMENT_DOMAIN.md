@@ -27,6 +27,17 @@ A `Stream` represents a payment channel between two Stellar accounts. Key fields
 
 All monetary amounts are stored as decimal strings to preserve precision above `Number.MAX_SAFE_INTEGER`.
 
+### Decimal Serialization Limits
+
+Amounts serialized by `serializeToDecimalString` (`src/serialization/decimal.ts`) are bounded by the signed int64 range, applied symmetrically:
+
+| Bound | Value |
+|---|---|
+| Minimum | `-9223372036854775808` (int64 min) |
+| Maximum | `9223372036854775807` (int64 max) |
+
+Both bounds are inclusive. Negative zero (`-0`), positive zero (`+0`), and zero with any number of fractional zeros (e.g. `0.000`) are normalised to `0` in the serialized output. Precision is unchanged by these rules.
+
 ## Event Types
 
 Event types are defined in `src/services/streamEventService.ts` and correspond to Soroban contract events.
@@ -99,5 +110,6 @@ Every event is keyed by `(transaction_hash, event_index)`.
 
 - Contract-scoped queries use `idx_streams_contract_event (contract_id, event_index)`.
 - Status + time range queries use `idx_streams_status_start_time`.
+- Amount values are subject to the decimal serialization limits described in the Stream section (int64 range, symmetric; zero always serialises as `0`).
 
 See `src/db/repositories/streamRepository.ts` for the full query interface.
