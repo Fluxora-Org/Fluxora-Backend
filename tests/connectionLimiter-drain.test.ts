@@ -16,6 +16,7 @@ describe('connectionLimiter graceful drain', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    _resetLimiter();
   });
 
   it('tracks active connections via metric', async () => {
@@ -38,7 +39,7 @@ describe('connectionLimiter graceful drain', () => {
 
   it('rejects new connections during shutdown', async () => {
     // Start shutdown (no wss, just sets flag)
-    gracefulDrain(null);
+    await gracefulDrain(null);
 
     // Try to reserve after shutdown
     const result = await checkAndReserve('127.0.0.1');
@@ -63,16 +64,20 @@ describe('connectionLimiter graceful drain', () => {
     // Start drain
     const drainPromise = gracefulDrain(mockServer, 30000);
 
-    // Advance timers to let drain loop run
-    await vi.advanceTimersByTimeAsync(100);
-
     // Verify close was called on both clients
-    expect(mockClients[0]!.close).toHaveBeenCalled();
-    expect(mockClients[1]!.close).toHaveBeenCalled();
+    expect(mockClients[0]!.close).toHaveBeenCalledWith(
+      1001,
+      JSON.stringify({ reason: 'Server restarting' })
+    );
+    expect(mockClients[1]!.close).toHaveBeenCalledWith(
+      1001,
+      JSON.stringify({ reason: 'Server restarting' })
+    );
 
     // Close connections to let drain complete
     untrackConnection('127.0.0.1');
     untrackConnection('127.0.0.2');
+    await vi.advanceTimersByTimeAsync(100);
     await drainPromise;
   });
 
@@ -124,10 +129,10 @@ describe('connectionLimiter graceful drain', () => {
     expect(getActiveConnectionCount()).toBe(2);
   });
 
-  it('reports shutdown status correctly', () => {
+  it('reports shutdown status correctly', async () => {
     expect(isShuttingDown()).toBe(false);
 
-    gracefulDrain(null, 30000);
+    await gracefulDrain(null, 30000);
 
     expect(isShuttingDown()).toBe(true);
 
