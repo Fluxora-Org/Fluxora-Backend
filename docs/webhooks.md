@@ -134,25 +134,34 @@ Every transition increments `fluxora_webhook_circuit_breaker_transitions_total{f
 
 ```json
 {
-  "total": 1,
-  "states": [
-    {
-      "endpointUrl": "https://receiver.example/webhooks",
-      "state": "open",
-      "paused": true,
-      "reason": "failure-threshold",
-      "consecutiveFailures": 4,
-      "failureCount": 4,
-      "threshold": 4,
-      "resetMs": 300000,
-      "lastFailureTime": "2023-11-14T22:13:20.003Z",
-      "resumeAt": "2023-11-14T22:18:20.003Z",
-      "nextAttemptTime": "2023-11-14T22:18:20.003Z"
-    }
-  ],
-  "observedAt": "2023-11-14T22:14:20.003Z"
+  "success": true,
+  "data": {
+    "total": 1,
+    "states": [
+      {
+        "endpointUrl": "https://receiver.example/webhooks",
+        "state": "open",
+        "paused": true,
+        "reason": "failure-threshold",
+        "consecutiveFailures": 4,
+        "failureCount": 4,
+        "threshold": 4,
+        "resetMs": 300000,
+        "lastFailureTime": "2023-11-14T22:13:20.003Z",
+        "resumeAt": "2023-11-14T22:18:20.003Z",
+        "nextAttemptTime": "2023-11-14T22:18:20.003Z"
+      }
+    ],
+    "observedAt": "2023-11-14T22:14:20.003Z"
+  },
+  "meta": {
+    "timestamp": "2023-11-14T22:14:20.003Z",
+    "requestId": "req_abc123"
+  }
 }
 ```
+
+The response uses the standard success envelope: the circuit-breaker payload is in `data`, and response metadata is in `meta`. Omitting `endpointUrl` returns `data.total: 0`, an empty `data.states` array, and a `data.note`.
 
 `threshold` and `resetMs` are the effective values for this process, so the response always states the numbers the circuit is actually applying. `nextAttemptTime` is a deprecated alias of `resumeAt` kept for existing dashboards.
 
