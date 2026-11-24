@@ -591,6 +591,7 @@ export function createApp(options: AppOptions = {}): Express {
 
   // Experimental GraphQL federation gateway — feature-flagged off by default.
   app.use('/api/graphql', graphqlGatewayRouter);
+  app.use('/api/graphql', protectRouter(graphqlGatewayRouter));
 
   app.get('/', (_req: Request, res: Response) => {
     res.json(
