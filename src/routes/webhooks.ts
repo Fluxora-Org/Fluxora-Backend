@@ -739,54 +739,20 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
 });
 
 /**
- * POST /internal/webhooks/process-outbox
- * Process outbox items (internal endpoint for background job)
- *
- * Previously gated by an ad-hoc `?secret=` query-param check.
- * That check has been removed — requireAdminAuth above provides real auth.
+ * Retired: this handler used to delete management-outbox items without sending
+ * them. The transactional WebhookDispatcher consumes a different queue, so it
+ * cannot safely replace this operation. Keep an authenticated tombstone so old
+ * jobs fail explicitly while their queued deliveries remain intact.
  */
-webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
-  const requestId = req.correlationId;
-  try {
-    const readyItems = webhookDeliveryStore.getReadyOutboxItems();
-    let processed = 0;
-    let errors = 0;
-
-    for (const item of readyItems) {
-      try {
-        // This would integrate with the webhook service to process the item
-        // For now, we'll just log and remove from outbox
-        logger.info('Processing outbox item', undefined, {
-          outboxId: item.id,
-          deliveryId: item.deliveryId,
-        });
-
-        webhookDeliveryStore.removeFromOutbox(item.id);
-        processed++;
-      } catch (error) {
-        logger.error('Error processing outbox item', undefined, {
-          outboxId: item.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        errors++;
-      }
-    }
-
-    res.json(successResponse({
-      processed,
-      errors,
-      total: readyItems.length,
-      message: 'Outbox processing completed',
-    }, requestId));
-  } catch (error) {
-    logger.error('Error processing webhook outbox', undefined, {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    res.status(500).json(
-      errorResponse('OUTBOX_PROCESSING_ERROR', 'Failed to process webhook outbox', undefined, requestId)
-    );
-  }
+webhooksRouter.post('/process-outbox', (_req, res): void => {
+  res.status(410).json(
+    errorResponse(
+      'OUTBOX_PROCESSING_ERROR',
+      'This endpoint has been removed. No outbox items were processed or removed.',
+      undefined,
+      _req.correlationId
+    )
+  );
 });
 
 /**
