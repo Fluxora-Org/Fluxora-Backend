@@ -47,7 +47,7 @@ import { getAuditEntries, recordAuditEventToDb, type AuditEntry } from '../lib/a
 import { successResponse } from '../utils/response.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { ApiError } from '../errors.js';
-import { ApiErrorCode } from '../middleware/errorHandler.js';
+import { ApiErrorCode, validationError } from '../middleware/errorHandler.js';
 import { OffsetPaginationSchema, DEFAULT_PAGE_LIMIT } from '../validation/paginationSchema.js';
 import {
   auditRepository,
@@ -275,7 +275,7 @@ auditRouter.get('/', authenticate, requireAuth, requirePermission(Permission.AUD
     const parsed = AuditQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       const firstIssue = parsed.error.issues[0];
-      throw new ApiError(400, ApiErrorCode.VALIDATION_ERROR, firstIssue?.message ?? 'Invalid query parameters', true);
+      throw validationError(firstIssue?.message ?? 'Invalid query parameters');
     }
 
     const { limit, offset, actor, actionType, resourceType, resourceId, dateFrom, dateTo } = parsed.data;

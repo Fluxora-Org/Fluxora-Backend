@@ -372,9 +372,12 @@ async function purgeRule(
       break;
     }
 
+    // A rule gets its own budget. Bound the final batch as well so a
+    // non-multiple of batchSize cannot exceed that rule's remaining allowance.
+    const remainingBatchSize = Math.min(batchSize, maxRowsPerRun - rowsPurged);
     const { purged, skipped } = await processBatch(rule, {
       cutoff,
-      batchSize,
+      batchSize: remainingBatchSize,
       batchIndex,
       pool,
       correlationId,
@@ -391,7 +394,7 @@ async function purgeRule(
     // (purged=0, skipped=batchSize) does NOT mean there are more; SKIP LOCKED
     // means those rows will not appear again.  We stop when the batch was not
     // full — regardless of the purged/skipped split.
-    if (purged + skipped < batchSize) {
+    if (purged + skipped < remainingBatchSize) {
       break;
     }
   }

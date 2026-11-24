@@ -141,7 +141,6 @@ class ReadinessManager extends EventEmitter {
       });
     }
     this.setPhase('READY');
-    this.emit('readyChanged', { ready: true, phase: 'READY' });
   }
 
   /**
@@ -152,7 +151,6 @@ class ReadinessManager extends EventEmitter {
    */
   markShuttingDown(): void {
     this.setPhase('SHUTTING_DOWN');
-    this.emit('readyChanged', { ready: false, phase: 'SHUTTING_DOWN' });
   }
 
   /**
@@ -181,7 +179,7 @@ class ReadinessManager extends EventEmitter {
     const prevReady = this.state.ready;
 
     this.state.phase = phase;
-    this.state.ready = phase === 'READY' && phase !== 'SHUTTING_DOWN';
+    this.state.ready = phase === 'READY';
     this.state.transitionedAtMs = Date.now();
 
     if (prevPhase !== phase) {

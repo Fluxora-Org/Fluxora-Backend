@@ -355,6 +355,27 @@ describe('Strict origin validation', () => {
     expect(isOriginAllowed('*', allowed)).toBe(false);
   });
 
+  it('returns false without throwing for other malformed origins', () => {
+    const allowed = new Set(['https://app.fluxora.io']);
+    const malformedOrigins = [
+      '',
+      '   ',
+      'not-a-url',
+      'https://',
+      'ftp://app.fluxora.io',
+      'https://app.fluxora.io/path',
+      'https://app.fluxora.io?query=1',
+      'https://app.fluxora.io#fragment',
+      'https://user:pass@app.fluxora.io',
+      'https://app.fluxora.io\r\nX-Injected: true',
+    ];
+
+    for (const origin of malformedOrigins) {
+      expect(() => isOriginAllowed(origin, allowed)).not.toThrow();
+      expect(isOriginAllowed(origin, allowed)).toBe(false);
+    }
+  });
+
   it('allows legitimate configured origin on non-preflight', async () => {
     const app = express();
     app.use(corsAllowlistMiddleware);

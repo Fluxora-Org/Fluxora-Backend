@@ -41,6 +41,12 @@ export const infrastructureEnvSchema = {
   /** Retention window for idempotency keys in seconds (max 7 days). @default 86400 */
   IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
+  /**
+   * Stream-event deduplication window in seconds (1 second to 7 days).
+   * @default 86400
+   */
+  DEDUP_WINDOW_SECONDS: integerEnv('DEDUP_WINDOW_SECONDS', 1, 604800).default(86400),
+
   /** AWS region for S3 backup uploads (explicit). */
   AWS_REGION: optionalString('AWS_REGION'),
   /** AWS region for S3 backup uploads (SDK fallback variable). */
@@ -105,4 +111,14 @@ export const infrastructureEnvSchema = {
    * @default 500
    */
   DLQ_PURGE_BATCH_SIZE: integerEnv('DLQ_PURGE_BATCH_SIZE', 1, 5000).default(500),
+
+  /**
+   * Partition lead time in whole calendar months for the partition maintenance job.
+   * Ensures monthly partitions exist for the current month plus this many months ahead.
+   * @default 3
+   */
+  PARTITION_MAINTENANCE_LEAD_TIME_MONTHS: integerEnv(
+    'PARTITION_MAINTENANCE_LEAD_TIME_MONTHS',
+    0
+  ).default(3),
 };

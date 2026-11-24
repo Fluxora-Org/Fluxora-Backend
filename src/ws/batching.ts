@@ -141,6 +141,7 @@ export class BatchAccumulator {
       });
 
     // Trim to MAX_MESSAGE_BYTES safety cap (in-order, keep first N events).
+    // Dropped frames are accounted for by the caller via the `frames` count.
     let safeEvents = events;
     if (Buffer.byteLength(frame(events), 'utf8') > MAX_MESSAGE_BYTES) {
       // Binary-search for the largest safe prefix.

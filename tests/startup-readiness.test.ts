@@ -159,7 +159,7 @@ describe('Startup Readiness', () => {
       _setPhase('READY');
       const res = await request(app).get('/');
       expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({
+      expect(res.body.data).toMatchObject({
         name: 'Fluxora API',
         version: '0.1.0',
       });
@@ -220,6 +220,16 @@ describe('Startup Readiness', () => {
       expect(isReady()).toBe(true);
 
       _setPhase('SHUTTING_DOWN');
+      expect(isReady()).toBe(false);
+    });
+
+    it('should clear readiness when transitioning from READY to SHUTTING_DOWN', () => {
+      markReady();
+      expect(getPhase()).toBe('READY');
+      expect(isReady()).toBe(true);
+
+      markShuttingDown();
+      expect(getPhase()).toBe('SHUTTING_DOWN');
       expect(isReady()).toBe(false);
     });
   });
@@ -373,7 +383,7 @@ describe('Startup Readiness', () => {
       // Root endpoint should work
       const res = await request(app).get('/');
       expect(res.status).toBe(200);
-      expect(res.body.name).toBe('Fluxora API');
+      expect(res.body.data.name).toBe('Fluxora API');
     });
   });
 });

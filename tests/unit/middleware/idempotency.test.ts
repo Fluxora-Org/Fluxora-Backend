@@ -2,7 +2,8 @@ import express from 'express';
 import request from 'supertest';
 import { createIdempotencyMiddleware } from '../../../src/middleware/idempotency.js';
 import { InMemoryIdempotencyStore } from '../../../src/redis/idempotencyStore.js';
-import { IdempotencyConflictSchema } from '../../../src/validation/idempotency.js';
+import { ApiErrorCode } from '../../../src/middleware/errorHandler.js';
+import { isErrorEnvelope } from '../../../src/utils/response.js';
 
 describe('Idempotency Middleware', () => {
   let app: express.Express;
@@ -74,12 +75,10 @@ describe('Idempotency Middleware', () => {
       .send({ foo: 'baz' });
 
     expect(response.status).toBe(409);
-    expect(response.body.error).toBe('idempotency_conflict');
-    expect(response.body.stored_hash).toBeDefined();
-    expect(response.body.incoming_hash).toBeDefined();
-    
-    // Validate with schema
-    IdempotencyConflictSchema.parse(response.body);
+    expect(response.body.error.code).toBe(ApiErrorCode.IDEMPOTENCY_CONFLICT);
+    expect(response.body.error.details.storedHash).toBeDefined();
+    expect(response.body.error.details.incomingHash).toBeDefined();
+    expect(isErrorEnvelope(response.body)).toBe(true);
   });
 
   it('should normalize body: whitespace and key ordering', async () => {

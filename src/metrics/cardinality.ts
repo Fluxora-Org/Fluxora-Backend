@@ -175,7 +175,7 @@ const STELLAR_STRKEY_RE = /^[GC][A-Z0-9]{55}$/;
 const LONG_HEX_RE = /^[0-9a-f]{16,}$/i;
 
 /** Pure numeric ids. */
-const NUMERIC_ID_RE = /^\d{3,}$/;
+const NUMERIC_ID_RE = /^\d+$/;
 
 /** ULID / Crockford base32 opaque ids (26 chars). */
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/i;

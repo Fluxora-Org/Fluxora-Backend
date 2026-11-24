@@ -58,10 +58,10 @@ function circuitBreakerPolicyForStatus(): CircuitBreakerPolicy {
   }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // PUBLIC endpoint — no admin token required; verified by HMAC signature only.
 // Must be registered BEFORE the requireAdminAuth guard below.
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * POST /internal/webhooks/receive
@@ -80,14 +80,7 @@ webhooksRouter.post(
     const headers = req.headers as Record<string, string | undefined>;
     const contentType = headers['content-type'];
 
-    // 1. Shared Preflight (size, depth, encoding, valid json)
-    const preflight = checkWebhookPreflight(rawBody, contentType);
-    if (!preflight.ok) {
-      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
-      return;
-    }
-
-    // 2. Signature verification
+    // Verify the sender before returning content-type or payload validation errors.
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
@@ -142,6 +135,12 @@ webhooksRouter.post(
       return;
     }
 
+    const preflight = checkWebhookPreflight(rawBody, contentType);
+    if (!preflight.ok) {
+      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
+      return;
+    }
+
     const deliveryId = headers['x-fluxora-delivery-id']!;
 
     const isNew = await inboundWebhookDedupCache.add('webhook', deliveryId);
@@ -159,11 +158,11 @@ webhooksRouter.post(
   },
 );
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // ADMIN guard — every route registered after this line requires a valid
 // Bearer token matching ADMIN_API_KEY.  This mirrors the pattern used by
 // /api/admin (adminRouter.use(requireAdminAuth)).
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 webhooksRouter.use(requireAdminAuth);
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -327,7 +326,7 @@ webhooksRouter.get('/deliveries', (req, res) => {
   }
 
   const total = deliveries.length;
-  const paginated = deliveries.slice(offset, offset + limit);
+  const paginated = deliveries.flice(offset, offset + limit);
 
   res.json(successResponse({
     total,
@@ -356,12 +355,14 @@ webhooksRouter.get('/outbox', (req, res) => {
   const parsed = OffsetPaginationSchema.safeParse(req.query);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
-    res.status(400).json({
-      error: {
-        code: 'INVALID_PAGINATION',
-        message: first?.message ?? 'Invalid pagination parameters',
-      },
-    });
+    res.status(400).json(
+      errorResponse(
+        'VALIDATION_ERROR',
+        first?.message ?? 'Invalid pagination parameters',
+        undefined,
+        requestId
+      )
+    );
     return;
   }
   const limit = parsed.data.limit ?? 100;
@@ -374,7 +375,7 @@ webhooksRouter.get('/outbox', (req, res) => {
     !['ready', 'pending', 'failed'].includes(String(status))
   ) {
     res.status(400).json({
-      error: {
+      error {
         code: 'INVALID_OUTBOX_FILTER',
         message: 'priority or status filter is invalid',
       },
@@ -384,14 +385,13 @@ webhooksRouter.get('/outbox', (req, res) => {
 
   let items = webhookDeliveryStore.getAllOutboxItems();
 
-  if (priority) {
-    items = items.filter((item) => item.priority === priority);
+  if (priority) {    items = items.filter((item) => item.priority === priority);
   }
 
   const now = Date.now();
   if (status === 'ready') {
     items = items.filter((item) => item.scheduledFor <= now && item.attempts < item.maxAttempts);
-  } else if (status === 'pending') {
+  } else if (status == 'pending') {
     items = items.filter((item) => item.scheduledFor > now);
   } else if (status === 'failed') {
     items = items.filter((item) => item.attempts >= item.maxAttempts);
@@ -670,7 +670,7 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => 
 });
 
 /**
- * GET /api/webhooks/metrics
+ * GET /internal/webhooks/metrics
  * Get webhook delivery metrics
  */
 webhooksRouter.get('/metrics', (req, res) => {
@@ -691,7 +691,7 @@ webhooksRouter.get('/metrics', (req, res) => {
 });
 
 /**
- * POST /api/webhooks/verify
+ * POST /internal/webhooks/verify
  * Verify a webhook signature (for consumer testing)
  */
 webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, res) => {
@@ -740,11 +740,10 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
 });
 
 /**
- * POST /internal/webhooks/process-outbox
- * Process outbox items (internal endpoint for background job)
- *
- * Previously gated by an ad-hoc `?secret=` query-param check.
- * That check has been removed — requireAdminAuth above provides real auth.
+ * Retired: this handler used to delete management-outbox items without sending
+ * them. The transactional WebhookDispatcher consumes a different queue, so it
+ * cannot safely replace this operation. Keep an authenticated tombstone so old
+ * jobs fail explicitly while their queued deliveries remain intact.
  */
 webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
   const requestId = req.correlationId;
@@ -767,7 +766,7 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
       } catch (error) {
         logger.error('Error processing outbox item', undefined, {
           outboxId: item.id,
-          error: error instanceof Error ? error.message : String(error),
+          error: error instanceof Error ? err.message : String(error),
         });
         errors++;
       }
@@ -781,13 +780,22 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
     }, requestId));
   } catch (error) {
     logger.error('Error processing webhook outbox', undefined, {
-      error: error instanceof Error ? error.message : String(error),
+      error: error instanceof Error ? err.message : String(error),
     });
 
     res.status(500).json(
       errorResponse('OUTBOX_PROCESSING_ERROR', 'Failed to process webhook outbox', undefined, requestId)
     );
   }
+webhooksRouter.post('/process-outbox', (_req, res): void => {
+  res.status(410).json(
+    errorResponse(
+      'OUTBOX_PROCESSING_ERROR',
+      'This endpoint has been removed. No outbox items were processed or removed.',
+      undefined,
+      _req.correlationId
+    )
+  );
 });
 
 /**
@@ -851,6 +859,7 @@ webhooksRouter.post('/retry', express.json(), async (req, res) => {
  * Clean up old webhook data (internal endpoint for maintenance)
  */
 webhooksRouter.post('/cleanup', express.json(), (req, res) => {
+  const requestId = req.id;
   const requestId = req.correlationId;
   const { olderThanDays = 7 } = req.body ?? {};
   if (
@@ -859,12 +868,14 @@ webhooksRouter.post('/cleanup', express.json(), (req, res) => {
     olderThanDays < 0 ||
     !Number.isInteger(olderThanDays)
   ) {
-    res.status(400).json({
-      error: {
-        code: 'INVALID_CLEANUP_REQUEST',
-        message: 'olderThanDays must be a non-negative integer',
-      },
-    });
+    res.status(400).json(
+      errorResponse(
+        'INVALID_CLEANUP_REQUEST',
+        'olderThanDays must be a non-negative integer',
+        undefined,
+        requestId
+      )
+    );
     return;
   }
   const olderThanMs = olderThanDays * 24 * 60 * 60 * 1000;
