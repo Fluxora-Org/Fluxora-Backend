@@ -888,7 +888,9 @@ describe('src/routes/audit.ts', () => {
         vi.spyOn(auditLogModule, 'recordAuditEventToDb').mockResolvedValue({} as any);
 
         let yieldedCount = 0;
-        async function* infiniteGenerator(signal: { aborted: boolean }) {
+        async function* infiniteGenerator(
+          signal: { readonly aborted: boolean } = { aborted: false }
+        ) {
           while (!signal.aborted) {
             yieldedCount++;
             yield mockRows[0];
