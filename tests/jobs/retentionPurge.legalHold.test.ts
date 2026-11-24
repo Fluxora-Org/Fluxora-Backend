@@ -98,8 +98,14 @@ function buildMockClient(batches: Record<string, MockRow[][]> = {}) {
         const table = /FROM\s+"([^"]+)"/.exec(sql)?.[1] ?? '';
         const queued = batches[table] ?? [];
         const idx = cursors.get(table) ?? 0;
-        cursors.set(table, idx + 1);
-        const batch = queued[idx] ?? [];
+        const pending = queued[idx] ?? [];
+        const limit = _params?.[1] as number;
+        const batch = pending.slice(0, limit);
+        if (pending.length > limit) {
+          queued[idx] = pending.slice(limit);
+        } else {
+          cursors.set(table, idx + 1);
+        }
         return { rows: batch, rowCount: batch.length };
       }
 
@@ -225,7 +231,11 @@ describe('AC-1: purge window boundary', () => {
 
     expect(deleteSqls).toHaveLength(0);
     expect(updateSqls.length).toBeGreaterThanOrEqual(1);
-    expect(updateSqls[0]).toContain('[REDACTED:DATA_RETENTION]');
+    const update = client.query.mock.calls.find(([sql]) => sql.trim().startsWith('UPDATE'));
+    expect(update?.[0]).toMatch(/sender_address\s*=\s*\$1/);
+    expect(update?.[0]).toMatch(/recipient_address\s*=\s*\$1/);
+    expect(update?.[0]).toContain("encryption_state       = 'redacted'");
+    expect(update?.[1]).toEqual(['[REDACTED:DATA_RETENTION]', 's1']);
   });
 });
 
@@ -475,32 +485,103 @@ describe('AC-4: volume cap', () => {
   });
 
   it('cap applies independently per rule (one rule hitting cap does not stop others)', async () => {
-    // Give streams a full batch at the cap boundary; audit_logs gets its own
-    // independent batch that should still be processed.
-    const cap = 1;
-    const batchSize = 1;
-    const streamsBatch = [expiredRow('sr1')];
-    const auditBatch = [expiredRow('al2')];
-
+    const cap = 2;
+    const streamsBatch = [expiredRow('sr1'), expiredRow('sr2')];
     const client = buildMockClient({
-      streams: [streamsBatch, streamsBatch], // second batch should be suppressed by cap
-      audit_logs: [auditBatch, []], // should still run fine
+      streams: [streamsBatch, [expiredRow('sr3')]],
+      audit_logs: [[expiredRow('al1')]],
     });
     const pool = buildMockPool(() => client);
 
     const result = await runRetentionPurge({
       ...baseOptions(pool),
-      batchSize,
+      batchSize: 2,
       maxRowsPerRun: cap,
     });
 
     const streamsRule = result.results.find((r) => r.table === 'streams');
     const auditRule = result.results.find((r) => r.table === 'audit_logs');
+    expect(streamsRule).toMatchObject({ rowsPurged: 2, volumeCapReached: true });
+    expect(auditRule).toMatchObject({ rowsPurged: 1, volumeCapReached: false });
+    expect(result.totalRowsPurged).toBe(3);
+    expect(mockPurgeVolumeCapExceededInc.mock.calls).toEqual([[{ table: 'streams' }]]);
+  });
 
-    expect(streamsRule!.volumeCapReached).toBe(true);
-    // audit_logs rule runs its own loop independently — cap only applies per rule
-    expect(auditRule!.rowsPurged).toBe(1);
-    expect(auditRule!.volumeCapReached).toBe(false);
+  it('reports each rule that independently reaches its cap', async () => {
+    const client = buildMockClient({
+      streams: [[expiredRow('sr1')]],
+      audit_logs: [[expiredRow('al1')]],
+    });
+    const result = await runRetentionPurge({
+      ...baseOptions(buildMockPool(() => client)),
+      batchSize: 1,
+      maxRowsPerRun: 1,
+    });
+
+    expect(result.totalRowsPurged).toBe(2);
+    for (const table of ['streams', 'audit_logs']) {
+      expect(result.results.find((r) => r.table === table)).toMatchObject({
+        rowsPurged: 1,
+        volumeCapReached: true,
+      });
+      expect(mockPurgeVolumeCapExceededInc).toHaveBeenCalledWith({ table });
+    }
+    expect(mockPurgeVolumeCapExceededInc).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])('never exceeds a partial final batch budget (dryRun=%s)', async (dryRun) => {
+    const client = buildMockClient({
+      streams: [
+        [expiredRow('s1'), expiredRow('s2')],
+        [expiredRow('s3'), expiredRow('s4')],
+      ],
+    });
+    const result = await runRetentionPurge({
+      ...baseOptions(buildMockPool(() => client)),
+      batchSize: 2,
+      maxRowsPerRun: 3,
+      dryRun,
+    });
+
+    expect(result.results.find((r) => r.table === 'streams')).toMatchObject({
+      rowsPurged: 3,
+      volumeCapReached: true,
+    });
+    const selects = client.query.mock.calls.filter(
+      ([sql]) => sql.includes('FROM "streams"') && sql.includes('FOR UPDATE SKIP LOCKED'),
+    );
+    expect(selects.map(([, params]) => params?.[1])).toEqual([2, 1]);
+    const updates = client.query.mock.calls.filter(([sql]) => sql.trim().startsWith('UPDATE'));
+    expect(updates.map(([, params]) => params?.[1])).toEqual(dryRun ? [] : ['s1', 's2', 's3']);
+    if (dryRun) expect(mockRecordAuditEventToDb).not.toHaveBeenCalled();
+  });
+
+  it('does not charge held rows against a rule budget and retains skip auditing', async () => {
+    const client = buildMockClient({
+      streams: [
+        [expiredRow('held', true), expiredRow('s1')],
+        [expiredRow('s2'), expiredRow('s3')],
+      ],
+    });
+    const result = await runRetentionPurge({
+      ...baseOptions(buildMockPool(() => client)),
+      batchSize: 2,
+      maxRowsPerRun: 2,
+    });
+    expect(result.results.find((r) => r.table === 'streams')).toMatchObject({
+      rowsPurged: 2,
+      rowsSkipped: 1,
+      volumeCapReached: true,
+    });
+    expect(mockRecordAuditEventToDb).toHaveBeenCalledWith(
+      'PURGE_SKIPPED_LEGAL_HOLD',
+      'streams',
+      'held',
+      'test-1457',
+      { table: 'streams', reason: 'legal_hold = TRUE' },
+    );
+    const updates = client.query.mock.calls.filter(([sql]) => sql.trim().startsWith('UPDATE'));
+    expect(updates.map(([, params]) => params?.[1])).toEqual(['s1', 's2']);
   });
 });
 

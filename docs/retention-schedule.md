@@ -68,6 +68,18 @@ them, committing each batch separately. It reads a single `now` for the whole
 run, so a run spanning a month boundary still evaluates every rule against one
 instant. `dryRun: true` counts candidates without writing anything.
 
+Stream redaction writes `[REDACTED:DATA_RETENTION]` to `sender_address` and
+`recipient_address`, clears their hashes, and sets `encryption_state` to
+`redacted`. The marker is supplied as a SQL parameter; the stream row is kept.
+
+`maxRowsPerRun` (default **50,000**) limits deleted or redacted rows **per rule
+per invocation**, across all its batches. The last batch is limited to that
+rule's remaining allowance. Reaching the limit sets `volumeCapReached` and
+increments the cap metric for that table, even when the last batch exactly
+fills the allowance. Later rules receive their own full allowance; the job's
+aggregate `totalRowsPurged` can therefore exceed this per-rule cap. Held rows
+do not consume the allowance. The same limits apply to dry-run counts.
+
 `audit_logs` is append-only at the storage layer, so that rule is the only
 delete path into it and runs under the dedicated `fluxora_retention` role (or,
 in single-role deployments, a transaction-local bypass flag that no request
