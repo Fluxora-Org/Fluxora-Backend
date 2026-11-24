@@ -1,7 +1,14 @@
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import pg from 'pg';
 import { db } from '../db/client.js';
-import { config } from '../config.js';
+import { getConfig, loadConfig, type Config } from '../config/env.js';
+
+function resolveConfig(): Config {
+  try {
+    return getConfig();
+  } catch {
+    return loadConfig();
+  }
+}
 import { ReplayCursor, ReplayProgress, ReplayRequest } from '../types/index.js';
 import { logger } from '../lib/logger.js';
 import {
@@ -81,6 +88,33 @@ function elapsedSecondsSince(startedAt: bigint): number {
  *   database work begins.
  * - Concurrent replays are rejected by an in-memory lock.
  */
+/** Progress reported by {@link IndexerService.replayEvents} after start and after each committed batch. */
+export interface ReplayProgressUpdate {
+  /** Rows committed so far, including rows committed by an earlier run this one resumed. */
+  processedRows: number;
+  /** Source rows matching the replay request, counted when the cursor was created. */
+  totalRows: number;
+}
+
+export interface ReplayEventsOptions {
+  /**
+   * Called once the replay knows its total, then after every committed batch.
+   * Errors thrown by the callback are logged and ignored so a progress
+   * consumer can never break a replay.
+   */
+  onProgress?: (update: ReplayProgressUpdate) => void;
+}
+
+/**
+ * How a replay ended without throwing.
+ * - `completed`: the run reached the end of its source rows and the cursor was closed.
+ * - `cancelled`: a stop was requested; committed batches are kept and a later
+ *   run resumes from the last committed offset.
+ */
+export interface ReplayResult extends ReplayProgressUpdate {
+  outcome: 'completed' | 'cancelled';
+}
+
 export class IndexerService {
   private maxRangeBlocks: number;
   private replayBudgetMs: number;
@@ -102,16 +136,17 @@ export class IndexerService {
     // Use the injected pool or fall back to the shared db pool.
     // Accessing db.pool directly is avoided to keep the service testable.
     this.pool = pool ?? (db as unknown as { pool: pg.Pool }).pool;
-    this.maxRangeBlocks = maxRangeBlocks ?? config.indexer.maxRangeBlocks;
-    this.replayBudgetMs = replayBudgetMs ?? config.indexer.replayBudgetMs;
+    const cfg = resolveConfig();
+    this.maxRangeBlocks = maxRangeBlocks ?? cfg.indexerMaxReplayRangeBlocks;
+    this.replayBudgetMs = replayBudgetMs ?? cfg.indexerReplayBudgetMs;
     this.cursorRepo = cursorRepo ?? new ReplayCursorRepository();
     this.progressRepo = new ReplayProgressCheckpointRepository();
     this.batchRunner = new ReplayBatchRunner(
       this.pool,
       this.cursorRepo,
       this.progressRepo,
-      batchSize ?? config.indexer.replayBatchSize,
-      replayStopForcedTimeoutMs ?? config.indexer.replayStopForcedTimeoutMs,
+      batchSize ?? cfg.indexerReplayBatchSize,
+      replayStopForcedTimeoutMs ?? cfg.indexerReplayStopForcedTimeoutMs,
     );
     // Only stored when explicitly injected (tests). Otherwise every call
     // resolves the *current* default via getLeaderElection() below —
@@ -143,7 +178,22 @@ export class IndexerService {
    * @throws {ReplayBudgetExceededError} If the wall-clock budget is exceeded.
    * @throws {ReplayForcedStopError}     If a stop was requested and a batch's DB wait did not settle within the forced timeout.
    */
-  async replayEvents(request: ReplayRequest): Promise<void> {
+  async replayEvents(
+    request: ReplayRequest,
+    options: ReplayEventsOptions = {},
+  ): Promise<ReplayResult> {
+    const reportProgress = (processedRows: number, totalRows: number): void => {
+      if (!options.onProgress) return;
+      try {
+        options.onProgress({ processedRows, totalRows });
+      } catch (err) {
+        logger.warn('replay_progress_callback_failed', undefined, {
+          event: 'replay_progress_callback_failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
     // 0. Cancel-before-start: if a stop was already requested (e.g. shutdown
     //    signalled before this replay began), do not acquire the in-memory
     //    lock or the leader lease. The flag is cleared so a later, genuine
@@ -155,7 +205,7 @@ export class IndexerService {
         ledger: request.ledger,
       });
       _resetStopReplay();
-      return;
+      return { outcome: 'cancelled', processedRows: 0, totalRows: 0 };
     }
 
     // 1. Validate input (no DB access yet)
@@ -192,7 +242,8 @@ export class IndexerService {
         // Nothing to replay — mark complete and return.
         await this.completeCursor(cursor.id);
         replayState.endReplay();
-        return;
+        reportProgress(0, 0);
+        return { outcome: 'completed', processedRows: 0, totalRows: 0 };
       }
 
       // 4. Initialise in-memory progress (for /status polling).
@@ -206,6 +257,7 @@ export class IndexerService {
 
       let offset = cursor.last_committed_offset;
       let batchIndex = 0;
+      reportProgress(offset, totalRows);
 
       // 5. Per-batch loop — each iteration uses a fresh connection.
       while (offset < totalRows) {
@@ -320,6 +372,7 @@ export class IndexerService {
 
         // Update in-memory progress.
         replayState.updateProgress(batchResult.rowsFetched, newOffset);
+        reportProgress(newOffset, totalRows);
 
         // Compute rows/sec for the gauge.
         const elapsedSec = (Date.now() - replayStart) / 1_000;
@@ -396,6 +449,12 @@ export class IndexerService {
           offset,
         });
       }
+
+      return {
+        outcome: stoppedByRequest ? 'cancelled' : 'completed',
+        processedRows: offset,
+        totalRows,
+      };
     } catch (error) {
       replayState.endReplay();
       indexerReplayRowsPerSecond.set({ contract_id: request.contract_id.slice(0, 64) }, 0);

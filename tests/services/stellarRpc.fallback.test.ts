@@ -195,6 +195,7 @@ describe('StellarRpcService fallback cache', () => {
 
     expect(res.status).toBe(200);
     expect(res.headers['x-rpc-cache']).toBe('stale');
+    expect(Number(res.headers['x-rpc-cache-age-ms'])).toBeGreaterThanOrEqual(0);
     expect(res.body).toEqual({ sequence: 500 });
   });
 

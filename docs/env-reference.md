@@ -3,8 +3,10 @@
 # Environment Variable Reference
 
 Generated from the composed environment schema (`src/config/env-schema/schema.ts`,
-issue #1519). 162 variables across 11 subsystems.
+issue #1519). 167 variables across 11 subsystems.
 issue #1519). 161 variables across 11 subsystems.
+issue #1519). 161 variables across 11 subsystems.
+issue #1519). 163 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
 (required, or optional with a runtime fallback).
@@ -89,6 +91,7 @@ issue #1519). 161 variables across 11 subsystems.
 | Variable | Purpose | Default |
 |---|---|---|
 | `CORS_ALLOWED_ORIGINS` | Comma-separated CORS origins; '*' is rejected in production. | — |
+| `EARLY_HINTS_ENABLED` | Kill switch for HTTP 103 Early Hints responses. Set to `false` to disable hints globally. @default true | `true` |
 | `GRAPHQL_INTROSPECTION_ENABLED` | Allow the GraphQL introspection query. @default true | `true` |
 | `GRAPHQL_PERSISTED_QUERY_ALLOWLIST` | Comma-separated SHA-256 allowlist for GraphQL persisted queries. | — |
 | `GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION` | Require APQ hashes to match the allowlist. @default true | `true` |
@@ -181,7 +184,11 @@ issue #1519). 161 variables across 11 subsystems.
 | `INDEXER_BACKFILL_RETRY_DELAY_MS` | Delay between backfill batch retries in ms. @default 1000 | `1000` |
 | `INDEXER_BACKFILL_STRICT_ORDER` | Require backfill checkpoints to advance in ledger order. @default true | `true` |
 | `INDEXER_LAST_SUCCESSFUL_SYNC_AT` | Manually recorded timestamp of the last successful sync, surfaced in status endpoints for operational dashboards. | — |
+| `INDEXER_MAX_REPLAY_RANGE_BLOCKS` | Maximum allowed `to_block - from_block` replay range; 0 = unlimited. @default 10000000 | `10000000` |
 | `INDEXER_MTLS_REQUIRED` | When true, reject non-TLS indexer worker connections (fail-closed). Defaults to true in production, false otherwise. | — |
+| `INDEXER_REPLAY_BATCH_SIZE` | Number of source rows fetched and inserted per replay batch transaction. @default 250 | `250` |
+| `INDEXER_REPLAY_BUDGET_MS` | Wall-clock budget in ms for a single replay run; 0 = unlimited. @default 0 | `0` |
+| `INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS` | Forced-stop timeout in ms bounding a single batch's DB wait after cancellation; 0 = wait indefinitely. @default 10000 | `10000` |
 | `INDEXER_STALL_THRESHOLD_MS` | Flag the indexer as stalled when no ledger progress for this long, in ms. @default 300000 (5 min) | `300000` |
 
 ## Rate limiting
@@ -211,7 +218,9 @@ issue #1519). 161 variables across 11 subsystems.
 | `CANARY_TRAFFIC_PERCENT` | Percentage of traffic (0–100) to route through the canary code path. 0 disables canary tagging entirely (default). Set to e.g. 10 to tag 10 % of clients deterministically as canary based on a SHA-256 hash of their identity (API key or IP). @default 0 | `0` |
 | `DLQ_PURGE_BATCH_SIZE` | Maximum rows to delete per batch in the DLQ retention purge job. Keeps lock duration short on the dead_letter_queue table. Defaults to 500. @default 500 | `500` |
 | `DLQ_RETENTION_DAYS` | Retention period in days for dead_letter_queue entries. Entries in a terminal state (status = 'replayed' or permanently failed) older than this many days are eligible for automatic purge. Defaults to 30 days. Set to 0 to disable the purge job entirely. @default 30 | `30` |
+| `DEDUP_WINDOW_SECONDS` | Retention window for stream-event dedup keys in seconds (integer, 1–604800 i.e. max 7 days). @default 86400 | `86400` |
 | `IDEMPOTENCY_TTL_SECONDS` | Retention window for idempotency keys in seconds (max 7 days). @default 86400 | `86400` |
+| `PARTITION_MAINTENANCE_LEAD_TIME_MONTHS` | Partition lead time in whole calendar months for the partition maintenance job. Ensures monthly partitions exist for the current month plus this many months ahead. @default 3 | `3` |
 | `RPC_CB_FAILURE_THRESHOLD` | Failed RPC calls within the window before the circuit opens. @default 5 | `5` |
 | `RPC_CB_RESET_TIMEOUT_MS` | Time before an open RPC circuit half-opens, in ms. @default 60000 | `60000` |
 | `RPC_CB_WINDOW_MS` | Sliding window for RPC failure counting, in ms. @default 30000 | `30000` |
@@ -228,3 +237,4 @@ issue #1519). 161 variables across 11 subsystems.
 | `STARTUP_PROBE_REDIS_TIMEOUT_MS` | Per-attempt timeout for each Redis (soft-tier) retry, in ms. @default 3000 | `3000` |
 | `STARTUP_PROBE_STELLAR_TIMEOUT_MS` | Per-attempt timeout for each Stellar RPC (soft-tier) retry, in ms. @default 5000 | `5000` |
 
+| `HEALTH_CHECK_REDIS_TIMEOUT_MS` | Per-checker timeout override for the Redis health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. | — |

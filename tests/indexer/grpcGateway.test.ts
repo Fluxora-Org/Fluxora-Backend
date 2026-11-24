@@ -438,14 +438,36 @@ describe('GetEvents RPC', () => {
     });
 
     const res = await callRpc<unknown, {
-      events: Array<{ eventId: string }>;
+      events: Array<{
+        eventId: string;
+        ledger: number;
+        contractId: string;
+        topic: string;
+        txHash: string;
+        payloadJson: string;
+        happenedAt: string;
+        ledgerHash: string;
+      }>;
       total: number;
+      limit: number;
+      offset: number;
       nextCursor: string;
     }>(client, 'GetEvents', { limit: 100, offset: 0 }, makeMetadata(VALID_TOKEN));
 
     expect(res.events).toHaveLength(1);
-    expect(res.events[0].eventId).toBe('ev1');
+    expect(res.events[0]).toEqual({
+      eventId: 'ev1',
+      ledger: 10,
+      contractId: 'c1',
+      topic: 'transfer',
+      txHash: 'h1',
+      payloadJson: JSON.stringify({ amount: '50' }),
+      happenedAt: '2024-01-01T00:00:00Z',
+      ledgerHash: 'lh1',
+    });
     expect(res.total).toBe(1);
+    expect(res.limit).toBe(100);
+    expect(res.offset).toBe(0);
     expect(res.nextCursor).toBe('ev1');
   });
 

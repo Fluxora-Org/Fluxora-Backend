@@ -500,8 +500,8 @@ describe('GET /internal/webhooks/circuit-breakers — per-receiver observability
     const res = await getState(RECEIVER);
 
     expect(res.status).toBe(200);
-    expect(res.body.total).toBe(1);
-    expect(res.body.states[0]).toMatchObject({
+    expect(res.body.data.total).toBe(1);
+    expect(res.body.data.states[0]).toMatchObject({
       endpointUrl: RECEIVER,
       state: 'closed',
       paused: false,
@@ -521,7 +521,7 @@ describe('GET /internal/webhooks/circuit-breakers — per-receiver observability
     expect(open.state).toBe('open');
 
     const res = await getState(RECEIVER);
-    const state = res.body.states[0];
+    const state = res.body.data.states[0];
 
     expect(res.status).toBe(200);
     expect(state).toMatchObject({
@@ -536,7 +536,7 @@ describe('GET /internal/webhooks/circuit-breakers — per-receiver observability
       resumeAt: new Date(open.resetAt).toISOString(),
     });
     expect(state.nextAttemptTime).toBe(state.resumeAt);
-    expect(res.body.observedAt).toEqual(expect.any(String));
+    expect(res.body.data.observedAt).toEqual(expect.any(String));
   });
 
   it('reports half-open probe contention as the pause reason', async () => {
@@ -548,12 +548,12 @@ describe('GET /internal/webhooks/circuit-breakers — per-receiver observability
     const res = await getState(RECEIVER);
 
     expect(res.status).toBe(200);
-    expect(res.body.states[0]).toMatchObject({
+    expect(res.body.data.states[0]).toMatchObject({
       state: 'half-open',
       paused: true,
       reason: 'half-open-probe-in-flight',
     });
-    expect(res.body.states[0].resumeAt).not.toBeNull();
+    expect(res.body.data.states[0].resumeAt).not.toBeNull();
   });
 
   it('reports the receiver as healthy after a manual reset', async () => {

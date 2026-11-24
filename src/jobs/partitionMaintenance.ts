@@ -129,7 +129,15 @@
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import { logger } from '../lib/logger.js';
 import { raiseAlert } from '../lib/alerts.js';
-import { config } from '../config.js';
+import { getConfig, loadConfig, type Config } from '../config/env.js';
+
+function resolveConfig(): Config {
+  try {
+    return getConfig();
+  } catch {
+    return loadConfig();
+  }
+}
 import {
   partitionsCreatedTotal,
   partitionMaintenanceBehindScheduleTotal,
@@ -476,7 +484,7 @@ function resolveLeadTimeMonths(options: PartitionMaintenanceOptions): number {
   const explicit = options.leadTimeMonths ?? options.monthsAhead;
   if (explicit !== undefined) return explicit;
 
-  const configured = config.partitionMaintenance?.leadTimeMonths;
+  const configured = resolveConfig().partitionMaintenanceLeadTimeMonths;
   return Number.isInteger(configured) && configured >= 0 ? configured : DEFAULT_LEAD_TIME_MONTHS;
 }
 

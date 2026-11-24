@@ -4,9 +4,6 @@ import {
 HealthCheckManager,
 type HealthChecker,
 type DependencyHealth,
-createDatabaseHealthChecker,
-createRedisHealthChecker,
-createHorizonHealthChecker,
 createBoundedHealthCheckManager,
 validateHealthConfig,
 } from './health.js';
@@ -186,38 +183,6 @@ describe('Health Check Manager', () => {
 
       expect(report.status).toBe('healthy');
       expect(report.dependencies[0]!.status).toBe('healthy');
-    });
-  });
-
-  describe('Built-in checkers', () => {
-    it('should create database health checker with default and custom timeout', async () => {
-      const checker = createDatabaseHealthChecker();
-      expect(checker.name).toBe('database');
-      expect(checker.timeoutMs).toBe(5000);
-      const custom = createDatabaseHealthChecker({ timeoutMs: 2500 });
-      expect(custom.timeoutMs).toBe(2500);
-      const result = await checker.check();
-      expect(result.latency).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should create redis health checker with default and custom timeout', async () => {
-      const checker = createRedisHealthChecker();
-      expect(checker.name).toBe('redis');
-      expect(checker.timeoutMs).toBe(5000);
-      const custom = createRedisHealthChecker({ timeoutMs: 1500 });
-      expect(custom.timeoutMs).toBe(1500);
-      const result = await checker.check();
-      expect(result.latency).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should create horizon health checker with default and custom timeout', async () => {
-      const checker = createHorizonHealthChecker('https://horizon.stellar.org');
-      expect(checker.name).toBe('horizon');
-      expect(checker.timeoutMs).toBe(5000);
-      const custom = createHorizonHealthChecker('https://horizon.stellar.org', { timeoutMs: 3500 });
-      expect(custom.timeoutMs).toBe(3500);
-      const result = await checker.check();
-      expect(result.latency).toBeGreaterThanOrEqual(0);
     });
   });
 

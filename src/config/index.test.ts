@@ -1,4 +1,4 @@
-import { expect, test, describe } from 'vitest';
+import { expect, test, describe, afterEach, beforeEach } from 'vitest';
 import { 
   composeConfiguration, 
   baseConfig, 
@@ -6,6 +6,27 @@ import {
   featureFlagsConfig,
   COMPOSITION_ORDER
 } from './index.js';
+import { loadConfig } from './env.js';
+
+describe('RPC fallback cache max age configuration', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.RPC_FALLBACK_CACHE_MAX_AGE_MS;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test('uses the default and applies an environment override', () => {
+    expect(loadConfig().rpcFallbackCacheMaxAgeMs).toBe(300000);
+
+    process.env.RPC_FALLBACK_CACHE_MAX_AGE_MS = '120000';
+    expect(loadConfig().rpcFallbackCacheMaxAgeMs).toBe(120000);
+  });
+});
 
 describe('Configuration Composition', () => {
   test('asserts documented precedence for overlapping settings', () => {
