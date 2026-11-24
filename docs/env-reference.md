@@ -6,6 +6,7 @@ Generated from the composed environment schema (`src/config/env-schema/schema.ts
 issue #1519). 167 variables across 11 subsystems.
 issue #1519). 161 variables across 11 subsystems.
 issue #1519). 161 variables across 11 subsystems.
+issue #1519). 163 variables across 11 subsystems.
 
 “—” in the Default column means the variable has no schema-level default
 (required, or optional with a runtime fallback).
@@ -90,6 +91,7 @@ issue #1519). 161 variables across 11 subsystems.
 | Variable | Purpose | Default |
 |---|---|---|
 | `CORS_ALLOWED_ORIGINS` | Comma-separated CORS origins; '*' is rejected in production. | — |
+| `EARLY_HINTS_ENABLED` | Kill switch for HTTP 103 Early Hints responses. Set to `false` to disable hints globally. @default true | `true` |
 | `GRAPHQL_INTROSPECTION_ENABLED` | Allow the GraphQL introspection query. @default true | `true` |
 | `GRAPHQL_PERSISTED_QUERY_ALLOWLIST` | Comma-separated SHA-256 allowlist for GraphQL persisted queries. | — |
 | `GRAPHQL_PERSISTED_QUERY_HASH_VERIFICATION` | Require APQ hashes to match the allowlist. @default true | `true` |
@@ -235,3 +237,4 @@ issue #1519). 161 variables across 11 subsystems.
 | `STARTUP_PROBE_REDIS_TIMEOUT_MS` | Per-attempt timeout for each Redis (soft-tier) retry, in ms. @default 3000 | `3000` |
 | `STARTUP_PROBE_STELLAR_TIMEOUT_MS` | Per-attempt timeout for each Stellar RPC (soft-tier) retry, in ms. @default 5000 | `5000` |
 
+| `HEALTH_CHECK_REDIS_TIMEOUT_MS` | Per-checker timeout override for the Redis health check, in ms. When absent, falls back to HEALTH_CHECK_TIMEOUT_MS. | — |

@@ -110,6 +110,7 @@ export interface Config {
 
   logLevel: LogLevel;
   metricsEnabled: boolean;
+  earlyHintsEnabled: boolean;
 
   tracingEnabled: boolean;
   tracingSampleRate: number;
