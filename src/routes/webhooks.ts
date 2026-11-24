@@ -740,11 +740,10 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
 });
 
 /**
- * POST /internal/webhooks/process-outbox
- * Process outbox items (internal endpoint for background job)
- *
- * Previously gated by an ad-hoc `?secret=` query-param check.
- * That check has been removed — requireAdminAuth above provides real auth.
+ * Retired: this handler used to delete management-outbox items without sending
+ * them. The transactional WebhookDispatcher consumes a different queue, so it
+ * cannot safely replace this operation. Keep an authenticated tombstone so old
+ * jobs fail explicitly while their queued deliveries remain intact.
  */
 webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
   const requestId = req.correlationId;
@@ -788,6 +787,15 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
       errorResponse('OUTBOX_PROCESSING_ERROR', 'Failed to process webhook outbox', undefined, requestId)
     );
   }
+webhooksRouter.post('/process-outbox', (_req, res): void => {
+  res.status(410).json(
+    errorResponse(
+      'OUTBOX_PROCESSING_ERROR',
+      'This endpoint has been removed. No outbox items were processed or removed.',
+      undefined,
+      _req.correlationId
+    )
+  );
 });
 
 /**

@@ -8,7 +8,7 @@
  *  - POST /receive remains publicly accessible (HMAC-verified only, no Bearer token needed)
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { webhooksRouter } from '../../src/routes/webhooks.js';
@@ -347,45 +347,52 @@ describe('GET /circuit-breakers — functional', () => {
   });
 });
 
-describe('POST /process-outbox — functional', () => {
-  it('processes an empty outbox successfully with valid auth', async () => {
-    const res = await authed(
-      request(app)
-        .post(`${BASE}/process-outbox`)
-        .set('Content-Type', 'application/json')
-        .send({})
-    );
-    expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.processed).toBe(0);
+describe('POST /process-outbox - retired without data loss', () => {
+  it('returns 410 for an empty outbox instead of reporting successful processing', async () => {
+    const res = await authed(request(app).post(`${BASE}/process-outbox`)).send({});
+    expect(res.status).toBe(410);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('OUTBOX_PROCESSING_ERROR');
+    expect(res.body.error.message).toContain('No outbox items were processed or removed');
+    expect(res.body).not.toHaveProperty('data');
   });
 
-  it('processes outbox items and removes them', async () => {
-    // Seed the outbox
-    webhookDeliveryStore.addToOutbox({
-      deliveryId: 'deliv_test_001',
-      eventId: 'event_001',
-      eventType: 'stream.created',
-      endpointUrl: 'https://example.com/webhook',
-      payload: '{"test": true}',
-      secret: 'secret123',
-      priority: 'normal',
-      createdAt: Date.now(),
-      scheduledFor: Date.now() - 1000, // Already due
-      attempts: 0,
-      maxAttempts: 5,
-    });
-
-    const res = await authed(
-      request(app)
-        .post(`${BASE}/process-outbox`)
-        .set('Content-Type', 'application/json')
-        .send({})
-    );
-    expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.processed).toBe(1);
-    expect(res.body.total).toBe(1);
+  it('preserves due, retrying, and future items across repeated authenticated requests', async () => {
+    const now = Date.now();
+    for (const [index, scheduledFor, attempts] of [
+      [0, now - 1000, 0],
+      [1, now - 1000, 2],
+      [2, now + 60000, 0],
+    ]) {
+      webhookDeliveryStore.addToOutbox({
+        deliveryId: `deliv_test_${index}`,
+        eventId: `event_${index}`,
+        eventType: 'stream.created',
+        endpointUrl: 'https://example.com/webhook',
+        payload: '{"test": true}',
+        secret: 'secret123',
+        priority: 'normal',
+        createdAt: now,
+        scheduledFor,
+        attempts,
+        maxAttempts: 5,
+      });
+    }
+    const before = structuredClone(webhookDeliveryStore.getReadyOutboxItems(now + 60001));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('endpoint unavailable'));
+    try {
+      for (let i = 0; i < 2; i++) {
+        const res = await authed(request(app).post(`${BASE}/process-outbox`)).send({});
+        expect(res.status).toBe(410);
+        expect(res.body.success).toBe(false);
+      }
+      expect(webhookDeliveryStore.getReadyOutboxItems(now + 60001)).toEqual(before);
+      expect(webhookDeliveryStore.getMetrics().outboxItems).toBe(3);
+      expect(webhookDeliveryStore.getDeadLetterQueueItems()).toEqual([]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 
@@ -463,16 +470,16 @@ describe('GET /deliveries/:deliveryId — functional', () => {
 // ── No more ad-hoc secret checks on process-outbox / retry ───────────────────
 
 describe('Removal of ad-hoc secret checks', () => {
-  it('POST /process-outbox no longer requires ?secret= query param', async () => {
-    // With valid admin auth and NO ?secret= param, should succeed
+  it('POST /process-outbox reports retirement after admin authentication', async () => {
+    // Valid admin auth reaches the retirement response without a query secret.
     const res = await authed(
       request(app)
         .post(`${BASE}/process-outbox`)
         .set('Content-Type', 'application/json')
         .send({})
     );
-    expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(410);
+    expect(res.body.success).toBe(false);
   });
 
   it('POST /retry no longer requires ?secret= query param', async () => {
