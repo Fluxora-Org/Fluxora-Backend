@@ -80,14 +80,7 @@ webhooksRouter.post(
     const headers = req.headers as Record<string, string | undefined>;
     const contentType = headers['content-type'];
 
-    // 1. Shared Preflight (size, depth, encoding, valid json)
-    const preflight = checkWebhookPreflight(rawBody, contentType);
-    if (!preflight.ok) {
-      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
-      return;
-    }
-
-    // 2. Signature verification
+    // Verify the sender before returning content-type or payload validation errors.
     const verifyInput: Parameters<typeof verifyWebhookSignature>[0] = {
       rawBody,
     };
@@ -139,6 +132,12 @@ webhooksRouter.post(
 
     if (!verification.ok) {
       res.status(verification.status).json(errorResponse(verification.code, verification.message, undefined, req.correlationId));
+      return;
+    }
+
+    const preflight = checkWebhookPreflight(rawBody, contentType);
+    if (!preflight.ok) {
+      res.status(preflight.status).json(errorResponse(preflight.code, preflight.message));
       return;
     }
 

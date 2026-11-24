@@ -76,15 +76,33 @@ describe('Webhooks Route Early-Return Safeguards & Error Paths', () => {
       const res = await request(app)
         .post('/internal/webhooks/receive')
         .set('x-fluxora-delivery-id', 'deliv_bad')
-        .set('x-fluxora-timestamp', '12345')
+        .set('x-fluxora-timestamp', Math.floor(Date.now() / 1000).toString())
         .set('x-fluxora-signature', 'invalid-sig')
+        .set('Content-Type', 'text/plain')
         .send('{}');
 
       expect(res.status).toBe(401);
       expect(res.body).toHaveProperty('error');
-      // Verify dedup cache was NOT populated
       const isNew = await cache.add('webhook', 'deliv_bad');
       expect(isNew).toBe(true);
+    });
+
+    it('checks content type after a valid signature', async () => {
+      const app = makeApp();
+      const payload = '{}';
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const signature = computeWebhookSignature('test-secret', timestamp, payload);
+
+      const res = await request(app)
+        .post('/internal/webhooks/receive')
+        .set('x-fluxora-delivery-id', 'deliv_wrong_content_type')
+        .set('x-fluxora-timestamp', timestamp)
+        .set('x-fluxora-signature', signature)
+        .set('Content-Type', 'text/plain')
+        .send(payload);
+
+      expect(res.status).toBe(415);
+      expect(await getInboundWebhookDedupCache().add('webhook', 'deliv_wrong_content_type')).toBe(true);
     });
   });
 
