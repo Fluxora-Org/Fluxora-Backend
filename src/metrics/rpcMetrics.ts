@@ -185,8 +185,8 @@ export const rpcDegradationTransitionsTotal =
     registers: [registry],
   });
 
-export const rpcUpgradeCallsTotal =
-  (registry.getSingleMetric('import') as Counter<'operation' | 'outcome'>)  ||
+export const rpcUpstreamCallsTotal =
+  (registry.getSingleMetric('rpc_upstream_calls_total') as Counter<'operation' | 'outcome'>)  ||
   new Counter({
     name: 'rpc_upstream_calls_total',
     help: 'Total Stellar RPC upstream calls attempted',
@@ -244,11 +244,66 @@ export const rpcDegradedModeGauge =
     registers: [registry],
   });
 
+export const rpcCircuitOpenFallbackHitsTotal =
+  (registry.getSingleMetric('rpc_circuit_open_fallback_hits_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'rpc_circuit_open_fallback_hits_total',
+    help: 'Total Stellar RPC calls served from last-known-good cache while the circuit breaker is OPEN',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
+export const rpcCircuitOpenFallbackMissesTotal =
+  (registry.getSingleMetric('rpc_circuit_open_fallback_misses_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'rpc_circuit_open_fallback_misses_total',
+    help: 'Total Stellar RPC calls that missed last-known-good cache while the circuit breaker is OPEN',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
+export const rpcFallbackCacheExhaustedTotal =
+  (registry.getSingleMetric('rpc_fallback_cache_exhausted_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'rpc_fallback_cache_exhausted_total',
+    help: 'Total Stellar RPC calls refused because the last-known-good cache entry exceeded the maximum fallback age',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
+export const rpcFallbackCacheHitsTotal =
+  (registry.getSingleMetric('rpc_fallback_cache_hits_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'rpc_fallback_cache_hits_total',
+    help: 'Total Stellar RPC calls served from the Redis fallback cache while the circuit breaker is CLOSED',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
+export const rpcFallbackCacheMissesTotal =
+  (registry.getSingleMetric('rpc_fallback_cache_misses_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'rpc_fallback_cache_misses_total',
+    help: 'Total Stellar RPC calls that missed the Redis fallback cache while the circuit breaker is CLOSED',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
+export const rpcFallbackCacheEarlyRefreshesTotal =
+  (registry.getSingleMetric('rpc_fallback_cache_early_refreshes_total') as Counter<'operation'>) ||
+  new Counter({
+    name: 'rpc_fallback_cache_early_refreshes_total',
+    help: 'Total probabilistic early refreshes started for Stellar RPC fallback cache entries',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+  });
+
 export const rpcProviderHealthyGauge =
   (registry.getSingleMetric('rpc_provider_healthy') as Gauge<'provider'>) ||
   new Gauge({
     name: 'rpc_provider_healthy',
     help: 'Whether a Stellar RPC provider is healthy (1 = healthy, 0 = unhealthy)',
+    help: 'Stellar RPC provider health-check status (1 = healthy, 0 = unhealthy)',
     labelNames: ['provider'] as const,
     registers: [registry],
   });
@@ -260,6 +315,10 @@ export const rpcProviderHealthCheckFailuresTotal =
   new Counter({
     name: 'rpc_provider_health_check_failures_total',
     help: 'Total Stellar RPC provider health-check failures by provider and failure reason',
+  (registry.getSingleMetric('rpc_provider_health_check_failures_total') as Counter<'provider' | 'reason'>) ||
+  new Counter({
+    name: 'rpc_provider_health_check_failures_total',
+    help: 'Total Stellar RPC background health-check failures',
     labelNames: ['provider', 'reason'] as const,
     registers: [registry],
   });
@@ -272,6 +331,12 @@ export function deRegisterRpcMetrics(): void {
     'rpc_upstream_call_duration_seconds',
     'fluxora_rpc_cache_corrupt_total',
     'rpc_degraded_mode',
+    'rpc_circuit_open_fallback_hits_total',
+    'rpc_circuit_open_fallback_misses_total',
+    'rpc_fallback_cache_exhausted_total',
+    'rpc_fallback_cache_hits_total',
+    'rpc_fallback_cache_misses_total',
+    'rpc_fallback_cache_early_refreshes_total',
     'rpc_provider_healthy',
     'rpc_provider_health_check_failures_total',
   ]) {
