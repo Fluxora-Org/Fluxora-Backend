@@ -64,7 +64,7 @@ function result(rows: Record<string, unknown>[]): { rows: Record<string, unknown
 const originalApiKeyMax = process.env.RATE_LIMIT_APIKEY_MAX;
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
   mocks.getPool.mockReturnValue(fakePool);
   mocks.createId.mockReturnValue('generated-override-id');
   process.env.RATE_LIMIT_APIKEY_MAX = '500';
@@ -128,12 +128,20 @@ describe('getOverride', () => {
     await expect(getOverride('tenant-key-1')).resolves.toBeNull();
   });
 
-  it('accepts an empty key id as a boundary and forwards it unchanged', async () => {
-    mocks.query.mockResolvedValueOnce(result([]));
+  it('rejects empty and whitespace key ids before touching the store', async () => {
+    await expect(getOverride('')).rejects.toMatchObject({
+      statusCode: 400,
+      code: ApiErrorCode.VALIDATION_ERROR,
+      message: 'keyId must be a non-empty string',
+    });
+    await expect(getOverride('   ')).rejects.toMatchObject({
+      statusCode: 400,
+      code: ApiErrorCode.VALIDATION_ERROR,
+      message: 'keyId must be a non-empty string',
+    });
 
-    await expect(getOverride('')).resolves.toBeNull();
-
-    expect(mocks.query.mock.calls[0]![2]).toEqual(['']);
+    expect(mocks.getPool).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
   });
 
   it('propagates store errors', async () => {
@@ -173,12 +181,20 @@ describe('getOverrideById', () => {
     await expect(getOverrideById('override-1')).resolves.toBeNull();
   });
 
-  it('accepts an empty id as a boundary and forwards it unchanged', async () => {
-    mocks.query.mockResolvedValueOnce(result([]));
+  it('rejects empty and whitespace ids before touching the store', async () => {
+    await expect(getOverrideById('')).rejects.toMatchObject({
+      statusCode: 400,
+      code: ApiErrorCode.VALIDATION_ERROR,
+      message: 'id must be a non-empty string',
+    });
+    await expect(getOverrideById('   ')).rejects.toMatchObject({
+      statusCode: 400,
+      code: ApiErrorCode.VALIDATION_ERROR,
+      message: 'id must be a non-empty string',
+    });
 
-    await expect(getOverrideById('')).resolves.toBeNull();
-
-    expect(mocks.query.mock.calls[0]![2]).toEqual(['']);
+    expect(mocks.getPool).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
   });
 
   it('propagates store errors', async () => {
@@ -414,14 +430,20 @@ describe('deleteOverride', () => {
     }
   });
 
-  it('treats an empty id as a boundary and reports not found', async () => {
-    mocks.query.mockResolvedValueOnce(result([]));
-
+  it('rejects empty and whitespace ids before touching the store', async () => {
     await expect(deleteOverride('')).rejects.toMatchObject({
-      statusCode: 404,
-      message: 'Override not found: ',
+      statusCode: 400,
+      code: ApiErrorCode.VALIDATION_ERROR,
+      message: 'id must be a non-empty string',
     });
-    expect(mocks.query.mock.calls[0]![2]).toEqual(['']);
+    await expect(deleteOverride('   ')).rejects.toMatchObject({
+      statusCode: 400,
+      code: ApiErrorCode.VALIDATION_ERROR,
+      message: 'id must be a non-empty string',
+    });
+
+    expect(mocks.getPool).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
   });
 
   it('propagates store errors', async () => {

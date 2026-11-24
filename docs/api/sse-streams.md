@@ -62,6 +62,18 @@ usually because a reorg rollback removed it. The server emits an SSE `error`
 event with code `STALE_CURSOR` and closes the response; clients should discard
 that cursor and re-sync from the last trusted `fromLedger` checkpoint.
 
+### In-process replay buffer
+
+Every `stream_update` emitted on `sseEventBus` (for example by `broadcastEvent` in `src/ws/fanout.ts`) is appended to a per-stream ring buffer in `src/streams/sseEmitter.ts`. Buffering happens inside `sseEventBus.emit`, before any listener runs:
+
+* Events are buffered **whether or not the stream has live SSE subscribers**. A client that disconnects while it is the only subscriber can reconnect and resume from `Last-Event-ID` without a gap.
+* Events are buffered **before fan-out**, so the event a subscriber is handling is already replayable.
+* Each stream keeps at most `SSE_REPLAY_BUFFER_SIZE` events (default `200`); the oldest are evicted first.
+* `replayFromBuffer(streamId, afterEventId)` returns the events emitted strictly after the cursor. It throws `SseReplayExpiredError` (code `SSE_REPLAY_EXPIRED`) when the stream has no buffered events or the cursor has been evicted or was never emitted; callers should then resync from the persistent event store.
+* The buffer is process-local and is cleared on shutdown (`drainSseEventBus`).
+
+Tests can clear the buffer with `_resetSseReplayBufferForTest()`. `_resetSseSubscriptionsForTest()` also clears it, along with live subscribers.
+
 ---
 
 ## Connection Limits and Maximum Duration

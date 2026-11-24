@@ -23,6 +23,7 @@ import {
   SSE_STREAM_UPDATE_EVENT,
   sseEventBus,
   _resetSseSubscriptionsForTest,
+  _resetSseReplayBufferForTest,
 } from './sseEmitter.js';
 import type { LiveSseStreamUpdateEvent } from './sseEmitter.js';
 
@@ -47,6 +48,7 @@ function emitN(streamId: string, count: number, prefix = 'evt'): LiveSseStreamUp
 
 beforeEach(() => {
   _resetSseSubscriptionsForTest();
+  _resetSseReplayBufferForTest();
 });
 
 // ── 1. Resumption from a last-event identifier ────────────────────────────────
@@ -244,6 +246,17 @@ describe('buffer populated before subscriber fan-out', () => {
 });
 
 // ── 6. Reset clears the buffer ────────────────────────────────────────────────
+
+describe('_resetSseReplayBufferForTest', () => {
+  it('clears buffered events without needing a subscriber', () => {
+    emitN('reset-helper', 2);
+    expect(replayFromBuffer('reset-helper', 'evt-0')).toHaveLength(1);
+
+    _resetSseReplayBufferForTest();
+
+    expect(() => replayFromBuffer('reset-helper', 'evt-0')).toThrow(SseReplayExpiredError);
+  });
+});
 
 describe('_resetSseSubscriptionsForTest clears replay buffer', () => {
   it('throws SseReplayExpiredError after reset for a previously emitted cursor', () => {

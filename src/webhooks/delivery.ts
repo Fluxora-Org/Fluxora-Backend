@@ -184,7 +184,6 @@ export class WebhookService {
         }
 
         delivery.attempts.push(attempt);
-        delivery.status = 'pending';
         webhookDeliveryStore.store(delivery);
         webhookDeliveriesTotal.inc({ outcome: 'failed' });
       }

@@ -120,21 +120,13 @@ Same as §1.1. The same JWT revocation store is authoritative; the WebSocket han
 
 ---
 
-### 1.5 Partner / Internal Static Bearer Token
+### 1.5 HTTP Authentication Entry Point
 
-| Property | Value |
-|---|---|
-| **Header** | `Authorization: Bearer <token>` |
-| **Accepted credential** | A pre-shared static token configured per route (not the same as `ADMIN_API_KEY`) |
-| **Roles** | `partner` or `administrator` (configured per-router) |
-
-**Middleware**
-
-- `createBearerTokenAuth(options)` (`src/middleware/tokenAuth.ts`) — factory that returns a middleware enforcing a specific static token. Returns `401` when the token is absent or wrong, `503` when the token is required but not configured.
-
-**Expiry and revocation**
-
-No built-in expiry. Rotate by updating the environment variable that feeds the token and restarting the service.
+User and service HTTP routes use the authoritative middleware in
+`src/middleware/auth.ts`; admin routes use the dedicated `requireAdminAuth`
+guard. See [`docs/auth.md`](auth.md) for the required guard chains.
+`src/middleware/tokenAuth.ts` is limited to WebSocket and stream-transport JWT
+checks and is not an HTTP bearer-authentication entry point.
 
 ---
 
@@ -312,7 +304,7 @@ Some routes accept multiple credential types. The precedence rules are:
 |---|---|
 | `src/middleware/auth.ts` | `authenticate`, `authenticateApiKey`, `requireAuth`, `requirePermission`, `requireScope`, `Permission` enum, `ROLE_PERMISSIONS` |
 | `src/middleware/adminAuth.ts` | `requireAdminAuth` |
-| `src/middleware/tokenAuth.ts` | `verifyWsToken`, `createBearerTokenAuth` |
+| `src/middleware/tokenAuth.ts` | `verifyWsToken` |
 | `src/middleware/authLockout.ts` | `authLockoutMiddleware`, `setAuthAttemptStore` |
 | `src/lib/auth.ts` | `generateToken`, `verifyToken` (HS256 sign / verify) |
 | `src/lib/apiKey.ts` | `createApiKey`, `rotateApiKey`, `revokeApiKey`, `findRecordByRawKey`, `getApiKeyFromRequest` |

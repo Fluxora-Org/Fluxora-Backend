@@ -154,4 +154,13 @@ describe('resolveRoute cardinality integration', () => {
     expect(routes.size).toBe(1);
     expect([...routes][0]).toBe('/api/tenants/:id/streams/:id');
   });
+
+  it('buckets numeric ids in the final unmatched path segment', () => {
+    const req = {
+      baseUrl: '',
+      route: undefined,
+      originalUrl: '/api/streams/42/events/42?include=payload',
+    } as unknown as Request;
+    expect(resolveRoute(req)).toBe('/api/streams/:id/events/:id');
+  });
 });

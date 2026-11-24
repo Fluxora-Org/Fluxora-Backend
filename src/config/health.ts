@@ -703,38 +703,6 @@ export function validateHealthConfig(config: {
   return issues;
 }
 
-// ─── Built-in stub checkers (used when real clients are not wired up) ─────────
-
-export function createDatabaseHealthChecker(opts: { timeoutMs?: number } = {}): HealthChecker {
-  return {
-    name: 'database',
-    timeoutMs: opts.timeoutMs ?? 5_000,
-    async check() {
-      return { latency: 1 };
-    },
-  };
-}
-
-export function createRedisHealthChecker(opts: { timeoutMs?: number } = {}): HealthChecker {
-  return {
-    name: 'redis',
-    timeoutMs: opts.timeoutMs ?? 5_000,
-    async check() {
-      return { latency: 1 };
-    },
-  };
-}
-
-export function createHorizonHealthChecker(_url: string, opts: { timeoutMs?: number } = {}): HealthChecker {
-  return {
-    name: 'horizon',
-    timeoutMs: opts.timeoutMs ?? 5_000,
-    async check() {
-      return { latency: 1 };
-    },
-  };
-}
-
 // ─── Bounded HealthCheckManager factory ──────────────────────────────────────
 
 /**
