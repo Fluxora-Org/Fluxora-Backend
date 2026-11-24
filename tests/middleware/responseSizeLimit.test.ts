@@ -215,9 +215,9 @@ describe('largest-response endpoint: GET /internal/webhooks/outbox', () => {
   it('returns at most 100 items by default, with the true total', async () => {
     const res = await get();
     expect(res.status).toBe(200);
-    expect(res.body.total).toBe(ITEMS);
-    expect(res.body.items).toHaveLength(100);
-    expect(res.body).toMatchObject({ limit: 100, offset: 0, has_more: true });
+    expect(res.body.data.total).toBe(ITEMS);
+    expect(res.body.data.items).toHaveLength(100);
+    expect(res.body.data).toMatchObject({ limit: 100, offset: 0, has_more: true });
   });
 
   it('keeps the response body within the endpoint byte bound', async () => {
@@ -229,8 +229,8 @@ describe('largest-response endpoint: GET /internal/webhooks/outbox', () => {
   it('pages through the rest with offset', async () => {
     const res = await get('?limit=100&offset=200');
     expect(res.status).toBe(200);
-    expect(res.body.items).toHaveLength(50);
-    expect(res.body.has_more).toBe(false);
+    expect(res.body.data.items).toHaveLength(50);
+    expect(res.body.data.has_more).toBe(false);
   });
 
   it('rejects a limit above 100 instead of returning more', async () => {
