@@ -131,7 +131,9 @@ webhooksRouter.post(
     const verification = verifyWebhookSignature(verifyInput);
 
     if (!verification.ok) {
-      res.status(verification.status).json(errorResponse(verification.code, verification.message, undefined, req.correlationId));
+      res
+        .status(verification.status)
+        .json(errorResponse(verification.code, verification.message, undefined, req.correlationId));
       return;
     }
 
@@ -155,7 +157,7 @@ webhooksRouter.post(
       eventType: headers['x-fluxora-event'] ?? null,
       event: preflight.parsed,
     });
-  },
+  }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,18 +223,23 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
       priority,
     });
 
-    res.status(202).json(successResponse({
-      outboxId,
-      message: 'Webhook queued for delivery',
-    }, requestId));
+    res.status(202).json(
+      successResponse(
+        {
+          outboxId,
+          message: 'Webhook queued for delivery',
+        },
+        requestId
+      )
+    );
   } catch (error) {
     logger.error('Error queueing webhook', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json(
-      errorResponse('QUEUE_ERROR', 'Failed to queue webhook', undefined, requestId)
-    );
+    res
+      .status(500)
+      .json(errorResponse('QUEUE_ERROR', 'Failed to queue webhook', undefined, requestId));
   }
 });
 
@@ -328,19 +335,24 @@ webhooksRouter.get('/deliveries', (req, res) => {
   const total = deliveries.length;
   const paginated = deliveries.flice(offset, offset + limit);
 
-  res.json(successResponse({
-    total,
-    deliveries: paginated.map((delivery) => ({
-      id: delivery.id,
-      deliveryId: delivery.deliveryId,
-      eventId: delivery.eventId,
-      eventType: delivery.eventType,
-      status: delivery.status,
-      attemptCount: delivery.attempts.length,
-      createdAt: new Date(delivery.createdAt).toISOString(),
-      updatedAt: new Date(delivery.updatedAt).toISOString(),
-    })),
-  }, requestId));
+  res.json(
+    successResponse(
+      {
+        total,
+        deliveries: paginated.map((delivery) => ({
+          id: delivery.id,
+          deliveryId: delivery.deliveryId,
+          eventId: delivery.eventId,
+          eventType: delivery.eventType,
+          status: delivery.status,
+          attemptCount: delivery.attempts.length,
+          createdAt: new Date(delivery.createdAt).toISOString(),
+          updatedAt: new Date(delivery.updatedAt).toISOString(),
+        })),
+      },
+      requestId
+    )
+  );
 });
 
 /**
@@ -352,6 +364,7 @@ webhooksRouter.get('/outbox', (req, res) => {
   // #1555: the outbox is an unbounded queue, so this listing is paginated
   // (limit 1–100, default 100) instead of returning every item. The default
   // keeps existing callers with ≤ 100 items seeing the same list.
+  const requestId = req.correlationId;
   const parsed = OffsetPaginationSchema.safeParse(req.query);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
@@ -400,24 +413,29 @@ webhooksRouter.get('/outbox', (req, res) => {
   const total = items.length;
   const page = items.slice(offset, offset + limit);
 
-  res.json(successResponse({
-    total,
-    limit,
-    offset,
-    has_more: offset + page.length < total,
-    items: page.map(item => ({
-      id: item.id,
-      deliveryId: item.deliveryId,
-      eventId: item.eventId,
-      eventType: item.eventType,
-      endpointUrl: item.endpointUrl,
-      priority: item.priority,
-      attempts: item.attempts,
-      maxAttempts: item.maxAttempts,
-      scheduledFor: new Date(item.scheduledFor).toISOString(),
-      createdAt: new Date(item.createdAt).toISOString(),
-    })),
-  }, requestId));
+  res.json(
+    successResponse(
+      {
+        total,
+        limit,
+        offset,
+        has_more: offset + page.length < total,
+        items: page.map((item) => ({
+          id: item.id,
+          deliveryId: item.deliveryId,
+          eventId: item.eventId,
+          eventType: item.eventType,
+          endpointUrl: item.endpointUrl,
+          priority: item.priority,
+          attempts: item.attempts,
+          maxAttempts: item.maxAttempts,
+          scheduledFor: new Date(item.scheduledFor).toISOString(),
+          createdAt: new Date(item.createdAt).toISOString(),
+        })),
+      },
+      requestId
+    )
+  );
 });
 
 /**
@@ -443,20 +461,25 @@ webhooksRouter.get('/dlq', (req, res) => {
 
   const items = webhookDeliveryStore.getDeadLetterQueueItems(limit, offset);
 
-  res.json(successResponse({
-    total: items.length,
-    items: items.map((item) => ({
-      id: item.id,
-      deliveryId: item.deliveryId,
-      eventId: item.eventId,
-      eventType: item.eventType,
-      endpointUrl: item.endpointUrl,
-      failureReason: item.failureReason,
-      attemptCount: item.originalDelivery.attempts.length,
-      createdAt: new Date(item.createdAt).toISOString(),
-      processedAt: item.processedAt ? new Date(item.processedAt).toISOString() : null,
-    })),
-  }, requestId));
+  res.json(
+    successResponse(
+      {
+        total: items.length,
+        items: items.map((item) => ({
+          id: item.id,
+          deliveryId: item.deliveryId,
+          eventId: item.eventId,
+          eventType: item.eventType,
+          endpointUrl: item.endpointUrl,
+          failureReason: item.failureReason,
+          attemptCount: item.originalDelivery.attempts.length,
+          createdAt: new Date(item.createdAt).toISOString(),
+          processedAt: item.processedAt ? new Date(item.processedAt).toISOString() : null,
+        })),
+      },
+      requestId
+    )
+  );
 });
 
 /**
@@ -501,9 +524,16 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
     const dlqItem = dlqItems.find((item) => item.id === dlqId);
 
     if (!dlqItem) {
-      res.status(404).json(
-        errorResponse('NOT_FOUND', `Dead-letter queue item ${dlqId} not found`, undefined, requestId)
-      );
+      res
+        .status(404)
+        .json(
+          errorResponse(
+            'NOT_FOUND',
+            `Dead-letter queue item ${dlqId} not found`,
+            undefined,
+            requestId
+          )
+        );
       return;
     }
 
@@ -511,9 +541,11 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
     const processed = webhookDeliveryStore.processDeadLetterQueueItem(dlqId);
 
     if (!processed) {
-      res.status(500).json(
-        errorResponse('DLQ_PROCESS_ERROR', 'Failed to process DLQ item', undefined, requestId)
-      );
+      res
+        .status(500)
+        .json(
+          errorResponse('DLQ_PROCESS_ERROR', 'Failed to process DLQ item', undefined, requestId)
+        );
       return;
     }
 
@@ -544,19 +576,24 @@ webhooksRouter.post('/dlq/:dlqId/retry', express.json(), async (req, res) => {
       deliveryId: dlqItem.deliveryId,
     });
 
-    res.json(successResponse({
-      outboxId,
-      message: 'DLQ item queued for retry',
-    }, requestId));
+    res.json(
+      successResponse(
+        {
+          outboxId,
+          message: 'DLQ item queued for retry',
+        },
+        requestId
+      )
+    );
   } catch (error) {
     logger.error('Error retrying DLQ item', undefined, {
       dlqId,
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json(
-      errorResponse('DLQ_RETRY_ERROR', 'Failed to retry DLQ item', undefined, requestId)
-    );
+    res
+      .status(500)
+      .json(errorResponse('DLQ_RETRY_ERROR', 'Failed to retry DLQ item', undefined, requestId));
   }
 });
 
@@ -583,11 +620,16 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
     return;
   }
   if (!endpointUrl) {
-    res.json(successResponse({
-      total: 0,
-      states: [],
-      note: 'Provide endpointUrl query parameter to inspect Redis-backed circuit breaker state',
-    }, requestId));
+    res.json(
+      successResponse(
+        {
+          total: 0,
+          states: [],
+          note: 'Provide endpointUrl query parameter to inspect Redis-backed circuit breaker state',
+        },
+        requestId
+      )
+    );
     return;
   }
 
@@ -595,28 +637,35 @@ webhooksRouter.get('/circuit-breakers', async (req, res) => {
   const record = await getWebhookCircuitBreakerStore().getState(endpointUrl);
   const status = describeWebhookCircuitBreaker(record, circuitBreakerPolicyForStatus(), now);
 
-  res.json(successResponse({
-    total: 1,
-    states: [
+  res.json(
+    successResponse(
       {
-        endpointUrl,
-        state: status.state,
-        /** True while deliveries to this receiver are blocked. */
-        paused: status.paused,
-        /** Why delivery is paused — see docs/webhooks.md "Pause reasons". */
-        reason: status.reason,
-        consecutiveFailures: status.consecutiveFailures,
-        failureCount: status.consecutiveFailures,
-        threshold: status.threshold,
-        resetMs: status.resetMs,
-        lastFailureTime: status.lastFailureAt !== null ? new Date(status.lastFailureAt).toISOString() : null,
-        /** When the next probe may be claimed, or null when nothing is blocked. */
-        resumeAt: status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
-        nextAttemptTime: status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
+        total: 1,
+        states: [
+          {
+            endpointUrl,
+            state: status.state,
+            /** True while deliveries to this receiver are blocked. */
+            paused: status.paused,
+            /** Why delivery is paused — see docs/webhooks.md "Pause reasons". */
+            reason: status.reason,
+            consecutiveFailures: status.consecutiveFailures,
+            failureCount: status.consecutiveFailures,
+            threshold: status.threshold,
+            resetMs: status.resetMs,
+            lastFailureTime:
+              status.lastFailureAt !== null ? new Date(status.lastFailureAt).toISOString() : null,
+            /** When the next probe may be claimed, or null when nothing is blocked. */
+            resumeAt: status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
+            nextAttemptTime:
+              status.resumeAt !== null ? new Date(status.resumeAt).toISOString() : null,
+          },
+        ],
+        observedAt: new Date(now).toISOString(),
       },
-    ],
-    observedAt: new Date(now).toISOString(),
-  }, requestId));
+      requestId
+    )
+  );
 });
 
 /**
@@ -647,7 +696,7 @@ webhooksRouter.post('/circuit-breakers/:endpointUrl/reset', async (req, res) => 
   const status = describeWebhookCircuitBreaker(
     await getWebhookCircuitBreakerStore().getState(decodedUrl),
     circuitBreakerPolicyForStatus(),
-    Date.now(),
+    Date.now()
   );
 
   res.json({
@@ -683,11 +732,16 @@ webhooksRouter.get('/metrics', (req, res) => {
       ? (metrics.successfulDeliveries / metrics.totalDeliveries) * 100
       : 0;
 
-  res.json(successResponse({
-    ...metrics,
-    successRate: Math.round(successRate * 100) / 100,
-    failureRate: Math.round((100 - successRate) * 100) / 100,
-  }, requestId));
+  res.json(
+    successResponse(
+      {
+        ...metrics,
+        successRate: Math.round(successRate * 100) / 100,
+        failureRate: Math.round((100 - successRate) * 100) / 100,
+      },
+      requestId
+    )
+  );
 });
 
 /**
@@ -700,9 +754,9 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
   const contentType = req.header('content-type');
   const preflight = checkWebhookPreflight(req.body, contentType);
   if (!preflight.ok) {
-    res.status(preflight.status).json(
-      errorResponse(preflight.code, preflight.message, undefined, requestId)
-    );
+    res
+      .status(preflight.status)
+      .json(errorResponse(preflight.code, preflight.message, undefined, requestId));
     return;
   }
 
@@ -772,20 +826,32 @@ webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
       }
     }
 
-    res.json(successResponse({
-      processed,
-      errors,
-      total: readyItems.length,
-      message: 'Outbox processing completed',
-    }, requestId));
+    res.json(
+      successResponse(
+        {
+          processed,
+          errors,
+          total: readyItems.length,
+          message: 'Outbox processing completed',
+        },
+        requestId
+      )
+    );
   } catch (error) {
     logger.error('Error processing webhook outbox', undefined, {
       error: error instanceof Error ? err.message : String(error),
     });
 
-    res.status(500).json(
-      errorResponse('OUTBOX_PROCESSING_ERROR', 'Failed to process webhook outbox', undefined, requestId)
-    );
+    res
+      .status(500)
+      .json(
+        errorResponse(
+          'OUTBOX_PROCESSING_ERROR',
+          'Failed to process webhook outbox',
+          undefined,
+          requestId
+        )
+      );
   }
 webhooksRouter.post('/process-outbox', (_req, res): void => {
   res.status(410).json(
@@ -806,7 +872,7 @@ webhooksRouter.post('/process-outbox', (_req, res): void => {
  * That check has been removed — requireAdminAuth above provides real auth.
  */
 webhooksRouter.post('/retry', express.json(), async (req, res) => {
-  const requestId = req.id;
+  const requestId = req.correlationId;
 
   try {
     // Extract the webhook secret from the request body for use with processPendingRetries.
@@ -889,19 +955,24 @@ webhooksRouter.post('/cleanup', express.json(), (req, res) => {
       errors: result.errors.length,
     });
 
-    res.json(successResponse({
-      cleaned: result.cleaned,
-      errors: result.errors,
-      olderThanDays,
-      message: 'Webhook cleanup completed',
-    }, requestId));
+    res.json(
+      successResponse(
+        {
+          cleaned: result.cleaned,
+          errors: result.errors,
+          olderThanDays,
+          message: 'Webhook cleanup completed',
+        },
+        requestId
+      )
+    );
   } catch (error) {
     logger.error('Error during webhook cleanup', undefined, {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    res.status(500).json(
-      errorResponse('CLEANUP_ERROR', 'Failed to cleanup webhook data', undefined, requestId)
-    );
+    res
+      .status(500)
+      .json(errorResponse('CLEANUP_ERROR', 'Failed to cleanup webhook data', undefined, requestId));
   }
 });
