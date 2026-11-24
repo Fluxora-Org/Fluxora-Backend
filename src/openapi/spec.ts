@@ -2498,6 +2498,79 @@ registry.registerPath({
 // ── Webhooks ──────────────────────────────────────────────────────────────────
 
 registry.registerPath({
+  method: 'get',
+  path: '/internal/webhooks/circuit-breakers',
+  summary: 'Inspect a webhook receiver circuit breaker',
+  description:
+    'Returns the receiver circuit state, whether deliveries are paused, the pause reason, and the latest time the pause may end. With no endpointUrl, returns an empty states array and an explanatory note.',
+  tags: ['webhooks'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    query: z.object({
+      endpointUrl: z.string().optional().openapi({
+        example: 'https://receiver.example/webhooks',
+        description: 'Receiver URL to inspect. Omit to receive an empty states list.',
+      }),
+    }),
+  },
+  responses: {
+    '200': successResponse(
+      z.object({
+        total: z.number(),
+        states: z.array(z.object({
+          endpointUrl: z.string(),
+          state: z.enum(['closed', 'open', 'half-open']),
+          paused: z.boolean(),
+          reason: z.enum([
+            'deliveries-allowed',
+            'failure-threshold',
+            'reset-elapsed',
+            'half-open-probe-in-flight',
+          ]),
+          consecutiveFailures: z.number(),
+          failureCount: z.number(),
+          threshold: z.number(),
+          resetMs: z.number(),
+          lastFailureTime: z.string().nullable(),
+          resumeAt: z.string().nullable(),
+          nextAttemptTime: z.string().nullable(),
+        })),
+        note: z.string().optional(),
+        observedAt: z.string().optional(),
+      }),
+      {
+        success: true,
+        data: {
+          total: 1,
+          states: [{
+            endpointUrl: 'https://receiver.example/webhooks',
+            state: 'open',
+            paused: true,
+            reason: 'failure-threshold',
+            consecutiveFailures: 4,
+            failureCount: 4,
+            threshold: 4,
+            resetMs: 300000,
+            lastFailureTime: '2023-11-14T22:13:20.003Z',
+            resumeAt: '2023-11-14T22:18:20.003Z',
+            nextAttemptTime: '2023-11-14T22:18:20.003Z',
+          }],
+          observedAt: '2023-11-14T22:14:20.003Z',
+        },
+        meta: { timestamp: '2023-11-14T22:14:20.003Z', requestId: 'req_abc123' },
+      },
+    ),
+    '400': errorResponseWithExample(
+      'Invalid endpointUrl query parameter',
+      'INVALID_ENDPOINT_URL',
+      'endpointUrl must be a string'
+    ),
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+  },
+});
+
+registry.registerPath({
   method: 'post',
   path: '/internal/webhooks/receive',
   summary: 'Receive and verify an inbound Fluxora webhook',
