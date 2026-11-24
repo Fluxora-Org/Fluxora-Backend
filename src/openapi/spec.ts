@@ -1348,6 +1348,44 @@ registry.registerPath({
   },
 });
 
+const ReindexTargetSchema = z
+  .object({
+    contract_id: z.string().openapi({ example: 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC' }),
+    ledger: z.number().int().nonnegative().openapi({ example: 7 }),
+    from_block: z.number().int().nonnegative().optional().openapi({ example: 1000 }),
+    to_block: z.number().int().nonnegative().optional().openapi({ example: 2000 }),
+  })
+  .openapi({ description: 'Range of historical contract events to replay' });
+
+const ReindexStateSchema = z
+  .object({
+    status: z.enum(['idle', 'running', 'completed', 'failed', 'cancelled']),
+    startedAt: z.string().nullable(),
+    completedAt: z.string().nullable(),
+    error: z.string().nullable(),
+    processedItems: z
+      .number()
+      .int()
+      .openapi({ description: 'Source rows committed so far, from replay batch results' }),
+    totalItems: z
+      .number()
+      .int()
+      .nullable()
+      .openapi({ description: 'Source rows to replay; null until the replay has counted them' }),
+    target: ReindexTargetSchema.nullable(),
+  })
+  .openapi({ description: 'Reindex job state' });
+
+const exampleReindexState = {
+  status: 'running',
+  startedAt: '2026-01-01T00:00:00.000Z',
+  completedAt: null,
+  error: null,
+  processedItems: 500,
+  totalItems: 1200,
+  target: { contract_id: 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC', ledger: 7 },
+};
+
 registry.registerPath({
   method: 'get',
   path: '/api/admin/reindex',
@@ -1356,10 +1394,10 @@ registry.registerPath({
   security: [{ bearerAuth: [] }],
   responses: {
     '200': successResponse(
-      z.record(z.string(), z.unknown()),
+      ReindexStateSchema,
       {
         success: true,
-        data: { status: 'idle', lastCompletedAt: null, progress: null },
+        data: exampleReindexState,
         meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
       'Reindex state'
@@ -1373,20 +1411,60 @@ registry.registerPath({
   method: 'post',
   path: '/api/admin/reindex',
   summary: 'Trigger reindex',
+  description:
+    'Replays the given contract/ledger range through the indexer. Progress comes from committed ' +
+    'replay batches; poll GET /api/admin/reindex until status is completed, failed or cancelled.',
   tags: ['admin'],
   security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: ReindexTargetSchema,
+          example: { contract_id: 'CASTMR2YNF5IXHFNX3H6B4ICCMSDKRSXNB4YVG5MXXHN74ABCIRTISIC', ledger: 7 },
+        },
+      },
+    },
+  },
   responses: {
     '202': successResponse(
-      z.object({ message: z.string(), reindex: z.record(z.string(), z.unknown()) }),
+      z.object({ message: z.string(), reindex: ReindexStateSchema }),
       {
         success: true,
         data: {
           message: 'Reindex started.',
-          reindex: { status: 'running', startedAt: '2026-01-01T00:00:00.000Z', progress: 0 },
+          reindex: { ...exampleReindexState, processedItems: 0, totalItems: null },
         },
         meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
       },
       'Reindex started'
+    ),
+    '400': errorResponses['400'],
+    '401': errorResponses['401'],
+    '409': errorResponses['409'],
+    '406': errorResponses['406'],
+  },
+});
+
+registry.registerPath({
+  method: 'delete',
+  path: '/api/admin/reindex',
+  summary: 'Cancel reindex',
+  description:
+    'Stops the running reindex at its next replay batch boundary. Committed batches are kept and ' +
+    'the job ends as cancelled. 409 when no reindex is running.',
+  tags: ['admin'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    '202': successResponse(
+      z.object({ message: z.string(), reindex: ReindexStateSchema }),
+      {
+        success: true,
+        data: { message: 'Reindex cancellation requested.', reindex: exampleReindexState },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+      },
+      'Cancellation requested'
     ),
     '401': errorResponses['401'],
     '409': errorResponses['409'],
@@ -1561,6 +1639,41 @@ const DeprecatedRouteEntry = registry.register(
     daysUntilSunset: z.number().int().openapi({ example: 93, description: 'Days until sunset; negative if already past sunset date' }),
   }).openapi({ description: 'A deprecated route entry with sunset metadata' })
 );
+
+registry.registerPath({
+  method: 'get',
+  path: '/api/admin/ban-store/status',
+  summary: 'Ban store health',
+  description:
+    'Reports whether the global HybridBanStore is initialised (`available`) and whether it is ' +
+    'currently serving bans from its in-memory fallback because Redis is unreachable (`usingFallback`).',
+  tags: ['admin'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    '200': successResponse(
+      z.object({
+        banStore: z.object({
+          available: z.boolean().openapi({
+            description: 'True once the global HybridBanStore has been initialised',
+          }),
+          usingFallback: z.boolean().openapi({
+            description: 'True while bans are served from the in-memory fallback instead of Redis',
+          }),
+        }),
+      }),
+      {
+        success: true,
+        data: { banStore: { available: true, usingFallback: false } },
+        meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+      },
+      'Ban store status'
+    ),
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+    '406': errorResponses['406'],
+    '503': errorResponses['503'],
+  },
+});
 
 registry.registerPath({
   method: 'get',

@@ -18,8 +18,10 @@ RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 
 COPY . .
-# TODO(drips-wave): re-enable strict build — tsc reports type errors on main; JS is still emitted, so keep the image build (and Trivy scan) alive.
-RUN pnpm run build || { echo 'tsc reported errors (see TODO)'; test -f dist/src/index.js; }
+# Strict build: any tsc type error fails the image build. Run `pnpm typecheck`
+# locally (must be clean) before building. The dist/src/index.js existence
+# check is kept as a second guard that the emitted entrypoint is present.
+RUN pnpm run build && test -f dist/src/index.js
 
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
     pnpm prune --prod

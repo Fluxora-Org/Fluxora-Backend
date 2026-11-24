@@ -20,7 +20,6 @@ import {
   HALF_OPEN_CONTENTION_DEFERRAL_MS,
   countsTowardCircuitBreaker,
 } from '../../src/webhooks/retry.js';
-import { registry } from '../../src/metrics.js';
 
 const consumerUrl = 'https://consumer.example/webhooks';
 const policy = {
@@ -42,7 +41,7 @@ describe('RedisWebhookCircuitBreakerStore', () => {
   beforeEach(() => {
     redis = new FakeRedisClient();
     store = new RedisWebhookCircuitBreakerStore(redis);
-    registry.removeSingleMetric('fluxora_webhook_circuit_breaker_transitions_total');
+    transitionsTotal.reset();
   });
 
   afterEach(async () => {
@@ -650,7 +649,7 @@ describe('Webhook Circuit Breaker — metric emissions (Redis store)', () => {
   beforeEach(() => {
     redis = new FakeRedisClient();
     store = new RedisWebhookCircuitBreakerStore(redis);
-    registry.removeSingleMetric('fluxora_webhook_circuit_breaker_transitions_total');
+    transitionsTotal.reset();
   });
 
   afterEach(async () => {
@@ -801,7 +800,7 @@ describe('Webhook Circuit Breaker — metric emissions (InMemory store)', () => 
 
   beforeEach(() => {
     memory = new InMemoryWebhookCircuitBreakerStore();
-    registry.removeSingleMetric('fluxora_webhook_circuit_breaker_transitions_total');
+    transitionsTotal.reset();
   });
 
   afterEach(async () => {

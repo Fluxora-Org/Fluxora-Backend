@@ -268,7 +268,7 @@ export class InMemoryContractEventStore implements ContractEventStore {
     return [...this.records.values()].filter((r) => r.ledger === ledger).sort((a, b) => a.eventIndex - b.eventIndex);
   }
 
-  getReorgLog(): Readonly<RecorgRecord[]> { return this.reorgLog; }
+  getReorgLog(): Readonly<ReorgRecord[]> { return this.reorgLog; }
 
   ledgerCount(): number {
     return new Set([...this.records.values()].map((r) => r.ledger)).size;

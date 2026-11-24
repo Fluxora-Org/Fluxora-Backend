@@ -429,14 +429,47 @@ export class SlidingWindowStore implements RateLimitStore {
  *   degraded operation (`GET /api/rate-limits` returns `degraded: true`) even
  *   after Redis recovers.
  */
+function isRateLimitStore(value: RateLimitStore | RedisClient): value is RateLimitStore {
+    return (
+        typeof (value as RateLimitStore).increment === 'function' &&
+        typeof (value as RateLimitStore).getCount === 'function'
+    );
+}
+
 export class HybridStore implements RateLimitStore {
-    usingFallback = false;
+    private primary: RateLimitStore | null;
+    private hasPreAttachFallbackCounts = false;
+    private closed = false;
+    usingFallback: boolean;
 
     constructor(
-        private readonly primary: RateLimitStore,
+        primary: RateLimitStore | null,
         private readonly fallback: RateLimitStore,
         private readonly onError: (err: unknown, op: string) => void,
-    ) {}
+    ) {
+        this.primary = primary;
+        this.usingFallback = primary === null;
+    }
+
+    /**
+     * Atomically attach the primary store (or a RedisClient wrapped in a
+     * `SlidingWindowStore`) once Redis is ready. Migrates nothing: any counts
+     * recorded in `fallback` before attachment continue to be combined with
+     * primary reads/writes until their sliding window naturally expires.
+     */
+    attachPrimary(primaryOrClient: RateLimitStore | RedisClient): void {
+        const nextPrimary = isRateLimitStore(primaryOrClient)
+            ? primaryOrClient
+            : new SlidingWindowStore(primaryOrClient);
+
+        if (this.closed) {
+            void nextPrimary.close();
+            return;
+        }
+
+        this.primary = nextPrimary;
+        this.usingFallback = false;
+    }
 
     async increment(
         key: string,
@@ -444,8 +477,22 @@ export class HybridStore implements RateLimitStore {
         limit: number,
     ): Promise<{ count: number; resetAt: number }> {
         assertOperationInputs(key, windowMs);
+        if (!this.primary) {
+            this.hasPreAttachFallbackCounts = true;
+            return this.fallback.increment(key, windowMs, limit);
+        }
         try {
-            return await this.primary.increment(key, windowMs, limit);
+            const primaryResult = await this.primary.increment(key, windowMs, limit);
+            if (this.hasPreAttachFallbackCounts) {
+                const fallbackResult = await this.fallback.getCount(key, windowMs);
+                if (fallbackResult.count > 0) {
+                    return {
+                        count: primaryResult.count + fallbackResult.count,
+                        resetAt: Math.min(primaryResult.resetAt, fallbackResult.resetAt),
+                    };
+                }
+            }
+            return primaryResult;
         } catch (err) {
             this.onError(err, 'increment');
             this.usingFallback = true;
@@ -458,8 +505,21 @@ export class HybridStore implements RateLimitStore {
         windowMs: number,
     ): Promise<{ count: number; resetAt: number }> {
         assertOperationInputs(key, windowMs);
+        if (!this.primary) {
+            return this.fallback.getCount(key, windowMs);
+        }
         try {
-            return await this.primary.getCount(key, windowMs);
+            const primaryResult = await this.primary.getCount(key, windowMs);
+            if (this.hasPreAttachFallbackCounts) {
+                const fallbackResult = await this.fallback.getCount(key, windowMs);
+                if (fallbackResult.count > 0) {
+                    return {
+                        count: primaryResult.count + fallbackResult.count,
+                        resetAt: Math.min(primaryResult.resetAt, fallbackResult.resetAt),
+                    };
+                }
+            }
+            return primaryResult;
         } catch (err) {
             this.onError(err, 'getCount');
             this.usingFallback = true;
@@ -468,6 +528,10 @@ export class HybridStore implements RateLimitStore {
     }
 
     async close(): Promise<void> {
-        await Promise.all([this.primary.close(), this.fallback.close()]);
+        this.closed = true;
+        await Promise.all([
+            this.primary ? this.primary.close() : Promise.resolve(),
+            this.fallback.close(),
+        ]);
     }
 }

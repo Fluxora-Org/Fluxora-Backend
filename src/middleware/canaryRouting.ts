@@ -109,7 +109,9 @@ export function computeCanaryBucket(
   // Use the first 8 hex characters (32 bits) to avoid BigInt overhead while
   // still giving a uniform distribution over 2^32 values.
   const uint32 = parseInt(digest.slice(0, 8), 16);
-  return uint32 % modulus;
+  const safeModulus =
+    Number.isFinite(modulus) && modulus > 0 ? modulus : CANARY_BUCKET_COUNT;
+  return uint32 % safeModulus;
 }
 
 /**
@@ -124,14 +126,18 @@ export function computeCanaryBucket(
  * do not set an IP and send no API key).
  */
 export function resolveClientIdentity(req: Request): string | undefined {
+  if (!req || typeof req !== 'object') {
+    return undefined;
+  }
+
   // Prefer API key: provides a stable identity across NAT/proxy topologies.
-  const apiKey = req.headers['x-api-key'];
+  const apiKey = req.headers?.['x-api-key'];
   if (typeof apiKey === 'string' && apiKey.trim().length > 0) {
     return apiKey.trim();
   }
 
   // Fall back to client IP.
-  if (req.ip && req.ip.length > 0) {
+  if (typeof req.ip === 'string' && req.ip.length > 0) {
     return req.ip;
   }
 
@@ -140,7 +146,11 @@ export function resolveClientIdentity(req: Request): string | undefined {
 
 /** Resolve the session identity used for sticky canary assignment. */
 export function resolveSessionIdentity(req: Request): string | undefined {
-  const sessionId = req.headers[SESSION_HEADER.toLowerCase()];
+  if (!req || typeof req !== 'object') {
+    return undefined;
+  }
+
+  const sessionId = req.headers?.[SESSION_HEADER.toLowerCase()];
   if (typeof sessionId === 'string' && sessionId.trim().length > 0) {
     return sessionId.trim();
   }
@@ -186,12 +196,23 @@ export interface CanaryRoutingOptions {
  * app.use(createCanaryRoutingMiddleware());
  * ```
  */
+let defaultCanaryRoutingMiddleware:
+  | ((req: Request, res: Response, next: NextFunction) => void)
+  | undefined;
+
 export function createCanaryRoutingMiddleware(
   options: CanaryRoutingOptions = {},
 ): (req: Request, res: Response, next: NextFunction) => void {
+  const safeOptions = options && typeof options === 'object' ? options : {};
+  const isDefaultConfig =
+    safeOptions.trafficPercent === undefined && safeOptions.salt === undefined;
+  if (isDefaultConfig && defaultCanaryRoutingMiddleware) {
+    return defaultCanaryRoutingMiddleware;
+  }
+
   const sessionAssignments = new Map<string, boolean>();
 
-  return function canaryRoutingMiddleware(
+  const middleware = function canaryRoutingMiddleware(
     req: Request,
     res: Response,
     next: NextFunction,
@@ -199,7 +220,7 @@ export function createCanaryRoutingMiddleware(
     // ── Resolve configuration ─────────────────────────────────────────────
 
     const trafficPercent =
-      options.trafficPercent ??
+      safeOptions.trafficPercent ??
       (() => {
         const raw = getRuntimeEnv()['CANARY_TRAFFIC_PERCENT'];
         if (raw === undefined || raw === '') return 0;
@@ -208,14 +229,29 @@ export function createCanaryRoutingMiddleware(
       })();
 
     const salt =
-      options.salt ?? (getRuntimeEnv()['CANARY_SALT'] ?? DEFAULT_CANARY_SALT);
+      safeOptions.salt ?? (getRuntimeEnv()['CANARY_SALT'] ?? DEFAULT_CANARY_SALT);
+
+    const hasReq = Boolean(req && typeof req === 'object');
+    const correlationId = hasReq ? req.correlationId : undefined;
+    const setCanaryHeader = (value: string): void => {
+      if (res && typeof res.setHeader === 'function') {
+        res.setHeader(CANARY_HEADER, value);
+      }
+    };
+    const callNext = (): void => {
+      if (typeof next === 'function') {
+        next();
+      }
+    };
 
     // ── Fast path: canary disabled ────────────────────────────────────────
 
     if (trafficPercent === 0) {
-      req.isCanary = false;
-      res.setHeader(CANARY_HEADER, 'false');
-      next();
+      if (hasReq) {
+        req.isCanary = false;
+      }
+      setCanaryHeader('false');
+      callNext();
       return;
     }
 
@@ -231,12 +267,14 @@ export function createCanaryRoutingMiddleware(
       // unexpected misses without polluting production logs.
       logger.debug(
         'Canary routing: unable to determine client identity; request not tagged',
-        req.correlationId,
+        correlationId,
         { component: 'canary-routing' },
       );
-      req.isCanary = false;
-      res.setHeader(CANARY_HEADER, 'false');
-      next();
+      if (hasReq) {
+        req.isCanary = false;
+      }
+      setCanaryHeader('false');
+      callNext();
       return;
     }
 
@@ -252,12 +290,14 @@ export function createCanaryRoutingMiddleware(
       sessionAssignments.set(sessionIdentity, isCanary);
     }
 
-    req.isCanary = isCanary;
-    res.setHeader(CANARY_HEADER, String(isCanary));
+    if (hasReq) {
+      req.isCanary = isCanary;
+    }
+    setCanaryHeader(String(isCanary));
 
     logger.debug(
       'Canary routing: session assignment resolved',
-      req.correlationId,
+      correlationId,
       {
         component: 'canary-routing',
         bucket,
@@ -267,8 +307,14 @@ export function createCanaryRoutingMiddleware(
       },
     );
 
-    next();
+    callNext();
   };
+
+  if (isDefaultConfig) {
+    defaultCanaryRoutingMiddleware = middleware;
+  }
+
+  return middleware;
 }
 
 /**

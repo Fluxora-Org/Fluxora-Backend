@@ -54,7 +54,15 @@
 import { logger } from '../lib/logger.js';
 import { dlqRepository } from '../db/repositories/dlqRepository.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
-import { config } from '../config.js';
+import { getConfig, loadConfig, type Config } from '../config/env.js';
+
+function resolveConfig(): Config {
+  try {
+    return getConfig();
+  } catch {
+    return loadConfig();
+  }
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -145,9 +153,10 @@ export interface DlqPurgeResult {
 export async function runDlqPurge(
   options: DlqPurgeOptions = {},
 ): Promise<DlqPurgeResult> {
+  const cfg = resolveConfig();
   const {
-    batchSize = config.dlq.purgeBatchSize || DEFAULT_BATCH_SIZE,
-    retentionDays = config.dlq.retentionDays || DEFAULT_RETENTION_DAYS,
+    batchSize = cfg.dlqPurgeBatchSize || DEFAULT_BATCH_SIZE,
+    retentionDays = cfg.dlqRetentionDays || DEFAULT_RETENTION_DAYS,
     now = new Date(),
     correlationId,
     tenantId,

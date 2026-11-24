@@ -112,7 +112,7 @@ describe('Redis-outage policy — docs/security/redis-outage-policy.md', () => {
       const redis = new FakeRedisClient();
       const store = new RedisWebhookCircuitBreakerStore(redis);
       redis.throwOnNext('get');
-      const result = await store.checkAndClaimAttempt({ tenant: 'test', endpoint: 'https://consumer.example/webhook', outcome: 'first_attempt' } as any, {
+      const result = await store.checkAndClaimAttempt('https://consumer.example/webhook', {
         circuitBreakerThreshold: 10,
       });
       expect(result.allowed).toBe(true);

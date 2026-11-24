@@ -12,7 +12,12 @@ import {
   AdminStatePersistenceError,
   _resetForTest,
   _reloadPauseFlagsFromPersistenceForTest,
+  _setReindexRunnerForTest,
+  cancelReindex,
+  indexerReplayRunner,
+  triggerStreamReindex,
 } from '../../src/state/adminState.js';
+import { TEST_REINDEX_TARGET, timedReindexRunner } from '../helpers/fakeReindexRunner.js';
 import { RedisDistributedLock } from '../../src/state/adminStateLock.js';
 import { NoOpRedisClient } from '../../src/redis/client.js';
 
@@ -28,9 +33,12 @@ describe('adminState', () => {
     );
     process.env.ADMIN_STATE_FILE = adminStateFile;
     _resetForTest();
+    _setReindexRunnerForTest(timedReindexRunner());
   });
 
   afterEach(() => {
+    _setReindexRunnerForTest(null);
+    vi.restoreAllMocks();
     _resetForTest();
     fs.rmSync(adminStateFile, { recursive: true, force: true });
 
@@ -230,26 +238,136 @@ describe('adminState', () => {
     });
 
     it('transitions to running on triggerReindex', async () => {
-      const result = await triggerReindex();
+      const result = await triggerReindex(TEST_REINDEX_TARGET);
       expect(result.status).toBe('running');
       expect(result.startedAt).toBeTruthy();
     });
 
     it('completes after the background job finishes', async () => {
-      await triggerReindex();
+      await triggerReindex(TEST_REINDEX_TARGET);
 
-      // Wait for the simulated job (5 × 50ms + margin).
+      // Wait for the fake runner's 5 batches (5 × 50ms + margin).
       await new Promise((r) => setTimeout(r, 400));
 
       const state = getReindexState();
       expect(state.status).toBe('completed');
       expect(state.completedAt).toBeTruthy();
       expect(state.processedItems).toBe(5);
+      expect(state.totalItems).toBe(5);
+      expect(state.target).toEqual(TEST_REINDEX_TARGET);
+    });
+
+    it('records the replay error and outcome failed', async () => {
+      _setReindexRunnerForTest({
+        run: async () => {
+          throw new Error('historical_events query failed');
+        },
+        cancel: () => {},
+      });
+      await triggerReindex(TEST_REINDEX_TARGET);
+      await new Promise((r) => setImmediate(r));
+
+      const state = getReindexState();
+      expect(state.status).toBe('failed');
+      expect(state.error).toBe('historical_events query failed');
+      expect(state.completedAt).toBeTruthy();
+    });
+
+    it('cancelReindex stops the replay and ends the job as cancelled', async () => {
+      _setReindexRunnerForTest(timedReindexRunner(10, 30));
+      await triggerReindex(TEST_REINDEX_TARGET);
+      await new Promise((r) => setTimeout(r, 75));
+
+      expect(cancelReindex().status).toBe('running');
+      await new Promise((r) => setTimeout(r, 100));
+
+      const state = getReindexState();
+      expect(state.status).toBe('cancelled');
+      expect(state.processedItems).toBeGreaterThan(0);
+      expect(state.processedItems).toBeLessThan(10);
+      expect(state.totalItems).toBe(10);
+      expect(state.error).toBeNull();
+    });
+
+    it('cancelReindex is a no-op when nothing is running', () => {
+      const cancel = vi.fn();
+      _setReindexRunnerForTest({ run: vi.fn(), cancel });
+      expect(cancelReindex().status).toBe('idle');
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it('a reset while a job runs is not overwritten when that job finishes', async () => {
+      await triggerReindex(TEST_REINDEX_TARGET);
+      _resetForTest();
+      await new Promise((r) => setTimeout(r, 400));
+      expect(getReindexState().status).toBe('idle');
+    });
+
+    it('triggerStreamReindex rejects an unknown stream without starting a replay', async () => {
+      const run = vi.fn();
+      _setReindexRunnerForTest({ run, cancel: () => {} });
+      const { streamRepository } = await import('../../src/db/repositories/streamRepository.js');
+      vi.spyOn(streamRepository, 'getById').mockResolvedValue(undefined);
+
+      await expect(triggerStreamReindex('missing-stream', { ledger: 3 })).rejects.toThrow(
+        'Stream missing-stream not found',
+      );
+      expect(run).not.toHaveBeenCalled();
+    });
+
+    it("triggerStreamReindex replays the stream's contract on the given ledger", async () => {
+      const run = vi.fn(() => new Promise<never>(() => {}));
+      _setReindexRunnerForTest({ run, cancel: () => {} });
+      const { streamRepository } = await import('../../src/db/repositories/streamRepository.js');
+      vi.spyOn(streamRepository, 'getById').mockResolvedValue({
+        contract_id: 'CSTREAMCONTRACT',
+      } as Awaited<ReturnType<typeof streamRepository.getById>>);
+
+      const state = await triggerStreamReindex('stream-1', { ledger: 3, from_block: 10 });
+      expect(state.status).toBe('running');
+      expect(run).toHaveBeenCalledWith(
+        { contract_id: 'CSTREAMCONTRACT', ledger: 3, from_block: 10 },
+        expect.any(Function),
+      );
+
+      // A second stream reindex while one runs fails rather than claiming success.
+      await expect(triggerStreamReindex('stream-2', { ledger: 3 })).rejects.toThrow(/already in progress/);
+    });
+  });
+
+  describe('indexerReplayRunner (production wiring)', () => {
+    it('drives IndexerService.replayEvents with the target and forwards batch progress', async () => {
+      const { indexerService } = await import('../../src/indexer/service.js');
+      const spy = vi
+        .spyOn(indexerService, 'replayEvents')
+        .mockImplementation(async (_req, options) => {
+          options?.onProgress?.({ processedRows: 0, totalRows: 40 });
+          options?.onProgress?.({ processedRows: 40, totalRows: 40 });
+          return { outcome: 'completed', processedRows: 40, totalRows: 40 };
+        });
+      const seen: Array<{ processedRows: number; totalRows: number }> = [];
+
+      const result = await indexerReplayRunner.run(TEST_REINDEX_TARGET, (u) => seen.push(u));
+
+      expect(spy).toHaveBeenCalledWith(TEST_REINDEX_TARGET, { onProgress: expect.any(Function) });
+      expect(seen).toEqual([
+        { processedRows: 0, totalRows: 40 },
+        { processedRows: 40, totalRows: 40 },
+      ]);
+      expect(result).toEqual({ outcome: 'completed', processedRows: 40, totalRows: 40 });
+    });
+
+    it('cancel requests a replay stop', async () => {
+      const runtime = await import('../../src/indexer/replayRuntimeState.js');
+      runtime._resetStopReplay();
+      indexerReplayRunner.cancel();
+      expect(runtime.isReplayStopRequested()).toBe(true);
+      runtime._resetStopReplay();
     });
 
     it('returns current state if reindex is already running', async () => {
-      await triggerReindex();
-      const second = await triggerReindex();
+      await triggerReindex(TEST_REINDEX_TARGET);
+      const second = await triggerReindex(TEST_REINDEX_TARGET);
       expect(second.status).toBe('running');
     });
 

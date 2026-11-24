@@ -190,6 +190,9 @@ function closed(): WebhookCircuitBreakerRecord {
 }
 
 export function hashConsumerUrl(url: string): string {
+  if (typeof url !== 'string') {
+    throw new TypeError(`hashConsumerUrl expected a string, got ${typeof url}`);
+  }
   return createHash('sha256').update(url).digest('hex').slice(0, 16);
 }
 

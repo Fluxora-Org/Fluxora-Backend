@@ -15,16 +15,11 @@
  * access properly.
  */
 import type { IncomingMessage } from 'http';
-import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import jwt from 'jsonwebtoken';
-
-import { unauthorized } from '../errors.js';
 
 import { logger } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
-import { verifyIdToken } from '../services/oidcProvider.js';
-import { isRevoked } from '../redis/jwtRevocationStore.js';
 
 // ── WebSocket JWT auth ────────────────────────────────────────────────────────
 
@@ -115,68 +110,4 @@ function _recordWsAuthFailure(code: WsAuthFailureCode, req: IncomingMessage): vo
   if (AUDIT_WORTHY.has(code)) {
     recordAuditEvent('WS_AUTH_FAILURE', 'ws_connection', req.socket?.remoteAddress ?? 'unknown', undefined, { reason: code });
   }
-}
-
-export interface TokenAuthOptions {
-  role: 'partner' | 'administrator';
-  token?: string;
-  required: boolean;
-}
-
-function getBearerToken(headerValue: string | undefined): string | null {
-  if (!headerValue) return null;
-
-  const [scheme, value] = headerValue.split(' ', 2);
-  if (scheme !== 'Bearer' || !value) {
-    return null;
-  }
-
-  return value.trim();
-}
-
-export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler {
-  const authEnabled = options.required || Boolean(options.token);
-
-  return async (req: Request, _res: Response, next: NextFunction) => {
-    if (!authEnabled) {
-      next();
-      return;
-    }
-
-    const bearerToken = getBearerToken(req.header('authorization'));
-    if (!bearerToken) {
-      next(
-        unauthorized(`${options.role} bearer token is required`, {
-          role: options.role,
-        }),
-      );
-      return;
-    }
-
-    if (options.token && bearerToken === options.token) {
-      next();
-      return;
-    }
-
-    try {
-      const decoded = await verifyIdToken(bearerToken);
-      const jti = decoded.claims?.jti;
-      
-      if (jti) {
-        const revoked = await isRevoked(jti);
-        if (revoked) {
-          next(unauthorized(`Token revoked`, { role: options.role }));
-          return;
-        }
-      }
-      
-      next();
-    } catch {
-      next(
-        unauthorized(`Invalid ${options.role} bearer token`, {
-          role: options.role,
-        }),
-      );
-    }
-  };
 }
