@@ -850,6 +850,7 @@ webhooksRouter.post('/retry', express.json(), async (req, res) => {
  * Clean up old webhook data (internal endpoint for maintenance)
  */
 webhooksRouter.post('/cleanup', express.json(), (req, res) => {
+  const requestId = req.id;
   const { olderThanDays = 7 } = req.body ?? {};
   if (
     typeof olderThanDays !== 'number' ||
@@ -857,12 +858,14 @@ webhooksRouter.post('/cleanup', express.json(), (req, res) => {
     olderThanDays < 0 ||
     !Number.isInteger(olderThanDays)
   ) {
-    res.status(400).json({
-      error: {
-        code: 'INVALID_CLEANUP_REQUEST',
-        message: 'olderThanDays must be a non-negative integer',
-      },
-    });
+    res.status(400).json(
+      errorResponse(
+        'INVALID_CLEANUP_REQUEST',
+        'olderThanDays must be a non-negative integer',
+        undefined,
+        requestId
+      )
+    );
     return;
   }
   const olderThanMs = olderThanDays * 24 * 60 * 60 * 1000;

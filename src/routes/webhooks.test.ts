@@ -5,6 +5,7 @@ import { webhooksRouter, setInboundWebhookDedupCache, getInboundWebhookDedupCach
 import { InMemoryDedupCache } from '../redis/dedup.js';
 import { computeWebhookSignature } from '../webhooks/signature.js';
 import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
+import { isErrorEnvelope } from '../utils/response.js';
 
 function makeApp() {
   const app = express();
@@ -180,6 +181,109 @@ describe('Webhooks Route Early-Return Safeguards & Error Paths', () => {
       expect(res.status).toBe(401);
       expect(res.body).toHaveProperty('error');
       expect(res.body.error).toHaveProperty('code');
+    });
+  });
+
+  describe('POST /internal/webhooks/cleanup', () => {
+    it('returns standard error envelope when olderThanDays is a string', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-string';
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .send({ olderThanDays: '7' });
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-string',
+        },
+      });
+    });
+
+    it('returns standard error envelope when olderThanDays is negative', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-negative';
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .send({ olderThanDays: -1 });
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-negative',
+        },
+      });
+    });
+
+    it('returns standard error envelope when olderThanDays is a float', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-float';
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .send({ olderThanDays: 1.5 });
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-float',
+        },
+      });
+    });
+
+    it('returns standard error envelope when olderThanDays is NaN', async () => {
+      const app = express();
+      app.use((req, _res, next) => {
+        req.id = 'req-cleanup-nan';
+        req.body = { olderThanDays: Number.NaN };
+        (req as express.Request & { _body?: boolean })._body = true;
+        next();
+      });
+      app.use('/internal/webhooks', webhooksRouter);
+
+      const res = await request(app)
+        .post('/internal/webhooks/cleanup')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(res.status).toBe(400);
+      expect(isErrorEnvelope(res.body)).toBe(true);
+      expect(res.body).toEqual({
+        success: false,
+        error: {
+          code: 'INVALID_CLEANUP_REQUEST',
+          message: 'olderThanDays must be a non-negative integer',
+          requestId: 'req-cleanup-nan',
+        },
+      });
     });
   });
 });
