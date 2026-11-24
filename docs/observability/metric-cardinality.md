@@ -41,7 +41,7 @@ When a path must be labelled (HTTP metrics, body-size rejects), run it through
 | Input segment | Bucket |
 |---------------|--------|
 | UUID | `:id` |
-| Numeric id (`\d{3,}`) | `:id` |
+| Numeric id (`\d+`) | `:id` |
 | ULID / cuid / long hex | `:id` |
 | Stellar `G…` / `C…` strkey | `:address` |
 | Static vocabulary (`streams`, `health`) | unchanged |
