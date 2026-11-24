@@ -41,6 +41,12 @@ export const infrastructureEnvSchema = {
   /** Retention window for idempotency keys in seconds (max 7 days). @default 86400 */
   IDEMPOTENCY_TTL_SECONDS: integerEnv('IDEMPOTENCY_TTL_SECONDS', 1, 86400 * 7).default(86400),
 
+  /**
+   * Stream-event deduplication window in seconds (1 second to 7 days).
+   * @default 86400
+   */
+  DEDUP_WINDOW_SECONDS: integerEnv('DEDUP_WINDOW_SECONDS', 1, 604800).default(86400),
+
   /** AWS region for S3 backup uploads (explicit). */
   AWS_REGION: optionalString('AWS_REGION'),
   /** AWS region for S3 backup uploads (SDK fallback variable). */

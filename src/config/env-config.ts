@@ -139,6 +139,8 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Window in seconds during which duplicate stream events are suppressed (1..604800). */
+  dedupWindowSeconds: number;
   /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
   wsAuthRequired: boolean;
   /** Origins allowed to perform browser WebSocket upgrades (WS_ALLOWED_ORIGINS). */
@@ -466,6 +468,7 @@ function toConfig(env: ParsedEnv): Config {
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    dedupWindowSeconds: env.DEDUP_WINDOW_SECONDS,
     /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
     wsAuthRequired: env.WS_AUTH_REQUIRED,
     wsAllowedOrigins: splitCommaSeparated(env.WS_ALLOWED_ORIGINS),
