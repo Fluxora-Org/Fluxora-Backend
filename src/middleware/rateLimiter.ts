@@ -14,7 +14,7 @@ import {
   type RateLimitHeaderValues,
 } from '../types/rateLimit.js';
 import { getRateLimitConfig, getRouteRateLimitConfig } from '../config/rateLimits.js';
-import { InMemoryStore, SlidingWindowStore, HybridStore } from '../redis/rateLimitStore.js';
+import { InMemoryStore, HybridStore } from '../redis/rateLimitStore.js';
 import { createRedisClient } from '../redis/client.js';
 import { logger } from '../lib/logger.js';
 import { rateLimitRejectedTotal, rateLimitRedisErrorsTotal } from '../metrics.js';
@@ -321,7 +321,10 @@ export function createRateLimiter(
     logger.warn('Redis disabled (REDIS_ENABLED=false); using in-memory rate-limit store');
     store = new InMemoryStore();
   } else {
-    // Build HybridStore: SlidingWindowStore (primary) + InMemoryStore (fallback)
+    // Build one stable HybridStore with no placeholder primary; attach the
+    // Redis-backed SlidingWindowStore atomically once createRedisClient
+    // resolves. Until then, requests count against fallback and pre-attach
+    // counts are preserved across the switch.
     const fallback = new InMemoryStore();
 
     const onRedisError = (err: unknown, op: string) => {
@@ -332,24 +335,14 @@ export function createRateLimiter(
       rateLimitRedisErrorsTotal.inc({ operation: op });
     };
 
+    const hybrid = new HybridStore(null, fallback, onRedisError);
+    store = hybrid;
+
     try {
       const redisUrl = env.REDIS_URL ?? 'redis://localhost:6379';
-      // createRedisClient is async; we build the store lazily via a promise
-      // and swap it in once connected. Until then HybridStore uses fallback.
-      const primary = new InMemoryStore(); // temporary placeholder
-      const hybrid = new HybridStore(primary, fallback, onRedisError);
-      store = hybrid;
-
-      // Kick off async Redis connection; replace primary when ready
       createRedisClient({ url: redisUrl, enabled: true })
         .then((client) => {
-          const slidingWindow = new SlidingWindowStore(client);
-          // Swap the primary inside the hybrid by replacing the store reference
-          // We rebuild the hybrid with the real primary
-          const realHybrid = new HybridStore(slidingWindow, fallback, onRedisError);
-          store = realHybrid;
-          // Update the handler's store reference
-          rateLimitHandler.store = realHybrid;
+          hybrid.attachPrimary(client);
         })
         .catch((err) => {
           logger.warn('Failed to connect to Redis for rate limiting; using in-memory store', undefined, {
@@ -360,7 +353,6 @@ export function createRateLimiter(
       logger.warn('Failed to initialise Redis rate-limit store; using in-memory store', undefined, {
         error: err instanceof Error ? err.message : String(err),
       });
-      store = fallback;
     }
   }
 
