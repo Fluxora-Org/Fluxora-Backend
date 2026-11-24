@@ -219,8 +219,10 @@ describe('rate limiter middleware', () => {
       expect.objectContaining({
         error: expect.objectContaining({
           code: 'RATE_LIMIT_EXCEEDED',
-          limit: 3,
-          window: 'minute',
+          details: expect.objectContaining({
+            limit: 3,
+            window: 'minute',
+          }),
         }),
       })
     );
@@ -232,6 +234,11 @@ describe('rate limiter middleware', () => {
     const res = mockResponse();
     const next = mockNext();
 
+    // Capture baseline before triggering the rate limit
+    const before = await requestRefusedTotal.get();
+    const beforeValue =
+      before.values.find((m) => m.labels.reason === 'rate_limit_exceeded')?.value ?? 0;
+
     // Hit limit: 3 requests
     for (let i = 0; i < 3; i++) {
       await invoke(limiter, req, res, next);
@@ -241,11 +248,10 @@ describe('rate limiter middleware', () => {
     const fourthNext = mockNext();
     await invoke(limiter, req, res, fourthNext);
 
-    const metric = await registry.getSingleMetric('fluxora_request_refused_total');
-    const metricValue = (metric as any).get();
-    const rateLimitExceededValue = metricValue.find((m: any) => m.values.reason === 'rate_limit_exceeded');
+    const metric = await requestRefusedTotal.get();
+    const rateLimitExceededValue = metric.values.find((m) => m.labels.reason === 'rate_limit_exceeded');
     expect(rateLimitExceededValue).toBeDefined();
-    expect(rateLimitExceededValue.value).toBe(1);
+    expect(rateLimitExceededValue!.value).toBe(beforeValue + 1);
   });
 
   it('applies separate counters for different IPs', async () => {
