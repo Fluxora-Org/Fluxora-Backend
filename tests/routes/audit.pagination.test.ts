@@ -147,6 +147,13 @@ describe('GET /api/audit — pagination parameter validation', () => {
 
   it('returns 400 for offset=-1 (negative)', async () => {
     const res = await authed(request(app).get('/api/audit?offset=-1')).expect(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('returns 400 for non-numeric offset', async () => {
+    const res = await authed(request(app).get('/api/audit?offset=abc')).expect(400);
+    expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
   });
 
