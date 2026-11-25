@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 
 const gaugeSet = vi.fn();
 const counterInc = vi.fn();
@@ -40,29 +40,27 @@ vi.mock('prom-client', () => {
 });
 
 // Import after mocks so constructors use the mocked registry / prom-client
-const {
-  statusToValue,
-  recordRedisReconnect,
-  recordRedisCommandFailure,
-  syncRedisGauges,
-  deRegisterRedisPoolMetrics,
-} = await import('./redisPool.js');
+let mod: typeof import('./redisPool.js');
+
+beforeAll(async () => {
+  mod = await import('./redisPool.js');
+});
 
 describe('statusToValue', () => {
   it('maps known ioredis statuses to documented enum values', () => {
-    expect(statusToValue('end')).toBe(0);
-    expect(statusToValue('connecting')).toBe(1);
-    expect(statusToValue('reconnecting')).toBe(2);
-    expect(statusToValue('ready')).toBe(3);
-    expect(statusToValue('connect')).toBe(3);
-    expect(statusToValue('close')).toBe(4);
-    expect(statusToValue('wait')).toBe(1);
+    expect(mod.statusToValue('end')).toBe(0);
+    expect(mod.statusToValue('connecting')).toBe(1);
+    expect(mod.statusToValue('reconnecting')).toBe(2);
+    expect(mod.statusToValue('ready')).toBe(3);
+    expect(mod.statusToValue('connect')).toBe(3);
+    expect(mod.statusToValue('close')).toBe(4);
+    expect(mod.statusToValue('wait')).toBe(1);
   });
 
   it('returns -1 for unknown status (failure / boundary)', () => {
-    expect(statusToValue('')).toBe(-1);
-    expect(statusToValue('weird')).toBe(-1);
-    expect(statusToValue('READY')).toBe(-1); // case-sensitive
+    expect(mod.statusToValue('')).toBe(-1);
+    expect(mod.statusToValue('weird')).toBe(-1);
+    expect(mod.statusToValue('READY')).toBe(-1); // case-sensitive
   });
 });
 
@@ -72,12 +70,12 @@ describe('recordRedisReconnect', () => {
   });
 
   it('increments reconnects counter for the instance label (normal path)', () => {
-    recordRedisReconnect('dedup');
+    mod.recordRedisReconnect('dedup');
     expect(counterInc).toHaveBeenCalledWith({ instance: 'dedup' });
   });
 
   it('accepts empty instance name as a boundary label value', () => {
-    recordRedisReconnect('');
+    mod.recordRedisReconnect('');
     expect(counterInc).toHaveBeenCalledWith({ instance: '' });
   });
 });
@@ -88,7 +86,7 @@ describe('recordRedisCommandFailure', () => {
   });
 
   it('increments command failures for the instance (normal path)', () => {
-    recordRedisCommandFailure('idempotency');
+    mod.recordRedisCommandFailure('idempotency');
     expect(counterInc).toHaveBeenCalledWith({ instance: 'idempotency' });
   });
 });
@@ -99,7 +97,7 @@ describe('syncRedisGauges', () => {
   });
 
   it('sets queue length and status gauges (normal path)', () => {
-    syncRedisGauges({
+    mod.syncRedisGauges({
       commandQueueLength: 3,
       status: 'ready',
       instanceName: 'default',
@@ -110,7 +108,7 @@ describe('syncRedisGauges', () => {
   });
 
   it('handles zero queue length boundary', () => {
-    syncRedisGauges({
+    mod.syncRedisGauges({
       commandQueueLength: 0,
       status: 'end',
       instanceName: 'default',
@@ -120,7 +118,7 @@ describe('syncRedisGauges', () => {
   });
 
   it('maps unknown status to -1 on the status gauge', () => {
-    syncRedisGauges({
+    mod.syncRedisGauges({
       commandQueueLength: 1,
       status: 'nope',
       instanceName: 'webhook-rate-limit',
@@ -133,7 +131,7 @@ describe('syncRedisGauges', () => {
 describe('deRegisterRedisPoolMetrics', () => {
   it('removes all five redis pool metric names', () => {
     removeSingleMetric.mockClear();
-    deRegisterRedisPoolMetrics();
+    mod.deRegisterRedisPoolMetrics();
     expect(removeSingleMetric).toHaveBeenCalledWith('redis_command_queue_length');
     expect(removeSingleMetric).toHaveBeenCalledWith('redis_connection_status');
     expect(removeSingleMetric).toHaveBeenCalledWith('redis_queue_length_warnings_total');

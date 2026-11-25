@@ -1,9 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
-const mod = await import('./diagnostics');
-const validate = (mod as any).validateDiagnosticsInput as ((input: unknown) => unknown) | undefined;
-const run = (mod as any).runDiagnostics as ((input: unknown) => unknown) | undefined;
-const TypedError = ((mod as any).DiagnosticsValidationError || ((mod as any).ValidationError) || Error) as new (message: string, ...args: unknown[]) => Error;
+
+let mod: typeof import('./diagnostics');
+let validate: ((input: unknown) => unknown) | undefined;
+let run: ((input: unknown) => unknown) | undefined;
+let TypedError: new (message: string, ...args: unknown[]) => Error;
+
+beforeAll(async () => {
+  mod = await import('./diagnostics');
+  validate = (mod as any).validateDiagnosticsInput as ((input: unknown) => unknown) | undefined;
+  run = (mod as any).runDiagnostics as ((input: unknown) => unknown) | undefined;
+  TypedError = ((mod as any).DiagnosticsValidationError || ((mod as any).ValidationError) || Error) as new (message: string, ...args: unknown[]) => Error;
+});
 
 describe('src/services/diagnostics', () => {
   let tmpDir: string;
