@@ -16,6 +16,10 @@ function buildApp() {
     throw new ApiError(500, 'DB_ERROR', 'Database connection failed', {}, false);
   });
 
+  app.get('/hidden-bad-gateway', () => {
+    throw new ApiError(502, 'UPSTREAM_ERROR', 'Upstream service failed', {}, false);
+  });
+
   app.get('/unknown', () => {
     throw new Error('Unexpected failure at /internal/private/path using pg-driver');
   });
@@ -67,6 +71,15 @@ describe('errorHandler middleware', () => {
     expect(res.body.error).toEqual({ code: ApiErrorCode.INTERNAL_ERROR, message: 'Internal server error' });
     expect(res.body).not.toHaveProperty('error.details');
     expect(res.body).not.toHaveProperty('stack');
+  });
+
+  it('preserves the status code for an unexposed error', async () => {
+    const app = buildApp();
+    const res = await request(app).get('/hidden-bad-gateway');
+
+    expect(res.status).toBe(502);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toEqual({ code: ApiErrorCode.INTERNAL_ERROR, message: 'Internal server error' });
   });
 
   it('treats unknown errors as non-exposed and hides internals', async () => {

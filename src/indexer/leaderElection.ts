@@ -250,14 +250,11 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
     this._lastRenewAttemptMs = now;
 
     try {
-      const current = await this.redis.get(LEADER_KEY);
-      if (current !== this.instanceId) {
-        this._isLeader = false;
-        this.stopHeartbeat();
-        indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_lost_lease' });
-        return;
-      }
-      const renewed = await this.redis.peexpire(LEADER_KEY, this.leaseMs);
+      const renewed = await this.redis.pexpireIfValue(
+        LEADER_KEY,
+        this.instanceId,
+        this.leaseMs,
+      );
       if (!renewed) {
         this._isLeader = false;
         this.stopHeartbeat();

@@ -77,6 +77,7 @@ export interface Config {
   rpcTimeoutMs: number;
   rpcFallbackCacheTtlSeconds: number;
   rpcFallbackCacheEarlyExpiryBeta: number;
+  rpcFallbackCacheMaxAgeMs: number;
   rpcHealthCheckIntervalMs: number;
   rpcHealthCheckFailureThreshold: number;
   horizonUrl: string;
@@ -109,6 +110,7 @@ export interface Config {
 
   logLevel: LogLevel;
   metricsEnabled: boolean;
+  earlyHintsEnabled: boolean;
 
   tracingEnabled: boolean;
   tracingSampleRate: number;
@@ -139,6 +141,8 @@ export interface Config {
   partnerApiToken?: string | undefined;
   requireAdminAuth: boolean;
   adminApiToken?: string | undefined;
+  /** Window in seconds during which duplicate stream events are suppressed (1..604800). */
+  dedupWindowSeconds: number;
   /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
   wsAuthRequired: boolean;
   /** Origins allowed to perform browser WebSocket upgrades (WS_ALLOWED_ORIGINS). */
@@ -213,6 +217,14 @@ export interface Config {
   indexerBackfillMaxRetries: number;
   /** Delay between backfill batch retries, in ms. */
   indexerBackfillRetryDelayMs: number;
+  /** Number of source rows fetched and inserted per replay batch transaction. */
+  indexerReplayBatchSize: number;
+  /** Maximum allowed `to_block - from_block` replay range; 0 = unlimited. */
+  indexerMaxReplayRangeBlocks: number;
+  /** Wall-clock budget in ms for a single replay run; 0 = unlimited. */
+  indexerReplayBudgetMs: number;
+  /** Forced-stop timeout in ms bounding a single batch's DB wait after cancellation; 0 = wait indefinitely. */
+  indexerReplayStopForcedTimeoutMs: number;
   indexerStallThresholdMs: number;
   indexerLastSuccessfulSyncAt?: string | undefined;
   deploymentChecklistVersion: string;
@@ -253,6 +265,12 @@ export interface Config {
    * Defaults to 500.
    */
   dlqPurgeBatchSize: number;
+
+  /**
+   * Partition lead time in whole calendar months for the partition maintenance job.
+   * Defaults to 3.
+   */
+  partitionMaintenanceLeadTimeMonths: number;
 }
 
 export class ConfigError extends Error {
@@ -382,6 +400,7 @@ function toConfig(env: ParsedEnv): Config {
     rpcTimeoutMs: env.RPC_TIMEOUT_MS,
     rpcFallbackCacheTtlSeconds: env.RPC_FALLBACK_CACHE_TTL_SECONDS,
     rpcFallbackCacheEarlyExpiryBeta: env.RPC_FALLBACK_CACHE_EARLY_EXPIRY_BETA,
+    rpcFallbackCacheMaxAgeMs: env.RPC_FALLBACK_CACHE_MAX_AGE_MS,
     rpcHealthCheckIntervalMs: env.RPC_HEALTH_CHECK_INTERVAL_MS,
     rpcHealthCheckFailureThreshold: env.RPC_HEALTH_CHECK_FAILURE_THRESHOLD,
     horizonUrl: env.HORIZON_URL ?? networkDefaults.horizonUrl,
@@ -452,6 +471,7 @@ function toConfig(env: ParsedEnv): Config {
     partnerApiToken: env.PARTNER_API_TOKEN,
     requireAdminAuth: env.REQUIRE_ADMIN_AUTH,
     adminApiToken: env.ADMIN_API_TOKEN,
+    dedupWindowSeconds: env.DEDUP_WINDOW_SECONDS,
     /** Reject unauthenticated WebSocket, SSE and long-poll clients (WS_AUTH_REQUIRED). */
     wsAuthRequired: env.WS_AUTH_REQUIRED,
     wsAllowedOrigins: splitCommaSeparated(env.WS_ALLOWED_ORIGINS),
@@ -488,6 +508,10 @@ function toConfig(env: ParsedEnv): Config {
     indexerBackfillCommitInterval: env.INDEXER_BACKFILL_COMMIT_INTERVAL,
     indexerBackfillMaxRetries: env.INDEXER_BACKFILL_MAX_RETRIES,
     indexerBackfillRetryDelayMs: env.INDEXER_BACKFILL_RETRY_DELAY_MS,
+    indexerReplayBatchSize: env.INDEXER_REPLAY_BATCH_SIZE,
+    indexerMaxReplayRangeBlocks: env.INDEXER_MAX_REPLAY_RANGE_BLOCKS,
+    indexerReplayBudgetMs: env.INDEXER_REPLAY_BUDGET_MS,
+    indexerReplayStopForcedTimeoutMs: env.INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS,
     indexerStallThresholdMs: env.INDEXER_STALL_THRESHOLD_MS,
     indexerLastSuccessfulSyncAt: env.INDEXER_LAST_SUCCESSFUL_SYNC_AT,
     deploymentChecklistVersion: env.DEPLOYMENT_CHECKLIST_VERSION,
@@ -504,6 +528,7 @@ function toConfig(env: ParsedEnv): Config {
 
     dlqRetentionDays: env.DLQ_RETENTION_DAYS,
     dlqPurgeBatchSize: env.DLQ_PURGE_BATCH_SIZE,
+    partitionMaintenanceLeadTimeMonths: env.PARTITION_MAINTENANCE_LEAD_TIME_MONTHS,
   };
 }
 

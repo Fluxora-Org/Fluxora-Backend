@@ -100,6 +100,22 @@ describe('observability PII redaction contract', () => {
     assertForbiddenValues(sanitized);
   });
 
+  it('does not retain nested or array payloads in serialized error objects', () => {
+    const nestedSecret = 'nested-webhook-secret-1925';
+    const arraySecret = 'array-webhook-secret-1925';
+    const error = new Error(`webhook failed: payload={"nested":"${nestedSecret}"}`);
+    Object.assign(error, {
+      payload: { nested: nestedSecret, list: [arraySecret, { deep: nestedSecret }] },
+      body: [{ token: nestedSecret }],
+    });
+
+    const sanitized = sanitizeError(error);
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).not.toContain(nestedSecret);
+    expect(serialized).not.toContain(arraySecret);
+    expect(serialized).not.toContain('nested-webhook-secret-1925');
+  });
+
   it('redacts every policy-named field across all egress paths', async () => {
     const { redactableFields } = await import('../../src/pii/policy.js');
     const { sanitize } = await import('../../src/pii/sanitizer.js');

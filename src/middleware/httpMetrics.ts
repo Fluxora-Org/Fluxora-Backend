@@ -7,28 +7,14 @@ import { normalizeRouteLabel } from '../metrics/cardinality.js';
 export const UNMATCHED_ROUTE = 'unmatched';
 
 /**
- * Resolve the Prometheus `route` label from the matched Express route template.
- *
- * Uses `baseUrl + route.path` (the pattern, e.g. `/users/:id`) so path
- * parameters never appear as distinct series. Unmatched requests share one
- * fixed label to keep cardinality bounded.
-
-/**
- * Resolve the Prometheus `route` label from the matched Express route template.
- *
- * Unmatched requests use one fixed label so arbitrary paths cannot create
- * unbounded Prometheus series.
+ * Resolve a bounded Prometheus route label from the matched route template or,
+ * for unmatched requests, the original URL path.
  */
 export function resolveRoute(req: Request): string {
-  if (!req.route?.path) {
-    return UNMATCHED_ROUTE;
-  }
-
-  const raw = `${req.baseUrl ?? ''}${req.route.path}`;
-
-  // Collapse trailing slash to keep label cardinality predictable,
-  // but preserve the bare root path "/".
-  return raw.length > 1 && raw.endsWith('/') ? raw.slice(0, -1) : raw;
+  const raw = req.route?.path
+    ? `${req.baseUrl ?? ''}${req.route.path}`
+    : req.originalUrl;
+  return raw ? normalizeRouteLabel(raw) : UNMATCHED_ROUTE;
 }
 
 /**

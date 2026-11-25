@@ -51,6 +51,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import { app } from '../../src/app.js';
+import { TEST_REINDEX_TARGET, timedReindexRunner } from '../helpers/fakeReindexRunner.js';
 import { _resetForTest } from '../../src/state/adminState.js';
 import { _resetAuditLog } from '../../src/lib/auditLog.js';
 import { initializeConfig } from '../../src/config/env.js';
@@ -337,11 +338,21 @@ describe('PUT /api/admin/pause — persistence error → 503', () => {
 });
 
 describe('POST /api/admin/reindex — conflict when already running', () => {
+  beforeEach(async () => {
+    const { _setReindexRunnerForTest } = await import('../../src/state/adminState.js');
+    _setReindexRunnerForTest(timedReindexRunner());
+  });
+
+  afterEach(async () => {
+    const { _setReindexRunnerForTest } = await import('../../src/state/adminState.js');
+    _setReindexRunnerForTest(null);
+  });
+
   it('returns 409 when a reindex is already in progress', async () => {
     // Trigger first reindex
-    await authed(request(app).post('/api/admin/reindex'));
+    await authed(request(app).post('/api/admin/reindex').send(TEST_REINDEX_TARGET));
     // Attempt a second one immediately
-    const res = await authed(request(app).post('/api/admin/reindex'));
+    const res = await authed(request(app).post('/api/admin/reindex').send(TEST_REINDEX_TARGET));
     expect(res.status).toBe(409);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('CONFLICT');
@@ -380,7 +391,10 @@ describe('Audit trail — successful admin mutations', () => {
     const auditModule = await import('../../src/lib/auditLog.js');
     const spy = vi.spyOn(auditModule, 'recordAuditEvent');
 
-    await authed(request(app).post('/api/admin/reindex'));
+    const { _setReindexRunnerForTest } = await import('../../src/state/adminState.js');
+    _setReindexRunnerForTest(timedReindexRunner());
+    await authed(request(app).post('/api/admin/reindex').send(TEST_REINDEX_TARGET));
+    _setReindexRunnerForTest(null);
 
     expect(spy).toHaveBeenCalledWith(
       'REINDEX_TRIGGERED',

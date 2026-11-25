@@ -451,7 +451,7 @@ describe('subscriptionRouter', () => {
       });
 
       it('returns NOT_FOUND if stream does not exist in repository', async () => {
-        vi.mocked(streamRepository.getById).mockResolvedValueOnce(null);
+        vi.mocked(streamRepository.getById).mockResolvedValueOnce(undefined);
 
         const filter: SubscriptionFilter = { streamId: 'non-existent' };
         const result = await router.authorize(ws, filter);
@@ -799,7 +799,7 @@ describe('subscriptionRouter', () => {
           ok: true,
           filter,
         });
-        vi.mocked(streamRepository.getById).mockResolvedValueOnce(null); // NOT_FOUND
+        vi.mocked(streamRepository.getById).mockResolvedValueOnce(undefined); // NOT_FOUND
 
         const req = { url: '/ws?stream_id=unauthorized-stream' } as IncomingMessage;
         router.applyHandshakeSubscription(ws, req);

@@ -1,4 +1,3 @@
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { generateToken } from '../lib/auth.js';
@@ -83,10 +82,20 @@ authRouter.post(
     const requestId = req.correlationId;
 
     if (!result.success) {
-      throw validationError(
-        'Stellar address is required when idToken is not provided',
-        result.error.format()
-      );
+      // #1935: pre-authentication failures must not tell a caller which field
+      // was wrong. A specific validation message (plus a distinct
+      // "Invalid credentials" for a bad token) lets a caller enumerate request
+      // shapes. The client only ever sees one generic message; the field-level
+      // detail stays in the structured log keyed by request id.
+      info('Session request validation failed', {
+        requestId,
+        issues: result.error.issues.map((issue) => ({
+          path: issue.path.join('.'),
+          code: issue.code,
+          message: issue.message,
+        })),
+      });
+      throw validationError('Invalid session request');
     }
 
     const { address, role, idToken } = result.data;
@@ -122,7 +131,11 @@ authRouter.post(
     }
 
     if (!targetAddress) {
-      throw validationError('Stellar address is required');
+      // #1935: same generic pre-authentication failure as above, so a missing
+      // address after OIDC verification is indistinguishable from a malformed
+      // request body.
+      info('Session request missing address after OIDC verification', { requestId });
+      throw validationError('Invalid session request');
     }
 
     const token = generateToken({ address: targetAddress, role: targetRole as 'operator' | 'viewer' });

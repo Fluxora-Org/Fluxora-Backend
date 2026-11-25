@@ -99,7 +99,7 @@ describe('RPC degradation visibility and automatic recovery', () => {
     res = await request(app).post('/data');
     expect(res.status).toBe(503);
     expect(res.body.error.message).toBe(DEGRADED_WRITE_MESSAGE);
-    expect(res.body.error.degradation.circuitState).toBe('OPEN');
+    expect(res.body.error.details.circuitState).toBe('OPEN');
 
     // Entry into degradation is exposed as a metric.
     expect(await transitionCount('CLOSED', 'OPEN')).toBe(entriesBefore + 1);

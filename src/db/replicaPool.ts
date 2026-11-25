@@ -41,15 +41,22 @@ function envInt(name: string, fallback: number): number {
 let _replicaPool: pg.Pool | null = null;
 let _replicaHealthy = false;
 let _healthCheckDone = false;
-let _lastLagCheckTime = 0;
+let _lastLagCheckTime: number | null = null;
 let _lastLagValue: number | null = null;
+let _lagFallbackActive = false;
 const LAG_CHECK_INTERVAL_MS = 30000; // 30 seconds
+
 /**
  * Maximum replication lag (seconds) before reads are routed to the primary.
  * Configurable via REPLICA_MAX_LAG_SECONDS (default 30 s).
  * Set to 0 to disable lag-based fallback entirely.
  */
-const LAG_MAX_SECONDS = envInt('REPLICA_MAX_LAG_SECONDS', 30);
+function getLagMaxSeconds(): number {
+  const v = getRuntimeEnv()['REPLICA_MAX_LAG_SECONDS'];
+  if (v === undefined || v === '') return 30;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 30;
+}
 
 /**
  * Extract hostname from a connection string for safe logging.
@@ -199,7 +206,7 @@ export async function checkReplicationLag(): Promise<number | null> {
   }
 
   const now = Date.now();
-  if (now - _lastLagCheckTime < LAG_CHECK_INTERVAL_MS) {
+  if (_lastLagCheckTime !== null && now - _lastLagCheckTime < LAG_CHECK_INTERVAL_MS) {
     return _lastLagValue;
   }
 
@@ -215,8 +222,9 @@ export async function checkReplicationLag(): Promise<number | null> {
         END AS lag_seconds
     `);
 
-    const lagSeconds = result.rows[0]?.lag_seconds as number | null;
-    _lastLagValue = lagSeconds ?? null;
+    const rawLag = result.rows[0]?.lag_seconds;
+    const parsedLag = rawLag === null || rawLag === undefined ? null : Number(rawLag);
+    _lastLagValue = parsedLag !== null && Number.isFinite(parsedLag) ? parsedLag : null;
     _lastLagCheckTime = now;
 
     // Update the metric
@@ -281,15 +289,24 @@ export async function getReadPool(options: GetReadPoolOptions = {}): Promise<pg.
 
     // Enforce lag-based fallback: if the replica is lagging beyond the
     // configured threshold, route this read to the primary instead.
-    if (LAG_MAX_SECONDS > 0) {
+    const maxLagSeconds = getLagMaxSeconds();
+    if (maxLagSeconds > 0) {
       const lag = await checkReplicationLag();
-      if (lag !== null && lag > LAG_MAX_SECONDS) {
-        logger.warn('Replica lag exceeds threshold — routing read to primary', undefined, {
-          lagSeconds: lag,
-          thresholdSeconds: LAG_MAX_SECONDS,
-        });
+      if (lag !== null && lag > maxLagSeconds) {
+        if (!_lagFallbackActive) {
+          _lagFallbackActive = true;
+          logger.warn('Replica lag exceeds threshold — routing read to primary', undefined, {
+            lagSeconds: lag,
+            thresholdSeconds: maxLagSeconds,
+          });
+        }
         return getPool();
       }
+    }
+
+    if (_lagFallbackActive) {
+      _lagFallbackActive = false;
+      logger.info('Replica lag back within threshold — resuming replica reads');
     }
 
     return _replicaPool;
@@ -327,8 +344,9 @@ export function resetReplicaPool(): void {
   _replicaPool = null;
   _replicaHealthy = false;
   _healthCheckDone = false;
-  _lastLagCheckTime = 0;
+  _lastLagCheckTime = null;
   _lastLagValue = null;
+  _lagFallbackActive = false;
 }
 
 /** Replace the singleton replica pool (for tests only). */

@@ -158,6 +158,13 @@ describe('hashConsumerUrl', () => {
     expect(hashConsumerUrl('https://evil/redis\nkey')).toMatch(/^[0-9a-f]{16}$/);
     expect(hashConsumerUrl('https://例え.テスト/フック')).toMatch(/^[0-9a-f]{16}$/);
   });
+
+  it('throws a TypeError when given a non-string input', () => {
+    expect(() => hashConsumerUrl({ endpoint: RECEIVER } as unknown as string)).toThrow(TypeError);
+    expect(() => hashConsumerUrl(null as unknown as string)).toThrow(TypeError);
+    expect(() => hashConsumerUrl(undefined as unknown as string)).toThrow(TypeError);
+    expect(() => hashConsumerUrl(123 as unknown as string)).toThrow(TypeError);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -1,41 +1,91 @@
-import { readdirSync, readFileSync } from 'fs';
-import { join, relative } from 'path';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import * as ts from 'typescript';
 
 const ROOT = process.cwd();
 
-function listTs(dir: string): string[] {
-  return readdirSync(dir).flatMap((name) => {
-    const full = join(dir, name);
-    if (full.includes('node_modules')) return [];
-    try {
-      const stat = require('fs').statSync(full);
-      if (stat.isDirectory()) return listTs(full);
-    } catch {}
-    return name.endsWith('.ts') && !name.endsWith('.test.ts') ? [full] : [];
-  });
+const PUBLIC_ROUTER_MOUNTS = new Set([
+  '/health', // Health checks are intentionally available without authentication.
+  '/api/auth', // Authentication endpoints must be reachable before a token exists.
+  '/api/streams', // Stream routes apply their own API-key and scope authorization.
+  '/metrics', // The metrics router enforces ADMIN_API_KEY authentication internally.
+]);
+
+const PUBLIC_ROOT_ROUTERS = new Set([
+  'docsRouter', // The root-mounted docs router serves public documentation and schemas.
+]);
+
+const KNOWN_MIDDLEWARE = new Set([
+  'csrfMiddleware',
+  'requireJsonContentType',
+  'requireJsonAccept',
+]);
+
+function isAppUse(node: ts.CallExpression): boolean {
+  const expression = node.expression;
+  return (
+    ts.isPropertyAccessExpression(expression) &&
+    ts.isIdentifier(expression.expression) &&
+    expression.expression.text === 'app' &&
+    expression.name.text === 'use'
+  );
 }
 
-const ROUTE_FILES = [...listTs(join(ROOT, 'src', 'routes'))].map((file) => ({ file: relative(ROOT, file).replace(/\\/g, '/'), src: readFileSync(file, 'utf8') }));
+function isProtectRouter(node: ts.Expression): boolean {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === 'protectRouter'
+  );
+}
+
+function isRouterHandler(node: ts.Expression): boolean {
+  if (isProtectRouter(node)) return true;
+  if (ts.isIdentifier(node)) return node.text.endsWith('Router');
+  return (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text.endsWith('Router')
+  );
+}
 
 describe('structural auth registration', () => {
-  it('ensures protected routers are wrapped with protectRouter', () => {
+  it('requires protectRouter for every non-public router mount', () => {
     const appSrc = readFileSync(join(ROOT, 'src', 'app.ts'), 'utf8');
+    const sourceFile = ts.createSourceFile(
+      'src/app.ts',
+      appSrc,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    );
+    const routerMounts: Array<{ path: string; handler: ts.Expression }> = [];
 
-    // Extract every app.use mount path and the RHS source text around it.
-    const mounts = Array.from(appSrc.matchAll(/app\.use\(([^,]+),?\s*([^;\)]+)\)?/g)).map((m) => ({ raw: m[0], path: m[1].trim(), handler: m[2]?.trim() }));
+    function visit(node: ts.Node): void {
+      if (ts.isCallExpression(node) && isAppUse(node)) {
+        const [first, ...remaining] = node.arguments;
+        const hasPath = first && ts.isStringLiteral(first);
+        const path = hasPath ? first.text : '/';
+        const handlers = hasPath ? remaining : node.arguments;
 
-    // Load declared public paths to allow exceptions.
-    const protectSrc = readFileSync(join(ROOT, 'src', 'routes', 'protect.ts'), 'utf8');
-    const publicPathsMatch = protectSrc.match(/new Set<string>\(\[([\s\S]*?)\]\)/);
-    const publicPaths: string[] = publicPathsMatch ? Array.from(publicPathsMatch[1].matchAll(/'([^']+)'/g)).map((x) => x[1]) : [];
+        for (const handler of handlers) {
+          if (ts.isIdentifier(handler) && KNOWN_MIDDLEWARE.has(handler.text)) continue;
+          if (!hasPath && !isRouterHandler(handler)) continue;
+          routerMounts.push({ path, handler });
+        }
+      }
 
-    for (const m of mounts) {
-      const p = m.path.replace(/^['"`]|['"`]$/g, '');
-      if (!p.startsWith('/')) continue; // skip middleware mounts like app.use(rateLimiter)
-      if (publicPaths.includes(p)) continue;
+      ts.forEachChild(node, visit);
+    }
 
-      // Handler should be a protectRouter(...) expression for protected mounts
-      expect(m.raw).toMatch(/protectRouter\(/);
+    visit(sourceFile);
+    expect(routerMounts.length).toBeGreaterThan(0);
+
+    for (const { path, handler } of routerMounts) {
+      if (PUBLIC_ROUTER_MOUNTS.has(path)) continue;
+      if (ts.isIdentifier(handler) && PUBLIC_ROOT_ROUTERS.has(handler.text)) continue;
+
+      expect(handler.getText(sourceFile)).toMatch(/^protectRouter\s*\(/);
     }
   });
 

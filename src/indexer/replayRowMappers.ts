@@ -1,4 +1,3 @@
-// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 import { ContractEvent, ReplayCursor } from '../types/index.js';
 import { rowReader, INT32_MAX, BIGINT_SAFE_MAX } from '../db/rowMapping.js';
 

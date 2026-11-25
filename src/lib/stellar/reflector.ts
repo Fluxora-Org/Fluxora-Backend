@@ -18,13 +18,6 @@ interface CacheEntry {
 
 const DEFAULT_BASE_URL = 'https://api.reflector.network/v1/prices';
 const DEFAULT_TTL_MS = 60_000;
-const DEFAULT_CURRENCY_SYMBOLS: Record<FiatCurrency, string> = {
-  USD: '$',
-  EUR: '€',
-  GBP: '£',
-  NGN: '₦',
-};
-
 export class ReflectorOracle {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -37,7 +30,11 @@ export class ReflectorOracle {
     this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   }
 
-  async getPrice(assetCode: string, assetIssuer: string, currency: FiatCurrency): Promise<number | undefined> {
+  async getPrice(
+    assetCode: string,
+    assetIssuer: string,
+    currency: FiatCurrency
+  ): Promise<number | undefined> {
     const cacheKey = `${assetCode}:${assetIssuer}:${currency}`;
     const cached = this.cache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
@@ -57,7 +54,7 @@ export class ReflectorOracle {
 
       const payload = (await response.json()) as ReflectorResponse;
       const price = payload.price;
-      if (typeof price !== 'number' || Number.isNaN(price)) {
+      if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0) {
         return undefined;
       }
 
@@ -68,7 +65,12 @@ export class ReflectorOracle {
     }
   }
 
-  async formatAmount(amount: number, assetCode: string, assetIssuer: string, currency: FiatCurrency): Promise<string | undefined> {
+  async formatAmount(
+    amount: number,
+    assetCode: string,
+    assetIssuer: string,
+    currency: FiatCurrency
+  ): Promise<string | undefined> {
     const price = await this.getPrice(assetCode, assetIssuer, currency);
     if (price === undefined) {
       return undefined;
@@ -80,17 +82,13 @@ export class ReflectorOracle {
 }
 
 export function formatFiatAmount(amount: number, currency: FiatCurrency): string {
-  const symbol = DEFAULT_CURRENCY_SYMBOLS[currency];
-  const normalized = new Intl.NumberFormat('en-US', {
+  // Let Intl round the original value; scaling large amounts to cents first
+  // can lose precision. Narrow symbols also preserve the sign for NGN.
+  return new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency,
+    currencyDisplay: 'narrowSymbol',
     maximumFractionDigits: 2,
     minimumFractionDigits: 2,
   }).format(amount);
-
-  if (currency === 'NGN') {
-    return `${symbol}${normalized.replace(/^\D+/, '')}`;
-  }
-
-  return normalized;
 }

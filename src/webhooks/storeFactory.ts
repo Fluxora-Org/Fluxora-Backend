@@ -35,7 +35,7 @@ import { getRuntimeEnv } from '../config/runtime-env.js';
  * import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
  * ```
  *
- * In tests that need the in-memory store explicitly:
+ * in tests that need the in-memory store explicitly:
  * ```ts
  * import { webhookDeliveryStore } from '../webhooks/store.js';
  * // (store.ts no longer re-exports the singleton; use storeFactory.ts in app code)
@@ -171,6 +171,21 @@ export function createWebhookDeliveryStore(
  * The active webhook delivery store singleton.
  *
  * Callers import this instead of constructing their own instance.
- * The backing implementation is determined by `WEBHOOK_DELIVERY_STORE`.
+ * The backing implementation is determined by `WEBHOOK_DELIVERY_STORE`
  */
 export const webhookDeliveryStore: IWebhookDeliveryStore = createWebhookDeliveryStore();
+
+/**
+ * Reset and seed the active store singleton for tests.
+ *
+ * Routes read `webhookDeliveryStore`, so fixtures must write to that exact
+ * instance. This helper clears it and hands it to the caller, keeping test
+ * setup in from reaching into implementation-specific state or constructing a
+ * second store the routes never see.
+ */
+export function resetWebhookDeliveryStoreForTests(
+  seed: (store: IWebhookDeliveryStore) => void
+): void {
+  webhookDeliveryStore.clear();
+  seed(webhookDeliveryStore);
+}

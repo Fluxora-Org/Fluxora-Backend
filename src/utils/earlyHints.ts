@@ -313,49 +313,9 @@ export function sendEarlyHintsWithBoth(
       debug('Early Hints (multi): client did not advertise support, skipping 103');
       return;
     }
-
-    if (res.headersSent) return;
-
-    const links: string[] = [];
-
-    if (hasMore && nextCursor && isSafeCursor(nextCursor)) {
-      const nextParams = { cursor: nextCursor, limit: '50', ...queryParams };
-      const nextUrl = buildPaginationUrl(baseUrl, nextParams);
-      links.push(buildLinkHeader(nextUrl, 'next'));
-    }
-
-    if (prevCursor && isSafeCursor(prevCursor)) {
-      const prevParams = { cursor: prevCursor, limit: '50', ...queryParams };
-      const prevUrl = buildPaginationUrl(baseUrl, prevParams);
-      links.push(buildLinkHeader(prevUrl, 'prev'));
-    }
-
-    if (links.length === 0) return;
-
-    const resWithProcessing = res as unknown as { writeProcessing?: (header: string, value: string) => void };
-    if (typeof resWithProcessing.writeProcessing === 'function') {
-      setImmediate(() => {
-        try {
-          const writeProcessing = resWithProcessing.writeProcessing;
-          if (!res.headersSent && writeProcessing) {
-            links.forEach((linkHeader) => {
-              writeProcessing('Link', linkHeader);
-            });
-            debug('Early Hints: sent 103 with multiple Link headers', {
-              linkCount: links.length,
-            });
-          }
-        } catch (err) {
-          debug('Early Hints: failed to send 103', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      });
-    }
   } catch (err) {
     warn('Early Hints (multi): unexpected error', {
       error: err instanceof Error ? err.message : String(err),
     });
   }
 }
-
