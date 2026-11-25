@@ -45,14 +45,22 @@ Requests that are refused carry no `X-API-Version` header, because no version wa
 
 If a client requests a version that does not exist or is no longer supported (for example, `v2` or `beta`), the server will immediately reject the request with a `400 Bad Request` status.
 
-The response payload will be a structured JSON error indicating the unsupported version and listing the currently available versions:
+The response payload uses the standard error envelope. The `error.code` identifies the refusal, and `error.details.supported` lists the currently available versions:
 
 ```json
 {
-  "error": "unsupported_version",
-  "supported": ["v1"]
+  "success": false,
+  "error": {
+    "code": "UNSUPPORTED_VERSION",
+    "message": "Requested API version is not supported.",
+    "details": {
+      "supported": ["v1"]
+    }
+  }
 }
 ```
+
+A `requestId` may also be included in the `error` object when a correlation ID is available.
 
 No `X-API-Version` header is set on the refusal response: the request was never bound to a served
 contract.
