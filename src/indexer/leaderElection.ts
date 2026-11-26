@@ -289,4 +289,63 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
       this.heartbeat = null;
     }
   }
+
+  /**
+   * Test-only hook: stop any running heartbeat timer so the accessor's reset
+   * helper can tear this instance down cleanly.
+   */
+  _stopHeartbeatForReset(): void {
+    this.stopHeartbeat();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide accessor
+// ---------------------------------------------------------------------------
+//
+// `app.ts` wires the indexer leader election once at startup (passing the
+// Redis client when Redis is enabled, or nothing when it is disabled) and
+// `src/indexer/service.ts` reads it per batch. Modeled on `getIdempotencyStore`
+// in `src/routes/streams/state.ts`: a lazily initialised module singleton with
+// a safe NoOp default, so callers that run before (or without) initialisation
+// still get a working object rather than throwing.
+
+const defaultLeaderElection: IndexerLeaderElection = new NoOpLeaderElection();
+let currentLeaderElection: IndexerLeaderElection = defaultLeaderElection;
+
+/**
+ * Install the process-wide leader election. When `redis` is `null`/`undefined`
+ * the accessor keeps returning the always-leader `NoOpLeaderElection`;
+ * otherwise a `RedisIndexerLeaderElection` is swapped in.
+ */
+export function initializeIndexerLeaderElection(
+  redis: RedisClient | null | undefined,
+  options?: IndexerLeaderElectionOptions,
+): IndexerLeaderElection {
+  if (!redis) {
+    currentLeaderElection = defaultLeaderElection;
+    return currentLeaderElection;
+  }
+  currentLeaderElection = new RedisIndexerLeaderElection(redis, options);
+  return currentLeaderElection;
+}
+
+/**
+ * Return the process-wide leader election. Safe to call before
+ * `initializeIndexerLeaderElection`: returns the `NoOpLeaderElection` default
+ * so single-process / Redis-disabled deployments continue to behave as leader.
+ */
+export function getIndexerLeaderElection(): IndexerLeaderElection {
+  return currentLeaderElection;
+}
+
+/**
+ * Test-only: stop the current instance's heartbeat (if any) and restore the
+ * `NoOpLeaderElection` default. Used by unit tests to isolate setups.
+ */
+export function _resetIndexerLeaderElection(): void {
+  if (currentLeaderElection instanceof RedisIndexerLeaderElection) {
+    currentLeaderElection._stopHeartbeatForReset();
+  }
+  currentLeaderElection = defaultLeaderElection;
 }
