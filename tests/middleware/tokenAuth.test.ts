@@ -11,6 +11,7 @@ import { IncomingMessage } from 'http';
 import {
   verifyWsToken,
   WsAuthFailureCode,
+  WsTokenPayload,
 } from '../../src/middleware/tokenAuth.js';
 import jwt from 'jsonwebtoken';
 
@@ -145,6 +146,20 @@ describe('verifyWsToken', () => {
       ok: true,
       payload: { sub: 'header-user', role: 'admin', iat: expect.any(Number) },
     });
+  });
+
+  it('includes issued-at (iat) timestamp in payload matching WsTokenPayload shape', () => {
+    const beforeSec = Math.floor(Date.now() / 1000);
+    const validToken = jwt.sign({ sub: 'user123', role: 'operator' }, SECRET);
+    const req = { headers: { authorization: `Bearer ${validToken}` }, url: '/ws' } as IncomingMessage;
+    const result = verifyWsToken(req, SECRET);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const payload: WsTokenPayload = result.payload;
+      expect(payload.iat).toBeTypeOf('number');
+      expect(payload.iat).toBeGreaterThanOrEqual(beforeSec);
+    }
   });
 
   it('returns INVALID_TOKEN when JWT verification fails', () => {
