@@ -45,7 +45,8 @@ import {
  *
  * A SHA-256 fingerprint of the normalised body is cached with the response:
  * same key + same body replays the original 201, same key + different body
- * is a 409.
+ * is a 409. A key for an in-flight request returns 409 CONFLICT with
+ * a hint to retry after the request completes.
  */
 async function createStreamHandler(req: Request, res: Response): Promise<void> {
   const requestId = req.correlationId;
@@ -86,13 +87,6 @@ async function createStreamHandler(req: Request, res: Response): Promise<void> {
   }
 
   if (existingResponse) {
-    if (existingResponse === 'in_progress') {
-      throw new ApiError(
-        409,
-        ApiErrorCode.CONFLICT,
-        'Request is currently being processed',
-      );
-    }
     if (existingResponse.requestFingerprint !== requestFingerprint) {
       warn('Idempotency-Key reused with different payload', {
         requestId,
