@@ -59,6 +59,20 @@ Without `DATABASE_URL` the check is skipped, matching the other live-database su
 | `POOL_QUEUE_LIMIT` | `50` | Max requests allowed to queue before fast-failing with 503 |
 | `STATEMENT_TIMEOUT_MS` | `5000` | Per-connection statement timeout in ms. Set to `0` to disable. |
 
+## Pool Idle Lifecycle
+
+The application pool sets node-postgres `allowExitOnIdle` to `false` in every
+pool mode. Open idle connections therefore keep the Node.js event loop alive;
+this is appropriate for the long-running backend server, whose shutdown code
+must close the pool. `allowExitOnIdle` is unrelated to PgBouncer session or
+transaction mode and does not control prepared-statement behavior.
+
+Node-postgres documents `allowExitOnIdle: true` as a convenience for scripts
+and tests that should exit as soon as the pool is idle. Short-lived code that
+needs that behavior should set it explicitly in its own pool configuration
+rather than changing the application pool default. The migration runner uses
+dedicated `pg.Client` connections and closes them after use.
+
 ### Migration job environment
 
 `pnpm run migrate` (`src/db/migrate.ts`) does not load the application config,

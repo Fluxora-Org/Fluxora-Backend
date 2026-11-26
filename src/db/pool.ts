@@ -39,8 +39,8 @@ import { getRuntimeEnv } from '../config/runtime-env.js';
  *   - The `connect` hook skips `SET statement_timeout` (per-query timeout is
  *     the operator's responsibility at the pgbouncer.ini level, or via a
  *     wrapper in each query).
- *   - The pool is created with `allowExitOnIdle: false` (no pg internal
- *     prepared statement cache in this mode).
+ *   - The pool uses `allowExitOnIdle: false` to keep the application event
+ *     loop alive while its connections are idle.
  *   - A startup warning is logged so operators know which features are
  *     bypassed.
  *
@@ -220,10 +220,7 @@ export function createPool(config?: PoolConfig): pg.Pool {
     max: cfg.max,
     connectionTimeoutMillis: cfg.connectionTimeoutMillis,
     idleTimeoutMillis: cfg.idleTimeoutMillis,
-    // In transaction-pooling mode, pg's internal prepared-statement cache is
-    // incompatible (PgBouncer returns error on PREPARE/EXECUTE).  Setting
-    // allowExitOnIdle: false disables the cache so the driver does not try to
-    // use PREPARE.  In session mode we explicitly enable it (default in pg).
+    allowExitOnIdle: false,
   });
 
   // Store queueLimit, poolMode and poolName on the pool instance for use in query()
