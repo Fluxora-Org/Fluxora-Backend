@@ -100,9 +100,10 @@ describe('parseInterfaces / parseTypeAliases', () => {
     expect(parsed.interfaces.ApiKeyRecord.scopes.type).toBe('string[]');
 
     expect(Object.keys(parsed.interfaces.StreamEventRecord)).toHaveLength(12);
+    expect(parsed.interfaces.StreamEventRecord.ledgerHash.type).toBe('string | null');
     expect(parsed.interfaces.StreamEventRecord.payload.type).toBe('Record<string, unknown>');
 
-    expect(parsed.aliases.StreamStatus).toContain('"active"');
+    expect(parsed.aliases.StreamStatus).toBe('ApiStreamStatus');
   });
 
   it('does not let a {@link} reference inside JSDoc truncate an interface', () => {
@@ -110,7 +111,7 @@ describe('parseInterfaces / parseTypeAliases', () => {
       'export interface Foo {',
       '  /** @see {@link Bar} for details. */',
       '  id: string;',
-      '  /** Optional counter. */',
+      '  /** Optional counter; omitted on legacy rows. */',
       '  count?: number;',
       '}',
     ].join('\n');
@@ -165,16 +166,12 @@ describe('compareDeclaredToLive against the migrated schema', () => {
     const { errors, reports } = compareWithLive();
     expect(errors).toEqual([]);
 
-    const reported = reports.map((report) => `${report.table}.${report.column}`);
-    expect(reported).toContain('streams.sender_address_hash');
-    expect(reported).toContain('streams.recipient_address_hash');
-    expect(reported).toContain('streams.encryption_state');
-    expect(reported).toContain('streams.legal_hold');
-    // declared non-null, nullable live column.
-    expect(reported).toContain('contract_events.ledger_hash');
-    expect(
-      reports.filter((report) => report.code === 'UNDECLARED_COLUMN'),
-    ).toHaveLength(4);
+    expect(reports.map(({ table, column }) => `${table}.${column}`).sort()).toEqual([
+      'streams.encryption_state',
+      'streams.legal_hold',
+      'streams.recipient_address_hash',
+      'streams.sender_address_hash',
+    ]);
   });
 
   it('fails when a mapped column is renamed in a migration', () => {

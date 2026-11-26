@@ -188,8 +188,8 @@ export function parseInterfaces(source) {
 
 function parsePropertyBlock(body) {
   const properties = {};
-  for (const raw of body.split(';')) {
-    const text = stripCommentLines(raw).trim();
+  for (const raw of stripCommentLines(body).split(';')) {
+    const text = raw.trim();
     if (!text) continue;
     const match = text.match(/^([A-Za-z_$][\w$]*)\s*(\?)?\s*:\s*([\s\S]+)$/);
     if (!match) continue;
