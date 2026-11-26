@@ -13,7 +13,8 @@
  * next time these tests run — no test edit required.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { logs, type LogRecord } from '@opentelemetry/api-logs';
 import {
   forwardToOtel,
   initLogsBridge,
@@ -24,45 +25,12 @@ import { logger } from '../../src/lib/logger.js';
 import { redactableFields } from '../../src/pii/policy.js';
 import { REDACTED } from '../../src/pii/sanitizer.js';
 
-/** Shape of the LogRecord passed to `logs.getLogger().emit()`. */
-interface EmittedLogRecord {
-  body?: unknown;
-  attributes?: Record<string, unknown>;
-  severityText?: string;
-}
-
-// ── OTel Logs API test double ─────────────────────────────────────────────────
-// `logsBridge` emits LogRecords via `logs.getLogger(scope).emit(record)`. We
-// intercept that single call so each test can inspect exactly what would have
-// reached the trace backend. The state is hoisted because `vi.mock` factories
-// are lifted above imports.
-const bridgeState = vi.hoisted(() => ({
-  emitted: [] as unknown[],
+const bridgeState = {
+  emitted: [] as LogRecord[],
   order: [] as string[],
   emitError: null as Error | null,
   getLoggerError: null as Error | null,
-}));
-
-vi.mock('@opentelemetry/api-logs', async () => {
-  const actual =
-    await vi.importActual<typeof import('@opentelemetry/api-logs')>('@opentelemetry/api-logs');
-  return {
-    ...actual,
-    logs: {
-      getLogger: () => {
-        if (bridgeState.getLoggerError) throw bridgeState.getLoggerError;
-        return {
-          emit: (record: unknown) => {
-            bridgeState.order.push('trace');
-            // Simulate a collector/exporter that is down: `emit()` throws.
-            if (bridgeState.emitError) throw bridgeState.emitError;
-            bridgeState.emitted.push(record);
-          },
-        };
-      },
-    } as unknown as typeof actual.logs,
-  };
-});
+};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -115,8 +83,8 @@ function isRedactedAttributeValue(value: unknown): boolean {
   return typeof value === 'string' && /^.{4}\.\..{4}$/.test(value);
 }
 
-function emittedRecords(): EmittedLogRecord[] {
-  return bridgeState.emitted as EmittedLogRecord[];
+function emittedRecords(): LogRecord[] {
+  return bridgeState.emitted;
 }
 
 function expectNoForbiddenValues(serialized: string): void {
@@ -164,14 +132,32 @@ describe('logs bridge PII contract (issue #1440)', () => {
     bridgeState.order.length = 0;
     bridgeState.emitError = null;
     bridgeState.getLoggerError = null;
-    resetLogsBridge();
+    // Startup setup has already loaded the bridge, so register on the live Logs API.
+    logs.setGlobalLoggerProvider({
+      getLogger: () => {
+        if (bridgeState.getLoggerError) throw bridgeState.getLoggerError;
+
+        return {
+          enabled: () => true,
+          emit: (record) => {
+            bridgeState.order.push('trace');
+            if (bridgeState.emitError) throw bridgeState.emitError;
+            bridgeState.emitted.push(record);
+          },
+        };
+      },
+    });
+    initLogsBridge({ enabled: true });
   });
 
   afterEach(() => {
     resetLogsBridge();
+    logs.disable();
   });
 
   it('is a no-op until explicitly enabled', () => {
+    resetLogsBridge();
+
     expect(isLogsBridgeEnabled()).toBe(false);
 
     const { stdout } = captureStdio(() => {
@@ -183,21 +169,18 @@ describe('logs bridge PII contract (issue #1440)', () => {
   });
 
   it('redacts before forwarding: the original log line is written before the trace emit', () => {
-    initLogsBridge({ enabled: true });
-    const order: string[] = [];
-
     captureStdio(() => {
-      logger.info('ordering check', 'corr-order', { note: 'ok' });
-    }, order);
+      logger.info('ordering check', 'corr-order', { password: BEARER_TOKEN });
+    }, bridgeState.order);
 
     // The structured log line must be written before the OTel emission, so a
     // failing exporter can never suppress it.
-    expect(order).toEqual(['log', 'trace']);
+    expect(bridgeState.order).toEqual(['log', 'trace']);
     expect(emittedRecords()).toHaveLength(1);
+    expect(emittedRecords()[0].attributes?.password).toBe(REDACTED);
   });
 
   it('asserts no field named in the PII policy reaches a forwarded record', () => {
-    initLogsBridge({ enabled: true });
     const payload = buildPolicyPayload();
 
     captureStdio(() => {
@@ -229,7 +212,6 @@ describe('logs bridge PII contract (issue #1440)', () => {
     expect(policyFields.length).toBeGreaterThan(0);
     expect(Object.keys(payload).sort()).toEqual([...policyFields].sort());
 
-    initLogsBridge({ enabled: true });
     captureStdio(() => {
       logger.info('policy coverage', 'corr-coverage', payload);
     });
@@ -245,7 +227,6 @@ describe('logs bridge PII contract (issue #1440)', () => {
   });
 
   it('re-sanitizes raw metadata when the caller bypasses the logger pipeline', () => {
-    initLogsBridge({ enabled: true });
 
     forwardToOtel('info', 'direct bridge call', 'corr-direct', {
       password: 'hunter2',
@@ -262,7 +243,6 @@ describe('logs bridge PII contract (issue #1440)', () => {
   });
 
   it('redacts PII embedded in the forwarded message body', () => {
-    initLogsBridge({ enabled: true });
     const message = `contact ${STELLAR_PUBLIC_KEY} using ${BEARER_TOKEN}`;
 
     captureStdio(() => {
@@ -277,7 +257,6 @@ describe('logs bridge PII contract (issue #1440)', () => {
   });
 
   it('redacts PII nested below the top level of the forwarded metadata', () => {
-    initLogsBridge({ enabled: true });
 
     captureStdio(() => {
       logger.info('nested', 'corr-nested', {
@@ -294,7 +273,6 @@ describe('logs bridge PII contract (issue #1440)', () => {
   });
 
   it('does not drop the original log when the OTel exporter throws', () => {
-    initLogsBridge({ enabled: true });
     bridgeState.emitError = new Error('collector unavailable');
 
     const { stdout } = captureStdio(() => {
@@ -309,7 +287,6 @@ describe('logs bridge PII contract (issue #1440)', () => {
   });
 
   it('does not drop the original log when resolving the OTel logger throws', () => {
-    initLogsBridge({ enabled: true });
     bridgeState.getLoggerError = new Error('logger provider misconfigured');
 
     const { stderr } = captureStdio(() => {
