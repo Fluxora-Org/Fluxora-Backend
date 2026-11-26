@@ -57,6 +57,7 @@ import {
   WRITE_FENCE_HEADER,
   CLOCK_SKEW_TOLERANCE_MS,
 } from '../../src/db/writeFencePin.js';
+import { dbWriteFenceRejectedTotal } from '../../src/metrics/dbMetrics.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -312,8 +313,15 @@ describe('writeFencePin', () => {
 
     // --- structural malformation ---
 
-    it('returns false for a non-base64url string', () => {
+    it('returns false for a non-base64url string and counts the rejection', async () => {
+      const before = (await dbWriteFenceRejectedTotal.get()).values
+        .find((value) => value.labels.reason === 'malformed')?.value ?? 0;
+
       expect(verifyWriteFencePin('not!base64url@#$')).toBe(false);
+
+      const after = (await dbWriteFenceRejectedTotal.get()).values
+        .find((value) => value.labels.reason === 'malformed')?.value ?? 0;
+      expect(after).toBe(before + 1);
     });
 
     it('returns false for a base64url string that decodes to fewer than 3 parts', () => {
@@ -589,19 +597,24 @@ vi.mock('../../src/db/replicaPool.js', () => ({
   setReplicaPool: vi.fn(),
 }));
 
-vi.mock('../../src/lib/logger.js', () => ({
-  info: vi.fn(),
-  debug: vi.fn(),
-  warn: vi.fn(),
-  error: vi.fn(),
-}));
+vi.mock('../../src/lib/logger.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/lib/logger.js')>();
+  return {
+    ...actual,
+    logger: { ...actual.logger, warn: vi.fn() },
+    info: vi.fn(),
+    debug: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  };
+});
 
-vi.mock('../../src/metrics/dbMetrics.js', () => ({
+vi.mock('../../src/metrics/dbMetrics.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/metrics/dbMetrics.js')>()),
   dbQueryDurationSeconds: {
     observe: vi.fn(),
     startTimer: vi.fn(() => vi.fn()),
   },
-  dbReplicationLagSeconds: { set: vi.fn() },
 }));
 
 vi.mock('../../src/tracing/hooks.js', () => ({
