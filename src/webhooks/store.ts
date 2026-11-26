@@ -70,6 +70,7 @@
  */
 
 import type { WebhookDelivery, WebhookDeliveryStatus, DLQReasonCode } from './types.js';
+import { newId } from './ids.js';
 import { logger } from '../lib/logger.js';
 
 export interface DeadLetterQueueItem {
@@ -258,7 +259,7 @@ export class WebhookDeliveryStore implements IWebhookDeliveryStore {
    * Add item to outbox for reliable delivery
    */
   addToOutbox(item: Omit<OutboxItem, 'id' | 'status'>): string {
-    const id = `outbox_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const id = newId('outbox');
     const outboxItem: OutboxItem = { ...item, id, status: 'pending' };
 
     this.outbox.set(id, outboxItem);
@@ -530,7 +531,7 @@ export class WebhookDeliveryStore implements IWebhookDeliveryStore {
     failureReason: string,
     reasonCode: DLQReasonCode = 'other'
   ): string {
-    const id = `dlq_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const id = newId('dlq');
 
     const dlqItem: DeadLetterQueueItem = {
       id,

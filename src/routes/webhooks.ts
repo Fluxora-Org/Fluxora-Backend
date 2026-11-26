@@ -20,6 +20,7 @@ import {
 import { resolveWebhookRetryPolicy } from '../webhooks/delivery-support.js';
 import { verifyWebhookSignature } from '../webhooks/signature.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
+import { newId } from '../webhooks/ids.js';
 import { logger } from '../lib/logger.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { OffsetPaginationSchema, DEFAULT_PAGE_LIMIT } from '../validation/paginationSchema.js';
@@ -202,7 +203,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
 
     // Add to outbox for reliable processing
     const outboxId = webhookDeliveryStore.addToOutbox({
-      deliveryId: `deliv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      deliveryId: newId('deliv'),
       eventId: event.id,
       eventType: event.type,
       endpointUrl,
