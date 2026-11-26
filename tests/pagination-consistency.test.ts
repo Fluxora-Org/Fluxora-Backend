@@ -154,7 +154,7 @@ function buildApp(): Express {
   app.use(correlationIdMiddleware);
   app.use('/api/audit',            auditRouter);
   app.use('/internal/webhooks',    webhooksRouter);
-  app.use(errorHandlerBusiness);
+  app.use(errorHandler);
   return app;
 }
 

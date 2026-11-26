@@ -214,14 +214,15 @@ export function createPool(config?: PoolConfig): pg.Pool {
     );
   }
 
-  const pool = new Pool({
+  const poolOptions = {
     connectionString: cfg.connectionString,
     min: cfg.min,
     max: cfg.max,
     connectionTimeoutMillis: cfg.connectionTimeoutMillis,
     idleTimeoutMillis: cfg.idleTimeoutMillis,
     allowExitOnIdle: false,
-  });
+  };
+  const pool = new Pool(poolOptions);
 
   // Store queueLimit, poolMode and poolName on the pool instance for use in query()
   (pool as pg.Pool & { _queueLimit?: number; _poolMode?: string })._queueLimit = cfg.queueLimit;
