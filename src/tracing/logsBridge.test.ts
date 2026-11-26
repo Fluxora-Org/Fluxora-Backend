@@ -11,8 +11,8 @@
  * - the disabled bridge remains a side-effect-free no-op.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { SeverityNumber } from '@opentelemetry/api-logs';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { logs, SeverityNumber, type LogRecord } from '@opentelemetry/api-logs';
 import {
   forwardToOtel,
   initLogsBridge,
@@ -24,47 +24,14 @@ import {
   LOGS_BRIDGE_MAX_META_BYTES,
 } from './logsBridge.js';
 
-interface EmittedLogRecord {
-  timestamp?: number;
-  severityNumber?: SeverityNumber;
-  severityText?: string;
-  body?: unknown;
-  attributes?: Record<string, unknown>;
-}
-
-// The bridge only touches `logs.getLogger(scope).emit(record)`. Intercept that
-// call so tests can prove both the emitted payload and the absence of writes.
-const bridgeState = vi.hoisted(() => ({
-  emitted: [] as unknown[],
+const bridgeState = {
+  emitted: [] as LogRecord[],
   getLoggerCalls: 0,
   emitCalls: 0,
-}));
+};
 
-vi.mock('@opentelemetry/api-logs', async () => {
-  const actual =
-    await vi.importActual<typeof import('@opentelemetry/api-logs')>('@opentelemetry/api-logs');
-  return {
-    ...actual,
-    logs: {
-      getLogger: () => {
-        bridgeState.getLoggerCalls += 1;
-        return {
-          emit: (record: unknown) => {
-            bridgeState.emitCalls += 1;
-            bridgeState.emitted.push(record);
-          },
-        };
-      },
-    } as unknown as typeof actual.logs,
-  };
-});
-
-function enableBridge(): void {
-  initLogsBridge({ enabled: true });
-}
-
-function emittedRecords(): EmittedLogRecord[] {
-  return bridgeState.emitted as EmittedLogRecord[];
+function emittedRecords(): LogRecord[] {
+  return bridgeState.emitted;
 }
 
 function expectNoWrites(): void {
@@ -93,17 +60,29 @@ describe('logsBridge input validation (issue #1765)', () => {
     bridgeState.emitted.length = 0;
     bridgeState.getLoggerCalls = 0;
     bridgeState.emitCalls = 0;
-    resetLogsBridge();
+    // Startup setup has already loaded the bridge, so register on the live Logs API.
+    logs.setGlobalLoggerProvider({
+      getLogger: () => {
+        bridgeState.getLoggerCalls += 1;
+        return {
+          enabled: () => true,
+          emit: (record) => {
+            bridgeState.emitCalls += 1;
+            bridgeState.emitted.push(record);
+          },
+        };
+      },
+    });
+    initLogsBridge({ enabled: true });
   });
 
   afterEach(() => {
     resetLogsBridge();
+    logs.disable();
   });
 
   describe('valid input', () => {
     it('forwards a valid entry unchanged', () => {
-      enableBridge();
-
       forwardToOtel('warn', 'stream stalled', 'corr-42', {
         streamId: 'stream-1',
         attempt: 2,
@@ -131,8 +110,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('accepts values exactly at the documented limits', () => {
-      enableBridge();
-
       forwardToOtel(
         'info',
         'm'.repeat(LOGS_BRIDGE_MAX_MESSAGE_BYTES),
@@ -147,8 +124,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('accepts omitted (undefined/null) optional fields', () => {
-      enableBridge();
-
       forwardToOtel('debug', 'no extras', undefined, undefined);
       forwardToOtel(
         'debug',
@@ -163,8 +138,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('keeps forwarding after a rejected entry', () => {
-      enableBridge();
-
       expect(() => forwardToOtel('info', '', undefined, undefined)).toThrow(
         LogsBridgeValidationError,
       );
@@ -177,6 +150,8 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('is a side-effect-free no-op while disabled', () => {
+      resetLogsBridge();
+
       forwardToOtel('info', 'valid but disabled', 'corr-off', { ok: true });
 
       expect(isLogsBridgeEnabled()).toBe(false);
@@ -186,8 +161,6 @@ describe('logsBridge input validation (issue #1765)', () => {
 
   describe('malformed input', () => {
     it('rejects an unsupported level with a typed error', () => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel('trace' as never, 'message', undefined, undefined),
       );
@@ -200,8 +173,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('rejects a non-string message with a typed error', () => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel('info', 42 as unknown as string, undefined, undefined),
       );
@@ -216,8 +187,6 @@ describe('logsBridge input validation (issue #1765)', () => {
       ['number', 123],
       ['object', { id: 'corr' }],
     ])('rejects a %s correlation ID with a typed error', (_label, correlationId) => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel('info', 'message', correlationId as never, undefined),
       );
@@ -232,8 +201,6 @@ describe('logsBridge input validation (issue #1765)', () => {
       ['a string', 'not-an-object' as unknown],
       ['a class instance', new Date(0) as unknown],
     ])('rejects metadata that is %s with a typed error', (_label, meta) => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel('info', 'message', undefined, meta as Record<string, unknown>),
       );
@@ -244,7 +211,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('rejects circular metadata with a typed error before sanitisation', () => {
-      enableBridge();
       const meta: Record<string, unknown> = {};
       meta.self = meta;
 
@@ -258,8 +224,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('rejects malformed init input without changing the enabled state', () => {
-      enableBridge();
-
       const nonBoolean = captureValidationError(() =>
         initLogsBridge({ enabled: 'true' } as unknown as { enabled: boolean }),
       );
@@ -281,8 +245,6 @@ describe('logsBridge input validation (issue #1765)', () => {
       ['the empty string', ''],
       ['whitespace only', '   \n\t '],
     ])('rejects %s as a message', (_label, message) => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel('info', message, undefined, undefined),
       );
@@ -294,8 +256,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('rejects an empty correlation ID', () => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel('info', 'message', '', undefined),
       );
@@ -308,8 +268,6 @@ describe('logsBridge input validation (issue #1765)', () => {
 
   describe('oversized input', () => {
     it('rejects a message one byte over the limit', () => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel(
           'info',
@@ -327,8 +285,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('rejects an oversized correlation ID', () => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel(
           'info',
@@ -345,8 +301,6 @@ describe('logsBridge input validation (issue #1765)', () => {
     });
 
     it('rejects oversized serialised metadata', () => {
-      enableBridge();
-
       const error = captureValidationError(() =>
         forwardToOtel('info', 'message', undefined, {
           payload: 'x'.repeat(LOGS_BRIDGE_MAX_META_BYTES),
