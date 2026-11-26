@@ -83,10 +83,15 @@ describe('apiVersionMiddleware', () => {
       expect(req.apiVersion).toBeUndefined();
       expect(next).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({
-        error: 'unsupported_version',
-        supported: ['v1']
-      });
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          error: expect.objectContaining({
+            code: 'UNSUPPORTED_VERSION',
+            details: { supported: SUPPORTED_VERSIONS },
+          }),
+        }),
+      );
     }
   });
 
