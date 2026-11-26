@@ -386,16 +386,20 @@ describe('Pagination contract — response envelope includes limit and offset', 
       .set('Authorization', 'Bearer test-admin-key');
     expect(res.status).toBe(200);
     expect(typeof res.body.data.total).toBe('number');
+    expect(res.body.data.limit).toBe(3);
+    expect(res.body.data.offset).toBe(1);
     expect(res.body.data.deliveries).toHaveLength(3);
   });
 
-  it('GET /internal/webhooks/dlq response includes total', async () => {
+  it('GET /internal/webhooks/dlq response includes total, limit, offset fields', async () => {
     const res = await request(app)
       .get('/internal/webhooks/dlq?limit=2&offset=0')
       .set('Authorization', 'Bearer test-admin-key');
     expect(res.status).toBe(200);
     // DLQ items come from the dead-letter store; may be empty — just check shape
     expect(typeof res.body.data.total).toBe('number');
+    expect(res.body.data.limit).toBe(2);
+    expect(res.body.data.offset).toBe(0);
     expect(Array.isArray(res.body.data.items)).toBe(true);
   });
 

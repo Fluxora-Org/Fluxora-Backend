@@ -17,6 +17,11 @@ import {
   ReplayCursorSchema as SharedReplayCursorSchema,
   ReplayRequestSchema as SharedReplayRequestSchema,
 } from '../types/index.js';
+import {
+  DEFAULT_PAGE_LIMIT,
+  MAX_PAGE_LIMIT,
+  MIN_PAGE_LIMIT,
+} from '../validation/paginationSchema.js';
 
 extendZodWithOpenApi(z);
 
@@ -2496,6 +2501,127 @@ registry.registerPath({
 });
 
 // ── Webhooks ──────────────────────────────────────────────────────────────────
+
+const webhookOffsetPaginationQuery = z.object({
+  limit: z.string().regex(/^\d+$/).optional().openapi({
+    description: `Maximum number of results to return (${MIN_PAGE_LIMIT}–${MAX_PAGE_LIMIT}, default ${DEFAULT_PAGE_LIMIT}).`,
+    example: String(DEFAULT_PAGE_LIMIT),
+  }),
+  offset: z.string().regex(/^\d+$/).optional().openapi({
+    description: 'Number of results to skip. Must be non-negative. Default 0.',
+    example: '0',
+  }),
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/internal/webhooks/deliveries',
+  summary: 'List webhook deliveries',
+  tags: ['webhooks'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    query: webhookOffsetPaginationQuery.extend({
+      status: z.string().optional().openapi({
+        description: 'Filter deliveries by status.',
+      }),
+    }),
+  },
+  responses: {
+    '200': successResponse(
+      z.object({
+        total: z.number(),
+        limit: z.number(),
+        offset: z.number(),
+        deliveries: z.array(z.object({
+          id: z.string(),
+          deliveryId: z.string(),
+          eventId: z.string(),
+          eventType: z.string(),
+          status: z.string(),
+          attemptCount: z.number(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+        })),
+      }),
+      {
+        success: true,
+        data: {
+          total: 1,
+          limit: DEFAULT_PAGE_LIMIT,
+          offset: 0,
+          deliveries: [{
+            id: 'delivery_001',
+            deliveryId: 'deliv_001',
+            eventId: 'event_001',
+            eventType: 'stream.created',
+            status: 'delivered',
+            attemptCount: 1,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:01.000Z',
+          }],
+        },
+        meta: { timestamp: '2026-01-01T00:00:01.000Z', requestId: 'req_abc123' },
+      },
+      'Paginated webhook deliveries'
+    ),
+    '400': errorResponses['400'],
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/internal/webhooks/dlq',
+  summary: 'List webhook dead-letter queue items',
+  tags: ['webhooks'],
+  security: [{ bearerAuth: [] }],
+  request: { query: webhookOffsetPaginationQuery },
+  responses: {
+    '200': successResponse(
+      z.object({
+        total: z.number(),
+        limit: z.number(),
+        offset: z.number(),
+        items: z.array(z.object({
+          id: z.string(),
+          deliveryId: z.string(),
+          eventId: z.string(),
+          eventType: z.string(),
+          endpointUrl: z.string(),
+          failureReason: z.string(),
+          attemptCount: z.number(),
+          createdAt: z.string(),
+          processedAt: z.string().nullable(),
+        })),
+      }),
+      {
+        success: true,
+        data: {
+          total: 1,
+          limit: DEFAULT_PAGE_LIMIT,
+          offset: 0,
+          items: [{
+            id: 'dlq_001',
+            deliveryId: 'deliv_001',
+            eventId: 'event_001',
+            eventType: 'stream.created',
+            endpointUrl: 'https://receiver.example/webhooks',
+            failureReason: 'Receiver returned 500',
+            attemptCount: 3,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            processedAt: null,
+          }],
+        },
+        meta: { timestamp: '2026-01-01T00:00:01.000Z', requestId: 'req_abc123' },
+      },
+      'Paginated webhook dead-letter queue items'
+    ),
+    '400': errorResponses['400'],
+    '401': errorResponses['401'],
+    '403': errorResponses['403'],
+  },
+});
 
 registry.registerPath({
   method: 'get',

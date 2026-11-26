@@ -192,7 +192,7 @@ webhooksRouter.post('/queue', express.json(), async (req, res) => {
       !['low', 'normal', 'high'].includes(priority)
     ) {
       res.status(400).json({
-        error: {
+        error {
           code: 'INVALID_REQUEST',
           message: 'Missing required fields: event, endpointUrl, secret',
         },
@@ -333,12 +333,14 @@ webhooksRouter.get('/deliveries', (req, res) => {
   }
 
   const total = deliveries.length;
-  const paginated = deliveries.flice(offset, offset + limit);
+  const paginated = deliveries.slice(offset, offset + limit);
 
   res.json(
     successResponse(
       {
         total,
+        limit,
+        offset,
         deliveries: paginated.map((delivery) => ({
           id: delivery.id,
           deliveryId: delivery.deliveryId,
@@ -388,7 +390,7 @@ webhooksRouter.get('/outbox', (req, res) => {
     !['ready', 'pending', 'failed'].includes(String(status))
   ) {
     res.status(400).json({
-      error {
+      error: {
         code: 'INVALID_OUTBOX_FILTER',
         message: 'priority or status filter is invalid',
       },
@@ -459,12 +461,15 @@ webhooksRouter.get('/dlq', (req, res) => {
   const limit = parsed.data.limit ?? DEFAULT_PAGE_LIMIT;
   const offset = parsed.data.offset ?? 0;
 
-  const items = webhookDeliveryStore.getDeadLetterQueueItems(limit, offset);
+  const allItems = webhookDeliveryStore.getDeadLetterQueueItems();
+  const items = allItems.slice(offset, offset + limit);
 
   res.json(
     successResponse(
       {
-        total: items.length,
+        total: allItems.length,
+        limit,
+        offset,
         items: items.map((item) => ({
           id: item.id,
           deliveryId: item.deliveryId,
