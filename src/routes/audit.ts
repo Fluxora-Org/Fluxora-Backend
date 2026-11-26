@@ -281,6 +281,8 @@ auditRouter.get('/', authenticate, requireAuth, requirePermission(Permission.AUD
     const { limit, offset, actor, actionType, resourceType, resourceId, dateFrom, dateTo } = parsed.data;
     const limitNum = limit ?? DEFAULT_PAGE_LIMIT;
     const offsetNum = offset ?? 0;
+    const dateFromMs = dateFrom === undefined ? undefined : Date.parse(dateFrom);
+    const dateToMs = dateTo === undefined ? undefined : Date.parse(dateTo);
 
     let filteredEntries = getAuditEntries();
 
@@ -302,12 +304,12 @@ auditRouter.get('/', authenticate, requireAuth, requirePermission(Permission.AUD
       filteredEntries = filteredEntries.filter((e) => e.resourceId === resourceId);
     }
 
-    if (dateFrom !== undefined) {
-      filteredEntries = filteredEntries.filter((e) => e.timestamp >= dateFrom);
+    if (dateFromMs !== undefined) {
+      filteredEntries = filteredEntries.filter((e) => Date.parse(e.timestamp) >= dateFromMs);
     }
 
-    if (dateTo !== undefined) {
-      filteredEntries = filteredEntries.filter((e) => e.timestamp <= dateTo);
+    if (dateToMs !== undefined) {
+      filteredEntries = filteredEntries.filter((e) => Date.parse(e.timestamp) <= dateToMs);
     }
 
     const page = filteredEntries.slice(offsetNum, offsetNum + limitNum).map(sanitizeEntry);
