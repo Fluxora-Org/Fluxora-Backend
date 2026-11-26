@@ -333,12 +333,14 @@ webhooksRouter.get('/deliveries', (req, res) => {
   }
 
   const total = deliveries.length;
-  const paginated = deliveries.flice(offset, offset + limit);
+  const paginated = deliveries.slice(offset, offset + limit);
 
   res.json(
     successResponse(
       {
         total,
+        limit,
+        offset,
         deliveries: paginated.map((delivery) => ({
           id: delivery.id,
           deliveryId: delivery.deliveryId,
@@ -364,7 +366,6 @@ webhooksRouter.get('/outbox', (req, res) => {
   // #1555: the outbox is an unbounded queue, so this listing is paginated
   // (limit 1–100, default 100) instead of returning every item. The default
   // keeps existing callers with ≤ 100 items seeing the same list.
-  const requestId = req.correlationId;
   const parsed = OffsetPaginationSchema.safeParse(req.query);
   if (!parsed.success) {
     const first = parsed.error.issues[0];
@@ -388,7 +389,7 @@ webhooksRouter.get('/outbox', (req, res) => {
     !['ready', 'pending', 'failed'].includes(String(status))
   ) {
     res.status(400).json({
-      error {
+      error: {
         code: 'INVALID_OUTBOX_FILTER',
         message: 'priority or status filter is invalid',
       },
@@ -398,7 +399,8 @@ webhooksRouter.get('/outbox', (req, res) => {
 
   let items = webhookDeliveryStore.getAllOutboxItems();
 
-  if (priority) {    items = items.filter((item) => item.priority === priority);
+  if (priority) {
+    items = items.filter((item) => item.priority === priority);
   }
 
   const now = Date.now();
@@ -459,12 +461,15 @@ webhooksRouter.get('/dlq', (req, res) => {
   const limit = parsed.data.limit ?? DEFAULT_PAGE_LIMIT;
   const offset = parsed.data.offset ?? 0;
 
-  const items = webhookDeliveryStore.getDeadLetterQueueItems(limit, offset);
+  const allItems = webhookDeliveryStore.getDeadLetterQueueItems();
+  const items = allItems.slice(offset, offset + limit);
 
   res.json(
     successResponse(
       {
-        total: items.length,
+        total: allItems.length,
+        limit,
+        offset,
         items: items.map((item) => ({
           id: item.id,
           deliveryId: item.deliveryId,
@@ -799,60 +804,6 @@ webhooksRouter.post('/verify', express.raw({ type: 'application/json' }), (req, 
  * cannot safely replace this operation. Keep an authenticated tombstone so old
  * jobs fail explicitly while their queued deliveries remain intact.
  */
-webhooksRouter.post('/process-outbox', express.json(), async (req, res) => {
-  const requestId = req.correlationId;
-  try {
-    const readyItems = webhookDeliveryStore.getReadyOutboxItems();
-    let processed = 0;
-    let errors = 0;
-
-    for (const item of readyItems) {
-      try {
-        // This would integrate with the webhook service to process the item
-        // For now, we'll just log and remove from outbox
-        logger.info('Processing outbox item', undefined, {
-          outboxId: item.id,
-          deliveryId: item.deliveryId,
-        });
-
-        webhookDeliveryStore.removeFromOutbox(item.id);
-        processed++;
-      } catch (error) {
-        logger.error('Error processing outbox item', undefined, {
-          outboxId: item.id,
-          error: error instanceof Error ? err.message : String(error),
-        });
-        errors++;
-      }
-    }
-
-    res.json(
-      successResponse(
-        {
-          processed,
-          errors,
-          total: readyItems.length,
-          message: 'Outbox processing completed',
-        },
-        requestId
-      )
-    );
-  } catch (error) {
-    logger.error('Error processing webhook outbox', undefined, {
-      error: error instanceof Error ? err.message : String(error),
-    });
-
-    res
-      .status(500)
-      .json(
-        errorResponse(
-          'OUTBOX_PROCESSING_ERROR',
-          'Failed to process webhook outbox',
-          undefined,
-          requestId
-        )
-      );
-  }
 webhooksRouter.post('/process-outbox', (_req, res): void => {
   res.status(410).json(
     errorResponse(
@@ -925,7 +876,6 @@ webhooksRouter.post('/retry', express.json(), async (req, res) => {
  * Clean up old webhook data (internal endpoint for maintenance)
  */
 webhooksRouter.post('/cleanup', express.json(), (req, res) => {
-  const requestId = req.id;
   const requestId = req.correlationId;
   const { olderThanDays = 7 } = req.body ?? {};
   if (

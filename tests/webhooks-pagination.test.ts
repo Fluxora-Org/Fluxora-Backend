@@ -13,7 +13,7 @@ import express from 'express';
 import request from 'supertest';
 import { webhooksRouter } from '../src/routes/webhooks.js';
 import { webhookDeliveryStore } from '../src/webhooks/storeFactory.js';
-import { MAX_PAGE_LIMIT } from '../src/validation/paginationSchema.js';
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT } from '../src/validation/paginationSchema.js';
 import type { WebhookDelivery } from '../src/webhooks/types.js';
 
 function buildApp() {
@@ -98,14 +98,15 @@ describe('GET /internal/webhooks/deliveries — pagination validation', () => {
     const res = await request(app).get(ENDPOINT).set('Authorization', 'Bearer test-admin-key').query({ limit: '3', offset: '1' });
     expect(res.status).toBe(200);
     // deliveries.slice(1, 1 + 3) → indices 1..3 → 3 items
-    expect(res.body.deliveries).toHaveLength(3);
+    expect(res.body.data.deliveries).toHaveLength(3);
+    expect(res.body.data).toMatchObject({ total: 5, limit: 3, offset: 1 });
   });
 
-  it('returns 200 and uses default limit=20 when limit is omitted', async () => {
+  it(`returns 200 and uses default limit=${DEFAULT_PAGE_LIMIT} when limit is omitted`, async () => {
     const res = await request(app).get(ENDPOINT).set('Authorization', 'Bearer test-admin-key');
     expect(res.status).toBe(200);
-    expect(res.body.deliveries).toHaveLength(5);
-    expect(res.body.total).toBe(5);
+    expect(res.body.data.deliveries).toHaveLength(5);
+    expect(res.body.data).toMatchObject({ total: 5, limit: DEFAULT_PAGE_LIMIT, offset: 0 });
   });
 
   it('returns 200 for limit at MAX_PAGE_LIMIT boundary', async () => {
@@ -116,13 +117,14 @@ describe('GET /internal/webhooks/deliveries — pagination validation', () => {
   it('returns 200 for offset 0', async () => {
     const res = await request(app).get(ENDPOINT).set('Authorization', 'Bearer test-admin-key').query({ offset: '0' });
     expect(res.status).toBe(200);
-    expect(res.body.deliveries).toHaveLength(5);
+    expect(res.body.data.deliveries).toHaveLength(5);
   });
 
   it('returns empty deliveries array for offset beyond total', async () => {
     const res = await request(app).get(ENDPOINT).set('Authorization', 'Bearer test-admin-key').query({ offset: '100' });
     expect(res.status).toBe(200);
-    expect(res.body.deliveries).toHaveLength(0);
+    expect(res.body.data.deliveries).toHaveLength(0);
+    expect(res.body.data).toMatchObject({ total: 5, limit: DEFAULT_PAGE_LIMIT, offset: 100 });
   });
 });
 
@@ -177,14 +179,15 @@ describe('GET /internal/webhooks/dlq — pagination validation', () => {
   it('returns 200 for valid limit', async () => {
     const res = await request(app).get(ENDPOINT).set('Authorization', 'Bearer test-admin-key').query({ limit: '2' });
     expect(res.status).toBe(200);
-    expect(res.body.items).toHaveLength(2);
+    expect(res.body.data.items).toHaveLength(2);
+    expect(res.body.data).toMatchObject({ total: 3, limit: 2, offset: 0 });
   });
 
-  it('returns 200 and uses default limit=20 when limit is omitted', async () => {
+  it(`returns 200 and uses default limit=${DEFAULT_PAGE_LIMIT} when limit is omitted`, async () => {
     const res = await request(app).get(ENDPOINT).set('Authorization', 'Bearer test-admin-key');
     expect(res.status).toBe(200);
-    expect(res.body.items).toHaveLength(3);
-    expect(res.body.total).toBe(3);
+    expect(res.body.data.items).toHaveLength(3);
+    expect(res.body.data).toMatchObject({ total: 3, limit: DEFAULT_PAGE_LIMIT, offset: 0 });
   });
 
   it('returns 200 for limit at MAX_PAGE_LIMIT boundary', async () => {
@@ -192,9 +195,10 @@ describe('GET /internal/webhooks/dlq — pagination validation', () => {
     expect(res.status).toBe(200);
   });
 
-  it('accepts offset query param on dlq route (validated but ignored)', async () => {
+  it('applies offset to dlq results and returns the full total', async () => {
     const res = await request(app).get(ENDPOINT).set('Authorization', 'Bearer test-admin-key').query({ offset: '5' });
-    // offset is accepted by the schema but ignored by the route handler
     expect(res.status).toBe(200);
+    expect(res.body.data.items).toHaveLength(0);
+    expect(res.body.data).toMatchObject({ total: 3, limit: DEFAULT_PAGE_LIMIT, offset: 5 });
   });
 });

@@ -366,9 +366,9 @@ describe('isTransactionPoolMode — env fallback when no pool', () => {
   });
 });
 
-// ── allowExitOnIdle: false in transaction mode ────────────────────────────────
+// ── allowExitOnIdle stays false for the long-running application pool ─────────
 
-describe('createPool — allowExitOnIdle in transaction mode', () => {
+describe('createPool — allowExitOnIdle', () => {
   beforeEach(() => deRegisterDbMetrics());
 
   it('sets allowExitOnIdle: false when poolMode=transaction', () => {
@@ -384,7 +384,7 @@ describe('createPool — allowExitOnIdle in transaction mode', () => {
     pool.end();
   });
 
-  it('sets allowExitOnIdle: true when poolMode=session', () => {
+  it('sets allowExitOnIdle: false when poolMode=session', () => {
     const pool = createPool({
       connectionString: 'postgresql://localhost/test',
       min: 1, max: 5,
@@ -393,11 +393,11 @@ describe('createPool — allowExitOnIdle in transaction mode', () => {
       poolMode: 'session',
     });
     // @ts-ignore - accessing internal option
-    expect(pool.options.allowExitOnIdle).toBe(true);
+    expect(pool.options.allowExitOnIdle).toBe(false);
     pool.end();
   });
 
-  it('sets allowExitOnIdle: true when poolMode not specified (default session)', () => {
+  it('sets allowExitOnIdle: false when poolMode is not specified', () => {
     const pool = createPool({
       connectionString: 'postgresql://localhost/test',
       min: 1, max: 5,
@@ -405,7 +405,7 @@ describe('createPool — allowExitOnIdle in transaction mode', () => {
       queueLimit: 50, statementTimeoutMs: 5000,
     });
     // @ts-ignore - accessing internal option
-    expect(pool.options.allowExitOnIdle).toBe(true);
+    expect(pool.options.allowExitOnIdle).toBe(false);
     pool.end();
   });
 });
