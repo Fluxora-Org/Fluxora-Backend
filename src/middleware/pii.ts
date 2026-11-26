@@ -135,7 +135,7 @@ export function safeErrorHandler(
   });
 
   res.status(500).json(
-    errorResponse('INTERNAL_ERROR', 'An unexpected error occurred. No sensitive data has been included in this response.')
+    errorResponse('INTERNAL_ERROR', 'Internal server error')
   );
 }
 

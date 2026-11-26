@@ -533,9 +533,29 @@ describe('G — Error payloads: safeErrorHandler strips PII', () => {
     });
     const res = await request(app).get('/boom');
     expect(res.status).toBe(500);
-    expect(res.body.error).toBe('Internal server error');
+    expect(res.body.error).toMatchObject({
+      code: 'INTERNAL_ERROR',
+      message: 'Internal server error',
+    });
     // The internal detail must not be present
     expect(JSON.stringify(res.body)).not.toContain('10.0.0.5:5432');
+  });
+
+  it('keeps a nested error cause containing a Stellar address private', async () => {
+    const cause = new Error(`recipient lookup failed for ${RECIPIENT_KEY}`);
+    const app = buildErrorApp(() => {
+      throw new Error('account read failed', { cause });
+    });
+
+    const res = await request(app).get('/boom');
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatchObject({
+      code: 'INTERNAL_ERROR',
+      message: 'Internal server error',
+    });
+    expect(res.text).not.toContain(RECIPIENT_KEY);
+    expect(res.text).not.toContain('account read failed');
+    expect(res.text).not.toContain('recipient lookup failed');
   });
 
   it('the 500 response body does not include a stack trace or internal paths', async () => {
@@ -848,7 +868,10 @@ describe('L — Fail-closed behavior: no plaintext on unexpected errors', () => 
     expect(res.status).toBe(500);
     expect(JSON.stringify(res.body)).not.toContain(SENDER_KEY);
     // Generic safe message
-    expect(res.body.error).toBe('Internal server error');
+    expect(res.body.error).toMatchObject({
+      code: 'INTERNAL_ERROR',
+      message: 'Internal server error',
+    });
   });
 
   it('safeErrorHandler returns 500 even when the error object is unusual', async () => {
