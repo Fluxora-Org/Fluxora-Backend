@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import express from 'express';
 import request from 'supertest';
+import { ApiErrorCode } from '../../src/errors.js';
 import { webhooksRouter } from '../../src/routes/webhooks.js';
 import { webhookDeliveryStore } from '../../src/webhooks/storeFactory.js';
 import { MAX_PAGE_LIMIT } from '../../src/validation/paginationSchema.js';
@@ -16,6 +17,14 @@ function buildApp() {
 
 function withAdmin(req: request.Test) {
   return req.set('Authorization', `Bearer ${ADMIN_KEY}`);
+}
+
+function expectAuthError(res: request.Response, status: number, code: ApiErrorCode): void {
+  expect(res.status).toBe(status);
+  expect(res.body).toMatchObject({
+    success: false,
+    error: { code, message: expect.any(String) },
+  });
 }
 
 const app = buildApp();
@@ -54,8 +63,7 @@ describe('webhook management ownership guard', () => {
         .set('Content-Type', 'application/json')
         .send({});
 
-      expect(res.status).toBe(401);
-      expect(res.body).toEqual({ error: expect.any(String) });
+      expectAuthError(res, 401, ApiErrorCode.UNAUTHORIZED);
     }
   );
 
@@ -68,10 +76,19 @@ describe('webhook management ownership guard', () => {
         .set('Content-Type', 'application/json')
         .send({});
 
-      expect(res.status).toBe(403);
-      expect(res.body).toEqual({ error: 'Invalid admin credentials.' });
+      expectAuthError(res, 403, ApiErrorCode.FORBIDDEN);
+      expect(res.body.error.message).toBe('Invalid admin credentials.');
     }
   );
+
+  it.each([
+    ['get', '/deliveries/missing', ApiErrorCode.DELIVERY_NOT_FOUND],
+    ['post', '/dlq/missing/retry', ApiErrorCode.NOT_FOUND],
+  ] as const)('%s %s returns a not-found envelope for an authenticated admin', async (method, path, code) => {
+    const res = await withAdmin(request(app)[method](`${BASE}${path}`));
+
+    expectAuthError(res, 404, code);
+  });
 });
 
 describe('webhook management input contracts', () => {
