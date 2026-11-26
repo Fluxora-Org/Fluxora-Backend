@@ -1,134 +1,196 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { IncomingMessage } from 'node:http';
-import type { Socket } from 'node:net';
-import {
-  upgradeHandler,
-  validateUpgradeRequest,
-  parseUpgradeHeaders,
-} from './upgradeHandler';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { EventEmitter } from 'node:events';
+import type { IncomingHttpHeaders, IncomingMessage, Server } from 'node:http';
+import type { Duplex } from 'node:stream';
+import type { WebSocket, WebSocketServer } from 'ws';
+import { verifyWsToken } from '../middleware/tokenAuth.js';
+import { checkAndReserve, getClientIp, untrackConnection } from './connectionLimiter.js';
+import { attachUpgradeHandler, type UpgradeHandlerDeps } from './upgradeHandler.js';
 
-function makeReq(overrides: Partial<Record<string, unknown>> = {}): IncomingMessage {
+vi.mock('../middleware/tokenAuth.js', () => ({
+  verifyWsToken: vi.fn(),
+}));
+
+vi.mock('./connectionLimiter.js', () => ({
+  checkAndReserve: vi.fn(),
+  getClientIp: vi.fn(),
+  untrackConnection: vi.fn(),
+}));
+
+const CLIENT_IP = '203.0.113.7';
+const IDENTITY = 'user-1';
+const WS_PATH = '/ws/streams';
+
+function makeReq({
+  url = WS_PATH,
+  headers = {},
+}: { url?: string; headers?: IncomingHttpHeaders } = {}): IncomingMessage {
   return {
-    headers: {},
-    url: '/',
+    url,
+    headers,
     method: 'GET',
     httpVersion: '1.1',
-    httpVersionMajor: 1,
-    httpVersionMinor: 1,
-    rawHeaders: [],
-    socket: { remoteAddress: '127.0.0.1' } as unknown as Socket,
-    complete: false,
-    ...overrides,
   } as unknown as IncomingMessage;
 }
 
 function makeSocket() {
-  const socket = {
-    write: vi.fn(),
-    destroy: vi.fn(),
-    end: vi.fn(),
+  const emitter = new EventEmitter();
+  const write = vi.fn();
+  const destroy = vi.fn();
+  const socket = Object.assign(emitter, { write, destroy }) as unknown as Duplex;
+
+  return {
+    socket,
+    write,
+    destroy,
+    emitClose: () => emitter.emit('close'),
+    closeListeners: () => emitter.listenerCount('close'),
   };
-  return socket as unknown as Socket;
 }
 
-describe('parseUpgradeHeaders', () => {
-  it('returns an empty object for empty headers', () => {
-    expect(parseUpgradeHeaders({})).toEqual({});
-  });
+function makeWss() {
+  const handleUpgrade = vi.fn();
+  const emit = vi.fn();
+  const wss = { handleUpgrade, emit } as unknown as WebSocketServer;
+  return { wss, handleUpgrade, emit };
+}
 
-  it('parses single-value headers and lowercases names', () => {
-    const headers = parseUpgradeHeaders({
-      Upgrade: 'websocket',
-      Connection: 'Upgrade',
-    });
-    expect(headers).toEqual({ upgrade: 'websocket', connection: 'Upgrade' });
-  });
+let server: Server;
+let socket: ReturnType<typeof makeSocket>;
+let wss: ReturnType<typeof makeWss>;
 
-  it('joins array values with commas', () => {
-    const headers = parseUpgradeHeaders({ 'Sec-WebSocket-Protocol': ['chat', 'superchat'] });
-    expect(headers['sec-websocket-protocol']).toBe('chat, superchat');
-  });
+function attach(overrides: Partial<UpgradeHandlerDeps> = {}): void {
+  const deps: UpgradeHandlerDeps = {
+    wss: wss.wss,
+    allowedOrigins: undefined,
+    wsAuthRequired: false,
+    jwtSecret: 'test-secret',
+    ...overrides,
+  };
+  attachUpgradeHandler(server, deps);
+}
 
-  it('skips undefined values', () => {
-    const headers = parseUpgradeHeaders({ Upgrade: undefined });
-    expect(headers).toEqual({});
-  });
-});
+function emitUpgrade(req: IncomingMessage, head = Buffer.alloc(0)): void {
+  server.emit('upgrade', req, socket.socket, head);
+}
 
-describe('validateUpgradeRequest', () => {
-  it('accepts a valid websocket upgrade request', () => {
-    const req = makeReq({
-      headers: { upgrade: 'websocket', connection: 'Upgrade' },
-    });
-    const result = validateUpgradeRequest(req);
-    expect(result.ok).toBe(true);
-  });
+async function expectRefusal(statusLine: string, body: string): Promise<void> {
+  await vi.waitFor(() => expect(socket.write).toHaveBeenCalledOnce());
+  const response = socket.write.mock.calls[0]?.[0] as string;
+  expect(response).toContain(statusLine);
+  expect(response).toContain(body);
+  expect(socket.destroy).toHaveBeenCalledOnce();
+}
 
-  it('rejects requests missing the upgrade header', () => {
-    const req = makeReq({ headers: { connection: 'Upgrade' } });
-    const result = validateUpgradeRequest(req);
-    expect(result.ok).toBe(false);
-    expect(result.reason).toBeTruthy();
-  });
-
-  it('rejects requests missing the connection header', () => {
-    const req = makeReq({ headers: { upgrade: 'websocket' } });
-    const result = validateUpgradeRequest(req);
-    expect(result.ok).toBe(false);
-  });
-
-  it('rejects a request with a non-websocket upgrade', () => {
-    const req = makeReq({
-      headers: { upgrade: 'h2c', connection: 'Upgrade' },
-    });
-    const result = validateUpgradeRequest(req);
-    expect(result.ok).toBe(false);
-  });
-
-  it('rejects a request with an empty upgrade header', () => {
-    const req = makeReq({ headers: { upgrade: '', connection: 'Upgrade' } });
-    const result = validateUpgradeRequest(req);
-    expect(result.ok).toBe(false);
-  });
-
-  it('accepts a connection header containing Upgrade among other tokens', () => {
-    const req = makeReq({
-      headers: { upgrade: 'websocket', connection: 'keep-alive, Upgrade' },
-    });
-    const result = validateUpgradeRequest(req);
-    expect(result.ok).toBe(true);
-  });
-});
-
-describe('upgradeHandler', () => {
-  let socket: Socket;
-
+describe('attachUpgradeHandler', () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    server = new EventEmitter() as unknown as Server;
     socket = makeSocket();
+    wss = makeWss();
+
+    vi.mocked(getClientIp).mockReturnValue(CLIENT_IP);
+    vi.mocked(verifyWsToken).mockReturnValue({ ok: true, payload: { sub: IDENTITY } });
+    vi.mocked(checkAndReserve).mockResolvedValue({ allowed: true });
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+  it('ignores upgrades outside /ws/streams', () => {
+    attach();
+    emitUpgrade(makeReq({ url: '/health' }));
 
-  it('accepts a valid upgrade request without destroying the socket', () => {
-    const req = makeReq({
-      headers: { upgrade: 'websocket', connection: 'Upgrade' },
-    });
-    upgradeHandler(req, socket, Buffer.alloc(0));
+    expect(verifyWsToken).not.toHaveBeenCalled();
+    expect(checkAndReserve).not.toHaveBeenCalled();
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+    expect(socket.write).not.toHaveBeenCalled();
     expect(socket.destroy).not.toHaveBeenCalled();
   });
 
-  it('rejects and destroys the socket for an invalid request', () => {
-    const req = makeReq({ headers: {} });
-    upgradeHandler(req, socket, Buffer.alloc(0));
-    expect(socket.destroy).toHaveBeenCalledOnce();
+  it('rejects a disallowed origin with 403 before auth or the limiter', async () => {
+    attach({ allowedOrigins: new Set(['https://app.example.com']) });
+    emitUpgrade(makeReq({ headers: { origin: 'https://evil.example' } }));
+
+    await expectRefusal('HTTP/1.1 403 Forbidden', 'Forbidden origin');
+    expect(verifyWsToken).not.toHaveBeenCalled();
+    expect(checkAndReserve).not.toHaveBeenCalled();
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
   });
 
-  it('handles an empty head buffer', () => {
-    const req = makeReq({ headers: {} });
-    const head = Buffer.alloc(0);
-    upgradeHandler(req, socket, head);
-    expect(socket.destroy).toHaveBeenCalled();
+  it('accepts an allowlisted origin and emits the connection after upgrade', async () => {
+    const origin = 'https://app.example.com';
+    const req = makeReq({ headers: { origin } });
+    const head = Buffer.from('early-bytes');
+    const ws = {} as WebSocket;
+    attach({ allowedOrigins: new Set([origin]), wsAuthRequired: true });
+
+    emitUpgrade(req, head);
+    await vi.waitFor(() => expect(wss.handleUpgrade).toHaveBeenCalledOnce());
+
+    expect(verifyWsToken).toHaveBeenCalledWith(req, 'test-secret');
+    expect(checkAndReserve).toHaveBeenCalledWith(CLIENT_IP, IDENTITY);
+    expect(wss.handleUpgrade).toHaveBeenCalledWith(req, socket.socket, head, expect.any(Function));
+    expect(socket.write).not.toHaveBeenCalled();
+    expect(socket.destroy).not.toHaveBeenCalled();
+
+    const onUpgrade = wss.handleUpgrade.mock.calls[0]?.[3] as (ws: WebSocket) => void;
+    onUpgrade(ws);
+    expect(wss.emit).toHaveBeenCalledWith('connection', ws, req);
+  });
+
+  it('rejects a missing token with 401 when auth is required', async () => {
+    vi.mocked(verifyWsToken).mockReturnValue({ ok: false, code: 'MISSING_TOKEN' });
+    attach({ wsAuthRequired: true });
+    emitUpgrade(makeReq());
+
+    await expectRefusal('HTTP/1.1 401 Unauthorized', 'Unauthorized: MISSING_TOKEN');
+    expect(checkAndReserve).not.toHaveBeenCalled();
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects an over-limit reservation with 429 without upgrading', async () => {
+    vi.mocked(checkAndReserve).mockResolvedValue({
+      allowed: false,
+      reason: 'Too many connections',
+    });
+    attach();
+    emitUpgrade(makeReq());
+
+    await expectRefusal('HTTP/1.1 429 Too Many Requests', 'Too many connections');
+    expect(wss.handleUpgrade).not.toHaveBeenCalled();
+    expect(untrackConnection).not.toHaveBeenCalled();
+  });
+
+  it('uses the default 429 reason when the limiter omits one', async () => {
+    vi.mocked(checkAndReserve).mockResolvedValue({ allowed: false });
+    attach();
+    emitUpgrade(makeReq());
+
+    await expectRefusal('HTTP/1.1 429 Too Many Requests', 'Too many connections');
+  });
+
+  it('releases the reservation once when the socket closes before registration', async () => {
+    attach();
+    emitUpgrade(makeReq());
+    await vi.waitFor(() => expect(wss.handleUpgrade).toHaveBeenCalledOnce());
+
+    expect(socket.closeListeners()).toBe(1);
+    socket.emitClose();
+    socket.emitClose();
+
+    expect(untrackConnection).toHaveBeenCalledOnce();
+    expect(untrackConnection).toHaveBeenCalledWith(CLIENT_IP, IDENTITY);
+    expect(socket.closeListeners()).toBe(0);
+  });
+
+  it('keeps the reservation after a completed upgrade', async () => {
+    attach();
+    emitUpgrade(makeReq());
+    await vi.waitFor(() => expect(wss.handleUpgrade).toHaveBeenCalledOnce());
+
+    const onUpgrade = wss.handleUpgrade.mock.calls[0]?.[3] as (ws: WebSocket) => void;
+    onUpgrade({} as WebSocket);
+
+    expect(socket.closeListeners()).toBe(0);
+    socket.emitClose();
+    expect(untrackConnection).not.toHaveBeenCalled();
   });
 });

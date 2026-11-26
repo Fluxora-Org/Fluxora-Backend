@@ -302,12 +302,16 @@ export const rpcProviderHealthyGauge =
   (registry.getSingleMetric('rpc_provider_healthy') as Gauge<'provider'>) ||
   new Gauge({
     name: 'rpc_provider_healthy',
+    help: 'Whether a Stellar RPC provider is healthy (1 = healthy, 0 = unhealthy)',
     help: 'Stellar RPC provider health-check status (1 = healthy, 0 = unhealthy)',
     labelNames: ['provider'] as const,
     registers: [registry],
   });
 
 export const rpcProviderHealthCheckFailuresTotal =
+  (registry.getSingleMetric('rpc_provider_health_check_failures_total') as Counter<
+    'provider' | 'reason'
+  >) ||
   (registry.getSingleMetric('rpc_provider_health_check_failures_total') as Counter<'provider' | 'reason'>) ||
   new Counter({
     name: 'rpc_provider_health_check_failures_total',
