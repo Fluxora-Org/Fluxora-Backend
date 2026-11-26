@@ -26,6 +26,8 @@ import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
 export interface WsTokenPayload {
   sub: string;
   role?: string;
+  /** JWT issued-at timestamp (seconds since Unix epoch). */
+  iat?: number;
 }
 
 export type WsAuthFailureCode = 'MISSING_TOKEN' | 'INVALID_TOKEN' | 'AUTH_NOT_CONFIGURED';
