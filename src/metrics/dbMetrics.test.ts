@@ -1,158 +1,85 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import {
-  recordQuery,
-  getDbMetrics,
-  resetDbMetrics,
-  percentile,
-} from './dbMetrics';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { registry } from '../metrics.js';
+
+vi.mock('../metrics.js', async () => {
+  const { Registry } = await import('prom-client');
+  return { registry: new Registry() };
+});
+
+let metrics: typeof import('./dbMetrics.js');
+
+beforeEach(async () => {
+  vi.resetModules();
+  metrics = await import('./dbMetrics.js');
+});
+
+afterEach(() => {
+  metrics.deRegisterDbMetrics();
+});
 
 describe('dbMetrics', () => {
-  beforeEach(() => {
-    resetDbMetrics();
+  it('registers the duration histogram with repository and operation labels', async () => {
+    const name = 'fluxora_db_query_duration_seconds';
+    const labels = { repository: 'streamRepository', operation: 'upsertStream' };
+    metrics.dbQueryDurationSeconds.observe(labels, 0.025);
+
+    expect(registry.getSingleMetric(name)).toBe(metrics.dbQueryDurationSeconds);
+    const histogram = await metrics.dbQueryDurationSeconds.get();
+    expect(histogram.type).toBe('histogram');
+    expect(histogram.values).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ metricName: name + '_sum', labels, value: 0.025 }),
+        expect.objectContaining({ metricName: name + '_count', labels, value: 1 }),
+      ]),
+    );
   });
 
-  describe('recordQuery', () => {
-    it('records a successful query', () => {
-      recordQuery('SELECT 1', 10, true);
-      const m = getDbMetrics();
-      expect(m.totalQueries).toBe(1);
-      expect(m.successfulQueries).toBe(1);
-      expect(m.failedQueries).toBe(0);
-    });
+  it('records slow queries by table hint', async () => {
+    const name = 'fluxora_db_slow_queries_total';
+    metrics.dbSlowQueriesTotal.inc({ table_hint: 'streams' }, 2);
 
-    it('records a failed query', () => {
-      recordQuery('SELECT 2', 20, false);
-      const m = getDbMetrics();
-      exists: {
-        expect(m.totalQueries).toBe(1);
-        expect(m.successfulQueries).toBe(0);
-        expect(m.failedQueries).toBe(1);
-      }
-    });
-
-    it('accumulates multiple queries', () => {
-      recordQuery('SELECT 1', 10, true);
-      recordQuery('SELECT 2', 30, true);
-      recordQuery('SELECT 3', 50, false);
-      const m = getDbMetrics();
-      expect(m.totalQueries).toBe(3);
-      expect(m.successfulQueries).toBe(2);
-      expect(m.failedQueries).toBe(1);
-    });
-
-    it('handles zero duration', () => {
-      recordQuery('SELECT zero', 0, true);
-      const m = getDbMetrics();
-      expect(m.totalQueries).toBe(1);
-      expect(m.averageDurationMs).toBe(0);
-    });
-
-    it('handles maximum safe integer duration', () => {
-      const max = Number.MAX_SAFE_INTEGER;
-      recordQuery('SELECT max', max, true);
-      const m = getDbMetrics();
-      expect(m.totalQueries).toBe(1);
-      expect(m.maxDurationMs).toBe(max);
-    });
-
-    it('tracks max duration across queries', () => {
-      recordQuery('SELECT 1', 10, true);
-      recordQuery('SELECT 2', 100, true);
-      recordQuery('SELECT 3', 50, true);
-      const m = getDbMetrics();
-      expect(m.maxDurationMs).toBe(100);
-    });
-
-    it('computes average duration', () => {
-      recordQuery('SELECT 1', 10, true);
-      recordQuery('SELECT 2', 20, true);
-      recordQuery('SELECT 3', 30, true);
-      const m = getDbMetrics();
-      expect(m.averageDurationMs).toBe(20);
-    });
-
-    it('records last query timestamp as a number', () => {
-      recordQuery('SELECT 1', 10, true);
-      const m = getDbMetrics();
-      expect(typeof m.lastQueryTimestamp).toBe('number');
-    });
+    expect(registry.getSingleMetric(name)).toBe(metrics.dbSlowQueriesTotal);
+    expect((await metrics.dbSlowQueriesTotal.get()).values).toEqual([
+      expect.objectContaining({ labels: { table_hint: 'streams' }, value: 2 }),
+    ]);
   });
 
-  describe('getDbMetrics', () => {
-    it('returns zero values when nothing recorded', () => {
-      const m = getDbMetrics();
-      expect(m.totalQueries).toBe(0);
-      expect(m.successfulQueries).toBe(0);
-      expect(m.failedQueries).toBe(0);
-      expect(m.averageDurationMs).toBe(0);
-      expect(m.maxDurationMs).toBe(0);
-    });
+  it('records one error counter series per supported error type', async () => {
+    expect(metrics.DB_ERROR_TYPES).toEqual([
+      'pool_exhausted',
+      'query_timeout',
+      'duplicate_entry',
+      'other',
+    ]);
+    for (const error_type of metrics.DB_ERROR_TYPES) {
+      metrics.dbQueryErrorsTotal.inc({ error_type });
+    }
 
-    it('returns a snapshot copy that does not mutate internal state', () => {
-      recordQuery('SELECT 1', 10, true);
-      const a = getDbMetrics();
-      a.totalQueries = 999;
-      const b = getDbMetrics();
-      expect(b.totalQueries).toBe(1);
-    });
+    expect(registry.getSingleMetric('fluxora_db_query_errors_total')).toBe(metrics.dbQueryErrorsTotal);
+    expect((await metrics.dbQueryErrorsTotal.get()).values).toEqual(
+      metrics.DB_ERROR_TYPES.map((error_type) =>
+        expect.objectContaining({ labels: { error_type }, value: 1 }),
+      ),
+    );
   });
 
-  describe('resetDbMetrics', () => {
-    it('clears all collected metrics', () => {
-      recordQuery('SELECT 1', 10, true);
-      resetDbMetrics();
-      const m = getDbMetrics();
-      expect(m.totalQueries).toBe(0);
-      expect(m.successfulQueries).toBe(0);
-      expect(m.failedQueries).toBe(0);
-    });
+  it('deregisters each DB metric and is safe to call again', () => {
+    const names = [
+      'fluxora_db_query_duration_seconds',
+      'fluxora_db_slow_queries_total',
+      'fluxora_db_pool_active_connections',
+      'fluxora_db_pool_idle_connections',
+      'fluxora_db_pool_waiting_requests',
+      'fluxora_db_pool_exhausted_total',
+      'fluxora_db_write_fence_rejected_total',
+      'fluxora_db_query_errors_total',
+      'fluxora_db_replication_lag_seconds',
+    ];
+    for (const name of names) expect(registry.getSingleMetric(name)).toBeDefined();
 
-    it('is safe to call on empty state', () => {
-      expect(() => resetDbMetrics()).not.toThrow();
-      expect(getDbMetrics().totalQueries).toBe(0);
-    });
-  });
+    metrics.deRegisterDbMetrics();
 
-  describe('percentile', () => {
-    it('returns 0 for an empty array', () => {
-      expect(percentile([], 50)).toBe(0);
-    });
-
-    it('returns the single value for a one-element array', () => {
-      expect(percentile([42], 50)).toBe(42);
-      expect(percentile([42], 99)).toBe(42);
-    });
-
-    it('returns the minimum for p=0', () => {
-      expect(percentile([10, 20, 30], 0)).toBe(10);
-    });
-
-    it('returns the maximum for p=100', () => {
-      expect(percentile([10, 20, 30], 100)).toBe(30);
-    });
-
-    it('computes the median for p=50', () => {
-      expect(percentile([10, 20, 30], 50)).toBe(20);
-    });
-
-    it('handles unsorted input', () => {
-      expect(percentile([30, 10, 20], 50)).toBe(20);
-    });
-
-    it('does not mutate the input array', () => {
-      const input = [30, 10, 20];
-      percentile(input, 50);
-      expect(input).toEqual([30, 10, 20]);
-    });
-
-    it('clamps out-of-range percentiles', () => {
-      expect(percentile([10, 20, 30], -10)).toBe(10);
-      expect(percentile([10, 20, 30], 150)).toBe(30);
-    });
-
-    it('handles maximum safe integer values', () => {
-      const max = Number.MAX_SAFE_INTEGER;
-      expect(percentile([max], 50)).toBe(max);
-    });
+    for (const name of names) expect(registry.getSingleMetric(name)).toBeUndefined();
+    expect(() => metrics.deRegisterDbMetrics()).not.toThrow();
   });
 });
