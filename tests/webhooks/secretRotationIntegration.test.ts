@@ -89,8 +89,17 @@ describe('POST /internal/webhooks/receive with rotated secrets', () => {
     const newResponse = await makeRequest(NEW_SECRET, AFTER_EXPIRY, 'expired-new');
 
     expect(oldResponse.status).toBe(401);
-    expect(oldResponse.body.error).toBe('previous_secret_expired');
+    expect(oldResponse.body.error.code).toBe('previous_secret_expired');
     expect(newResponse.status).toBe(200);
+  });
+
+  it('accepts the old signature at the exact expiry boundary', async () => {
+    mockQuery.mockResolvedValue({ rows: [rotationState()] });
+    Date.now = vi.fn(() => EXPIRES_AT * 1000);
+
+    const oldResponse = await makeRequest(OLD_SECRET, EXPIRES_AT, 'boundary-old');
+
+    expect(oldResponse.status).toBe(200);
   });
 
   it('falls back to the environment secret when no rotation row exists', async () => {
@@ -123,6 +132,6 @@ describe('POST /internal/webhooks/receive with rotated secrets', () => {
     const response = await makeRequest(OLD_SECRET, ROTATED_AT + 2, 'custom-window-expired');
 
     expect(response.status).toBe(401);
-    expect(response.body.error).toBe('previous_secret_expired');
+    expect(response.body.error.code).toBe('previous_secret_expired');
   });
 });
