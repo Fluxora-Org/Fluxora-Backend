@@ -20,6 +20,9 @@ import {
 import { registry } from '../src/metrics.js';
 import { countMetricSeries } from '../src/metrics/cardinality.js';
 
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => vi.useRealTimers());
+
 // ── StellarRpcService — failure classification ────────────────────────────────
 
 function makeService(
@@ -35,7 +38,9 @@ describe('StellarRpcService — failure classification', () => {
 
   it('classifies a timeout as TIMEOUT kind', async () => {
     const svc = makeService(() => new Promise(() => {}), { timeoutMs: 20 });
-    const err = await svc.getLatestLedger().catch((e) => e);
+    const promise = svc.getLatestLedger();
+    await vi.advanceTimersByTimeAsync(20);
+    const err = await promise.catch((e) => e);
     expect(err).toBeInstanceOf(RpcProviderError);
     expect((err as RpcProviderError).kind).toBe('TIMEOUT');
   });
@@ -66,7 +71,9 @@ describe('StellarRpcService — failure classification', () => {
 
   it('includes durationMs in the error', async () => {
     const svc = makeService(() => new Promise(() => {}), { timeoutMs: 20 });
-    const err = await svc.getLatestLedger().catch((e) => e) as RpcProviderError;
+    const promise = svc.getLatestLedger();
+    await vi.advanceTimersByTimeAsync(20);
+    const err = await promise.catch((e) => e) as RpcProviderError;
     expect(typeof err.durationMs).toBe('number');
     expect(err.durationMs).toBeGreaterThanOrEqual(0);
   });
@@ -91,6 +98,7 @@ describe('StellarRpcService — AbortController cancellation', () => {
     const svc = makeService(() => new Promise(() => {}), { timeoutMs: 5000 });
     const promise = svc.getLatestLedger({ signal: controller.signal });
     setTimeout(() => controller.abort(), 10);
+    await vi.advanceTimersByTimeAsync(10);
     const err = await promise.catch((e) => e);
     expect(err).toBeInstanceOf(RpcProviderError);
     expect((err as RpcProviderError).kind).toBe('CANCELLED');
@@ -171,7 +179,7 @@ describe('CircuitBreaker', () => {
     const cb = new CircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 10 });
     await cb.call(() => Promise.reject(new Error('x'))).catch(() => {});
     expect(cb.getState()).toBe('OPEN');
-    await new Promise((r) => setTimeout(r, 20));
+    await vi.advanceTimersByTimeAsync(20);
     await cb.call(() => Promise.resolve('ok')).catch(() => {});
     expect(cb.getState()).toBe('CLOSED');
   });
@@ -204,7 +212,7 @@ describe('CircuitBreaker — trace events', () => {
     await cb.call(() => Promise.reject(new Error('fail'))).catch(() => {});
 
     recordTransition.mockClear();
-    await new Promise((r) => setTimeout(r, 20));
+    await vi.advanceTimersByTimeAsync(20);
     // trigger probe — this causes the OPEN→HALF_OPEN transition inside call()
     await cb.call(() => Promise.resolve('ok')).catch(() => {});
 
@@ -214,7 +222,7 @@ describe('CircuitBreaker — trace events', () => {
   it('emits HALF_OPEN→CLOSED event when probe succeeds', async () => {
     const cb = new CircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 10 });
     await cb.call(() => Promise.reject(new Error('fail'))).catch(() => {});
-    await new Promise((r) => setTimeout(r, 20));
+    await vi.advanceTimersByTimeAsync(20);
 
     recordTransition.mockClear();
     await cb.call(() => Promise.resolve('ok'));
@@ -637,7 +645,7 @@ describe('RPC upstream metrics — per-method recording (not aggregated)', () =>
   it('latency histogram observes duration per-operation — slow and fast methods land in separate series', async () => {
     const slowClient: RawRpcClient = {
       getLatestLedger: async () => {
-        await new Promise((r) => setTimeout(r, 20));
+        await vi.advanceTimersByTimeAsync(20);
         return { sequence: 1 };
       },
       horizonUrl: 'https://horizon.test',
@@ -670,7 +678,9 @@ describe('RPC upstream metrics — failure path reflection', () => {
 
   it('TIMEOUT failure increments failure counter with kind=TIMEOUT and records outcome=failure', async () => {
     const svc = makeService(() => new Promise(() => {}), { timeoutMs: 10 });
-    await svc.getLatestLedger().catch(() => {});
+    const promise = svc.getLatestLedger();
+    await vi.advanceTimersByTimeAsync(10);
+    await promise.catch(() => {});
 
     const totalFail = getCounterValue(rpcUpstreamCallsTotal, {
       operation: 'getLatestLedger',

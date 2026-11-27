@@ -13,7 +13,7 @@
  *   pnpm vitest run tests/services/stellarRpc.deadlines.test.ts
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   StellarRpcService,
   CircuitOpenError,
@@ -22,6 +22,12 @@ import {
   type RawRpcClient,
 } from '../../src/services/stellar-rpc.js';
 
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function makeClient(fn: () => Promise<{ sequence: number }>): RawRpcClient {
@@ -29,7 +35,12 @@ function makeClient(fn: () => Promise<{ sequence: number }>): RawRpcClient {
 }
 
 function delay(ms: number): Promise<never> {
-  return new Promise((_, reject) => setTimeout(() => reject(new Error('slow')), ms));
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('slow')), ms);
+    // callWithTimeout installs its deadline timer before invoking the client;
+    // advance only to that first timer so the test stays deterministic.
+    void vi.advanceTimersToNextTimerAsync();
+  });
 }
 
 // ── parseOperationDeadlines ──────────────────────────────────────────────────
@@ -111,6 +122,30 @@ describe('StellarRpcService — per-operation deadlines', () => {
     expect(err).toBeInstanceOf(RpcProviderError);
     expect((err as RpcProviderError).kind).toBe('TIMEOUT');
     expect(elapsed).toBeLessThan(200);
+  });
+
+  it('uses the accountExists operation deadline independently of the global timeout', async () => {
+    const fetchMock = vi.fn(() => new Promise<Response>(() => {}));
+    vi.stubGlobal('fetch', fetchMock);
+    const svc = new StellarRpcService(
+      () => ({
+        getLatestLedger: async () => ({ sequence: 1 }),
+        horizonUrl: 'https://horizon.test',
+      }),
+      {
+        timeoutMs: 10_000,
+        operationDeadlines: { accountExists: 25 },
+      },
+    );
+
+    const promise = svc.accountExists('GACCOUNT').catch((err) => err);
+    await vi.advanceTimersByTimeAsync(25);
+    const err = await promise;
+
+    expect(err).toBeInstanceOf(RpcProviderError);
+    expect((err as RpcProviderError).kind).toBe('TIMEOUT');
+    expect((err as RpcProviderError).message).toContain('accountExists');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('uses global timeoutMs for operations not in the deadline map', async () => {
@@ -248,7 +283,10 @@ describe('StellarRpcService — deadline boundary cases', () => {
     const svc = new StellarRpcService(
       () =>
         makeClient(async () => {
-          await new Promise((r) => setTimeout(r, 5));
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 5);
+            void vi.advanceTimersByTimeAsync(5);
+          });
           return { sequence: 99 };
         }),
       {
