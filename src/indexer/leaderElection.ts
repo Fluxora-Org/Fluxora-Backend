@@ -238,7 +238,7 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
   private async renew(): Promise<void> {
     const now = this.clockNowMs();
     const elapsed = now >= this._lastRenewAttemptMs ? now - this._lastRenewAttemptMs : 0;
-    if (elapsed > this.leaseMs) {
+    if (elapsed >= this.leaseMs) {
       // The process was paused or the clock jumped forward for longer
       // than a full lease: we cannot know our lease is still valid, so drop
       // leadership without contacting Redis.
@@ -266,9 +266,11 @@ export class RedisIndexerLeaderElection implements IndexerLeaderElection {
         error: err instanceof Error ? err.message : String(err),
       });
       indexerLeaderElectionFailuresTotal.inc({ reason: 'renew_error' });
-      // Transient Redis error: keep the leadership flag as-is and let the
-      // next tick retry. The stale-clock guard above will self-revoke if
-      // the outage lasts a full lease period.
+      // A Redis error during renewal means we cannot confirm the lease is
+      // still ours. Drop leadership immediately so callers abort in-flight
+      // work at a safe boundary rather than continuing as a stale leader.
+      this._isLeader = false;
+      this.stopHeartbeat();
     }
   }
 

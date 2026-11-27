@@ -41,7 +41,7 @@ describe('RedisIndexerLeaderElection', () => {
       .find((v: any) => v.labels?.contract_id === 'test')?.value ?? 0;
     
     const beforeFailure = (await indexerLeaderElectionFailuresTotal.get()).values
-      .find((v: any) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
+      .find((v: any) => v.labels?.reason === 'renew_stale_clock')?.value ?? 0;
 
     const leaseMs = 9000;
     let now = 1_000_000;
@@ -55,7 +55,7 @@ describe('RedisIndexerLeaderElection', () => {
     expect(a.isLeader()).toBe(false);
 
     const afterFailure = (await indexerLeaderElectionFailuresTotal.get()).values
-      .find((v: any) => v.labels?.reason === 'clock_anomaly')?.value ?? 0;
+      .find((v: any) => v.labels?.reason === 'renew_stale_clock')?.value ?? 0;
     expect(afterFailure - beforeFailure).toBe(1);
 
     const after = (await indexerReplayBatchesCommittedTotal.get()).values
@@ -285,7 +285,9 @@ describe('RedisIndexerLeaderElection — multiple instance competition', () => {
     expect(a.isLeader()).toBe(false);
     expect(b.isLeader()).toBe(true);
     await expect(redis.get('indexer:leader-election:replay')).resolves.toBe('b');
-    expect(redis.getTtl('indexer:leader-election:replay')).toBeUndefined();
+    // B's heartbeat also fires during the timer advance and legitimately
+    // renews its own lease, so the recorded TTL is leaseMs (not undefined).
+    expect(redis.getTtl('indexer:leader-election:replay')).toBe(leaseMs);
   });
 
   /**
