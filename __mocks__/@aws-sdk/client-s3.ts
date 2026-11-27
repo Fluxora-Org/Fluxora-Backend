@@ -16,6 +16,8 @@ import { vi } from 'vitest';
 
 /** Generic no-op S3 command stub. */
 export class S3Client {
+  constructor(_config?: Record<string, unknown>) {}
+
   send(_command: unknown): Promise<Record<string, never>> {
     return Promise.resolve({});
   }
