@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockClient } from 'aws-sdk-client-mock';
 import { S3Client, ListObjectsV2Command, DeleteObjectsCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
-import { enforceBackupRetention, selectObjectsForDeletion, BackupObject } from '../../../src/scripts/backup-retention';
+import { enforceBackupRetention } from '../../../src/scripts/backup-retention';
 
 const s3Mock = mockClient(S3Client);
 
@@ -18,9 +18,13 @@ describe('backup-retention', () => {
     delete process.env.AWS_REGION;
   });
 
+  it('exposes send on the S3Client prototype for aws-sdk-client-mock', () => {
+    expect(S3Client.prototype.send).toBeTypeOf('function');
+  });
+
   it('runs dry-run and execution paths with identical deletion sets (shared selection oracle)', async () => {
     const fixedNow = new Date('2026-08-26T12:00:00Z');
-    
+
     // Fake objects setup
     const fakeObjects = [
       { Key: 'backups/db-today.sql', LastModified: new Date(fixedNow.getTime() - 1 * 86400000), Size: 1024 }, // Keep
@@ -53,12 +57,11 @@ describe('backup-retention', () => {
 
     logSpy.mockClear();
 
-    // 2. Execution (time shifted to simulate running later)
-    const laterTime = new Date('2026-08-27T12:00:00Z');
+    // 2. Execution uses the same fixed clock so both paths share a deterministic selection oracle.
     await enforceBackupRetention({
       dryRun: false,
       confirmDeletion: true,
-      now: fixedNow, // Oracle guarantees deterministic selection by using the same 'now'
+      now: fixedNow,
       legalHolds: ['backups/legal-hold']
     });
 
@@ -68,7 +71,7 @@ describe('backup-retention', () => {
     // Verify S3 calls
     const deleteCalls = s3Mock.commandCalls(DeleteObjectsCommand);
     expect(deleteCalls.length).toBe(1);
-    
+
     const deletedObjects = deleteCalls[0].args[0].input.Delete?.Objects?.map(o => o.Key);
     expect(deletedObjects).toEqual(['backups/db-40days-dup.sql', 'backups/db-400days.sql']);
   });
