@@ -28,6 +28,7 @@ import {
   setRuntimeRateLimitConfig,
 } from '../../src/config/rateLimits.js';
 import { reloadFlags, getFlags } from '../../src/config/featureFlags.js';
+import { flag } from '../helpers/featureFlagFixtures.js';
 import {
   recordConfigReloadSuccess,
   recordConfigReloadFailure,
@@ -206,12 +207,13 @@ describe('reloadHotConfig - Validation Edge Cases', () => {
     });
 
     it('handles FEATURE_FLAGS_JSON with invalid entries', () => {
+      const { name: _missingName, ...withoutName } = flag('missing_name', { percentage: 100 });
       process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-        { name: 'valid', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
+        flag('valid', { percentage: 50 }),
         { name: '', percentage: 100 }, // invalid empty name
-        { percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' }, // missing name
-        { name: 'invalid', percentage: 150 , default: false, owner: 'test', removalDate: '2099-01-01' }, // invalid percentage
-        { name: 'invalid2', percentage: -10 , default: false, owner: 'test', removalDate: '2099-01-01' }, // invalid negative
+        withoutName, // missing name
+        flag('invalid', { percentage: 150 }), // invalid percentage
+        flag('invalid2', { percentage: -10 }), // invalid negative
       ]);
 
       reloadFlags();
@@ -228,8 +230,8 @@ describe('reloadHotConfig - Validation Edge Cases', () => {
 
     it('handles FEATURE_FLAGS_JSON as object format', () => {
       process.env.FEATURE_FLAGS_JSON = JSON.stringify({
-        flag1: { percentage: 25 , default: false, owner: 'test', removalDate: '2099-01-01' },
-        flag2: { percentage: 75, default: false, owner: 'test', removalDate: '2099-01-01', description: 'test flag'  },
+        flag1: flag('flag1', { percentage: 25 }),
+        flag2: flag('flag2', { percentage: 75, description: 'test flag' }),
       });
 
       reloadFlags();
@@ -241,18 +243,13 @@ describe('reloadHotConfig - Validation Edge Cases', () => {
       expect(getFlags().get('flag2')?.description).toBe('test flag');
     });
 
-    it('handles FEATURE_FLAGS_JSON as shorthand object', () => {
+    it('rejects FEATURE_FLAGS_JSON shorthand object missing required metadata', () => {
       process.env.FEATURE_FLAGS_JSON = JSON.stringify({
         flag1: 25,
         flag2: 75,
       });
 
-      reloadFlags();
-
-      expect(getFlags().has('flag1')).toBe(true);
-      expect(getFlags().get('flag1')?.percentage).toBe(25);
-      expect(getFlags().has('flag2')).toBe(true);
-      expect(getFlags().get('flag2')?.percentage).toBe(75);
+      expect(() => reloadFlags()).toThrow(/Flag "flag1" is missing an owner/);
     });
 
     it('handles missing FEATURE_FLAGS_FILE gracefully', () => {
@@ -462,9 +459,7 @@ describe('Integration: reloadHotConfig + runtime updates', () => {
   });
 
   it('reloads feature flags correctly', () => {
-    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'test_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
-    ]);
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([flag('test_flag', { percentage: 50 })]);
 
     reloadFlags();
     expect(getFlags().has('test_flag')).toBe(true);
@@ -472,9 +467,7 @@ describe('Integration: reloadHotConfig + runtime updates', () => {
   });
 
   it('clears feature flags when JSON is removed', () => {
-    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'test_flag', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
-    ]);
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([flag('test_flag', { percentage: 50 })]);
 
     reloadFlags();
     expect(getFlags().size).toBe(1);
@@ -610,9 +603,7 @@ describe('Config Refresh Path Edge Cases', () => {
 
   it('handles config refresh during active feature flag usage', () => {
     // Set initial flags
-    process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag1', percentage: 50 , default: false, owner: 'test', removalDate: '2099-01-01' },
-    ]);
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([flag('flag1', { percentage: 50 })]);
     reloadFlags();
 
     // Verify flags are active
@@ -620,8 +611,8 @@ describe('Config Refresh Path Edge Cases', () => {
 
     // Update flags
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'flag1', percentage: 75 , default: false, owner: 'test', removalDate: '2099-01-01' },
-      { name: 'flag2', percentage: 25 , default: false, owner: 'test', removalDate: '2099-01-01' },
+      flag('flag1', { percentage: 75 }),
+      flag('flag2', { percentage: 25 }),
     ]);
     reloadFlags();
 
@@ -816,7 +807,8 @@ describe('Regression Surface Tests', () => {
     process.env.TRACING_SAMPLE_RATE = '0.75';
     process.env.TRACING_ENABLED = 'true';
     process.env.LOG_LEVEL = 'warn';
-    process.env.FEATURE_FLAGS_JSON = '[{"name":"test","percentage":50}]';
+    const flagsJson = JSON.stringify([flag('test', { percentage: 50 })]);
+    process.env.FEATURE_FLAGS_JSON = flagsJson;
 
     const hot = reloadHotConfig();
 
@@ -829,7 +821,7 @@ describe('Regression Surface Tests', () => {
     expect(hot.tracingSampleRate).toBe(0.75);
     expect(hot.tracingEnabled).toBe(true);
     expect(hot.logLevel).toBe('warn');
-    expect(hot.featureFlagsJson).toBe('[{"name":"test","percentage":50}]');
+    expect(hot.featureFlagsJson).toBe(flagsJson);
   });
 
   it('handles edge case: no hot-reloadable keys set (all defaults)', () => {
@@ -955,7 +947,7 @@ describe('refreshHotConfig - deterministic apply path', () => {
   it('applies rate limits and feature flags in fixed order', async () => {
     const order: string[] = [];
     process.env.RATE_LIMIT_IP_MAX = '10';
-    process.env.FEATURE_FLAGS_JSON = JSON.stringify([{ name: 'x', percentage: 100 , default: false, owner: 'test', removalDate: '2099-01-01' }]);
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([flag('x', { percentage: 100 })]);
 
     await refreshHotConfig({
       applyRateLimits: () => order.push('rate'),
