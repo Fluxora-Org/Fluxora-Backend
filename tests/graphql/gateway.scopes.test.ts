@@ -105,6 +105,7 @@ import { initializeConfig } from '../../src/config/env.js';
 import { reloadFlags } from '../../src/config/featureFlags.js';
 import { createApiKey, revokeApiKey } from '../../src/lib/apiKey.js';
 import { graphqlGatewayRouter } from '../../src/graphql/gateway.js';
+import { flag } from '../helpers/featureFlagFixtures.js';
 
 const app = express();
 app.use(express.json());
@@ -132,7 +133,7 @@ describe('GraphQL gateway — API-key scope matrix (#1266)', () => {
     });
     // Enable the gateway for every requester.
     process.env.FEATURE_FLAGS_JSON = JSON.stringify([
-      { name: 'experimental_graphql_gateway', percentage: 100 },
+      flag('experimental_graphql_gateway', { percentage: 100 }),
     ]);
     reloadFlags();
   });
